@@ -624,71 +624,161 @@ pub async fn handle_deposit_core(
             return Err(DepositReject::BadPayload);
         }
     }
-    let packet = decode_packet(&payload.cidnotify_packet).map_err(|_| DepositReject::BadPayload)?;
-    let (signed, signature, signed_bytes) = match packet {
-        DmPacket::CidNotify {
-            signed,
-            signature,
-            signed_bytes,
-        } => (signed, signature, signed_bytes),
-        _ => return Err(DepositReject::BadPayload),
-    };
-    if signed.sender_owner_addr.0 != frame.sender_owner {
-        return Err(DepositReject::InnerVerifyFailed);
-    }
-    let (resolved_owner, identity_pub) = ctx
-        .resolve_sender_device(signed.signing_device_hash)
-        .await
-        .ok_or(DepositReject::InnerVerifyFailed)?;
-    if resolved_owner != frame.sender_owner {
-        return Err(DepositReject::InnerVerifyFailed);
-    }
-    verify_dm_packet_signature(
-        &signed_bytes,
-        &signature,
-        &identity_pub,
-        signed.signing_device_hash,
-    )
-    .map_err(|_| DepositReject::InnerVerifyFailed)?;
-    let computed_cid = ContentId::for_book(
-        &payload.storage_blob,
-        ContentFlags {
-            encrypted: true,
-            ..Default::default()
-        },
-    )
-    .map_err(|_| DepositReject::BadPayload)?;
-    if computed_cid != signed.message_cid {
-        return Err(DepositReject::InnerVerifyFailed);
-    }
+    // ZEB-505: a deposit is either a MESSAGE (Some CidNotify + storage blob) or
+    // a standalone durable INVITE (None CidNotify — the invite IS the payload).
+    // Verify whichever half is present with the same receive-path primitives —
+    // device→owner binding + packet signature + the co-member space bind — then
+    // hand back the persist key + the ack identifier. The invite-only branch has
+    // no storage blob, so it skips the `for_book` cid check (there is no cid).
+    let (deposit_space_id, key, ack_message_cid): ([u8; 16], String, Vec<u8>) =
+        match payload.cidnotify_packet.as_deref() {
+            Some(cidnotify_bytes) => {
+                let packet =
+                    decode_packet(cidnotify_bytes).map_err(|_| DepositReject::BadPayload)?;
+                let (signed, signature, signed_bytes) = match packet {
+                    DmPacket::CidNotify {
+                        signed,
+                        signature,
+                        signed_bytes,
+                    } => (signed, signature, signed_bytes),
+                    _ => return Err(DepositReject::BadPayload),
+                };
+                if signed.sender_owner_addr.0 != frame.sender_owner {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
+                let (resolved_owner, identity_pub) = ctx
+                    .resolve_sender_device(signed.signing_device_hash)
+                    .await
+                    .ok_or(DepositReject::InnerVerifyFailed)?;
+                if resolved_owner != frame.sender_owner {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
+                verify_dm_packet_signature(
+                    &signed_bytes,
+                    &signature,
+                    &identity_pub,
+                    signed.signing_device_hash,
+                )
+                .map_err(|_| DepositReject::InnerVerifyFailed)?;
+                let computed_cid = ContentId::for_book(
+                    &payload.storage_blob,
+                    ContentFlags {
+                        encrypted: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|_| DepositReject::BadPayload)?;
+                if computed_cid != signed.message_cid {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
 
-    // Step 5.5 (ZEB-424 D28.1, security follow-up) — bind co-member admission
-    // to the DEPOSITED space. Step 1 only proved the sender shares SOME live
-    // group DM (the `space_id` was still sealed); now that the inner packet is
-    // open and its signing device is bound to `frame.sender_owner`, require
-    // that the deposit's own `signed.space_id` is a live `GroupDm` containing
-    // BOTH this owner and the sender. Without it, a co-member of group A could
-    // get a deposit for an unrelated space B (which they are NOT in)
-    // persisted+acked, only for ingestion (which re-checks space membership)
-    // to reject it until TTL — an inbox-slot-pinning DoS plus a lying ack. The
-    // friend path is intentionally NOT space-bound here: friendship is the
-    // authorization for 1:1 DM deposits and is unchanged by ZEB-424. The
-    // pre-decrypt "shares any" gate stays as the cheap stranger-filter in
-    // front of decrypt; this is the authoritative bind.
-    if matches!(admission, Admission::CoMember)
-        && !ctx
-            .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
-            .await
-    {
-        return Err(DepositReject::NotAuthorized);
-    }
+                // Step 5.5 (ZEB-424 D28.1, security follow-up) — bind co-member
+                // admission to the DEPOSITED space. Step 1 only proved the sender
+                // shares SOME live group DM (the `space_id` was still sealed); now
+                // that the inner packet is open and its signing device is bound to
+                // `frame.sender_owner`, require that the deposit's own
+                // `signed.space_id` is a live `GroupDm` containing BOTH this owner
+                // and the sender. Without it, a co-member of group A could get a
+                // deposit for an unrelated space B persisted+acked, only for
+                // ingestion to reject it until TTL — an inbox-slot-pinning DoS
+                // plus a lying ack. The friend path is intentionally NOT
+                // space-bound here: friendship authorizes 1:1 DM deposits.
+                if matches!(admission, Admission::CoMember)
+                    && !ctx
+                        .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
+                        .await
+                {
+                    return Err(DepositReject::NotAuthorized);
+                }
+                let key = DmInboxDoc::key(&signed.space_id.0, &signed.message_cid.to_bytes());
+                (
+                    signed.space_id.0,
+                    key,
+                    signed.message_cid.to_bytes().to_vec(),
+                )
+            }
+            // ZEB-505 invite-only deposit: the invite is the sole payload and MUST
+            // be present. Verify it with the same device→owner binding + signature
+            // primitives the message path uses (so the butler never persists+acks
+            // a forged invite — D7), bind co-member admission to the invite's
+            // space, then persist keyed by the invite (one standalone invite per
+            // space).
+            None => {
+                // CodeRabbit (Stability, Major): the invite is the SOLE payload —
+                // an invite-only deposit carries no message, so any storage_blob
+                // is unused bytes an admitted sender could attach to waste inbox
+                // storage until TTL. Reject a non-empty blob fail-closed.
+                if !payload.storage_blob.is_empty() {
+                    return Err(DepositReject::BadPayload);
+                }
+                let invite_bytes = payload
+                    .invite_packet
+                    .as_deref()
+                    .ok_or(DepositReject::BadPayload)?;
+                let packet = decode_packet(invite_bytes).map_err(|_| DepositReject::BadPayload)?;
+                let (signed, signature, signed_bytes) = match packet {
+                    DmPacket::Invite {
+                        signed,
+                        signature,
+                        signed_bytes,
+                    } => (signed, signature, signed_bytes),
+                    _ => return Err(DepositReject::BadPayload),
+                };
+                if signed.inviter.0 != frame.sender_owner {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
+                let (resolved_owner, identity_pub) = ctx
+                    .resolve_sender_device(signed.signing_device_hash)
+                    .await
+                    .ok_or(DepositReject::InnerVerifyFailed)?;
+                if resolved_owner != frame.sender_owner {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
+                // CodeRabbit (Data Integrity, Major): complete invite validation
+                // BEFORE persist+ack so the butler never acks an invite that
+                // `apply_invite` (run at ingestion) would reject — which would
+                // otherwise leave the entry pending until TTL. Mirror the two
+                // remaining `apply_invite` gates: (a) the invite's inline
+                // `inviter_identity_pub` must match the resolved signing-device
+                // pubkey, and (b) the deposit's recipient must actually be a
+                // member of the invited Space.
+                if signed.inviter_identity_pub != identity_pub {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
+                if !signed
+                    .members
+                    .contains(&crate::owner_state_types::OwnerAddr(frame.recipient_owner))
+                {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
+                verify_dm_packet_signature(
+                    &signed_bytes,
+                    &signature,
+                    &identity_pub,
+                    signed.signing_device_hash,
+                )
+                .map_err(|_| DepositReject::InnerVerifyFailed)?;
+                if matches!(admission, Admission::CoMember)
+                    && !ctx
+                        .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
+                        .await
+                {
+                    return Err(DepositReject::NotAuthorized);
+                }
+                let key = DmInboxDoc::invite_key(&signed.space_id.0);
+                (
+                    signed.space_id.0,
+                    key,
+                    crate::butler_deposit::INVITE_ONLY_DEPOSIT_MARKER.to_vec(),
+                )
+            }
+        };
 
     // Step 6 — atomic persist-with-caps + durable flush BEFORE the ack
     // exists (D7: an ack never lies). Insert-once on the key with the
     // per-sender + global quotas enforced inside the persist critical
     // section; an occupied key bypasses the caps, so a redelivery after a
     // lost ack is absorbed and still acked even at a full inbox.
-    let key = DmInboxDoc::key(&signed.space_id.0, &signed.message_cid.to_bytes());
     let entry = DmInboxEntry {
         sender_owner: frame.sender_owner,
         cidnotify_packet: payload.cidnotify_packet,
@@ -706,8 +796,8 @@ pub async fn handle_deposit_core(
 
     // Step 7 — ack.
     Ok(DepositAck {
-        space_id: signed.space_id.0,
-        message_cid: signed.message_cid.to_bytes().to_vec(),
+        space_id: deposit_space_id,
+        message_cid: ack_message_cid,
     })
 }
 
@@ -977,7 +1067,7 @@ mod tests {
         let (cidnotify_packet, identity_pub, dm_device_hash) =
             build_cidnotify(so.owner, space_id, message_cid);
         let payload = DepositPayload {
-            cidnotify_packet: cidnotify_packet.clone(),
+            cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet: None,
         };
@@ -1022,7 +1112,7 @@ mod tests {
         let (cidnotify_packet, identity_pub, dm_device_hash) =
             build_cidnotify(so.owner, space_id, message_cid);
         let payload = DepositPayload {
-            cidnotify_packet: cidnotify_packet.clone(),
+            cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet,
         };
@@ -1210,7 +1300,7 @@ mod tests {
     fn filler_entry(sender_owner: [u8; 16]) -> DmInboxEntry {
         DmInboxEntry {
             sender_owner,
-            cidnotify_packet: Vec::new(),
+            cidnotify_packet: Some(Vec::new()),
             storage_blob: Vec::new(),
             invite_packet: None,
             deposited_at: Hlc {
@@ -1240,7 +1330,8 @@ mod tests {
             "invite carried through verbatim"
         );
         assert_eq!(
-            entry.cidnotify_packet, f.cidnotify_packet,
+            entry.cidnotify_packet,
+            Some(f.cidnotify_packet),
             "CidNotify validation/persist unchanged"
         );
     }
@@ -1279,7 +1370,7 @@ mod tests {
             let store = ctx.store.lock().unwrap();
             let entry = store.get(&key).expect("entry persisted under inbox key");
             assert_eq!(entry.sender_owner, f.sender_owner);
-            assert_eq!(entry.cidnotify_packet, f.cidnotify_packet);
+            assert_eq!(entry.cidnotify_packet, Some(f.cidnotify_packet.clone()));
             assert_eq!(entry.storage_blob, f.storage_blob);
             assert_eq!(entry.deposited_by, ctx.device_id());
             assert!(entry.ingested_by.is_empty());
@@ -1447,7 +1538,7 @@ mod tests {
         let f = valid_fixture();
         let so = sender();
         let payload = DepositPayload {
-            cidnotify_packet: f.cidnotify_packet.clone(),
+            cidnotify_packet: Some(f.cidnotify_packet.clone()),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
         };
@@ -1475,7 +1566,7 @@ mod tests {
         let key = DmInboxDoc::key(&f.space_id.0, &f.message_cid.to_bytes());
         let store = ctx.store.lock().unwrap();
         let entry = store.get(&key).expect("entry persisted");
-        assert_eq!(entry.cidnotify_packet, f.cidnotify_packet);
+        assert_eq!(entry.cidnotify_packet, Some(f.cidnotify_packet));
         assert_eq!(entry.storage_blob, f.storage_blob);
     }
 
@@ -1814,7 +1905,7 @@ mod tests {
         let last = tampered_packet.len() - 1;
         tampered_packet[last] ^= 0xFF;
         let frame = reframe(&DepositPayload {
-            cidnotify_packet: tampered_packet,
+            cidnotify_packet: Some(tampered_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
         });
@@ -1836,7 +1927,7 @@ mod tests {
         let (mismatch_packet, _, _) =
             build_cidnotify(OwnerAddr(f.sender_owner), f.space_id, other_cid);
         let frame = reframe(&DepositPayload {
-            cidnotify_packet: mismatch_packet,
+            cidnotify_packet: Some(mismatch_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
         });
@@ -1860,7 +1951,7 @@ mod tests {
         let (foreign_packet, _, _) =
             build_cidnotify(OwnerAddr([0xEE; 16]), f.space_id, f.message_cid);
         let frame = reframe(&DepositPayload {
-            cidnotify_packet: foreign_packet,
+            cidnotify_packet: Some(foreign_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
         });

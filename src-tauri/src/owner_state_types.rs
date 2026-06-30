@@ -2293,6 +2293,27 @@ pub enum DeliveryStatus {
 /// satisfied. `delivered_to` is `BTreeSet` so canonical CBOR encoding
 /// is deterministic (BTreeSet serializes in `K::Ord` order which is
 /// bytewise for `OwnerAddr` since it's a `bstr(16)`).
+///
+/// ZEB-505: `message_cid` is `Option<ContentId>`. `Some(cid)` = a normal
+/// sent-message entry; `None` = a standalone durable DM *invite* with no
+/// following message (minted by `add_space` so the bootstrap invite gets the
+/// same retry + deposit durability a message rides on, instead of the old
+/// best-effort fire-and-forget). Wire-compatible by construction: ciborium
+/// encodes `Some(cid)` transparently as the bare `cid`, so existing persisted
+/// entries stay byte-identical; `#[serde(default)]` lets an absent `mc` decode
+/// to `None`; a `None` entry encodes `mc: null`.
+///
+/// Forward-compat caveat (Greptile): a *pre-ZEB-505* paired device decodes
+/// `message_cid` as a MANDATORY `ContentId` and so cannot decode an invite-only
+/// entry (`mc: null`). Because a fleet root publish is decoded as one atomic
+/// `OwnerState` blob, such a device drops the WHOLE publish that carries an
+/// invite-only entry until it upgrades. This is a transient multi-device
+/// upgrade-window degradation ONLY: it never affects the originating device's
+/// own durability or the recipient's invite delivery (that device deposits
+/// regardless), and it self-heals once both devices run ZEB-505. Filtering
+/// invite-only entries out of the published root would avoid it, at the cost of
+/// fleet-failover redundancy for the invite — a tradeoff deferred while the
+/// originating device's durability is sufficient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxEntry {
     #[serde(rename = "id")]
@@ -2301,8 +2322,8 @@ pub struct OutboxEntry {
     pub space_id: SpaceId,
     #[serde(rename = "rc")]
     pub recipient_owners: Vec<OwnerAddr>,
-    #[serde(rename = "mc")]
-    pub message_cid: ContentId,
+    #[serde(rename = "mc", default)]
+    pub message_cid: Option<ContentId>,
     #[serde(rename = "ca")]
     pub created_at: Hlc,
     #[serde(rename = "dl")]
@@ -2583,7 +2604,7 @@ mod outbox_tests {
             id: OutboxEntryId([1u8; 16]),
             space_id: SpaceId([2u8; 16]),
             recipient_owners: recipients.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
-            message_cid: ContentId::from_bytes([3u8; 32]),
+            message_cid: Some(ContentId::from_bytes([3u8; 32])),
             created_at: hlc(100),
             delivered_to: delivered.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             delivery_status: DeliveryStatus::Pending,
@@ -2624,6 +2645,62 @@ mod outbox_tests {
         ciborium::into_writer(&e, &mut bytes).unwrap();
         let recovered: OutboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(e, recovered);
+    }
+
+    #[test]
+    fn outbox_entry_invite_only_message_cid_none_round_trips() {
+        // ZEB-505: a durable invite-only entry has no message. `message_cid:
+        // None` must survive the persisted-CRDT round-trip and come back None.
+        let mut e = entry(vec![1, 2, 3], vec![]);
+        e.message_cid = None;
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&e, &mut bytes).unwrap();
+        let recovered: OutboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(e, recovered);
+        assert_eq!(recovered.message_cid, None);
+    }
+
+    #[test]
+    fn outbox_entry_legacy_bare_message_cid_decodes_as_some() {
+        // ZEB-505 migration: a pre-change OutboxEntry encoded `mc` as a BARE
+        // mandatory ContentId. Under the new `Option<ContentId>` with
+        // `#[serde(default)]`, those already-persisted bytes must still load —
+        // the bare value decoding to `Some(cid)` — so existing on-disk owner
+        // outbox state survives the format change (ciborium encodes `Some(x)`
+        // transparently as bare `x`, so new MESSAGE entries are also
+        // byte-identical to the legacy encoding).
+        #[derive(serde::Serialize)]
+        struct LegacyOutboxEntry {
+            #[serde(rename = "id")]
+            id: OutboxEntryId,
+            #[serde(rename = "sp")]
+            space_id: SpaceId,
+            #[serde(rename = "rc")]
+            recipient_owners: Vec<OwnerAddr>,
+            #[serde(rename = "mc")]
+            message_cid: ContentId,
+            #[serde(rename = "ca")]
+            created_at: Hlc,
+            #[serde(rename = "dl")]
+            delivered_to: BTreeSet<OwnerAddr>,
+            #[serde(rename = "ds")]
+            delivery_status: DeliveryStatus,
+        }
+        let cid = ContentId::from_bytes([7u8; 32]);
+        let legacy = LegacyOutboxEntry {
+            id: OutboxEntryId([1u8; 16]),
+            space_id: SpaceId([2u8; 16]),
+            recipient_owners: vec![OwnerAddr([3u8; 16])],
+            message_cid: cid,
+            created_at: hlc(100),
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&legacy, &mut bytes).unwrap();
+        let recovered: OutboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(recovered.message_cid, Some(cid));
+        assert_eq!(recovered.space_id, SpaceId([2u8; 16]));
     }
 }
 

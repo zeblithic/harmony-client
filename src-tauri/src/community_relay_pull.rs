@@ -43,9 +43,16 @@ pub trait RelayIngestCtx: Send + Sync {
 
     /// Ingest a recovered [`DepositPayload`] via the NORMAL receive path
     /// (verify_cidnotify_admission, decrypt_and_bind_dm_blob, apply_inbox,
-    /// emit_dm_received). Returns `Ok(())` on success; `Err(reason)` causes
-    /// the blob to be dropped (content_id NOT returned to the relay).
-    async fn ingest_recovered(&self, payload: DepositPayload) -> Result<(), String>;
+    /// emit_dm_received). `sender_owner` is the AUTHENTICATED depositor the
+    /// relay recorded ([`RelayHeldBlob::sender_owner`]); the ZEB-505 invite-only
+    /// branch binds the invite's `expected_inviter` to it (the payload's own
+    /// `signed.inviter` is untrusted). Returns `Ok(())` on success; `Err(reason)`
+    /// causes the blob to be dropped (content_id NOT returned to the relay).
+    async fn ingest_recovered(
+        &self,
+        sender_owner: [u8; 16],
+        payload: DepositPayload,
+    ) -> Result<(), String>;
 }
 
 /// Open each blob in `blobs` (trying every device priv from
@@ -129,7 +136,9 @@ pub async fn open_and_ingest(blobs: &[RelayHeldBlob], ctx: &dyn RelayIngestCtx) 
         };
 
         // 4. Ingest via the normal receive path.  Only ack on success.
-        match ctx.ingest_recovered(payload).await {
+        //    Pass the relay-authenticated sender so the ZEB-505 invite-only
+        //    branch binds the invite to it (not the payload's own claim).
+        match ctx.ingest_recovered(blob.sender_owner, payload).await {
             Ok(()) => {
                 acked.push(content_id.to_bytes());
             }
@@ -172,8 +181,10 @@ mod tests {
         privs: Vec<Zeroizing<[u8; 32]>>,
         /// `true` → `ingest_recovered` returns `Ok(())`; `false` → `Err`.
         ingest_ok: bool,
-        /// Payloads recorded by `ingest_recovered`, in call order.
-        ingested: StdMutex<Vec<DepositPayload>>,
+        /// `(sender_owner, payload)` recorded by `ingest_recovered`, in call
+        /// order — the sender lets a test assert `open_and_ingest` threads the
+        /// relay-authenticated `blob.sender_owner` (ZEB-505 / Qodo).
+        ingested: StdMutex<Vec<([u8; 16], DepositPayload)>>,
     }
 
     impl MockCtx {
@@ -185,7 +196,7 @@ mod tests {
             }
         }
 
-        fn ingested(&self) -> Vec<DepositPayload> {
+        fn ingested(&self) -> Vec<([u8; 16], DepositPayload)> {
             self.ingested.lock().unwrap().clone()
         }
     }
@@ -196,8 +207,12 @@ mod tests {
             self.privs.clone()
         }
 
-        async fn ingest_recovered(&self, payload: DepositPayload) -> Result<(), String> {
-            self.ingested.lock().unwrap().push(payload);
+        async fn ingest_recovered(
+            &self,
+            sender_owner: [u8; 16],
+            payload: DepositPayload,
+        ) -> Result<(), String> {
+            self.ingested.lock().unwrap().push((sender_owner, payload));
             if self.ingest_ok {
                 Ok(())
             } else {
@@ -212,7 +227,7 @@ mod tests {
 
     fn dummy_payload(tag: u8) -> DepositPayload {
         DepositPayload {
-            cidnotify_packet: vec![tag; 4],
+            cidnotify_packet: Some(vec![tag; 4]),
             storage_blob: vec![tag + 1; 5],
             invite_packet: None,
         }
@@ -266,6 +281,7 @@ mod tests {
         .expect("for_book must succeed")
         .to_bytes();
 
+        let expected_sender = blob.sender_owner;
         let ctx = MockCtx::new(vec![x_priv], true);
         let acked = open_and_ingest(&[blob], &ctx).await;
 
@@ -276,12 +292,17 @@ mod tests {
             "content_id must be returned for a successfully ingested blob"
         );
 
-        // ingest_recovered was called with the EXACT DepositPayload.
+        // ingest_recovered was called with the EXACT DepositPayload, and with
+        // the blob's relay-authenticated sender_owner threaded through (ZEB-505).
         let ingested = ctx.ingested();
         assert_eq!(ingested.len(), 1, "ingest_recovered must be called once");
         assert_eq!(
-            ingested[0], payload,
+            ingested[0].1, payload,
             "ingest_recovered must receive the exact decoded DepositPayload"
+        );
+        assert_eq!(
+            ingested[0].0, expected_sender,
+            "open_and_ingest must thread the blob's authenticated sender_owner"
         );
     }
 
@@ -417,7 +438,11 @@ mod tests {
             self.privs.clone()
         }
 
-        async fn ingest_recovered(&self, _payload: DepositPayload) -> Result<(), String> {
+        async fn ingest_recovered(
+            &self,
+            _sender_owner: [u8; 16],
+            _payload: DepositPayload,
+        ) -> Result<(), String> {
             let mut n = self.call_count.lock().unwrap();
             let result = if *n == 0 {
                 Ok(())

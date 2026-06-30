@@ -14,10 +14,20 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct DmInboxEntry {
     #[serde(rename = "so")]
     pub sender_owner: [u8; 16],
-    /// Full signed CidNotify packet bytes (discriminant+body+sig).
-    #[serde(rename = "cn", with = "serde_bytes")]
-    pub cidnotify_packet: Vec<u8>,
-    /// The CAS storage blob ([ver][nonce][ct][tag]).
+    /// Signed CidNotify packet bytes (discriminant+body+sig). ZEB-505: `None`
+    /// for a standalone durable DM *invite* deposit (no message) — then
+    /// `invite_packet` is the sole payload and `storage_blob` is empty.
+    /// Symmetric to `invite_packet`/`iv`; backward-compatible since legacy
+    /// deposits always carry `cn` (decoding to `Some`).
+    #[serde(
+        rename = "cn",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub cidnotify_packet: Option<Vec<u8>>,
+    /// The CAS storage blob ([ver][nonce][ct][tag]). Empty for an invite-only
+    /// deposit (`cidnotify_packet` is `None`).
     #[serde(rename = "pl", with = "serde_bytes")]
     pub storage_blob: Vec<u8>,
     /// ZEB-483: optional signed DmInvite packet bytes, carried through from the
@@ -57,6 +67,13 @@ impl CanonicalPayload for DmInboxDoc {}
 impl DmInboxDoc {
     pub fn key(space_id: &[u8; 16], message_cid: &[u8]) -> String {
         format!("{}:{}", hex::encode(space_id), hex::encode(message_cid))
+    }
+
+    /// ZEB-505: deposit key for a standalone invite-only entry (no message).
+    /// The `:invite` suffix can't collide with a message key, whose second
+    /// half is always 64 hex chars — so one standalone invite per space.
+    pub fn invite_key(space_id: &[u8; 16]) -> String {
+        format!("{}:invite", hex::encode(space_id))
     }
 
     /// Insert-once + ig-union merge. Same key redeposited carries identical
@@ -138,7 +155,7 @@ mod tests {
     fn entry(at: Hlc, by: &str, ig: &[&str]) -> DmInboxEntry {
         DmInboxEntry {
             sender_owner: [7u8; 16],
-            cidnotify_packet: vec![1, 2, 3],
+            cidnotify_packet: Some(vec![1, 2, 3]),
             storage_blob: vec![4, 5, 6],
             invite_packet: None,
             deposited_at: at,
@@ -317,5 +334,25 @@ mod tests {
         let bytes = canonical_cbor_encode(&d).expect("encode");
         let back: DmInboxDoc = canonical_cbor_decode(&bytes).expect("decode");
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn dm_inbox_entry_invite_only_cidnotify_none_round_trips() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+        // ZEB-505: a fleet-replicated invite-only deposit carries the bootstrap
+        // invite ALONE — `cidnotify_packet: None`, no storage blob — keyed by
+        // `invite_key`. None must survive the canonical-CBOR round-trip
+        // (skip_serializing_if omits `cn`; absent → None via default).
+        let mut e = entry(hlc(1, "A"), "dev-a", &["dev-1"]);
+        e.cidnotify_packet = None;
+        e.storage_blob = Vec::new();
+        e.invite_packet = Some(vec![0xAA, 0xBB, 0xCC]);
+        let mut d = DmInboxDoc::default();
+        let k = DmInboxDoc::invite_key(&[1u8; 16]);
+        d.entries.insert(k.clone(), e);
+        let bytes = canonical_cbor_encode(&d).expect("encode");
+        let back: DmInboxDoc = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(back, d);
+        assert_eq!(back.entries[&k].cidnotify_packet, None);
     }
 }

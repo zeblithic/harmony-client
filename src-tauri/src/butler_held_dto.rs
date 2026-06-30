@@ -71,7 +71,7 @@ mod tests {
     fn entry(sender_owner: u8, dev: &str, ingested: &[&str]) -> DmInboxEntry {
         DmInboxEntry {
             sender_owner: [sender_owner; 16],
-            cidnotify_packet: vec![1, 2, 3],
+            cidnotify_packet: Some(vec![1, 2, 3]),
             storage_blob: vec![4, 5, 6],
             invite_packet: None,
             deposited_at: Hlc {

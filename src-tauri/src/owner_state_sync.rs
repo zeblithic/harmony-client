@@ -1166,7 +1166,7 @@ mod subscriber_tests {
                 id: OutboxEntryId([7; 16]),
                 space_id: SpaceId([1; 16]),
                 recipient_owners: vec![OwnerAddr([2; 16])],
-                message_cid: ContentId::from_bytes([3; 32]),
+                message_cid: Some(ContentId::from_bytes([3; 32])),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,
@@ -1736,7 +1736,7 @@ mod integration_tests {
                 id: OutboxEntryId([42; 16]),
                 space_id: SpaceId([5; 16]),
                 recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-                message_cid: ContentId::from_bytes([7; 32]),
+                message_cid: Some(ContentId::from_bytes([7; 32])),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,
@@ -1790,7 +1790,7 @@ mod integration_tests {
                 id: OutboxEntryId([42; 16]),
                 space_id: SpaceId([5; 16]), // lagging — old loser id
                 recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-                message_cid: ContentId::from_bytes([7; 32]),
+                message_cid: Some(ContentId::from_bytes([7; 32])),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,
@@ -1992,7 +1992,7 @@ mod integration_tests {
                 id,
                 space_id: SpaceId([0x01; 16]),
                 recipient_owners: vec![OwnerAddr([0x02; 16])],
-                message_cid: ContentId::from_bytes([0x03; 32]),
+                message_cid: Some(ContentId::from_bytes([0x03; 32])),
                 created_at: entry_hlc.clone(),
                 delivered_to: Default::default(),
                 delivery_status: DeliveryStatus::Pending,
@@ -2110,7 +2110,7 @@ mod integration_tests {
             id,
             space_id: SpaceId([0x0a; 16]),
             recipient_owners: vec![OwnerAddr([0x0b; 16])],
-            message_cid: ContentId::from_bytes([0x0c; 32]),
+            message_cid: Some(ContentId::from_bytes([0x0c; 32])),
             created_at: entry_hlc.clone(),
             delivered_to: Default::default(),
             delivery_status: DeliveryStatus::Pending,

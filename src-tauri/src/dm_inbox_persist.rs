@@ -238,7 +238,7 @@ mod tests {
     fn sample_entry() -> DmInboxEntry {
         DmInboxEntry {
             sender_owner: [7u8; 16],
-            cidnotify_packet: vec![1, 2, 3],
+            cidnotify_packet: Some(vec![1, 2, 3]),
             storage_blob: vec![4, 5, 6],
             invite_packet: None,
             deposited_at: Hlc {

@@ -246,9 +246,16 @@ impl DmTransport for RuntimeUnicastTransport {
                 "no known devices for recipient {recipient:?}"
             )));
         }
+        // ZEB-505: this test-only transport builds a CidNotify, so it handles
+        // message entries only (invite-only entries have no `message_cid`).
+        let Some(message_cid) = entry.message_cid else {
+            return Err(TransportError::Transient(
+                "RuntimeUnicastTransport (test-only) does not handle invite-only entries".into(),
+            ));
+        };
         let signed = crate::dm_envelope::DmCidNotifySigned {
             space_id: entry.space_id,
-            message_cid: entry.message_cid,
+            message_cid,
             sender_owner_addr: self.self_owner,
             // `RuntimeUnicastTransport` is test-only (no production `::new`
             // call site — the Reticulum direct path it served was torn out in
@@ -864,7 +871,8 @@ impl DmOutbox {
             id: entry_id,
             space_id,
             recipient_owners: recipients,
-            message_cid,
+            // ZEB-505: a real message entry always carries a `message_cid`.
+            message_cid: Some(message_cid),
             created_at: sent_at.clone(),
             delivered_to: BTreeSet::new(),
             delivery_status: DeliveryStatus::Pending,
@@ -1010,14 +1018,20 @@ impl DmOutbox {
             .outbox
             .remove(&message_id)
             .expect("entry existed in get() above; no await between");
-        let inbox_key = crate::owner_state_types::InboxKey {
-            space_id: outbox_entry.space_id,
-            message_cid: outbox_entry.message_cid,
-        };
+        // ZEB-505: an invite-only entry (`None` message_cid) has no InboxEntry.
+        let inbox_key =
+            outbox_entry
+                .message_cid
+                .map(|message_cid| crate::owner_state_types::InboxKey {
+                    space_id: outbox_entry.space_id,
+                    message_cid,
+                });
         // Self-InboxEntry may legitimately be absent (e.g., a paired
         // device's CidNotify could have raced ahead and the InboxEntry
         // could have been GC'd). Either way, idempotent removal.
-        let _removed_inbox = state.delete_inbox_entry(inbox_key);
+        if let Some(key) = inbox_key {
+            let _removed_inbox = state.delete_inbox_entry(key);
+        }
 
         // ZEB-243: write a tombstone so paired-device sync cannot
         // resurrect this entry via apply_outbox. HLC is minted with the
@@ -1045,9 +1059,9 @@ impl DmOutbox {
 
         Ok(DeleteDmOutboxOutcome {
             deleted_outbox_id: Some(message_id),
-            deleted_inbox_key: Some(inbox_key),
+            deleted_inbox_key: inbox_key,
             space_id: Some(outbox_entry.space_id),
-            message_cid: Some(outbox_entry.message_cid),
+            message_cid: outbox_entry.message_cid,
         })
     }
 
@@ -1129,11 +1143,15 @@ impl DmOutbox {
                         match butler_outcome {
                             crate::butler_deposit::DepositRungOutcome::Acked => {
                                 if self.mark_ack_delivered(state, c.entry_id, c.recipient_owner) {
-                                    outcome.newly_delivered.push((
-                                        c.space_id,
-                                        c.message_cid,
-                                        c.recipient_owner,
-                                    ));
+                                    // ZEB-505: invite-only entries (no message_cid) ack
+                                    // but emit no `dm-delivered` (no message to surface).
+                                    if let Some(message_cid) = c.message_cid {
+                                        outcome.newly_delivered.push((
+                                            c.space_id,
+                                            message_cid,
+                                            c.recipient_owner,
+                                        ));
+                                    }
                                 }
                             }
                             crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
@@ -1157,11 +1175,14 @@ impl DmOutbox {
                             if relay.deposit(&c).await
                                 && self.mark_ack_delivered(state, c.entry_id, c.recipient_owner)
                             {
-                                outcome.newly_delivered.push((
-                                    c.space_id,
-                                    c.message_cid,
-                                    c.recipient_owner,
-                                ));
+                                // ZEB-505: invite-only entries emit no `dm-delivered`.
+                                if let Some(message_cid) = c.message_cid {
+                                    outcome.newly_delivered.push((
+                                        c.space_id,
+                                        message_cid,
+                                        c.recipient_owner,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1434,7 +1455,10 @@ impl DmOutbox {
                     .all(|r| entry.delivered_to.contains(*r));
                 if !all_acked {
                     entry.delivery_status = DeliveryStatus::Expired;
-                    expired.push((entry.space_id, entry.message_cid));
+                    // ZEB-505: invite-only entries emit no `dm-expired` (no message).
+                    if let Some(message_cid) = entry.message_cid {
+                        expired.push((entry.space_id, message_cid));
+                    }
                 }
             }
         }
@@ -1489,9 +1513,15 @@ impl DmOutbox {
         state: &OwnerState,
         entry: &OutboxEntry,
     ) -> Result<Vec<u8>, String> {
+        // ZEB-505: a CidNotify exists only for a message entry. An invite-only
+        // entry (`None` message_cid) is deposited as an invite alone — the
+        // caller (`push_deposit_candidate`) branches before reaching here.
+        let Some(message_cid) = entry.message_cid else {
+            return Err("build_cidnotify_packet_bytes called on an invite-only entry".into());
+        };
         let signed = crate::dm_envelope::DmCidNotifySigned {
             space_id: entry.space_id,
-            message_cid: entry.message_cid,
+            message_cid,
             sender_owner_addr: self.self_owner,
             sender_devices: resolve_sender_devices(
                 state,
@@ -1576,23 +1606,45 @@ impl DmOutbox {
                 return;
             }
         };
-        match self.build_cidnotify_packet_bytes(state, entry) {
-            Ok(cidnotify_packet) => out.push(crate::butler_deposit::ButlerDepositRequest {
-                entry_id,
-                recipient_owner: recipient,
-                space_id: entry.space_id,
-                message_cid: entry.message_cid,
-                cidnotify_packet,
-                invite_packet,
-                now_ms,
-            }),
-            Err(err) => tracing::warn!(
-                entry_id = ?entry_id,
-                recipient = ?recipient,
-                error = %err,
-                "ZEB-418: CidNotify build failed; skipping deposit candidate"
-            ),
-        }
+        // ZEB-505: branch on message vs invite-only entry.
+        let cidnotify_packet = match entry.message_cid {
+            // Message entry: deposit the CidNotify (alongside the invite). A
+            // CidNotify build failure skips the candidate (leave pending).
+            Some(_) => match self.build_cidnotify_packet_bytes(state, entry) {
+                Ok(packet) => Some(packet),
+                Err(err) => {
+                    tracing::warn!(
+                        entry_id = ?entry_id,
+                        recipient = ?recipient,
+                        error = %err,
+                        "ZEB-418: CidNotify build failed; skipping deposit candidate"
+                    );
+                    return;
+                }
+            },
+            // Invite-only entry: the invite IS the payload, so a missing
+            // rebuildable invite is fail-closed — there is nothing to deposit.
+            None => {
+                if invite_packet.is_none() {
+                    tracing::warn!(
+                        entry_id = ?entry_id,
+                        recipient = ?recipient,
+                        "ZEB-505: invite-only entry has no rebuildable invite; skipping deposit candidate (stays pending for retry)"
+                    );
+                    return;
+                }
+                None
+            }
+        };
+        out.push(crate::butler_deposit::ButlerDepositRequest {
+            entry_id,
+            recipient_owner: recipient,
+            space_id: entry.space_id,
+            message_cid: entry.message_cid,
+            cidnotify_packet,
+            invite_packet,
+            now_ms,
+        });
     }
 
     fn is_due(&self, entry_id: OutboxEntryId, recipient: OwnerAddr, wall_now_ms: u64) -> bool {
@@ -2068,7 +2120,9 @@ impl DmOutbox {
         let entry_id = state
             .outbox
             .iter()
-            .find(|(_, e)| e.space_id == signed.space_id && e.message_cid == signed.message_cid)
+            .find(|(_, e)| {
+                e.space_id == signed.space_id && e.message_cid == Some(signed.message_cid)
+            })
             .map(|(id, _)| *id)
             .ok_or(DmReceiveError::OutboxEntryNotFound)?;
 
@@ -2635,17 +2689,21 @@ pub async fn drain_lifted(
                             let mut s_g = state.lock().await;
                             o_g.mark_ack_delivered(&mut s_g, c.entry_id, c.recipient_owner)
                         };
+                        // ZEB-505: invite-only entries ack but emit no
+                        // `dm-delivered` (no message to surface).
                         if newly {
-                            let payload = serde_json::json!({
-                                "spaceId": hex::encode(c.space_id.0),
-                                "messageCid": hex::encode(c.message_cid.to_bytes()),
-                                "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
-                            });
-                            crate::node_event_sink::emit_ser(
-                                app.as_ref(),
-                                "dm-delivered",
-                                &payload,
-                            );
+                            if let Some(message_cid) = c.message_cid {
+                                let payload = serde_json::json!({
+                                    "spaceId": hex::encode(c.space_id.0),
+                                    "messageCid": hex::encode(message_cid.to_bytes()),
+                                    "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
+                                });
+                                crate::node_event_sink::emit_ser(
+                                    app.as_ref(),
+                                    "dm-delivered",
+                                    &payload,
+                                );
+                            }
                         }
                     }
                     crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {}
@@ -2672,17 +2730,21 @@ pub async fn drain_lifted(
                             let mut s_g = state.lock().await;
                             o_g.mark_ack_delivered(&mut s_g, c.entry_id, c.recipient_owner)
                         };
+                        // ZEB-505: invite-only entries ack but emit no
+                        // `dm-delivered` (no message to surface).
                         if newly {
-                            let payload = serde_json::json!({
-                                "spaceId": hex::encode(c.space_id.0),
-                                "messageCid": hex::encode(c.message_cid.to_bytes()),
-                                "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
-                            });
-                            crate::node_event_sink::emit_ser(
-                                app.as_ref(),
-                                "dm-delivered",
-                                &payload,
-                            );
+                            if let Some(message_cid) = c.message_cid {
+                                let payload = serde_json::json!({
+                                    "spaceId": hex::encode(c.space_id.0),
+                                    "messageCid": hex::encode(message_cid.to_bytes()),
+                                    "recipientOwnerAddr": hex::encode(c.recipient_owner.0),
+                                });
+                                crate::node_event_sink::emit_ser(
+                                    app.as_ref(),
+                                    "dm-delivered",
+                                    &payload,
+                                );
+                            }
                         }
                     }
                 }
@@ -3221,7 +3283,7 @@ mod tests {
             id: OutboxEntryId([id; 16]),
             space_id: SpaceId([1u8; 16]),
             recipient_owners: vec![OwnerAddr([2u8; 16])],
-            message_cid: ContentId::from_bytes([3u8; 32]),
+            message_cid: Some(ContentId::from_bytes([3u8; 32])),
             created_at: Hlc {
                 wall_ms: 0,
                 logical: 0,
@@ -3554,7 +3616,7 @@ mod tests {
             id: OutboxEntryId([id; 16]),
             space_id: SpaceId([1u8; 16]),
             recipient_owners: recipients,
-            message_cid: ContentId::from_bytes([3u8; 32]),
+            message_cid: Some(ContentId::from_bytes([3u8; 32])),
             created_at: Hlc {
                 wall_ms: 0,
                 logical: 0,
@@ -3701,7 +3763,7 @@ mod tests {
             id: OutboxEntryId([id; 16]),
             space_id: SpaceId([1u8; 16]),
             recipient_owners: recipients,
-            message_cid: ContentId::from_bytes([3u8; 32]),
+            message_cid: Some(ContentId::from_bytes([3u8; 32])),
             created_at: Hlc {
                 wall_ms: created_wall_ms,
                 logical: 0,
@@ -4072,13 +4134,17 @@ mod tests {
         assert_eq!(req.entry_id, entry_id);
         assert_eq!(req.recipient_owner, bob);
         assert_eq!(req.space_id, space_id);
-        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(req.message_cid, Some(message_cid));
         assert_eq!(req.now_ms, 15_000);
 
         // The packet rides the SAME construction the direct path sends:
         // a signed CidNotify for this entry from this device.
-        let packet = crate::dm_envelope::decode_packet(&req.cidnotify_packet)
-            .expect("deposit request must carry a decodable DM packet");
+        let packet = crate::dm_envelope::decode_packet(
+            req.cidnotify_packet
+                .as_deref()
+                .expect("deposit message entry has cidnotify_packet"),
+        )
+        .expect("deposit request must carry a decodable DM packet");
         match packet {
             crate::dm_envelope::DmPacket::CidNotify { signed, .. } => {
                 assert_eq!(signed.space_id, space_id);
@@ -4476,7 +4542,7 @@ mod tests {
         assert_eq!(req.entry_id, entry_id);
         assert_eq!(req.recipient_owner, bob);
         assert_eq!(req.space_id, space_id);
-        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(req.message_cid, Some(message_cid));
         assert_eq!(
             req.now_ms, 27_000,
             "freshness clock = this tick's backoff clock (same as Err arm)"
@@ -4658,7 +4724,7 @@ mod tests {
         // Every candidate carries the shared fan-out identity.
         for c in &candidates {
             assert_eq!(c.entry_id, entry_id, "candidate bound to the fan-out entry");
-            assert_eq!(c.message_cid, ContentId::from_bytes([3u8; 32]));
+            assert_eq!(c.message_cid, Some(ContentId::from_bytes([3u8; 32])));
         }
 
         // ---- Assertion 2: entry stays Partial. ----
@@ -5059,7 +5125,7 @@ mod tests {
         let entry = entry_with_age(7, vec![bob], 1_000);
         let entry_id = entry.id;
         let entry_space_id = entry.space_id;
-        let entry_message_cid = entry.message_cid;
+        let entry_message_cid = entry.message_cid.expect("message entry has message_cid");
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
@@ -5294,7 +5360,7 @@ mod tests {
             id: OutboxEntryId([0xab; 16]),
             space_id: SpaceId([0xcc; 16]),
             recipient_owners: vec![recipient],
-            message_cid: ContentId::from_bytes([0xee; 32]),
+            message_cid: Some(ContentId::from_bytes([0xee; 32])),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
@@ -5389,7 +5455,7 @@ mod tests {
             id: OutboxEntryId([0xab; 16]),
             space_id: SpaceId([0xcc; 16]),
             recipient_owners: vec![OwnerAddr([1; 16])],
-            message_cid: ContentId::from_bytes([0xee; 32]),
+            message_cid: Some(ContentId::from_bytes([0xee; 32])),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
@@ -5498,7 +5564,7 @@ mod tests {
             id: OutboxEntryId([0xab; 16]),
             space_id: SpaceId([0xcc; 16]),
             recipient_owners: vec![OwnerAddr([1; 16])],
-            message_cid: ContentId::from_bytes([0xee; 32]),
+            message_cid: Some(ContentId::from_bytes([0xee; 32])),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
@@ -6779,7 +6845,7 @@ mod tests {
             id: entry_id,
             space_id,
             recipient_owners: vec![bob],
-            message_cid,
+            message_cid: Some(message_cid),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
@@ -7273,7 +7339,8 @@ mod tests {
             .outbox
             .get(&msg_id)
             .expect("outbox entry exists")
-            .message_cid;
+            .message_cid
+            .expect("message entry has message_cid");
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
@@ -7384,7 +7451,12 @@ mod tests {
             assert!(matches!(entry.delivery_status, DeliveryStatus::Complete));
         }
         // Pre-condition: self-InboxEntry exists.
-        let message_cid = state.outbox.get(&msg_id).unwrap().message_cid;
+        let message_cid = state
+            .outbox
+            .get(&msg_id)
+            .unwrap()
+            .message_cid
+            .expect("message entry has message_cid");
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
@@ -8756,7 +8828,7 @@ mod tests {
             id: OutboxEntryId([1u8; 16]),
             space_id: SpaceId([7u8; 16]),
             recipient_owners: vec![],
-            message_cid: ContentId::from_bytes([9u8; 32]),
+            message_cid: Some(ContentId::from_bytes([9u8; 32])),
             created_at: Hlc {
                 wall_ms: 0,
                 logical: 0,
@@ -8827,7 +8899,7 @@ mod tests {
         assert_eq!(req.entry_id, entry_id);
         assert_eq!(req.recipient_owner, bob);
         assert_eq!(req.space_id, space_id);
-        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(req.message_cid, Some(message_cid));
         assert_eq!(
             outcome2.newly_delivered,
             vec![(space_id, message_cid, bob)],

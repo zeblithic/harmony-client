@@ -1055,7 +1055,7 @@ mod tests {
         let storage_blob = b"dm-storage-blob-opaque-to-relay".to_vec();
         let cidnotify_bytes = b"fake-cidnotify-packet".to_vec();
         let payload = DepositPayload {
-            cidnotify_packet: cidnotify_bytes,
+            cidnotify_packet: Some(cidnotify_bytes),
             storage_blob,
             invite_packet: None,
         };

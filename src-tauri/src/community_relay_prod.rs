@@ -388,9 +388,58 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
         self.device_x25519_privs.clone()
     }
 
-    async fn ingest_recovered(&self, payload: DepositPayload) -> Result<(), String> {
+    async fn ingest_recovered(
+        &self,
+        sender_owner: [u8; 16],
+        payload: DepositPayload,
+    ) -> Result<(), String> {
+        // ZEB-505: an invite-only recovered deposit (no CidNotify) bootstraps
+        // the DM Space from the invite ALONE — no blob, no message, no emit.
+        // The inviter is bound to the AUTHENTICATED relay `sender_owner` (the
+        // relay verified the deposit frame's signature over it) — NOT the
+        // payload-controlled `signed.inviter`. `apply_invite`'s signature check
+        // authenticates only the signing DEVICE, so without an authenticated
+        // `expected_inviter` an admitted co-member could recover a blob
+        // attributing the Space to a different owner (Qodo: the relay pull path
+        // carries `RelayHeldBlob.sender_owner`; bind to it, mirroring the butler
+        // acceptor's `frame.sender_owner` bind).
+        let Some(cidnotify_bytes) = payload.cidnotify_packet.as_deref() else {
+            let invite = payload
+                .invite_packet
+                .as_deref()
+                .ok_or("ZEB-505: invite-only deposit missing invite_packet")?;
+            let inv_packet = crate::dm_envelope::decode_packet(invite)
+                .map_err(|e| format!("decode invite: {e}"))?;
+            let crate::dm_envelope::DmPacket::Invite {
+                signed,
+                signature,
+                signed_bytes,
+            } = inv_packet
+            else {
+                return Err("ZEB-505: invite-only deposit packet is not an Invite".into());
+            };
+            if signed.inviter.0 != sender_owner {
+                return Err(
+                    "ZEB-505: invite inviter does not match authenticated relay sender".into(),
+                );
+            }
+            let mut state = self.crdt_state.lock().await;
+            crate::dm_outbox::apply_invite(
+                &mut state,
+                self.self_owner,
+                &self.device_id,
+                signed,
+                signature,
+                &signed_bytes,
+                now_epoch_ms(),
+                Some(crate::owner_state_types::OwnerAddr(sender_owner)),
+                false,
+            )
+            .map_err(|e| format!("apply_invite: {e:?}"))?;
+            return Ok(());
+        };
         // 1. Decode the recovered packet — must be a signed CidNotify.
-        let packet = crate::dm_envelope::decode_packet(&payload.cidnotify_packet)
+        let packet = crate::dm_envelope::decode_packet(cidnotify_bytes)
             .map_err(|e| format!("decode_packet: {e}"))?;
         let crate::dm_envelope::DmPacket::CidNotify {
             signed,
@@ -825,9 +874,14 @@ impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayD
 
         // 3. Fetch the storage blob (only after a target + a shared community
         //    are confirmed — no CAS work for a no-op rung). Miss/err → false.
-        let storage_blob = match self.cas.get(&req.message_cid).await {
-            Ok(Some(blob)) => blob,
-            Ok(None) | Err(_) => return false,
+        //    ZEB-505: an invite-only deposit (no message_cid) carries the invite
+        //    alone — there is no blob to fetch.
+        let storage_blob = match req.message_cid {
+            Some(message_cid) => match self.cas.get(&message_cid).await {
+                Ok(Some(blob)) => blob,
+                Ok(None) | Err(_) => return false,
+            },
+            None => Vec::new(),
         };
         let payload = DepositPayload {
             cidnotify_packet: req.cidnotify_packet.clone(),
@@ -1706,8 +1760,8 @@ mod tests {
             entry_id: OutboxEntryId([0x77; 16]),
             recipient_owner: OwnerAddr(recipient),
             space_id: SpaceId([0xDD; 16]),
-            message_cid: cid,
-            cidnotify_packet: vec![0x01, 0x02, 0x03],
+            message_cid: Some(cid),
+            cidnotify_packet: Some(vec![0x01, 0x02, 0x03]),
             invite_packet: None,
             now_ms: TEST_NOW,
         }
@@ -2530,6 +2584,15 @@ mod tests {
             payload.invite_packet = Some(invite_wire);
             payload
         }
+
+        /// A clone of the payload as a ZEB-505 invite-only deposit: the CidNotify
+        /// and storage blob are stripped, leaving only Alice's bootstrap invite.
+        fn invite_only_payload(&self) -> DepositPayload {
+            let mut p = self.payload.clone();
+            p.cidnotify_packet = None;
+            p.storage_blob = Vec::new();
+            p
+        }
     }
 
     fn relay_ingest_fixture_without_space_with_invite(
@@ -2650,7 +2713,7 @@ mod tests {
             .unwrap();
 
         let payload = DepositPayload {
-            cidnotify_packet,
+            cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
         };
@@ -2720,7 +2783,8 @@ mod tests {
         }
 
         fx.prod_ctx
-            .ingest_recovered(fx.payload.clone())
+            // alice ([0xA1;16]) is the relay-authenticated sender.
+            .ingest_recovered([0xA1; 16], fx.payload.clone())
             .await
             .expect("invite bootstraps space, notify admits, blob delivers");
 
@@ -2743,7 +2807,9 @@ mod tests {
         let payload = fx.payload_with_mismatched_inviter();
         let err = fx
             .prod_ctx
-            .ingest_recovered(payload)
+            // alice ([0xA1;16]) is the relay-authenticated sender; the message
+            // branch is unchanged, so this still rejects via the CidNotify bind.
+            .ingest_recovered([0xA1; 16], payload)
             .await
             .expect_err("mismatched inviter must fail-closed");
         // Pinned to the verified CidNotify signer → rejects at the signer-binding
@@ -2776,7 +2842,7 @@ mod tests {
 
         let err = fx
             .prod_ctx
-            .ingest_recovered(fx.payload.clone())
+            .ingest_recovered(alice.0, fx.payload.clone())
             .await
             .expect_err("uncached sender must fail-closed (no trust bootstrap)");
         assert!(
@@ -2797,5 +2863,54 @@ mod tests {
         );
         drop(st);
         assert_eq!(fx.emitted_dm_received(), 0, "no delivery on reject");
+    }
+
+    /// ZEB-505 / Qodo (Security, High): an invite-only recovered deposit binds
+    /// the invite's `expected_inviter` to the RELAY-AUTHENTICATED `sender_owner`,
+    /// NOT the payload's own `signed.inviter`. A blob recovered under the wrong
+    /// authenticated sender must fail-closed; the matching sender bootstraps the
+    /// Space from the invite alone.
+    #[tokio::test]
+    async fn ingest_recovered_invite_only_binds_to_authenticated_sender() {
+        let alice = [0xA1u8; 16];
+        let wrong = [0x99u8; 16];
+
+        // (a) Wrong authenticated sender → reject at the sender bind; no Space.
+        let fx = relay_ingest_fixture_without_space_with_invite(true);
+        let err = fx
+            .prod_ctx
+            .ingest_recovered(wrong, fx.invite_only_payload())
+            .await
+            .expect_err("invite-only deposit under a mismatched sender must fail-closed");
+        assert!(
+            err.contains("authenticated relay sender"),
+            "must reject at the sender bind, got {err}"
+        );
+        {
+            let st = fx.crdt_state.lock().await;
+            assert!(
+                !st.spaces.contains_key(&fx.space_id),
+                "no Space bootstrapped under the wrong sender"
+            );
+        }
+
+        // (b) Correct authenticated sender (alice) → Space bootstrapped from the
+        //     invite ALONE; no message, so no dm-received emit.
+        let fx2 = relay_ingest_fixture_without_space_with_invite(true);
+        fx2.prod_ctx
+            .ingest_recovered(alice, fx2.invite_only_payload())
+            .await
+            .expect("invite-only deposit under the authenticated sender bootstraps the Space");
+        let st = fx2.crdt_state.lock().await;
+        assert!(
+            st.spaces.contains_key(&fx2.space_id),
+            "Space bootstrapped from the invite-only deposit"
+        );
+        drop(st);
+        assert_eq!(
+            fx2.emitted_dm_received(),
+            0,
+            "invite-only recover delivers no message"
+        );
     }
 }

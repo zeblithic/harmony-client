@@ -10947,7 +10947,9 @@ async fn decrypt_inbox_entries(
         // 'delivered'). One linear scan over the snapshot serves both.
         let (delivery_state, message_id) = if is_self_outbound {
             let hit = outbox_snapshot.iter().find_map(|(id, e)| {
-                if e.space_id == entry.space_id && e.message_cid == entry.message_cid {
+                // ZEB-505: a self-outbound message correlates to its message
+                // entry; invite-only entries (None message_cid) never match.
+                if e.space_id == entry.space_id && e.message_cid == Some(entry.message_cid) {
                     Some((*id, e.delivery_status))
                 } else {
                     None
@@ -11379,12 +11381,42 @@ pub fn add_space_dm_inner(
         content_key,
         sender_devices,
         signing_device_hash: our_signing_device_hash,
-        created_at: creation_hlc,
+        created_at: creation_hlc.clone(),
     };
     let invite_packet = crate::dm_envelope::build_signed_invite(signed_invite, signing_key)
         .map_err(|e| format!("build_signed_invite: {e}"))?;
     let invite_wire = crate::dm_envelope::encode_packet(&invite_packet)
         .map_err(|e| format!("encode_packet: {e}"))?;
+
+    // ── 7b. ZEB-505: mint a DURABLE invite-only OutboxEntry so the bootstrap
+    //       invite is RETRIED + DEPOSITED independently of any message. The
+    //       fan-out returned below is a best-effort live tunnel attempt; if
+    //       every recipient device is offline/cold and no message ever follows,
+    //       that attempt is lost and the recipient never learns the Space. This
+    //       entry (`message_cid: None`) makes the outbox drain re-send the
+    //       invite alone and the butler/community-relay deposit rung carry
+    //       durability — exactly like a message entry. There is intentionally NO
+    //       dedup against a later message: the first message's deposit also
+    //       piggybacks the invite, but `apply_invite` is idempotent (dedups by
+    //       Space on the recipient), so the invite-only entry and any message
+    //       entry resolve + GC independently. A Rejected outcome is logged but
+    //       does not fail Space creation — the live fan-out still fires.
+    let invite_entry = crate::owner_state_types::OutboxEntry {
+        id: crate::owner_state_types::OutboxEntryId(ulid::Ulid::new().to_bytes()),
+        space_id: canonical_space_id,
+        recipient_owners: recipients.clone(),
+        message_cid: None,
+        created_at: creation_hlc,
+        delivered_to: std::collections::BTreeSet::new(),
+        delivery_status: crate::owner_state_types::DeliveryStatus::Pending,
+    };
+    if let ApplyOutcome::Rejected(reason) = state.apply_outbox(invite_entry) {
+        tracing::warn!(
+            ?reason,
+            space = ?canonical_space_id,
+            "ZEB-505: durable invite-only outbox entry rejected; relying on live fan-out only"
+        );
+    }
 
     // ── 8. ZEB-482: return the invite fan-out (the signed wire bytes +
     //       the recipient owners) for the caller to route over the iroh

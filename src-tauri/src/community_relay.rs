@@ -615,7 +615,7 @@ mod tests {
 
     fn fixture_payload() -> DepositPayload {
         DepositPayload {
-            cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
+            cidnotify_packet: Some(vec![0x01, 0x02, 0x03, 0x04]),
             storage_blob: vec![0x05, 0x06, 0x07, 0x08, 0x09],
             invite_packet: None,
         }

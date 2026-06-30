@@ -128,7 +128,7 @@ impl DmOutholdCtx for ProdDmOutholdCtx {
         state
             .outbox
             .values()
-            .find(|e| e.space_id.0 == *space_id && &e.message_cid == message_cid)
+            .find(|e| e.space_id.0 == *space_id && e.message_cid.as_ref() == Some(message_cid))
             .map(|e| e.delivery_status)
     }
 }

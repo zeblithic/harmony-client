@@ -27,7 +27,7 @@ use harmony_app::add_space_dm_inner;
 use harmony_app::dm_envelope::{decode_packet, DmPacket};
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{
-    DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry, SpaceKind,
+    DeliveryStatus, DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry, SpaceKind,
 };
 
 /// Build a complete identity for a participant in the test:
@@ -164,6 +164,70 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
         }
         _ => panic!("expected DmPacket::Invite"),
     }
+}
+
+#[tokio::test]
+async fn add_space_dm_mints_durable_invite_only_outbox_entry() {
+    // ZEB-505: creating a DM (even with zero messages) must mint a DURABLE
+    // invite-only OutboxEntry (`message_cid: None`) so the bootstrap invite is
+    // retried + deposited independently of any message — the live fan-out is
+    // best-effort only and is lost if every recipient device is cold.
+    let (alice_owner, alice_device, alice_identity_pub, alice_signing_key) = make_party(0xa1);
+    let (bob_owner, bob_device, bob_identity_pub, _bob_signing_key) = make_party(0xb2);
+
+    let mut state = OwnerState::default();
+    cache_party(
+        &mut state,
+        alice_owner,
+        alice_device,
+        alice_identity_pub,
+        100,
+        "alice",
+    );
+    cache_party(
+        &mut state,
+        bob_owner,
+        bob_device,
+        bob_identity_pub,
+        100,
+        "alice",
+    );
+
+    let (space_id, fanout) = add_space_dm_inner(
+        &mut state,
+        &alice_signing_key,
+        &alice_identity_pub,
+        alice_owner,
+        alice_device,
+        "alice-device",
+        SpaceKind::Dm,
+        "DM with Bob".into(),
+        vec![bob_owner],
+        500,
+        None,
+    )
+    .expect("add_space_dm_inner must succeed");
+    assert!(fanout.is_some(), "fresh create returns Some(fanout)");
+
+    // Exactly one outbox entry, and it is the invite-only one: no message has
+    // been sent, so there is no message entry yet.
+    assert_eq!(
+        state.outbox.len(),
+        1,
+        "one durable invite-only entry minted on DM create"
+    );
+    let entry = state.outbox.values().next().expect("the minted entry");
+    assert_eq!(
+        entry.message_cid, None,
+        "invite-only entry carries no message_cid"
+    );
+    assert_eq!(entry.space_id, space_id, "entry bound to the new DM Space");
+    assert_eq!(entry.recipient_owners, vec![bob_owner], "recipient = Bob");
+    assert!(entry.delivered_to.is_empty(), "not yet delivered");
+    assert!(
+        matches!(entry.delivery_status, DeliveryStatus::Pending),
+        "a fresh invite-only entry is Pending"
+    );
 }
 
 #[tokio::test]
