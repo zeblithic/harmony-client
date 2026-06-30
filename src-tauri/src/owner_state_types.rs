@@ -2592,7 +2592,7 @@ mod outbox_tests {
             id: OutboxEntryId([1u8; 16]),
             space_id: SpaceId([2u8; 16]),
             recipient_owners: recipients.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
-            message_cid: ContentId::from_bytes([3u8; 32]),
+            message_cid: Some(ContentId::from_bytes([3u8; 32])),
             created_at: hlc(100),
             delivered_to: delivered.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             delivery_status: DeliveryStatus::Pending,

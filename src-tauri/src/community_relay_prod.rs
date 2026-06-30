@@ -1747,8 +1747,8 @@ mod tests {
             entry_id: OutboxEntryId([0x77; 16]),
             recipient_owner: OwnerAddr(recipient),
             space_id: SpaceId([0xDD; 16]),
-            message_cid: cid,
-            cidnotify_packet: vec![0x01, 0x02, 0x03],
+            message_cid: Some(cid),
+            cidnotify_packet: Some(vec![0x01, 0x02, 0x03]),
             invite_packet: None,
             now_ms: TEST_NOW,
         }
@@ -2691,7 +2691,7 @@ mod tests {
             .unwrap();
 
         let payload = DepositPayload {
-            cidnotify_packet,
+            cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
         };

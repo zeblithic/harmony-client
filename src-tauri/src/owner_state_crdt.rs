@@ -1978,7 +1978,7 @@ mod apply_outbox_tests {
             id: OutboxEntryId([id; 16]),
             space_id: SpaceId([1; 16]),
             recipient_owners: recipients.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
-            message_cid: ContentId::from_bytes([2; 32]),
+            message_cid: Some(ContentId::from_bytes([2; 32])),
             created_at: hlc(100),
             delivered_to: delivered.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             delivery_status: DeliveryStatus::Pending,
@@ -2191,7 +2191,7 @@ mod apply_outbox_tests {
         let mut s = OwnerState::default();
         s.apply_outbox(entry(1, vec![10, 20], vec![10]));
         let mut diverged = entry(1, vec![10, 20], vec![20]);
-        diverged.message_cid = ContentId::from_bytes([99; 32]);
+        diverged.message_cid = Some(ContentId::from_bytes([99; 32]));
         let outcome = s.apply_outbox(diverged);
         assert!(matches!(
             outcome,
@@ -2606,7 +2606,7 @@ mod canonicalization_tests {
             id: OutboxEntryId([100; 16]),
             space_id: SpaceId([5; 16]),
             recipient_owners: vec![OwnerAddr([2; 16])],
-            message_cid: ContentId::from_bytes([1; 32]),
+            message_cid: Some(ContentId::from_bytes([1; 32])),
             created_at: hlc(100),
             delivered_to: Default::default(),
             delivery_status: DeliveryStatus::Pending,
@@ -2661,7 +2661,7 @@ mod canonicalization_tests {
             id: OutboxEntryId([99; 16]),
             space_id: SpaceId([1; 16]),
             recipient_owners: vec![OwnerAddr([2; 16])],
-            message_cid: ContentId::from_bytes([1; 32]),
+            message_cid: Some(ContentId::from_bytes([1; 32])),
             created_at: hlc(100),
             delivered_to: Default::default(),
             delivery_status: DeliveryStatus::Pending,
@@ -2690,7 +2690,7 @@ mod canonicalization_tests {
             id: OutboxEntryId([42; 16]),
             space_id: SpaceId([5; 16]),
             recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-            message_cid: ContentId::from_bytes([7; 32]),
+            message_cid: Some(ContentId::from_bytes([7; 32])),
             created_at: hlc(100),
             delivered_to: [OwnerAddr([1; 16])].into_iter().collect(),
             delivery_status: DeliveryStatus::Partial,
@@ -2713,7 +2713,7 @@ mod canonicalization_tests {
             id: OutboxEntryId([42; 16]),
             space_id: SpaceId([5; 16]), // peer is still on the old loser id
             recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-            message_cid: ContentId::from_bytes([7; 32]),
+            message_cid: Some(ContentId::from_bytes([7; 32])),
             created_at: hlc(100),
             delivered_to: [OwnerAddr([2; 16])].into_iter().collect(),
             delivery_status: DeliveryStatus::Partial,
@@ -2941,7 +2941,7 @@ mod crypto_integration_tests {
             id: OutboxEntryId([7; 16]),
             space_id: SpaceId([8; 16]),
             recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-            message_cid: ContentId::from_bytes([3; 32]),
+            message_cid: Some(ContentId::from_bytes([3; 32])),
             created_at: hlc(100),
             delivered_to: [OwnerAddr([1; 16])].into_iter().collect(),
             delivery_status: DeliveryStatus::Partial,

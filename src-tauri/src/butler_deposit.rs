@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn deposit_payload_round_trips() {
         let payload = DepositPayload {
-            cidnotify_packet: vec![0x01, 0x02, 0x03],
+            cidnotify_packet: Some(vec![0x01, 0x02, 0x03]),
             storage_blob: vec![0x04, 0x05, 0x06, 0x07],
             invite_packet: None,
         };
@@ -773,7 +773,7 @@ mod tests {
     fn deposit_payload_round_trips_invite_packet_and_decodes_legacy_as_none() {
         // (a) Some(invite) round-trips.
         let with_invite = DepositPayload {
-            cidnotify_packet: vec![1, 2, 3],
+            cidnotify_packet: Some(vec![1, 2, 3]),
             storage_blob: vec![4, 5, 6],
             invite_packet: Some(vec![7, 8, 9]),
         };
@@ -782,7 +782,7 @@ mod tests {
 
         // (b) None round-trips and (skip_serializing_if) omits the key.
         let without = DepositPayload {
-            cidnotify_packet: vec![1],
+            cidnotify_packet: Some(vec![1]),
             storage_blob: vec![2],
             invite_packet: None,
         };
@@ -812,7 +812,7 @@ mod tests {
         ciborium::into_writer(&legacy, &mut legacy_bytes).expect("legacy encode");
         let decoded = decode_deposit_payload(&legacy_bytes).expect("legacy decode");
         assert_eq!(decoded.invite_packet, None);
-        assert_eq!(decoded.cidnotify_packet, vec![1]);
+        assert_eq!(decoded.cidnotify_packet, Some(vec![1]));
     }
 
     /// The sealed envelope round-trips under the butler info string, and is

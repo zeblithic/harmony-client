@@ -518,7 +518,15 @@ impl ButlerDepositClient for InProcessButlerClient {
             .expect("client poisoned")
             .push(req.clone());
         // Blob from the sender device's CAS (IrohButlerDepositClient step 2).
-        let storage_blob = match self.cas.get(&req.message_cid).await {
+        let storage_blob = match self
+            .cas
+            .get(
+                req.message_cid
+                    .as_ref()
+                    .expect("message deposit has message_cid"),
+            )
+            .await
+        {
             Ok(Some(blob)) => blob,
             Ok(None) => {
                 return DepositRungOutcome::Failed("storage blob missing from CAS".to_string())
@@ -549,7 +557,13 @@ impl ButlerDepositClient for InProcessButlerClient {
                 // Never mark delivered off a mismatched ack
                 // (deposit_to_entry's check, verbatim semantics).
                 if ack.space_id != req.space_id.0
-                    || ack.message_cid != req.message_cid.to_bytes().to_vec()
+                    || ack.message_cid
+                        != req
+                            .message_cid
+                            .as_ref()
+                            .expect("message deposit has message_cid")
+                            .to_bytes()
+                            .to_vec()
                 {
                     return DepositRungOutcome::Failed("ack space/cid mismatch".to_string());
                 }
@@ -844,7 +858,8 @@ async fn sibling_completes_delivery_via_butler_after_originator_stops() {
     assert_eq!(requests[0].recipient_owner, owner_b_addr);
     assert_eq!(requests[0].space_id, space_id);
     assert_eq!(
-        requests[0].message_cid, message_cid,
+        requests[0].message_cid,
+        Some(message_cid),
         "deposit request carries the held message's CID"
     );
 

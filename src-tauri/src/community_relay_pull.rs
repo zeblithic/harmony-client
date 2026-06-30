@@ -212,7 +212,7 @@ mod tests {
 
     fn dummy_payload(tag: u8) -> DepositPayload {
         DepositPayload {
-            cidnotify_packet: vec![tag; 4],
+            cidnotify_packet: Some(vec![tag; 4]),
             storage_blob: vec![tag + 1; 5],
             invite_packet: None,
         }

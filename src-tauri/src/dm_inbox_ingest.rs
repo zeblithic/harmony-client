@@ -939,7 +939,7 @@ mod tests {
         packet.extend_from_slice(&cid);
         let entry = DmInboxEntry {
             sender_owner: SENDER_OWNER,
-            cidnotify_packet: packet,
+            cidnotify_packet: Some(packet),
             storage_blob: format!("blob-{}", hex::encode(&cid[..4])).into_bytes(),
             invite_packet: None,
             deposited_at: hlc(deposited_ms),
@@ -2505,7 +2505,7 @@ mod tests {
 
         let entry = DmInboxEntry {
             sender_owner: alice.0,
-            cidnotify_packet,
+            cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
             deposited_at: Hlc {

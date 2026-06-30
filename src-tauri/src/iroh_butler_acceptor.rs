@@ -1043,7 +1043,7 @@ mod tests {
         let (cidnotify_packet, identity_pub, dm_device_hash) =
             build_cidnotify(so.owner, space_id, message_cid);
         let payload = DepositPayload {
-            cidnotify_packet: cidnotify_packet.clone(),
+            cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet: None,
         };
@@ -1088,7 +1088,7 @@ mod tests {
         let (cidnotify_packet, identity_pub, dm_device_hash) =
             build_cidnotify(so.owner, space_id, message_cid);
         let payload = DepositPayload {
-            cidnotify_packet: cidnotify_packet.clone(),
+            cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet,
         };
@@ -1276,7 +1276,7 @@ mod tests {
     fn filler_entry(sender_owner: [u8; 16]) -> DmInboxEntry {
         DmInboxEntry {
             sender_owner,
-            cidnotify_packet: Vec::new(),
+            cidnotify_packet: Some(Vec::new()),
             storage_blob: Vec::new(),
             invite_packet: None,
             deposited_at: Hlc {
@@ -1306,7 +1306,8 @@ mod tests {
             "invite carried through verbatim"
         );
         assert_eq!(
-            entry.cidnotify_packet, f.cidnotify_packet,
+            entry.cidnotify_packet,
+            Some(f.cidnotify_packet),
             "CidNotify validation/persist unchanged"
         );
     }
@@ -1345,7 +1346,7 @@ mod tests {
             let store = ctx.store.lock().unwrap();
             let entry = store.get(&key).expect("entry persisted under inbox key");
             assert_eq!(entry.sender_owner, f.sender_owner);
-            assert_eq!(entry.cidnotify_packet, f.cidnotify_packet);
+            assert_eq!(entry.cidnotify_packet, Some(f.cidnotify_packet.clone()));
             assert_eq!(entry.storage_blob, f.storage_blob);
             assert_eq!(entry.deposited_by, ctx.device_id());
             assert!(entry.ingested_by.is_empty());
@@ -1513,7 +1514,7 @@ mod tests {
         let f = valid_fixture();
         let so = sender();
         let payload = DepositPayload {
-            cidnotify_packet: f.cidnotify_packet.clone(),
+            cidnotify_packet: Some(f.cidnotify_packet.clone()),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
         };
@@ -1541,7 +1542,7 @@ mod tests {
         let key = DmInboxDoc::key(&f.space_id.0, &f.message_cid.to_bytes());
         let store = ctx.store.lock().unwrap();
         let entry = store.get(&key).expect("entry persisted");
-        assert_eq!(entry.cidnotify_packet, f.cidnotify_packet);
+        assert_eq!(entry.cidnotify_packet, Some(f.cidnotify_packet));
         assert_eq!(entry.storage_blob, f.storage_blob);
     }
 
@@ -1880,7 +1881,7 @@ mod tests {
         let last = tampered_packet.len() - 1;
         tampered_packet[last] ^= 0xFF;
         let frame = reframe(&DepositPayload {
-            cidnotify_packet: tampered_packet,
+            cidnotify_packet: Some(tampered_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
         });
@@ -1902,7 +1903,7 @@ mod tests {
         let (mismatch_packet, _, _) =
             build_cidnotify(OwnerAddr(f.sender_owner), f.space_id, other_cid);
         let frame = reframe(&DepositPayload {
-            cidnotify_packet: mismatch_packet,
+            cidnotify_packet: Some(mismatch_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
         });
@@ -1926,7 +1927,7 @@ mod tests {
         let (foreign_packet, _, _) =
             build_cidnotify(OwnerAddr([0xEE; 16]), f.space_id, f.message_cid);
         let frame = reframe(&DepositPayload {
-            cidnotify_packet: foreign_packet,
+            cidnotify_packet: Some(foreign_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
         });

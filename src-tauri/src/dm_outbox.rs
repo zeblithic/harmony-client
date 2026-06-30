@@ -3283,7 +3283,7 @@ mod tests {
             id: OutboxEntryId([id; 16]),
             space_id: SpaceId([1u8; 16]),
             recipient_owners: vec![OwnerAddr([2u8; 16])],
-            message_cid: ContentId::from_bytes([3u8; 32]),
+            message_cid: Some(ContentId::from_bytes([3u8; 32])),
             created_at: Hlc {
                 wall_ms: 0,
                 logical: 0,
@@ -3616,7 +3616,7 @@ mod tests {
             id: OutboxEntryId([id; 16]),
             space_id: SpaceId([1u8; 16]),
             recipient_owners: recipients,
-            message_cid: ContentId::from_bytes([3u8; 32]),
+            message_cid: Some(ContentId::from_bytes([3u8; 32])),
             created_at: Hlc {
                 wall_ms: 0,
                 logical: 0,
@@ -3763,7 +3763,7 @@ mod tests {
             id: OutboxEntryId([id; 16]),
             space_id: SpaceId([1u8; 16]),
             recipient_owners: recipients,
-            message_cid: ContentId::from_bytes([3u8; 32]),
+            message_cid: Some(ContentId::from_bytes([3u8; 32])),
             created_at: Hlc {
                 wall_ms: created_wall_ms,
                 logical: 0,
@@ -4134,13 +4134,17 @@ mod tests {
         assert_eq!(req.entry_id, entry_id);
         assert_eq!(req.recipient_owner, bob);
         assert_eq!(req.space_id, space_id);
-        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(req.message_cid, Some(message_cid));
         assert_eq!(req.now_ms, 15_000);
 
         // The packet rides the SAME construction the direct path sends:
         // a signed CidNotify for this entry from this device.
-        let packet = crate::dm_envelope::decode_packet(&req.cidnotify_packet)
-            .expect("deposit request must carry a decodable DM packet");
+        let packet = crate::dm_envelope::decode_packet(
+            req.cidnotify_packet
+                .as_deref()
+                .expect("deposit message entry has cidnotify_packet"),
+        )
+        .expect("deposit request must carry a decodable DM packet");
         match packet {
             crate::dm_envelope::DmPacket::CidNotify { signed, .. } => {
                 assert_eq!(signed.space_id, space_id);
@@ -4538,7 +4542,7 @@ mod tests {
         assert_eq!(req.entry_id, entry_id);
         assert_eq!(req.recipient_owner, bob);
         assert_eq!(req.space_id, space_id);
-        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(req.message_cid, Some(message_cid));
         assert_eq!(
             req.now_ms, 27_000,
             "freshness clock = this tick's backoff clock (same as Err arm)"
@@ -4720,7 +4724,7 @@ mod tests {
         // Every candidate carries the shared fan-out identity.
         for c in &candidates {
             assert_eq!(c.entry_id, entry_id, "candidate bound to the fan-out entry");
-            assert_eq!(c.message_cid, ContentId::from_bytes([3u8; 32]));
+            assert_eq!(c.message_cid, Some(ContentId::from_bytes([3u8; 32])));
         }
 
         // ---- Assertion 2: entry stays Partial. ----
@@ -5121,7 +5125,7 @@ mod tests {
         let entry = entry_with_age(7, vec![bob], 1_000);
         let entry_id = entry.id;
         let entry_space_id = entry.space_id;
-        let entry_message_cid = entry.message_cid;
+        let entry_message_cid = entry.message_cid.expect("message entry has message_cid");
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
@@ -5356,7 +5360,7 @@ mod tests {
             id: OutboxEntryId([0xab; 16]),
             space_id: SpaceId([0xcc; 16]),
             recipient_owners: vec![recipient],
-            message_cid: ContentId::from_bytes([0xee; 32]),
+            message_cid: Some(ContentId::from_bytes([0xee; 32])),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
@@ -5451,7 +5455,7 @@ mod tests {
             id: OutboxEntryId([0xab; 16]),
             space_id: SpaceId([0xcc; 16]),
             recipient_owners: vec![OwnerAddr([1; 16])],
-            message_cid: ContentId::from_bytes([0xee; 32]),
+            message_cid: Some(ContentId::from_bytes([0xee; 32])),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
@@ -5560,7 +5564,7 @@ mod tests {
             id: OutboxEntryId([0xab; 16]),
             space_id: SpaceId([0xcc; 16]),
             recipient_owners: vec![OwnerAddr([1; 16])],
-            message_cid: ContentId::from_bytes([0xee; 32]),
+            message_cid: Some(ContentId::from_bytes([0xee; 32])),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
@@ -6841,7 +6845,7 @@ mod tests {
             id: entry_id,
             space_id,
             recipient_owners: vec![bob],
-            message_cid,
+            message_cid: Some(message_cid),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
@@ -7335,7 +7339,8 @@ mod tests {
             .outbox
             .get(&msg_id)
             .expect("outbox entry exists")
-            .message_cid;
+            .message_cid
+            .expect("message entry has message_cid");
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
@@ -7446,7 +7451,12 @@ mod tests {
             assert!(matches!(entry.delivery_status, DeliveryStatus::Complete));
         }
         // Pre-condition: self-InboxEntry exists.
-        let message_cid = state.outbox.get(&msg_id).unwrap().message_cid;
+        let message_cid = state
+            .outbox
+            .get(&msg_id)
+            .unwrap()
+            .message_cid
+            .expect("message entry has message_cid");
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
@@ -8818,7 +8828,7 @@ mod tests {
             id: OutboxEntryId([1u8; 16]),
             space_id: SpaceId([7u8; 16]),
             recipient_owners: vec![],
-            message_cid: ContentId::from_bytes([9u8; 32]),
+            message_cid: Some(ContentId::from_bytes([9u8; 32])),
             created_at: Hlc {
                 wall_ms: 0,
                 logical: 0,
@@ -8889,7 +8899,7 @@ mod tests {
         assert_eq!(req.entry_id, entry_id);
         assert_eq!(req.recipient_owner, bob);
         assert_eq!(req.space_id, space_id);
-        assert_eq!(req.message_cid, message_cid);
+        assert_eq!(req.message_cid, Some(message_cid));
         assert_eq!(
             outcome2.newly_delivered,
             vec![(space_id, message_cid, bob)],

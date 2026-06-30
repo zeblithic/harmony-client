@@ -490,7 +490,7 @@ fn build_fixture() -> RelayFixture {
     let recipient = recipient_owner();
     let cid = community_id();
     let payload = DepositPayload {
-        cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
+        cidnotify_packet: Some(vec![0x01, 0x02, 0x03, 0x04]),
         storage_blob: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
         invite_packet: None,
     };
@@ -1386,7 +1386,7 @@ fn build_deposit_frame_with_blob(
 ) -> (harmony_app::community_relay::RelayDepositFrame, [u8; 32]) {
     let cid = community_id();
     let payload = DepositPayload {
-        cidnotify_packet: vec![0x01, 0x02, 0x03, 0x04],
+        cidnotify_packet: Some(vec![0x01, 0x02, 0x03, 0x04]),
         storage_blob,
         invite_packet: None,
     };

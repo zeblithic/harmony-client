@@ -435,7 +435,13 @@ impl DmInboxIngestCtx for ProbeIngestCtx {
 
     async fn verify(&self, entry: &DmInboxEntry) -> Result<VerifiedDmDeposit, String> {
         // Real packet decode — must be a CidNotify.
-        let packet = decode_packet(&entry.cidnotify_packet).map_err(|e| format!("decode: {e}"))?;
+        let packet = decode_packet(
+            entry
+                .cidnotify_packet
+                .as_deref()
+                .expect("probe message entry has cidnotify_packet"),
+        )
+        .map_err(|e| format!("decode: {e}"))?;
         let DmPacket::CidNotify {
             signed,
             signature,
@@ -483,6 +489,13 @@ impl DmInboxIngestCtx for ProbeIngestCtx {
                 device_id: "sender-dm-device".into(),
             },
         })
+    }
+
+    async fn apply_invite_only(&self, _entry: &DmInboxEntry) -> Result<(), String> {
+        // ZEB-505 standalone invite-only deposits (`cidnotify_packet == None`)
+        // are not exercised by these message-entry probes; the recovery path is
+        // unit-covered in `dm_inbox_ingest.rs`. Succeed without applying.
+        Ok(())
     }
 
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
@@ -595,7 +608,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
         &fx.sender.device_key,
         &a_sk.verifying_key().to_bytes(),
         &DepositPayload {
-            cidnotify_packet: fx.cidnotify_packet.clone(),
+            cidnotify_packet: Some(fx.cidnotify_packet.clone()),
             storage_blob: fx.storage_blob.clone(),
             invite_packet: None,
         },
@@ -645,7 +658,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
         let doc = a.doc.lock().await;
         let entry = doc.entries.get(&key).expect("entry in A's doc at ack");
         assert_eq!(entry.sender_owner, fx.sender.owner.0);
-        assert_eq!(entry.cidnotify_packet, fx.cidnotify_packet);
+        assert_eq!(entry.cidnotify_packet, Some(fx.cidnotify_packet.clone()));
         assert_eq!(entry.storage_blob, fx.storage_blob);
         assert_eq!(entry.deposited_by, a_id);
         assert!(entry.ingested_by.is_empty());
@@ -670,7 +683,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
         let doc = b.doc.lock().await;
         let entry = &doc.entries[&key];
         assert_eq!(entry.sender_owner, fx.sender.owner.0);
-        assert_eq!(entry.cidnotify_packet, fx.cidnotify_packet);
+        assert_eq!(entry.cidnotify_packet, Some(fx.cidnotify_packet));
         assert_eq!(entry.storage_blob, fx.storage_blob);
         assert_eq!(entry.deposited_by, a_id);
         entry.deposited_at.clone()
@@ -895,7 +908,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
         &fx.sender.device_key,
         &a_sk.verifying_key().to_bytes(),
         &DepositPayload {
-            cidnotify_packet: fx.cidnotify_packet.clone(),
+            cidnotify_packet: Some(fx.cidnotify_packet.clone()),
             storage_blob: fx.storage_blob.clone(),
             invite_packet: None,
         },
@@ -945,7 +958,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
         let doc = a.doc.lock().await;
         let entry = doc.entries.get(&key).expect("entry in A's doc at ack");
         assert_eq!(entry.sender_owner, fx.sender.owner.0);
-        assert_eq!(entry.cidnotify_packet, fx.cidnotify_packet);
+        assert_eq!(entry.cidnotify_packet, Some(fx.cidnotify_packet.clone()));
         assert_eq!(entry.storage_blob, fx.storage_blob);
         assert_eq!(entry.deposited_by, a_id);
         assert!(entry.ingested_by.is_empty());
@@ -970,7 +983,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
         let doc = b.doc.lock().await;
         let entry = &doc.entries[&key];
         assert_eq!(entry.sender_owner, fx.sender.owner.0);
-        assert_eq!(entry.cidnotify_packet, fx.cidnotify_packet);
+        assert_eq!(entry.cidnotify_packet, Some(fx.cidnotify_packet));
         assert_eq!(entry.storage_blob, fx.storage_blob);
         assert_eq!(entry.deposited_by, a_id);
         entry.deposited_at.clone()
@@ -1053,7 +1066,7 @@ async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
         &fx.sender.device_key,
         &a_sk.verifying_key().to_bytes(),
         &DepositPayload {
-            cidnotify_packet: fx.cidnotify_packet.clone(),
+            cidnotify_packet: Some(fx.cidnotify_packet.clone()),
             storage_blob: fx.storage_blob.clone(),
             invite_packet: None,
         },
@@ -1145,7 +1158,7 @@ async fn co_member_deposit_for_unrelated_space_is_rejected_and_not_persisted() {
         &fx.sender.device_key,
         &a_sk.verifying_key().to_bytes(),
         &DepositPayload {
-            cidnotify_packet: fx.cidnotify_packet.clone(),
+            cidnotify_packet: Some(fx.cidnotify_packet.clone()),
             storage_blob: fx.storage_blob.clone(),
             invite_packet: None,
         },

@@ -475,7 +475,7 @@ mod tests {
             id: OutboxEntryId([0xab; 16]),
             space_id: space,
             recipient_owners: vec![recipient],
-            message_cid: cid,
+            message_cid: Some(cid),
             created_at: Hlc {
                 wall_ms: 100,
                 logical: 0,
