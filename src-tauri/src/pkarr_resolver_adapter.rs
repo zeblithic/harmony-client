@@ -8,6 +8,8 @@ use async_trait::async_trait;
 use harmony_pkarr::{derive_ephemeral_key, epoch_tolerance_window, PkarrCase, PkarrResolver};
 use std::sync::Arc;
 
+use crate::community_membership::MemberStatus;
+use crate::community_state_sync::{CommunitySyncRegistry, IdentityResolver};
 use crate::network_health::{PkarrFallbackOutcome, PkarrFallbackTelemetry};
 use crate::owner_state_types::{OwnerAddr, SpaceId};
 use crate::reachability_record::ReachabilityAnnouncePayload;
@@ -15,7 +17,18 @@ use crate::reachability_resolver::ReachabilityFallback;
 
 /// Closure type that yields the set of community contexts to probe for a given
 /// peer address. Injected at boot from lib.rs which has access to NodeState.
-pub type ContextsFn = Arc<dyn Fn(&OwnerAddr) -> Vec<PkarrCommunityContext> + Send + Sync>;
+///
+/// ZEB-596: **async** — producing the contexts requires walking the community
+/// registry (per-community EpochKey + the target's identity_pub) which is only
+/// reachable through `.await`. `ReachabilityFallback::resolve` is already async
+/// and the resolver drops its own lock before invoking the fallback, so this
+/// adds no trait change and no new lock-ordering risk. The closure takes
+/// `OwnerAddr` by value (it is `Copy`) so the returned future can be `'static`.
+pub type ContextsFn = Arc<
+    dyn Fn(OwnerAddr) -> futures::future::BoxFuture<'static, Vec<PkarrCommunityContext>>
+        + Send
+        + Sync,
+>;
 
 /// Context for a single community membership that may yield a routing record
 /// for a target peer.
@@ -58,7 +71,11 @@ impl PkarrResolverAdapter {
 #[async_trait]
 impl ReachabilityFallback for PkarrResolverAdapter {
     async fn resolve(&self, addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
-        let ctxs = (self.contexts)(addr);
+        // ZEB-596: the contexts closure walks the community registry (async).
+        // It gathers all contexts and returns BEFORE we issue any pkarr relay
+        // round-trips below, so no community-engine / owner-state lock is held
+        // across the network IO.
+        let ctxs = (self.contexts)(*addr).await;
         if ctxs.is_empty() {
             return Vec::new();
         }
@@ -137,6 +154,58 @@ impl ReachabilityFallback for PkarrResolverAdapter {
     }
 }
 
+/// ZEB-596: build the case-C community contexts for a target peer by walking
+/// every community this device is in (spec §7.4). For each community where
+/// `target` is a currently-`Joined` member and whose 64-byte harmony
+/// identity_pub we can resolve, yields `(community_id, our EpochKey, target
+/// identity_pub)`. Communities where the target isn't Joined — or whose
+/// identity_pub we can't yet resolve from our owner-device cache — are skipped
+/// (without the target's identity_pub the case-C HKDF key can't be derived).
+///
+/// This reads the **current** EpochKey directly (it rotates per epoch, ZEB-249)
+/// rather than a snapshot, and gathers all contexts before returning — the
+/// caller (`PkarrResolverAdapter::resolve`) only issues pkarr relay round-trips
+/// after this returns, so no engine / owner-state lock is held across network IO.
+pub async fn community_contexts_for_target(
+    registry: &CommunitySyncRegistry,
+    resolver: &(dyn IdentityResolver + Send + Sync),
+    target: OwnerAddr,
+) -> Vec<PkarrCommunityContext> {
+    let mut out = Vec::new();
+    let community_ids = registry.known_ids().await;
+    for cid in &community_ids {
+        let Some(engine) = registry.engine_arc(cid).await else {
+            continue;
+        };
+        // Probe only communities where the target is a current member — this
+        // is what makes case C members-only (we hold the EpochKey only as a
+        // co-member) and avoids deriving keys for peers who have left.
+        let target_joined = {
+            let state_arc = engine.state();
+            let st = state_arc.lock().await;
+            let mat = st.materialized(engine.admin_addr());
+            mat.members
+                .get(&target)
+                .map(|m| m.status == MemberStatus::Joined)
+                .unwrap_or(false)
+        };
+        if !target_joined {
+            continue;
+        }
+        let epoch_key = *engine.membership_key().as_bytes();
+        // Need the target's 64-byte identity_pub to derive their case-C key;
+        // skip the community if our device cache hasn't learned it yet.
+        if let Some(identity_pub) = resolver.resolve(&target).await {
+            out.push(PkarrCommunityContext {
+                community_id: *cid,
+                epoch_key,
+                target_member_identity_pub: identity_pub,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,8 +219,11 @@ mod tests {
         let client = Arc::new(RelayClient::new(pool));
         let pkarr = Arc::new(PkarrResolver::new(client));
         let telemetry = Arc::new(PkarrFallbackTelemetry::new());
-        let adapter =
-            PkarrResolverAdapter::new(pkarr, Arc::new(|_addr| Vec::new()), Arc::clone(&telemetry));
+        let contexts: ContextsFn = Arc::new(|_addr: OwnerAddr| {
+            Box::pin(async { Vec::new() })
+                as futures::future::BoxFuture<'static, Vec<PkarrCommunityContext>>
+        });
+        let adapter = PkarrResolverAdapter::new(pkarr, contexts, Arc::clone(&telemetry));
         let result = adapter.resolve(&OwnerAddr([0u8; 16])).await;
         assert!(result.is_empty());
         // ZEB-595: no community context to probe -> nothing recorded. The ring
@@ -174,8 +246,8 @@ mod tests {
 
         let target_addr = OwnerAddr([0x22u8; 16]);
         let community_id = SpaceId([0x33u8; 16]);
-        let contexts: ContextsFn = Arc::new(move |addr: &OwnerAddr| {
-            if *addr == target_addr {
+        let contexts: ContextsFn = Arc::new(move |addr: OwnerAddr| {
+            let ctxs = if addr == target_addr {
                 vec![PkarrCommunityContext {
                     community_id,
                     epoch_key: [0xBBu8; 32],
@@ -183,7 +255,9 @@ mod tests {
                 }]
             } else {
                 vec![]
-            }
+            };
+            Box::pin(async move { ctxs })
+                as futures::future::BoxFuture<'static, Vec<PkarrCommunityContext>>
         });
         let adapter = PkarrResolverAdapter::new(pkarr, contexts, Arc::clone(&telemetry));
 
