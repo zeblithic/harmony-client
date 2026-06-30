@@ -3524,18 +3524,15 @@ pub async fn start_node_inner(
         // and threaded into event_loop::run for the periodic
         // BUTLER_SET_REFRESH_MS tick. None when no owner identity is loaded.
         let mut routing_republish_opt: Option<std::sync::Arc<dyn Fn() + Send + Sync>> = None;
-        // ZEB-597: late-populated handle to `routing_republish`, read by the
-        // on_epoch_event delta hook so a freshly-applied EpochRotation/
-        // EpochCatchup re-registers the case-C pkarr publications PROMPTLY under
-        // the new live epoch key (instead of waiting up to BUTLER_SET_REFRESH_MS
-        // for the periodic re-publish). The hook is built before the pkarr block
-        // that creates `routing_republish`, so — like `network_health_hook_cell`
-        // — it captures this `OnceLock` and boot `.set()`s it once below. A None
-        // read (delta arrives pre-wiring) is a graceful no-op; the periodic tick
-        // is the safety net.
-        let routing_republish_epoch_cell: std::sync::Arc<
-            std::sync::OnceLock<std::sync::Arc<dyn Fn() + Send + Sync>>,
-        > = std::sync::Arc::new(std::sync::OnceLock::new());
+        // ZEB-597: late-populated, burst-coalescing handle to `routing_republish`,
+        // read by the on_epoch_event delta hook so a freshly-applied EpochRotation/
+        // EpochCatchup re-registers the case-C pkarr publications PROMPTLY under the
+        // new live epoch key (instead of waiting up to BUTLER_SET_REFRESH_MS for the
+        // periodic re-publish). The hook is built before the pkarr block that
+        // creates `routing_republish`, so — like `network_health_hook_cell` — it
+        // captures this and boot `.set()`s it once below. See EpochRepublishTrigger
+        // for the leading-edge + cooldown coalescing (Qodo #379).
+        let epoch_republish_trigger = std::sync::Arc::new(EpochRepublishTrigger::new());
         // ZEB-225 Sub-B Phase 2: lift the per-identity handles SyncEngine
         // depends on (device_id, self_owner, crdt_state, tracker,
         // content_store) out of the `if let Some(seed)` block so the
@@ -5486,12 +5483,12 @@ pub async fn start_node_inner(
                                 // iroh-bind-failed).
                                 let network_health_for_hook =
                                     std::sync::Arc::clone(&network_health_hook_cell);
-                                // ZEB-597: capture the late-populated
-                                // routing-republish handle so an applied epoch
+                                // ZEB-597: capture the late-populated, coalescing
+                                // routing-republish trigger so an applied epoch
                                 // event can prompt a case-C re-register under the
                                 // new live key.
-                                let routing_republish_epoch_for_hook =
-                                    std::sync::Arc::clone(&routing_republish_epoch_cell);
+                                let epoch_republish_trigger_for_hook =
+                                    std::sync::Arc::clone(&epoch_republish_trigger);
                                 // ZEB-329: clone the membership-projection handle
                                 // into the hook so per-invocation clones can feed it.
                                 let membership_projection_for_hook = membership_projection.clone();
@@ -5626,9 +5623,9 @@ pub async fn start_node_inner(
                                     let network_health_cell =
                                         std::sync::Arc::clone(&network_health_for_hook);
                                     // ZEB-597: per-invocation clone of the
-                                    // routing-republish cell (async block moves it).
-                                    let routing_republish_epoch_cell =
-                                        std::sync::Arc::clone(&routing_republish_epoch_for_hook);
+                                    // routing-republish trigger (async block moves it).
+                                    let epoch_republish_trigger =
+                                        std::sync::Arc::clone(&epoch_republish_trigger_for_hook);
                                     // ZEB-329: per-invocation clones for the
                                     // membership-projection update (the async block
                                     // moves them). `projection_registry` is a SEPARATE
@@ -5850,21 +5847,17 @@ pub async fn start_node_inner(
                                         // to BUTLER_SET_REFRESH_MS for the periodic
                                         // re-publish. Fired AFTER the apply so the
                                         // re-register (which re-reads crdt_state)
-                                        // sees the updated key. Reuses the shared
-                                        // fire-and-forget routing-republish trigger
-                                        // (spawns its own task; re-registers every
-                                        // joined community under its current live
-                                        // key). A non-epoch-relevant catchup may
-                                        // fire a redundant — but idempotent —
-                                        // republish; epoch events are infrequent.
+                                        // sees the updated key. `fire_coalesced`
+                                        // collapses bursts (kick-flurry rotations)
+                                        // to one leading-edge republish per cooldown
+                                        // window (Qodo #379); the periodic tick
+                                        // covers any suppressed trailing rotation.
                                         if matches!(
                                             event.kind,
                                             crate::community_membership::MembershipEventKind::EpochRotation { .. }
                                                 | crate::community_membership::MembershipEventKind::EpochCatchup { .. }
                                         ) {
-                                            if let Some(rp) = routing_republish_epoch_cell.get() {
-                                                rp();
-                                            }
+                                            epoch_republish_trigger.fire_coalesced();
                                         }
                                         self_heal_community_observer(
                                             delta.community_id,
@@ -7534,10 +7527,9 @@ pub async fn start_node_inner(
                     };
                     routing_republish_opt = Some(std::sync::Arc::clone(&routing_republish));
                     // ZEB-597: hand the trigger to the on_epoch_event hook so an
-                    // applied epoch rotation can prompt a case-C re-register under
-                    // the new live key. Set-once; the hook reads it via the cell.
-                    let _ =
-                        routing_republish_epoch_cell.set(std::sync::Arc::clone(&routing_republish));
+                    // applied epoch rotation can prompt a (coalesced) case-C
+                    // re-register under the new live key. Set-once.
+                    epoch_republish_trigger.set(std::sync::Arc::clone(&routing_republish));
 
                     // ── ZEB-418 P2 Task 7: fleet-net snapshot refresh task ──
                     //
@@ -45971,6 +45963,100 @@ fn effective_persisted_relays(settings_path: Option<&std::path::Path>) -> Vec<St
         .map(|p| pkarr_settings::PkarrSettings::load_or_default(&p.to_path_buf()).relays)
         .unwrap_or_default();
     effective_pkarr_relays(persisted)
+}
+
+/// ZEB-597: coalescing trigger for the case-C pkarr re-register on epoch
+/// rotation. The `on_epoch_event` delta hook calls [`Self::fire_coalesced`] on
+/// every applied `EpochRotation`/`EpochCatchup`; without coalescing, a burst of
+/// such events (e.g. a moderation kick-flurry — ZEB-249 rotates the epoch per
+/// removed member) would each spawn a full fire-and-forget `routing_republish`
+/// task: redundant disk reads + re-registrations (Qodo #379, precedent PR #344).
+/// This applies a leading-edge + cooldown: fire PROMPTLY on the first event,
+/// then suppress further fires for `FLEET_CHANGE_REPUBLISH_DEBOUNCE_MS` (the same
+/// coalescing window the fleet-change republish path uses). Trailing rotations
+/// within the window are picked up by the periodic `BUTLER_SET_REFRESH_MS`
+/// re-publish (which also re-registers under the live key), so suppression's only
+/// effect is bounded staleness — never below the no-prompt-trigger baseline.
+struct EpochRepublishTrigger {
+    /// Set once at boot, after `routing_republish` is built.
+    republish: std::sync::OnceLock<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Instant of the last leading-edge fire; `None` until the first.
+    last_fire: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl EpochRepublishTrigger {
+    fn new() -> Self {
+        Self {
+            republish: std::sync::OnceLock::new(),
+            last_fire: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Install the shared `routing_republish` trigger. Set-once; later calls are
+    /// ignored (the closure is built exactly once per boot).
+    fn set(&self, republish: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.republish.set(republish);
+    }
+
+    /// Fire `routing_republish` when outside the cooldown window, coalescing
+    /// bursts to one fire per window. No-op before [`Self::set`] (graceful: a
+    /// delta applied pre-wiring relies on the periodic tick).
+    fn fire_coalesced(&self) {
+        let Some(rp) = self.republish.get() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let cooldown = std::time::Duration::from_millis(
+            crate::butler_deposit::FLEET_CHANGE_REPUBLISH_DEBOUNCE_MS,
+        );
+        let due = {
+            let mut last = self.last_fire.lock().unwrap_or_else(|p| p.into_inner());
+            let due = last.is_none_or(|t| now.duration_since(t) >= cooldown);
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        if due {
+            rp();
+        }
+    }
+}
+
+#[cfg(test)]
+mod epoch_republish_trigger_tests {
+    use super::EpochRepublishTrigger;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn coalesces_burst_to_single_leading_fire() {
+        let trigger = EpochRepublishTrigger::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        trigger.set(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        // A burst of epoch events in quick succession (well within the cooldown
+        // window) must collapse to ONE leading-edge republish — the regression
+        // guard for Qodo #379's burst-amplification concern.
+        for _ in 0..10 {
+            trigger.fire_coalesced();
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a burst within the cooldown window must fire exactly once"
+        );
+    }
+
+    #[test]
+    fn no_fire_before_trigger_is_set() {
+        // Pre-wiring (republish not yet set): fire_coalesced is a graceful no-op
+        // — the periodic tick covers the gap. Must not panic.
+        let trigger = EpochRepublishTrigger::new();
+        trigger.fire_coalesced();
+    }
 }
 
 /// ZEB-516: case-B (identity) pkarr re-publish gate for `routing_republish`.
