@@ -218,7 +218,19 @@ pub async fn community_contexts_for_target(
                 .await
             {
                 Ok((k, _epoch)) => *k.as_bytes(),
-                Err(_) => continue,
+                Err(e) => {
+                    // Skip this community from case-C discovery rather than probe
+                    // with a stale key. Log so a silently-skipped community is
+                    // visible in production (Greptile #378); debug-level because a
+                    // missing/incomplete Space is an expected transient right after
+                    // join, before the Space CRDT has populated current_epoch_key.
+                    tracing::debug!(
+                        community = ?cid,
+                        error = %e,
+                        "case-C pkarr discovery: skipping community, live epoch key unavailable"
+                    );
+                    continue;
+                }
             };
         out.push(PkarrCommunityContext {
             community_id: *cid,
