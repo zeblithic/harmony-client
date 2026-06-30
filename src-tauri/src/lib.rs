@@ -49488,11 +49488,16 @@ pub(crate) async fn network_health_snapshot_impl(
     // ZEB-595: enrich peer display names from the profile-card cache (local
     // lookup, no network). owner-addr hex → owner bytes → cached card name.
     if let Some(cache) = profile_card_cache.as_ref() {
-        for peer in &mut snap.peers {
-            if let Ok(bytes) = hex::decode(&peer.owner_addr) {
-                if let Ok(owner) = <[u8; 16]>::try_from(bytes.as_slice()) {
-                    if let Some(name) = cache.display_name_for_owner(&owner).await {
-                        peer.display_name = Some(name);
+        // Lock + scan the cache ONCE into an owner→name map, then do O(1)
+        // lookups per peer (avoids O(peers × slots) + repeated locking).
+        let names = cache.display_names_by_owner().await;
+        if !names.is_empty() {
+            for peer in &mut snap.peers {
+                if let Ok(bytes) = hex::decode(&peer.owner_addr) {
+                    if let Ok(owner) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                        if let Some(name) = names.get(&owner) {
+                            peer.display_name = Some(name.clone());
+                        }
                     }
                 }
             }

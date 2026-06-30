@@ -291,23 +291,29 @@ impl ProfileCardCache {
         })
     }
 
-    /// The display name of the most-recent verified card for `owner`, across
-    /// all subscription slots (newest by HLC wins). Used by the Network Health
-    /// snapshot to label peers; None if no verified card for that owner is
-    /// cached.
-    pub async fn display_name_for_owner(&self, owner: &[u8; 16]) -> Option<String> {
+    /// Map of `owner_id` → newest verified card's display name, across all
+    /// subscription slots (newest by HLC wins; a tie keeps the first seen).
+    /// Used by the Network Health snapshot to label peers in ONE pass —
+    /// O(slots) under a single lock, vs O(peers × slots) per-peer lookups.
+    pub async fn display_names_by_owner(&self) -> std::collections::HashMap<[u8; 16], String> {
         let g = self.slots.lock().await;
-        g.values()
-            .filter_map(|slot| slot.latest.as_ref())
-            .filter(|c| &c.owner_id == owner)
-            .max_by(|a, b| {
-                if a.shared_at.is_strictly_newer_than(&b.shared_at) {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Less
+        let mut best: std::collections::HashMap<[u8; 16], &CachedCard> =
+            std::collections::HashMap::new();
+        for slot in g.values() {
+            let Some(c) = slot.latest.as_ref() else {
+                continue;
+            };
+            match best.get(&c.owner_id) {
+                // Keep the existing entry unless this card is strictly newer.
+                Some(existing) if !c.shared_at.is_strictly_newer_than(&existing.shared_at) => {}
+                _ => {
+                    best.insert(c.owner_id, c);
                 }
-            })
-            .map(|c| c.display_name.clone())
+            }
+        }
+        best.into_iter()
+            .map(|(owner, c)| (owner, c.display_name.clone()))
+            .collect()
     }
 }
 
@@ -771,7 +777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn display_name_for_owner_returns_cached_name() {
+    async fn display_names_by_owner_maps_owner_to_newest_name() {
         let cache = ProfileCardCache::default();
         let a = crate::community_membership::mint_test_owner(0x71);
         cache.register(7, a.owner.0).await;
@@ -791,13 +797,11 @@ mod tests {
         )
         .unwrap();
         cache.insert_verified(7, &card).await;
-        assert_eq!(
-            cache.display_name_for_owner(&a.owner.0).await,
-            Some("Alice".to_string())
-        );
-        // Unknown owner → None.
+        let names = cache.display_names_by_owner().await;
+        assert_eq!(names.get(&a.owner.0), Some(&"Alice".to_string()));
+        // Unknown owner → absent from the map.
         let b = crate::community_membership::mint_test_owner(0x72);
-        assert_eq!(cache.display_name_for_owner(&b.owner.0).await, None);
+        assert_eq!(names.get(&b.owner.0), None);
     }
 
     #[test]
