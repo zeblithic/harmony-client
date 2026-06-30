@@ -49554,6 +49554,15 @@ pub(crate) async fn network_health_run_self_test_impl(
         None => false,
     };
 
+    // ZEB-407: build the production per-peer ping dispatcher from the same
+    // iroh endpoint ProdSelfTest uses (clone before the struct moves it). No
+    // endpoint (node not bound) → fall back to the Skipped-emitting stub.
+    let ping_dispatcher: Box<dyn crate::network_health::PingDispatcher> =
+        match iroh_endpoint.clone() {
+            Some(ep) => Box::new(crate::network_health::ProdPingDispatcher::new(ep)),
+            None => Box::new(crate::network_health::NullDispatcher),
+        };
+
     let probes = crate::network_health::ProdSelfTest {
         iroh_endpoint,
         pkarr_relay_client,
@@ -49564,7 +49573,7 @@ pub(crate) async fn network_health_run_self_test_impl(
 
     // run_self_test caches the report internally for network_health_export_payload.
     Ok(svc
-        .run_self_test(&probes, &probes, &crate::network_health::NullDispatcher)
+        .run_self_test(&probes, &probes, ping_dispatcher.as_ref())
         .await)
 }
 
