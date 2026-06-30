@@ -616,7 +616,35 @@ impl NetworkHealthService {
             });
 
         let records = self.resolver.list_records();
-        let peers = filter_peers_by_shared_membership(records, &*self.membership, now);
+        let mut peers = filter_peers_by_shared_membership(records, &*self.membership, now);
+
+        // ZEB-595: enrich each peer's connection_mode + rtt_ms from the most
+        // recent self-test's per-peer ping results (NO new network call — the
+        // self-test already measured them; matched by owner-addr hex). Only a
+        // Pass updates the peer; Fail/Skipped leave the NoConnection/None
+        // defaults. Done BEFORE derive_reachability_status so the overall
+        // status reflects real per-peer connectivity too. No-op until a
+        // self-test has run (empty cache → peers keep their defaults).
+        {
+            let last = self.last_self_test.read().await;
+            if let Some(report) = last.as_ref() {
+                let by_owner: std::collections::HashMap<&str, &PeerPingResult> = report
+                    .peer_results
+                    .iter()
+                    .map(|p| (p.owner_addr.as_str(), p))
+                    .collect();
+                for peer in &mut peers {
+                    if let Some(ping) = by_owner.get(peer.owner_addr.as_str()) {
+                        if let StepOutcome::Pass { duration_ms } = &ping.outcome {
+                            peer.rtt_ms = Some(*duration_ms);
+                            if let Some(mode) = ping.mode {
+                                peer.connection_mode = mode;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Patch reachability status now that we have peers.
         let my_network = my_network.map(|mut my| {
@@ -2596,6 +2624,57 @@ mod tests {
             "cc should Skip (no node id)"
         );
         assert_eq!(cc.mode, None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_enriches_peer_mode_rtt_from_last_self_test() {
+        // A peer shares a community (survives the filter); the last self-test
+        // pinged it Pass(Direct, 37ms). snapshot() should reflect that on the
+        // peer instead of the NoConnection/None defaults.
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xAA, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0xAA]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        *svc.last_self_test.write().await = Some(SelfTestReport {
+            started_at_ms: 0,
+            finished_at_ms: 100,
+            steps: vec![],
+            peer_results: vec![PeerPingResult {
+                owner_addr: hex::encode([0xAA; 16]),
+                outcome: StepOutcome::Pass { duration_ms: 37 },
+                mode: Some(ConnectionMode::Direct),
+            }],
+        });
+
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(snap.peers[0].rtt_ms, Some(37));
+        assert_eq!(snap.peers[0].connection_mode, ConnectionMode::Direct);
+    }
+
+    #[tokio::test]
+    async fn snapshot_peer_mode_rtt_default_without_self_test() {
+        // No cached self-test → the peer keeps the NoConnection/None defaults.
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xAA, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0xAA]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(snap.peers[0].rtt_ms, None);
+        assert_eq!(snap.peers[0].connection_mode, ConnectionMode::NoConnection);
     }
 
     #[tokio::test]

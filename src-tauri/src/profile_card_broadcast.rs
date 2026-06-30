@@ -290,6 +290,31 @@ impl ProfileCardCache {
             profile_page_root: c.profile_page_root.map(hex::encode),
         })
     }
+
+    /// Map of `owner_id` → newest verified card's display name, across all
+    /// subscription slots (newest by HLC wins; a tie keeps the first seen).
+    /// Used by the Network Health snapshot to label peers in ONE pass —
+    /// O(slots) under a single lock, vs O(peers × slots) per-peer lookups.
+    pub async fn display_names_by_owner(&self) -> std::collections::HashMap<[u8; 16], String> {
+        let g = self.slots.lock().await;
+        let mut best: std::collections::HashMap<[u8; 16], &CachedCard> =
+            std::collections::HashMap::new();
+        for slot in g.values() {
+            let Some(c) = slot.latest.as_ref() else {
+                continue;
+            };
+            match best.get(&c.owner_id) {
+                // Keep the existing entry unless this card is strictly newer.
+                Some(existing) if !c.shared_at.is_strictly_newer_than(&existing.shared_at) => {}
+                _ => {
+                    best.insert(c.owner_id, c);
+                }
+            }
+        }
+        best.into_iter()
+            .map(|(owner, c)| (owner, c.display_name.clone()))
+            .collect()
+    }
 }
 
 /// Sign a card, canonical-CBOR-encode it, and publish to its owner_id topic.
@@ -749,6 +774,34 @@ mod tests {
         .unwrap();
         cache.insert_verified(3, &b_card).await; // owner_id == B != expected A -> ignored
         assert_eq!(cache.get_cached(3).await, None);
+    }
+
+    #[tokio::test]
+    async fn display_names_by_owner_maps_owner_to_newest_name() {
+        let cache = ProfileCardCache::default();
+        let a = crate::community_membership::mint_test_owner(0x71);
+        cache.register(7, a.owner.0).await;
+        let card = sign_card(
+            &a.device_key,
+            a.owner.0,
+            "Alice".into(),
+            "".into(),
+            None,
+            None,
+            a.cert.clone(),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(7, &card).await;
+        let names = cache.display_names_by_owner().await;
+        assert_eq!(names.get(&a.owner.0), Some(&"Alice".to_string()));
+        // Unknown owner → absent from the map.
+        let b = crate::community_membership::mint_test_owner(0x72);
+        assert_eq!(names.get(&b.owner.0), None);
     }
 
     #[test]
