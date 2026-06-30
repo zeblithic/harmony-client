@@ -1,52 +1,25 @@
 # Nextest config — see https://nexte.st/docs/configuration/
 #
-# The default profile excludes 5 tests that broke on main between the
-# last green CI run (2026-05-13, before `ci.yml.disabled`) and PR #166's
-# CI re-enable. None are introduced by PR #166 itself — they accumulated
-# across PRs #160-165 while CI was off. Tracked + scoped in
-# [ZEB-332](https://linear.app/zeblith/issue/ZEB-332).
-#
-# Of the original 21 failures, PR #166 fixed 4 real production bugs:
-#   - `validate_amount_rejects_nonnumeric` (mint accepting scientific
-#     notation; rust_decimal 1.x parses `1e5`)
-#   - `validate_date_rejects_malformed` (mint accepting `26-05-19` as
-#     year 26 AD; chrono's `%Y` is greedy)
-#   - `boot_hook_skips_when_empty` (fresh-install client publishes a
-#     useless USD-only snapshot because `apply_migrations` inserts
-#     `default_currency='USD'` and the publish empty-check counts it)
-#   - `publish_skips_when_snapshot_is_empty` (same root cause)
-#
-# These are real test-infrastructure issues, not production bugs. They split
-# into two root causes — note the original inventory mis-bucketed the 9
-# `folder_ingest_walker_integration` tests as ACL; direct repro shows they hit
-# the same tempfile issue as the unit tests, not the IPC ACL gate:
+# (Historical) PR #166 quarantined 17 tests via a `[profile.default]`
+# `default-filter` after CI was re-enabled on 2026-05-13. None were
+# production bugs — all 17 were test-infrastructure issues, now fixed
+# (ZEB-332), so the quarantine filter has been removed and the full suite
+# runs in CI again:
 #
 #   - 12 dot-prefixed-tempdir-root tests (3 `folder_ingest` unit + 9
-#     `folder_ingest_walker_integration`): `tempfile::tempdir()`'s `.tmp<rand>`
-#     basename trips `should_filter_name` at the walk-root guard, so the walk
-#     sees no files. FIXED (ZEB-332): these build a non-dot-prefixed walk root
-#     via a `walk_root_tempdir` helper.
-#   - 5 Tauri 2.11 ACL-drift tests (the `get_ipc_response` IPC roundtrips):
-#     `mock_context(noop_assets())` ships an empty ACL, so the webview IPC gate
-#     rejects the command. Needs a `mock_context_with_full_acl` test-fixtures
-#     helper.
+#     `folder_ingest_walker_integration`): `tempfile::tempdir()`'s default
+#     `.tmp<rand>` basename was rejected by `should_filter_name` at the
+#     walk-root guard, so the walk saw no files. Fixed by building a
+#     non-dot-prefixed walk root via a `walk_root_tempdir` helper. (The
+#     original inventory mis-bucketed the 9 walker tests as ACL failures;
+#     direct repro showed they never reach the IPC ACL gate.)
+#   - 5 Tauri 2.11 ACL-drift IPC tests (`get_ipc_response` roundtrips):
+#     `mock_context(noop_assets())` ships an empty ACL and the request URL
+#     was the Windows-only local form, so the webview IPC gate denied the
+#     command. Fixed with the `harmony_app::mock_context_with_full_acl`
+#     fixture (pre-allows the invoked commands) plus `harmony_app::LOCAL_IPC_URL`
+#     (the Linux/macOS `tauri://localhost` origin so the call is treated as
+#     local).
 #
-# Local devs: pass an explicit `-E test(NAME)` (substring) or
-# `-E test(/regex/)` to run any of the below; the default-filter
-# intersects with `-E`, so use substring or regex (the `=` exact-match
-# form does NOT match short names — empirical verification on
-# nextest 0.9.x: `test(=pre_walk_counts_only_non_filtered_leaves)`
-# returns 0 hits, `test(pre_walk_counts_only_non_filtered_leaves)`
-# returns 1 hit). Removing entries one at a time as the sweep lands is
-# straightforward — just delete the corresponding `test(...)` clause.
-
-[profile.default]
-default-filter = """\
-  not (\
-    test(ipc_tier3_error_extraction_string_and_error) \
-    + test(add_space_binds_camelcase_params) \
-    + test(delete_outbox_entry_binds_camelcase_params) \
-    + test(read_dm_thread_binds_camelcase_params) \
-    + test(send_dm_binds_camelcase_params)\
-  )\
-  """
+# No profile config is needed today; this file is kept as the home for any
+# future nextest configuration.

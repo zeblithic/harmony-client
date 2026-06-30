@@ -55,9 +55,9 @@
 
 use std::sync::Mutex;
 
-use harmony_app::{add_dm_ipc_handlers, NodeState};
+use harmony_app::{add_dm_ipc_handlers, mock_context_with_full_acl, NodeState, LOCAL_IPC_URL};
 use tauri::ipc::{CallbackFn, InvokeBody};
-use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
+use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::WebviewWindowBuilder;
 
@@ -68,7 +68,12 @@ use tauri::WebviewWindowBuilder;
 fn build_test_app() -> tauri::App<tauri::test::MockRuntime> {
     add_dm_ipc_handlers(mock_builder())
         .manage(Mutex::new(NodeState::default()))
-        .build(mock_context(noop_assets()))
+        .build(mock_context_with_full_acl(&[
+            "send_dm",
+            "read_dm_thread",
+            "delete_outbox_entry",
+            "add_space",
+        ]))
         .expect("failed to build mock app")
 }
 
@@ -81,7 +86,7 @@ fn make_invoke_request(cmd: &str, body: serde_json::Value) -> InvokeRequest {
         cmd: cmd.into(),
         callback: CallbackFn(0),
         error: CallbackFn(1),
-        url: "http://tauri.localhost".parse().expect("url must parse"),
+        url: LOCAL_IPC_URL.parse().expect("url must parse"),
         body: InvokeBody::Json(body),
         headers: Default::default(),
         invoke_key: INVOKE_KEY.to_string(),
@@ -121,11 +126,12 @@ fn assert_err_contains_empty_state_marker(
             assert!(
                 err_str.contains("node not running")
                     || err_str.contains("no owner identity")
+                    || err_str.contains("Owner identity not loaded")
                     || err_str.contains("crdt_state missing")
                     || err_str.contains("dm_outbox"),
                 "{cmd}: expected command-body Err proving params bound (one of: \
-                 'node not running', 'no owner identity', 'crdt_state missing', \
-                 'dm_outbox'). got: {err_str}"
+                 'node not running', 'no owner identity', 'Owner identity not loaded', \
+                 'crdt_state missing', 'dm_outbox'). got: {err_str}"
             );
         }
     }
@@ -266,6 +272,7 @@ fn send_dm_rejects_snake_case_keys_that_dont_match_param_names() {
     assert!(
         !err_str.contains("node not running")
             && !err_str.contains("no owner identity")
+            && !err_str.contains("Owner identity not loaded")
             && !err_str.contains("crdt_state missing")
             && !err_str.contains("dm_outbox"),
         "send_dm should NOT silently bind unknown keys to defaults \

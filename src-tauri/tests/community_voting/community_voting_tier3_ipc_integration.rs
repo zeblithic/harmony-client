@@ -53,10 +53,10 @@ use harmony_app::community_voting_log_engine::{VotingLogEngine, VotingLogEngineP
 use harmony_app::community_voting_sortition::fisher_yates_select;
 use harmony_app::community_voting_tier3::Stage;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-use harmony_app::{add_dm_ipc_handlers, NodeState};
+use harmony_app::{add_dm_ipc_handlers, mock_context_with_full_acl, NodeState, LOCAL_IPC_URL};
 use std::collections::HashMap;
 use tauri::ipc::{CallbackFn, InvokeBody};
-use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
+use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::WebviewWindowBuilder;
 use tokio::sync::{mpsc, Mutex};
@@ -391,7 +391,12 @@ fn build_sortition_selection_event(
 fn build_test_app() -> tauri::App<tauri::test::MockRuntime> {
     add_dm_ipc_handlers(mock_builder())
         .manage(StdMutex::new(NodeState::default()))
-        .build(mock_context(noop_assets()))
+        .build(mock_context_with_full_acl(&[
+            "voting_decline_sortition",
+            "voting_create_tier3_proposal",
+            "voting_propose_draft_candidate",
+            "voting_approve_draft_candidate",
+        ]))
         .expect("failed to build mock app")
 }
 
@@ -400,7 +405,7 @@ fn make_invoke_request(cmd: &str, body: serde_json::Value) -> InvokeRequest {
         cmd: cmd.into(),
         callback: CallbackFn(0),
         error: CallbackFn(1),
-        url: "http://tauri.localhost".parse().expect("url must parse"),
+        url: LOCAL_IPC_URL.parse().expect("url must parse"),
         body: InvokeBody::Json(body),
         headers: Default::default(),
         invoke_key: INVOKE_KEY.to_string(),

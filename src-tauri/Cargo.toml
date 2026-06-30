@@ -19,7 +19,12 @@ tauri-build = { version = "2", features = [] }
 # feature to keep wire-format pin tests compilable. NEVER enable in a
 # production build — see `community_channel_log::encrypt_channel_packet_with_nonce`
 # for the nonce-reuse footgun this gate guards.
-test-fixtures = []
+#
+# Enables `tauri/test` so lib-side fixtures that build a mock app/context
+# (e.g. `mock_context_with_full_acl`) compile with just `--features
+# test-fixtures`, not only under `--all-targets` (where the dev-dependency
+# would otherwise pull `tauri/test` in via feature unification).
+test-fixtures = ["tauri/test"]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
