@@ -429,7 +429,11 @@ mod tests {
         fn device_x25519_privs(&self) -> Vec<Zeroizing<[u8; 32]>> {
             Vec::new()
         }
-        async fn ingest_recovered(&self, _payload: DepositPayload) -> Result<(), String> {
+        async fn ingest_recovered(
+            &self,
+            _sender_owner: [u8; 16],
+            _payload: DepositPayload,
+        ) -> Result<(), String> {
             Ok(())
         }
     }

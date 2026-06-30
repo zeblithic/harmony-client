@@ -445,7 +445,11 @@ impl RelayIngestCtx for TestRecipientIngestCtx {
         self.device_privs.clone()
     }
 
-    async fn ingest_recovered(&self, payload: DepositPayload) -> Result<(), String> {
+    async fn ingest_recovered(
+        &self,
+        _sender_owner: [u8; 16],
+        payload: DepositPayload,
+    ) -> Result<(), String> {
         self.ingested.lock().unwrap().push(payload);
         Ok(())
     }

@@ -704,6 +704,13 @@ pub async fn handle_deposit_core(
             // space, then persist keyed by the invite (one standalone invite per
             // space).
             None => {
+                // CodeRabbit (Stability, Major): the invite is the SOLE payload —
+                // an invite-only deposit carries no message, so any storage_blob
+                // is unused bytes an admitted sender could attach to waste inbox
+                // storage until TTL. Reject a non-empty blob fail-closed.
+                if !payload.storage_blob.is_empty() {
+                    return Err(DepositReject::BadPayload);
+                }
                 let invite_bytes = payload
                     .invite_packet
                     .as_deref()
@@ -725,6 +732,23 @@ pub async fn handle_deposit_core(
                     .await
                     .ok_or(DepositReject::InnerVerifyFailed)?;
                 if resolved_owner != frame.sender_owner {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
+                // CodeRabbit (Data Integrity, Major): complete invite validation
+                // BEFORE persist+ack so the butler never acks an invite that
+                // `apply_invite` (run at ingestion) would reject — which would
+                // otherwise leave the entry pending until TTL. Mirror the two
+                // remaining `apply_invite` gates: (a) the invite's inline
+                // `inviter_identity_pub` must match the resolved signing-device
+                // pubkey, and (b) the deposit's recipient must actually be a
+                // member of the invited Space.
+                if signed.inviter_identity_pub != identity_pub {
+                    return Err(DepositReject::InnerVerifyFailed);
+                }
+                if !signed
+                    .members
+                    .contains(&crate::owner_state_types::OwnerAddr(frame.recipient_owner))
+                {
                     return Err(DepositReject::InnerVerifyFailed);
                 }
                 verify_dm_packet_signature(

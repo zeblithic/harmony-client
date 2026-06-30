@@ -644,6 +644,62 @@ mod tests {
         );
     }
 
+    /// ZEB-505 (CodeRabbit): an invite-only outbox entry (`message_cid: None`)
+    /// has no message, so `send` routes the bootstrap invite ALONE over the
+    /// tunnel (no CidNotify can be built without a message_cid), and still
+    /// returns `Transient` so the deposit rung carries durability.
+    #[tokio::test]
+    async fn send_routes_invite_only_entry_as_bare_invite() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let space = SpaceId([0xcc; 16]);
+
+        let state = Arc::new(tokio::sync::Mutex::new(state_with_recipient_and_dm_space(
+            recipient,
+            space,
+            &dsa_pubkey,
+        )));
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
+
+        // Invite-only entry: message_cid: None.
+        let cid = ContentId::from_bytes([0xee; 32]);
+        let mut entry = synthetic_outbox_entry(space, cid, recipient);
+        entry.message_cid = None;
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+
+        let err = transport
+            .send(&entry, recipient, Vec::new())
+            .await
+            .expect_err("tunnel transport must return Transient (always-deposit)");
+        assert!(matches!(err, TransportError::Transient(_)));
+
+        // Exactly one routed packet, and it is the bootstrap invite.
+        let first = wait_for_routed(&mut cmd_rx).await;
+        assert!(
+            matches!(
+                crate::dm_envelope::decode_packet(&first),
+                Ok(crate::dm_envelope::DmPacket::Invite { .. })
+            ),
+            "an invite-only entry must route the bootstrap DmInvite alone"
+        );
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            wait_for_routed(&mut cmd_rx),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "no CidNotify must follow an invite-only send (there is no message)"
+        );
+    }
+
     /// ZEB-504: once the recipient has ACKed (an ack implies they admitted a
     /// CidNotify, so the Space exists on their side), `send` omits the invite and
     /// routes only the CidNotify.
