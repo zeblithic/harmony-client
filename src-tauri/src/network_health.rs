@@ -1546,19 +1546,82 @@ impl PkarrSnapshot for ProdPkarrSnapshot {
 /// per-peer async lookups inside its synthesis. That contradicts the
 /// "synthesis only" design of `network_health` (top-of-file doc).
 ///
-/// Until a synchronous projection (e.g. a maintained
-/// `OwnerAddr → Vec<CommunityIdHex>` cache fed off the existing
-/// `on_epoch_event` hook) lands, we ship a stub returning empty Vec.
-/// The Network Health panel renders as "no peers" — a documented
-/// graceful degradation per spec §6.1, captured in the PR description.
-pub struct ProdMembership;
+/// This is now satisfied by [`MembershipProjection`] — a synchronous
+/// `SpaceId → joined-member set` cache fed off the `on_epoch_event`
+/// hook in lib.rs boot wiring. `communities_shared_with` reads it under
+/// a `std::sync::RwLock` with no `.await`, preserving the "synthesis
+/// only" design.
+///
+/// A community is inserted ONLY while the local node is `Joined` in it
+/// (the updater's gate), so every stored entry already implies local
+/// membership — and `communities_shared_with(peer)` is exactly the set
+/// of communities BOTH the local node and `peer` are `Joined` in.
+#[derive(Clone, Default)]
+pub struct MembershipProjection {
+    inner: std::sync::Arc<
+        std::sync::RwLock<
+            std::collections::BTreeMap<
+                crate::owner_state_types::SpaceId,
+                std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
+            >,
+        >,
+    >,
+}
+
+impl MembershipProjection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The local node IS `Joined` in `community`; replace its recorded
+    /// joined-member set. Callers must drop any async lock guard before
+    /// calling — writers never hold this guard across an `.await`.
+    pub fn set_community_members(
+        &self,
+        community: crate::owner_state_types::SpaceId,
+        joined: std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
+    ) {
+        if let Ok(mut g) = self.inner.write() {
+            g.insert(community, joined);
+        }
+    }
+
+    /// The local node is NOT (or no longer) `Joined` in `community`;
+    /// drop it entirely so no peer matches through it.
+    pub fn remove_community(&self, community: &crate::owner_state_types::SpaceId) {
+        if let Ok(mut g) = self.inner.write() {
+            g.remove(community);
+        }
+    }
+
+    /// Communities (lowercase hex, ascending) the local node shares
+    /// with `peer`. Synchronous: no `.await` on the read path.
+    pub fn communities_shared_with(&self, peer: &[u8; 16]) -> Vec<String> {
+        let needle = crate::owner_state_types::OwnerAddr(*peer);
+        let Ok(g) = self.inner.read() else {
+            return Vec::new();
+        };
+        g.iter()
+            .filter(|(_, members)| members.contains(&needle))
+            .map(|(cid, _)| hex::encode(cid.0))
+            .collect()
+    }
+}
+
+/// Production membership lookup backed by [`MembershipProjection`].
+pub struct ProdMembership {
+    projection: MembershipProjection,
+}
+
+impl ProdMembership {
+    pub fn new(projection: MembershipProjection) -> Self {
+        Self { projection }
+    }
+}
 
 impl MyMembershipSet for ProdMembership {
-    fn communities_shared_with(&self, _peer: &[u8; 16]) -> Vec<String> {
-        // TODO(zeb-329-followup): maintain a synchronous
-        // OwnerAddr → Vec<CommunityIdHex> projection updated from the
-        // existing on_epoch_event hook and consult it here.
-        Vec::new()
+    fn communities_shared_with(&self, peer: &[u8; 16]) -> Vec<String> {
+        self.projection.communities_shared_with(peer)
     }
 }
 
@@ -1596,6 +1659,77 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: last_seen,
         }
+    }
+
+    fn sid(b: u8) -> crate::owner_state_types::SpaceId {
+        crate::owner_state_types::SpaceId([b; 16])
+    }
+    fn oaddr(b: u8) -> crate::owner_state_types::OwnerAddr {
+        crate::owner_state_types::OwnerAddr([b; 16])
+    }
+
+    #[test]
+    fn membership_projection_lists_shared_community_for_member() {
+        let proj = MembershipProjection::new();
+        proj.set_community_members(sid(0xC1), [oaddr(0xAA), oaddr(0xBB)].into_iter().collect());
+        assert_eq!(
+            proj.communities_shared_with(&[0xAA; 16]),
+            vec![hex::encode([0xC1u8; 16])]
+        );
+    }
+
+    #[test]
+    fn membership_projection_excludes_non_member_peer() {
+        let proj = MembershipProjection::new();
+        proj.set_community_members(sid(0xC1), [oaddr(0xAA)].into_iter().collect());
+        assert!(proj.communities_shared_with(&[0xBB; 16]).is_empty());
+    }
+
+    #[test]
+    fn membership_projection_empty_before_any_set() {
+        let proj = MembershipProjection::new();
+        assert!(proj.communities_shared_with(&[0xAA; 16]).is_empty());
+    }
+
+    #[test]
+    fn membership_projection_remove_community_clears_match() {
+        let proj = MembershipProjection::new();
+        let community = sid(0xC1);
+        proj.set_community_members(community, [oaddr(0xAA)].into_iter().collect());
+        assert!(!proj.communities_shared_with(&[0xAA; 16]).is_empty());
+        proj.remove_community(&community);
+        assert!(proj.communities_shared_with(&[0xAA; 16]).is_empty());
+    }
+
+    #[test]
+    fn membership_projection_returns_both_shared_communities_ascending() {
+        let proj = MembershipProjection::new();
+        // 0xC1 < 0xC2 → BTreeMap iteration yields them in ascending order.
+        proj.set_community_members(sid(0xC2), [oaddr(0xAA)].into_iter().collect());
+        proj.set_community_members(sid(0xC1), [oaddr(0xAA)].into_iter().collect());
+        assert_eq!(
+            proj.communities_shared_with(&[0xAA; 16]),
+            vec![hex::encode([0xC1u8; 16]), hex::encode([0xC2u8; 16])]
+        );
+    }
+
+    #[test]
+    fn prod_membership_filter_keeps_only_shared_peers() {
+        // Phase-A keystone, end-to-end through the real ProdMembership +
+        // filter (not the FakeMembership): a hand-seeded projection makes
+        // exactly the shared peer survive filter_peers_by_shared_membership,
+        // proving the empty-peer-list blocker is lifted.
+        let proj = MembershipProjection::new();
+        proj.set_community_members(sid(0xC1), [oaddr(0xAA)].into_iter().collect());
+        let membership = ProdMembership::new(proj);
+        let records = vec![
+            make_record(0xAA, ConnectionMode::NoConnection, Some(1_000)),
+            make_record(0xBB, ConnectionMode::NoConnection, Some(1_000)),
+        ];
+        let kept = filter_peers_by_shared_membership(records, &membership, 2_000);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].owner_addr, hex::encode([0xAA; 16]));
+        assert_eq!(kept[0].shared_communities, vec![hex::encode([0xC1u8; 16])]);
     }
 
     #[test]
