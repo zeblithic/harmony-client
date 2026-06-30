@@ -440,6 +440,9 @@ pub fn filter_peers_by_shared_membership(
 #[derive(Debug, Clone)]
 pub struct ResolverPeerRecord {
     pub owner_addr: [u8; 16],
+    /// Iroh endpoint id from the peer's reachability announce — used by
+    /// the self-test ping dispatcher to dial the peer. Zero if unknown.
+    pub iroh_node_id: [u8; 32],
     pub display_name: Option<String>,
     pub connection_mode: ConnectionMode,
     pub rtt_ms: Option<u32>,
@@ -1050,7 +1053,7 @@ pub trait PingDispatcher: Send + Sync {
         &self,
         peer_node_id_bytes: [u8; 32],
         timeout: std::time::Duration,
-    ) -> futures::future::BoxFuture<'_, Result<(std::time::Duration, ConnectionMode), String>>;
+    ) -> futures::future::BoxFuture<'static, Result<(std::time::Duration, ConnectionMode), String>>;
 }
 
 /// Per-peer ping wall-clock budget. Spec §5.3.
@@ -1137,6 +1140,17 @@ impl NetworkHealthService {
         // all peer pings are Skipped.
         let records = self.resolver.list_records();
         let now = now_ms();
+        // ZEB-407: owner-hex → iroh node id, built before the membership
+        // filter consumes `records`. The per-peer ping loop below looks up
+        // each scoped peer's node id here (PeerHealth carries only the hex
+        // owner addr, not the node id). Records whose node id is unknown
+        // (all-zero) are excluded, so the loop reports them Skipped ("no node
+        // id") rather than dialing a bogus zero id and reporting Fail.
+        let node_id_by_owner: std::collections::HashMap<String, [u8; 32]> = records
+            .iter()
+            .filter(|r| r.iroh_node_id != [0u8; 32])
+            .map(|r| (r.owner_addr_hex(), r.iroh_node_id))
+            .collect();
         let scoped = filter_peers_by_shared_membership(records, &*self.membership, now);
         if endpoint_ok {
             // Semaphore-bounded parallel ping. The ping dispatcher itself
@@ -1151,44 +1165,60 @@ impl NetworkHealthService {
             // it's kept in the signature so Task 7 can flip the body to
             // call `ping.ping(...)` without touching the trait. Suppress
             // the unused-warning here rather than at the function level.
-            let _ = ping;
             let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(PEER_PING_CONCURRENCY));
             let mut handles = Vec::with_capacity(scoped.len());
             for peer in &scoped {
                 // Permit acquired BEFORE spawn to provide N-of-32 spawn-rate
-                // gating (back-pressure). If Task 7 reflexively moves this
-                // into the spawned task to avoid the parent-loop wait, the
-                // bound semantics break — all permits acquire immediately
-                // and all tasks fan out concurrently.
+                // gating (back-pressure) — do NOT move this into the spawned
+                // task: that would let all permits acquire immediately and
+                // fan out unboundedly.
                 let permit = std::sync::Arc::clone(&semaphore)
                     .acquire_owned()
                     .await
                     .expect("semaphore not closed");
                 let owner_addr = peer.owner_addr.clone();
-                let mode_hint = peer.connection_mode;
-                let last_seen = peer.last_seen_ms;
-                // STAGE: Task 7's production NetworkHealthService
-                // construction site replaces this stub closure with a
-                // dispatcher.ping(...) call. For now: emit Skipped so the
-                // peer-results vector is well-formed without iroh.
-                handles.push(tokio::spawn(async move {
-                    // TASK 7 NOTE: move this drop to AFTER the production
-                    // `dispatcher.ping(...).await` — releasing the permit
-                    // here in Phase 1 is safe ONLY because the stub does
-                    // no work. Dropping early in production would defeat
-                    // the semaphore cap and allow unbounded concurrency.
-                    drop(permit);
-                    PeerPingResult {
-                        owner_addr,
-                        outcome: StepOutcome::Skipped {
-                            reason: format!(
-                                "phase-1: dispatcher not wired (last_seen={:?}, hint={:?})",
-                                last_seen, mode_hint
-                            ),
-                        },
-                        mode: None,
+                match node_id_by_owner.get(&peer.owner_addr).copied() {
+                    Some(node_id) => {
+                        // `ping.ping` returns a 'static future (the trait was
+                        // widened from '_ to 'static precisely so the future can
+                        // be moved into a spawned task — a '_ future bound to
+                        // this &self frame cannot). Build it in the parent loop,
+                        // then move it into the task with the permit.
+                        let fut = ping.ping(node_id, PEER_PING_TIMEOUT);
+                        handles.push(tokio::spawn(async move {
+                            // Hold the permit until the ping completes, then
+                            // drop — preserves the semaphore cap (the Phase-1
+                            // stub dropped early only because it did no work).
+                            let _permit = permit;
+                            let (outcome, mode) = match fut.await {
+                                Ok((rtt, mode)) => (
+                                    StepOutcome::Pass {
+                                        duration_ms: rtt.as_millis() as u32,
+                                    },
+                                    Some(mode),
+                                ),
+                                Err(reason) => (StepOutcome::Fail { reason }, None),
+                            };
+                            PeerPingResult {
+                                owner_addr,
+                                outcome,
+                                mode,
+                            }
+                        }));
                     }
-                }));
+                    None => {
+                        // No reachability record carrying an iroh node id for
+                        // this peer — nothing to dial. Honest Skipped.
+                        drop(permit);
+                        peer_results.push(PeerPingResult {
+                            owner_addr,
+                            outcome: StepOutcome::Skipped {
+                                reason: "no node id for peer".into(),
+                            },
+                            mode: None,
+                        });
+                    }
+                }
             }
             for h in handles {
                 if let Ok(r) = h.await {
@@ -1232,8 +1262,46 @@ impl PingDispatcher for NullDispatcher {
         &self,
         _peer_node_id_bytes: [u8; 32],
         _timeout: std::time::Duration,
-    ) -> futures::future::BoxFuture<'_, Result<(std::time::Duration, ConnectionMode), String>> {
+    ) -> futures::future::BoxFuture<'static, Result<(std::time::Duration, ConnectionMode), String>>
+    {
         Box::pin(async { Err("dispatcher not wired".into()) })
+    }
+}
+
+/// Production [`PingDispatcher`]: dials each peer's iroh node id on the
+/// `harmony/ping/v1` ALPN via [`ping_peer`] and reports the measured RTT.
+pub struct ProdPingDispatcher {
+    endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+}
+
+impl ProdPingDispatcher {
+    pub fn new(endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>) -> Self {
+        Self { endpoint }
+    }
+}
+
+impl PingDispatcher for ProdPingDispatcher {
+    fn ping(
+        &self,
+        peer_node_id_bytes: [u8; 32],
+        timeout: std::time::Duration,
+    ) -> futures::future::BoxFuture<'static, Result<(std::time::Duration, ConnectionMode), String>>
+    {
+        // Clone the endpoint Arc into the 'static future so it owns
+        // everything it needs (no borrow of &self).
+        let endpoint = std::sync::Arc::clone(&self.endpoint);
+        Box::pin(async move {
+            let node_id = iroh::EndpointId::from_bytes(&peer_node_id_bytes)
+                .map_err(|_| "invalid node id".to_string())?;
+            let rtt = ping_peer(&endpoint, node_id, timeout).await?;
+            // Phase-1 mode approximation: `ping_peer` returns RTT only (no
+            // ConnectionMode). A successful HARMONY_PING round-trip is
+            // reported Direct — consistent with the other Phase-1
+            // placeholders (ProdReachabilitySnapshot's NoConnection,
+            // nat_classification's Unknown). Distinguishing Direct vs Relay
+            // via the iroh conn-type is a documented follow-up.
+            Ok((rtt, ConnectionMode::Direct))
+        })
     }
 }
 
@@ -1438,6 +1506,7 @@ impl ReachabilitySnapshot for ProdReachabilitySnapshot {
             .into_iter()
             .map(|(owner, payload)| ResolverPeerRecord {
                 owner_addr: owner.0,
+                iroh_node_id: payload.iroh_node_id,
                 // Phase 1: no profile-cache lookup wired here. Follow-up
                 // pulls display names out of the profile-broadcast cache.
                 display_name: None,
@@ -1546,19 +1615,84 @@ impl PkarrSnapshot for ProdPkarrSnapshot {
 /// per-peer async lookups inside its synthesis. That contradicts the
 /// "synthesis only" design of `network_health` (top-of-file doc).
 ///
-/// Until a synchronous projection (e.g. a maintained
-/// `OwnerAddr → Vec<CommunityIdHex>` cache fed off the existing
-/// `on_epoch_event` hook) lands, we ship a stub returning empty Vec.
-/// The Network Health panel renders as "no peers" — a documented
-/// graceful degradation per spec §6.1, captured in the PR description.
-pub struct ProdMembership;
+/// This is now satisfied by [`MembershipProjection`] — a synchronous
+/// `SpaceId → joined-member set` cache fed off the `on_epoch_event`
+/// hook in lib.rs boot wiring. `communities_shared_with` reads it under
+/// a `std::sync::RwLock` with no `.await`, preserving the "synthesis
+/// only" design.
+///
+/// A community is inserted ONLY while the local node is `Joined` in it
+/// (the updater's gate), so every stored entry already implies local
+/// membership — and `communities_shared_with(peer)` is exactly the set
+/// of communities BOTH the local node and `peer` are `Joined` in.
+#[derive(Clone, Default)]
+pub struct MembershipProjection {
+    inner: std::sync::Arc<
+        std::sync::RwLock<
+            std::collections::BTreeMap<
+                crate::owner_state_types::SpaceId,
+                std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
+            >,
+        >,
+    >,
+}
+
+impl MembershipProjection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The local node IS `Joined` in `community`; replace its recorded
+    /// joined-member set. Callers should drop any async lock guard before
+    /// calling (the on-epoch and boot-replay paths both do) to keep the
+    /// engine critical section short. A poisoned lock is RECOVERED rather
+    /// than treated as a no-op: the critical sections are panic-free map
+    /// ops, so one panic-while-holding elsewhere must not permanently
+    /// disable peer scoping (matches the ZEB-495 dedupe-lock recovery).
+    pub fn set_community_members(
+        &self,
+        community: crate::owner_state_types::SpaceId,
+        joined: std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
+    ) {
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        g.insert(community, joined);
+    }
+
+    /// The local node is NOT (or no longer) `Joined` in `community`;
+    /// drop it entirely so no peer matches through it. Poisoned lock
+    /// recovered (see `set_community_members`).
+    pub fn remove_community(&self, community: &crate::owner_state_types::SpaceId) {
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        g.remove(community);
+    }
+
+    /// Communities (lowercase hex, ascending) the local node shares with
+    /// `peer`. Synchronous: no `.await` on the read path. A poisoned lock
+    /// is recovered rather than read as an (incorrect) empty set.
+    pub fn communities_shared_with(&self, peer: &[u8; 16]) -> Vec<String> {
+        let needle = crate::owner_state_types::OwnerAddr(*peer);
+        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        g.iter()
+            .filter(|(_, members)| members.contains(&needle))
+            .map(|(cid, _)| hex::encode(cid.0))
+            .collect()
+    }
+}
+
+/// Production membership lookup backed by [`MembershipProjection`].
+pub struct ProdMembership {
+    projection: MembershipProjection,
+}
+
+impl ProdMembership {
+    pub fn new(projection: MembershipProjection) -> Self {
+        Self { projection }
+    }
+}
 
 impl MyMembershipSet for ProdMembership {
-    fn communities_shared_with(&self, _peer: &[u8; 16]) -> Vec<String> {
-        // TODO(zeb-329-followup): maintain a synchronous
-        // OwnerAddr → Vec<CommunityIdHex> projection updated from the
-        // existing on_epoch_event hook and consult it here.
-        Vec::new()
+    fn communities_shared_with(&self, peer: &[u8; 16]) -> Vec<String> {
+        self.projection.communities_shared_with(peer)
     }
 }
 
@@ -1591,11 +1725,83 @@ mod tests {
     fn make_record(byte: u8, mode: ConnectionMode, last_seen: Option<u64>) -> ResolverPeerRecord {
         ResolverPeerRecord {
             owner_addr: [byte; 16],
+            iroh_node_id: [byte; 32],
             display_name: None,
             connection_mode: mode,
             rtt_ms: None,
             last_seen_ms: last_seen,
         }
+    }
+
+    fn sid(b: u8) -> crate::owner_state_types::SpaceId {
+        crate::owner_state_types::SpaceId([b; 16])
+    }
+    fn oaddr(b: u8) -> crate::owner_state_types::OwnerAddr {
+        crate::owner_state_types::OwnerAddr([b; 16])
+    }
+
+    #[test]
+    fn membership_projection_lists_shared_community_for_member() {
+        let proj = MembershipProjection::new();
+        proj.set_community_members(sid(0xC1), [oaddr(0xAA), oaddr(0xBB)].into_iter().collect());
+        assert_eq!(
+            proj.communities_shared_with(&[0xAA; 16]),
+            vec![hex::encode([0xC1u8; 16])]
+        );
+    }
+
+    #[test]
+    fn membership_projection_excludes_non_member_peer() {
+        let proj = MembershipProjection::new();
+        proj.set_community_members(sid(0xC1), [oaddr(0xAA)].into_iter().collect());
+        assert!(proj.communities_shared_with(&[0xBB; 16]).is_empty());
+    }
+
+    #[test]
+    fn membership_projection_empty_before_any_set() {
+        let proj = MembershipProjection::new();
+        assert!(proj.communities_shared_with(&[0xAA; 16]).is_empty());
+    }
+
+    #[test]
+    fn membership_projection_remove_community_clears_match() {
+        let proj = MembershipProjection::new();
+        let community = sid(0xC1);
+        proj.set_community_members(community, [oaddr(0xAA)].into_iter().collect());
+        assert!(!proj.communities_shared_with(&[0xAA; 16]).is_empty());
+        proj.remove_community(&community);
+        assert!(proj.communities_shared_with(&[0xAA; 16]).is_empty());
+    }
+
+    #[test]
+    fn membership_projection_returns_both_shared_communities_ascending() {
+        let proj = MembershipProjection::new();
+        // 0xC1 < 0xC2 → BTreeMap iteration yields them in ascending order.
+        proj.set_community_members(sid(0xC2), [oaddr(0xAA)].into_iter().collect());
+        proj.set_community_members(sid(0xC1), [oaddr(0xAA)].into_iter().collect());
+        assert_eq!(
+            proj.communities_shared_with(&[0xAA; 16]),
+            vec![hex::encode([0xC1u8; 16]), hex::encode([0xC2u8; 16])]
+        );
+    }
+
+    #[test]
+    fn prod_membership_filter_keeps_only_shared_peers() {
+        // Phase-A keystone, end-to-end through the real ProdMembership +
+        // filter (not the FakeMembership): a hand-seeded projection makes
+        // exactly the shared peer survive filter_peers_by_shared_membership,
+        // proving the empty-peer-list blocker is lifted.
+        let proj = MembershipProjection::new();
+        proj.set_community_members(sid(0xC1), [oaddr(0xAA)].into_iter().collect());
+        let membership = ProdMembership::new(proj);
+        let records = vec![
+            make_record(0xAA, ConnectionMode::NoConnection, Some(1_000)),
+            make_record(0xBB, ConnectionMode::NoConnection, Some(1_000)),
+        ];
+        let kept = filter_peers_by_shared_membership(records, &membership, 2_000);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].owner_addr, hex::encode([0xAA; 16]));
+        assert_eq!(kept[0].shared_communities, vec![hex::encode([0xC1u8; 16])]);
     }
 
     #[test]
@@ -2279,6 +2485,117 @@ mod tests {
             std::sync::Arc::new(EmptyDialSnapshot),
             std::sync::Arc::new(EmptyRelaySnapshot),
         )
+    }
+
+    /// Scripted [`PingDispatcher`] keyed by node id — returns `Err` for any
+    /// peer not in the table, so an "unscripted" dial surfaces loudly.
+    struct ScriptedPingDispatcher {
+        results: std::collections::HashMap<
+            [u8; 32],
+            Result<(std::time::Duration, ConnectionMode), String>,
+        >,
+    }
+    impl PingDispatcher for ScriptedPingDispatcher {
+        fn ping(
+            &self,
+            peer_node_id_bytes: [u8; 32],
+            _timeout: std::time::Duration,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<(std::time::Duration, ConnectionMode), String>,
+        > {
+            let r = self
+                .results
+                .get(&peer_node_id_bytes)
+                .cloned()
+                .unwrap_or_else(|| Err("unscripted peer".into()));
+            Box::pin(async move { r })
+        }
+    }
+
+    fn membership_sharing(peers: &[u8]) -> std::sync::Arc<FakeMembership> {
+        let mut table = std::collections::HashMap::new();
+        for &b in peers {
+            table.insert([b; 16], vec!["c1".to_string()]);
+        }
+        std::sync::Arc::new(FakeMembership { table })
+    }
+
+    #[tokio::test]
+    async fn self_test_per_peer_ping_reports_pass_fail_and_skip() {
+        // Three peers share a community and survive the membership filter:
+        //   0xAA — scripted Ok  → Pass + Direct mode
+        //   0xBB — scripted Err → Fail (reason surfaced)
+        //   0xCC — zeroed node id → Skipped ("no node id"), never dialed.
+        let mut records = vec![
+            make_record(0xAA, ConnectionMode::NoConnection, Some(3_000)),
+            make_record(0xBB, ConnectionMode::NoConnection, Some(2_000)),
+            make_record(0xCC, ConnectionMode::NoConnection, Some(1_000)),
+        ];
+        records[2].iroh_node_id = [0u8; 32];
+
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records }),
+            membership_sharing(&[0xAA, 0xBB, 0xCC]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+
+        let mut scripted = std::collections::HashMap::new();
+        scripted.insert(
+            [0xAAu8; 32],
+            Ok((std::time::Duration::from_millis(42), ConnectionMode::Direct)),
+        );
+        scripted.insert([0xBBu8; 32], Err("connect failed".to_string()));
+        let dispatcher = ScriptedPingDispatcher { results: scripted };
+
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: StepOutcome::Pass { duration_ms: 1 },
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: StepOutcome::Pass { duration_ms: 1 },
+            resolve: StepOutcome::Pass { duration_ms: 1 },
+        };
+
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &dispatcher).await;
+
+        // Spawned pings complete in arbitrary order — index by owner hex.
+        assert_eq!(report.peer_results.len(), 3);
+        let by_owner: std::collections::HashMap<_, _> = report
+            .peer_results
+            .iter()
+            .map(|p| (p.owner_addr.clone(), p))
+            .collect();
+
+        let aa = by_owner
+            .get(&hex::encode([0xAAu8; 16]))
+            .expect("aa result present");
+        assert!(
+            matches!(aa.outcome, StepOutcome::Pass { duration_ms: 42 }),
+            "aa should Pass at 42ms"
+        );
+        assert_eq!(aa.mode, Some(ConnectionMode::Direct));
+
+        let bb = by_owner
+            .get(&hex::encode([0xBBu8; 16]))
+            .expect("bb result present");
+        assert!(
+            matches!(&bb.outcome, StepOutcome::Fail { reason } if reason == "connect failed"),
+            "bb should Fail with the dispatcher's reason"
+        );
+        assert_eq!(bb.mode, None);
+
+        let cc = by_owner
+            .get(&hex::encode([0xCCu8; 16]))
+            .expect("cc result present");
+        assert!(
+            matches!(&cc.outcome, StepOutcome::Skipped { reason } if reason == "no node id for peer"),
+            "cc should Skip (no node id)"
+        );
+        assert_eq!(cc.mode, None);
     }
 
     #[tokio::test]

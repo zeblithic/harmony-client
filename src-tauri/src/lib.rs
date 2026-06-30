@@ -3776,6 +3776,12 @@ pub async fn start_node_inner(
         // sign-off arrives.
         let iroh_endpoint_arc: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>;
         let reachability_resolver: crate::reachability_resolver::ReachabilityResolver;
+        // ZEB-329: synchronous OwnerAddr→communities projection consumed by
+        // ProdMembership (Network Health peer scoping). Declared here — alongside
+        // reachability_resolver — so it's in scope for the on_epoch_event hook
+        // captures, the boot-time replay seed, and the NetworkHealthService
+        // install site below.
+        let membership_projection = crate::network_health::MembershipProjection::new();
         let iroh_handles_for_loop: Option<crate::event_loop::IrohRuntimeHandles>;
         // ZEB-329: shared cell holding the NetworkHealthService Arc
         // once boot wiring populates it. The on_epoch_event closure
@@ -5461,6 +5467,9 @@ pub async fn start_node_inner(
                                 // iroh-bind-failed).
                                 let network_health_for_hook =
                                     std::sync::Arc::clone(&network_health_hook_cell);
+                                // ZEB-329: clone the membership-projection handle
+                                // into the hook so per-invocation clones can feed it.
+                                let membership_projection_for_hook = membership_projection.clone();
                                 // Per-session synthesized-set: avoids re-synthesizing
                                 // the same rotation/catchup within one node session.
                                 // Wrapped in Arc<Mutex<_>> so the FnMut closure can
@@ -5591,6 +5600,14 @@ pub async fn start_node_inner(
                                     // the inner Arc to fire notify().
                                     let network_health_cell =
                                         std::sync::Arc::clone(&network_health_for_hook);
+                                    // ZEB-329: per-invocation clones for the
+                                    // membership-projection update (the async block
+                                    // moves them). `projection_registry` is a SEPARATE
+                                    // clone because `registry` (above) is consumed by
+                                    // self_heal_community_observer.
+                                    let membership_projection = membership_projection_for_hook.clone();
+                                    let projection_registry =
+                                        std::sync::Arc::clone(&community_registry_for_heal);
                                     // ZEB-495: per-invocation clones for the
                                     // self-introduce trigger (async block moves
                                     // them).
@@ -5806,6 +5823,52 @@ pub async fn start_node_inner(
                                             synth_catchups,
                                         )
                                         .await;
+
+                                        // ── ZEB-329: maintain the
+                                        // OwnerAddr→communities projection that
+                                        // ProdMembership::communities_shared_with
+                                        // consults for Network Health peer scoping.
+                                        // Runs on EVERY delta (membership changes on
+                                        // any Join/Leave/Kick), ungated by the
+                                        // ZEB-495 session dedupe below. Mirrors the
+                                        // materialize idiom used above. A community is
+                                        // recorded ONLY while the local node is
+                                        // Joined, so communities_shared_with is exactly
+                                        // the set both we and the peer are Joined in.
+                                        if let Some(engine) =
+                                            projection_registry.engine_arc(&community_id).await
+                                        {
+                                            let state_arc = engine.state();
+                                            let st = state_arc.lock().await;
+                                            let mat = st.materialized(engine.admin_addr());
+                                            let local_joined = mat
+                                                .members
+                                                .get(&self_owner)
+                                                .map(|m| {
+                                                    m.status
+                                                        == crate::community_membership::MemberStatus::Joined
+                                                })
+                                                .unwrap_or(false);
+                                            if local_joined {
+                                                let joined: std::collections::BTreeSet<_> = mat
+                                                    .members
+                                                    .iter()
+                                                    .filter(|(_, m)| {
+                                                        m.status
+                                                            == crate::community_membership::MemberStatus::Joined
+                                                    })
+                                                    .map(|(addr, _)| *addr)
+                                                    .collect();
+                                                drop(st);
+                                                membership_projection
+                                                    .set_community_members(community_id, joined);
+                                            } else {
+                                                drop(st);
+                                                membership_projection.remove_community(&community_id);
+                                            }
+                                        } else {
+                                            membership_projection.remove_community(&community_id);
+                                        }
 
                                         // ── ZEB-495 (ZEB-340 Part 2):
                                         // self-introduce (Option A). On this
@@ -6443,7 +6506,14 @@ pub async fn start_node_inner(
                                 crate::community_relay_announce::CommunityRelayAnnouncePayload,
                                 crate::owner_state_types::Hlc,
                             )> = Vec::new();
-                            {
+                            // ZEB-329: the projection seed for this community is the
+                            // block's tail value — computed UNDER the engine lock,
+                            // applied AFTER it's released (the projection's contract).
+                            // Some(set) = local Joined with these members; None =
+                            // local not Joined → remove the community.
+                            let seed_joined_members: Option<
+                                std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
+                            > = {
                                 let st = state_arc.lock().await;
                                 let current = st.materialized(engine.admin_addr());
                                 let is_joined = |actor: &crate::owner_state_types::OwnerAddr| {
@@ -6471,6 +6541,28 @@ pub async fn start_node_inner(
                                         _ => {}
                                     }
                                 }
+                                // ZEB-329: tail value — the seed for THIS community
+                                // (the Network Health peer list is scoped immediately
+                                // on restart; the on_epoch_event hook only fires on
+                                // NEW deltas). Applied below after the guard drops.
+                                is_joined(&self_owner).then(|| {
+                                    current
+                                        .members
+                                        .iter()
+                                        .filter(|(_, s)| {
+                                            s.status
+                                                == crate::community_membership::MemberStatus::Joined
+                                        })
+                                        .map(|(addr, _)| *addr)
+                                        .collect::<std::collections::BTreeSet<_>>()
+                                })
+                            };
+                            // Apply the seed now that the engine guard is dropped.
+                            match seed_joined_members {
+                                Some(joined) => {
+                                    membership_projection.set_community_members(*cid, joined)
+                                }
+                                None => membership_projection.remove_community(cid),
                             }
                             for (actor, payload, hlc) in to_replay {
                                 reachability_resolver.update(actor, payload, hlc);
@@ -9235,7 +9327,9 @@ pub async fn start_node_inner(
                             };
                             let prod_membership: std::sync::Arc<
                                 dyn crate::network_health::MyMembershipSet + Send + Sync,
-                            > = std::sync::Arc::new(crate::network_health::ProdMembership);
+                            > = std::sync::Arc::new(crate::network_health::ProdMembership::new(
+                                membership_projection.clone(),
+                            ));
                             // ZEB-373: dial-telemetry source reads the shared Arc
                             // stashed above; the event-loop dial driver writes it.
                             let prod_dial: std::sync::Arc<dyn crate::network_health::DialSnapshot> =
@@ -49470,6 +49564,15 @@ pub(crate) async fn network_health_run_self_test_impl(
         None => false,
     };
 
+    // ZEB-407: build the production per-peer ping dispatcher from the same
+    // iroh endpoint ProdSelfTest uses (clone before the struct moves it). No
+    // endpoint (node not bound) → fall back to the Skipped-emitting stub.
+    let ping_dispatcher: Box<dyn crate::network_health::PingDispatcher> =
+        match iroh_endpoint.clone() {
+            Some(ep) => Box::new(crate::network_health::ProdPingDispatcher::new(ep)),
+            None => Box::new(crate::network_health::NullDispatcher),
+        };
+
     let probes = crate::network_health::ProdSelfTest {
         iroh_endpoint,
         pkarr_relay_client,
@@ -49480,7 +49583,7 @@ pub(crate) async fn network_health_run_self_test_impl(
 
     // run_self_test caches the report internally for network_health_export_payload.
     Ok(svc
-        .run_self_test(&probes, &probes, &crate::network_health::NullDispatcher)
+        .run_self_test(&probes, &probes, ping_dispatcher.as_ref())
         .await)
 }
 

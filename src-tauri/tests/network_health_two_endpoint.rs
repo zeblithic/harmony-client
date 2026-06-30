@@ -166,6 +166,26 @@ async fn ping_round_trip_between_two_endpoints() {
             rtt < Duration::from_secs(5),
             "loopback ping should be well under 5s, got {rtt:?}"
         );
+
+        // ── 6. The SAME round-trip through the production
+        //    ProdPingDispatcher (ZEB-407) — proving the self-test adapter
+        //    (EndpointId::from_bytes + the Phase-1 mode mapping) works
+        //    end-to-end over a real endpoint, not just ping_peer directly.
+        use harmony_app::network_health::PingDispatcher;
+        let dispatcher = network_health::ProdPingDispatcher::new(Arc::clone(&endpoint_b));
+        let (rtt2, mode) = dispatcher
+            .ping(*a_node_id.as_bytes(), Duration::from_secs(10))
+            .await
+            .expect("ProdPingDispatcher should succeed for the loopback round-trip");
+        assert!(
+            rtt2 < Duration::from_secs(5),
+            "dispatcher loopback ping should be well under 5s, got {rtt2:?}"
+        );
+        assert_eq!(
+            mode,
+            network_health::ConnectionMode::Direct,
+            "Phase-1 dispatcher reports a successful ping as Direct"
+        );
     })
     .await
     .expect("two-endpoint ping must complete within 60s");
