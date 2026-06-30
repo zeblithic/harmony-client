@@ -350,7 +350,11 @@ async fn run_inner() {
             .allowed_destination(zenoh::sample::Locality::Remote)
             .await
             .expect("declare media readiness publisher");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // 10s is far above the sub-second loopback subscriber-discovery time but
+        // comfortably under the test's 30s outer timeout, so a genuine discovery
+        // failure surfaces as the informative assertion below rather than the
+        // less-specific outer guard (and leaves budget for the 10s recv).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if media_ready_pub
                 .matching_status()
@@ -362,7 +366,7 @@ async fn run_inner() {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "A never matched C's remote media subscriber within 30s"
+                "A never matched C's remote media subscriber within 10s"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
