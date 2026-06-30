@@ -1,6 +1,6 @@
 # Nextest config — see https://nexte.st/docs/configuration/
 #
-# The default profile excludes 17 tests that broke on main between the
+# The default profile excludes 14 tests that broke on main between the
 # last green CI run (2026-05-13, before `ci.yml.disabled`) and PR #166's
 # CI re-enable. None are introduced by PR #166 itself — they accumulated
 # across PRs #160-165 while CI was off. Tracked + scoped in
@@ -16,13 +16,14 @@
 #     `default_currency='USD'` and the publish empty-check counts it)
 #   - `publish_skips_when_snapshot_is_empty` (same root cause)
 #
-# The remaining 17 are real test-infrastructure issues, not production
-# bugs. The dominant failure mode is Tauri 2.11 ACL drift in the test
-# mock setup (14 of the 17), which needs a `mock_context_with_full_acl`
-# test-fixtures helper that's a separate-PR-shaped change. The other 3
-# are pre-existing `folder_ingest` orphans per `feedback_unrelated_test_failures`
-# — tempfile's `.tmp`-prefixed paths get caught by the deny-list filter
-# in `should_filter_name`, so the test never sees its own files.
+# These are real test-infrastructure issues, not production bugs. The
+# 3 `folder_ingest` tempfile orphans (per `feedback_unrelated_test_failures`
+# — tempfile's `.tmp`-prefixed paths got caught by the deny-list filter in
+# `should_filter_name`, so the test never saw its own files) are now FIXED
+# (ZEB-332): those tests build a non-dot-prefixed walk root via
+# `folder_ingest::tests::walk_root_tempdir`. The remaining 14 are Tauri 2.11
+# ACL drift in the test mock setup, which needs a `mock_context_with_full_acl`
+# test-fixtures helper.
 #
 # Local devs: pass an explicit `-E test(NAME)` (substring) or
 # `-E test(/regex/)` to run any of the below; the default-filter
@@ -36,10 +37,7 @@
 [profile.default]
 default-filter = """\
   not (\
-    test(pre_walk_counts_only_non_filtered_leaves) \
-    + test(walker_honors_cancel_flag_and_cleans_up_registry) \
-    + test(walker_leaf_ingest_does_not_pollute_root_listing) \
-    + test(ipc_tier3_error_extraction_string_and_error) \
+    test(ipc_tier3_error_extraction_string_and_error) \
     + test(add_space_binds_camelcase_params) \
     + test(delete_outbox_entry_binds_camelcase_params) \
     + test(read_dm_thread_binds_camelcase_params) \
