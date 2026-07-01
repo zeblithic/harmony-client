@@ -195,6 +195,150 @@ async fn community_presence_two_engine_online_and_sweep() {
         .expect("community presence two-engine test timed out");
 }
 
+/// ZEB-600: a publisher spawned INVISIBLE (`presence_visible = false`) must emit
+/// NO beacons — even after its session has matched a remote subscriber, so a
+/// "no beacon" result cannot be a lost-before-matched transport race. Then a
+/// live flip to visible converges (proving the gate was the only suppressor and
+/// the flip takes effect without re-spawning).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invisible_publisher_emits_no_beacon() {
+    tokio::time::timeout(Duration::from_secs(60), invisible_inner())
+        .await
+        .expect("invisible presence test timed out");
+}
+
+async fn invisible_inner() {
+    let cfg = zenoh::Config::default();
+    let session_a = zenoh::open(cfg.clone()).await.expect("session A");
+    let session_b = zenoh::open(cfg).await.expect("session B");
+
+    // Distinct community/owner/key from the sibling two-engine test. Both run as
+    // separate processes, but zenoh's loopback scouting means their sessions
+    // discover each other — so sharing a topic would let THIS test's B receive
+    // the OTHER (visible) test's A beacons, a false failure. A unique community
+    // (hence a unique topic) isolates us.
+    let owner_a = OwnerAddr([0xa6; 16]);
+    let sk_a = SigningKey::from_bytes(&[6u8; 32]);
+    let device_a: [u8; 32] = sk_a.verifying_key().to_bytes();
+
+    let membership_key = EpochKey::new([0x66; 32]);
+    let community = SpaceId([0xc6; 16]);
+    let topic = format!("harmony/presence/{}/beacons", hex::encode(community.0));
+
+    let registry_b = seeded_registry(community, &membership_key, &[(owner_a, device_a)]).await;
+    let registry_a = seeded_registry(community, &membership_key, &[(owner_a, device_a)]).await;
+
+    let map_b = Arc::new(Mutex::new(CommunityPresenceMap::new()));
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let now_ms: Arc<dyn Fn() -> u64 + Send + Sync> = {
+        let c = clock.clone();
+        Arc::new(move || c.load(Ordering::SeqCst))
+    };
+    let no_emit_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
+        Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
+
+    let closing_a = Arc::new(AtomicBool::new(false));
+    let closing_b = Arc::new(AtomicBool::new(false));
+
+    let sub_handle = spawn_community_presence_subscriber(
+        session_b.clone(),
+        topic.clone(),
+        Arc::clone(&registry_b),
+        community,
+        Arc::clone(&map_b),
+        Arc::clone(&no_emit_sink),
+        Arc::clone(&closing_b),
+        Arc::clone(&now_ms),
+    );
+
+    // Match A's session to B's REMOTE subscriber first, so a later "no beacon"
+    // is attributable to the invisible gate, not a discovery race.
+    {
+        let readiness_pub = session_a
+            .declare_publisher(
+                zenoh::key_expr::KeyExpr::try_from(topic.clone()).expect("presence topic key"),
+            )
+            .allowed_destination(zenoh::sample::Locality::Remote)
+            .await
+            .expect("declare presence readiness publisher");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if readiness_pub
+                .matching_status()
+                .await
+                .expect("presence matching_status query failed")
+                .matching()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "A never matched B's remote presence subscriber within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    // A's REAL publisher, but INVISIBLE.
+    let started_hlc = Hlc {
+        wall_ms: 1,
+        logical: 0,
+        device_id: hex::encode(device_a),
+    };
+    let seq_counter_a = Arc::new(AtomicU64::new(0));
+    let a_visible = Arc::new(AtomicBool::new(false));
+    let pub_handle = spawn_community_presence_publisher(
+        session_a.clone(),
+        topic.clone(),
+        Arc::clone(&registry_a),
+        community,
+        Arc::new(sk_a.clone()),
+        owner_a,
+        device_a,
+        started_hlc,
+        Arc::clone(&seq_counter_a),
+        Duration::from_millis(200),
+        Arc::clone(&a_visible),
+        Arc::clone(&closing_a),
+    );
+
+    // Over ~2s (10 beacon intervals) B must NEVER see A.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seen = map_b
+            .lock()
+            .await
+            .online_owners(&community)
+            .iter()
+            .any(|o| o.owner == owner_a.0);
+        assert!(!seen, "invisible A must never appear in B's roster");
+    }
+
+    // Flip A visible → B converges. Proves the gate was the sole suppressor and
+    // the live flip works without a re-spawn.
+    a_visible.store(true, Ordering::SeqCst);
+    wait_until(Duration::from_secs(10), || {
+        let map_b = Arc::clone(&map_b);
+        async move {
+            map_b
+                .lock()
+                .await
+                .online_owners(&community)
+                .iter()
+                .any(|o| o.owner == owner_a.0)
+        }
+    })
+    .await
+    .expect("after flipping visible, B should see A online");
+
+    // Teardown: the subscriber blocks in `recv_async().await` (it wakes on
+    // samples, not the closing flag), so abort rather than await to avoid a hang.
+    closing_a.store(true, Ordering::SeqCst);
+    closing_b.store(true, Ordering::SeqCst);
+    pub_handle.abort();
+    sub_handle.abort();
+}
+
 async fn run_inner() {
     // ── Two real Zenoh sessions on the shared loopback peer router ───────────
     let cfg = zenoh::Config::default();
@@ -304,6 +448,7 @@ async fn run_inner() {
         started_hlc.clone(),
         Arc::clone(&seq_counter_a),
         Duration::from_millis(200),
+        Arc::new(AtomicBool::new(true)),
         Arc::clone(&closing_a),
     );
 

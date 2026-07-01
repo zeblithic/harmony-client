@@ -265,15 +265,48 @@ impl PresenceUpdatedPayload {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CommunityPresenceMap {
     // community → device → entry
     inner: BTreeMap<SpaceId, BTreeMap<[u8; 32], PresenceEntry>>,
+    /// ZEB-600: node-global presence-visibility gate. `true` = broadcast beacons
+    /// (visible); `false` = appear offline. Shared as an `Arc` handle with every
+    /// presence publisher so `set_presence_visibility` takes effect live. Default
+    /// is TRUE — note a *derived* `Default` would be `false`
+    /// (`Arc<AtomicBool>::default()`), which would silently ship every node
+    /// invisible; hence the explicit `new()`/`Default` below.
+    presence_visible: Arc<AtomicBool>,
+}
+
+impl Default for CommunityPresenceMap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommunityPresenceMap {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: BTreeMap::new(),
+            presence_visible: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// ZEB-600: clone the node-global visibility gate handle for a presence
+    /// publisher, so a live [`set_visible`](Self::set_visible) flip is observed
+    /// on the publisher's next tick without re-spawning it.
+    pub fn visible_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.presence_visible)
+    }
+
+    /// ZEB-600: set node-global presence visibility (`true` = broadcast beacons).
+    pub fn set_visible(&self, visible: bool) {
+        self.presence_visible.store(visible, Ordering::SeqCst);
+    }
+
+    /// ZEB-600: read node-global presence visibility.
+    pub fn is_visible(&self) -> bool {
+        self.presence_visible.load(Ordering::SeqCst)
     }
 
     /// Apply a (verified, opened) beacon. `now_ms` is a monotonic clock the
@@ -411,6 +444,7 @@ pub fn spawn_community_presence_publisher(
     started_hlc: Hlc,
     seq_counter: Arc<AtomicU64>,
     interval: std::time::Duration,
+    presence_visible: Arc<AtomicBool>,
     closing: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -421,6 +455,13 @@ pub fn spawn_community_presence_publisher(
             tick.tick().await;
             if closing.load(Ordering::SeqCst) {
                 break;
+            }
+            // ZEB-600: invisible mode — skip publishing our beacon (the
+            // subscriber keeps running, so we still see others). Peers evict us
+            // within STALE_MS once we stop publishing. Mirrors the `closing`
+            // gate; a live `set_presence_visibility(false)` takes effect here.
+            if !presence_visible.load(Ordering::SeqCst) {
+                continue;
             }
             let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
             let beacon = build_presence_beacon(self_owner.0, self_device, &started_hlc, seq);
@@ -624,6 +665,30 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].owner, [1; 16]);
         assert_eq!(r[0].device_count, 1);
+    }
+
+    #[test]
+    fn visibility_defaults_to_visible() {
+        // ZEB-600: a fresh map (and its Default) must be VISIBLE. A *derived*
+        // Default would be false (Arc<AtomicBool>::default) — invisible — which
+        // would silently hide every node. Pin the correct direction.
+        assert!(CommunityPresenceMap::new().is_visible());
+        assert!(CommunityPresenceMap::default().is_visible());
+    }
+
+    #[test]
+    fn set_visible_toggles_and_handle_shares_state() {
+        let m = CommunityPresenceMap::new();
+        let handle = m.visible_handle();
+        assert!(handle.load(Ordering::SeqCst));
+        m.set_visible(false);
+        // A publisher holds this Arc handle; a set_visible flip is observed
+        // through it (same atomic) — this is what makes the toggle live.
+        assert!(!handle.load(Ordering::SeqCst));
+        assert!(!m.is_visible());
+        m.set_visible(true);
+        assert!(handle.load(Ordering::SeqCst));
+        assert!(m.is_visible());
     }
 
     #[test]

@@ -7006,6 +7006,14 @@ pub async fn start_node_inner(
                     let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
                     let pkarr_settings =
                         pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
+                    // ZEB-600: apply the persisted appear-offline setting to the
+                    // presence map's node-global visibility gate BEFORE the event
+                    // loop can publish, so an invisible user emits no launch beacon.
+                    // (Map default is visible; flip to invisible only if opted in.)
+                    community_presence_map
+                        .lock()
+                        .await
+                        .set_visible(!pkarr_settings.presence_invisible);
                     // ZEB-380: build the pool from the persisted user-configurable
                     // relay list via the SAME lenient reader the IPCs + boot
                     // reconcile use — drops only malformed entries (a single bad
