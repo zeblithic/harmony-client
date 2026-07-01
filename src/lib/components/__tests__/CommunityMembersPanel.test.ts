@@ -92,6 +92,32 @@ describe('CommunityMembersPanel', () => {
     expect(container.querySelector('.panel-title')?.textContent ?? '').toMatch(/2 online/);
   });
 
+  it('excludes self from the online count when selfInvisible is on', async () => {
+    // Same as above but the viewer is invisible → self is NOT counted → 1 online.
+    const isOnline = (addr: string) => addr === bob.address;
+    const { container } = render(CommunityMembersPanel, {
+      props: { ...baseProps(), isOnline, selfInvisible: true },
+    });
+    await screen.findByText(/Alice/);
+    expect(container.querySelector('.panel-title')?.textContent ?? '').toMatch(/1 online/);
+  });
+
+  it('sorts invisible self below actually-online members', async () => {
+    // alice is self+invisible; bob is online. Online bob must float above alice.
+    const isOnline = (addr: string) => addr === bob.address;
+    render(CommunityMembersPanel, {
+      props: { ...baseProps(), isOnline, selfInvisible: true },
+    });
+    await screen.findByText(/Alice/);
+    const activeList = screen.getByRole('list', { name: 'Active members' });
+    const names = Array.from(activeList.querySelectorAll('.name')).map((el) => el.textContent ?? '');
+    const bobIdx = names.findIndex((n) => n.includes('Bob'));
+    const aliceIdx = names.findIndex((n) => n.includes('Alice'));
+    expect(bobIdx).toBeGreaterThanOrEqual(0);
+    expect(aliceIdx).toBeGreaterThanOrEqual(0);
+    expect(bobIdx).toBeLessThan(aliceIdx); // online Bob above invisible-self Alice
+  });
+
   it('sorts online members before offline (online-first)', async () => {
     const carol: CommunityMember = {
       address: 'carol'.padEnd(32, '0'),

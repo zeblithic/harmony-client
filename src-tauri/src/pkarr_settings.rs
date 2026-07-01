@@ -567,8 +567,10 @@ mod tests {
     fn presence_invisible_round_trips() {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
-        let mut s = PkarrSettings::default();
-        s.presence_invisible = true;
+        let s = PkarrSettings {
+            presence_invisible: true,
+            ..Default::default()
+        };
         s.save(&path).expect("save");
         assert!(PkarrSettings::load_or_default(&path).presence_invisible);
     }

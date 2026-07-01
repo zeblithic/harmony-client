@@ -108,11 +108,13 @@
     isLastAdmin: viewerIsLastAdmin,
   });
   let searchTrimmed = $derived(searchQuery.trim());
-  // ZEB-600: self is always shown online (see MemberRow) unless invisible; the
-  // panel only knows `isOnline`, so treat self as online here for count + sort.
-  // (Invisible self-styling is handled in MemberRow via `selfInvisible`.)
+  // ZEB-600: self counts as online unless "Appear offline" is on — matching
+  // MemberRow's self-dot exactly, so the header count and online-first sort never
+  // disagree with what the row shows. zenoh never loops our own beacon back, so
+  // the resolver can't answer for self; we decide it from `selfInvisible` here.
   function memberOnline(m: CommunityMember): boolean {
-    return m.address === ownAddress || (isOnline?.(m.address) ?? false);
+    if (m.address === ownAddress) return !selfInvisible;
+    return isOnline?.(m.address) ?? false;
   }
   // ZEB-600: sort online-first (stable — Array.sort keeps the backend order
   // within each group), so who's around floats to the top.
