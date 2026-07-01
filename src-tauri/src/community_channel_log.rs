@@ -1593,6 +1593,72 @@ const CHANNEL_LOG_TAIL_V1: u8 = 1;
 /// Schema version byte prefixed to each `segments/{N:08x}.cbor`.
 /// v3 may add per-segment metadata or compression.
 const CHANNEL_LOG_SEGMENT_V1: u8 = 1;
+/// Schema version byte prefixed to the `backfill_state.cbor` sidecar
+/// (ZEB-599). Bump when the sidecar gains fields.
+const CHANNEL_BACKFILL_STATE_V1: u8 = 1;
+
+/// Per-channel anti-entropy sidecar (ZEB-599), persisted at
+/// `root/backfill_state.cbor` next to the manifest.
+///
+/// Holds the wall-clock ms of the last full (`since = None`) periodic
+/// reconcile. The ZEB-425/584 resync floor arms its FIRST fire this
+/// session at `last_full_reconcile_ms + interval` instead of
+/// `spawn + interval`, so the ~1h floor survives process restarts
+/// rather than resetting its clock on every respawn (a node restarting
+/// more often than hourly otherwise never crosses the floor, and the
+/// only backstop for a sub-max-HLC gap never fires).
+///
+/// Written independently of segment-sealing (via [`Self::save`]) so it
+/// lands even for a quiet channel that never seals a segment — exactly
+/// the case where a peer's offline-window backlog matters most. It is a
+/// pure optimization hint: an absent, unreadable, or unknown-version
+/// sidecar degrades to [`load`](Self::load) returning `None` (⇒ legacy
+/// interval-from-spawn), never an error that could block spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelBackfillState {
+    /// Wall-clock ms (UNIX epoch) of the last full periodic reconcile.
+    pub last_full_reconcile_ms: u64,
+}
+
+impl ChannelBackfillState {
+    /// Sidecar path under a channel-log `root` directory.
+    fn path(root: &std::path::Path) -> PathBuf {
+        root.join("backfill_state.cbor")
+    }
+
+    /// Read the sidecar. `None` on any of: file absent, unreadable,
+    /// empty, or an unknown schema version — all mean "never
+    /// reconciled," so the caller falls back to interval-from-spawn.
+    /// Deliberately non-erroring: a corrupt hint must never block a
+    /// channel from spawning.
+    pub fn load(root: &std::path::Path) -> Option<ChannelBackfillState> {
+        let bytes = std::fs::read(Self::path(root)).ok()?;
+        match bytes.split_first() {
+            Some((&CHANNEL_BACKFILL_STATE_V1, rest)) => ciborium::from_reader(rest).ok(),
+            _ => None,
+        }
+    }
+
+    /// Atomically persist the sidecar with `last_full_reconcile_ms`.
+    /// Errors surface to the caller, which logs-and-continues: a missed
+    /// write only forfeits restart-awareness for that one cycle (the
+    /// floor falls back to interval-from-spawn next boot).
+    pub fn save(
+        root: &std::path::Path,
+        last_full_reconcile_ms: u64,
+    ) -> Result<(), crate::owner_state_persist::PersistError> {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.push(CHANNEL_BACKFILL_STATE_V1);
+        ciborium::into_writer(
+            &Self {
+                last_full_reconcile_ms,
+            },
+            &mut bytes,
+        )
+        .map_err(|e| crate::owner_state_persist::PersistError::Io(std::io::Error::other(e)))?;
+        crate::owner_state_persist::save_atomically(&Self::path(root), &bytes)
+    }
+}
 
 impl Default for ChannelLogConfig {
     fn default() -> Self {
@@ -2420,6 +2486,46 @@ mod tests {
 
     fn fixture_channel(id: u8) -> ChannelId {
         ChannelId([id; 16])
+    }
+
+    // ── ZEB-599: backfill_state sidecar ─────────────────────────────
+    #[test]
+    fn backfill_state_round_trips() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        ChannelBackfillState::save(tmp.path(), 1_700_000_123_456).expect("save");
+        assert_eq!(
+            ChannelBackfillState::load(tmp.path()),
+            Some(ChannelBackfillState {
+                last_full_reconcile_ms: 1_700_000_123_456
+            }),
+        );
+    }
+
+    #[test]
+    fn backfill_state_absent_is_none() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // No sidecar written → "never reconciled" → None (legacy path).
+        assert_eq!(ChannelBackfillState::load(tmp.path()), None);
+    }
+
+    #[test]
+    fn backfill_state_unknown_version_is_none() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // A future/corrupt schema byte must degrade to None, never error.
+        let path = tmp.path().join("backfill_state.cbor");
+        std::fs::write(&path, [0xFF, 0x01, 0x02, 0x03]).expect("write");
+        assert_eq!(ChannelBackfillState::load(tmp.path()), None);
+    }
+
+    #[test]
+    fn backfill_state_save_overwrites() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        ChannelBackfillState::save(tmp.path(), 100).expect("save 1");
+        ChannelBackfillState::save(tmp.path(), 999).expect("save 2");
+        assert_eq!(
+            ChannelBackfillState::load(tmp.path()).map(|s| s.last_full_reconcile_ms),
+            Some(999),
+        );
     }
 
     #[test]
