@@ -26047,8 +26047,10 @@ mod list_bootstrap_hint_tests {
     /// (no real CRDT events) plus an owner-state Community `Space` so the read
     /// RPCs can resolve `admin_addr`. Mirrors the post-redeem state that
     /// `redeem_invite_inner_with_overrides` seeds via `seed_bootstrap_hint`.
-    /// Returns the wired NodeState, the community hex id, and the registry
-    /// (kept alive — its engine owns a background task torn down at test end).
+    /// Returns the wired NodeState, the community hex id, the registry (kept
+    /// alive — its engine owns a background task torn down at test end), and the
+    /// `TempDir` (the caller owns it so it drops — cleaning up — only after
+    /// `shutdown_all()`, rather than being leaked via `std::mem::forget`).
     async fn seeded_node_state(
         community: SpaceId,
         admin: OwnerAddr,
@@ -26057,6 +26059,7 @@ mod list_bootstrap_hint_tests {
         std::sync::Mutex<crate::NodeState>,
         String,
         Arc<CommunitySyncRegistry>,
+        tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
@@ -26078,9 +26081,6 @@ mod list_bootstrap_hint_tests {
             crdt_state: None,
             nav_emitter: None,
         }));
-        // Keep the tempdir alive for the engine's persist paths; the test
-        // process is short-lived, so leaking is cheaper than threading a guard.
-        std::mem::forget(dir);
 
         let (pub_tx, _pub_rx) = mpsc::channel(8);
         let (_sub_tx, sub_rx) = mpsc::channel(8);
@@ -26152,7 +26152,9 @@ mod list_bootstrap_hint_tests {
             ..crate::NodeState::default()
         });
 
-        (node_state, hex::encode(community.0), registry)
+        // Hand the tempdir to the caller — it must outlive the engine's persist
+        // paths and drop (cleaning up) only after `shutdown_all()` completes.
+        (node_state, hex::encode(community.0), registry, dir)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26177,7 +26179,8 @@ mod list_bootstrap_hint_tests {
             ..Default::default()
         };
 
-        let (node_state, community_hex, registry) = seeded_node_state(community, admin, hint).await;
+        let (node_state, community_hex, registry, dir) =
+            seeded_node_state(community, admin, hint).await;
 
         // list_channels: pre-fix (materialize_now, empty events) → []; the
         // bootstrap hint's two channels must surface, ordered by created_at.
@@ -26212,6 +26215,9 @@ mod list_bootstrap_hint_tests {
             .shutdown_all()
             .await
             .expect("shutdown community registry");
+        // Remove the tempdir only after the engine's final flush completes, so
+        // the persist paths never vanish mid-write.
+        drop(dir);
     }
 }
 
