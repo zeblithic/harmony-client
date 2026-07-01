@@ -1350,9 +1350,17 @@
   // (web/dev mode has no Tauri backend), so neither can crash boot.
   $effect(() => {
     let cancelled = false;
+    // Subscribe BEFORE the initial read so a live "Appear offline" flip that
+    // lands mid-boot can't be overwritten by a late-resolving getPresenceVisibility
+    // seed (CodeRabbit #381). sawLiveUpdate wins over the initial read.
+    let sawLiveUpdate = false;
+    const stop = onPresenceVisibilityChanged((v) => {
+      sawLiveUpdate = true;
+      presenceVisible = v;
+    });
     void getPresenceVisibility()
       .then((v) => {
-        if (!cancelled) presenceVisible = v;
+        if (!cancelled && !sawLiveUpdate) presenceVisible = v;
       })
       .catch((e) => {
         console.warn(
@@ -1360,9 +1368,6 @@
           e instanceof Error ? e.message : String(e),
         );
       });
-    const stop = onPresenceVisibilityChanged((v) => {
-      presenceVisible = v;
-    });
     return () => {
       cancelled = true;
       stop();
@@ -1831,14 +1836,19 @@
       // ZEB-600: subscribe presence for ALL joined communities (not just the
       // active one) so the sidebar + DM dots reflect every community. A shared
       // callback bumps presenceVersion; per-community failures are logged and
-      // skipped. The last subscribe wins as isOnline's active community, but
-      // changeSelectedCommunity re-points it to the user's current selection.
+      // skipped. setActive:false so these background subscribes never clobber the
+      // active roster isOnline() reads — only an explicit selection
+      // (changeSelectedCommunity) points active at a community (CodeRabbit #381).
       for (const navNode of navService.nodes) {
         if (navNode.type === 'community') {
           void presenceService
-            .subscribe(navNode.id, () => {
-              presenceVersion++;
-            })
+            .subscribe(
+              navNode.id,
+              () => {
+                presenceVersion++;
+              },
+              { setActive: false },
+            )
             .catch((e) =>
               console.error(
                 'presence subscribe-all failed for',

@@ -337,6 +337,16 @@ async fn invisible_inner() {
     closing_b.store(true, Ordering::SeqCst);
     pub_handle.abort();
     sub_handle.abort();
+    // Tear down the seeded membership engines (parity with run_inner) so this
+    // test doesn't leave detached registries running (CodeRabbit #381).
+    registry_b
+        .shutdown_all()
+        .await
+        .expect("shutdown registry B");
+    registry_a
+        .shutdown_all()
+        .await
+        .expect("shutdown registry A");
 }
 
 async fn run_inner() {

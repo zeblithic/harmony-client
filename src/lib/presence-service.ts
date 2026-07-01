@@ -80,6 +80,7 @@ export class PresenceService {
   async subscribe(
     communityId: string,
     onUpdate: (members: PresenceMemberDto[]) => void,
+    opts?: { setActive?: boolean },
   ): Promise<void> {
     if (!this.adapter) {
       console.warn('PresenceService.subscribe: no adapter wired; ignoring');
@@ -92,8 +93,13 @@ export class PresenceService {
       this.callbacks.delete(communityId);
       throw new Error(e instanceof Error ? e.message : String(e));
     }
-    // Backend subscribe succeeded → this is now the active community for isOnline.
-    this.activeCommunityId = communityId;
+    // Backend subscribe succeeded → point isOnline at this community UNLESS the
+    // caller opts out. Boot subscribe-all subscribes every joined community but
+    // passes setActive:false so a slow async completion can't clobber the user's
+    // selected roster (CodeRabbit #381); the selection path uses the default.
+    if (opts?.setActive ?? true) {
+      this.activeCommunityId = communityId;
+    }
 
     // Install the push listener and seed initial state (firing onUpdate) from
     // the authoritative snapshot. If EITHER the `listen` install OR the seed
