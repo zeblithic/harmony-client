@@ -721,6 +721,137 @@ mod vault_tests {
         );
     }
 
+    // ── ZEB-429: pre-ZEB-363 relic quarantine ───────────────────────────
+
+    #[test]
+    fn is_pre363_relic_matches_integer_tag_only() {
+        // The relic: integer-version-tagged CBOR (major type 0), like the
+        // 161-byte item observed on Ildwyn (`invalid type: integer 1, expected map`).
+        let mut relic = vec![0x01u8];
+        relic.resize(161, 0x00);
+        assert!(is_pre363_relic(&relic), "integer-tagged payload is a relic");
+        // A real SecretVault serializes as a CBOR map (major type 5) → NOT a relic.
+        let vault_cbor = SecretVault::from_seed([7u8; BLOB_LEN])
+            .to_cbor()
+            .expect("encode");
+        assert!(
+            !is_pre363_relic(&vault_cbor),
+            "a real vault (CBOR map) is never a relic"
+        );
+        // A bare 32-byte legacy seed item is valid → NOT a relic.
+        assert!(!is_pre363_relic(&[0x00u8; BLOB_LEN]));
+        // Other corrupt shapes (major type 7 here) keep the pre-existing
+        // "leave intact / hard-fail" contract → NOT a relic.
+        assert!(!is_pre363_relic(&[0xFFu8; 40]));
+        // Empty item → nothing to quarantine.
+        assert!(!is_pre363_relic(&[]));
+
+        // A well-formed multi-byte uint header (uint8, `0x18` + 1 payload byte)
+        // is still a top-level unsigned integer → a relic.
+        assert!(
+            is_pre363_relic(&[0x18u8, 0xAB]),
+            "complete uint8-tagged payload is a relic"
+        );
+        // Truncated multi-byte header (`0x18` promising a payload byte that is
+        // absent) is malformed CBOR → NOT a relic; must hard-fail.
+        assert!(
+            !is_pre363_relic(&[0x18u8]),
+            "truncated uint8 header is corruption, not a relic"
+        );
+        // Reserved additional-info (`0x1c`) and the illegal indefinite-length
+        // form (`0x1f`) are not well-formed integers → NOT relics.
+        assert!(!is_pre363_relic(&[0x1cu8, 0xAB, 0xCD]));
+        assert!(!is_pre363_relic(&[0x1fu8, 0xAB, 0xCD]));
+    }
+
+    #[test]
+    fn quarantine_relic_between_preserves_then_evicts() {
+        let primary = mock_entry();
+        let backup = mock_entry();
+        let relic = vec![0x01u8, 2, 3, 4, 5];
+        primary.set_secret(&relic).expect("seed relic");
+        quarantine_relic_between(&primary, &backup, &relic).expect("quarantine");
+        assert!(
+            matches!(primary.get_secret(), Err(keyring::Error::NoEntry)),
+            "primary address must be freed"
+        );
+        assert_eq!(
+            backup.get_secret().expect("backup present"),
+            relic,
+            "relic bytes must be preserved verbatim in the backup"
+        );
+    }
+
+    #[test]
+    fn quarantine_relic_between_is_idempotent_on_identical_backup() {
+        let primary = mock_entry();
+        let backup = mock_entry();
+        let relic = vec![0x01u8, 9, 9, 9];
+        primary.set_secret(&relic).expect("seed relic");
+        backup
+            .set_secret(&relic)
+            .expect("pre-existing identical backup");
+        quarantine_relic_between(&primary, &backup, &relic).expect("idempotent quarantine");
+        assert!(
+            matches!(primary.get_secret(), Err(keyring::Error::NoEntry)),
+            "primary still evicted when backup already matches"
+        );
+        assert_eq!(backup.get_secret().expect("backup present"), relic);
+    }
+
+    #[test]
+    fn quarantine_relic_between_refuses_to_clobber_different_backup() {
+        let primary = mock_entry();
+        let backup = mock_entry();
+        let relic = vec![0x01u8, 1, 1, 1];
+        let other = vec![0x01u8, 2, 2, 2];
+        primary.set_secret(&relic).expect("seed relic");
+        backup
+            .set_secret(&other)
+            .expect("pre-existing DIFFERENT backup");
+        let err = quarantine_relic_between(&primary, &backup, &relic)
+            .expect_err("must refuse to clobber a different backup");
+        assert!(err.contains("clobber"), "got: {err}");
+        // Nothing is lost: both the relic and the pre-existing backup stay intact.
+        assert_eq!(primary.get_secret().expect("relic intact"), relic);
+        assert_eq!(backup.get_secret().expect("backup intact"), other);
+    }
+
+    #[test]
+    fn keychain_pre363_relic_is_quarantined_and_unblocks_vault() {
+        let kc = KeychainStore::new_mock();
+        // A pre-ZEB-363 relic (integer-tagged, 161 bytes) sitting at harmony/identity.
+        let mut relic = vec![0x01u8];
+        relic.resize(161, 0xAB);
+        kc.entry.set_secret(&relic).expect("seed relic");
+
+        // load_vault must quarantine (not propagate the decode error) → reports absent.
+        assert!(
+            kc.load_vault()
+                .expect("relic must be quarantined, not error")
+                .is_none(),
+            "a quarantined relic reads as an empty vault address"
+        );
+        // Primary freed; relic preserved verbatim in the backup account.
+        assert!(
+            matches!(kc.entry.get_secret(), Err(keyring::Error::NoEntry)),
+            "the relic must be removed from the primary vault address"
+        );
+        assert_eq!(
+            kc.backup.get_secret().expect("relic preserved in backup"),
+            relic,
+            "the relic bytes must be preserved verbatim (never lost)"
+        );
+        // Migration unblocked: a subsequent seed save now creates a clean vault.
+        kc.save(&[9u8; BLOB_LEN])
+            .expect("save must now create a fresh vault at the freed address");
+        assert_eq!(
+            kc.load_vault().expect("load").expect("present").seed,
+            [9u8; BLOB_LEN],
+            "a fresh vault materializes at the freed address"
+        );
+    }
+
     #[test]
     fn reconcile_after_enc_restore_preserves_app_local_keys() {
         // An encrypted-file force-restore reconciles a stale keychain vault to
@@ -2098,10 +2229,19 @@ impl KeyStore for FileStore {
 
 const KEYCHAIN_SERVICE: &str = "harmony";
 const KEYCHAIN_ACCOUNT: &str = "identity";
+/// ZEB-429: quarantine address for a pre-ZEB-363 relic occupying
+/// `KEYCHAIN_ACCOUNT`. A distinct account under the same service, so the primary
+/// vault address is freed for a clean vault while the relic's bytes (which may be
+/// an old identity's only seed copy) are preserved — never deleted.
+const KEYCHAIN_BACKUP_ACCOUNT: &str = "identity.pre363-backup";
 
 /// OS-native keychain storage via the `keyring` crate.
 pub struct KeychainStore {
     entry: keyring::Entry,
+    /// ZEB-429: backup slot a pre-ZEB-363 relic is copied to before the primary
+    /// is evicted (see `quarantine_pre363_relic`). Eagerly bound so tests can
+    /// inject a mock backend rather than reaching the real keychain.
+    backup: keyring::Entry,
 }
 
 impl KeychainStore {
@@ -2161,15 +2301,21 @@ impl KeychainStore {
         }
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
             .map_err(|e| format!("keychain entry creation failed: {e}"))?;
-        Ok(Self { entry })
+        let backup = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_BACKUP_ACCOUNT)
+            .map_err(|e| format!("keychain backup entry creation failed: {e}"))?;
+        Ok(Self { entry, backup })
     }
 
     /// Create a store backed by the keyring mock credential store (for tests).
+    /// The `backup` slot is an independent mock — modelling two separate keychain
+    /// items, exactly as the real store has two distinct accounts.
     #[cfg(test)]
     pub fn new_mock() -> Self {
-        let credential = keyring::mock::MockCredential::default();
-        let entry = keyring::Entry::new_with_credential(Box::new(credential));
-        Self { entry }
+        let entry =
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        let backup =
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        Self { entry, backup }
     }
 
     /// Create a store that always fails on save (for testing fallback).
@@ -2178,18 +2324,20 @@ impl KeychainStore {
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn new_failing_mock() -> Self {
-        let credential = AlwaysFailOnSave;
-        let entry = keyring::Entry::new_with_credential(Box::new(credential));
-        Self { entry }
+        let entry = keyring::Entry::new_with_credential(Box::new(AlwaysFailOnSave));
+        let backup =
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        Self { entry, backup }
     }
 
     /// Create a store where ALL operations fail (simulates inaccessible keychain).
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn new_load_failing_mock() -> Self {
-        let credential = AlwaysFailOnLoad;
-        let entry = keyring::Entry::new_with_credential(Box::new(credential));
-        Self { entry }
+        let entry = keyring::Entry::new_with_credential(Box::new(AlwaysFailOnLoad));
+        let backup =
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        Self { entry, backup }
     }
 
     /// Delete the keychain entry. Returns `Ok(())` if deleted or not present.
@@ -2208,7 +2356,36 @@ impl KeyStore for KeychainStore {
         match self.entry.get_secret() {
             Ok(bytes) => {
                 let buf = Zeroizing::new(bytes);
-                Ok(Some(item_bytes_to_vault(&buf)?))
+                match item_bytes_to_vault(&buf) {
+                    Ok(v) => Ok(Some(v)),
+                    // ZEB-429: a pre-ZEB-363 build wrote a DIFFERENT payload to this
+                    // same address (harmony/identity) — integer-version-tagged CBOR
+                    // that cannot be a SecretVault (always a CBOR map or a bare
+                    // 32-byte seed). Left intact it permanently blocked vault
+                    // migration: every read Err'd → legacy/file fallback, 3 warns per
+                    // boot. Quarantine the relic (copy to a backup account, verify,
+                    // evict the primary) and report the address as now-empty, so a
+                    // fresh vault is created on the next write. A decode failure that
+                    // is NOT this relic signature (a future map-shaped vault version,
+                    // or other corruption) is left intact and propagated, per the
+                    // pre-existing "never overwrite an unreadable item" contract.
+                    Err(e) => {
+                        if is_pre363_relic(&buf) {
+                            match self.quarantine_pre363_relic(&buf) {
+                                Ok(()) => Ok(None),
+                                Err(qe) => {
+                                    tracing::warn!(
+                                        "ZEB-429: could not quarantine pre-ZEB-363 keychain relic \
+                                         ({qe}); leaving it intact and falling back"
+                                    );
+                                    Err(e)
+                                }
+                            }
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
             }
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(format!("keychain load failed: {e}")),
@@ -2221,6 +2398,99 @@ impl KeyStore for KeychainStore {
             .set_secret(&cbor)
             .map_err(|e| format!("keychain save failed: {e}"))
     }
+}
+
+impl KeychainStore {
+    /// ZEB-429: preserve, then evict, a pre-ZEB-363 relic occupying the vault
+    /// address. Delegates to [`quarantine_relic_between`] with this store's
+    /// primary + backup entries.
+    fn quarantine_pre363_relic(&self, raw: &[u8]) -> Result<(), String> {
+        quarantine_relic_between(&self.entry, &self.backup, raw)
+    }
+}
+
+/// ZEB-429: true iff `bytes` carries the pre-ZEB-363 relic signature — a
+/// **well-formed** top-level CBOR unsigned integer (major type 0, the "version
+/// tag" that decodes as `invalid type: integer 1, expected map`). The current
+/// vault is always a CBOR map (major type 5) or a bare `BLOB_LEN`-byte seed, so
+/// neither is ever misclassified. Only consulted after `item_bytes_to_vault`
+/// has already failed to decode `bytes`.
+///
+/// The header must be a *complete* uint encoding: an inline value (`0x00..=0x17`)
+/// or a `0x18/0x19/0x1a/0x1b` header with its full 1/2/4/8-byte payload present.
+/// Reserved additional-info (`0x1c..=0x1e`), the illegal indefinite form
+/// (`0x1f`), and truncated multi-byte headers are NOT relics — matching mere
+/// major-type bits would let arbitrary corruption be quarantined instead of
+/// hard-failing.
+///
+/// Deliberately narrow: other undecodable shapes (a future map-shaped vault
+/// version, or arbitrary corruption) are NOT relics and stay under the
+/// pre-existing "leave intact / hard-fail" contract — so an older build never
+/// clobbers a newer vault, and genuine corruption is never silently discarded.
+fn is_pre363_relic(bytes: &[u8]) -> bool {
+    // A bare legacy seed is a valid item, never a relic.
+    if bytes.len() == BLOB_LEN {
+        return false;
+    }
+    match bytes.first().copied() {
+        // Inline unsigned integer (value 0..=23): complete in one byte.
+        Some(0x00..=0x17) => true,
+        // uint8/16/32/64 headers: relic only if the promised payload is present.
+        Some(0x18) => bytes.len() >= 2,
+        Some(0x19) => bytes.len() >= 3,
+        Some(0x1a) => bytes.len() >= 5,
+        Some(0x1b) => bytes.len() >= 9,
+        // Reserved (0x1c..=0x1e), indefinite (0x1f), any other major type, or
+        // an empty buffer → not a relic; keep the hard-fail contract.
+        _ => false,
+    }
+}
+
+/// ZEB-429: the store-agnostic quarantine step, split out so tests can inject
+/// mock `primary`/`backup` entries (a real backup entry can't share state with a
+/// `MockCredential`). Copy → verify → delete; never deletes without a verified,
+/// byte-identical backup, so a crash mid-quarantine can never leave zero copies.
+fn quarantine_relic_between(
+    primary: &keyring::Entry,
+    backup: &keyring::Entry,
+    raw: &[u8],
+) -> Result<(), String> {
+    match backup.get_secret() {
+        // Backup already holds these exact bytes → a prior quarantine; idempotent.
+        Ok(existing) => {
+            let existing = Zeroizing::new(existing);
+            if existing.as_slice() != raw {
+                return Err(
+                    "backup account already holds different bytes; refusing to clobber it"
+                        .to_string(),
+                );
+            }
+        }
+        Err(keyring::Error::NoEntry) => {
+            backup
+                .set_secret(raw)
+                .map_err(|e| format!("relic backup write failed: {e}"))?;
+            // Confirm the copy is durable + byte-exact BEFORE evicting the primary.
+            let back = Zeroizing::new(
+                backup
+                    .get_secret()
+                    .map_err(|e| format!("relic backup read-back failed: {e}"))?,
+            );
+            if back.as_slice() != raw {
+                return Err("relic backup read-back mismatch; leaving the relic intact".to_string());
+            }
+        }
+        Err(e) => return Err(format!("relic backup probe failed: {e}")),
+    }
+    // Backup verified present + identical → safe to free the primary address.
+    primary
+        .delete_credential()
+        .map_err(|e| format!("relic eviction failed: {e}"))?;
+    tracing::info!(
+        "ZEB-429: quarantined a pre-ZEB-363 keychain relic to account \
+         '{KEYCHAIN_BACKUP_ACCOUNT}'; a fresh secret vault will be created on next write"
+    );
+    Ok(())
 }
 
 // ── Passphrase-file parser ─────────────────────────────────────────────
