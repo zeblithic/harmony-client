@@ -1644,6 +1644,137 @@ mod tests {
         driver.abort();
     }
 
+    /// ZEB-599 Direction 1 (PR #384 review, CodeRabbit): a presence kick that
+    /// arrives while the driver is mid-backoff (`WaitUntil`, latch unsatisfied)
+    /// must re-arm with a FULL reconcile (`since = None`) after the cooldown —
+    /// NOT the incremental watermark (which the epoch `WaitUntil` arm uses),
+    /// and NOT the backoff-retry's original `since`. Mirror of
+    /// `root_driver_epoch_bump_mid_backoff_requeries_after_cooldown`, but on the
+    /// presence path and asserting the full-vs-incremental `since`.
+    #[tokio::test(start_paused = true)]
+    async fn backfill_driver_presence_kick_mid_backoff_requeries_full_after_cooldown() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let counter = Arc::clone(&requests);
+        let since_log = Arc::clone(&sinces);
+        // NoReply leaves the latch unsatisfied → the driver backs off
+        // (`WaitUntil`) instead of parking on Idle.
+        let request_page = move |since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            let since_log = Arc::clone(&since_log);
+            async move {
+                since_log.lock().unwrap().push(since);
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::NoReply
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (presence_tx, presence_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(Some(hlc(100))),
+            request_page,
+            // Watermark advanced to 200 — a FULL re-arm must IGNORE it.
+            || async { Some(hlc(200)) },
+            shutdown_rx,
+            None,              // no transport-epoch watch — isolate the presence path
+            Some(presence_rx), // ZEB-599 presence reachability watch
+            None,              // no periodic floor — isolate the presence kick
+            move || start.elapsed().as_millis() as u64,
+            None,
+        ));
+        // Request #1 fires (NoReply) → the driver enters its backoff (WaitUntil).
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "must back off (WaitUntil) on NoReply"
+        );
+        // Presence kick mid-backoff. Send + yield BEFORE advancing time so the
+        // presence arm (ready immediately) wins the select over the not-yet-
+        // elapsed backoff sleep; the driver then parks inside `cooldown_wait`,
+        // abandoning the sleep future. Advancing past the cooldown boundary
+        // fires the FULL reconcile deterministically.
+        presence_tx.send(1).expect("presence bump");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sinces.lock().unwrap().clone(),
+            vec![Some(hlc(100)), None],
+            "presence kick mid-backoff must re-arm FULL (None), not the \
+             incremental watermark (200) nor the backoff-retry since (100)"
+        );
+        driver.abort();
+    }
+
+    /// ZEB-599 Direction 1 (PR #384 review, CodeRabbit): a presence SENDER drop
+    /// mid-backoff must degrade the driver to no-presence mode — backoff
+    /// retries continue — not exit with the latch unsatisfied (which would
+    /// strand the channel without backfill until engine restart). Mirror of
+    /// `backfill_driver_epoch_sender_drop_degrades_to_backoff_retries` on the
+    /// presence path (exercises the `full_resync_rx = None; continue;` branch).
+    #[tokio::test(start_paused = true)]
+    async fn backfill_driver_presence_sender_drop_degrades_to_backoff_retries() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_page = move |_since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::NoReply
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (presence_tx, presence_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None },
+            shutdown_rx,
+            None,              // no transport-epoch watch — isolate the presence-drop path
+            Some(presence_rx), // ZEB-599 presence reachability watch
+            None,
+            move || start.elapsed().as_millis() as u64,
+            None,
+        ));
+        // Request #1 fires (NoReply) and the driver enters its backoff.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Drop the presence sender, then give the driver time to process the
+        // closed-watch wakeup and re-enter the (now presence-less) wait.
+        drop(presence_tx);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "presence sender drop mid-backoff must not end the driver"
+        );
+        tokio::time::advance(Duration::from_millis(BACKFILL_RETRY_BASE_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        driver.abort();
+    }
+
     /// PR #230 review (CodeAnt): an epoch SENDER drop mid-backoff must
     /// degrade the driver to no-epoch mode — backoff retries continue —
     /// not exit with the latch unsatisfied (which would strand the
