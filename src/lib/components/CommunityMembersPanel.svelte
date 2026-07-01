@@ -104,10 +104,23 @@
     isLastAdmin: viewerIsLastAdmin,
   });
   let searchTrimmed = $derived(searchQuery.trim());
+  // ZEB-600: self is always shown online (see MemberRow) unless invisible; the
+  // panel only knows `isOnline`, so treat self as online here for count + sort.
+  // (Invisible self-styling is handled in MemberRow via `selfInvisible`.)
+  function memberOnline(m: CommunityMember): boolean {
+    return m.address === ownAddress || (isOnline?.(m.address) ?? false);
+  }
+  // ZEB-600: sort online-first (stable — Array.sort keeps the backend order
+  // within each group), so who's around floats to the top.
   let joined = $derived(
-    members.filter(
-      (m) => m.status === 'joined' && matchesSearch(m, searchTrimmed)
-    )
+    members
+      .filter((m) => m.status === 'joined' && matchesSearch(m, searchTrimmed))
+      .sort((a, b) => Number(memberOnline(b)) - Number(memberOnline(a)))
+  );
+  // ZEB-600: count of online joined members (incl. yourself when visible),
+  // independent of the search filter.
+  let onlineCount = $derived(
+    members.filter((m) => m.status === 'joined' && memberOnline(m)).length
   );
   let banned = $derived(
     members.filter(
@@ -248,7 +261,9 @@
 
 <section class="community-members-panel">
   <header class="panel-header">
-    <h2 class="panel-title">Community Members</h2>
+    <h2 class="panel-title">
+      Community Members{#if onlineCount > 0} · {onlineCount} online{/if}
+    </h2>
     <input
       type="search"
       placeholder="Filter members..."
