@@ -745,6 +745,23 @@ mod vault_tests {
         assert!(!is_pre363_relic(&[0xFFu8; 40]));
         // Empty item → nothing to quarantine.
         assert!(!is_pre363_relic(&[]));
+
+        // A well-formed multi-byte uint header (uint8, `0x18` + 1 payload byte)
+        // is still a top-level unsigned integer → a relic.
+        assert!(
+            is_pre363_relic(&[0x18u8, 0xAB]),
+            "complete uint8-tagged payload is a relic"
+        );
+        // Truncated multi-byte header (`0x18` promising a payload byte that is
+        // absent) is malformed CBOR → NOT a relic; must hard-fail.
+        assert!(
+            !is_pre363_relic(&[0x18u8]),
+            "truncated uint8 header is corruption, not a relic"
+        );
+        // Reserved additional-info (`0x1c`) and the illegal indefinite-length
+        // form (`0x1f`) are not well-formed integers → NOT relics.
+        assert!(!is_pre363_relic(&[0x1cu8, 0xAB, 0xCD]));
+        assert!(!is_pre363_relic(&[0x1fu8, 0xAB, 0xCD]));
     }
 
     #[test]
@@ -2393,18 +2410,40 @@ impl KeychainStore {
 }
 
 /// ZEB-429: true iff `bytes` carries the pre-ZEB-363 relic signature — a
-/// top-level CBOR **unsigned integer** (major type 0, the "version tag" that
-/// decodes as `invalid type: integer 1, expected map`). The current vault is
-/// always a CBOR map (major type 5) or a bare `BLOB_LEN`-byte seed, so neither is
-/// ever misclassified. Only consulted after `item_bytes_to_vault` has already
-/// failed to decode `bytes`.
+/// **well-formed** top-level CBOR unsigned integer (major type 0, the "version
+/// tag" that decodes as `invalid type: integer 1, expected map`). The current
+/// vault is always a CBOR map (major type 5) or a bare `BLOB_LEN`-byte seed, so
+/// neither is ever misclassified. Only consulted after `item_bytes_to_vault`
+/// has already failed to decode `bytes`.
+///
+/// The header must be a *complete* uint encoding: an inline value (`0x00..=0x17`)
+/// or a `0x18/0x19/0x1a/0x1b` header with its full 1/2/4/8-byte payload present.
+/// Reserved additional-info (`0x1c..=0x1e`), the illegal indefinite form
+/// (`0x1f`), and truncated multi-byte headers are NOT relics — matching mere
+/// major-type bits would let arbitrary corruption be quarantined instead of
+/// hard-failing.
 ///
 /// Deliberately narrow: other undecodable shapes (a future map-shaped vault
 /// version, or arbitrary corruption) are NOT relics and stay under the
 /// pre-existing "leave intact / hard-fail" contract — so an older build never
 /// clobbers a newer vault, and genuine corruption is never silently discarded.
 fn is_pre363_relic(bytes: &[u8]) -> bool {
-    bytes.len() != BLOB_LEN && bytes.first().is_some_and(|&b| (b >> 5) == 0)
+    // A bare legacy seed is a valid item, never a relic.
+    if bytes.len() == BLOB_LEN {
+        return false;
+    }
+    match bytes.first().copied() {
+        // Inline unsigned integer (value 0..=23): complete in one byte.
+        Some(0x00..=0x17) => true,
+        // uint8/16/32/64 headers: relic only if the promised payload is present.
+        Some(0x18) => bytes.len() >= 2,
+        Some(0x19) => bytes.len() >= 3,
+        Some(0x1a) => bytes.len() >= 5,
+        Some(0x1b) => bytes.len() >= 9,
+        // Reserved (0x1c..=0x1e), indefinite (0x1f), any other major type, or
+        // an empty buffer → not a relic; keep the hard-fail contract.
+        _ => false,
+    }
 }
 
 /// ZEB-429: the store-agnostic quarantine step, split out so tests can inject
