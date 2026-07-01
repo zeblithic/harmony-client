@@ -637,6 +637,8 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
             signing_key: Arc::clone(&bob_comm_sk),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
+            // ZEB-599 Direction 1: no presence watch in this integration harness.
+            presence_resync_rx: None,
         });
     let bob_hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
         Arc::new(TokioMutex::new(BTreeMap::new()));

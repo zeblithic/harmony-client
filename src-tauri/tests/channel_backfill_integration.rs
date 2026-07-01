@@ -226,6 +226,8 @@ fn build_registry(session: &Arc<zenoh::Session>, seed: u8, device_id: &str) -> R
             ..Default::default()
         },
         transport_epoch_rx: None,
+        // ZEB-599 Direction 1: no presence watch in this integration harness.
+        presence_resync_rx: None,
     });
     RegistryHandle {
         registry,

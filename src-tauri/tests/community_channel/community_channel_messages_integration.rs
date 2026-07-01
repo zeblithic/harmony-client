@@ -297,6 +297,8 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             ..Default::default()
         },
         transport_epoch_rx: None,
+        // ZEB-599 Direction 1: no presence watch in this integration harness.
+        presence_resync_rx: None,
     });
     let registry_b = ChannelLogRegistry::new(ChannelLogRegistryConfig {
         adapter_request_tx: adapter_tx_b,
@@ -312,6 +314,8 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             ..Default::default()
         },
         transport_epoch_rx: None,
+        // ZEB-599 Direction 1: no presence watch in this integration harness.
+        presence_resync_rx: None,
     });
 
     // B's `channel-message-received` + `channel-backfill-progress`

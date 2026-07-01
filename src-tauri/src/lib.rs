@@ -3600,6 +3600,16 @@ pub async fn start_node_inner(
         // Built unconditionally — without an owner identity no
         // receivers exist and the event loop's send_modify is a no-op.
         let (transport_epoch_tx, transport_epoch_rx) = tokio::sync::watch::channel(0u64);
+        // ZEB-599 Direction 1: presence-driven full-reconcile watch. The SENDER
+        // goes to `event_loop::run`, which hands it to each community presence
+        // subscriber — bumped whenever a new roster device (a new potential
+        // holder) appears cross-WAN. RECEIVER clones go into every channel-log
+        // backfill driver so a satisfied driver re-arms with a FULL reconcile
+        // within the cooldown — the fast, relay-mediated analogue of the ~1h
+        // anti-entropy floor. Built unconditionally (no owner identity ⇒ no
+        // receivers ⇒ the subscriber's send is a no-op), mirroring
+        // `transport_epoch` above.
+        let (presence_resync_tx, presence_resync_rx) = tokio::sync::watch::channel(0u64);
         // ZEB-270 Phase 3 Task 4.5: bridge channel for the channel-log
         // adapter requests. Built unconditionally — even when no owner
         // identity is loaded, `event_loop::run` needs to be passed the
@@ -5222,6 +5232,10 @@ pub async fn start_node_inner(
                             // refresh) — channel-log backfill drivers park on
                             // Idle and re-arm on peer arrival/recovery.
                             transport_epoch_rx: Some(transport_epoch_rx.clone()),
+                            // ZEB-599 Direction 1: presence-driven fast
+                            // full-reconcile watch (sender lives in
+                            // event_loop::run's presence subscribers).
+                            presence_resync_rx: Some(presence_resync_rx.clone()),
                         },
                     );
                     // Clones of the registry: one for the delta
@@ -9078,6 +9092,11 @@ pub async fn start_node_inner(
                                 // 5s peer-refresh arm bumps it on every
                                 // never-before-seen zenoh session id.
                                 transport_epoch_tx,
+                                // ZEB-599 Direction 1: presence-driven
+                                // full-reconcile sender — handed to each
+                                // community presence subscriber, bumped when a
+                                // new roster device (potential holder) appears.
+                                presence_resync_tx,
                             )
                             .await;
                         });
@@ -24070,6 +24089,8 @@ mod create_community_inner_tests {
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
+            // ZEB-599 Direction 1: no presence watch in this test harness.
+            presence_resync_rx: None,
         });
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -28543,6 +28564,8 @@ mod redeem_invite_inner_tests {
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
+            // ZEB-599 Direction 1: no presence watch in this test harness.
+            presence_resync_rx: None,
         });
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -29928,6 +29951,8 @@ mod zeb436_orphan_adoption_tests {
             signing_key: std::sync::Arc::clone(&signing_key),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
+            // ZEB-599 Direction 1: no presence watch in this test harness.
+            presence_resync_rx: None,
         });
 
         // ── Fabricate the orphaned dir exactly as a healthy engine left

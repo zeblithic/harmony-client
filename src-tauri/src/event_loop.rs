@@ -882,6 +882,13 @@ pub async fn run(
     // catch-up path pass `tokio::sync::watch::channel(0u64).0` (a
     // sender with no receivers — send_modify is then a no-op).
     transport_epoch_tx: tokio::sync::watch::Sender<u64>,
+    // ZEB-599 Direction 1: presence-driven full-reconcile sender. Cloned into
+    // each community presence subscriber; bumped when a new roster device
+    // (potential holder) appears so channel-log backfill drivers re-arm with a
+    // FULL reconcile within the cooldown instead of waiting the ~1h floor. Test
+    // callers that don't exercise presence pass a receiver-less sender (bump is
+    // then a no-op), same as `transport_epoch_tx`.
+    presence_resync_tx: tokio::sync::watch::Sender<u64>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -2988,6 +2995,9 @@ pub async fn run(
             let closing_for_presence = Arc::clone(&closing);
             let map_for_presence = std::sync::Arc::clone(&community_presence_map);
             let now_ms_for_presence = std::sync::Arc::clone(&voice_now_ms);
+            // ZEB-599 Direction 1: presence-driven full-reconcile sender —
+            // moved into the presence task, cloned per subscriber below.
+            let presence_resync_tx_for_presence = presence_resync_tx;
             tokio::spawn(async move {
                 use std::collections::HashMap;
                 let mut handles: HashMap<
@@ -3073,6 +3083,11 @@ pub async fn run(
                                     app_for_presence.clone(),
                                     Arc::clone(&closing_for_presence),
                                     std::sync::Arc::clone(&now_ms_for_presence),
+                                    // ZEB-599 Direction 1: kick channel-log
+                                    // backfill drivers into a full reconcile
+                                    // when this community's roster gains a
+                                    // device (a new potential holder).
+                                    presence_resync_tx_for_presence.clone(),
                                 );
                             handles.insert(community_id, (pub_handle, sub_handle));
                             // Emit an INITIAL empty roster so the UI has a

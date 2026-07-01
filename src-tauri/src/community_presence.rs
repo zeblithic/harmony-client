@@ -503,6 +503,11 @@ pub fn spawn_community_presence_subscriber(
     app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: Arc<AtomicBool>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    // ZEB-599 Direction 1: bumped on a roster device-set change so channel-log
+    // backfill drivers re-arm with a FULL reconcile — the fast, relay-mediated
+    // analogue of the ~1h anti-entropy floor. A bump with no receivers is a
+    // harmless no-op (same as `transport_epoch`).
+    resync_tx: tokio::sync::watch::Sender<u64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let sub = match session.declare_subscriber(&topic).await {
@@ -553,6 +558,13 @@ pub fn spawn_community_presence_subscriber(
                 g.apply(&community, &signed.beacon, (now_ms)())
             };
             if changed {
+                // ZEB-599 Direction 1: a roster device-set change means a new
+                // potential holder just became reachable cross-WAN → kick every
+                // channel-log backfill driver into a FULL reconcile (the driver
+                // cooldown-gates it, and the ~1h floor stays the backstop).
+                // `send_modify` notifies all watchers; a bump with no receivers
+                // is a harmless no-op (mirrors the transport-epoch bump).
+                resync_tx.send_modify(|e| *e = e.wrapping_add(1));
                 let members = {
                     let g = map.lock().await;
                     g.online_owners(&community)

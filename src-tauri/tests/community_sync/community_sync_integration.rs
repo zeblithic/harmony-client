@@ -2058,6 +2058,8 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         signing_key: Arc::clone(&signing_key),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
+        // ZEB-599 Direction 1: no presence watch in this integration harness.
+        presence_resync_rx: None,
     });
 
     // Pre-call snapshot of owner-state's canonical byte encoding. Any
@@ -2920,6 +2922,8 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
         signing_key: Arc::clone(&bob_signing_key),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
+        // ZEB-599 Direction 1: no presence watch in this integration harness.
+        presence_resync_rx: None,
     });
 
     // Pre-call snapshot of owner-state's canonical encoding — used to detect

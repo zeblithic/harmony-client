@@ -202,6 +202,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
                     None, // ZEB-418 P2: routing_republish not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
+                    tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                 )
                 .await;
             });
@@ -503,6 +504,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
                     None, // ZEB-418 P2: routing_republish not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
+                    tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                 )
                 .await;
             });
@@ -911,6 +913,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
                     None, // ZEB-418 P2: routing_republish not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
+                    tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                 )
                 .await;
             });
@@ -1177,6 +1180,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
                     None, // ZEB-418 P2: routing_republish not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
+                    tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                 )
                 .await;
             });
@@ -1506,6 +1510,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in this test)
                     None, // ZEB-418 P2: routing_republish not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
+                    tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                 )
                 .await;
             });
