@@ -19139,9 +19139,14 @@ pub(crate) async fn list_community_members_impl(
         )
     })?;
 
+    // ZEB-598: hint-AWARE materialize. A freshly-redeemed invite seeds the
+    // community's roster into `bootstrap_hint` (no CRDT events yet); the
+    // hint-blind `materialize_now` would report a near-empty roster until real
+    // events happen to land. `materialized` returns the hint while the event
+    // log is empty and is superseded by the authoritative CRDT thereafter.
     let materialized = {
         let g = engine_state.lock().await;
-        g.materialize_now(admin_addr)
+        g.materialized(admin_addr)
     };
 
     Ok(member_info_for(&materialized))
@@ -21015,9 +21020,15 @@ pub(crate) async fn list_channels_impl(
         )
     })?;
 
+    // ZEB-598: hint-AWARE materialize. A freshly-redeemed invite embeds its
+    // channel configs in `bootstrap_hint` (no CRDT events yet); the hint-blind
+    // `materialize_now` would return an empty channel list until real events
+    // happen to land locally (which may never happen for a quiet channel).
+    // `materialized` returns the hint while the event log is empty and is
+    // superseded by the authoritative CRDT thereafter.
     let materialized = {
         let g = engine_state.lock().await;
-        g.materialize_now(admin_addr)
+        g.materialized(admin_addr)
     };
 
     let mut rows: Vec<ChannelInfoDto> = materialized
@@ -25966,6 +25977,241 @@ mod create_community_inner_tests {
             &ctx,
         )
         .expect("cert-bearing bootstrap Join must verify against empty membership");
+    }
+}
+
+/// ZEB-598 regression: `list_channels` / `list_community_members` must read a
+/// freshly-redeemed community's inline bootstrap snapshot (seeded as the
+/// `CommunityState.bootstrap_hint`) through the hint-aware `materialized()`
+/// accessor — NOT the hint-blind `materialize_now()`. Before the fix both read
+/// RPCs walked `materialize_now`, so a just-joined member saw an empty channel
+/// list and a near-empty roster until a real CRDT event happened to land
+/// locally (which may never happen for a quiet channel). This exercises the two
+/// impls end-to-end against an engine that holds ONLY a bootstrap hint (zero
+/// events), so it fails on `materialize_now` and passes on `materialized`.
+#[cfg(test)]
+mod list_bootstrap_hint_tests {
+    use crate::community_membership::{
+        ChannelId, ChannelInfo, ChannelKind, MaterializedMembership, MemberState, MemberStatus,
+    };
+    use crate::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use crate::content_store::{ContentStore, RuntimeContentStore};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+    use ed25519_dalek::SigningKey;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// The bootstrap-hint path never consults the resolver (membership comes
+    /// verbatim from the seeded hint), so a `None` resolver is sufficient.
+    struct NopResolver;
+    #[async_trait::async_trait]
+    impl IdentityResolver for NopResolver {
+        async fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
+            None
+        }
+    }
+
+    fn joined_member(seed: &str) -> MemberState {
+        MemberState {
+            status: MemberStatus::Joined,
+            joined_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: seed.into(),
+            },
+            left_at: None,
+            enrolled_device_keys: BTreeSet::new(),
+        }
+    }
+
+    fn text_channel(name: &str, wall_ms: u64) -> ChannelInfo {
+        ChannelInfo {
+            name: name.to_string(),
+            write_power: 0,
+            kind: ChannelKind::Text,
+            created_at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "seed".into(),
+            },
+            deleted_at: None,
+        }
+    }
+
+    /// Build a `NodeState` whose community engine holds ONLY a bootstrap hint
+    /// (no real CRDT events) plus an owner-state Community `Space` so the read
+    /// RPCs can resolve `admin_addr`. Mirrors the post-redeem state that
+    /// `redeem_invite_inner_with_overrides` seeds via `seed_bootstrap_hint`.
+    /// Returns the wired NodeState, the community hex id, and the registry
+    /// (kept alive — its engine owns a background task torn down at test end).
+    async fn seeded_node_state(
+        community: SpaceId,
+        admin: OwnerAddr,
+        hint: MaterializedMembership,
+    ) -> (
+        std::sync::Mutex<crate::NodeState>,
+        String,
+        Arc<CommunitySyncRegistry>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            Duration::from_millis(1000),
+        ));
+
+        let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_id: "test-dev".into(),
+            content_store: cs,
+            identity_resolver: Arc::new(NopResolver),
+            identity_dir: dir.path().to_path_buf(),
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            error_tx: None,
+            delta_tx: None,
+            self_owner: admin,
+            signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
+            crdt_state: None,
+            nav_emitter: None,
+        }));
+        // Keep the tempdir alive for the engine's persist paths; the test
+        // process is short-lived, so leaking is cheaper than threading a guard.
+        std::mem::forget(dir);
+
+        let (pub_tx, _pub_rx) = mpsc::channel(8);
+        let (_sub_tx, sub_rx) = mpsc::channel(8);
+        registry
+            .spawn_engine_inner_now(
+                community,
+                EpochKey::new([0x33; 32]),
+                admin,
+                /* is_invite_only */ true,
+                pub_tx,
+                sub_rx,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("spawn community engine");
+
+        // Seed the inline bootstrap snapshot as the hint. No CRDT events are
+        // inserted, so `materialized()` returns this hint verbatim while
+        // `materialize_now()` (the pre-fix accessor) returns an empty view.
+        registry
+            .engine_arc(&community)
+            .await
+            .expect("engine present after spawn")
+            .state()
+            .lock()
+            .await
+            .seed_bootstrap_hint(hint);
+
+        // Owner-state Community Space — the read RPCs read `admin_addr` here.
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "seed".into(),
+        };
+        let mut owner_state = OwnerState::default();
+        owner_state.spaces.insert(
+            community,
+            Space {
+                id: community,
+                kind: SpaceKind::Community,
+                parent: None,
+                community_id: None,
+                name: "test-community".into(),
+                transport: None,
+                members: vec![],
+                custom_name: None,
+                notification_pref: None,
+                left_at: None,
+                created_at: hlc.clone(),
+                updated_at: hlc,
+                content_key: None,
+                prior_content_keys: vec![],
+                current_epoch: Some(0),
+                current_epoch_key: Some(EpochKey::new([0x33; 32])),
+                old_epoch_keys: BTreeMap::new(),
+                admin_addr: Some(admin),
+                is_invite_only: Some(true),
+                shared_in_profile: false,
+                pending_join_at: None,
+            },
+        );
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+        let node_state = std::sync::Mutex::new(crate::NodeState {
+            crdt_state: Some(crdt_state),
+            community_registry: Some(Arc::clone(&registry)),
+            ..crate::NodeState::default()
+        });
+
+        (node_state, hex::encode(community.0), registry)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_channels_and_members_see_bootstrap_hint_before_any_crdt_event() {
+        let community = SpaceId([0xc0; 16]);
+        let admin = OwnerAddr([0xad; 16]);
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+
+        let mut members = BTreeMap::new();
+        members.insert(admin, joined_member("admin"));
+        members.insert(alice, joined_member("alice"));
+        members.insert(bob, joined_member("bob"));
+
+        let mut channels = BTreeMap::new();
+        channels.insert(ChannelId([0x11; 16]), text_channel("general", 1));
+        channels.insert(ChannelId([0x22; 16]), text_channel("random", 2));
+
+        let hint = MaterializedMembership {
+            members,
+            channels,
+            ..Default::default()
+        };
+
+        let (node_state, community_hex, registry) = seeded_node_state(community, admin, hint).await;
+
+        // list_channels: pre-fix (materialize_now, empty events) → []; the
+        // bootstrap hint's two channels must surface, ordered by created_at.
+        let listed_channels = crate::list_channels_impl(&node_state, community_hex.clone())
+            .await
+            .expect("list_channels_impl ok");
+        assert_eq!(
+            listed_channels
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["general", "random"],
+            "list_channels must return the bootstrap hint's channels, ordered by created_at"
+        );
+
+        // list_community_members: pre-fix (materialize_now, empty events) →
+        // near-empty; the hint's three members must surface.
+        let listed_members = crate::list_community_members_impl(&node_state, community_hex)
+            .await
+            .expect("list_community_members_impl ok");
+        let addrs: BTreeSet<String> = listed_members.iter().map(|m| m.addr.clone()).collect();
+        assert_eq!(
+            listed_members.len(),
+            3,
+            "roster must reflect the hint's three members"
+        );
+        assert!(addrs.contains(&hex::encode(admin.0)));
+        assert!(addrs.contains(&hex::encode(alice.0)));
+        assert!(addrs.contains(&hex::encode(bob.0)));
+
+        registry
+            .shutdown_all()
+            .await
+            .expect("shutdown community registry");
     }
 }
 
