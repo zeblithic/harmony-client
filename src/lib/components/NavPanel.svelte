@@ -17,6 +17,7 @@
     onSettingsClick,
     onModeChange,
     profileLookup,
+    presenceOnline,
     appMode = 'messages',
     contentItems,
     storageBuddies,
@@ -46,6 +47,8 @@
     onSettingsClick?: () => void;
     onModeChange?: (mode: AppMode) => void;
     profileLookup?: (address: string) => string | undefined;
+    /** ZEB-600: presence-dot resolver forwarded to NavTree → NavNodeRow. */
+    presenceOnline?: (node: NavNode) => boolean;
     appMode?: AppMode;
     contentItems?: ContentItem[];
     storageBuddies?: StorageBuddy[];
@@ -303,6 +306,7 @@
           onDisplayModeChange={changeDisplayMode}
           onSortOrderChange={changeSortOrder}
           {profileLookup}
+          {presenceOnline}
         />
         <!-- ZEB-553 item 13: zero-community empty-state CTA. Suppressed while a
              search is active (the empty nav is then a "no results" state, not a

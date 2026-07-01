@@ -13,6 +13,7 @@
     onDisplayModeChange,
     onSortOrderChange,
     profileLookup,
+    presenceOnline,
   }: {
     nodes: NavNode[];
     parentId: string | null;
@@ -22,6 +23,8 @@
     onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
     onSortOrderChange?: (nodeId: string, order: SortOrder) => void;
     profileLookup?: (address: string) => string | undefined;
+    /** ZEB-600: presence-dot resolver, threaded down to every NavNodeRow. */
+    presenceOnline?: (node: NavNode) => boolean;
   } = $props();
 
   let sortedChildren = $derived.by(() => {
@@ -49,9 +52,10 @@
     {onClick}
     {onDisplayModeChange}
     {onSortOrderChange}
+    {presenceOnline}
   />
 
   {#if (child.type === 'folder' || child.type === 'community') && child.expanded}
-    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} />
+    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} {presenceOnline} />
   {/if}
 {/each}

@@ -2881,6 +2881,18 @@
         onSettingsClick={() => { showSettings = !showSettings; }}
         settingsActive={showSettings}
         profileLookup={(addr) => navService.profileLookup(addr)}
+        presenceOnline={(node) => {
+          // ZEB-600: reading presenceVersion registers the reactive dependency
+          // so every NavNodeRow dot recomputes when a beacon lands.
+          void presenceVersion;
+          if (node.type === 'community') {
+            return presenceService.hasOthersOnline(node.id, selfOwnerId ?? '');
+          }
+          if ((node.type === 'dm' || node.type === 'group-chat') && node.peer) {
+            return presenceService.isOnlineAnywhere(node.peer.address);
+          }
+          return false;
+        }}
         onModeChange={switchMode}
         {appMode}
         contentItems={allFileContents}
