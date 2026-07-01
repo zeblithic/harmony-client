@@ -31129,9 +31129,14 @@ async fn set_presence_visibility(
     if let Some(m) = map {
         m.lock().await.set_visible(visible);
     }
-    // Durable: persist so an invisible user stays hidden across restarts.
+    // Durable: persist so an invisible user stays hidden across restarts. Offload
+    // the sync std::fs load+save off the Tokio worker — this seam is reachable
+    // over the async IPC/headless surface (matches connectivity_set_identity_
+    // discoverable; PR #207/#305).
     let path = connectivity_settings_path(settings_path)?;
-    persist_presence_visibility(&path, visible)?;
+    tokio::task::spawn_blocking(move || persist_presence_visibility(&path, visible))
+        .await
+        .map_err(|e| format!("persist presence visibility task: {e}"))??;
 
     // Notify the frontend so any panel showing self-presence (e.g. the member
     // list self-dot) re-renders without polling. Mirrors the identity-
@@ -31166,7 +31171,14 @@ async fn get_presence_visibility(
         return Ok(m.lock().await.is_visible());
     }
     let path = connectivity_settings_path(settings_path)?;
-    Ok(!pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible)
+    // Offload the sync std::fs read off the Tokio worker (same rationale as the
+    // setter — this seam is reachable over the async IPC/headless surface).
+    let invisible = tokio::task::spawn_blocking(move || {
+        pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible
+    })
+    .await
+    .map_err(|e| format!("load presence visibility task: {e}"))?;
+    Ok(!invisible)
 }
 
 /// IPC: ZEB-537. Snapshot the current online roster for a community without
