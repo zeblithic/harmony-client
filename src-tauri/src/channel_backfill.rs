@@ -578,6 +578,14 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     // advanced by `resync_interval_ms` after each fire. `None` (no
     // persist) leaves the legacy interval-from-spawn path untouched.
     let mut resync_deadline: Option<u64> = resync_persist.as_ref().map(|p| p.first_deadline_ms);
+    // ZEB-599 D3: `harmony_channel` debug events pin which re-arm path a
+    // recovery came through on a live fleet (RUST_LOG=info,harmony_channel=debug).
+    tracing::debug!(
+        target: "harmony_channel",
+        floor_deadline_ms = ?resync_deadline,
+        restart_aware = resync_persist.is_some(),
+        "backfill driver started"
+    );
     loop {
         // Cheap pre-check: covers "stopped before the driver's first
         // poll" (spawn/stop race) without waiting for a `changed()`.
@@ -620,7 +628,13 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
-                        latch.reset(current_watermark().await);
+                        let wm = current_watermark().await;
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            since = ?wm,
+                            "re-arm: transport-epoch bump (incremental)"
+                        );
+                        latch.reset(wm);
                     }
                     kicked = epoch_bump(&mut full_resync_rx) => {
                         // ZEB-599 Direction 1: a presence-driven reachability
@@ -643,6 +657,10 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "re-arm: presence kick (full reconcile, since=None)"
+                        );
                         latch.reset(None);
                     }
                     _ = resync_tick(resync_arg) => {
@@ -665,6 +683,10 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         // the interval is the rate limit (a re-armed no-holder
                         // latch backs off via WaitUntil, never straight back to
                         // Idle).
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "re-arm: periodic floor fired (full reconcile, since=None)"
+                        );
                         latch.reset(None);
                         // ZEB-599: record + persist this full reconcile,
                         // then set the next deadline a full interval out.
@@ -673,6 +695,12 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                             (p.on_full_reconcile)(fired_at);
                             if let Some(ms) = resync_interval_ms {
                                 resync_deadline = Some(fired_at.saturating_add(ms));
+                                tracing::debug!(
+                                    target: "harmony_channel",
+                                    fired_at_ms = fired_at,
+                                    next_deadline_ms = ?resync_deadline,
+                                    "floor fire persisted; next absolute deadline set"
+                                );
                             }
                         }
                     }
@@ -703,7 +731,13 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
-                        latch.reset(current_watermark().await);
+                        let wm = current_watermark().await;
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            since = ?wm,
+                            "re-arm: transport-epoch bump mid-backoff (incremental)"
+                        );
+                        latch.reset(wm);
                     }
                     kicked = epoch_bump(&mut full_resync_rx) => {
                         // ZEB-599 Direction 1: a presence kick mid-backoff — a
@@ -717,6 +751,10 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "re-arm: presence kick mid-backoff (full reconcile, since=None)"
+                        );
                         latch.reset(None);
                     }
                     changed = shutdown_rx.changed() => {
@@ -730,8 +768,19 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
             }
             BackfillAction::Request { since } => {
                 last_request_at = Some(now_ms());
+                tracing::debug!(
+                    target: "harmony_channel",
+                    since = ?since,
+                    "backfill page request"
+                );
                 match request_page(since).await {
                     PageFetch::Completed(replies, limit) => {
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            replies,
+                            limit,
+                            "backfill page completed"
+                        );
                         let full_page = limit > 0 && replies >= limit;
                         // Watermark re-read from the LOG (only verified
                         // events land there) rather than trusted from the
@@ -752,7 +801,13 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                             now_ms(),
                         );
                     }
-                    PageFetch::NoReply => latch.on_no_reply(now_ms()),
+                    PageFetch::NoReply => {
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "backfill page no-reply (no responder) → backoff"
+                        );
+                        latch.on_no_reply(now_ms());
+                    }
                     // Permanent: the engine/adapter is gone for good and
                     // no recovery hook exists — stop instead of burning
                     // eternal futile retries until engine stop.
