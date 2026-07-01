@@ -331,6 +331,82 @@ pub fn periodic_resync_interval_ms() -> u64 {
     PERIODIC_RESYNC_FLOOR_MS + rand::thread_rng().gen_range(0..PERIODIC_RESYNC_JITTER_MS)
 }
 
+/// Safety floor (ms) for the persist-aware resync wake (ZEB-599). The
+/// caller always hands the driver a FUTURE first deadline (past-due
+/// channels are spread by [`first_resync_deadline`]), so this only
+/// guards a deadline that lands in the past via clock skew — clamping
+/// keeps the wake strictly positive so it can never collapse into
+/// [`resync_tick`]'s `Some(0)` = disabled meaning.
+const MIN_RESYNC_WAKE_MS: u64 = 1_000;
+
+/// Persist hook + restart-aware first deadline for the ZEB-425/584
+/// anti-entropy floor (ZEB-599).
+///
+/// Threaded into [`run_backfill_driver`] as `Some(..)` in production so
+/// the floor survives process restarts: the FIRST periodic full
+/// reconcile this session fires at the absolute wall-clock
+/// [`first_deadline_ms`](Self::first_deadline_ms) (derived by the caller
+/// from the persisted last-full-reconcile via [`first_resync_deadline`])
+/// instead of `spawn + interval`, and each floor fire invokes
+/// [`on_full_reconcile`](Self::on_full_reconcile) with the current
+/// wall-ms so the caller persists the new timestamp.
+///
+/// `None` preserves the exact legacy floor behaviour (interval measured
+/// from each spawn/Idle, no persistence) — used by every test call site
+/// and any caller without a persistence sink.
+#[derive(Clone)]
+pub struct ResyncPersist {
+    /// Absolute wall-clock ms at which the first periodic full reconcile
+    /// should fire this session.
+    pub first_deadline_ms: u64,
+    /// Invoked (synchronously, non-blocking) with the wall-clock ms at
+    /// each floor fire, right after `latch.reset(None)`. The production
+    /// callback offloads the tiny sidecar write to `spawn_blocking`, so
+    /// the driver never parks a worker on fsync.
+    pub on_full_reconcile: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
+}
+
+impl std::fmt::Debug for ResyncPersist {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResyncPersist")
+            .field("first_deadline_ms", &self.first_deadline_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Absolute wall-clock ms for the FIRST periodic full reconcile this
+/// session, restart-aware (ZEB-599).
+///
+/// - `last = Some(t)` not yet due (`t + interval > now`) ⇒ honor the
+///   persisted schedule (`t + interval`): a restart resumes the
+///   remaining wait instead of resetting a fresh interval.
+/// - `last = Some(t)` past-due ⇒ spread across the jitter window
+///   (`now + (interval - PERIODIC_RESYNC_FLOOR_MS)`, i.e. the per-driver
+///   jitter already baked into `interval`) so a boot herd of overdue
+///   channels doesn't fire in lockstep.
+/// - `last = None` (never reconciled) ⇒ `now + interval`, identical to
+///   the legacy interval-from-spawn.
+///
+/// A persisted `last` AHEAD of `now` (a backward clock correction, VM
+/// restore, or corrupt stamp) is untrustworthy and would otherwise honor
+/// a far-future deadline that stalls the backstop for hours — so `last`
+/// is clamped to `now` first, degrading to `now + interval` (Qodo #380).
+pub fn first_resync_deadline(last: Option<u64>, interval_ms: u64, now_ms: u64) -> u64 {
+    match last {
+        Some(t) => {
+            // Clamp a future/skewed stamp so `due` can never sit far ahead.
+            let t = t.min(now_ms);
+            let due = t.saturating_add(interval_ms);
+            if due > now_ms {
+                due
+            } else {
+                now_ms.saturating_add(interval_ms.saturating_sub(PERIODIC_RESYNC_FLOOR_MS))
+            }
+        }
+        None => now_ms.saturating_add(interval_ms),
+    }
+}
+
 /// Wait for a transport-epoch bump. Pends forever when no watch is
 /// wired; returns false when the epoch sender dropped — callers
 /// degrade to no-epoch mode (`epoch_rx = None`) rather than exiting,
@@ -454,6 +530,13 @@ const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 ///   precedent): production passes a `SystemTime`-based closure;
 ///   tests pair a `tokio::time::Instant`-based closure with paused
 ///   time so no test ever sleeps for real.
+/// - `resync_persist` (ZEB-599) makes the floor restart-aware — see
+///   [`ResyncPersist`].
+///
+/// Each parameter is a distinct injected dependency (transport, clock,
+/// lifecycle, persistence), kept separate for test injection rather than
+/// bundled into an opaque config struct.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     mut latch: BackfillLatch,
     request_page: Rq,
@@ -462,6 +545,10 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     mut epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     resync_interval_ms: Option<u64>,
     now_ms: impl Fn() -> u64,
+    // ZEB-599: `Some(..)` makes the periodic floor restart-aware — the
+    // first fire lands at an absolute (persisted) deadline and every
+    // fire persists a fresh timestamp. `None` = exact legacy behaviour.
+    resync_persist: Option<ResyncPersist>,
 ) where
     Rq: Fn(Option<Hlc>) -> RqFut,
     RqFut: std::future::Future<Output = PageFetch>,
@@ -469,6 +556,11 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     WmFut: std::future::Future<Output = Option<Hlc>>,
 {
     let mut last_request_at: Option<u64> = None;
+    // ZEB-599: absolute-deadline resync when a persistence sink is
+    // wired. Seeded from the caller's restart-aware first deadline;
+    // advanced by `resync_interval_ms` after each fire. `None` (no
+    // persist) leaves the legacy interval-from-spawn path untouched.
+    let mut resync_deadline: Option<u64> = resync_persist.as_ref().map(|p| p.first_deadline_ms);
     loop {
         // Cheap pre-check: covers "stopped before the driver's first
         // poll" (spawn/stop race) without waiting for a `changed()`.
@@ -480,6 +572,21 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                 if epoch_rx.is_none() && !matches!(resync_interval_ms, Some(ms) if ms > 0) {
                     return;
                 }
+                // ZEB-599: with a persist sink, arm the floor at the
+                // absolute (restart-aware) deadline, recomputed each Idle
+                // entry so epoch-churn can't postpone it. Without a sink,
+                // fall back to the legacy interval-measured-from-now.
+                let resync_arg = match (&resync_persist, resync_deadline) {
+                    (Some(_), Some(deadline)) => match resync_interval_ms {
+                        Some(ms) if ms > 0 => {
+                            Some(deadline.saturating_sub(now_ms()).max(MIN_RESYNC_WAKE_MS))
+                        }
+                        // Sink wired but floor disabled — respect disable.
+                        _ => None,
+                    },
+                    // Legacy: interval measured from now (or disabled).
+                    _ => resync_interval_ms,
+                };
                 tokio::select! {
                     bumped = epoch_bump(&mut epoch_rx) => {
                         if !bumped {
@@ -495,7 +602,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         }
                         latch.reset(current_watermark().await);
                     }
-                    _ = resync_tick(resync_interval_ms) => {
+                    _ = resync_tick(resync_arg) => {
                         // ZEB-425 anti-entropy floor + ZEB-584 full reconcile:
                         // re-arm with `since = None` (pull from scratch), NOT
                         // the incremental `current_watermark()`. A scalar HLC
@@ -516,6 +623,15 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         // latch backs off via WaitUntil, never straight back to
                         // Idle).
                         latch.reset(None);
+                        // ZEB-599: record + persist this full reconcile,
+                        // then set the next deadline a full interval out.
+                        if let Some(p) = resync_persist.as_ref() {
+                            let fired_at = now_ms();
+                            (p.on_full_reconcile)(fired_at);
+                            if let Some(ms) = resync_interval_ms {
+                                resync_deadline = Some(fired_at.saturating_add(ms));
+                            }
+                        }
                     }
                     changed = shutdown_rx.changed() => {
                         // Err = sender dropped (registry entry gone):
@@ -1119,6 +1235,7 @@ mod tests {
             None,
             None,
             move || start.elapsed().as_millis() as u64,
+            None,
         )
         .await;
         assert_eq!(
@@ -1176,6 +1293,7 @@ mod tests {
             None,
             None,
             move || start.elapsed().as_millis() as u64,
+            None,
         )
         .await;
         assert_eq!(requests.load(Ordering::SeqCst), 3);
@@ -1220,6 +1338,7 @@ mod tests {
             None,
             None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Let the driver issue request #1 and arm its 30s backoff
         // sleep. yield_now keeps the test task runnable so paused time
@@ -1266,6 +1385,7 @@ mod tests {
             None,
             None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         while requests.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
@@ -1313,6 +1433,7 @@ mod tests {
             None,
             None,
             move || start.elapsed().as_millis() as u64,
+            None,
         )
         .await;
         assert_eq!(
@@ -1361,6 +1482,7 @@ mod tests {
             Some(epoch_rx),
             None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         while requests.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
@@ -1409,6 +1531,7 @@ mod tests {
             Some(epoch_rx),
             None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Request #1 fires (NoReply) and the driver enters its backoff.
         while requests.load(Ordering::SeqCst) < 1 {
@@ -1916,6 +2039,7 @@ mod tests {
             None,
             Some(RESYNC_MS),
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Req #1 fires + satisfies → driver parks (resync keeps it alive
         // despite epoch_rx = None).
@@ -2006,6 +2130,7 @@ mod tests {
             None, // epoch_rx None: ONLY the periodic floor can re-arm.
             Some(RESYNC_MS),
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Req #1: the initial reconnect catch-up uses the incremental
         // watermark.
@@ -2027,6 +2152,138 @@ mod tests {
             None,
             "ZEB-584: the periodic floor must re-arm with since=None (full \
              reconcile) so a sub-max-HLC offline-window entry is re-fetched"
+        );
+        driver.abort();
+    }
+
+    // ── ZEB-599: restart-aware (persisted-deadline) resync floor ─────
+    #[test]
+    fn first_resync_deadline_cases() {
+        // Not yet due: honor the persisted schedule (`last + interval`) so
+        // a restart resumes the remaining wait instead of resetting.
+        assert_eq!(
+            first_resync_deadline(Some(1_000), 100_000, 5_000),
+            101_000,
+            "not-yet-due resumes the persisted schedule"
+        );
+        // Never reconciled: identical to legacy interval-from-spawn.
+        assert_eq!(
+            first_resync_deadline(None, 100_000, 5_000),
+            105_000,
+            "no persisted timestamp → now + interval (legacy)"
+        );
+        // Past-due: fire within the jitter window (`now + (interval -
+        // FLOOR)`), never in lockstep at `now` — spreads a boot herd.
+        let interval = PERIODIC_RESYNC_FLOOR_MS + 250_000;
+        let now = 10 * PERIODIC_RESYNC_FLOOR_MS; // far past `0 + interval`
+        assert_eq!(
+            first_resync_deadline(Some(0), interval, now),
+            now + 250_000,
+            "past-due spreads across the jitter window, not a lockstep now-fire"
+        );
+        // Future/skewed stamp (last > now): clamp to now → `now + interval`,
+        // never a far-future deadline that stalls the backstop.
+        assert_eq!(
+            first_resync_deadline(Some(5_000 + 100_000), 100_000, 5_000),
+            105_000,
+            "a persisted stamp ahead of now degrades to legacy now + interval"
+        );
+    }
+
+    /// ZEB-599: with a persist sink the FIRST periodic full reconcile
+    /// fires at the absolute (restart-aware) deadline — NOT `spawn +
+    /// interval` — each fire persists a fresh wall-ms, and subsequent
+    /// fires fall on the steady-state interval.
+    #[tokio::test(start_paused = true)]
+    async fn backfill_persist_floor_first_fire_at_deadline_then_interval() {
+        const DEADLINE_MS: u64 = 40_000;
+        const INTERVAL_MS: u64 = 200_000;
+        let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::clone(&sinces);
+        let request_page = move |since: Option<Hlc>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.lock().unwrap().push(since);
+                PageFetch::Completed(0, 256) // short page → satisfied → park
+            }
+        };
+        let fired: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
+        let fired_cb = Arc::clone(&fired);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            None, // no epoch watch: only the floor can re-arm
+            Some(INTERVAL_MS),
+            move || start.elapsed().as_millis() as u64,
+            Some(ResyncPersist {
+                first_deadline_ms: DEADLINE_MS,
+                on_full_reconcile: Arc::new(move |ts| fired_cb.lock().unwrap().push(ts)),
+            }),
+        ));
+        // Req #1 (initial full pull) satisfies → park on the persisted deadline.
+        while sinces.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Just shy of the 40s deadline: no fire. (Legacy interval-from-spawn
+        // would fire at 200s, so any fire at 40s proves the absolute
+        // deadline is in force.)
+        tokio::time::advance(Duration::from_millis(DEADLINE_MS - 1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sinces.lock().unwrap().len(),
+            1,
+            "floor must not fire before the absolute deadline"
+        );
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "nothing persisted before the first fire"
+        );
+        // Cross 40s → first floor fire: FULL reconcile (since=None) + persist.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        while sinces.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sinces.lock().unwrap()[1],
+            None,
+            "the floor re-arms with a full reconcile (since=None)"
+        );
+        {
+            let stamps = fired.lock().unwrap();
+            assert_eq!(stamps.len(), 1, "exactly one persist per floor fire");
+            assert!(
+                stamps[0] >= DEADLINE_MS,
+                "persisted timestamp is the fire wall-clock (>= deadline)"
+            );
+        }
+        // Second fire is a full INTERVAL after the first (steady state),
+        // NOT the 40s deadline again.
+        tokio::time::advance(Duration::from_millis(INTERVAL_MS - 1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sinces.lock().unwrap().len(),
+            2,
+            "second fire waits the full steady-state interval"
+        );
+        tokio::time::advance(Duration::from_millis(2)).await;
+        while sinces.lock().unwrap().len() < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fired.lock().unwrap().len(),
+            2,
+            "each floor fire persists a fresh timestamp"
         );
         driver.abort();
     }
@@ -2107,6 +2364,7 @@ mod tests {
             None,
             Some(PERIODIC_RESYNC_FLOOR_MS), // the real 1 h floor
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         while requests.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
@@ -2152,6 +2410,7 @@ mod tests {
             None,
             Some(0),
             move || start.elapsed().as_millis() as u64,
+            None,
         )
         .await;
         assert_eq!(

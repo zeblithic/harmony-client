@@ -2395,6 +2395,18 @@ impl ChannelLogRegistry {
             ChannelLogEngineError::Persist(ChannelLogPersistError::Io(e.to_string()))
         })?;
 
+        // ZEB-599: read the persisted last-full-reconcile timestamp before
+        // `root_dir` moves into the engine params below. The backfill
+        // driver arms its FIRST periodic-resync floor at an absolute
+        // deadline derived from this (restart-aware) instead of
+        // `spawn + interval`, and re-persists on each fire — so a node that
+        // restarts more often than hourly still gets its full reconcile.
+        let backfill_state_root = root_dir.clone();
+        let backfill_last_full_reconcile_ms =
+            crate::community_channel_log::ChannelBackfillState::load_async(&backfill_state_root)
+                .await
+                .map(|s| s.last_full_reconcile_ms);
+
         let (publisher_tx, publisher_rx) = mpsc::channel::<Vec<u8>>(64);
         let (subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(64);
         let (query_request_tx, query_request_rx) = mpsc::channel::<BackfillQueryRequest>(8);
@@ -2639,6 +2651,36 @@ impl ChannelLogRegistry {
         );
         let request_engine = Arc::clone(&engine);
         let watermark_engine = Arc::clone(&engine);
+        // ZEB-599: restart-aware periodic floor. `resync_interval_ms` is the
+        // same per-driver jittered ~1h as before; `first_deadline` places
+        // the FIRST fire relative to the persisted last-full-reconcile so a
+        // frequently-restarting node still crosses the floor. The persist
+        // callback offloads the tiny atomic sidecar write to `spawn_blocking`
+        // so the driver never parks a worker on fsync; a failed write only
+        // forfeits restart-awareness for one cycle (logged, non-fatal).
+        let resync_interval_ms = crate::channel_backfill::periodic_resync_interval_ms();
+        let now_for_deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let resync_first_deadline_ms = crate::channel_backfill::first_resync_deadline(
+            backfill_last_full_reconcile_ms,
+            resync_interval_ms,
+            now_for_deadline,
+        );
+        let persist_root = backfill_state_root;
+        let on_full_reconcile: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |ts: u64| {
+            let root = persist_root.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::community_channel_log::ChannelBackfillState::save(&root, ts)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "ZEB-599: failed to persist channel backfill_state sidecar"
+                    );
+                }
+            });
+        });
         tokio::spawn(crate::channel_backfill::run_backfill_driver(
             latch,
             move |since: Option<Hlc>| {
@@ -2682,13 +2724,18 @@ impl ChannelLogRegistry {
             // driver to avoid a startup thundering herd) even with no epoch
             // bump (router-only holders / late queryables / same-zid
             // reconnects the never-seen-zid signal misses).
-            Some(crate::channel_backfill::periodic_resync_interval_ms()),
+            Some(resync_interval_ms),
             || {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64
             },
+            // ZEB-599: make the floor restart-aware + persist each fire.
+            Some(crate::channel_backfill::ResyncPersist {
+                first_deadline_ms: resync_first_deadline_ms,
+                on_full_reconcile,
+            }),
         ));
 
         Ok(engine)
