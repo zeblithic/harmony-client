@@ -17,6 +17,8 @@
     getIdentityDiscoverable,
     setIdentityDiscoverable,
     onIdentityDiscoverableChanged,
+    getPresenceVisibility,
+    setPresenceVisibility,
     getPkarrRelays,
     addPkarrRelay,
     removePkarrRelay,
@@ -35,6 +37,14 @@
 
   // Cleanup for the event listener.
   let stopListener: (() => void) | null = null;
+
+  // ZEB-600: presence visibility ("Appear offline"). presenceVisible=true means
+  // this node publishes beacons (others see it online). The toggle is INVERTED —
+  // it reads "Appear offline", so checked = !presenceVisible.
+  let presenceVisible = $state(true);
+  let presenceLoading = $state(true);
+  let presencePending = $state(false);
+  let presenceError = $state<string | null>(null);
 
   // ZEB-380: relay manager state.
   let relays = $state<RelayHealth[]>([]);
@@ -187,6 +197,16 @@
       loading = false;
     }
 
+    // ZEB-600: seed the "Appear offline" toggle from the persisted/live setting.
+    try {
+      presenceVisible = await getPresenceVisibility();
+      presenceError = null;
+    } catch (e) {
+      presenceError = e instanceof Error ? e.message : String(e);
+    } finally {
+      presenceLoading = false;
+    }
+
     // ZEB-380: load relay pool and subscribe to live changes.
     await fetchRelays();
     // Race-safe: if destroyed before listen() resolves, immediately call
@@ -235,6 +255,28 @@
       pending = false;
     }
   }
+
+  // ZEB-600: the checkbox is "Appear offline", so checked=true means INVISIBLE.
+  // presenceVisible is the inverse of what the box shows.
+  async function handlePresenceToggle(e: Event) {
+    if (presencePending) return;
+    const target = e.target as HTMLInputElement;
+    const appearOffline = target.checked;
+    const newVisible = !appearOffline;
+    // Optimistic update.
+    presenceVisible = newVisible;
+    presencePending = true;
+    try {
+      await setPresenceVisibility(newVisible);
+      presenceError = null;
+    } catch (err) {
+      // Roll back.
+      presenceVisible = !newVisible;
+      presenceError = err instanceof Error ? err.message : String(err);
+    } finally {
+      presencePending = false;
+    }
+  }
 </script>
 
 <div class="discoverability-section" data-testid="network-discoverability-settings">
@@ -272,6 +314,47 @@
       </span>
       <span class="toggle-value" data-testid="discoverability-value">
         {loading ? '…' : enabled ? 'On' : 'Off'}
+      </span>
+    </div>
+  </label>
+</div>
+
+<!-- ZEB-600: presence "Appear offline" toggle. Inverted — checked = invisible. -->
+<div class="discoverability-section" data-testid="presence-visibility-settings">
+  <div class="section-header">
+    <h4 class="section-title">Presence</h4>
+  </div>
+
+  {#if presenceError}
+    <p class="error-text" data-testid="presence-error">{presenceError}</p>
+  {/if}
+
+  <label class="toggle-row" for="appear-offline-toggle">
+    <div class="toggle-text">
+      <span class="toggle-label">Appear offline</span>
+      <span class="toggle-hint">
+        When on, no one sees you as online — your device stops broadcasting presence.
+        You still see who else is around. When off, communities you share show you as online.
+      </span>
+    </div>
+    <div class="toggle-control">
+      <input
+        id="appear-offline-toggle"
+        type="checkbox"
+        role="switch"
+        class="visually-hidden"
+        checked={!presenceVisible}
+        disabled={presenceLoading || presencePending}
+        onchange={handlePresenceToggle}
+        data-testid="appear-offline-toggle"
+        aria-checked={!presenceVisible}
+        aria-label="Appear offline"
+      />
+      <span class="toggle-track" class:on={!presenceVisible} aria-hidden="true">
+        <span class="toggle-thumb"></span>
+      </span>
+      <span class="toggle-value" data-testid="appear-offline-value">
+        {presenceLoading ? '…' : !presenceVisible ? 'On' : 'Off'}
       </span>
     </div>
   </label>

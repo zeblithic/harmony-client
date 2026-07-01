@@ -36,7 +36,11 @@
   import { VotingAdapter } from './lib/voting-adapter';
   import { setupDelegateOnBehalfToast } from './lib/voting-toast-wiring';
   import { LibraryDirectoryService } from './lib/library-directory-service';
-  import { openJoinIroh } from './lib/connectivity-adapter';
+  import {
+    openJoinIroh,
+    getPresenceVisibility,
+    onPresenceVisibilityChanged,
+  } from './lib/connectivity-adapter';
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
@@ -142,6 +146,11 @@
   // repaints live.
   const presenceService = new PresenceService();
   let presenceVersion = $state(0);
+  // ZEB-600: the viewer's own presence visibility ("Appear offline" inverse).
+  // Seeded on boot and kept live via the presence-visibility-changed event so
+  // the member-list self-dot reflects a toggle flip made in Settings. Defaults
+  // to visible; a corrupt settings file fails closed to invisible backend-side.
+  let presenceVisible = $state(true);
   // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
   // Set at startup (after start_node) and kept stable for the session.
   let selfOwnerId = $state<string | null>(null);
@@ -1333,6 +1342,31 @@
   // absent.
   $effect(() => () => {
     void presenceService.unsubscribeAll();
+  });
+  // ZEB-600: seed the viewer's own presence visibility once and stay live with
+  // the backend so an "Appear offline" flip in Settings re-renders the member
+  // self-dot without a restart. Empty reactive deps → runs once, torn down on
+  // unmount. Both the initial read and the listen are individually error-guarded
+  // (web/dev mode has no Tauri backend), so neither can crash boot.
+  $effect(() => {
+    let cancelled = false;
+    void getPresenceVisibility()
+      .then((v) => {
+        if (!cancelled) presenceVisible = v;
+      })
+      .catch((e) => {
+        console.warn(
+          '[zeb-600] getPresenceVisibility failed:',
+          e instanceof Error ? e.message : String(e),
+        );
+      });
+    const stop = onPresenceVisibilityChanged((v) => {
+      presenceVisible = v;
+    });
+    return () => {
+      cancelled = true;
+      stop();
+    };
   });
 
   let navNodes = $state([...navService.nodes]);
@@ -3029,6 +3063,7 @@
         {resolveCard}
         {resolveNickname}
         {isOnline}
+        selfInvisible={!presenceVisible}
         {subscribeVisibleCards}
         {unsubscribeCards}
         onOpenCard={openMemberCard}

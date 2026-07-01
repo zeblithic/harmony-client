@@ -181,6 +181,39 @@ export async function getIdentityDiscoverable(): Promise<boolean> {
 }
 
 /**
+ * ZEB-600: set community-presence visibility.
+ *
+ * When `visible` is `false` ("appear offline"), this node stops publishing its
+ * signed presence beacons, so no community sees it as online — while it keeps
+ * receiving everyone else's beacons (privacy-complete invisible mode). The live
+ * gate flips on the running node's next heartbeat and is persisted to
+ * `connectivity-settings.json`, fail-closed to invisible on a corrupt file.
+ */
+export async function setPresenceVisibility(visible: boolean): Promise<void> {
+  try {
+    await invoke('set_presence_visibility', { visible });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`set_presence_visibility: ${msg}`);
+  }
+}
+
+/**
+ * ZEB-600: read the current presence visibility (`true` = visible/online).
+ *
+ * Prefers the live gate on a running node; falls back to the persisted setting
+ * when no node is running yet, so the settings toggle can seed pre-connect.
+ */
+export async function getPresenceVisibility(): Promise<boolean> {
+  try {
+    return await invoke<boolean>('get_presence_visibility');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`get_presence_visibility: ${msg}`);
+  }
+}
+
+/**
  * Query the pkarr DHT for a peer's current iroh routing record given its
  * 64-byte identity public key as a lowercase hex string.
  *
@@ -278,6 +311,36 @@ export function onIdentityDiscoverableChanged(cb: (enabled: boolean) => void): (
     .catch((e) =>
       console.error(
         'connectivity-identity-discoverable-changed listen failed:',
+        e instanceof Error ? e.message : String(e),
+      ),
+    );
+  return () => {
+    destroyed = true;
+    unlisten?.();
+  };
+}
+
+/**
+ * ZEB-600: subscribe to `presence-visibility-changed` events.
+ *
+ * Fired whenever `set_presence_visibility` completes so any panel showing the
+ * viewer's own presence (the "Appear offline" toggle, the member-list self-dot)
+ * stays in sync without polling. Returns a teardown function.
+ */
+export function onPresenceVisibilityChanged(cb: (visible: boolean) => void): () => void {
+  let unlisten: UnlistenFn | undefined;
+  let destroyed = false;
+  listen<{ visible: boolean }>('presence-visibility-changed', (e) => cb(e.payload.visible))
+    .then((u) => {
+      if (destroyed) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    })
+    .catch((e) =>
+      console.error(
+        'presence-visibility-changed listen failed:',
         e instanceof Error ? e.message : String(e),
       ),
     );

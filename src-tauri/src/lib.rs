@@ -31111,6 +31111,7 @@ fn persist_presence_visibility(path: &std::path::Path, visible: bool) -> Result<
 /// settings-write failure.
 #[tauri::command]
 async fn set_presence_visibility(
+    app: tauri::AppHandle,
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     visible: bool,
 ) -> Result<(), String> {
@@ -31130,7 +31131,19 @@ async fn set_presence_visibility(
     }
     // Durable: persist so an invisible user stays hidden across restarts.
     let path = connectivity_settings_path(settings_path)?;
-    persist_presence_visibility(&path, visible)
+    persist_presence_visibility(&path, visible)?;
+
+    // Notify the frontend so any panel showing self-presence (e.g. the member
+    // list self-dot) re-renders without polling. Mirrors the identity-
+    // discoverable toggle. Emit failures are non-fatal — the write succeeded.
+    if let Err(e) = app.emit(
+        "presence-visibility-changed",
+        serde_json::json!({ "visible": visible }),
+    ) {
+        tracing::warn!(error = %e, "set_presence_visibility: emit failed");
+    }
+
+    Ok(())
 }
 
 /// IPC: ZEB-600. Read the current presence visibility (`true` = visible). Prefers

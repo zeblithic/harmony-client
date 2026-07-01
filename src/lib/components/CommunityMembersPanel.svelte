@@ -17,6 +17,7 @@
     resolveCard,
     resolveNickname,
     isOnline,
+    selfInvisible = false,
     onOpenCard,
   }: {
     communityId: string;
@@ -35,6 +36,9 @@
     /** ZEB-537: optional online-presence resolver. Pure consumer of the
      *  parent's PresenceService — same contract as resolveCard. */
     isOnline?: (ownerIdHex: string) => boolean;
+    /** ZEB-600: true when the viewer has "Appear offline" on — forwarded to
+     *  MemberRow so only the self row shows the hollow "invisible" dot. */
+    selfInvisible?: boolean;
     /** ZEB-341: open the owner_id card popover for a clicked member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
@@ -320,6 +324,7 @@
           {resolveCard}
           {resolveNickname}
           {isOnline}
+          {selfInvisible}
           {onOpenCard}
           onaction={(detail) => onMemberAction(detail)}
         />
@@ -340,6 +345,7 @@
               {resolveCard}
               {resolveNickname}
               {isOnline}
+              {selfInvisible}
               {onOpenCard}
               onaction={(detail) => onMemberAction(detail)}
             />
