@@ -1626,17 +1626,29 @@ impl ChannelBackfillState {
         root.join("backfill_state.cbor")
     }
 
-    /// Read the sidecar. `None` on any of: file absent, unreadable,
-    /// empty, or an unknown schema version — all mean "never
-    /// reconciled," so the caller falls back to interval-from-spawn.
-    /// Deliberately non-erroring: a corrupt hint must never block a
-    /// channel from spawning.
-    pub fn load(root: &std::path::Path) -> Option<ChannelBackfillState> {
-        let bytes = std::fs::read(Self::path(root)).ok()?;
+    /// Decode sidecar bytes. `None` on empty, unknown-version, or corrupt
+    /// content — all mean "never reconciled," so the caller falls back to
+    /// interval-from-spawn. Deliberately non-erroring: a corrupt hint must
+    /// never block a channel from spawning.
+    fn parse(bytes: &[u8]) -> Option<ChannelBackfillState> {
         match bytes.split_first() {
             Some((&CHANNEL_BACKFILL_STATE_V1, rest)) => ciborium::from_reader(rest).ok(),
             _ => None,
         }
+    }
+
+    /// Read the sidecar synchronously (tests / non-async callers). `None`
+    /// on file absent / unreadable / [`parse`](Self::parse) failure.
+    pub fn load(root: &std::path::Path) -> Option<ChannelBackfillState> {
+        Self::parse(&std::fs::read(Self::path(root)).ok()?)
+    }
+
+    /// Async sibling of [`load`](Self::load) for the channel-log spawn
+    /// path, which must not park a tokio worker on filesystem I/O
+    /// (ZEB-467 — mirrors the `tokio::fs::create_dir_all` used there;
+    /// Qodo #380). Same `None`-on-any-error contract.
+    pub async fn load_async(root: &std::path::Path) -> Option<ChannelBackfillState> {
+        Self::parse(&tokio::fs::read(Self::path(root)).await.ok()?)
     }
 
     /// Atomically persist the sidecar with `last_full_reconcile_ms`.

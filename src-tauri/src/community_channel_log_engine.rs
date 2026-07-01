@@ -2403,7 +2403,8 @@ impl ChannelLogRegistry {
         // restarts more often than hourly still gets its full reconcile.
         let backfill_state_root = root_dir.clone();
         let backfill_last_full_reconcile_ms =
-            crate::community_channel_log::ChannelBackfillState::load(&backfill_state_root)
+            crate::community_channel_log::ChannelBackfillState::load_async(&backfill_state_root)
+                .await
                 .map(|s| s.last_full_reconcile_ms);
 
         let (publisher_tx, publisher_rx) = mpsc::channel::<Vec<u8>>(64);

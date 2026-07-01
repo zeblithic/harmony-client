@@ -386,9 +386,16 @@ impl std::fmt::Debug for ResyncPersist {
 ///   channels doesn't fire in lockstep.
 /// - `last = None` (never reconciled) ⇒ `now + interval`, identical to
 ///   the legacy interval-from-spawn.
+///
+/// A persisted `last` AHEAD of `now` (a backward clock correction, VM
+/// restore, or corrupt stamp) is untrustworthy and would otherwise honor
+/// a far-future deadline that stalls the backstop for hours — so `last`
+/// is clamped to `now` first, degrading to `now + interval` (Qodo #380).
 pub fn first_resync_deadline(last: Option<u64>, interval_ms: u64, now_ms: u64) -> u64 {
     match last {
         Some(t) => {
+            // Clamp a future/skewed stamp so `due` can never sit far ahead.
+            let t = t.min(now_ms);
             let due = t.saturating_add(interval_ms);
             if due > now_ms {
                 due
@@ -2173,6 +2180,13 @@ mod tests {
             first_resync_deadline(Some(0), interval, now),
             now + 250_000,
             "past-due spreads across the jitter window, not a lockstep now-fire"
+        );
+        // Future/skewed stamp (last > now): clamp to now → `now + interval`,
+        // never a far-future deadline that stalls the backstop.
+        assert_eq!(
+            first_resync_deadline(Some(5_000 + 100_000), 100_000, 5_000),
+            105_000,
+            "a persisted stamp ahead of now degrades to legacy now + interval"
         );
     }
 
