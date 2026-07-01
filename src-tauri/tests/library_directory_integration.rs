@@ -862,6 +862,8 @@ async fn click_to_join_redeem_invite_smoke() {
         signing_key: Arc::clone(&joiner_signing_key),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
+        // ZEB-599 Direction 1: no presence watch in this integration harness.
+        presence_resync_rx: None,
     }));
 
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));

@@ -513,6 +513,14 @@ const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 ///   the driver degrades to the no-epoch contract (keeps any backoff
 ///   retries running; returns on Idle only if resync is also disabled)
 ///   instead of exiting mid-latch.
+/// - `full_resync_rx` (ZEB-599 Direction 1) is the presence-driven
+///   reachability watch. A bump re-arms with a FULL reconcile
+///   (`since = None`, like the periodic floor) rather than the epoch arm's
+///   incremental watermark, so a relay-mediated cross-WAN peer's
+///   below-watermark backlog heals within seconds of the peer appearing
+///   instead of waiting the ~1h floor. Same cooldown + sender-drop
+///   degradation as `epoch_rx`; `None` disables it (used by tests / callers
+///   with no presence signal).
 /// - `resync_interval_ms = Some(ms)` arms the ZEB-425 anti-entropy floor:
 ///   a satisfied latch re-arms every `ms` even with NO epoch bump. ZEB-584:
 ///   the floor re-arms with a FULL reconcile (`since = None`), NOT the
@@ -543,6 +551,15 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     current_watermark: Wm,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    // ZEB-599 Direction 1: presence-driven reachability watch. Bumped by the
+    // per-community presence subscriber when a new device enters the roster (a
+    // new potential holder became reachable). A bump re-arms the latch with a
+    // FULL reconcile (`since = None`) — the fast, relay-mediated analogue of the
+    // ~1h periodic floor — so a NAT'd cross-WAN peer's below-watermark backlog
+    // heals within seconds instead of waiting the hour. Same `Option<watch>`
+    // shape + sender-drop degradation as `epoch_rx`; `None` (tests, callers with
+    // no presence) preserves prior behaviour exactly.
+    mut full_resync_rx: Option<tokio::sync::watch::Receiver<u64>>,
     resync_interval_ms: Option<u64>,
     now_ms: impl Fn() -> u64,
     // ZEB-599: `Some(..)` makes the periodic floor restart-aware — the
@@ -569,7 +586,10 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
         }
         match latch.next_action(now_ms()) {
             BackfillAction::Idle => {
-                if epoch_rx.is_none() && !matches!(resync_interval_ms, Some(ms) if ms > 0) {
+                if epoch_rx.is_none()
+                    && full_resync_rx.is_none()
+                    && !matches!(resync_interval_ms, Some(ms) if ms > 0)
+                {
                     return;
                 }
                 // ZEB-599: with a persist sink, arm the floor at the
@@ -601,6 +621,29 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                             return;
                         }
                         latch.reset(current_watermark().await);
+                    }
+                    kicked = epoch_bump(&mut full_resync_rx) => {
+                        // ZEB-599 Direction 1: a presence-driven reachability
+                        // kick re-arms with a FULL reconcile (`since = None`) —
+                        // the fast, relay-mediated analogue of the periodic floor
+                        // (`latch.reset(None)` below). Full, NOT the incremental
+                        // `current_watermark()` the epoch arm uses, because a
+                        // returning/relay peer may hold entries whose HLC sorts
+                        // below our max (the ZEB-584 blind spot). Cooldown-gated
+                        // like the epoch arm so presence churn can't storm; the
+                        // ~1h floor stays the ultimate backstop and its persisted
+                        // deadline is deliberately untouched here (a presence
+                        // reconcile is a bonus, not a floor fire).
+                        if !kicked {
+                            // Presence sender dropped: degrade to no-presence
+                            // mode (mirrors the epoch-sender-drop path above).
+                            full_resync_rx = None;
+                            continue;
+                        }
+                        if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
+                            return;
+                        }
+                        latch.reset(None);
                     }
                     _ = resync_tick(resync_arg) => {
                         // ZEB-425 anti-entropy floor + ZEB-584 full reconcile:
@@ -661,6 +704,20 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                             return;
                         }
                         latch.reset(current_watermark().await);
+                    }
+                    kicked = epoch_bump(&mut full_resync_rx) => {
+                        // ZEB-599 Direction 1: a presence kick mid-backoff — a
+                        // new holder just became reachable, so restart from
+                        // scratch with a FULL reconcile (see the Idle arm).
+                        // Cooldown-gated like the epoch arm.
+                        if !kicked {
+                            full_resync_rx = None;
+                            continue;
+                        }
+                        if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
+                            return;
+                        }
+                        latch.reset(None);
                     }
                     changed = shutdown_rx.changed() => {
                         // Err = sender dropped (registry entry gone):
@@ -1233,6 +1290,8 @@ mod tests {
             || async { None::<Hlc> },
             shutdown_rx,
             None,
+            // ZEB-599: no presence watch in this test.
+            None,
             None,
             move || start.elapsed().as_millis() as u64,
             None,
@@ -1291,6 +1350,8 @@ mod tests {
             current_watermark,
             shutdown_rx,
             None,
+            // ZEB-599: no presence watch in this test.
+            None,
             None,
             move || start.elapsed().as_millis() as u64,
             None,
@@ -1335,6 +1396,8 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
+            // ZEB-599: no presence watch in this test.
             None,
             None,
             move || start.elapsed().as_millis() as u64,
@@ -1383,6 +1446,8 @@ mod tests {
             || async { None::<Hlc> },
             shutdown_rx,
             None,
+            // ZEB-599: no presence watch in this test.
+            None,
             None,
             move || start.elapsed().as_millis() as u64,
             None,
@@ -1430,6 +1495,8 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
+            // ZEB-599: no presence watch in this test.
             None,
             None,
             move || start.elapsed().as_millis() as u64,
@@ -1480,6 +1547,8 @@ mod tests {
             || async { Some(hlc(200)) },
             shutdown_rx,
             Some(epoch_rx),
+            // ZEB-599: no presence watch in this test.
+            None,
             None,
             move || start.elapsed().as_millis() as u64,
             None,
@@ -1501,6 +1570,76 @@ mod tests {
         assert_eq!(
             sinces.lock().unwrap().clone(),
             vec![Some(hlc(100)), Some(hlc(200))]
+        );
+        driver.abort();
+    }
+
+    /// ZEB-599 Direction 1: a presence-driven reachability kick re-arms a
+    /// satisfied (Idle-parked) latch with a FULL reconcile (`since = None`),
+    /// NOT the incremental watermark — so a relay-mediated cross-WAN peer's
+    /// below-watermark backlog is refetched within the cooldown instead of
+    /// waiting the ~1h floor. Contrast
+    /// `backfill_driver_rearms_on_epoch_bump_with_fresh_watermark`, whose
+    /// epoch (direct-peer) re-arm stays incremental.
+    #[tokio::test(start_paused = true)]
+    async fn backfill_driver_rearms_full_reconcile_on_presence_kick() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let counter = Arc::clone(&requests);
+        let since_log = Arc::clone(&sinces);
+        // Every request answers with a short page (immediately satisfied).
+        let request_page = move |since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            let since_log = Arc::clone(&since_log);
+            async move {
+                since_log.lock().unwrap().push(since);
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::Completed(0, 256)
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (presence_tx, presence_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(Some(hlc(100))),
+            request_page,
+            // Watermark has advanced to 200 — a FULL reconcile must IGNORE it
+            // and request `None`, unlike the incremental epoch re-arm.
+            || async { Some(hlc(200)) },
+            shutdown_rx,
+            None,              // no transport-epoch watch — isolate the presence path
+            Some(presence_rx), // ZEB-599 presence reachability watch
+            None,              // no periodic floor — isolate the presence kick
+            move || start.elapsed().as_millis() as u64,
+            None,
+        ));
+        // First request satisfies the latch → the driver parks on Idle
+        // (parked because the presence watch is wired, though no epoch/floor is).
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "must park on Idle with a presence watch (no epoch, no floor)"
+        );
+        // A presence kick + cooldown elapse → a second request fires as a FULL
+        // reconcile (`since = None`), NOT the incremental watermark (200).
+        presence_tx.send(1).expect("presence bump");
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sinces.lock().unwrap().clone(),
+            vec![Some(hlc(100)), None],
+            "presence kick must re-arm with a FULL reconcile (None), not the \
+             incremental watermark"
         );
         driver.abort();
     }
@@ -1529,6 +1668,8 @@ mod tests {
             || async { None },
             shutdown_rx,
             Some(epoch_rx),
+            // ZEB-599: no presence watch in this test.
+            None,
             None,
             move || start.elapsed().as_millis() as u64,
             None,
@@ -2037,6 +2178,8 @@ mod tests {
             || async { None::<Hlc> },
             shutdown_rx,
             None,
+            // ZEB-599: no presence watch in this test.
+            None,
             Some(RESYNC_MS),
             move || start.elapsed().as_millis() as u64,
             None,
@@ -2128,6 +2271,7 @@ mod tests {
             },
             shutdown_rx,
             None, // epoch_rx None: ONLY the periodic floor can re-arm.
+            None, // ZEB-599: no presence watch in this test.
             Some(RESYNC_MS),
             move || start.elapsed().as_millis() as u64,
             None,
@@ -2216,6 +2360,8 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
+            // ZEB-599: no presence watch in this test.
             None, // no epoch watch: only the floor can re-arm
             Some(INTERVAL_MS),
             move || start.elapsed().as_millis() as u64,
@@ -2362,6 +2508,8 @@ mod tests {
             || async { None::<Hlc> },
             shutdown_rx,
             None,
+            // ZEB-599: no presence watch in this test.
+            None,
             Some(PERIODIC_RESYNC_FLOOR_MS), // the real 1 h floor
             move || start.elapsed().as_millis() as u64,
             None,
@@ -2407,6 +2555,8 @@ mod tests {
             request_page,
             || async { None::<Hlc> },
             shutdown_rx,
+            None,
+            // ZEB-599: no presence watch in this test.
             None,
             Some(0),
             move || start.elapsed().as_millis() as u64,

@@ -602,6 +602,8 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         signing_key: Arc::clone(&bob_comm_sk),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
+        // ZEB-599 Direction 1: no presence watch in this integration harness.
+        presence_resync_rx: None,
     });
 
     let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));

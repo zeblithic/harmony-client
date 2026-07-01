@@ -1985,6 +1985,16 @@ pub struct ChannelLogRegistryConfig {
     /// (tests, callers without a transport watch) preserves the legacy
     /// return-on-Idle driver behavior.
     pub transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    /// ZEB-599 Direction 1: presence-driven full-reconcile watch. Bumped by the
+    /// per-community presence subscriber whenever a new device enters a roster
+    /// (a new potential holder became reachable cross-WAN). Cloned into every
+    /// spawned channel-log backfill driver so a satisfied driver re-arms with a
+    /// FULL reconcile (`since = None`) within the cooldown — the fast,
+    /// relay-mediated analogue of the ~1h anti-entropy floor, closing the gap
+    /// where a NAT'd cross-WAN peer's below-watermark backlog only healed
+    /// hourly. `None` (tests / callers with no presence signal) preserves the
+    /// prior behavior.
+    pub presence_resync_rx: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
 /// One registered channel: the running engine and the adapter's
@@ -2720,6 +2730,11 @@ impl ChannelLogRegistry {
             // ZEB-434 Task 7: park-on-Idle + re-arm on transport-epoch
             // bumps (None preserves the legacy return-on-Idle path).
             self.config.transport_epoch_rx.clone(),
+            // ZEB-599 Direction 1: presence-driven fast full-reconcile re-arm —
+            // bumped when a new roster device (potential holder) appears, so a
+            // relay-mediated cross-WAN peer's below-watermark backlog heals in
+            // seconds instead of waiting the ~1h floor below.
+            self.config.presence_resync_rx.clone(),
             // ZEB-425: anti-entropy floor — re-arm ~hourly (jittered per
             // driver to avoid a startup thundering herd) even with no epoch
             // bump (router-only holders / late queryables / same-zid
@@ -5369,6 +5384,8 @@ mod tests {
                 ..Default::default()
             },
             transport_epoch_rx: None,
+            // ZEB-599 Direction 1: no presence watch in this test harness.
+            presence_resync_rx: None,
         };
         let registry = ChannelLogRegistry::new(config);
 
@@ -5474,6 +5491,8 @@ mod tests {
                 ..Default::default()
             },
             transport_epoch_rx: None,
+            // ZEB-599 Direction 1: no presence watch in this test harness.
+            presence_resync_rx: None,
         };
         let registry = ChannelLogRegistry::new(config);
 
