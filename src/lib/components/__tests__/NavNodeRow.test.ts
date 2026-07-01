@@ -108,4 +108,43 @@ describe('NavNodeRow', () => {
     const closeBracket = container.querySelector('.bracket-close');
     expect(closeBracket).toBeTruthy();
   });
+
+  // ZEB-600: presence dot — driven by the injected presenceOnline resolver.
+  it('shows the presence dot when presenceOnline(node) is true', () => {
+    const { container } = render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'community', name: 'IPFS Crew' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+        presenceOnline: () => true,
+      },
+    });
+    expect(container.querySelector('.nav-presence-dot')).toBeTruthy();
+  });
+
+  it('hides the presence dot when presenceOnline(node) is false', () => {
+    const { container } = render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'community', name: 'IPFS Crew' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+        presenceOnline: () => false,
+      },
+    });
+    expect(container.querySelector('.nav-presence-dot')).toBeNull();
+  });
+
+  it('hides the presence dot when no resolver is provided (default off)', () => {
+    const { container } = render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'community', name: 'IPFS Crew' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    expect(container.querySelector('.nav-presence-dot')).toBeNull();
+  });
 });

@@ -28,6 +28,7 @@
     onSortOrderChange,
     statusText,
     forkParentName,
+    presenceOnline,
   }: {
     node: NavNode;
     colorAncestry: number[];
@@ -43,11 +44,18 @@
      *  glyph tooltip. Passed by NavTree when the parent is in the user's nav;
      *  null / undefined when the parent is absent (user left the original). */
     forkParentName?: string | null;
+    /** ZEB-600: resolver — should this node show an "online" presence dot?
+     *  Community rows: someone besides you is online there; DM rows: the
+     *  counterparty is online in some shared community. App-provided so the
+     *  nav stays agnostic of the presence service. */
+    presenceOnline?: (node: NavNode) => boolean;
   } = $props();
 
   let showSortMenu = $state(false);
 
   let paddingLeft = $derived(colorAncestry.length * 4 + 8);
+  // ZEB-600: whether to show the "online" presence dot for this node.
+  let showPresenceDot = $derived(presenceOnline?.(node) ?? false);
 
   function handleClick(e: MouseEvent | KeyboardEvent) {
     e.stopPropagation();
@@ -148,6 +156,9 @@
       {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
         <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={20} />
       {/if}
+      {#if showPresenceDot}
+        <span class="nav-presence-dot" role="img" aria-label="Online" title="Online"></span>
+      {/if}
       <span
         class="node-name"
         title={node.forkedFrom != null
@@ -199,6 +210,14 @@
 </div>
 
 <style>
+  /* ZEB-600: nav presence dot — solid green when the resolver reports online. */
+  .nav-presence-dot {
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #3ba55d;
+  }
   .nav-row {
     position: relative;
     display: flex;

@@ -80,6 +80,7 @@ export class PresenceService {
   async subscribe(
     communityId: string,
     onUpdate: (members: PresenceMemberDto[]) => void,
+    opts?: { setActive?: boolean },
   ): Promise<void> {
     if (!this.adapter) {
       console.warn('PresenceService.subscribe: no adapter wired; ignoring');
@@ -92,8 +93,13 @@ export class PresenceService {
       this.callbacks.delete(communityId);
       throw new Error(e instanceof Error ? e.message : String(e));
     }
-    // Backend subscribe succeeded → this is now the active community for isOnline.
-    this.activeCommunityId = communityId;
+    // Backend subscribe succeeded → point isOnline at this community UNLESS the
+    // caller opts out. Boot subscribe-all subscribes every joined community but
+    // passes setActive:false so a slow async completion can't clobber the user's
+    // selected roster (CodeRabbit #381); the selection path uses the default.
+    if (opts?.setActive ?? true) {
+      this.activeCommunityId = communityId;
+    }
 
     // Install the push listener and seed initial state (firing onUpdate) from
     // the authoritative snapshot. If EITHER the `listen` install OR the seed
@@ -178,6 +184,71 @@ export class PresenceService {
     return (
       this.byCommunity.get(this.activeCommunityId)?.get(ownerIdHex.toLowerCase())?.online ?? false
     );
+  }
+
+  /**
+   * ZEB-600: count of online members in `communityId` (0 if unsubscribed or
+   * unknown). Feeds the member-panel "N online" header. Self is never in the
+   * roster (zenoh doesn't loop our own beacon), so callers that want to include
+   * themselves add 1 separately.
+   */
+  onlineCount(communityId: string): number {
+    const map = this.byCommunity.get(communityId);
+    if (!map) return 0;
+    let n = 0;
+    for (const m of map.values()) if (m.online) n++;
+    return n;
+  }
+
+  /**
+   * ZEB-600: true iff at least one member OTHER THAN `selfOwnerIdHex` is online
+   * in `communityId`. Drives the sidebar dot ("someone besides you is around"),
+   * so a community where only you are present does not light up. Self is never
+   * in the roster, but we exclude defensively (case-insensitive).
+   */
+  hasOthersOnline(communityId: string, selfOwnerIdHex: string): boolean {
+    const map = this.byCommunity.get(communityId);
+    if (!map) return false;
+    const self = selfOwnerIdHex.toLowerCase();
+    for (const m of map.values()) {
+      if (m.online && m.ownerIdHex.toLowerCase() !== self) return true;
+    }
+    return false;
+  }
+
+  /**
+   * ZEB-600: true iff `ownerIdHex` is online in ANY subscribed community. Drives
+   * the DM-list dot. Caveat: a DM contact who shares no joined community with
+   * you always reads offline — inherent to community-scoped presence.
+   */
+  isOnlineAnywhere(ownerIdHex: string): boolean {
+    const key = ownerIdHex.toLowerCase();
+    for (const map of this.byCommunity.values()) {
+      if (map.get(key)?.online) return true;
+    }
+    return false;
+  }
+
+  /** ZEB-600: true iff `communityId` currently has a live subscription. */
+  isSubscribed(communityId: string): boolean {
+    return this.callbacks.has(communityId);
+  }
+
+  /**
+   * ZEB-600: point {@link isOnline} at `communityId` without re-subscribing —
+   * the subscribe-all model keeps every joined community live, so a
+   * community-switch only needs to re-target the active roster. No-op if
+   * `communityId` isn't subscribed (the switch path subscribes it instead).
+   */
+  setActive(communityId: string): void {
+    if (this.callbacks.has(communityId)) this.activeCommunityId = communityId;
+  }
+
+  /** ZEB-600: tear down every live subscription (app unmount). Idempotent. */
+  async unsubscribeAll(): Promise<void> {
+    for (const id of [...this.callbacks.keys()]) {
+      await this.unsubscribe(id).catch(() => {});
+    }
   }
 
   /** Replace a community's cached presence map and notify its subscriber. */

@@ -290,3 +290,54 @@ describe('MemberRow presence dot (ZEB-553)', () => {
     expect(container.querySelector('.member-row')?.getAttribute('role')).toBe('listitem');
   });
 });
+
+describe('MemberRow self-invisible dot (ZEB-600)', () => {
+  const PEER = 'cc'.repeat(16);
+
+  it('renders the self dot hollow (not online) when selfInvisible is true', () => {
+    const selfMember = makeMember(0, 'joined', VIEWER_ADDR);
+    const { container } = render(MemberRow, {
+      props: {
+        member: selfMember,
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        isOnline: () => false,
+        selfInvisible: true,
+      },
+    });
+    const dot = container.querySelector('.presence-dot');
+    expect(dot).not.toBeNull();
+    expect(dot?.classList.contains('online')).toBe(false);
+    expect(dot?.classList.contains('self-invisible')).toBe(true);
+    expect(dot?.getAttribute('aria-label')).toMatch(/appearing offline/i);
+  });
+
+  it('keeps the self dot online when selfInvisible is false', () => {
+    const selfMember = makeMember(0, 'joined', VIEWER_ADDR);
+    const { container } = render(MemberRow, {
+      props: {
+        member: selfMember,
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        isOnline: () => false,
+        selfInvisible: false,
+      },
+    });
+    const dot = container.querySelector('.presence-dot');
+    expect(dot?.classList.contains('online')).toBe(true);
+    expect(dot?.classList.contains('self-invisible')).toBe(false);
+  });
+
+  it('does not apply the invisible style to a non-self member', () => {
+    const peer = makeMember(0, 'joined', PEER);
+    const { container } = render(MemberRow, {
+      props: {
+        member: peer,
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        isOnline: () => true,
+        selfInvisible: true, // set, but must only affect the self row
+      },
+    });
+    const dot = container.querySelector('.presence-dot');
+    expect(dot?.classList.contains('self-invisible')).toBe(false);
+    expect(dot?.classList.contains('online')).toBe(true);
+  });
+});

@@ -32,6 +32,7 @@
     resolveCard,
     resolveNickname,
     isOnline,
+    selfInvisible = false,
     onOpenCard,
   }: {
     member: CommunityMember;
@@ -46,6 +47,10 @@
     /** ZEB-537: optional online-presence resolver. Reads through a parent
      *  PresenceService; undefined → no dot (treated as offline). */
     isOnline?: (ownerIdHex: string) => boolean;
+    /** ZEB-600: true when the viewer has "Appear offline" on. Only affects the
+     *  self row — flips its always-online dot to a hollow "invisible" state so
+     *  the viewer can confirm their own hidden status at a glance. */
+    selfInvisible?: boolean;
     /** ZEB-341: open the owner_id card popover for this member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
@@ -147,7 +152,17 @@
   // back within a session, so `isOnline(self)` reads false even though we're
   // clearly online — showing yourself "offline" in a community you're using
   // is confusing and undermines trust in the indicator.
-  let online = $derived(isSelf || (isOnline ? isOnline(member.address) : false));
+  // ZEB-600: when the viewer has "Appear offline" on, invert exactly that
+  // hard-coded self branch so the one row we author reflects the choice.
+  let online = $derived(
+    isSelf ? !selfInvisible : isOnline ? isOnline(member.address) : false,
+  );
+  // ZEB-600: the self row while invisible gets a distinct hollow look + label so
+  // "you appear offline" is unmistakable (vs a peer who is merely offline).
+  let selfHollow = $derived(isSelf && selfInvisible);
+  let dotTitle = $derived(
+    selfHollow ? 'Appearing offline' : online ? 'Online' : 'Offline',
+  );
 
   function handleMenuItemClick(action: KebabAction) {
     menuOpen = false;
@@ -186,9 +201,10 @@
   <span
     class="presence-dot"
     class:online
+    class:self-invisible={selfHollow}
     role="img"
-    title={online ? 'Online' : 'Offline'}
-    aria-label={online ? 'Online' : 'Offline'}
+    title={dotTitle}
+    aria-label={dotTitle}
   ></span>
   <Avatar
     address={member.address}
@@ -270,6 +286,13 @@
   .presence-dot.online {
     background: #3ba55d;
     border-color: #3ba55d;
+  }
+  /* ZEB-600: self row while "Appear offline" is on — hollow with a dashed ring
+     so it reads as a deliberate state, not an offline peer. */
+  .presence-dot.self-invisible {
+    background: transparent;
+    border-style: dashed;
+    border-color: var(--text-muted, var(--text-secondary));
   }
   .member-info {
     flex: 1;

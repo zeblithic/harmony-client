@@ -153,6 +153,23 @@ describe('PresenceService', () => {
     expect(service.isOnline(OWNER_1)).toBe(false);
   });
 
+  it('subscribe with { setActive: false } does not repoint the active community (boot subscribe-all)', async () => {
+    // ZEB-600 / CodeRabbit #381: boot subscribe-all subscribes every community
+    // but must NOT clobber the selected active roster. CID_A is selected/active;
+    // a background subscribe of CID_B with setActive:false leaves CID_A active.
+    (adapter.invoke as any).mockImplementation(async (cmd: string, args: { communityId: string }) => {
+      if (cmd === 'get_community_presence') {
+        return args.communityId === CID_A ? [member(OWNER_1, true)] : [];
+      }
+      return undefined;
+    });
+    await service.subscribe(CID_A, vi.fn()); // selection path → CID_A active
+    expect(service.isOnline(OWNER_1)).toBe(true);
+    await service.subscribe(CID_B, vi.fn(), { setActive: false }); // background
+    expect(service.isSubscribed(CID_B)).toBe(true); // CID_B is live...
+    expect(service.isOnline(OWNER_1)).toBe(true); // ...but CID_A stays active
+  });
+
   it('seed (get_community_presence) rejection rolls back the partial subscription and rethrows', async () => {
     const unlistenSpy = adapter.unlistens;
     (adapter.invoke as any).mockImplementation(async (cmd: string) => {
@@ -239,5 +256,45 @@ describe('PresenceService', () => {
     expect(noAdapter.isOnline(OWNER_1)).toBe(false);
 
     warn.mockRestore();
+  });
+
+  it('onlineCount counts online members in a community (0 for unknown)', async () => {
+    (adapter.invoke as any).mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_community_presence') return [member(OWNER_1, true), member(OWNER_2, false)];
+      return undefined;
+    });
+    await service.subscribe(CID_A, vi.fn());
+    expect(service.onlineCount(CID_A)).toBe(1);
+    expect(service.onlineCount(CID_B)).toBe(0); // unsubscribed / unknown
+  });
+
+  it('hasOthersOnline excludes self (case-insensitive)', async () => {
+    (adapter.invoke as any).mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_community_presence') return [member(OWNER_1, true)];
+      return undefined;
+    });
+    await service.subscribe(CID_A, vi.fn());
+    // Only OWNER_1 online → from OWNER_1's own view, nobody else is around.
+    expect(service.hasOthersOnline(CID_A, OWNER_1)).toBe(false);
+    expect(service.hasOthersOnline(CID_A, OWNER_1.toUpperCase())).toBe(false);
+    // From OWNER_2's view, OWNER_1 is someone else who's online.
+    expect(service.hasOthersOnline(CID_A, OWNER_2)).toBe(true);
+    expect(service.hasOthersOnline(CID_B, OWNER_2)).toBe(false); // unknown community
+  });
+
+  it('isOnlineAnywhere is true if online in ANY subscribed community (case-insensitive)', async () => {
+    (adapter.invoke as any).mockImplementation(async (cmd: string, args: { communityId: string }) => {
+      if (cmd === 'get_community_presence') {
+        return args.communityId === CID_A ? [member(OWNER_1, true)] : [];
+      }
+      return undefined;
+    });
+    // Subscribe-all keeps BOTH community maps (unlike isOnline, which is
+    // active-only). CID_B becomes active but CID_A's roster is retained.
+    await service.subscribe(CID_A, vi.fn());
+    await service.subscribe(CID_B, vi.fn());
+    expect(service.isOnlineAnywhere(OWNER_1)).toBe(true);
+    expect(service.isOnlineAnywhere(OWNER_1.toUpperCase())).toBe(true);
+    expect(service.isOnlineAnywhere(OWNER_2)).toBe(false);
   });
 });

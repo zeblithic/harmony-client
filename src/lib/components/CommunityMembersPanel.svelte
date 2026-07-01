@@ -17,6 +17,7 @@
     resolveCard,
     resolveNickname,
     isOnline,
+    selfInvisible = false,
     onOpenCard,
   }: {
     communityId: string;
@@ -35,6 +36,9 @@
     /** ZEB-537: optional online-presence resolver. Pure consumer of the
      *  parent's PresenceService — same contract as resolveCard. */
     isOnline?: (ownerIdHex: string) => boolean;
+    /** ZEB-600: true when the viewer has "Appear offline" on — forwarded to
+     *  MemberRow so only the self row shows the hollow "invisible" dot. */
+    selfInvisible?: boolean;
     /** ZEB-341: open the owner_id card popover for a clicked member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
@@ -104,10 +108,25 @@
     isLastAdmin: viewerIsLastAdmin,
   });
   let searchTrimmed = $derived(searchQuery.trim());
+  // ZEB-600: self counts as online unless "Appear offline" is on — matching
+  // MemberRow's self-dot exactly, so the header count and online-first sort never
+  // disagree with what the row shows. zenoh never loops our own beacon back, so
+  // the resolver can't answer for self; we decide it from `selfInvisible` here.
+  function memberOnline(m: CommunityMember): boolean {
+    if (m.address === ownAddress) return !selfInvisible;
+    return isOnline?.(m.address) ?? false;
+  }
+  // ZEB-600: sort online-first (stable — Array.sort keeps the backend order
+  // within each group), so who's around floats to the top.
   let joined = $derived(
-    members.filter(
-      (m) => m.status === 'joined' && matchesSearch(m, searchTrimmed)
-    )
+    members
+      .filter((m) => m.status === 'joined' && matchesSearch(m, searchTrimmed))
+      .sort((a, b) => Number(memberOnline(b)) - Number(memberOnline(a)))
+  );
+  // ZEB-600: count of online joined members (incl. yourself when visible),
+  // independent of the search filter.
+  let onlineCount = $derived(
+    members.filter((m) => m.status === 'joined' && memberOnline(m)).length
   );
   let banned = $derived(
     members.filter(
@@ -248,7 +267,9 @@
 
 <section class="community-members-panel">
   <header class="panel-header">
-    <h2 class="panel-title">Community Members</h2>
+    <h2 class="panel-title">
+      Community Members{#if onlineCount > 0} · {onlineCount} online{/if}
+    </h2>
     <input
       type="search"
       placeholder="Filter members..."
@@ -305,6 +326,7 @@
           {resolveCard}
           {resolveNickname}
           {isOnline}
+          {selfInvisible}
           {onOpenCard}
           onaction={(detail) => onMemberAction(detail)}
         />
@@ -325,6 +347,7 @@
               {resolveCard}
               {resolveNickname}
               {isOnline}
+              {selfInvisible}
               {onOpenCard}
               onaction={(detail) => onMemberAction(detail)}
             />

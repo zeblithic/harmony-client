@@ -7006,6 +7006,14 @@ pub async fn start_node_inner(
                     let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
                     let pkarr_settings =
                         pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
+                    // ZEB-600: apply the persisted appear-offline setting to the
+                    // presence map's node-global visibility gate BEFORE the event
+                    // loop can publish, so an invisible user emits no launch beacon.
+                    // (Map default is visible; flip to invisible only if opted in.)
+                    community_presence_map
+                        .lock()
+                        .await
+                        .set_visible(!pkarr_settings.presence_invisible);
                     // ZEB-380: build the pool from the persisted user-configurable
                     // relay list via the SAME lenient reader the IPCs + boot
                     // reconcile use — drops only malformed entries (a single bad
@@ -31083,6 +31091,96 @@ pub(crate) async fn unsubscribe_community_presence_impl(
     Ok(())
 }
 
+/// ZEB-600: persist the appear-offline setting to `connectivity-settings.json`
+/// (`presence_invisible = !visible`). Factored out of the IPC so it is
+/// unit-testable without a live `NodeState`. Uses the same load→mutate→save
+/// pattern as `apply_pkarr_relays`.
+fn persist_presence_visibility(path: &std::path::Path, visible: bool) -> Result<(), String> {
+    let path_buf = path.to_path_buf();
+    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path_buf);
+    settings.presence_invisible = !visible;
+    settings
+        .save(&path_buf)
+        .map_err(|e| format!("save connectivity-settings: {e}"))
+}
+
+/// IPC: ZEB-600. Set node-global presence visibility ("appear offline" when
+/// `false`). Flips the live gate on the shared presence map (publishers act on
+/// their next tick — no re-spawn) AND persists to `connectivity-settings.json`
+/// so the choice survives restart. Errors only on a poisoned lock or a
+/// settings-write failure.
+#[tauri::command]
+async fn set_presence_visibility(
+    app: tauri::AppHandle,
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    visible: bool,
+) -> Result<(), String> {
+    let (map, settings_path) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_presence_map.clone(),
+            g.pkarr_settings_path.clone(),
+        )
+    };
+    // Live: flip the shared gate if a node is running. If not, the persisted
+    // value below is applied to the map at next boot (see start_node).
+    if let Some(m) = map {
+        m.lock().await.set_visible(visible);
+    }
+    // Durable: persist so an invisible user stays hidden across restarts. Offload
+    // the sync std::fs load+save off the Tokio worker — this seam is reachable
+    // over the async IPC/headless surface (matches connectivity_set_identity_
+    // discoverable; PR #207/#305).
+    let path = connectivity_settings_path(settings_path)?;
+    tokio::task::spawn_blocking(move || persist_presence_visibility(&path, visible))
+        .await
+        .map_err(|e| format!("persist presence visibility task: {e}"))??;
+
+    // Notify the frontend so any panel showing self-presence (e.g. the member
+    // list self-dot) re-renders without polling. Mirrors the identity-
+    // discoverable toggle. Emit failures are non-fatal — the write succeeded.
+    if let Err(e) = app.emit(
+        "presence-visibility-changed",
+        serde_json::json!({ "visible": visible }),
+    ) {
+        tracing::warn!(error = %e, "set_presence_visibility: emit failed");
+    }
+
+    Ok(())
+}
+
+/// IPC: ZEB-600. Read the current presence visibility (`true` = visible). Prefers
+/// the live gate on a running node; falls back to the persisted setting when no
+/// node is running yet, so the settings UI can seed its toggle pre-connect.
+#[tauri::command]
+async fn get_presence_visibility(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let (map, settings_path) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_presence_map.clone(),
+            g.pkarr_settings_path.clone(),
+        )
+    };
+    if let Some(m) = map {
+        return Ok(m.lock().await.is_visible());
+    }
+    let path = connectivity_settings_path(settings_path)?;
+    // Offload the sync std::fs read off the Tokio worker (same rationale as the
+    // setter — this seam is reachable over the async IPC/headless surface).
+    let invisible = tokio::task::spawn_blocking(move || {
+        pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible
+    })
+    .await
+    .map_err(|e| format!("load presence visibility task: {e}"))?;
+    Ok(!invisible)
+}
+
 /// IPC: ZEB-537. Snapshot the current online roster for a community without
 /// waiting for the next `presence-updated` event (e.g. on first paint).
 #[tauri::command]
@@ -50624,6 +50722,8 @@ pub fn run() {
             subscribe_community_presence,
             unsubscribe_community_presence,
             get_community_presence,
+            set_presence_visibility,
+            get_presence_visibility,
             // ZEB-290 Phase 1 Task 11: Tier 1 voting IPCs.
             voting_create_tier1_poll,
             voting_cast_tier1_ballot,
@@ -53134,6 +53234,25 @@ mod channel_message_ipc_tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
     use tauri::Manager;
+
+    #[test]
+    fn persist_presence_visibility_inverts_to_settings() {
+        // ZEB-600: set-visible=false persists presence_invisible=true; set-visible
+        // =true clears it. The IPC layers the live atomic flip on top of this —
+        // this covers the durable half (the inversion is easy to get backwards).
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("connectivity-settings.json");
+        persist_presence_visibility(&path, false).expect("persist invisible");
+        assert!(
+            pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible,
+            "visible=false must persist presence_invisible=true"
+        );
+        persist_presence_visibility(&path, true).expect("persist visible");
+        assert!(
+            !pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible,
+            "visible=true must persist presence_invisible=false"
+        );
+    }
 
     /// Build a mock app with an empty `NodeState` (registry = None).
     /// Mirrors Phase 1's pattern of testing helper paths without

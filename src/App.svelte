@@ -36,7 +36,11 @@
   import { VotingAdapter } from './lib/voting-adapter';
   import { setupDelegateOnBehalfToast } from './lib/voting-toast-wiring';
   import { LibraryDirectoryService } from './lib/library-directory-service';
-  import { openJoinIroh } from './lib/connectivity-adapter';
+  import {
+    openJoinIroh,
+    getPresenceVisibility,
+    onPresenceVisibilityChanged,
+  } from './lib/connectivity-adapter';
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
@@ -142,12 +146,11 @@
   // repaints live.
   const presenceService = new PresenceService();
   let presenceVersion = $state(0);
-  // ZEB-537: generation guard for the fire-and-forget presence switch in
-  // changeSelectedCommunity. Rapid community switches interleave their async
-  // unsubscribe/subscribe; a superseded switch must bail after each await so it
-  // never resubscribes to (or clobbers state for) a community the user has
-  // already left. Plain (non-$state) — read only inside the IIFE.
-  let presenceSwitchGen = 0;
+  // ZEB-600: the viewer's own presence visibility ("Appear offline" inverse).
+  // Seeded on boot and kept live via the presence-visibility-changed event so
+  // the member-list self-dot reflects a toggle flip made in Settings. Defaults
+  // to visible; a corrupt settings file fails closed to invisible backend-side.
+  let presenceVisible = $state(true);
   // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
   // Set at startup (after start_node) and kept stable for the session.
   let selfOwnerId = $state<string | null>(null);
@@ -1069,35 +1072,26 @@
       communityMembers = [];
       // ZEB-404: new community session → reset the refetch throttle.
       lastMessageRosterRefetchAt = 0;
-      // ZEB-537: follow the selected community with the presence subscription —
-      // tear down the previous community's subscription, then start the new
-      // one. The onUpdate bumps presenceVersion → App re-renders → the inline
-      // isOnline resolver gets a fresh identity → MemberRow's $derived re-reads.
-      // No-ops cleanly before the adapter is wired. Fire-and-forget (IPC errors
-      // are non-blocking for selection).
-      const prevPresenceId = selectedCommunityId;
-      const myGen = ++presenceSwitchGen;
-      void (async () => {
-        try {
-          if (prevPresenceId != null) await presenceService.unsubscribe(prevPresenceId);
-          // A newer switch superseded us while awaiting — stop before
-          // resubscribing/clobbering the now-active community's state.
-          if (myGen !== presenceSwitchGen) return;
-          if (id != null) {
-            await presenceService.subscribe(id, () => {
+      // ZEB-600: subscribe-all model — every joined community stays subscribed
+      // for the session (the sidebar/DM dots need non-active rosters), so a
+      // switch only re-points isOnline() at the newly-selected community. If it
+      // isn't subscribed yet (selected before boot subscribe-all, or a
+      // just-joined community), subscribe it now. onUpdate bumps presenceVersion
+      // → App re-renders → resolvers re-read. Fire-and-forget; no-ops before the
+      // adapter is wired.
+      if (id != null) {
+        if (presenceService.isSubscribed(id)) {
+          presenceService.setActive(id);
+        } else {
+          void presenceService
+            .subscribe(id, () => {
               presenceVersion++;
-            });
-            if (myGen !== presenceSwitchGen) {
-              // A newer switch superseded us mid-subscribe; undo our now-stale
-              // subscription before bailing.
-              await presenceService.unsubscribe(id);
-              return;
-            }
-          }
-        } catch (e) {
-          console.error('presence subscription switch failed:', e instanceof Error ? e.message : String(e));
+            })
+            .catch((e) =>
+              console.error('presence subscribe failed:', e instanceof Error ? e.message : String(e)),
+            );
         }
-      })();
+      }
     }
     // ZEB-334 (Cursor PR #180): selecting a real community leaves the Notes
     // space, so the nav highlights the community and the feed shows it. Passing
@@ -1343,10 +1337,41 @@
   $effect(() => () => void friendCardService.unsubscribeAll());
   const channelMessageService = new ChannelMessageService();
   $effect(() => () => channelMessageService.destroy());
-  // ZEB-537: on app teardown, drop the presence subscription for whatever
-  // community is currently selected (no-ops cleanly if none / adapter absent).
+  // ZEB-600: on app teardown, drop ALL presence subscriptions (subscribe-all
+  // keeps every joined community live for the session). No-ops if none / adapter
+  // absent.
   $effect(() => () => {
-    if (selectedCommunityId != null) void presenceService.unsubscribe(selectedCommunityId);
+    void presenceService.unsubscribeAll();
+  });
+  // ZEB-600: seed the viewer's own presence visibility once and stay live with
+  // the backend so an "Appear offline" flip in Settings re-renders the member
+  // self-dot without a restart. Empty reactive deps → runs once, torn down on
+  // unmount. Both the initial read and the listen are individually error-guarded
+  // (web/dev mode has no Tauri backend), so neither can crash boot.
+  $effect(() => {
+    let cancelled = false;
+    // Subscribe BEFORE the initial read so a live "Appear offline" flip that
+    // lands mid-boot can't be overwritten by a late-resolving getPresenceVisibility
+    // seed (CodeRabbit #381). sawLiveUpdate wins over the initial read.
+    let sawLiveUpdate = false;
+    const stop = onPresenceVisibilityChanged((v) => {
+      sawLiveUpdate = true;
+      presenceVisible = v;
+    });
+    void getPresenceVisibility()
+      .then((v) => {
+        if (!cancelled && !sawLiveUpdate) presenceVisible = v;
+      })
+      .catch((e) => {
+        console.warn(
+          '[zeb-600] getPresenceVisibility failed:',
+          e instanceof Error ? e.message : String(e),
+        );
+      });
+    return () => {
+      cancelled = true;
+      stop();
+    };
   });
 
   let navNodes = $state([...navService.nodes]);
@@ -1806,6 +1831,32 @@
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn('[harmony-client] community rehydration failed:', msg);
+      }
+
+      // ZEB-600: subscribe presence for ALL joined communities (not just the
+      // active one) so the sidebar + DM dots reflect every community. A shared
+      // callback bumps presenceVersion; per-community failures are logged and
+      // skipped. setActive:false so these background subscribes never clobber the
+      // active roster isOnline() reads — only an explicit selection
+      // (changeSelectedCommunity) points active at a community (CodeRabbit #381).
+      for (const navNode of navService.nodes) {
+        if (navNode.type === 'community') {
+          void presenceService
+            .subscribe(
+              navNode.id,
+              () => {
+                presenceVersion++;
+              },
+              { setActive: false },
+            )
+            .catch((e) =>
+              console.error(
+                'presence subscribe-all failed for',
+                navNode.id,
+                e instanceof Error ? e.message : String(e),
+              ),
+            );
+        }
       }
 
       // Fetch our node address so self-sent messages/vines echo back as
@@ -2874,6 +2925,18 @@
         onSettingsClick={() => { showSettings = !showSettings; }}
         settingsActive={showSettings}
         profileLookup={(addr) => navService.profileLookup(addr)}
+        presenceOnline={(node) => {
+          // ZEB-600: reading presenceVersion registers the reactive dependency
+          // so every NavNodeRow dot recomputes when a beacon lands.
+          void presenceVersion;
+          if (node.type === 'community') {
+            return presenceService.hasOthersOnline(node.id, selfOwnerId ?? '');
+          }
+          if ((node.type === 'dm' || node.type === 'group-chat') && node.peer) {
+            return presenceService.isOnlineAnywhere(node.peer.address);
+          }
+          return false;
+        }}
         onModeChange={switchMode}
         {appMode}
         contentItems={allFileContents}
@@ -3010,6 +3073,7 @@
         {resolveCard}
         {resolveNickname}
         {isOnline}
+        selfInvisible={!presenceVisible}
         {subscribeVisibleCards}
         {unsubscribeCards}
         onOpenCard={openMemberCard}

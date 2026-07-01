@@ -84,6 +84,69 @@ describe('CommunityMembersPanel', () => {
     expect(aliceIdx).toBeLessThan(bobIdx);
   });
 
+  it('shows an online count in the header (self + isOnline-true members)', async () => {
+    // alice is self (always online); mark bob online via isOnline → 2 online.
+    const isOnline = (addr: string) => addr === bob.address;
+    const { container } = render(CommunityMembersPanel, { props: { ...baseProps(), isOnline } });
+    await screen.findByText(/Alice/);
+    expect(container.querySelector('.panel-title')?.textContent ?? '').toMatch(/2 online/);
+  });
+
+  it('excludes self from the online count when selfInvisible is on', async () => {
+    // Same as above but the viewer is invisible → self is NOT counted → 1 online.
+    const isOnline = (addr: string) => addr === bob.address;
+    const { container } = render(CommunityMembersPanel, {
+      props: { ...baseProps(), isOnline, selfInvisible: true },
+    });
+    await screen.findByText(/Alice/);
+    expect(container.querySelector('.panel-title')?.textContent ?? '').toMatch(/1 online/);
+  });
+
+  it('sorts invisible self below actually-online members', async () => {
+    // alice is self+invisible; bob is online. Online bob must float above alice.
+    const isOnline = (addr: string) => addr === bob.address;
+    render(CommunityMembersPanel, {
+      props: { ...baseProps(), isOnline, selfInvisible: true },
+    });
+    await screen.findByText(/Alice/);
+    const activeList = screen.getByRole('list', { name: 'Active members' });
+    const names = Array.from(activeList.querySelectorAll('.name')).map((el) => el.textContent ?? '');
+    const bobIdx = names.findIndex((n) => n.includes('Bob'));
+    const aliceIdx = names.findIndex((n) => n.includes('Alice'));
+    expect(bobIdx).toBeGreaterThanOrEqual(0);
+    expect(aliceIdx).toBeGreaterThanOrEqual(0);
+    expect(bobIdx).toBeLessThan(aliceIdx); // online Bob above invisible-self Alice
+  });
+
+  it('sorts online members before offline (online-first)', async () => {
+    const carol: CommunityMember = {
+      address: 'carol'.padEnd(32, '0'),
+      displayName: 'Carol',
+      power: 10,
+      status: 'joined',
+      joinedAt: 1700000003000,
+    };
+    // Backend order bob(offline) then carol(online); no self in this list so
+    // presence alone drives the sort.
+    const isOnline = (addr: string) => addr === carol.address;
+    render(CommunityMembersPanel, {
+      props: {
+        ...baseProps(),
+        communityService: makeService([bob, carol]),
+        ownAddress: 'nobody'.padEnd(32, '0'),
+        isOnline,
+      },
+    });
+    await screen.findByText(/Carol/);
+    const activeList = screen.getByRole('list', { name: 'Active members' });
+    const names = Array.from(activeList.querySelectorAll('.name')).map((el) => el.textContent ?? '');
+    const carolIdx = names.findIndex((n) => n.includes('Carol'));
+    const bobIdx = names.findIndex((n) => n.includes('Bob'));
+    expect(carolIdx).toBeGreaterThanOrEqual(0);
+    expect(bobIdx).toBeGreaterThanOrEqual(0);
+    expect(carolIdx).toBeLessThan(bobIdx); // online Carol floats above offline Bob
+  });
+
   it('Banned section visible (with count) when banned members exist', async () => {
     render(CommunityMembersPanel, { props: baseProps() });
 

@@ -47,6 +47,7 @@
     resolveCard,
     resolveNickname,
     isOnline,
+    selfInvisible = false,
     subscribeVisibleCards,
     unsubscribeCards,
     onOpenCard,
@@ -77,6 +78,9 @@
      *  Pure consumer of the parent's PresenceService (same contract as
      *  resolveCard). Undefined until the presence subscription is wired. */
     isOnline?: (ownerIdHex: string) => boolean;
+    /** ZEB-600: true when the viewer has "Appear offline" on — forwarded to the
+     *  members panel so the self row shows the hollow "invisible" dot. */
+    selfInvisible?: boolean;
     /** ZEB-341 Task 8: subscribe to cross-peer cards for the visible member set. */
     subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
     /** ZEB-341 Task 8: tear down all card subscriptions when the panel unmounts. */
@@ -579,6 +583,7 @@
         {resolveCard}
         {resolveNickname}
         {isOnline}
+        {selfInvisible}
         {onOpenCard}
       />
     </div>

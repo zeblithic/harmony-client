@@ -3002,6 +3002,11 @@ pub async fn run(
                 // produces an identical `(started_hlc, seq=0)` prefix and peers
                 // reject the new session's beacons as stale until TTL.
                 let mut session_logical: u32 = 0;
+                // ZEB-600: node-global presence-visibility handle, pulled once
+                // from the shared map. Each publisher gates its beacon on this
+                // Arc, so a live set_presence_visibility flip suppresses beacons
+                // on the next tick without re-spawning the pool.
+                let presence_visible = map_for_presence.lock().await.visible_handle();
                 while let Some(req) = request_rx.recv().await {
                     match req {
                         CommunityPresenceRequest::Subscribe { community_id } => {
@@ -3055,6 +3060,7 @@ pub async fn run(
                                     Duration::from_millis(
                                         crate::community_presence::BEACON_INTERVAL_MS,
                                     ),
+                                    Arc::clone(&presence_visible),
                                     Arc::clone(&closing_for_presence),
                                 );
                             let sub_handle =
