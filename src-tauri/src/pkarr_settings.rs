@@ -24,6 +24,11 @@ pub struct PkarrSettings {
     /// `set_pkarr_relays` (no restart).
     #[serde(default = "default_relays")]
     pub relays: Vec<String>,
+    /// ZEB-600: user "appear offline" toggle. When true, the node suppresses
+    /// its community-presence beacons (others see it offline; it still receives
+    /// their presence). Default OFF (visible) — presence is a product default.
+    #[serde(default)]
+    pub presence_invisible: bool,
 }
 
 /// Default for [`PkarrSettings::friend_auto_accept_known`]: ON (spec §7.1).
@@ -55,6 +60,7 @@ impl Default for PkarrSettings {
             identity_discoverable: false,
             friend_auto_accept_known: default_friend_auto_accept_known(),
             relays: default_relays(),
+            presence_invisible: false,
         }
     }
 }
@@ -204,6 +210,11 @@ impl PkarrSettings {
             identity_discoverable: false,
             friend_auto_accept_known: false,
             relays: default_relays(),
+            // ZEB-600: fail closed = INVISIBLE. A corrupt/unreadable file must
+            // never silently re-broadcast a user who had opted to appear offline.
+            // This is the INVERSE of identity_discoverable's closed value (false):
+            // presence's restrictive value is "don't broadcast" = invisible = true.
+            presence_invisible: true,
         }
     }
 
@@ -336,6 +347,7 @@ mod tests {
             identity_discoverable: true,
             friend_auto_accept_known: false,
             relays: vec!["https://relay.pkarr.org".to_string()],
+            presence_invisible: false,
         };
         settings.save(&path).expect("save");
 
@@ -385,6 +397,7 @@ mod tests {
             identity_discoverable: false,
             friend_auto_accept_known: true,
             relays: vec!["https://relay.pkarr.org".to_string()],
+            presence_invisible: false,
         };
         settings.save(&path).expect("save");
         assert_eq!(
@@ -521,5 +534,42 @@ mod tests {
         let out = sanitize_relay_urls(many);
         assert_eq!(out.len(), MAX_RELAYS, "sanitize caps at MAX_RELAYS");
         assert_eq!(out[0], "https://r0.example.com", "keeps the first entries");
+    }
+
+    #[test]
+    fn presence_invisible_defaults_visible() {
+        // First-run product default: presence broadcasts (invisible = false).
+        assert!(!PkarrSettings::default().presence_invisible);
+    }
+
+    #[test]
+    fn presence_invisible_missing_field_defaults_visible() {
+        // A pre-ZEB-600 settings file has no `presence_invisible` key; serde's
+        // field default must fill it FALSE so existing users keep broadcasting.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("legacy.json");
+        std::fs::write(&path, r#"{"identity_discoverable":true}"#).expect("write");
+        assert!(!PkarrSettings::load_or_default(&path).presence_invisible);
+    }
+
+    #[test]
+    fn presence_invisible_fails_closed_to_invisible() {
+        // A corrupt settings file must fail CLOSED = INVISIBLE: never silently
+        // re-broadcast a user who had opted to appear offline. NB this is the
+        // INVERSE direction of identity_discoverable (whose closed value is false).
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        std::fs::write(&path, b"{ not valid json").expect("write");
+        assert!(PkarrSettings::load_or_default(&path).presence_invisible);
+    }
+
+    #[test]
+    fn presence_invisible_round_trips() {
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        let mut s = PkarrSettings::default();
+        s.presence_invisible = true;
+        s.save(&path).expect("save");
+        assert!(PkarrSettings::load_or_default(&path).presence_invisible);
     }
 }
