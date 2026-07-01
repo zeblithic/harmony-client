@@ -2678,80 +2678,109 @@ impl ChannelLogRegistry {
             resync_interval_ms,
             now_for_deadline,
         );
+        // ZEB-599 D3: short hex ids for the driver's `harmony_channel` debug
+        // span — full ids are already logged at INFO by the spawn/adapter paths.
+        let community_short = hex::encode(&community_id.0[..4]);
+        let channel_short = hex::encode(&ds.channel_id.0[..4]);
+        tracing::debug!(
+            target: "harmony_channel",
+            community = %community_short,
+            channel = %channel_short,
+            last_full_reconcile_ms = ?backfill_last_full_reconcile_ms,
+            first_floor_deadline_ms = resync_first_deadline_ms,
+            "backfill floor deadline computed (restart-aware)"
+        );
         let persist_root = backfill_state_root;
         let on_full_reconcile: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |ts: u64| {
             let root = persist_root.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = crate::community_channel_log::ChannelBackfillState::save(&root, ts)
-                {
-                    tracing::warn!(
+                match crate::community_channel_log::ChannelBackfillState::save(&root, ts) {
+                    Err(e) => tracing::warn!(
                         error = %e,
                         "ZEB-599: failed to persist channel backfill_state sidecar"
-                    );
+                    ),
+                    Ok(()) => tracing::debug!(
+                        target: "harmony_channel",
+                        ts_ms = ts,
+                        "persisted backfill_state sidecar"
+                    ),
                 }
             });
         });
-        tokio::spawn(crate::channel_backfill::run_backfill_driver(
-            latch,
-            move |since: Option<Hlc>| {
-                let me = Arc::clone(&request_engine);
-                async move {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    // Send failure = query bridge closed: the
-                    // engine/adapter is gone for good (no recovery
-                    // hook exists) — stop the driver instead of
-                    // burning eternal futile retries.
-                    if me.request_backfill_with_outcome(since, tx).await.is_err() {
-                        return crate::channel_backfill::PageFetch::EngineGone;
+        // ZEB-599 D3: the span attaches community/channel to every
+        // `harmony_channel` debug event the driver emits — the driver's
+        // signature stays identity-free (test call sites unchanged).
+        use tracing::Instrument as _;
+        let driver_span = tracing::debug_span!(
+            target: "harmony_channel",
+            "backfill",
+            community = %community_short,
+            channel = %channel_short,
+        );
+        tokio::spawn(
+            crate::channel_backfill::run_backfill_driver(
+                latch,
+                move |since: Option<Hlc>| {
+                    let me = Arc::clone(&request_engine);
+                    async move {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        // Send failure = query bridge closed: the
+                        // engine/adapter is gone for good (no recovery
+                        // hook exists) — stop the driver instead of
+                        // burning eternal futile retries.
+                        if me.request_backfill_with_outcome(since, tx).await.is_err() {
+                            return crate::channel_backfill::PageFetch::EngineGone;
+                        }
+                        match rx.await {
+                            Ok(report) => crate::channel_backfill::PageFetch::Completed(
+                                report.replies,
+                                report.limit,
+                            ),
+                            // Sender dropped before a clean reply-stream
+                            // close: query aborted (adapter shutdown /
+                            // GET failure) — could be a transient
+                            // teardown race during shutdown, so treat as
+                            // no-reply → backoff; the shutdown watch ends
+                            // the driver promptly anyway.
+                            Err(_) => crate::channel_backfill::PageFetch::NoReply,
+                        }
                     }
-                    match rx.await {
-                        Ok(report) => crate::channel_backfill::PageFetch::Completed(
-                            report.replies,
-                            report.limit,
-                        ),
-                        // Sender dropped before a clean reply-stream
-                        // close: query aborted (adapter shutdown /
-                        // GET failure) — could be a transient
-                        // teardown race during shutdown, so treat as
-                        // no-reply → backoff; the shutdown watch ends
-                        // the driver promptly anyway.
-                        Err(_) => crate::channel_backfill::PageFetch::NoReply,
-                    }
-                }
-            },
-            move || {
-                let me = Arc::clone(&watermark_engine);
-                // Post-page watermark is re-read from the LOG (only
-                // verified events land there), never taken from raw
-                // reply packets — see `run_backfill_driver` doc.
-                async move { me.log_max_hlc().await }
-            },
-            backfill_shutdown_rx,
-            // ZEB-434 Task 7: park-on-Idle + re-arm on transport-epoch
-            // bumps (None preserves the legacy return-on-Idle path).
-            self.config.transport_epoch_rx.clone(),
-            // ZEB-599 Direction 1: presence-driven fast full-reconcile re-arm —
-            // bumped when a new roster device (potential holder) appears, so a
-            // relay-mediated cross-WAN peer's below-watermark backlog heals in
-            // seconds instead of waiting the ~1h floor below.
-            self.config.presence_resync_rx.clone(),
-            // ZEB-425: anti-entropy floor — re-arm ~hourly (jittered per
-            // driver to avoid a startup thundering herd) even with no epoch
-            // bump (router-only holders / late queryables / same-zid
-            // reconnects the never-seen-zid signal misses).
-            Some(resync_interval_ms),
-            || {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64
-            },
-            // ZEB-599: make the floor restart-aware + persist each fire.
-            Some(crate::channel_backfill::ResyncPersist {
-                first_deadline_ms: resync_first_deadline_ms,
-                on_full_reconcile,
-            }),
-        ));
+                },
+                move || {
+                    let me = Arc::clone(&watermark_engine);
+                    // Post-page watermark is re-read from the LOG (only
+                    // verified events land there), never taken from raw
+                    // reply packets — see `run_backfill_driver` doc.
+                    async move { me.log_max_hlc().await }
+                },
+                backfill_shutdown_rx,
+                // ZEB-434 Task 7: park-on-Idle + re-arm on transport-epoch
+                // bumps (None preserves the legacy return-on-Idle path).
+                self.config.transport_epoch_rx.clone(),
+                // ZEB-599 Direction 1: presence-driven fast full-reconcile re-arm —
+                // bumped when a new roster device (potential holder) appears, so a
+                // relay-mediated cross-WAN peer's below-watermark backlog heals in
+                // seconds instead of waiting the ~1h floor below.
+                self.config.presence_resync_rx.clone(),
+                // ZEB-425: anti-entropy floor — re-arm ~hourly (jittered per
+                // driver to avoid a startup thundering herd) even with no epoch
+                // bump (router-only holders / late queryables / same-zid
+                // reconnects the never-seen-zid signal misses).
+                Some(resync_interval_ms),
+                || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                },
+                // ZEB-599: make the floor restart-aware + persist each fire.
+                Some(crate::channel_backfill::ResyncPersist {
+                    first_deadline_ms: resync_first_deadline_ms,
+                    on_full_reconcile,
+                }),
+            )
+            .instrument(driver_span),
+        );
 
         Ok(engine)
     }

@@ -564,6 +564,12 @@ pub fn spawn_community_presence_subscriber(
                 // cooldown-gates it, and the ~1h floor stays the backstop).
                 // `send_modify` notifies all watchers; a bump with no receivers
                 // is a harmless no-op (mirrors the transport-epoch bump).
+                tracing::debug!(
+                    target: "harmony_channel",
+                    community = %hex::encode(&community.0[..4]),
+                    device = %hex::encode(&signed.beacon.device[..4]),
+                    "presence roster change → full-reconcile kick to backfill drivers"
+                );
                 resync_tx.send_modify(|e| *e = e.wrapping_add(1));
                 let members = {
                     let g = map.lock().await;
