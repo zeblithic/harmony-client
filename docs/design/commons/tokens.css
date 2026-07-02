@@ -1,0 +1,140 @@
+/* =============================================================================
+   Harmony — "Commons" design tokens
+   Drop-in replacement for the :root block in src/app.css
+   -----------------------------------------------------------------------------
+   This keeps EVERY variable name the current codebase already uses, so pasting
+   it over the existing :root reskins the whole app to Commons with zero
+   component changes. New semantic tokens (governance, fonts) are added below.
+
+   Fonts: add this to index.html <head> (or self-host for offline/Tauri):
+   <link rel="preconnect" href="https://fonts.googleapis.com">
+   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+   <link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+   ============================================================================= */
+
+:root {
+  /* ---- existing names, remapped to Commons LIGHT ---- */
+  --bg-primary:   #fbf9f4;  /* channel / message feed / main reading surface */
+  --bg-secondary: #efeadf;  /* nav rail, assembly rail, side panels          */
+  --bg-tertiary:  #e9e3d6;  /* inputs, raised chips, hover fills, scrollbar   */
+  --bg-hover:     #e9e3d6;  /* row hover (Layout.svelte references this)      */
+
+  --text-primary:   #20241c; /* ink            */
+  --text-secondary: #4b4f44; /* ink-2          */
+  --text-muted:     #767a6c; /* muted          */
+
+  --accent:       #466b4c;  /* consensus green — active nav, primary buttons  */
+  --accent-hover: #2f4a35;
+  --danger:       #b1402f;  /* dissent red                                    */
+  --border:       #e3ddcf;
+
+  /* paper = the app's deepest backdrop (behind the layout grid) */
+  --paper: #f4f1ea;
+
+  --avatar-size-micro: 24px;
+  --avatar-size-mini: 20px;
+  --nav-width: 240px;
+  --nav-width-collapsed: 56px;
+  --breakpoint-collapse: 768px;
+
+  /* ---- NEW: semantic + governance tokens ---- */
+  --surface-raised: #ffffff;  /* cards on top of feed                         */
+  --line-soft:      #ece7da;  /* hairline inside cards                        */
+  --faint:          #a39e8e;  /* placeholders, disabled, # glyphs             */
+
+  --primary-deep:  #2f4a35;
+  --primary-soft:  #e4ece2;   /* sage tint: active nav row, "for"/passing bg  */
+  --primary-border:#c9d6c6;
+
+  --gov-clay:      #b9742c;   /* governance attention: open proposals, deadlines */
+  --gov-clay-soft: #f1e2cc;
+  --gov-clay-deep: #5a4321;
+
+  --vote-for:      #466b4c;
+  --vote-against:  #b1402f;
+  --vote-abstain:  #cdc6b4;
+  --tally-track:   #eadfc8;   /* the empty bar behind a tally                 */
+
+  /* Added during Track A (ZEB-604), beyond the original export: the codebase
+     defines these in app.css, so the flip needs Commons values for them. */
+  --overlay: rgba(32, 27, 15, 0.45); /* warm modal scrim                     */
+  --info:    #4a6fa5;                /* civic navy-blue informational accent */
+  --success: #466b4c;                /* = consensus green                    */
+  --warning: #b9742c;                /* = governance clay                    */
+
+  --status-drafting-fg: #5a5345; --status-drafting-bg: #e6e0d0;
+  --status-open-fg:     #5a4321; --status-open-bg:     #f1e2cc;
+  --status-passed-fg:   #ffffff; --status-passed-bg:   #466b4c;
+  --status-failed-fg:   #ffffff; --status-failed-bg:   #b1402f;
+  --status-recalled-fg: #7d2a1e; --status-recalled-bg: #f3ddd7;
+
+  /* type */
+  --font-display: 'Newsreader', Georgia, serif;       /* community names, headers */
+  --font-ui:      'Public Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono:    'IBM Plex Mono', ui-monospace, 'SF Mono', monospace; /* IDs, tallies, timestamps */
+
+  /* radius + elevation */
+  --radius-chip: 3px;  --radius-input: 5px;  --radius-card: 8px;
+  --shadow-e1: 0 1px 3px rgba(40,30,10,.07);
+  --shadow-e2: 0 2px 10px rgba(40,30,10,.10);
+  --shadow-e3: 0 8px 28px rgba(40,30,10,.16);
+
+  /* base typography */
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  background-color: var(--paper);
+}
+
+/* =============================================================================
+   Commons DARK — warm, brown-tinted near-black (never Discord graphite).
+   Toggle with <html data-theme="dark"> from a Settings → Appearance control,
+   or swap the selector for @media (prefers-color-scheme: dark) to auto-follow.
+   ============================================================================= */
+:root[data-theme="dark"] {
+  --bg-primary:   #26231e;
+  --bg-secondary: #201e19;
+  --bg-tertiary:  #322e27;
+  --bg-hover:     #322e27;
+
+  --text-primary:   #f0ece2;
+  --text-secondary: #c4bdab;
+  --text-muted:     #8f897a;
+
+  --accent:       #7fa886;
+  --accent-hover: #97bd9d;
+  --danger:       #d98377;
+  --border:       #38342c;
+
+  --paper: #1c1a16;
+
+  --surface-raised: #2b2823;
+  --line-soft:      #322e27;
+  --faint:          #6f6a5c;
+
+  --primary-deep:   #7fa886;
+  --primary-soft:   #2a342a;
+  --primary-border: #3c4a3d;
+
+  --gov-clay:       #d39450;
+  --gov-clay-soft:  #3a2f1f;
+  --gov-clay-deep:  #e2b888;
+
+  --vote-for:      #7fa886;
+  --vote-against:  #d98377;
+  --vote-abstain:  #4a4639;
+  --tally-track:   #322a1f;
+
+  /* ZEB-604 additions (see light block) */
+  --overlay: rgba(0, 0, 0, 0.55);
+  --info:    #8ab0d8;
+  --success: #7fa886;
+  --warning: #d39450;
+
+  --status-drafting-fg: #c4bdab; --status-drafting-bg: #322e27;
+  --status-open-fg:     #e2b888; --status-open-bg:     #3a2f1f;
+  --status-passed-fg:   #14160f; --status-passed-bg:   #7fa886;
+  --status-failed-fg:   #1c1a16; --status-failed-bg:   #d98377;
+  --status-recalled-fg: #e2b888; --status-recalled-bg: #3a2f1f;
+}

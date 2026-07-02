@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  html,body{height:auto;min-height:100%;overflow:auto;background:#e9e5db;}
+  @keyframes hToast{0%{opacity:0;transform:translate(-50%,8px)}12%{opacity:1;transform:translate(-50%,0)}88%{opacity:1;transform:translate(-50%,0)}100%{opacity:0;transform:translate(-50%,8px)}}
+  @keyframes hSheet{0%{transform:translateY(100%)}100%{transform:translateY(0)}}
+</style>
+</helmet>
+
+<div style="min-height:100vh; background:#e9e5db; display:flex; flex-direction:column; align-items:center; padding:30px 20px 60px; gap:16px; font-family:'Public Sans',system-ui;">
+  <div style="text-align:center; max-width:440px;">
+    <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:rgba(60,55,45,.55);">Harmony · interactive prototype</div>
+    <div style="font:500 26px 'Newsreader',serif; color:#2a2519; margin-top:3px;">The vote flow — live</div>
+    <div style="font:400 13px/1.5 'Public Sans'; color:#6b6256; margin-top:5px;">Tap a proposal, cast a vote, or hand it to someone you trust — the tally, quorum and status all respond. Everything below is real state.</div>
+  </div>
+
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 18px 50px rgba(40,30,10,.26);">
+    <div style="background:#fbf9f4; border-radius:36px; overflow:hidden; width:390px; height:844px; display:flex; flex-direction:column; position:relative;">
+      <div style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#20241c; flex-shrink:0; z-index:2;"><span>9:41</span><span style="font-size:11px;">●●● ▆ 􀛨</span></div>
+
+      <!-- ===== LIST ===== -->
+      <sc-if value="{{ isList }}" hint-placeholder-val="{{ true }}">
+        <div style="flex:1; display:flex; flex-direction:column; min-height:0;">
+          <div style="padding:4px 18px 12px;">
+            <div style="display:flex; align-items:center; gap:8px;"><span style="color:#b9742c; font-size:17px;">⚖</span><span style="font:500 24px 'Newsreader',serif; color:#20241c;">Assembly</span><span style="margin-left:auto; font:600 12px 'Public Sans'; color:#fff; background:#466b4c; padding:7px 13px; border-radius:8px; cursor:pointer;">＋ Draft</span></div>
+            <div style="font:400 11.5px 'IBM Plex Mono'; color:#959183; margin-top:3px;">Cascadia Commons · 142 members · quorum 72</div>
+          </div>
+          <div style="padding:0 16px 10px; display:flex; gap:7px;"><span style="font:600 12px 'Public Sans'; color:#fff; background:#b9742c; padding:6px 13px; border-radius:20px;">Open · 2</span><span style="font:500 12px 'Public Sans'; color:#767a6c; background:#efeadf; padding:6px 13px; border-radius:20px;">Drafting · 1</span><span style="font:500 12px 'Public Sans'; color:#767a6c; background:#efeadf; padding:6px 13px; border-radius:20px;">Decided · 24</span></div>
+          <div style="flex:1; overflow-y:auto; padding:6px 16px 16px; display:flex; flex-direction:column; gap:12px;">
+            <sc-for list="{{ list }}" as="p" hint-placeholder-count="2">
+              <div onClick="{{ p.open }}" style="background:#fff; border:1px solid #e6dcc6; border-left:3px solid #b9742c; border-radius:11px; padding:15px; box-shadow:0 1px 3px rgba(40,30,10,.06); cursor:pointer;">
+                <div style="display:flex; align-items:center; gap:7px;"><span style="font:600 10px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:2px 6px; border-radius:3px;">{{ p.tag }}</span><span style="{{ p.statusChip }}">{{ p.status }}</span><span style="margin-left:auto; font:500 10.5px 'IBM Plex Mono'; color:#b9742c;">⏳ {{ p.closes }}</span></div>
+                <div style="font:600 15px/1.32 'Public Sans'; color:#20241c; margin-top:9px;">{{ p.title }}</div>
+                <div style="margin-top:11px; height:8px; border-radius:4px; background:#eadfc8; overflow:hidden; display:flex;"><span style="{{ p.forSeg }}"></span><span style="{{ p.againstSeg }}"></span><span style="{{ p.abstainSeg }}"></span></div>
+                <div style="display:flex; align-items:center; gap:12px; margin-top:7px;"><span style="font:600 11px 'IBM Plex Mono'; color:#466b4c;">{{ p.forPct }}% for</span><span style="font:500 11px 'IBM Plex Mono'; color:#8a8472;">{{ p.quorumLine }}</span><span style="{{ p.votedChip }}">{{ p.chipLabel }}</span></div>
+              </div>
+            </sc-for>
+            <div style="display:flex; align-items:center; gap:11px; padding:13px 15px; opacity:.85;"><span style="font:600 10px 'IBM Plex Mono'; color:#5a5345; background:#e6e0d0; padding:2px 6px; border-radius:3px;">P-12</span><span style="font:600 10.5px 'Public Sans'; color:#fff; background:#466b4c; padding:2px 9px; border-radius:20px;">✓ Passed</span><span style="font:500 13px 'Public Sans'; color:#4b4f44;">Monthly treasury report-back</span><span style="margin-left:auto; font:500 10.5px 'IBM Plex Mono'; color:#a39e8e;">81%</span></div>
+          </div>
+          <div style="display:flex; padding:6px 8px 24px; border-top:1px solid #ece7da; background:#f6f3ec;">
+            <div style="flex:1; text-align:center; color:#959183;"><div style="font-size:19px;">💬</div><div style="font:500 10px 'Public Sans';">Chat</div></div>
+            <div style="flex:1; text-align:center; color:#b9742c;"><div style="font-size:19px;">⚖</div><div style="font:600 10px 'Public Sans';">Assembly</div></div>
+            <div style="flex:1; text-align:center; color:#959183;"><div style="font-size:19px;">🔔</div><div style="font:500 10px 'Public Sans';">Activity</div></div>
+            <div style="flex:1; text-align:center; color:#959183;"><div style="font-size:19px;">👤</div><div style="font:500 10px 'Public Sans';">You</div></div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- ===== BALLOT ===== -->
+      <sc-if value="{{ isBallot }}" hint-placeholder-val="{{ false }}">
+        <div style="flex:1; display:flex; flex-direction:column; min-height:0;">
+          <div style="padding:2px 14px 10px; display:flex; align-items:center; gap:10px; border-bottom:1px solid #ece7da;"><span onClick="{{ back }}" style="color:#466b4c; font-size:20px; cursor:pointer; padding:2px 6px;">‹</span><span style="font:600 12px 'IBM Plex Mono'; color:#8a8472;">{{ cur.tag }} · {{ cur.topic }}</span><span style="{{ cur.statusChipR }}">{{ cur.status }}</span></div>
+          <div style="flex:1; overflow-y:auto; padding:18px 18px 18px;">
+            <h1 style="margin:0; font:500 23px/1.22 'Newsreader',serif; color:#20241c;">{{ cur.title }}</h1>
+            <div style="display:flex; align-items:center; gap:8px; margin-top:9px; font:400 12px 'Public Sans'; color:#767a6c;"><span style="width:20px; height:20px; border-radius:50%; background:#a9bcc4;"></span> by <strong style="color:#466b4c;">{{ cur.author }}</strong> · ⏳ {{ cur.closes }} left</div>
+
+            <div style="margin-top:16px; background:#fff; border:1px solid #e6dcc6; border-radius:12px; padding:16px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+              <div style="display:flex; align-items:center;"><span style="font:600 10.5px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#8a8472;">Live tally</span><span style="margin-left:auto; font:500 10.5px 'IBM Plex Mono'; color:#a39e8e;">{{ cur.castLine }}</span></div>
+              <div style="margin-top:11px; display:flex; flex-direction:column; gap:9px;">
+                <div><div style="display:flex; justify-content:space-between; font:600 11.5px 'IBM Plex Mono'; color:#466b4c;"><span>▲ FOR</span><span>{{ cur.forN }} · {{ cur.forPct }}%</span></div><div style="height:8px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="{{ cur.forSeg }}"></span></div></div>
+                <div><div style="display:flex; justify-content:space-between; font:600 11.5px 'IBM Plex Mono'; color:#b1402f;"><span>▼ AGAINST</span><span>{{ cur.againstN }} · {{ cur.againstPct }}%</span></div><div style="height:8px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="{{ cur.againstSeg }}"></span></div></div>
+                <div><div style="display:flex; justify-content:space-between; font:600 11.5px 'IBM Plex Mono'; color:#8a8472;"><span>— ABSTAIN</span><span>{{ cur.abstainN }} · {{ cur.abstainPct }}%</span></div><div style="height:8px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="{{ cur.abstainSeg }}"></span></div></div>
+              </div>
+              <div style="margin-top:13px; display:flex; gap:8px;">
+                <div style="{{ cur.quorumBox }}"><div style="font:600 9px 'Public Sans'; letter-spacing:.05em; text-transform:uppercase; opacity:.75;">Quorum</div><div style="font:600 12.5px 'IBM Plex Mono'; margin-top:1px;">{{ cur.quorumValue }}</div></div>
+                <div style="flex:1; background:#f1e2cc; border-radius:7px; padding:9px 11px;"><div style="font:600 9px 'Public Sans'; letter-spacing:.05em; text-transform:uppercase; color:#6b5226;">Conviction</div><div style="font:600 12.5px 'IBM Plex Mono'; color:#5a4321; margin-top:1px;">▁▂▄▆ ↑</div></div>
+              </div>
+            </div>
+
+            <div style="margin-top:16px; font:400 14px/1.6 'Public Sans'; color:#3a3e34;">{{ cur.desc }}</div>
+            <div style="margin-top:13px; border-left:3px solid #466b4c; background:#e4ece2; border-radius:0 6px 6px 0; padding:11px 14px;"><div style="font:600 11.5px 'Public Sans'; color:#2f4a35;">Why now</div><div style="font:400 12.5px/1.5 'Public Sans'; color:#3a4d3a; margin-top:2px;">{{ cur.why }}</div></div>
+
+            <div style="margin-top:16px; display:flex; align-items:center; gap:8px; font:600 11px 'Public Sans'; letter-spacing:.06em; text-transform:uppercase; color:#8a8472;">Deliberation <span style="font:500 10px 'IBM Plex Mono'; color:#a39e8e; text-transform:none; letter-spacing:0;">18</span><span style="flex:1; height:1px; background:#ece7da;"></span></div>
+            <div style="margin-top:11px; display:flex; gap:9px;"><span style="width:28px; height:28px; border-radius:50%; background:#c9bfa6; flex-shrink:0;"></span><div><div style="font:600 12px 'Public Sans'; color:#20241c;">Mara Okafor <span style="font:500 9px 'IBM Plex Mono'; color:#466b4c; border:1px solid #c9d6c6; padding:0 3px; border-radius:3px;">▲</span></div><div style="font:400 12.5px/1.45 'Public Sans'; color:#3a3e34;">Strong support — can we earmark $50 for the shared heater library?</div></div></div>
+          </div>
+
+          <div style="padding:11px 14px 0; border-top:1px solid #e3ddcf; background:#f6f3ec; box-shadow:0 -4px 14px rgba(40,30,10,.05);">
+            <sc-if value="{{ cur.isDelegated }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex; align-items:center; gap:9px; background:#e8eef0; border:1px solid #cdd9dd; border-radius:9px; padding:9px 12px; margin-bottom:9px;">
+                <span style="{{ cur.delegateAvatar }}">{{ cur.delegateInitials }}</span>
+                <div style="flex:1; line-height:1.25;"><div style="font:600 12px 'Public Sans'; color:#20241c;">Proxied to {{ cur.delegateName }}</div><div style="font:400 10.5px 'Public Sans'; color:#5a6a72;">Your vote follows their {{ cur.delegateStanceLabel }}</div></div>
+                <button onClick="{{ cur.recall }}" style="padding:7px 12px; border:1px solid #e0b9b1; border-radius:7px; background:#fff; font:600 11px 'Public Sans'; color:#b1402f; cursor:pointer;">Recall</button>
+              </div>
+            </sc-if>
+            <sc-if value="{{ cur.hasVoted }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex; align-items:center; gap:8px; font:500 11px 'Public Sans'; color:#2f4a35; margin-bottom:9px;"><span>✓</span> You voted {{ cur.myVoteLabel }} · signed with your key. <span onClick="{{ cur.openSheet }}" style="margin-left:auto; color:#466b4c; text-decoration:underline; cursor:pointer;">Delegate instead</span></div>
+            </sc-if>
+            <sc-if value="{{ cur.isUndecided }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex; align-items:center; gap:8px; font:400 11px 'Public Sans'; color:#767a6c; margin-bottom:9px;"><span>🗳</span> Your 1 vote is uncast. <span onClick="{{ cur.openSheet }}" style="margin-left:auto; color:#466b4c; font-weight:600; text-decoration:underline; cursor:pointer;">Delegate to someone you trust</span></div>
+            </sc-if>
+            <div style="display:flex; gap:8px;">
+              <button onClick="{{ cur.castFor }}" style="{{ cur.forBtn }}">▲ Vote for</button>
+              <button onClick="{{ cur.castAgainst }}" style="{{ cur.againstBtn }}">▼</button>
+              <button onClick="{{ cur.castAbstain }}" style="{{ cur.abstainBtn }}">—</button>
+            </div>
+            <div style="height:22px;"></div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- ===== SHEET ===== -->
+      <sc-if value="{{ sheetOpen }}" hint-placeholder-val="{{ false }}">
+        <div onClick="{{ closeSheet }}" style="position:absolute; inset:0; background:rgba(28,26,22,.42); z-index:8;"></div>
+        <div style="position:absolute; left:0; right:0; bottom:0; z-index:9; background:#fbf9f4; border-radius:24px 24px 0 0; padding:10px 18px 30px; box-shadow:0 -10px 40px rgba(40,30,10,.25); animation:hSheet .26s ease;">
+          <div style="width:40px; height:5px; border-radius:3px; background:#d8d1c1; margin:4px auto 14px;"></div>
+          <div style="font:500 20px 'Newsreader',serif; color:#20241c;">Delegate this vote</div>
+          <div style="font:400 12.5px/1.5 'Public Sans'; color:#767a6c; margin-top:3px;">Your vote follows theirs on this proposal — and you can recall it any time before it closes.</div>
+          <div style="margin-top:14px; display:flex; flex-direction:column; gap:9px;">
+            <sc-for list="{{ delegates }}" as="d" hint-placeholder-count="3">
+              <div onClick="{{ d.choose }}" style="display:flex; align-items:center; gap:11px; background:#fff; border:1px solid #e3ddcf; border-radius:11px; padding:12px 14px; cursor:pointer;">
+                <span style="{{ d.avatar }}">{{ d.initials }}</span>
+                <div style="flex:1; line-height:1.3;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">{{ d.name }}</div><div style="font:400 11px 'Public Sans'; color:#767a6c;">{{ d.note }} · carries {{ d.votes }} votes</div></div>
+                <span style="{{ d.stanceStyle }}">{{ d.stanceLabel }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <button onClick="{{ closeSheet }}" style="width:100%; margin-top:14px; padding:12px; border:1px solid #d8d1c1; border-radius:10px; background:transparent; font:600 13px 'Public Sans'; color:#767a6c; cursor:pointer;">Cancel</button>
+        </div>
+      </sc-if>
+
+      <!-- TOAST -->
+      <sc-if value="{{ toast }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; bottom:120px; left:50%; z-index:12; background:#20241c; color:#f4f1ea; font:600 12.5px 'Public Sans'; padding:11px 18px; border-radius:22px; box-shadow:0 8px 24px rgba(0,0,0,.3); animation:hToast 2.15s ease forwards; white-space:nowrap;">{{ toast }}</div>
+      </sc-if>
+
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#20241c; opacity:.22; z-index:3;"></div>
+    </div>
+  </div>
+
+  <div style="font:400 12px 'Public Sans'; color:#8a8472; text-align:center; max-width:420px;">Try it: open <strong style="color:#5a5347;">P-14</strong> → tap <strong style="color:#466b4c;">Vote for</strong> and watch the bar move → then <strong style="color:#466b4c;">Delegate</strong> to the Heating WG → <strong style="color:#b1402f;">Recall</strong>. Each action is signed to your key, the Harmony way.</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = {
+    view: 'list',
+    selectedId: 'P-14',
+    sheetOpen: false,
+    toast: null,
+    byId: {
+      'P-14': { myVote: null, delegate: null },
+      'P-13': { myVote: null, delegate: null },
+    },
+  };
+
+  proposals = [
+    {
+      id: 'P-14', tag: 'P-14', topic: 'Treasury', author: 'Heating WG',
+      title: 'Reallocate $400 from reserves to the winter heating fund',
+      closes: '2d 4h',
+      desc: 'Our reserve sits at $2,140 against a winter we expect to be hard. This moves $400 into the heating fund so the mutual-aid group can cover emergency heating through March without a separate vote each time. The reserve floor stays above the $1,500 we agreed to hold in P-09.',
+      why: 'Two members have already raised heating emergencies this month and the fund is empty. Acting before the cold snap beats reacting after.',
+      base: { for: 96, against: 20, abstain: 24 }, members: 142, quorum: 72,
+    },
+    {
+      id: 'P-13', tag: 'P-13', topic: 'Membership', author: '5 members',
+      title: 'Recall vote — replace facilitator seat B before term end',
+      closes: '5d',
+      desc: 'A petition signed by five members calls a recall on facilitator seat B, citing three Town Halls that lost quorum waiting on the chair. A simple majority with a 61-vote quorum replaces the seat immediately.',
+      why: 'Three consecutive Town Halls were lost because the chair did not open the floor in time.',
+      base: { for: 58, against: 47, abstain: 12 }, members: 142, quorum: 61,
+    },
+  ];
+
+  delegates = [
+    { id: 'wg', name: 'Heating WG', initials: 'HW', color: '#5a7d8a', votes: 23, stance: 'for', note: 'Treasury working group' },
+    { id: 'mara', name: 'Mara Okafor', initials: 'MO', color: '#8a7a5a', votes: 7, stance: 'for', note: 'Trusted neighbor' },
+    { id: 'theo', name: 'Theo Lind', initials: 'TL', color: '#9a6a6a', votes: 3, stance: 'against', note: 'Watches the reserve floor' },
+  ];
+
+  showToast(msg) {
+    clearTimeout(this._t);
+    this.setState({ toast: msg });
+    this._t = setTimeout(() => this.setState({ toast: null }), 2100);
+  }
+  componentWillUnmount() { clearTimeout(this._t); }
+
+  openProposal(id) { this.setState({ view: 'ballot', selectedId: id }); }
+  back() { this.setState({ view: 'list', sheetOpen: false }); }
+  openSheet() { this.setState({ sheetOpen: true }); }
+  closeSheet() { this.setState({ sheetOpen: false }); }
+
+  cast(stance) {
+    const id = this.state.selectedId;
+    const byId = { ...this.state.byId, [id]: { myVote: stance, delegate: null } };
+    this.setState({ byId, sheetOpen: false });
+    this.showToast('\u2713 Vote ' + this.stanceLabel(stance) + ' \u00b7 signed with your key');
+  }
+  chooseDelegate(d) {
+    const id = this.state.selectedId;
+    const byId = { ...this.state.byId, [id]: { myVote: null, delegate: d } };
+    this.setState({ byId, sheetOpen: false });
+    this.showToast('\u21aa Proxied to ' + d.name);
+  }
+  recall() {
+    const id = this.state.selectedId;
+    const byId = { ...this.state.byId, [id]: { myVote: null, delegate: null } };
+    this.setState({ byId });
+    this.showToast('\u21a9 Delegation recalled \u2014 your vote is yours again');
+  }
+
+  stanceLabel(s) { return s === 'for' ? '\u25b2 for' : s === 'against' ? '\u25bc against' : '\u2014 abstain'; }
+
+  statusStyleFor(name) {
+    if (name === 'Passing') return { color: '#2f4a35', background: '#e4ece2' };
+    if (name === 'Failing') return { color: '#7d2a1e', background: '#f3ddd7' };
+    if (name === 'Tied') return { color: '#5a4321', background: '#f1e2cc' };
+    return { color: '#5a5345', background: '#e6e0d0' };
+  }
+
+  seg(pct, bg) { return { width: pct + '%', height: '100%', display: 'block', background: bg, transition: 'width .35s ease' }; }
+
+  decorate(p) {
+    const us = this.state.byId[p.id];
+    const stance = us.myVote || (us.delegate ? us.delegate.stance : null);
+    const c = { for: p.base.for, against: p.base.against, abstain: p.base.abstain };
+    if (stance) c[stance] += 1;
+    const cast = c.for + c.against + c.abstain;
+    const pct = (n) => Math.round((n / cast) * 100);
+    const forPct = pct(c.for), againstPct = pct(c.against), abstainPct = pct(c.abstain);
+    const quorumMet = cast >= p.quorum;
+    let status = 'Quorum not met';
+    if (quorumMet) status = c.for > c.against ? 'Passing' : c.against > c.for ? 'Failing' : 'Tied';
+
+    const chipBase = { font: "600 10.5px 'Public Sans'", padding: '2px 9px', borderRadius: '20px' };
+    const statusChip = { ...chipBase, ...this.statusStyleFor(status) };
+
+    const me = us.myVote;
+    const votedColors = me
+      ? (me === 'for' ? { color: '#2f4a35', background: '#e4ece2' } : me === 'against' ? { color: '#7d2a1e', background: '#f3ddd7' } : { color: '#5a5345', background: '#e6e0d0' })
+      : us.delegate ? { color: '#6b5226', background: '#f1e2cc' } : { color: '#959183', background: '#f0ebdf' };
+    const chipLabel = me ? ('\u2713 ' + this.stanceLabel(me)) : us.delegate ? ('\u21aa ' + us.delegate.name) : 'Not voted';
+
+    const btnBase = { borderRadius: '10px', cursor: 'pointer', padding: '13px' };
+    const onSel = { for: { background: '#466b4c', color: '#fff', border: 'none' }, against: { background: '#b1402f', color: '#fff', border: 'none' }, abstain: { background: '#767a6c', color: '#fff', border: 'none' } };
+    const offSel = { for: { background: '#fff', color: '#466b4c', border: '1px solid #c9d6c6' }, against: { background: '#fff', color: '#b1402f', border: '1px solid #e0b9b1' }, abstain: { background: '#fff', color: '#767a6c', border: '1px solid #d8d1c1' } };
+
+    const avatarBase = { borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' };
+
+    return {
+      id: p.id, tag: p.tag, topic: p.topic, author: p.author, title: p.title, closes: p.closes,
+      desc: p.desc, why: p.why,
+      forN: c.for, againstN: c.against, abstainN: c.abstain,
+      forPct, againstPct, abstainPct,
+      forSeg: this.seg(forPct, '#466b4c'), againstSeg: this.seg(againstPct, '#b1402f'), abstainSeg: this.seg(abstainPct, '#cdc6b4'),
+      status,
+      statusChip,
+      statusChipR: { ...statusChip, marginLeft: 'auto' },
+      votedChip: { ...chipBase, marginLeft: 'auto', ...votedColors },
+      chipLabel,
+      quorumLine: quorumMet ? 'quorum \u2713' : 'quorum ' + cast + '/' + p.quorum,
+      quorumValue: cast + '/' + p.members + (quorumMet ? ' \u2713' : ''),
+      quorumBox: { flex: 1, borderRadius: '7px', padding: '9px 11px', ...(quorumMet ? { background: '#e4ece2', color: '#2f4a35' } : { background: '#f3ddd7', color: '#7d2a1e' }) },
+      castLine: cast + ' of ' + p.members + ' voted',
+      open: () => this.openProposal(p.id),
+      myVote: me, myVoteLabel: me ? this.stanceLabel(me) : '',
+      hasVoted: !!me,
+      isDelegated: !!us.delegate,
+      isUndecided: !me && !us.delegate,
+      delegateName: us.delegate ? us.delegate.name : '',
+      delegateInitials: us.delegate ? us.delegate.initials : '',
+      delegateAvatar: { ...avatarBase, width: '26px', height: '26px', font: "600 9px 'Public Sans'", background: us.delegate ? us.delegate.color : '#a9bcc4' },
+      delegateStanceLabel: us.delegate ? this.stanceLabel(us.delegate.stance) : '',
+      forBtn: { ...btnBase, flex: 2, font: "600 14px 'Public Sans'", ...(me === 'for' ? onSel.for : offSel.for) },
+      againstBtn: { ...btnBase, flex: 1, font: "600 13px 'Public Sans'", ...(me === 'against' ? onSel.against : offSel.against) },
+      abstainBtn: { ...btnBase, flex: 1, font: "600 13px 'Public Sans'", ...(me === 'abstain' ? onSel.abstain : offSel.abstain) },
+      castFor: () => this.cast('for'), castAgainst: () => this.cast('against'), castAbstain: () => this.cast('abstain'),
+      openSheet: () => this.openSheet(), recall: () => this.recall(),
+    };
+  }
+
+  renderVals() {
+    const chipBase = { font: "600 10.5px 'Public Sans'", padding: '3px 9px', borderRadius: '20px' };
+    const avatarBase = { borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' };
+    const list = this.proposals.map((p) => this.decorate(p));
+    const cur = this.decorate(this.proposals.find((p) => p.id === this.state.selectedId));
+    const delegates = this.delegates.map((d) => ({
+      id: d.id, name: d.name, initials: d.initials, note: d.note, votes: d.votes,
+      avatar: { ...avatarBase, width: '36px', height: '36px', font: "600 12px 'Public Sans'", background: d.color },
+      stanceLabel: d.stance === 'for' ? '\u25b2 for' : '\u25bc against',
+      stanceStyle: { ...chipBase, ...(d.stance === 'for' ? { color: '#2f4a35', background: '#e4ece2' } : { color: '#7d2a1e', background: '#f3ddd7' }) },
+      choose: () => this.chooseDelegate(d),
+    }));
+    return {
+      isList: this.state.view === 'list',
+      isBallot: this.state.view === 'ballot',
+      list, cur, delegates,
+      sheetOpen: this.state.sheetOpen,
+      toast: this.state.toast,
+      back: () => this.back(),
+      openSheet: () => this.openSheet(),
+      closeSheet: () => this.closeSheet(),
+    };
+  }
+}
+</script>
+</body>
+</html>

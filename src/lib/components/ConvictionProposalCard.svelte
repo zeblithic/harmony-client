@@ -258,7 +258,7 @@
     font-weight: 600;
   }
   .cp-lifecycle.open { color: var(--accent, #4ade80); }
-  .cp-lifecycle.threshold { color: var(--warning, #fbbf24); }
+  .cp-lifecycle.threshold { color: #fbbf24; }
   .cp-lifecycle.finalized { color: var(--text-secondary); }
   .cp-text {
     margin: 0;
@@ -286,7 +286,7 @@
     transition: width 250ms ease;
   }
   .cp-bar-fill.past-threshold {
-    background: var(--warning, #fbbf24);
+    background: #fbbf24;
   }
   .cp-bar-threshold {
     position: absolute;
@@ -340,9 +340,9 @@
     gap: 10px;
     flex-wrap: wrap;
     padding: 8px 12px;
-    border: 1px solid var(--warning, #fbbf24);
+    border: 1px solid #fbbf24;
     border-radius: 4px;
-    background: color-mix(in srgb, var(--warning, #fbbf24) 8%, var(--bg-primary));
+    background: color-mix(in srgb, #fbbf24 8%, var(--bg-primary));
   }
   .cp-override-text {
     flex: 1 1 auto;
@@ -351,8 +351,8 @@
   }
   .cp-override-btn {
     padding: 4px 12px;
-    border: 1px solid var(--warning, #fbbf24);
-    background: var(--warning, #fbbf24);
+    border: 1px solid #fbbf24;
+    background: #fbbf24;
     color: var(--bg-primary);
     border-radius: 4px;
     font: inherit;

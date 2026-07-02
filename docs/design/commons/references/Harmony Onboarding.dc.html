@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</helmet>
+
+<!-- TITLE -->
+<div data-drags-parent="0" style="position:absolute; left:80px; top:60px; width:980px;">
+  <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:rgba(60,55,45,.6);">Harmony · Onboarding &amp; identity · hi-fi · "Commons"</div>
+  <div style="font:500 34px 'Newsreader',serif; color:#2a2519; margin-top:4px;">The self-sovereign welcome</div>
+  <div style="font:400 14px/1.55 'Public Sans'; color:#6b6256; margin-top:8px; max-width:74ch;">The hardest, most important moment in a sovereign app is the handoff of responsibility: <em>you</em> hold the keys, no company can reset them. The flow treats that as a feature, not a warning — calm, honest, and quick. First run happens in the desktop app; the same steps fold onto mobile.</div>
+</div>
+
+<!-- STEP 1 · WELCOME -->
+<div style="position:absolute; left:80px; top:230px; width:760px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">1 · Welcome</div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:36px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span></div>
+    <div style="height:560px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:0 60px;">
+      <svg width="96" height="96" viewBox="0 0 92 92"><circle cx="46" cy="34" r="22" fill="none" stroke="#466b4c" stroke-width="3.5"/><circle cx="32" cy="56" r="22" fill="none" stroke="#283450" stroke-width="3.5"/><circle cx="60" cy="56" r="22" fill="none" stroke="#c56a46" stroke-width="3.5"/><circle cx="46" cy="49" r="4.5" fill="#20241c"/></svg>
+      <div style="font:500 40px 'Newsreader',serif; color:#20241c; margin-top:22px;">Harmony</div>
+      <div style="font:500 18px 'Newsreader',serif; font-style:italic; color:#466b4c; margin-top:4px;">Form. Grow. Govern your commons.</div>
+      <p style="font:400 15px/1.6 'Public Sans'; color:#4b4f44; max-width:42ch; margin-top:18px;">A place your community owns — no company in the middle, no servers that can be switched off, no account that isn't yours.</p>
+      <button style="margin-top:26px; padding:13px 32px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 15px 'Public Sans'; cursor:pointer;">Get started</button>
+      <div style="margin-top:18px; font:400 13px 'Public Sans'; color:#767a6c;">Already have a recovery kit? <span style="color:#466b4c; font-weight:600; text-decoration:underline; cursor:pointer;">Restore your identity</span></div>
+      <div style="display:flex; gap:7px; margin-top:30px;"><span style="width:24px; height:6px; border-radius:3px; background:#466b4c;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span></div>
+    </div>
+  </div>
+</div>
+
+<!-- STEP 2 · MINT IDENTITY -->
+<div style="position:absolute; left:920px; top:230px; width:760px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">2 · Create identity</div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:36px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span></div>
+    <div style="height:560px; display:flex; flex-direction:column; justify-content:center; padding:0 70px;">
+      <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.12em; text-transform:uppercase; color:#8a8472;">Step 2 of 5</div>
+      <h2 style="margin:8px 0 8px; font:500 30px 'Newsreader',serif; color:#20241c;">Create your identity</h2>
+      <p style="margin:0 0 22px; font:400 14.5px/1.55 'Public Sans'; color:#4b4f44; max-width:46ch;">Harmony mints a cryptographic keypair right here on this device. Pick a handle — it travels with you across every community.</p>
+      <label style="font:600 12px 'Public Sans'; color:#20241c;">Handle</label>
+      <div style="display:flex; align-items:center; gap:0; margin-top:7px; border:1px solid #466b4c; background:#fff; border-radius:7px; padding:0 14px; box-shadow:0 0 0 3px rgba(70,107,76,.12);">
+        <span style="font:500 16px 'IBM Plex Mono'; color:#466b4c;">@</span><span style="font:500 16px 'IBM Plex Mono'; color:#20241c; padding:12px 2px;">jake</span><span style="margin-left:auto; font:500 12px 'IBM Plex Mono'; color:#466b4c;">✓ available</span>
+      </div>
+      <div style="margin-top:16px; background:#efeadf; border:1px solid #e3ddcf; border-radius:8px; padding:14px 16px;">
+        <div style="font:600 11px 'Public Sans'; letter-spacing:.06em; text-transform:uppercase; color:#8a8472;">Your decentralized ID</div>
+        <div style="font:500 14px 'IBM Plex Mono'; color:#466b4c; margin-top:5px;">did:harmony:7f3a·c91d·…·b2e1</div>
+        <div style="font:400 11.5px/1.5 'Public Sans'; color:#767a6c; margin-top:7px;">No email. No password to reset. This key <em>is</em> your account — which is exactly why the next step matters.</div>
+      </div>
+      <button style="margin-top:24px; padding:13px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 15px 'Public Sans'; cursor:pointer;">Mint identity</button>
+      <div style="display:flex; gap:7px; margin-top:24px; justify-content:center;"><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:24px; height:6px; border-radius:3px; background:#466b4c;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span></div>
+    </div>
+  </div>
+</div>
+
+<!-- STEP 3 · BACK UP (the hero) -->
+<div style="position:absolute; left:1760px; top:230px; width:760px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#b9742c;">3 · Back up your identity <span style="color:#8a8472; font-weight:400;">— the pivotal moment</span></div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:36px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span></div>
+    <div style="height:560px; overflow-y:auto; padding:34px 70px;">
+      <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.12em; text-transform:uppercase; color:#8a8472;">Step 3 of 5</div>
+      <h2 style="margin:8px 0 8px; font:500 30px 'Newsreader',serif; color:#20241c;">Save your recovery kit</h2>
+      <div style="display:flex; gap:11px; align-items:flex-start; background:#f1e2cc; border:1px solid #e6cfa3; border-radius:8px; padding:13px 15px; margin-bottom:20px;">
+        <span style="font-size:17px;">🔑</span>
+        <div style="font:400 13px/1.55 'Public Sans'; color:#6b5226;">You hold the <strong>only</strong> copy of your keys. If you lose them, no one — not even Harmony — can restore your identity or your community memberships. This kit is how you stay safe.</div>
+      </div>
+      <div style="font:600 12px 'Public Sans'; color:#20241c; margin-bottom:9px;">Recovery phrase · 12 words</div>
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:14px;">
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">1</span> harbor</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">2</span> meadow</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">3</span> cedar</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">4</span> lantern</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">5</span> tide</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">6</span> gather</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">7</span> ember</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">8</span> quorum</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">9</span> willow</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">10</span> anchor</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">11</span> commons</div>
+        <div style="font:500 13px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">12</span> rivet</div>
+      </div>
+      <div style="display:flex; gap:10px; margin-top:12px;">
+        <button style="flex:1; padding:10px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; color:#20241c; font:600 12.5px 'Public Sans'; cursor:pointer;">⧉ Copy phrase</button>
+        <button style="flex:1; padding:10px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; color:#20241c; font:600 12.5px 'Public Sans'; cursor:pointer;">⤓ Save encrypted file</button>
+      </div>
+      <div style="margin-top:14px; display:flex; align-items:center; gap:9px; font:400 12.5px 'Public Sans'; color:#466b4c;"><span style="width:18px; height:18px; border-radius:5px; background:#466b4c; color:#fff; display:flex; align-items:center; justify-content:center; font-size:11px;">✓</span> Also stored in this device's secure keychain</div>
+      <label style="margin-top:18px; display:flex; align-items:center; gap:10px; cursor:pointer; padding:12px 14px; border:1px solid #466b4c; background:#e4ece2; border-radius:8px;"><span style="width:20px; height:20px; border-radius:5px; background:#466b4c; color:#fff; display:flex; align-items:center; justify-content:center; font-size:13px; flex-shrink:0;">✓</span><span style="font:500 13.5px 'Public Sans'; color:#2f4a35;">I've saved my recovery kit somewhere safe and offline.</span></label>
+      <button style="width:100%; margin-top:18px; padding:13px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 15px 'Public Sans'; cursor:pointer;">Continue</button>
+      <div style="display:flex; gap:7px; margin-top:22px; justify-content:center;"><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:24px; height:6px; border-radius:3px; background:#b9742c;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span></div>
+    </div>
+  </div>
+</div>
+
+<!-- STEP 4 · REDEEM INVITE -->
+<div style="position:absolute; left:2600px; top:230px; width:760px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">4 · Redeem invite</div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:36px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span></div>
+    <div style="height:560px; display:flex; flex-direction:column; justify-content:center; padding:0 70px;">
+      <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.12em; text-transform:uppercase; color:#8a8472;">Step 4 of 5</div>
+      <h2 style="margin:8px 0 8px; font:500 30px 'Newsreader',serif; color:#20241c;">Join your first community</h2>
+      <p style="margin:0 0 20px; font:400 14.5px/1.55 'Public Sans'; color:#4b4f44; max-width:46ch;">Harmony is invite-only during alpha. Paste the <span style="font-family:'IBM Plex Mono'; font-size:13px;">harmony://</span> link a member shared with you.</p>
+      <div style="display:flex; align-items:center; gap:8px; border:1px solid #e3ddcf; background:#fff; border-radius:7px; padding:11px 14px; font:500 13px 'IBM Plex Mono'; color:#466b4c;">harmony://invite/cascadia/7Fk2…9aQ <span style="margin-left:auto; color:#466b4c;">✓</span></div>
+      <!-- resolved preview -->
+      <div style="margin-top:16px; background:#fbf9f4; border:1px solid #e6dcc6; border-radius:10px; padding:16px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <span style="width:46px; height:46px; border-radius:11px; background:#466b4c; color:#fff; font:600 18px 'Public Sans'; display:flex; align-items:center; justify-content:center;">C</span>
+          <div><div style="font:500 19px 'Newsreader',serif; color:#20241c;">Cascadia Commons</div><div style="font:400 12px 'IBM Plex Mono'; color:#767a6c;">142 members · 6 channels</div></div>
+        </div>
+        <div style="margin-top:13px; display:flex; align-items:center; gap:8px; font:400 12.5px 'Public Sans'; color:#767a6c; border-top:1px solid #ece7da; padding-top:12px;"><span style="width:22px; height:22px; border-radius:50%; background:#c9bfa6;"></span> Invited by <strong style="color:#466b4c;">Mara Okafor</strong> · <span style="font-family:'IBM Plex Mono'; color:#466b4c;">✓ signature verified</span></div>
+      </div>
+      <button style="margin-top:22px; padding:13px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 15px 'Public Sans'; cursor:pointer;">Join Cascadia Commons</button>
+      <button style="margin-top:10px; padding:11px; border:none; border-radius:8px; background:transparent; color:#767a6c; font:600 13px 'Public Sans'; cursor:pointer;">I'll do this later</button>
+      <div style="display:flex; gap:7px; margin-top:18px; justify-content:center;"><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:24px; height:6px; border-radius:3px; background:#466b4c;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span></div>
+    </div>
+  </div>
+</div>
+
+<!-- STEP 5 · DONE -->
+<div style="position:absolute; left:3440px; top:230px; width:760px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">5 · You're in</div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:36px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span></div>
+    <div style="height:560px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:0 64px;">
+      <div style="width:78px; height:78px; border-radius:50%; background:#e4ece2; display:flex; align-items:center; justify-content:center; font-size:36px; color:#466b4c;">✓</div>
+      <h2 style="margin:22px 0 6px; font:500 30px 'Newsreader',serif; color:#20241c;">Welcome to Cascadia Commons</h2>
+      <p style="margin:0; font:400 14.5px/1.6 'Public Sans'; color:#4b4f44; max-width:42ch;">Your identity is minted, backed up, and yours alone. Set a display name now, or jump straight in.</p>
+      <div style="display:flex; align-items:center; gap:12px; margin-top:22px; background:#fbf9f4; border:1px solid #e3ddcf; border-radius:10px; padding:14px 18px;">
+        <span style="width:44px; height:44px; border-radius:50%; background:#466b4c; color:#fff; font:600 16px 'Public Sans'; display:flex; align-items:center; justify-content:center;">JE</span>
+        <div style="text-align:left;"><div style="font:600 15px 'Public Sans'; color:#20241c;">Jake E.</div><div style="font:400 12px 'IBM Plex Mono'; color:#8aa68d;">@jake · ● self-sovereign</div></div>
+        <button style="margin-left:14px; padding:8px 14px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; font:600 12px 'Public Sans'; color:#767a6c; cursor:pointer;">Edit</button>
+      </div>
+      <button style="margin-top:24px; padding:13px 34px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 15px 'Public Sans'; cursor:pointer;">Enter Harmony →</button>
+      <div style="display:flex; gap:7px; margin-top:26px;"><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:6px; height:6px; border-radius:3px; background:#d2cbba;"></span><span style="width:24px; height:6px; border-radius:3px; background:#466b4c;"></span></div>
+    </div>
+  </div>
+</div>
+
+<div data-drags-parent="0" style="position:absolute; left:80px; top:840px; width:300px; background:#fef4a8; padding:14px 16px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(-1deg);"><strong>The whole arc is five calm steps</strong> — mint → <em>back up</em> → join → done. Step 3 is the only one that earns clay (attention) over sage; everywhere else the tone is reassuring, not alarming. "There's no password to reset" is framed as freedom, then immediately paired with the kit that makes it safe.</div>
+
+<!-- SECTION HEADER -->
+<div data-drags-parent="0" style="position:absolute; left:80px; top:1000px; font:500 22px 'Newsreader',serif; color:#3a352b;">Living with your keys — identity management &amp; the gentle backup reminder</div>
+
+<!-- IDENTITY & DEVICES (full settings) -->
+<div style="position:absolute; left:80px; top:1080px; width:1180px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">6 · Identity &amp; devices <span style="color:#8a8472; font-weight:400;">— Settings → the surface you return to</span></div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:38px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px; gap:10px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span><span style="margin:0 auto; font:500 12px 'IBM Plex Mono'; color:#8a8472;">Settings · Identity &amp; devices</span></div>
+    <div style="display:grid; grid-template-columns:230px 1fr; height:680px;">
+      <!-- settings nav -->
+      <div style="background:#efeadf; border-right:1px solid #e3ddcf; padding:16px 10px;">
+        <div style="font:500 18px 'Newsreader',serif; color:#20241c; padding:0 10px 14px;">Settings</div>
+        <div style="font:600 10px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; padding:8px 10px 5px;">You</div>
+        <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; background:#e4ece2; border-radius:6px; color:#2f4a35; font:600 13px 'Public Sans';"><span>🔑</span> Identity &amp; devices</div>
+        <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#767a6c; font:400 13px 'Public Sans';"><span>👤</span> Profile</div>
+        <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#767a6c; font:400 13px 'Public Sans';"><span>🔔</span> Notifications</div>
+        <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#767a6c; font:400 13px 'Public Sans';"><span>🎙</span> Voice &amp; video</div>
+        <div style="font:600 10px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; padding:12px 10px 5px;">App</div>
+        <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#767a6c; font:400 13px 'Public Sans';"><span>🎨</span> Appearance</div>
+        <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#767a6c; font:400 13px 'Public Sans';"><span>🌐</span> Network &amp; storage</div>
+      </div>
+      <!-- panel -->
+      <div style="background:#fbf9f4; overflow-y:auto; padding:28px 36px;">
+        <h1 style="margin:0 0 4px; font:500 26px 'Newsreader',serif; color:#20241c;">Identity &amp; devices</h1>
+        <div style="font:400 13px 'Public Sans'; color:#767a6c;">Your keys, your backups, the devices that can act as you.</div>
+
+        <!-- identity card -->
+        <div style="margin-top:22px; background:#fff; border:1px solid #e3ddcf; border-radius:10px; padding:20px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+          <div style="display:flex; align-items:center; gap:14px;">
+            <span style="width:54px; height:54px; border-radius:50%; background:#466b4c; color:#fff; font:600 19px 'Public Sans'; display:flex; align-items:center; justify-content:center;">JE</span>
+            <div style="flex:1;"><div style="display:flex; align-items:center; gap:9px;"><span style="font:500 21px 'Newsreader',serif; color:#20241c;">Jake E.</span><span style="font:600 10px 'IBM Plex Mono'; color:#466b4c; background:#e4ece2; padding:2px 8px; border-radius:20px;">● self-sovereign</span></div><div style="font:500 12.5px 'IBM Plex Mono'; color:#767a6c; margin-top:3px;">@jake · did:harmony:7f3a·c91d·…·b2e1</div></div>
+            <button style="padding:8px 14px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; font:600 12px 'Public Sans'; color:#20241c; cursor:pointer;">⧉ Copy DID</button>
+          </div>
+          <div style="margin-top:14px; padding-top:14px; border-top:1px solid #ece7da; display:flex; gap:28px; font:400 12px 'Public Sans'; color:#767a6c;"><span>Created <strong style="color:#20241c; font-family:'IBM Plex Mono';">Mar 2026</strong></span><span>Key type <strong style="color:#20241c; font-family:'IBM Plex Mono';">ed25519</strong></span><span>Memberships <strong style="color:#20241c; font-family:'IBM Plex Mono';">2 communities</strong></span></div>
+        </div>
+
+        <!-- backup status -->
+        <div style="margin-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:14px;">
+          <div style="background:#e4ece2; border:1px solid #c9d6c6; border-radius:10px; padding:17px;">
+            <div style="display:flex; align-items:center; gap:8px;"><span style="font-size:16px;">🛡</span><span style="font:600 13px 'Public Sans'; color:#2f4a35;">Recovery kit</span><span style="margin-left:auto; font:600 11px 'IBM Plex Mono'; color:#466b4c;">✓ backed up</span></div>
+            <div style="font:400 12px/1.5 'Public Sans'; color:#3a4d3a; margin-top:8px;">Last exported <strong>3 days ago</strong> · stored in keychain + encrypted file.</div>
+            <button style="margin-top:11px; padding:8px 14px; border:1px solid #c9d6c6; border-radius:7px; background:#fff; font:600 12px 'Public Sans'; color:#2f4a35; cursor:pointer;">Re-export kit</button>
+          </div>
+          <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:10px; padding:17px;">
+            <div style="display:flex; align-items:center; gap:8px;"><span style="font-size:16px;">🔄</span><span style="font:600 13px 'Public Sans'; color:#20241c;">Key rotation</span></div>
+            <div style="font:400 12px/1.5 'Public Sans'; color:#767a6c; margin-top:8px;">Rotate to a fresh key while keeping your handle &amp; history. Old key is revoked across communities.</div>
+            <button style="margin-top:11px; padding:8px 14px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; font:600 12px 'Public Sans'; color:#20241c; cursor:pointer;">Rotate keys…</button>
+          </div>
+        </div>
+
+        <!-- devices -->
+        <div style="margin-top:22px; display:flex; align-items:center; gap:10px;"><span style="font:600 11px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#8a8472;">Linked devices</span><span style="font:500 11px 'IBM Plex Mono'; color:#a39e8e;">2</span><span style="flex:1; height:1px; background:#ece7da;"></span><button style="padding:7px 13px; border:none; border-radius:7px; background:#466b4c; color:#fff; font:600 12px 'Public Sans'; cursor:pointer;">＋ Link a device</button></div>
+        <div style="margin-top:13px; display:flex; flex-direction:column; gap:10px;">
+          <div style="display:flex; align-items:center; gap:13px; background:#fff; border:1px solid #e3ddcf; border-radius:9px; padding:14px 16px;">
+            <span style="width:38px; height:38px; border-radius:9px; background:#e4ece2; display:flex; align-items:center; justify-content:center; font-size:17px;">💻</span>
+            <div style="flex:1;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">MacBook Pro <span style="font:600 10px 'IBM Plex Mono'; color:#466b4c; background:#e4ece2; padding:1px 7px; border-radius:20px; margin-left:4px;">this device</span></div><div style="font:400 11.5px 'IBM Plex Mono'; color:#767a6c;">Active now · paired Mar 2026</div></div>
+            <span style="font:500 11px 'Public Sans'; color:#a39e8e;">—</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:13px; background:#fff; border:1px solid #e3ddcf; border-radius:9px; padding:14px 16px;">
+            <span style="width:38px; height:38px; border-radius:9px; background:#e8eef0; display:flex; align-items:center; justify-content:center; font-size:17px;">📱</span>
+            <div style="flex:1;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">iPhone 15</div><div style="font:400 11.5px 'IBM Plex Mono'; color:#767a6c;">Last seen 2h ago · paired Apr 2026</div></div>
+            <button style="padding:6px 12px; border:1px solid #e0b9b1; border-radius:6px; background:#fff; font:600 11.5px 'Public Sans'; color:#b1402f; cursor:pointer;">Revoke</button>
+          </div>
+        </div>
+
+        <!-- danger -->
+        <div style="margin-top:20px; border:1px solid #e0b9b1; border-radius:10px; padding:16px 18px; background:#fdf6f4;">
+          <div style="display:flex; align-items:center; gap:11px;"><div style="flex:1;"><div style="font:600 13px 'Public Sans'; color:#7d2a1e;">Delete this identity</div><div style="font:400 11.5px/1.5 'Public Sans'; color:#9a5347; margin-top:2px;">Irreversible. Without your recovery kit there is no way back — by design.</div></div><button style="padding:8px 14px; border:1px solid #e0b9b1; border-radius:7px; background:#fff; font:600 12px 'Public Sans'; color:#b1402f; cursor:pointer;">Delete…</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- BACKUP REMINDER BANNER + MOBILE RECOVERY -->
+<div style="position:absolute; left:1320px; top:1080px; width:520px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">7 · States</div>
+  <!-- banner -->
+  <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:9px; box-shadow:0 4px 16px rgba(40,30,10,.10); padding:16px; margin-bottom:18px;">
+    <div style="font:600 11px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#8a8472; margin-bottom:10px;">In-app backup reminder · top banner</div>
+    <div style="display:flex; align-items:center; gap:13px; background:#f1e2cc; border:1px solid #e6cfa3; border-radius:8px; padding:13px 16px;">
+      <span style="font-size:18px;">🔑</span>
+      <div style="flex:1;"><div style="font:600 13px 'Public Sans'; color:#5a4321;">It's been 32 days since your last backup</div><div style="font:400 11.5px/1.45 'Public Sans'; color:#7a6230;">You've joined a new community since then. Re-export your recovery kit to keep it current.</div></div>
+      <button style="padding:8px 14px; border:none; border-radius:7px; background:#b9742c; color:#fff; font:600 12px 'Public Sans'; cursor:pointer; flex-shrink:0;">Back up now</button>
+      <span style="color:#b9742c; font-size:16px; cursor:pointer;">✕</span>
+    </div>
+    <div style="font:400 11px/1.5 'Public Sans'; color:#8a8472; margin-top:10px;">Appears at the top of the app, dismissible, never modal. The cost of sovereignty made gentle — a nudge, not a wall.</div>
+  </div>
+  <!-- mobile recovery -->
+  <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:9px; box-shadow:0 4px 16px rgba(40,30,10,.10); padding:16px;">
+    <div style="font:600 11px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#8a8472; margin-bottom:12px;">Mobile · same backup step</div>
+    <div style="display:flex; justify-content:center;">
+      <div style="width:300px; background:#1c1a16; border-radius:40px; padding:9px; box-shadow:0 10px 30px rgba(40,30,10,.2);">
+        <div style="background:#fbf9f4; border-radius:32px; overflow:hidden; font-family:'Public Sans',system-ui;">
+          <div style="height:40px; display:flex; align-items:center; justify-content:space-between; padding:0 22px; font:600 12px 'Public Sans'; color:#20241c;"><span>9:41</span><span style="font-size:10px;">●●● ▆ 􀛨</span></div>
+          <div style="padding:8px 22px 24px;">
+            <div style="font:600 10px 'IBM Plex Mono'; letter-spacing:.1em; text-transform:uppercase; color:#8a8472;">Step 3 of 5</div>
+            <div style="font:500 22px/1.2 'Newsreader',serif; color:#20241c; margin-top:6px;">Save your recovery kit</div>
+            <div style="display:flex; gap:9px; align-items:flex-start; background:#f1e2cc; border:1px solid #e6cfa3; border-radius:8px; padding:11px 13px; margin-top:13px;"><span style="font-size:15px;">🔑</span><div style="font:400 11.5px/1.5 'Public Sans'; color:#6b5226;">You hold the only copy. No one can restore it for you.</div></div>
+            <div style="margin-top:14px; display:grid; grid-template-columns:1fr 1fr; gap:7px; background:#fff; border:1px solid #e3ddcf; border-radius:8px; padding:12px;">
+              <div style="font:500 12px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">1</span> harbor</div><div style="font:500 12px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">2</span> meadow</div>
+              <div style="font:500 12px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">3</span> cedar</div><div style="font:500 12px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">4</span> lantern</div>
+              <div style="font:500 12px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">5</span> tide</div><div style="font:500 12px 'IBM Plex Mono'; color:#20241c;"><span style="color:#a39e8e;">6</span> gather</div>
+              <div style="font:500 12px 'IBM Plex Mono'; color:#a39e8e; grid-column:1 / -1; text-align:center; padding-top:2px;">＋ 6 more</div>
+            </div>
+            <label style="margin-top:13px; display:flex; align-items:center; gap:9px; padding:11px 13px; border:1px solid #466b4c; background:#e4ece2; border-radius:8px;"><span style="width:18px; height:18px; border-radius:5px; background:#466b4c; color:#fff; display:flex; align-items:center; justify-content:center; font-size:11px; flex-shrink:0;">✓</span><span style="font:500 12px 'Public Sans'; color:#2f4a35;">Saved it safely &amp; offline</span></label>
+            <button style="width:100%; margin-top:13px; padding:13px; border:none; border-radius:9px; background:#466b4c; color:#fff; font:600 14px 'Public Sans';">Continue</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div data-drags-parent="0" style="position:absolute; left:80px; top:1810px; width:820px; font:400 13px/1.6 'Public Sans'; color:#5a5347;">Onboarding and identity are done end-to-end. Next up: the interactive vote-flow prototype — clickable, with live tallies, real delegation &amp; recall.</div>
+</x-dc>
+</body>
+</html>

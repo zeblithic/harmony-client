@@ -1273,7 +1273,7 @@
   /* ZEB-415 #1: discovery-off advisory — amber, distinct from .error-text. */
   .warn-text {
     font-size: 12px;
-    color: var(--warning, #e0a23c);
+    color: #e0a23c;
     margin: 4px 0 8px;
   }
 

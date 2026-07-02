@@ -9,6 +9,17 @@
   --accent-hover: #4752c4;
   --danger: #f23f42;
   --border: #3f4147;
+
+  /* Semantic color tokens (ZEB-604). Values match the app's CURRENT rendered
+     appearance; the Commons flip (ZEB-605) re-values them. Reference colors
+     via variables — src/style-token-guard.test.ts rejects new raw color
+     literals in Svelte <style> blocks. */
+  --bg-hover: rgba(255, 255, 255, 0.1); /* row/button hover fill */
+  --overlay: rgba(0, 0, 0, 0.5); /* modal/dialog scrim */
+  --info: #4a9eff; /* informational accents, links, focus rings */
+  --success: #4ade80; /* positive/confirmed states */
+  --warning: #d8a200; /* caution, staleness, pending-attention */
+
   --avatar-size-micro: 24px;
   --avatar-size-mini: 20px;
   --nav-width: 240px;

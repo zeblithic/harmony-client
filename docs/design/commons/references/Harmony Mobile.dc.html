@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</helmet>
+
+<!-- TITLE -->
+<div data-drags-parent="0" style="position:absolute; left:80px; top:60px; width:900px;">
+  <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:rgba(60,55,45,.6);">Harmony · Mobile · hi-fi · "Commons"</div>
+  <div style="font:500 34px 'Newsreader',serif; color:#2a2519; margin-top:4px;">The same civic loop, in your hand</div>
+  <div style="font:400 14px/1.55 'Public Sans'; color:#6b6256; margin-top:8px; max-width:62ch;">Greenfield — no mobile client exists yet. The desktop's three columns fold into a bottom tab bar (Chat · Assembly · Activity · You) and a nav drawer. Governance keeps its own tab so it never gets buried; the ballot gets a thumb-reachable sticky vote bar.</div>
+</div>
+
+<!-- ===== S1 · CHANNEL ===== -->
+<div style="position:absolute; left:80px; top:230px; width:412px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">1 · Channel</div>
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 12px 40px rgba(40,30,10,.22);">
+    <div style="background:#fbf9f4; border-radius:36px; overflow:hidden; height:844px; display:flex; flex-direction:column; font-family:'Public Sans',system-ui; position:relative;">
+      <!-- status bar -->
+      <div style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#20241c; flex-shrink:0;"><span>9:41</span><span style="display:flex; gap:6px; align-items:center; font-size:11px;">●●● ▆ 􀛨</span></div>
+      <!-- app bar -->
+      <div style="padding:6px 16px 12px; display:flex; align-items:center; gap:11px; border-bottom:1px solid #ece7da;">
+        <span style="width:30px; height:30px; border-radius:8px; background:#466b4c; color:#fff; font:600 12px 'Public Sans'; display:flex; align-items:center; justify-content:center;">C</span>
+        <div style="line-height:1.15;"><div style="font:600 16px 'Public Sans'; color:#20241c;"><span style="color:#b3ad9c;">#</span> general</div><div style="font:400 11px 'IBM Plex Mono'; color:#959183;">Cascadia · 142 members</div></div>
+        <span style="margin-left:auto; display:flex; gap:16px; color:#959183; font-size:17px;"><span>🔍</span><span>⋯</span></span>
+      </div>
+      <!-- messages -->
+      <div style="flex:1; overflow-y:auto; padding:14px 16px; display:flex; flex-direction:column; gap:15px;">
+        <div style="display:flex; gap:10px;"><span style="width:34px; height:34px; border-radius:50%; background:#c9bfa6; flex-shrink:0;"></span><div><div style="display:flex; align-items:baseline; gap:6px;"><span style="font:600 13px 'Public Sans'; color:#20241c;">Mara Okafor</span><span style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">9:02</span></div><div style="font:400 13.5px/1.5 'Public Sans'; color:#3a3e34;">Reminder the winter-heating vote closes Friday. Away that day? Delegate to someone you trust.</div></div></div>
+        <!-- inline proposal -->
+        <div style="margin-left:44px; border:1px solid #e6dcc6; background:#fbf6ec; border-radius:10px; padding:13px 14px;">
+          <div style="display:flex; align-items:center; gap:7px;"><span style="font:600 10px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:2px 6px; border-radius:3px;">P-14</span><span style="font:600 10.5px 'Public Sans'; color:#5a4321; background:#f1e2cc; padding:2px 8px; border-radius:20px;">● Open · 2d</span></div>
+          <div style="font:600 14px/1.3 'Public Sans'; color:#5a4321; margin-top:9px;">Reallocate $400 to winter heating fund</div>
+          <div style="margin-top:11px; height:8px; border-radius:4px; background:#eadfc8; overflow:hidden; display:flex;"><span style="width:68%; background:#466b4c;"></span><span style="width:14%; background:#b1402f;"></span><span style="width:18%; background:#cdc6b4;"></span></div>
+          <div style="display:flex; gap:10px; margin-top:6px; font:600 11px 'IBM Plex Mono'; color:#6b6256;"><span style="color:#466b4c;">68% for</span><span>quorum ✓</span></div>
+          <button style="width:100%; margin-top:11px; padding:9px; border:none; border-radius:7px; background:#466b4c; color:#fff; font:600 12.5px 'Public Sans'; cursor:pointer;">Open ballot</button>
+        </div>
+        <div style="display:flex; gap:10px;"><span style="width:34px; height:34px; border-radius:50%; background:#a9bcc4; flex-shrink:0;"></span><div><div style="display:flex; align-items:baseline; gap:6px;"><span style="font:600 13px 'Public Sans'; color:#20241c;">Devin Ross</span><span style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">9:07</span></div><div style="font:400 13.5px/1.5 'Public Sans'; color:#3a3e34;">Proxied mine to the Heating WG already. Recall-before-close is the part I trust.</div></div></div>
+        <div style="display:flex; gap:10px;"><span style="width:34px; height:34px; border-radius:50%; background:#bdb39a; flex-shrink:0;"></span><div><div style="display:flex; align-items:baseline; gap:6px;"><span style="font:600 13px 'Public Sans'; color:#20241c;">Priya Nair</span><span style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">9:18</span></div><div style="font:400 13.5px/1.5 'Public Sans'; color:#3a3e34;">Voted for 🌿</div></div></div>
+      </div>
+      <!-- composer -->
+      <div style="padding:8px 14px 10px; border-top:1px solid #ece7da;"><div style="display:flex; align-items:center; gap:10px; border:1px solid #e3ddcf; background:#fff; border-radius:22px; padding:10px 16px;"><span style="color:#b3ad9c;">＋</span><span style="font:400 13.5px 'Public Sans'; color:#a39e8e; flex:1;">Message</span><span style="color:#b3ad9c;">☺</span></div></div>
+      <!-- tab bar -->
+      <div style="display:flex; padding:6px 8px 26px; border-top:1px solid #ece7da; background:#f6f3ec;">
+        <div style="flex:1; text-align:center; color:#466b4c;"><div style="font-size:19px;">💬</div><div style="font:600 10px 'Public Sans';">Chat</div></div>
+        <div style="flex:1; text-align:center; color:#959183; position:relative;"><div style="font-size:19px;">⚖</div><div style="font:500 10px 'Public Sans';">Assembly</div><span style="position:absolute; top:-2px; right:28px; background:#b9742c; color:#fff; font:600 9px 'IBM Plex Mono'; padding:0 5px; border-radius:8px;">3</span></div>
+        <div style="flex:1; text-align:center; color:#959183;"><div style="font-size:19px;">🔔</div><div style="font:500 10px 'Public Sans';">Activity</div></div>
+        <div style="flex:1; text-align:center; color:#959183;"><div style="font-size:19px;">👤</div><div style="font:500 10px 'Public Sans';">You</div></div>
+      </div>
+      <!-- home indicator -->
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#20241c; opacity:.25;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== S2 · NAV DRAWER ===== -->
+<div style="position:absolute; left:572px; top:230px; width:412px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">2 · Spaces drawer</div>
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 12px 40px rgba(40,30,10,.22);">
+    <div style="background:#efeadf; border-radius:36px; overflow:hidden; height:844px; display:flex; flex-direction:column; font-family:'Public Sans',system-ui; position:relative;">
+      <div style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#20241c; flex-shrink:0;"><span>9:41</span><span style="font-size:11px;">●●● ▆ 􀛨</span></div>
+      <div style="padding:8px 18px 14px; display:flex; align-items:center; gap:10px;">
+        <svg width="26" height="26" viewBox="0 0 92 92"><circle cx="46" cy="34" r="22" fill="none" stroke="#466b4c" stroke-width="5"/><circle cx="32" cy="56" r="22" fill="none" stroke="#283450" stroke-width="5"/><circle cx="60" cy="56" r="22" fill="none" stroke="#c56a46" stroke-width="5"/></svg>
+        <span style="font:500 22px 'Newsreader',serif; color:#20241c;">Harmony</span>
+        <button style="margin-left:auto; width:30px; height:30px; border:none; border-radius:8px; background:#466b4c; color:#fff; font-size:16px;">＋</button>
+      </div>
+      <div style="padding:0 16px 10px;"><div style="display:flex; align-items:center; gap:8px; background:#fbf9f4; border:1px solid #e3ddcf; border-radius:9px; padding:9px 12px;"><span style="color:#a39e8e;">⌕</span><span style="font:400 13px 'Public Sans'; color:#a39e8e;">Search</span></div></div>
+      <div style="flex:1; overflow-y:auto; padding:2px 12px;">
+        <div style="display:flex; align-items:center; gap:10px; padding:9px 12px; color:#4b4f44; font:500 14px 'Public Sans';">📝 Notes</div>
+        <div style="font:600 10px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; padding:12px 12px 6px;">Communities</div>
+        <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:10px; padding:6px; margin-bottom:8px;">
+          <div style="display:flex; align-items:center; gap:9px; padding:6px 8px;"><span style="width:24px; height:24px; border-radius:7px; background:#466b4c; color:#fff; font:600 11px 'Public Sans'; display:flex; align-items:center; justify-content:center;">C</span><span style="font:600 14px 'Public Sans'; color:#20241c;">Cascadia Commons</span><span style="margin-left:auto; color:#a39e8e; font-size:10px;">▾</span></div>
+          <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="color:#b3ad9c;">#</span> welcome</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; background:#e4ece2; border-radius:7px; color:#2f4a35; font:600 13.5px 'Public Sans';"><span style="color:#466b4c;">#</span> general</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#20241c; font:600 13.5px 'Public Sans';"><span style="color:#b3ad9c;">#</span> mutual-aid <span style="margin-left:auto; width:8px; height:8px; border-radius:50%; background:#466b4c;"></span></div>
+          <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#766f5c; font:500 13.5px 'Public Sans';"><span style="color:#b9742c;">⚖</span> proposals <span style="margin-left:auto; background:#b9742c; color:#fff; font:600 9px 'IBM Plex Mono'; padding:1px 6px; border-radius:9px;">3</span></div>
+          <div style="display:flex; align-items:center; gap:8px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="color:#b3ad9c;">🔊</span> Town Hall</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:9px; padding:9px 10px;"><span style="width:24px; height:24px; border-radius:7px; background:#7a6a52; color:#fff; font:600 11px 'Public Sans'; display:flex; align-items:center; justify-content:center;">M</span><span style="font:600 14px 'Public Sans'; color:#4b4f44;">Maple St. Tenants</span><span style="margin-left:auto; color:#a39e8e; font-size:10px;">▸</span></div>
+        <div style="font:600 10px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; padding:12px 12px 6px;">Direct messages</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="width:22px; height:22px; border-radius:50%; background:#c9bfa6;"></span> Mara Okafor</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="width:22px; height:22px; border-radius:50%; background:#a9bcc4;"></span> Heating WG <span style="margin-left:auto; background:#466b4c; color:#fff; font:600 9px 'IBM Plex Mono'; padding:1px 6px; border-radius:9px;">2</span></div>
+      </div>
+      <div style="padding:11px 16px; border-top:1px solid #e3ddcf; display:flex; align-items:center; gap:10px;"><span style="width:32px; height:32px; border-radius:50%; background:#466b4c; color:#fff; font:600 12px 'Public Sans'; display:flex; align-items:center; justify-content:center;">JE</span><div style="line-height:1.2;"><div style="font:600 13px 'Public Sans'; color:#20241c;">jake.eth</div><div style="font:400 10px 'IBM Plex Mono'; color:#8aa68d;">● self-sovereign</div></div><span style="margin-left:auto; color:#a39e8e;">⚙</span></div>
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#20241c; opacity:.25;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== S3 · ASSEMBLY LIST ===== -->
+<div style="position:absolute; left:1064px; top:230px; width:412px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">3 · Assembly tab</div>
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 12px 40px rgba(40,30,10,.22);">
+    <div style="background:#fbf9f4; border-radius:36px; overflow:hidden; height:844px; display:flex; flex-direction:column; font-family:'Public Sans',system-ui; position:relative;">
+      <div style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#20241c; flex-shrink:0;"><span>9:41</span><span style="font-size:11px;">●●● ▆ 􀛨</span></div>
+      <div style="padding:6px 18px 12px;">
+        <div style="display:flex; align-items:center; gap:8px;"><span style="color:#b9742c; font-size:17px;">⚖</span><span style="font:500 24px 'Newsreader',serif; color:#20241c;">Assembly</span><button style="margin-left:auto; padding:7px 13px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 12px 'Public Sans';">＋ Draft</button></div>
+        <div style="font:400 11.5px 'IBM Plex Mono'; color:#959183; margin-top:3px;">Cascadia Commons · quorum 142</div>
+      </div>
+      <div style="padding:0 16px 10px; display:flex; gap:7px;"><span style="font:600 12px 'Public Sans'; color:#fff; background:#b9742c; padding:6px 13px; border-radius:20px;">Open · 2</span><span style="font:500 12px 'Public Sans'; color:#767a6c; background:#efeadf; padding:6px 13px; border-radius:20px;">Drafting · 1</span><span style="font:500 12px 'Public Sans'; color:#767a6c; background:#efeadf; padding:6px 13px; border-radius:20px;">Decided</span></div>
+      <div style="flex:1; overflow-y:auto; padding:6px 16px; display:flex; flex-direction:column; gap:12px;">
+        <div style="background:#fff; border:1px solid #e6dcc6; border-left:3px solid #b9742c; border-radius:10px; padding:15px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+          <div style="display:flex; align-items:center; gap:7px;"><span style="font:600 10px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:2px 6px; border-radius:3px;">P-14</span><span style="font:600 10.5px 'Public Sans'; color:#2f4a35; background:#e4ece2; padding:2px 8px; border-radius:20px;">Passing</span><span style="margin-left:auto; font:500 10.5px 'IBM Plex Mono'; color:#b9742c;">⏳ 2d 4h</span></div>
+          <div style="font:600 15px/1.3 'Public Sans'; color:#20241c; margin-top:9px;">Reallocate $400 to winter heating fund</div>
+          <div style="margin-top:11px; height:8px; border-radius:4px; background:#eadfc8; overflow:hidden; display:flex;"><span style="width:68%; background:#466b4c;"></span><span style="width:14%; background:#b1402f;"></span><span style="width:18%; background:#cdc6b4;"></span></div>
+          <div style="display:flex; gap:12px; margin-top:6px; font:600 11px 'IBM Plex Mono';"><span style="color:#466b4c;">68% for</span><span style="color:#8a8472;">quorum ✓</span><span style="margin-left:auto; color:#767a6c; font-family:'Public Sans';">↪ Heating WG</span></div>
+        </div>
+        <div style="background:#fff; border:1px solid #e6dcc6; border-left:3px solid #b9742c; border-radius:10px; padding:15px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+          <div style="display:flex; align-items:center; gap:7px;"><span style="font:600 10px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:2px 6px; border-radius:3px;">P-13</span><span style="font:600 10.5px 'Public Sans'; color:#7d2a1e; background:#f3ddd7; padding:2px 8px; border-radius:20px;">Contested</span><span style="margin-left:auto; font:500 10.5px 'IBM Plex Mono'; color:#b9742c;">⏳ 5d</span></div>
+          <div style="font:600 15px/1.3 'Public Sans'; color:#20241c; margin-top:9px;">Recall vote — facilitator seat B</div>
+          <div style="margin-top:11px; height:8px; border-radius:4px; background:#eadfc8; overflow:hidden; display:flex;"><span style="width:41%; background:#466b4c;"></span><span style="width:33%; background:#b1402f;"></span><span style="width:26%; background:#cdc6b4;"></span></div>
+          <div style="display:flex; gap:12px; margin-top:6px; font:600 11px 'IBM Plex Mono';"><span style="color:#466b4c;">41% / 33%</span><span style="margin-left:auto; color:#b1402f; font-family:'Public Sans'; text-decoration:underline;">Vote now</span></div>
+        </div>
+        <div style="background:#fbf8f1; border:1px solid #e3ddcf; border-left:3px solid #cdc6b4; border-radius:10px; padding:15px;">
+          <div style="display:flex; align-items:center; gap:7px;"><span style="font:600 10px 'IBM Plex Mono'; color:#5a5345; background:#e6e0d0; padding:2px 6px; border-radius:3px;">P-15</span><span style="font:600 10.5px 'Public Sans'; color:#5a5345; background:#e6e0d0; padding:2px 8px; border-radius:20px;">Drafting</span><span style="margin-left:auto; font:500 10.5px 'IBM Plex Mono'; color:#959183;">opens 1d</span></div>
+          <div style="font:600 15px/1.3 'Public Sans'; color:#20241c; margin-top:9px;">Ratify the new moderation charter</div>
+          <div style="margin-top:8px; font:400 12px 'Public Sans'; color:#767a6c;">4 amendments · 9 co-signers</div>
+        </div>
+      </div>
+      <div style="display:flex; padding:6px 8px 26px; border-top:1px solid #ece7da; background:#f6f3ec;">
+        <div style="flex:1; text-align:center; color:#959183;"><div style="font-size:19px;">💬</div><div style="font:500 10px 'Public Sans';">Chat</div></div>
+        <div style="flex:1; text-align:center; color:#b9742c;"><div style="font-size:19px;">⚖</div><div style="font:600 10px 'Public Sans';">Assembly</div></div>
+        <div style="flex:1; text-align:center; color:#959183;"><div style="font-size:19px;">🔔</div><div style="font:500 10px 'Public Sans';">Activity</div></div>
+        <div style="flex:1; text-align:center; color:#959183;"><div style="font-size:19px;">👤</div><div style="font:500 10px 'Public Sans';">You</div></div>
+      </div>
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#20241c; opacity:.25;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== S4 · BALLOT ===== -->
+<div style="position:absolute; left:1556px; top:230px; width:412px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">4 · Ballot · sticky vote bar</div>
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 12px 40px rgba(40,30,10,.22);">
+    <div style="background:#fbf9f4; border-radius:36px; overflow:hidden; height:844px; display:flex; flex-direction:column; font-family:'Public Sans',system-ui; position:relative;">
+      <div style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#20241c; flex-shrink:0;"><span>9:41</span><span style="font-size:11px;">●●● ▆ 􀛨</span></div>
+      <div style="padding:4px 14px 10px; display:flex; align-items:center; gap:10px; border-bottom:1px solid #ece7da;"><span style="color:#767a6c; font-size:18px;">‹</span><span style="font:600 12px 'IBM Plex Mono'; color:#8a8472;">P-14 · Treasury</span><span style="margin-left:auto; font:600 10.5px 'Public Sans'; color:#5a4321; background:#f1e2cc; padding:3px 9px; border-radius:20px;">● 2d 4h</span></div>
+      <div style="flex:1; overflow-y:auto; padding:18px 18px 16px;">
+        <h1 style="margin:0; font:500 24px/1.2 'Newsreader',serif; color:#20241c;">Reallocate $400 from reserves to the winter heating fund</h1>
+        <div style="display:flex; align-items:center; gap:8px; margin-top:9px; font:400 12px 'Public Sans'; color:#767a6c;"><span style="width:20px; height:20px; border-radius:50%; background:#a9bcc4;"></span> by <strong style="color:#466b4c;">Heating WG</strong> · majority+quorum</div>
+        <!-- tally card -->
+        <div style="margin-top:16px; background:#fff; border:1px solid #e6dcc6; border-radius:11px; padding:15px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+          <div style="font:600 10.5px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#8a8472;">Live tally</div>
+          <div style="margin-top:10px; display:flex; flex-direction:column; gap:8px;">
+            <div><div style="display:flex; justify-content:space-between; font:600 11.5px 'IBM Plex Mono'; color:#466b4c;"><span>▲ FOR</span><span>97 · 68%</span></div><div style="height:7px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="display:block; width:68%; height:100%; background:#466b4c;"></span></div></div>
+            <div><div style="display:flex; justify-content:space-between; font:600 11.5px 'IBM Plex Mono'; color:#b1402f;"><span>▼ AGAINST</span><span>20 · 14%</span></div><div style="height:7px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="display:block; width:14%; height:100%; background:#b1402f;"></span></div></div>
+            <div><div style="display:flex; justify-content:space-between; font:600 11.5px 'IBM Plex Mono'; color:#8a8472;"><span>— ABSTAIN</span><span>25 · 18%</span></div><div style="height:7px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="display:block; width:18%; height:100%; background:#cdc6b4;"></span></div></div>
+          </div>
+          <div style="margin-top:12px; display:flex; gap:8px;"><div style="flex:1; background:#e4ece2; border-radius:6px; padding:8px 10px;"><div style="font:600 9px 'Public Sans'; letter-spacing:.05em; text-transform:uppercase; color:#5a6a55;">Quorum</div><div style="font:600 12px 'IBM Plex Mono'; color:#2f4a35;">142/142 ✓</div></div><div style="flex:1; background:#f1e2cc; border-radius:6px; padding:8px 10px;"><div style="font:600 9px 'Public Sans'; letter-spacing:.05em; text-transform:uppercase; color:#6b5226;">Conviction</div><div style="font:600 12px 'IBM Plex Mono'; color:#5a4321;">▁▂▄▆ ↑</div></div></div>
+        </div>
+        <!-- description -->
+        <div style="margin-top:16px; font:400 14px/1.6 'Public Sans'; color:#3a3e34;">Our reserve sits at $2,140 against a hard winter. This moves <strong>$400</strong> into the heating fund so mutual aid can cover emergency heating through March without a vote each time. Reserve floor stays above the $1,500 agreed in P-09.</div>
+        <div style="margin-top:14px; border-left:3px solid #466b4c; background:#e4ece2; border-radius:0 6px 6px 0; padding:11px 14px;"><div style="font:600 11.5px 'Public Sans'; color:#2f4a35;">Why now</div><div style="font:400 12.5px/1.5 'Public Sans'; color:#3a4d3a; margin-top:2px;">Two heating emergencies this month, fund empty. Act before the cold snap.</div></div>
+        <div style="margin-top:16px; display:flex; align-items:center; gap:8px; font:600 11px 'Public Sans'; letter-spacing:.06em; text-transform:uppercase; color:#8a8472;">Deliberation <span style="font:500 10px 'IBM Plex Mono'; color:#a39e8e; text-transform:none; letter-spacing:0;">18</span><span style="flex:1; height:1px; background:#ece7da;"></span></div>
+        <div style="margin-top:11px; display:flex; gap:9px;"><span style="width:28px; height:28px; border-radius:50%; background:#c9bfa6; flex-shrink:0;"></span><div><div style="font:600 12px 'Public Sans'; color:#20241c;">Mara Okafor <span style="font:500 9px 'IBM Plex Mono'; color:#466b4c; border:1px solid #c9d6c6; padding:0 3px; border-radius:3px;">▲</span></div><div style="font:400 12.5px/1.45 'Public Sans'; color:#3a3e34;">Earmark $50 for the shared heater library?</div></div></div>
+      </div>
+      <!-- sticky vote bar -->
+      <div style="padding:10px 14px 10px; border-top:1px solid #e3ddcf; background:#f6f3ec; box-shadow:0 -4px 14px rgba(40,30,10,.06);">
+        <div style="display:flex; align-items:center; gap:7px; margin-bottom:8px; font:400 10.5px 'Public Sans'; color:#767a6c;"><span style="width:16px; height:16px; border-radius:50%; background:#a9bcc4;"></span> Proxied to <strong style="color:#466b4c;">Heating WG</strong><button style="margin-left:auto; font:600 10.5px 'Public Sans'; color:#b1402f; background:none; border:none; text-decoration:underline;">Recall &amp; vote myself</button></div>
+        <div style="display:flex; gap:8px;"><button style="flex:2; padding:13px; border:none; border-radius:10px; background:#466b4c; color:#fff; font:600 14px 'Public Sans';">▲ Vote for</button><button style="flex:1; padding:13px; border:1px solid #e0b9b1; border-radius:10px; background:#fff; color:#b1402f; font:600 13px 'Public Sans';">▼</button><button style="flex:1; padding:13px; border:1px solid #d8d1c1; border-radius:10px; background:#fff; color:#767a6c; font:600 13px 'Public Sans';">—</button></div>
+      </div>
+      <div style="height:24px; background:#f6f3ec;"></div>
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#20241c; opacity:.25;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== S5 · DELEGATION ===== -->
+<div style="position:absolute; left:2048px; top:230px; width:412px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 12.5px 'Public Sans'; color:#466b4c;">5 · Delegation</div>
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 12px 40px rgba(40,30,10,.22);">
+    <div style="background:#fbf9f4; border-radius:36px; overflow:hidden; height:844px; display:flex; flex-direction:column; font-family:'Public Sans',system-ui; position:relative;">
+      <div style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#20241c; flex-shrink:0;"><span>9:41</span><span style="font-size:11px;">●●● ▆ 􀛨</span></div>
+      <div style="padding:4px 18px 12px;"><div style="display:flex; align-items:center; gap:8px;"><span style="color:#767a6c; font-size:18px;">‹</span><span style="font:500 22px 'Newsreader',serif; color:#20241c;">Your delegations</span></div><div style="font:400 12px/1.5 'Public Sans'; color:#767a6c; margin-top:4px;">Hand your vote to someone you trust — per topic, revocable any time.</div></div>
+      <div style="flex:1; overflow-y:auto; padding:4px 16px 16px;">
+        <!-- standing card -->
+        <div style="background:#e4ece2; border-radius:11px; padding:15px;">
+          <div style="display:flex; align-items:baseline; gap:8px;"><span style="font:500 30px 'Newsreader',serif; color:#466b4c;">9</span><span style="font:400 12.5px 'Public Sans'; color:#3a4d3a;">members delegate to you</span></div>
+          <div style="font:400 12px/1.5 'Public Sans'; color:#3a4d3a; margin-top:4px;">on <strong>Mutual aid</strong> — you carry <span style="font-family:'IBM Plex Mono';">10 votes</span> there.</div>
+        </div>
+        <div style="font:600 10.5px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#8a8472; margin:18px 4px 10px;">By topic</div>
+        <div style="display:flex; flex-direction:column; gap:11px;">
+          <div style="background:#fff; border:1px solid #e3ddcf; border-radius:11px; padding:14px;">
+            <div style="display:flex; align-items:center; gap:10px;"><span style="width:32px; height:32px; border-radius:8px; background:#f1e2cc; display:flex; align-items:center; justify-content:center; font-size:15px;">💰</span><div style="flex:1;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">Treasury &amp; budget</div><div style="font:400 11px 'Public Sans'; color:#767a6c;">12 proposals decided this way</div></div></div>
+            <div style="margin-top:12px; display:flex; align-items:center; gap:9px; background:#f6f3ec; border:1px solid #e3ddcf; border-radius:8px; padding:9px 11px;"><span style="width:26px; height:26px; border-radius:50%; background:#466b4c; color:#fff; font:600 10px 'Public Sans'; display:flex; align-items:center; justify-content:center;">me</span><span style="color:#b3ad9c;">→</span><span style="width:26px; height:26px; border-radius:50%; background:#a9bcc4;"></span><div style="flex:1; line-height:1.15;"><div style="font:600 12.5px 'Public Sans'; color:#20241c;">Heating WG</div><div style="font:400 10px 'IBM Plex Mono'; color:#8aa68d;">carries 23 votes</div></div><button style="padding:6px 11px; border:1px solid #e0b9b1; border-radius:6px; background:#fff; font:600 11px 'Public Sans'; color:#b1402f;">Recall</button></div>
+          </div>
+          <div style="background:#fff; border:1px solid #e3ddcf; border-radius:11px; padding:14px;"><div style="display:flex; align-items:center; gap:10px;"><span style="width:32px; height:32px; border-radius:8px; background:#e4ece2; display:flex; align-items:center; justify-content:center; font-size:15px;">🛡</span><div style="flex:1;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">Moderation &amp; charter</div><div style="font:400 11px 'Public Sans'; color:#767a6c;">You vote on these yourself</div></div><button style="padding:7px 12px; border:none; border-radius:7px; background:#466b4c; color:#fff; font:600 11px 'Public Sans';">Delegate</button></div></div>
+          <div style="background:#fff; border:1px solid #e3ddcf; border-radius:11px; padding:14px;"><div style="display:flex; align-items:center; gap:10px;"><span style="width:32px; height:32px; border-radius:8px; background:#e8eef0; display:flex; align-items:center; justify-content:center; font-size:15px;">🤝</span><div style="flex:1;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">Membership &amp; recalls</div><div style="font:400 11px 'Public Sans'; color:#767a6c;">You vote on these yourself</div></div><button style="padding:7px 12px; border:none; border-radius:7px; background:#466b4c; color:#fff; font:600 11px 'Public Sans';">Delegate</button></div></div>
+        </div>
+        <div style="margin-top:16px; display:flex; gap:10px; align-items:flex-start; background:#efeadf; border-radius:9px; padding:12px 14px;"><span style="font-size:14px;">⑃</span><div style="font:400 11.5px/1.5 'Public Sans'; color:#4b4f44;"><strong>Transitive &amp; cycle-safe.</strong> Your vote follows the chain and you can trace the whole path; loops are blocked automatically.</div></div>
+      </div>
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#20241c; opacity:.25;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- IA post-its -->
+<div data-drags-parent="0" style="position:absolute; left:2540px; top:260px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(1.2deg);"><strong>Bottom tabs:</strong> Chat · Assembly · Activity · You. Governance gets a permanent home so a member can act on a vote in two taps from anywhere — the mobile answer to "voting should be as easy as messaging."</div>
+<div data-drags-parent="0" style="position:absolute; left:2540px; top:470px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(-1.3deg);"><strong>Drawer, not rail.</strong> The desktop's left column becomes a swipe-in Spaces drawer; communities still expand to channels in place, so the mental model is identical across devices.</div>
+<div data-drags-parent="0" style="position:absolute; left:2540px; top:690px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(.8deg);"><strong>Thumb-zone ballot.</strong> The vote bar pins to the bottom of the proposal so the primary action is always reachable; "Recall &amp; vote myself" sits right above it.</div>
+
+<div data-drags-parent="0" style="position:absolute; left:80px; top:1140px; width:820px; font:400 13px/1.6 'Public Sans'; color:#5a5347;">That's the set: design system (light + dark tokens) → three directions → the chosen Commons direction taken to hi-fi on desktop and mobile, end-to-end through the governance loop. Open threads if you want them: onboarding &amp; identity/backup, community settings &amp; the fork/lineage tree, the Vines/Files/Mint side-modes, dark-theme renders of these screens, or an interactive clickable prototype of the vote flow.</div>
+</x-dc>
+</body>
+</html>

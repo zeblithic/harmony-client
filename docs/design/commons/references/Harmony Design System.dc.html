@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  html,body{height:auto;overflow:auto;background:#e9e5db;}
+</style>
+</helmet>
+
+<div style="font-family:'Public Sans',system-ui; background:#e9e5db; color:#20241c; padding:48px 0 96px;">
+<div style="max-width:1180px; margin:0 auto; padding:0 40px;">
+
+  <!-- ===== HEADER ===== -->
+  <div style="display:flex; align-items:flex-start; gap:20px; padding-bottom:28px; border-bottom:1px solid #d8d1c1;">
+    <svg width="58" height="58" viewBox="0 0 92 92" style="flex-shrink:0;"><circle cx="46" cy="34" r="22" fill="none" stroke="#466b4c" stroke-width="4"/><circle cx="32" cy="56" r="22" fill="none" stroke="#283450" stroke-width="4"/><circle cx="60" cy="56" r="22" fill="none" stroke="#c56a46" stroke-width="4"/><circle cx="46" cy="49" r="4" fill="#20241c"/></svg>
+    <div>
+      <div style="font:600 11px 'IBM Plex Mono',monospace; letter-spacing:.16em; text-transform:uppercase; color:#8a8472;">Harmony · Design System · "Commons"</div>
+      <h1 style="margin:4px 0 8px; font:500 40px/1.0 'Newsreader',serif; letter-spacing:-.01em; color:#20241c;">Foundations &amp; components</h1>
+      <p style="margin:0; font:400 15px/1.5 'Public Sans'; color:#4b4f44; max-width:64ch;">A warm, civic system for communities to form, grow, and govern their commons. Tokens ship light &amp; dark; every value is shown as a named token you can drop straight into <span style="font-family:'IBM Plex Mono'; font-size:13px; background:#dcd6c8; padding:1px 5px; border-radius:3px;">app.css</span>.</p>
+    </div>
+  </div>
+
+  <!-- ===== COLOR ===== -->
+  <div style="margin-top:48px;">
+    <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:#8a8472;">01 · Color</div>
+    <h2 style="margin:6px 0 4px; font:500 27px 'Newsreader',serif; color:#20241c;">Two themes, one warm temperature</h2>
+    <p style="margin:0 0 24px; font:400 14px/1.5 'Public Sans'; color:#767a6c; max-width:70ch;">Neutrals are warm (paper, not paper-white; ink, not black). Saturation stays low everywhere except the three semantic accents. The dark theme is a warm near-black — brown-tinted, never Discord graphite.</p>
+
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px;">
+      <!-- LIGHT -->
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:16px;"><span style="width:14px; height:14px; border-radius:50%; background:#f4f1ea; border:1px solid #c9c2b0;"></span><span style="font:700 13px 'Public Sans'; color:#20241c;">Light · default</span></div>
+        <div style="display:flex; flex-direction:column; gap:7px;">
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#f4f1ea; border:1px solid #d8d1c1;"></span><span style="font:500 12.5px 'Public Sans'; flex:1;">paper · app bg</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8a8472;">#f4f1ea</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#efeadf; border:1px solid #d8d1c1;"></span><span style="font:500 12.5px 'Public Sans'; flex:1;">surface · nav/rail</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8a8472;">#efeadf</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#fbf9f4; border:1px solid #d8d1c1;"></span><span style="font:500 12.5px 'Public Sans'; flex:1;">raised · cards/feed</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8a8472;">#fbf9f4</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#20241c;"></span><span style="font:500 12.5px 'Public Sans'; flex:1;">ink · primary text</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8a8472;">#20241c</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#4b4f44;"></span><span style="font:500 12.5px 'Public Sans'; flex:1;">ink-2 · secondary</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8a8472;">#4b4f44</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#767a6c;"></span><span style="font:500 12.5px 'Public Sans'; flex:1;">muted · tertiary</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8a8472;">#767a6c</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#e3ddcf; border:1px solid #d8d1c1;"></span><span style="font:500 12.5px 'Public Sans'; flex:1;">line · border</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8a8472;">#e3ddcf</span></div>
+        </div>
+      </div>
+      <!-- DARK -->
+      <div style="background:#24211c; border:1px solid #38342c; border-radius:8px; padding:22px;">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:16px;"><span style="width:14px; height:14px; border-radius:50%; background:#1c1a16; border:1px solid #4a4639;"></span><span style="font:700 13px 'Public Sans'; color:#f0ece2;">Dark · warm</span></div>
+        <div style="display:flex; flex-direction:column; gap:7px;">
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#1c1a16; border:1px solid #4a4639;"></span><span style="font:500 12.5px 'Public Sans'; flex:1; color:#f0ece2;">paper · app bg</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8f897a;">#1c1a16</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#24211c; border:1px solid #4a4639;"></span><span style="font:500 12.5px 'Public Sans'; flex:1; color:#f0ece2;">surface · nav/rail</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8f897a;">#24211c</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#2b2823; border:1px solid #4a4639;"></span><span style="font:500 12.5px 'Public Sans'; flex:1; color:#f0ece2;">raised · cards/feed</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8f897a;">#2b2823</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#f0ece2;"></span><span style="font:500 12.5px 'Public Sans'; flex:1; color:#f0ece2;">ink · primary text</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8f897a;">#f0ece2</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#c4bdab;"></span><span style="font:500 12.5px 'Public Sans'; flex:1; color:#f0ece2;">ink-2 · secondary</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8f897a;">#c4bdab</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#8f897a;"></span><span style="font:500 12.5px 'Public Sans'; flex:1; color:#f0ece2;">muted · tertiary</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8f897a;">#8f897a</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:40px; height:32px; border-radius:5px; background:#38342c; border:1px solid #4a4639;"></span><span style="font:500 12.5px 'Public Sans'; flex:1; color:#f0ece2;">line · border</span><span style="font:500 11.5px 'IBM Plex Mono'; color:#8f897a;">#38342c</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SEMANTIC -->
+    <div style="margin-top:20px; background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+      <div style="font:700 13px 'Public Sans'; color:#20241c; margin-bottom:4px;">Semantic accents</div>
+      <div style="font:400 13px 'Public Sans'; color:#767a6c; margin-bottom:16px;">Three carry meaning across the whole app. Hold their chroma constant; only hue changes.</div>
+      <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:18px;">
+        <div>
+          <div style="height:52px; border-radius:6px; background:#466b4c; display:flex; align-items:flex-end; padding:8px;"><span style="font:600 11px 'IBM Plex Mono'; color:#dfeadd;">#466b4c</span></div>
+          <div style="font:700 12.5px 'Public Sans'; margin-top:8px; color:#20241c;">primary — consensus green</div>
+          <div style="font:400 12px/1.45 'Public Sans'; color:#767a6c;">Brand, active nav, "for" votes, passing/quorum-met. Pastoral: the commons, growth, agreement.</div>
+          <div style="display:flex; gap:6px; margin-top:8px;"><span style="flex:1; height:18px; border-radius:3px; background:#2f4a35;"></span><span style="flex:1; height:18px; border-radius:3px; background:#466b4c;"></span><span style="flex:1; height:18px; border-radius:3px; background:#7fa886;"></span><span style="flex:1; height:18px; border-radius:3px; background:#e4ece2;"></span></div>
+          <div style="font:400 10.5px 'IBM Plex Mono'; color:#8a8472; margin-top:4px;">deep · base · light · soft</div>
+        </div>
+        <div>
+          <div style="height:52px; border-radius:6px; background:#b9742c; display:flex; align-items:flex-end; padding:8px;"><span style="font:600 11px 'IBM Plex Mono'; color:#f6ead5;">#b9742c</span></div>
+          <div style="font:700 12.5px 'Public Sans'; margin-top:8px; color:#20241c;">accent — civic clay</div>
+          <div style="font:400 12px/1.45 'Public Sans'; color:#767a6c;">Governance attention: open proposals, deadlines, deliberation. Used sparingly so it always means "act."</div>
+          <div style="display:flex; gap:6px; margin-top:8px;"><span style="flex:1; height:18px; border-radius:3px; background:#5a4321;"></span><span style="flex:1; height:18px; border-radius:3px; background:#b9742c;"></span><span style="flex:1; height:18px; border-radius:3px; background:#d39450;"></span><span style="flex:1; height:18px; border-radius:3px; background:#f1e2cc;"></span></div>
+          <div style="font:400 10.5px 'IBM Plex Mono'; color:#8a8472; margin-top:4px;">deep · base · light · soft</div>
+        </div>
+        <div>
+          <div style="height:52px; border-radius:6px; background:#b1402f; display:flex; align-items:flex-end; padding:8px;"><span style="font:600 11px 'IBM Plex Mono'; color:#f6dcd6;">#b1402f</span></div>
+          <div style="font:700 12.5px 'Public Sans'; margin-top:8px; color:#20241c;">danger — dissent red</div>
+          <div style="font:400 12px/1.45 'Public Sans'; color:#767a6c;">"Against" votes, destructive actions, failed/recalled. Never decorative.</div>
+          <div style="display:flex; gap:6px; margin-top:8px;"><span style="flex:1; height:18px; border-radius:3px; background:#7d2a1e;"></span><span style="flex:1; height:18px; border-radius:3px; background:#b1402f;"></span><span style="flex:1; height:18px; border-radius:3px; background:#d98377;"></span><span style="flex:1; height:18px; border-radius:3px; background:#f3ddd7;"></span></div>
+          <div style="font:400 10.5px 'IBM Plex Mono'; color:#8a8472; margin-top:4px;">deep · base · light · soft</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== TYPE ===== -->
+  <div style="margin-top:52px;">
+    <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:#8a8472;">02 · Typography</div>
+    <h2 style="margin:6px 0 4px; font:500 27px 'Newsreader',serif; color:#20241c;">A serif for gravitas, a civic sans for work</h2>
+    <p style="margin:0 0 24px; font:400 14px/1.5 'Public Sans'; color:#767a6c; max-width:70ch;">Newsreader (display serif) gives community names and headers a deliberate, almost editorial weight. Public Sans — the U.S. government's own UI typeface — handles every interface need and signals "civic" without a word. IBM Plex Mono carries data: tallies, IDs, timestamps, addresses.</p>
+    <div style="display:grid; grid-template-columns:1.3fr 1fr; gap:24px;">
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:26px;">
+        <div style="border-bottom:1px solid #ece7da; padding-bottom:16px; margin-bottom:16px;">
+          <div style="font:500 44px/1.0 'Newsreader',serif; color:#20241c; letter-spacing:-.01em;">Cascadia Commons</div>
+          <div style="font:400 11px 'IBM Plex Mono'; color:#8a8472; margin-top:8px;">Newsreader · 500 · display / community names · 28–44px</div>
+        </div>
+        <div style="border-bottom:1px solid #ece7da; padding-bottom:14px; margin-bottom:14px;">
+          <div style="font:600 19px 'Public Sans'; color:#20241c;">Reallocate $400 to the heating fund</div>
+          <div style="font:400 11px 'IBM Plex Mono'; color:#8a8472; margin-top:6px;">Public Sans · 600 · titles / proposal names · 16–20px</div>
+        </div>
+        <div style="border-bottom:1px solid #ece7da; padding-bottom:14px; margin-bottom:14px;">
+          <div style="font:400 14px/1.55 'Public Sans'; color:#3a3e34;">Body copy carries the conversation and proposal descriptions. It stays at 14px, line-height 1.55, warm ink for long-form readability across a dense interface.</div>
+          <div style="font:400 11px 'IBM Plex Mono'; color:#8a8472; margin-top:6px;">Public Sans · 400 · body · 14px / 1.55</div>
+        </div>
+        <div>
+          <div style="font:500 12.5px 'IBM Plex Mono'; color:#466b4c;">P-14 · 68% FOR · quorum 71% ✓ · closes 2d</div>
+          <div style="font:400 11px 'IBM Plex Mono'; color:#8a8472; margin-top:6px;">IBM Plex Mono · 500 · data / IDs / tallies / timestamps</div>
+        </div>
+      </div>
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:26px;">
+        <div style="font:700 13px 'Public Sans'; color:#20241c; margin-bottom:14px;">Type scale</div>
+        <div style="display:flex; flex-direction:column; gap:11px;">
+          <div style="display:flex; align-items:baseline; justify-content:space-between;"><span style="font:500 28px 'Newsreader',serif; color:#20241c;">Display</span><span style="font:400 11px 'IBM Plex Mono'; color:#8a8472;">28/500</span></div>
+          <div style="display:flex; align-items:baseline; justify-content:space-between;"><span style="font:600 19px 'Public Sans'; color:#20241c;">Title</span><span style="font:400 11px 'IBM Plex Mono'; color:#8a8472;">19/600</span></div>
+          <div style="display:flex; align-items:baseline; justify-content:space-between;"><span style="font:600 15px 'Public Sans'; color:#20241c;">Subtitle</span><span style="font:400 11px 'IBM Plex Mono'; color:#8a8472;">15/600</span></div>
+          <div style="display:flex; align-items:baseline; justify-content:space-between;"><span style="font:400 14px 'Public Sans'; color:#20241c;">Body</span><span style="font:400 11px 'IBM Plex Mono'; color:#8a8472;">14/400</span></div>
+          <div style="display:flex; align-items:baseline; justify-content:space-between;"><span style="font:500 13px 'Public Sans'; color:#20241c;">Label</span><span style="font:400 11px 'IBM Plex Mono'; color:#8a8472;">13/500</span></div>
+          <div style="display:flex; align-items:baseline; justify-content:space-between;"><span style="font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#20241c;">Overline</span><span style="font:400 11px 'IBM Plex Mono'; color:#8a8472;">10.5/600</span></div>
+          <div style="display:flex; align-items:baseline; justify-content:space-between;"><span style="font:500 12px 'IBM Plex Mono'; color:#20241c;">Mono data</span><span style="font:400 11px 'IBM Plex Mono'; color:#8a8472;">12/500</span></div>
+        </div>
+        <div style="margin-top:18px; padding-top:14px; border-top:1px solid #ece7da; font:400 12px/1.5 'Public Sans'; color:#767a6c;">Base 14px · scale ratio ≈ 1.2 · all sizes ≥ 12px for legibility at desktop density.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== SPACING / RADII / ELEVATION ===== -->
+  <div style="margin-top:52px;">
+    <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:#8a8472;">03 · Space, shape &amp; elevation</div>
+    <h2 style="margin:6px 0 20px; font:500 27px 'Newsreader',serif; color:#20241c;">Calm geometry</h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:24px;">
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Spacing · 4px base</div>
+        <div style="display:flex; flex-direction:column; gap:9px;">
+          <div style="display:flex; align-items:center; gap:12px;"><span style="height:14px; width:4px; background:#466b4c;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">4 · xs</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="height:14px; width:8px; background:#466b4c;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">8 · sm</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="height:14px; width:12px; background:#466b4c;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">12 · md</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="height:14px; width:16px; background:#466b4c;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">16 · lg</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="height:14px; width:24px; background:#466b4c;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">24 · xl</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="height:14px; width:32px; background:#466b4c;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">32 · 2xl</span></div>
+        </div>
+      </div>
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Radius</div>
+        <div style="display:flex; flex-direction:column; gap:11px;">
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:38px; height:30px; background:#e4ece2; border:1px solid #c9d6c6; border-radius:3px;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">3 · chips, bars</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:38px; height:30px; background:#e4ece2; border:1px solid #c9d6c6; border-radius:5px;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">5 · inputs, rows</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:38px; height:30px; background:#e4ece2; border:1px solid #c9d6c6; border-radius:8px;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">8 · cards, panels</span></div>
+          <div style="display:flex; align-items:center; gap:12px;"><span style="width:38px; height:30px; background:#e4ece2; border:1px solid #c9d6c6; border-radius:50px;"></span><span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">pill · badges, avatars</span></div>
+        </div>
+      </div>
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Elevation · warm shadow</div>
+        <div style="display:flex; flex-direction:column; gap:14px;">
+          <div style="background:#fff; border:1px solid #ece7da; border-radius:6px; padding:9px 12px; font:500 12px 'Public Sans'; color:#767a6c; box-shadow:0 1px 3px rgba(40,30,10,.07);">e1 · resting card</div>
+          <div style="background:#fff; border:1px solid #ece7da; border-radius:6px; padding:9px 12px; font:500 12px 'Public Sans'; color:#767a6c; box-shadow:0 2px 10px rgba(40,30,10,.10);">e2 · panel / popover</div>
+          <div style="background:#fff; border:1px solid #ece7da; border-radius:6px; padding:9px 12px; font:500 12px 'Public Sans'; color:#767a6c; box-shadow:0 8px 28px rgba(40,30,10,.16);">e3 · modal</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== COMPONENTS ===== -->
+  <div style="margin-top:52px;">
+    <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:#8a8472;">04 · Core components</div>
+    <h2 style="margin:6px 0 20px; font:500 27px 'Newsreader',serif; color:#20241c;">The everyday kit</h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px;">
+      <!-- buttons -->
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Buttons</div>
+        <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+          <button style="padding:9px 16px; border:none; border-radius:6px; background:#466b4c; color:#fff; font:600 13px 'Public Sans'; cursor:pointer;">Primary</button>
+          <button style="padding:9px 16px; border:1px solid #d8d1c1; border-radius:6px; background:#fff; color:#20241c; font:600 13px 'Public Sans'; cursor:pointer;">Secondary</button>
+          <button style="padding:9px 16px; border:none; border-radius:6px; background:transparent; color:#466b4c; font:600 13px 'Public Sans'; cursor:pointer;">Ghost</button>
+          <button style="padding:9px 16px; border:1px solid #e0b9b1; border-radius:6px; background:#fff; color:#b1402f; font:600 13px 'Public Sans'; cursor:pointer;">Danger</button>
+          <button style="padding:9px 16px; border:none; border-radius:6px; background:#d8d1c1; color:#a39e8e; font:600 13px 'Public Sans'; cursor:not-allowed;">Disabled</button>
+        </div>
+        <div style="font:700 12px 'Public Sans'; margin:18px 0 10px; color:#767a6c;">Vote buttons (governance)</div>
+        <div style="display:flex; gap:10px;">
+          <button style="flex:1; padding:10px; border:none; border-radius:6px; background:#466b4c; color:#fff; font:600 13px 'Public Sans'; cursor:pointer;">▲ Vote for</button>
+          <button style="flex:1; padding:10px; border:1px solid #e0b9b1; border-radius:6px; background:#fff; color:#b1402f; font:600 13px 'Public Sans'; cursor:pointer;">▼ Against</button>
+          <button style="flex:1; padding:10px; border:1px solid #d8d1c1; border-radius:6px; background:#fff; color:#767a6c; font:600 13px 'Public Sans'; cursor:pointer;">— Abstain</button>
+        </div>
+      </div>
+      <!-- inputs -->
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Inputs &amp; search</div>
+        <div style="display:flex; align-items:center; gap:8px; background:#fff; border:1px solid #e3ddcf; border-radius:5px; padding:8px 11px; margin-bottom:11px;"><span style="color:#a39e8e;">⌕</span><span style="font:400 13px 'Public Sans'; color:#a39e8e;">Search communities, people, proposals</span></div>
+        <div style="background:#fff; border:1px solid #466b4c; border-radius:5px; padding:8px 11px; margin-bottom:11px; font:400 13px 'Public Sans'; color:#20241c; box-shadow:0 0 0 3px rgba(70,107,76,.12);">Focused field<span style="border-left:1.5px solid #466b4c; margin-left:1px;">&nbsp;</span></div>
+        <div style="display:flex; align-items:center; gap:11px; background:#fff; border:1px solid #e3ddcf; border-radius:8px; padding:11px 14px;"><span style="color:#b3ad9c;">＋</span><span style="font:400 13.5px 'Public Sans'; color:#a39e8e; flex:1;">Message #general</span><span style="color:#b3ad9c;">☺</span></div>
+        <div style="font:400 11.5px 'Public Sans'; color:#8a8472; margin-top:9px;">Compose bar — raised, generous, the only pill-radius input.</div>
+      </div>
+      <!-- nav rows + avatars -->
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Nav rows</div>
+        <div style="background:#efeadf; border-radius:6px; padding:6px;">
+          <div style="display:flex; align-items:center; gap:7px; padding:6px 10px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="color:#b3ad9c;">#</span> welcome</div>
+          <div style="display:flex; align-items:center; gap:7px; padding:6px 10px; background:#e4ece2; border-radius:5px; color:#2f4a35; font:600 13.5px 'Public Sans';"><span style="color:#466b4c;">#</span> general · active</div>
+          <div style="display:flex; align-items:center; gap:7px; padding:6px 10px; color:#20241c; font:600 13.5px 'Public Sans';"><span style="color:#b3ad9c;">#</span> dev <span style="margin-left:auto; width:8px; height:8px; border-radius:50%; background:#466b4c;"></span></div>
+          <div style="display:flex; align-items:center; gap:7px; padding:6px 10px; color:#766f5c; font:500 13.5px 'Public Sans';"><span style="color:#b9742c;">⚖</span> proposals <span style="margin-left:auto; background:#b9742c; color:#fff; font:600 10px 'IBM Plex Mono'; padding:1px 6px; border-radius:9px;">3</span></div>
+        </div>
+        <div style="font:700 13px 'Public Sans'; margin:18px 0 10px;">Avatars &amp; presence</div>
+        <div style="display:flex; align-items:center; gap:14px;">
+          <span style="position:relative; display:inline-block;"><span style="width:40px; height:40px; border-radius:50%; background:#466b4c; color:#fff; font:600 14px 'Public Sans'; display:flex; align-items:center; justify-content:center;">JE</span><span style="position:absolute; right:-1px; bottom:-1px; width:12px; height:12px; border-radius:50%; background:#466b4c; border:2.5px solid #fbf9f4;"></span></span>
+          <span style="position:relative; display:inline-block;"><span style="width:40px; height:40px; border-radius:50%; background:#c9bfa6;"></span><span style="position:absolute; right:-1px; bottom:-1px; width:12px; height:12px; border-radius:50%; background:#b9742c; border:2.5px solid #fbf9f4;"></span></span>
+          <span style="position:relative; display:inline-block;"><span style="width:40px; height:40px; border-radius:50%; background:#a9bcc4;"></span><span style="position:absolute; right:-1px; bottom:-1px; width:12px; height:12px; border-radius:50%; background:#a39e8e; border:2.5px solid #fbf9f4;"></span></span>
+          <div style="font:400 11.5px/1.5 'Public Sans'; color:#767a6c;">online · <span style="color:#b9742c;">away</span> · offline<br>2.5px paper ring lifts off any surface.</div>
+        </div>
+      </div>
+      <!-- status pills -->
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="font:700 13px 'Public Sans'; margin-bottom:6px;">Status pills</div>
+        <div style="font:400 12px 'Public Sans'; color:#767a6c; margin-bottom:14px;">A proposal's lifecycle, color-coded so state is readable at a glance.</div>
+        <div style="display:flex; flex-wrap:wrap; gap:9px;">
+          <span style="font:600 11px 'Public Sans'; color:#5a5345; background:#e6e0d0; padding:4px 10px; border-radius:20px;">Drafting</span>
+          <span style="font:600 11px 'Public Sans'; color:#5a4321; background:#f1e2cc; padding:4px 10px; border-radius:20px;">● Open · 2d left</span>
+          <span style="font:600 11px 'Public Sans'; color:#2f4a35; background:#e4ece2; padding:4px 10px; border-radius:20px;">Passing</span>
+          <span style="font:600 11px 'Public Sans'; color:#fff; background:#466b4c; padding:4px 10px; border-radius:20px;">✓ Passed</span>
+          <span style="font:600 11px 'Public Sans'; color:#fff; background:#b1402f; padding:4px 10px; border-radius:20px;">✕ Failed</span>
+          <span style="font:600 11px 'Public Sans'; color:#7d2a1e; background:#f3ddd7; padding:4px 10px; border-radius:20px;">↩ Recalled</span>
+          <span style="font:600 11px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:4px 8px; border-radius:3px;">P-14</span>
+        </div>
+        <div style="font:700 13px 'Public Sans'; margin:18px 0 10px;">Message row</div>
+        <div style="display:flex; gap:10px;"><span style="width:34px; height:34px; border-radius:50%; background:#c9bfa6; flex-shrink:0;"></span><div><div style="display:flex; align-items:baseline; gap:8px;"><span style="font:600 13px 'Public Sans'; color:#20241c;">Mara Okafor</span><span style="font:400 11px 'IBM Plex Mono'; color:#a39e8e;">9:02</span><span style="font:500 10px 'IBM Plex Mono'; color:#466b4c; border:1px solid #c9d6c6; padding:0 4px; border-radius:3px;">✓ verified</span></div><div style="font:400 13.5px/1.5 'Public Sans'; color:#3a3e34;">A message with a verified-identity chip — trust is first-class here.</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== GOVERNANCE COMPONENTS ===== -->
+  <div style="margin-top:52px;">
+    <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:#8a8472;">05 · Governance components · the heart</div>
+    <h2 style="margin:6px 0 4px; font:500 27px 'Newsreader',serif; color:#20241c;">Making liquid democracy legible</h2>
+    <p style="margin:0 0 24px; font:400 14px/1.5 'Public Sans'; color:#767a6c; max-width:72ch;">These are the components that make Harmony more than a chat app. They privilege clarity over cleverness: a vote should read like a ballot, not a dashboard.</p>
+
+    <div style="display:grid; grid-template-columns:1.15fr 1fr; gap:24px; align-items:start;">
+      <!-- proposal card anatomy -->
+      <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+        <div style="font:700 13px 'Public Sans'; margin-bottom:4px;">Proposal card · anatomy</div>
+        <div style="font:400 12px 'Public Sans'; color:#767a6c; margin-bottom:16px;">The hero of the governance system. Header (ID + timer), title, tally, quorum, your-stance, actions.</div>
+        <div style="background:#fff; border:1px solid #e6dcc6; border-radius:8px; padding:16px 18px; box-shadow:0 1px 3px rgba(40,30,10,.07);">
+          <div style="display:flex; align-items:center; gap:8px;"><span style="font:600 10px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:2px 6px; border-radius:3px;">P-14</span><span style="font:600 11px 'Public Sans'; color:#5a4321; background:#f1e2cc; padding:3px 9px; border-radius:20px;">● Open</span><span style="margin-left:auto; font:500 11.5px 'IBM Plex Mono'; color:#8a8472;">⏳ closes Fri · 2d</span></div>
+          <div style="font:600 16px/1.35 'Public Sans'; color:#20241c; margin-top:11px;">Reallocate $400 from reserves to the winter heating fund</div>
+          <div style="font:400 13px/1.5 'Public Sans'; color:#767a6c; margin-top:6px;">Proposed by Heating WG · Treasury motion</div>
+          <!-- tally -->
+          <div style="margin-top:15px; height:10px; border-radius:6px; background:#eadfc8; overflow:hidden; display:flex;"><span style="width:68%; background:#466b4c;"></span><span style="width:14%; background:#b1402f;"></span><span style="width:18%; background:#cdc6b4;"></span></div>
+          <div style="display:flex; justify-content:space-between; margin-top:7px; font:600 11.5px 'IBM Plex Mono';"><span style="color:#466b4c;">For 68% · 97</span><span style="color:#b1402f;">Against 14% · 20</span><span style="color:#8a8472;">Abst 18% · 25</span></div>
+          <!-- quorum + conviction -->
+          <div style="display:flex; gap:10px; margin-top:13px;">
+            <div style="flex:1; background:#e4ece2; border-radius:5px; padding:8px 10px;"><div style="font:600 10px 'Public Sans'; letter-spacing:.06em; text-transform:uppercase; color:#5a6a55;">Quorum</div><div style="font:600 13px 'IBM Plex Mono'; color:#2f4a35; margin-top:2px;">142/142 ✓</div></div>
+            <div style="flex:1; background:#f1e2cc; border-radius:5px; padding:8px 10px;"><div style="font:600 10px 'Public Sans'; letter-spacing:.06em; text-transform:uppercase; color:#6b5226;">Conviction</div><div style="font:600 13px 'IBM Plex Mono'; color:#5a4321; margin-top:2px;">▁▂▄▆ rising</div></div>
+          </div>
+          <!-- actions -->
+          <div style="display:flex; gap:8px; margin-top:14px;"><button style="flex:1; padding:9px; border:none; border-radius:6px; background:#466b4c; color:#fff; font:600 12.5px 'Public Sans'; cursor:pointer;">▲ Vote for</button><button style="flex:1; padding:9px; border:1px solid #e0b9b1; border-radius:6px; background:#fff; color:#b1402f; font:600 12.5px 'Public Sans'; cursor:pointer;">▼ Against</button></div>
+          <div style="margin-top:11px; padding-top:11px; border-top:1px solid #ece7da; display:flex; align-items:center; gap:7px; font:400 11.5px 'Public Sans'; color:#767a6c;"><span style="width:18px; height:18px; border-radius:50%; background:#a9bcc4;"></span> Proxied to <span style="color:#466b4c; font-weight:600;">Heating WG</span> · <span style="text-decoration:underline; cursor:pointer; color:#b1402f;">Recall</span></div>
+        </div>
+      </div>
+
+      <!-- right column stack -->
+      <div style="display:flex; flex-direction:column; gap:24px;">
+        <!-- delegation chip -->
+        <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+          <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Delegation</div>
+          <div style="display:flex; align-items:center; gap:10px; background:#fff; border:1px solid #e3ddcf; border-radius:6px; padding:10px 12px;">
+            <span style="width:30px; height:30px; border-radius:50%; background:#466b4c; color:#fff; font:600 11px 'Public Sans'; display:flex; align-items:center; justify-content:center;">me</span>
+            <span style="color:#b3ad9c;">→</span>
+            <span style="width:30px; height:30px; border-radius:50%; background:#a9bcc4;"></span>
+            <div style="flex:1; line-height:1.2;"><div style="font:600 12.5px 'Public Sans'; color:#20241c;">Heating WG</div><div style="font:400 11px 'Public Sans'; color:#767a6c;">Treasury topics · revocable</div></div>
+            <button style="padding:5px 10px; border:1px solid #d8d1c1; border-radius:5px; background:#fff; font:600 11px 'Public Sans'; color:#767a6c; cursor:pointer;">Change</button>
+          </div>
+          <div style="font:400 11.5px/1.5 'Public Sans'; color:#8a8472; margin-top:10px;">Per-topic, transitive, and recallable any time before a vote closes. The spine of liquid democracy.</div>
+        </div>
+        <!-- quorum meter -->
+        <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+          <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Quorum &amp; outcome states</div>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <div><div style="display:flex; justify-content:space-between; font:600 11px 'Public Sans'; color:#2f4a35;"><span>Quorum reached</span><span style="font-family:'IBM Plex Mono';">100%</span></div><div style="height:7px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="display:block; width:100%; height:100%; background:#466b4c;"></span></div></div>
+            <div><div style="display:flex; justify-content:space-between; font:600 11px 'Public Sans'; color:#6b5226;"><span>Approaching quorum</span><span style="font-family:'IBM Plex Mono';">61%</span></div><div style="height:7px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="display:block; width:61%; height:100%; background:#b9742c;"></span></div></div>
+            <div><div style="display:flex; justify-content:space-between; font:600 11px 'Public Sans'; color:#7d2a1e;"><span>Quorum at risk</span><span style="font-family:'IBM Plex Mono';">28%</span></div><div style="height:7px; background:#eadfc8; border-radius:4px; margin-top:3px; overflow:hidden;"><span style="display:block; width:28%; height:100%; background:#b1402f;"></span></div></div>
+          </div>
+        </div>
+        <!-- self-sovereign banner -->
+        <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:22px;">
+          <div style="font:700 13px 'Public Sans'; margin-bottom:14px;">Self-sovereign banner</div>
+          <div style="display:flex; align-items:center; gap:12px; background:#f1e2cc; border:1px solid #e6cfa3; border-radius:8px; padding:12px 14px;">
+            <span style="font-size:18px;">🔑</span>
+            <div style="flex:1;"><div style="font:600 12.5px 'Public Sans'; color:#5a4321;">Back up your identity</div><div style="font:400 11.5px/1.4 'Public Sans'; color:#7a6230;">You hold your own keys. No one can recover them for you.</div></div>
+            <button style="padding:7px 12px; border:none; border-radius:5px; background:#b9742c; color:#fff; font:600 11.5px 'Public Sans'; cursor:pointer; flex-shrink:0;">Back up</button>
+          </div>
+          <div style="font:400 11.5px/1.5 'Public Sans'; color:#8a8472; margin-top:10px;">Sovereignty has a cost; the system makes it gentle, not nagging.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- footer -->
+  <div style="margin-top:54px; padding-top:24px; border-top:1px solid #d8d1c1; display:flex; gap:14px; align-items:center; font:400 13px/1.5 'Public Sans'; color:#767a6c;">
+    <svg width="26" height="26" viewBox="0 0 92 92" style="flex-shrink:0;"><circle cx="46" cy="34" r="22" fill="none" stroke="#466b4c" stroke-width="5"/><circle cx="32" cy="56" r="22" fill="none" stroke="#283450" stroke-width="5"/><circle cx="60" cy="56" r="22" fill="none" stroke="#c56a46" stroke-width="5"/></svg>
+    <span>This is the kit. Next: high-fidelity desktop screens (full shell + the governance flow — proposal list, proposal detail, delegation), then the mobile adaptation.</span>
+  </div>
+
+</div>
+</div>
+</x-dc>
+</body>
+</html>

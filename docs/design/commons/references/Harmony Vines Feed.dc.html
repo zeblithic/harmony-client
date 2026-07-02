@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *,*::before,*::after{box-sizing:border-box;}
+  html,body{height:auto;min-height:100%;overflow:auto;background:#e9e5db;margin:0;}
+  .vscroll{scroll-snap-type:y mandatory; -webkit-overflow-scrolling:touch;}
+  .vscroll::-webkit-scrollbar{width:0;}
+  .vcard{scroll-snap-align:start; scroll-snap-stop:always;}
+  @keyframes loopfill{from{width:0}to{width:100%}}
+  @keyframes panbg{0%{transform:scale(1.08) translate(0,0)}100%{transform:scale(1.16) translate(-3%,-3%)}}
+  @keyframes hToast{0%{opacity:0;transform:translate(-50%,8px)}12%{opacity:1;transform:translate(-50%,0)}88%{opacity:1;transform:translate(-50%,0)}100%{opacity:0;transform:translate(-50%,8px)}}
+  @keyframes hSheet{from{transform:translateY(100%)}to{transform:translateY(0)}}
+</style>
+</helmet>
+
+<div style="min-height:100vh; background:#e9e5db; display:flex; flex-direction:column; align-items:center; padding:30px 20px 60px; gap:14px; font-family:'Public Sans',system-ui;">
+  <div style="text-align:center; max-width:560px;">
+    <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:rgba(60,55,45,.55);">Harmony · interactive prototype</div>
+    <div style="font:500 26px 'Newsreader',serif; color:#2a2519; margin-top:3px;">The Vines feed — endless, auto-playing, transitive Discover</div>
+    <div style="font:400 13px/1.5 'Public Sans'; color:#6b6256; margin-top:5px;"><strong>Scroll</strong> the phone: each loop auto-plays as it snaps into view and the feed never ends. Switch to <strong>Discover</strong> to see vines reached through 2nd- and 3rd-degree follows — no algorithm, just your social graph — and <strong>Tune</strong> it to mute who propagates.</div>
+  </div>
+
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 18px 50px rgba(40,30,10,.26);">
+    <div style="background:#15140f; border-radius:36px; overflow:hidden; width:390px; height:820px; position:relative;">
+
+      <!-- ===== SCROLLER ===== -->
+      <div id="vscroller" class="vscroll" style="position:absolute; inset:0; overflow-y:auto;">
+        <sc-for list="{{ feed }}" as="v" hint-placeholder-count="3">
+          <div class="vcard" data-vine="{{ v.id }}" style="{{ v.cardStyle }}">
+            <!-- video layer -->
+            <div style="{{ v.bgStyle }}"></div>
+            <div style="position:absolute; inset:0; background:linear-gradient(180deg, rgba(0,0,0,.34) 0%, rgba(0,0,0,0) 24%, rgba(0,0,0,0) 52%, rgba(0,0,0,.62) 100%);"></div>
+            <!-- paused glyph -->
+            <sc-if value="{{ v.paused }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:64px; height:64px; border-radius:50%; background:rgba(255,255,255,.16); display:flex; align-items:center; justify-content:center; font-size:24px; color:#fff;">❚❚</div>
+            </sc-if>
+            <!-- loop ring -->
+            <div style="position:absolute; top:0; left:0; right:0; height:3px; background:rgba(255,255,255,.22); z-index:4;"><div style="{{ v.ringStyle }}"></div></div>
+            <!-- discover provenance ribbon -->
+            <sc-if value="{{ v.isDiscover }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute; top:96px; left:14px; right:14px; z-index:5; display:flex; align-items:center; gap:8px; background:rgba(20,19,15,.5); backdrop-filter:blur(6px); border:1px solid rgba(255,255,255,.14); border-radius:11px; padding:8px 11px;">
+                <span style="{{ v.degreeChip }}">{{ v.degreeLabel }}</span>
+                <span style="font:400 11px/1.35 'Public Sans'; color:rgba(255,255,255,.92); flex:1;">{{ v.provenance }}</span>
+              </div>
+            </sc-if>
+            <!-- right actions -->
+            <div style="position:absolute; right:12px; bottom:150px; z-index:5; display:flex; flex-direction:column; gap:18px; align-items:center;">
+              <div onClick="{{ v.like }}" style="text-align:center; cursor:pointer;"><div style="{{ v.likeBtn }}">{{ v.likeGlyph }}</div><div style="font:600 10px 'IBM Plex Mono'; color:#fff; margin-top:3px;">{{ v.likes }}</div></div>
+              <div style="text-align:center;"><div style="width:50px; height:50px; border-radius:50%; background:rgba(255,255,255,.18); display:flex; align-items:center; justify-content:center; font-size:20px;">↻</div><div style="font:600 10px 'IBM Plex Mono'; color:#fff; margin-top:3px;">{{ v.reshares }}</div></div>
+              <div style="text-align:center;"><div style="width:50px; height:50px; border-radius:50%; background:rgba(255,255,255,.18); display:flex; align-items:center; justify-content:center; font-size:18px;">↗</div></div>
+            </div>
+            <!-- caption -->
+            <div style="position:absolute; left:18px; right:74px; bottom:104px; z-index:5;">
+              <div style="display:flex; align-items:center; gap:9px;"><span style="{{ v.avatarStyle }}"></span><span style="font:600 14px 'Public Sans'; color:#fff;">{{ v.handle }}</span><span style="margin-left:6px; font:600 10px 'IBM Plex Mono'; color:#fff; background:rgba(0,0,0,.4); padding:3px 9px; border-radius:20px;">↻ {{ v.dur }}</span></div>
+              <div style="font:400 13.5px/1.4 'Public Sans'; color:#fff; margin-top:9px;">{{ v.caption }}</div>
+            </div>
+          </div>
+        </sc-for>
+        <div style="height:1px;"></div>
+      </div>
+
+      <!-- ===== STATUS BAR ===== -->
+      <div style="position:absolute; top:0; left:0; right:0; height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#fff; z-index:8; pointer-events:none;"><span>9:41</span><span style="font-size:11px;">●●● ▆ 􀛨</span></div>
+
+      <!-- ===== TOP TABS ===== -->
+      <div style="position:absolute; top:46px; left:0; right:0; z-index:8; display:flex; align-items:center; justify-content:center; gap:20px; padding:6px 0;">
+        <span onClick="{{ showFollowing }}" style="{{ followingTab }}">Following</span>
+        <span onClick="{{ showDiscover }}" style="{{ discoverTab }}">Discover</span>
+      </div>
+
+      <!-- ===== DISCOVER CONTROL BAR ===== -->
+      <sc-if value="{{ isDiscover }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; top:84px; left:0; right:0; z-index:8; display:flex; align-items:center; gap:7px; padding:0 14px;">
+          <span onClick="{{ toggle2 }}" style="{{ chip2 }}">2nd degree</span>
+          <span onClick="{{ toggle3 }}" style="{{ chip3 }}">3rd degree</span>
+          <span onClick="{{ openTune }}" style="margin-left:auto; display:flex; align-items:center; gap:5px; font:600 11px 'Public Sans'; color:#fff; background:rgba(20,19,15,.5); backdrop-filter:blur(6px); border:1px solid rgba(255,255,255,.18); padding:6px 12px; border-radius:20px; cursor:pointer;">⚙ Tune</span>
+        </div>
+      </sc-if>
+
+      <!-- ===== TAB BAR ===== -->
+      <div style="position:absolute; bottom:0; left:0; right:0; z-index:8; display:flex; padding:6px 8px 24px; background:linear-gradient(180deg, rgba(20,19,15,0), rgba(20,19,15,.82) 40%);">
+        <div style="flex:1; text-align:center; color:rgba(255,255,255,.6);"><div style="font-size:19px;">💬</div><div style="font:500 10px 'Public Sans';">Chat</div></div>
+        <div style="flex:1; text-align:center; color:rgba(255,255,255,.6);"><div style="font-size:19px;">⚖</div><div style="font:500 10px 'Public Sans';">Assembly</div></div>
+        <div style="flex:1; text-align:center; color:#fff;"><div style="font-size:19px;">🎞</div><div style="font:600 10px 'Public Sans';">Vines</div></div>
+        <div style="flex:1; text-align:center; color:rgba(255,255,255,.6);"><div style="font-size:19px;">👤</div><div style="font:500 10px 'Public Sans';">You</div></div>
+      </div>
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#fff; opacity:.5; z-index:9;"></div>
+
+      <!-- ===== TUNE SHEET ===== -->
+      <sc-if value="{{ tuneOpen }}" hint-placeholder-val="{{ false }}">
+        <div onClick="{{ closeTune }}" style="position:absolute; inset:0; background:rgba(10,9,7,.5); z-index:11;"></div>
+        <div style="position:absolute; left:0; right:0; bottom:0; z-index:12; background:#fbf9f4; border-radius:24px 24px 0 0; padding:10px 18px 26px; box-shadow:0 -10px 40px rgba(0,0,0,.4); animation:hSheet .26s ease; max-height:640px; overflow-y:auto;">
+          <div style="width:40px; height:5px; border-radius:3px; background:#d8d1c1; margin:4px auto 14px;"></div>
+          <div style="font:500 20px 'Newsreader',serif; color:#20241c;">Tune your Discover</div>
+          <div style="font:400 12.5px/1.5 'Public Sans'; color:#767a6c; margin-top:3px;">Discover is built only from people <em>your follows</em> follow — no algorithm. Mute anyone whose follows you'd rather not see propagate. We stop at 3rd degree.</div>
+          <!-- graph legend -->
+          <div style="margin-top:14px; display:flex; align-items:center; gap:8px; font:500 11px 'IBM Plex Mono'; color:#8a8472;"><span style="width:24px; height:24px; border-radius:50%; background:#466b4c; color:#fff; display:flex; align-items:center; justify-content:center; font:600 9px 'Public Sans';">you</span>→ direct (Following) → 2nd → 3rd</div>
+          <div style="margin-top:14px; font:600 10.5px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#a39e8e;">Your follows · propagation</div>
+          <div style="margin-top:10px; display:flex; flex-direction:column; gap:9px;">
+            <sc-for list="{{ sources }}" as="s" hint-placeholder-count="4">
+              <div style="display:flex; align-items:center; gap:11px; background:#fff; border:1px solid #e3ddcf; border-radius:11px; padding:11px 13px;">
+                <span style="{{ s.avatar }}">{{ s.initials }}</span>
+                <div style="flex:1; line-height:1.25;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">{{ s.name }}</div><div style="font:400 11px 'Public Sans'; color:#767a6c;">{{ s.statusText }}</div></div>
+                <span onClick="{{ s.toggle }}" style="{{ s.switchTrack }}"><span style="{{ s.switchKnob }}"></span></span>
+              </div>
+            </sc-for>
+          </div>
+          <button onClick="{{ closeTune }}" style="width:100%; margin-top:16px; padding:13px; border:none; border-radius:10px; background:#466b4c; color:#fff; font:600 13.5px 'Public Sans'; cursor:pointer;">Done · {{ discoverCount }} vines in Discover</button>
+        </div>
+      </sc-if>
+
+      <!-- TOAST -->
+      <sc-if value="{{ toast }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute; bottom:120px; left:50%; z-index:14; background:#20241c; color:#f4f1ea; font:600 12.5px 'Public Sans'; padding:11px 18px; border-radius:22px; box-shadow:0 8px 24px rgba(0,0,0,.4); animation:hToast 2.1s ease forwards; white-space:nowrap;">{{ toast }}</div>
+      </sc-if>
+
+    </div>
+  </div>
+  <div style="font:400 12px 'Public Sans'; color:#8a8472; text-align:center; max-width:480px;">Auto-play uses the card snapped to center. Discover provenance shows the exact path — "via Mara, who follows @kit." Toggle a degree off, or mute a follow in Tune, and the feed recomputes live.</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = {
+    tab: 'following',
+    playingId: null,
+    deg2: true,
+    deg3: true,
+    muted: {},          // sourceId -> true (muted from propagating)
+    tuneOpen: false,
+    toast: null,
+    likes: {},          // id -> liked bool
+    appendCount: 0,     // how many extra cycles appended (endless)
+  };
+
+  // direct follows (your graph) — also the Discover "sources"
+  follows = [
+    { id: 'mara',  name: 'Mara Okafor', handle: '@mara',  initials: 'MO', color: '#7a6a52' },
+    { id: 'devin', name: 'Devin Ross',  handle: '@devin', initials: 'DR', color: '#5a6a72' },
+    { id: 'priya', name: 'Priya Nair',  handle: '@priya', initials: 'PN', color: '#6a5a72' },
+    { id: 'sam',   name: 'Sam Cole',    handle: '@sam',   initials: 'SC', color: '#4a6a5a' },
+  ];
+
+  grads = [
+    'linear-gradient(160deg,#3a5a48,#1f2b24)',
+    'linear-gradient(160deg,#5a4a6a,#241f2e)',
+    'linear-gradient(160deg,#6a5a3a,#2e2619)',
+    'linear-gradient(160deg,#3a4a6a,#1f2632)',
+    'linear-gradient(160deg,#6a3a4a,#2e1f24)',
+    'linear-gradient(160deg,#3a6a5a,#1f2e28)',
+  ];
+
+  // base following feed (vines from your direct follows)
+  followingBase = [
+    { id: 'f1', who: 'mara',  caption: 'First frost on the community greenhouse 🌿', dur: '0:06', likes: 24, reshares: 5, g: 0 },
+    { id: 'f2', who: 'priya', caption: '6 seconds of pure bread-rising satisfaction', dur: '0:06', likes: 56, reshares: 12, g: 2 },
+    { id: 'f3', who: 'devin', caption: 'the recycling truck did a little drift today', dur: '0:05', likes: 18, reshares: 3, g: 3 },
+    { id: 'f4', who: 'sam',   caption: 'tomato seedlings, day 9 ⏱', dur: '0:06', likes: 41, reshares: 7, g: 5 },
+    { id: 'f5', who: 'mara',  caption: 'rain on the workshop skylight', dur: '0:04', likes: 33, reshares: 6, g: 1 },
+  ];
+
+  // discover pool — each reached THROUGH a direct follow (sourceId), at a degree.
+  // 2nd degree: someone your follow follows. 3rd: a follow-of-a-follow-of-a-follow.
+  discoverBase = [
+    { id: 'd1', creator: '@kit',    sourceId: 'mara',  degree: 2, via: 'Mara follows @kit',                    caption: 'the cat decided the keyboard was hers now', dur: '0:05', likes: 88, reshares: 41, g: 1 },
+    { id: 'd2', creator: '@lena',   sourceId: 'priya', degree: 2, via: 'Priya follows @lena',                  caption: 'kiln opening — the glaze worked!! 🔥', dur: '0:06', likes: 64, reshares: 9, g: 2 },
+    { id: 'd3', creator: '@ravi',   sourceId: 'devin', degree: 2, via: 'Devin follows @ravi',                  caption: 'bike repair stand, finally level', dur: '0:06', likes: 27, reshares: 4, g: 3 },
+    { id: 'd4', creator: '@nour',   sourceId: 'mara',  degree: 3, via: 'Mara → @kit → @nour',                  caption: 'street musician caught the perfect loop', dur: '0:06', likes: 132, reshares: 58, g: 4 },
+    { id: 'd5', creator: '@iris',   sourceId: 'priya', degree: 3, via: 'Priya → @lena → @iris',                caption: 'sourdough scoring, satisfying edition', dur: '0:05', likes: 71, reshares: 15, g: 5 },
+    { id: 'd6', creator: '@theo',   sourceId: 'sam',   degree: 2, via: 'Sam follows @theo',                    caption: 'community fridge restock run 🥕', dur: '0:06', likes: 45, reshares: 11, g: 0 },
+    { id: 'd7', creator: '@ada',    sourceId: 'devin', degree: 3, via: 'Devin → @ravi → @ada',                 caption: 'solar panel angle test, golden hour', dur: '0:06', likes: 39, reshares: 8, g: 1 },
+  ];
+
+  showToast(m) { clearTimeout(this._t); this.setState({ toast: m }); this._t = setTimeout(() => this.setState({ toast: null }), 2000); }
+  componentWillUnmount() { clearTimeout(this._t); cancelAnimationFrame(this._raf); const s = document.getElementById('vscroller'); if (s && this._onScroll) s.removeEventListener('scroll', this._onScroll); }
+
+  componentDidMount() {
+    const scroller = document.getElementById('vscroller');
+    if (!scroller) return;
+    this._scroller = scroller;
+    this._onScroll = () => {
+      if (this._raf) return;
+      this._raf = requestAnimationFrame(() => {
+        this._raf = null;
+        this.updatePlaying();
+        this.maybeAppend();
+      });
+    };
+    scroller.addEventListener('scroll', this._onScroll, { passive: true });
+    // initial play state
+    requestAnimationFrame(() => this.updatePlaying());
+  }
+  componentDidUpdate(prevProps, prevState) {
+    if (prevState.tab !== this.state.tab) {
+      if (this._scroller) this._scroller.scrollTop = 0;
+      requestAnimationFrame(() => this.updatePlaying());
+    }
+  }
+
+  updatePlaying() {
+    const s = this._scroller; if (!s) return;
+    const mid = s.scrollTop + s.clientHeight / 2;
+    const cards = s.querySelectorAll('[data-vine]');
+    let bestId = null, bestDist = Infinity;
+    cards.forEach((c) => {
+      const center = c.offsetTop + c.offsetHeight / 2;
+      const d = Math.abs(center - mid);
+      if (d < bestDist) { bestDist = d; bestId = c.getAttribute('data-vine'); }
+    });
+    if (bestId && bestId !== this.state.playingId) this.setState({ playingId: bestId });
+  }
+  maybeAppend() {
+    const s = this._scroller; if (!s) return;
+    if (s.scrollTop + s.clientHeight > s.scrollHeight - s.clientHeight * 1.5) {
+      this.setState((st) => ({ appendCount: st.appendCount + 1 }));
+    }
+  }
+
+  followById(id) { return this.follows.find((f) => f.id === id); }
+
+  buildFollowing() {
+    const out = [];
+    const cycles = this.state.appendCount + 1;
+    for (let c = 0; c < cycles; c++) {
+      this.followingBase.forEach((v) => {
+        const f = this.followById(v.who);
+        out.push({ uid: v.id + '_' + c, base: v.id, kind: 'following', handle: f.handle, color: f.color, caption: v.caption, dur: v.dur, likes: v.likes, reshares: v.reshares, g: v.g });
+      });
+    }
+    return out;
+  }
+  buildDiscover() {
+    const { deg2, deg3, muted } = this.state;
+    const pool = this.discoverBase.filter((v) =>
+      !muted[v.sourceId] && ((v.degree === 2 && deg2) || (v.degree === 3 && deg3))
+    );
+    const out = [];
+    const cycles = this.state.appendCount + 1;
+    for (let c = 0; c < cycles; c++) {
+      pool.forEach((v) => {
+        out.push({ uid: v.id + '_' + c, base: v.id, kind: 'discover', handle: v.creator, color: this.colorFor(v.creator), caption: v.caption, dur: v.dur, likes: v.likes, reshares: v.reshares, g: v.g, degree: v.degree, via: v.via });
+      });
+    }
+    return out;
+  }
+  colorFor(handle) { const palette = ['#5a7d8a', '#8a7a5a', '#7a5a6a', '#5a8a6a', '#8a5a5a']; let h = 0; for (const ch of handle) h = (h + ch.charCodeAt(0)) % palette.length; return palette[h]; }
+
+  decorate(v) {
+    const playing = v.uid === this.state.playingId;
+    const liked = !!this.state.likes[v.uid];
+    const bg = this.grads[v.g % this.grads.length];
+    return {
+      id: v.uid, handle: v.handle, caption: v.caption, dur: v.dur,
+      likes: v.likes + (liked ? 1 : 0), reshares: v.reshares,
+      paused: !playing,
+      isDiscover: v.kind === 'discover',
+      degreeLabel: v.degree === 3 ? '3rd' : '2nd',
+      degreeChip: { font: "600 9.5px 'IBM Plex Mono'", color: '#fff', background: v.degree === 3 ? 'rgba(185,116,44,.85)' : 'rgba(70,107,76,.9)', padding: '3px 8px', borderRadius: '20px', flexShrink: 0 },
+      provenance: v.via || '',
+      cardStyle: { position: 'relative', width: '390px', height: '820px', overflow: 'hidden', background: '#15140f' },
+      bgStyle: { position: 'absolute', inset: '0', background: bg, transformOrigin: 'center', animation: playing ? 'panbg 6s ease-in-out infinite alternate' : 'none', transform: playing ? '' : 'scale(1.08)', filter: playing ? 'none' : 'brightness(.82)' },
+      ringStyle: { height: '100%', background: '#7fa886', width: playing ? '0' : '0', animation: playing ? 'loopfill 6s linear infinite' : 'none' },
+      avatarStyle: { width: '34px', height: '34px', borderRadius: '50%', background: v.color, border: '2px solid #fff', flexShrink: 0, display: 'inline-block' },
+      likeGlyph: liked ? '♥' : '♡',
+      likeBtn: { width: '50px', height: '50px', borderRadius: '50%', background: liked ? 'rgba(177,64,47,.9)' : 'rgba(255,255,255,.18)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', color: '#fff' },
+      like: () => this.setState((st) => ({ likes: { ...st.likes, [v.uid]: !st.likes[v.uid] } })),
+    };
+  }
+
+  renderVals() {
+    const isDiscover = this.state.tab === 'discover';
+    const raw = isDiscover ? this.buildDiscover() : this.buildFollowing();
+    const feed = raw.map((v) => this.decorate(v));
+    const discoverCount = new Set(this.discoverBase.filter((v) => !this.state.muted[v.sourceId] && ((v.degree === 2 && this.state.deg2) || (v.degree === 3 && this.state.deg3))).map((v) => v.id)).size;
+
+    const tabBase = (active) => ({ font: "600 14px 'Public Sans'", color: active ? '#fff' : 'rgba(255,255,255,.55)', borderBottom: active ? '2px solid #fff' : '2px solid transparent', paddingBottom: '3px', cursor: 'pointer' });
+    const degChip = (on) => ({ font: "600 11px 'Public Sans'", color: on ? '#15140f' : '#fff', background: on ? 'rgba(255,255,255,.92)' : 'rgba(20,19,15,.5)', backdropFilter: 'blur(6px)', border: '1px solid rgba(255,255,255,.18)', padding: '6px 12px', borderRadius: '20px', cursor: 'pointer' });
+
+    const sources = this.follows.map((f) => {
+      const on = !this.state.muted[f.id];
+      const reached = this.discoverBase.filter((v) => v.sourceId === f.id);
+      return {
+        id: f.id, name: f.name, initials: f.initials,
+        avatar: { width: '36px', height: '36px', borderRadius: '50%', background: f.color, color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', font: "600 12px 'Public Sans'", flexShrink: 0 },
+        statusText: on ? ('brings ' + reached.length + ' vines into Discover') : 'muted — their follows are hidden',
+        switchTrack: { width: '40px', height: '23px', borderRadius: '20px', background: on ? '#466b4c' : '#d8d1c1', position: 'relative', flexShrink: 0, cursor: 'pointer', transition: 'background .15s' },
+        switchKnob: { position: 'absolute', top: '2px', left: on ? '19px' : '2px', width: '19px', height: '19px', borderRadius: '50%', background: '#fff', transition: 'left .15s', boxShadow: '0 1px 3px rgba(0,0,0,.25)' },
+        toggle: () => this.setState((st) => { const m = { ...st.muted }; if (m[f.id]) delete m[f.id]; else m[f.id] = true; return { muted: m }; }),
+      };
+    });
+
+    return {
+      feed, isDiscover,
+      followingTab: tabBase(!isDiscover),
+      discoverTab: tabBase(isDiscover),
+      showFollowing: () => { if (this.state.tab !== 'following') { this.setState({ tab: 'following', appendCount: 0 }); this.showToast('Following · your direct graph'); } },
+      showDiscover: () => { if (this.state.tab !== 'discover') { this.setState({ tab: 'discover', appendCount: 0 }); this.showToast('Discover · 2nd & 3rd degree'); } },
+      chip2: degChip(this.state.deg2),
+      chip3: degChip(this.state.deg3),
+      toggle2: () => this.setState((st) => ({ deg2: !st.deg2, appendCount: 0 })),
+      toggle3: () => this.setState((st) => ({ deg3: !st.deg3, appendCount: 0 })),
+      openTune: () => this.setState({ tuneOpen: true }),
+      closeTune: () => this.setState({ tuneOpen: false }),
+      tuneOpen: this.state.tuneOpen,
+      sources, discoverCount,
+      toast: this.state.toast,
+    };
+  }
+}
+</script>
+</body>
+</html>
