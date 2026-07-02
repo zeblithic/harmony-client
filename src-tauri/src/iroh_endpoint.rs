@@ -24,8 +24,9 @@
 //! - `iroh::NodeId` is renamed to `iroh::EndpointId` (a type alias for
 //!   `iroh::PublicKey`).
 //! - `Endpoint::builder` takes a `Preset` argument; we use
-//!   `iroh::endpoint::presets::N0` for production (n0's relay + STUN
-//!   defaults).
+//!   `iroh::endpoint::presets::N0` for production (n0's STUN/discovery
+//!   defaults; the preset's canary relay map is overridden by the
+//!   ZEB-617 stable-relay pin).
 //! - `RelayMode::Disabled` is reached via `.relay_mode(RelayMode::Disabled)`
 //!   on the builder — used only by hermetic tests.
 //! - The endpoint accessor for the local id is `.id()`, not `.node_id()`.
@@ -392,7 +393,7 @@ mod tests {
 
     /// Lifecycle smoke test against an ephemeral secret with relays
     /// disabled — keeps the test hermetic. Production callers
-    /// (`new_with_secret`) keep n0's default relay behavior.
+    /// (`new_with_secret`) pin the n0 STABLE relay cluster (ZEB-617).
     #[tokio::test]
     async fn iroh_endpoint_inits_with_ephemeral_secret() {
         let secret = SecretKey::generate();
