@@ -55,6 +55,13 @@
   --vote-abstain:  #cdc6b4;
   --tally-track:   #eadfc8;   /* the empty bar behind a tally                 */
 
+  /* Added during Track A (ZEB-604), beyond the original export: the codebase
+     defines these in app.css, so the flip needs Commons values for them. */
+  --overlay: rgba(32, 27, 15, 0.45); /* warm modal scrim                     */
+  --info:    #4a6fa5;                /* civic navy-blue informational accent */
+  --success: #466b4c;                /* = consensus green                    */
+  --warning: #b9742c;                /* = governance clay                    */
+
   --status-drafting-fg: #5a5345; --status-drafting-bg: #e6e0d0;
   --status-open-fg:     #5a4321; --status-open-bg:     #f1e2cc;
   --status-passed-fg:   #ffffff; --status-passed-bg:   #466b4c;
@@ -118,6 +125,12 @@
   --vote-against:  #d98377;
   --vote-abstain:  #4a4639;
   --tally-track:   #322a1f;
+
+  /* ZEB-604 additions (see light block) */
+  --overlay: rgba(0, 0, 0, 0.55);
+  --info:    #8ab0d8;
+  --success: #7fa886;
+  --warning: #d39450;
 
   --status-drafting-fg: #c4bdab; --status-drafting-bg: #322e27;
   --status-open-fg:     #e2b888; --status-open-bg:     #3a2f1f;

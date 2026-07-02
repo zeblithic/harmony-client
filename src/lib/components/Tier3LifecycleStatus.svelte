@@ -77,6 +77,6 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    color: var(--success, #4ad97a);
+    color: #4ad97a;
   }
 </style>

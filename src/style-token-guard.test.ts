@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /**
  * Style-token ratchet guard (ZEB-604).
@@ -23,12 +24,20 @@ import { join } from 'node:path';
  * under ZEB-611 where they are load-bearing).
  */
 
-const SRC_ROOT = join(process.cwd(), 'src');
+// Anchored to this file's own location so the guard works regardless of the
+// directory vitest is invoked from.
+const SRC_ROOT = dirname(fileURLToPath(import.meta.url));
 const ALLOWLIST_PATH = join(SRC_ROOT, 'style-token-allowlist.json');
 
 const STYLE_BLOCK = /<style[^>]*>([\s\S]*?)<\/style>/g;
 const CSS_COMMENT = /\/\*[\s\S]*?\*\//g;
-const COLOR_LITERAL = /#[0-9a-f]{3,8}\b|\b(?:rgb|rgba|hsl|hsla)\(/gi;
+// Hex, color functions (legacy + modern), and common named colors in value
+// position. `transparent`/`currentcolor` are deliberately not counted — they
+// are compositional keywords, not themeable colors. Named-color matching
+// requires a value-ish left boundary so selectors like `.text-red` and
+// properties like `white-space` don't false-positive.
+const COLOR_LITERAL =
+  /#[0-9a-f]{3,8}\b|\b(?:rgb|rgba|hsl|hsla|oklch|oklab|lab|lch|hwb|color-mix)\(|(?<=[:\s,(])(?:white|black|red|green|blue|yellow|orange|purple|pink|(?:dark|light)?gr[ae]y)(?=[\s;,)}!])/gi;
 
 function svelteFiles(dir: string): string[] {
   const out: string[] = [];

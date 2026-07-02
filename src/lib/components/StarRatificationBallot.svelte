@@ -215,7 +215,7 @@
     cursor: pointer;
   }
   .ballot-footer button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .success { color: var(--success, #4ad97a); font-size: 0.85rem; }
+  .success { color: #4ad97a; font-size: 0.85rem; }
   .error { color: #d93838; }
   .confirm-modal {
     position: fixed;

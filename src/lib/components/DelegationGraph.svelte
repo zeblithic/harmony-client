@@ -309,7 +309,7 @@
     stroke-width: 1;
   }
   .dg-node-local {
-    fill: var(--warning, #facc15);
+    fill: #facc15;
     stroke-width: 2;
   }
   .dg-edge {

@@ -692,7 +692,7 @@
     margin-right: 0.4rem;
     font-weight: 500;
   }
-  .badge.winner { background: var(--success-bg, rgba(74, 217, 122, 0.15)); color: var(--success, #4ad97a); }
+  .badge.winner { background: var(--success-bg, rgba(74, 217, 122, 0.15)); color: #4ad97a; }
   .badge.runner-up { background: rgba(74, 158, 255, 0.15); color: var(--accent, #4a9eff); }
   .finalists { margin-top: 0.5rem; color: #8a8c95; font-size: 0.85rem; }
   .finalists ol { margin: 0.25rem 0; padding-left: 1.25rem; }
