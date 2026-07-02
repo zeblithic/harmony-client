@@ -257,8 +257,8 @@
     height: 100vh;
     display: flex;
     flex-direction: column;
-    background: var(--bg-primary, #1e1f22);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-primary);
+    color: var(--text-primary);
     overflow: hidden;
   }
 

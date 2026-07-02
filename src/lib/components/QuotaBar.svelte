@@ -32,8 +32,8 @@
     flex-direction: column;
     gap: 4px;
     padding: 8px 12px;
-    background: var(--bg-secondary, #2b2d31);
-    border-top: 1px solid var(--border, #3f4147);
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
     cursor: pointer;
     width: 100%;
     text-align: left;
@@ -45,24 +45,24 @@
   }
 
   .quota-bar:hover {
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
   }
 
   .quota-bar:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 
   .quota-track {
     height: 6px;
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
     border-radius: 3px;
     overflow: hidden;
   }
 
   .quota-fill {
     height: 100%;
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     border-radius: 3px;
     transition: width 0.3s;
   }
@@ -73,6 +73,6 @@
 
   .quota-text {
     font-size: 0.75rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 </style>

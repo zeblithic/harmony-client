@@ -209,6 +209,6 @@
   .confirm-btn { background: var(--accent); color: var(--text-primary); }
   .confirm-btn:disabled, .cancel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .cancel-btn:focus-visible, .confirm-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2); outline-offset: 1px;
+    outline: 2px solid var(--accent); outline-offset: 1px;
   }
 </style>

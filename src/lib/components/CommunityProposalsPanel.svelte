@@ -334,7 +334,7 @@
     resize: vertical;
   }
   .np-text:focus {
-    outline: 1px solid var(--accent, #4ade80);
+    outline: 1px solid var(--accent);
     outline-offset: 1px;
   }
   .np-actions {
@@ -349,9 +349,9 @@
   }
   .np-submit {
     padding: 6px 16px;
-    border: 1px solid var(--accent, #4ade80);
+    border: 1px solid var(--accent);
     border-radius: 4px;
-    background: var(--accent, #4ade80);
+    background: var(--accent);
     color: var(--bg-primary);
     font: inherit;
     cursor: pointer;
@@ -361,7 +361,7 @@
     opacity: 0.5;
   }
   .np-error {
-    color: var(--danger, #f87171);
+    color: var(--danger);
     font-size: 0.85rem;
     margin: 4px 0 0;
   }
@@ -377,7 +377,7 @@
     margin: 0;
   }
   .cp-error {
-    color: var(--danger, #f87171);
+    color: var(--danger);
     font-size: 0.9rem;
     margin: 0;
   }

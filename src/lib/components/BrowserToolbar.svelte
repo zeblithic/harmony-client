@@ -96,8 +96,8 @@
     align-items: center;
     gap: 8px;
     padding: 8px 12px;
-    background: var(--bg-secondary, #2b2d31);
-    border-bottom: 1px solid var(--border, #3f4147);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
   }
 
   .toolbar-left {
@@ -110,22 +110,22 @@
     padding: 4px 10px;
     font: inherit;
     font-size: 0.85rem;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     background: transparent;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     cursor: pointer;
     border-radius: 4px;
   }
 
   .section-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
   .section-btn.active {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    color: var(--text-primary);
+    border-color: var(--accent);
   }
 
   .search-input {
@@ -134,19 +134,19 @@
     padding: 4px 8px;
     font: inherit;
     font-size: 0.85rem;
-    background: var(--bg-tertiary, #232428);
-    color: var(--text-primary, #f2f3f5);
-    border: 1px solid var(--border, #3f4147);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
     border-radius: 4px;
     outline: none;
   }
 
   .search-input::placeholder {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .search-input:focus {
-    border-color: var(--accent, #5865f2);
+    border-color: var(--accent);
   }
 
   .search-spacer {
@@ -164,47 +164,47 @@
     padding: 4px 8px;
     font: inherit;
     font-size: 0.85rem;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     background: transparent;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     cursor: pointer;
     border-radius: 4px;
   }
 
   .view-btn[aria-pressed='true'] {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    color: var(--text-primary);
+    border-color: var(--accent);
   }
 
   .action-btn {
     padding: 4px 10px;
     font: inherit;
     font-size: 0.85rem;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     background: transparent;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     cursor: pointer;
     border-radius: 4px;
   }
 
   .action-btn:hover {
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
   }
 
   .action-btn.active {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    color: var(--text-primary);
+    border-color: var(--accent);
   }
 
   .action-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
   .view-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

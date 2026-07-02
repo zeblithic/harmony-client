@@ -35,11 +35,11 @@
 
   .folder-load-error-icon {
     font-size: 2rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .folder-load-error-title {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.9rem;
   }
 
@@ -47,7 +47,7 @@
     margin: 0;
     max-width: 480px;
     overflow-wrap: anywhere;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-size: 0.85rem;
   }
 
@@ -56,19 +56,19 @@
     padding: 4px 10px;
     font: inherit;
     font-size: 0.85rem;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     background: transparent;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     cursor: pointer;
     border-radius: 4px;
   }
 
   .folder-load-error-retry:hover {
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
   }
 
   .folder-load-error-retry:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

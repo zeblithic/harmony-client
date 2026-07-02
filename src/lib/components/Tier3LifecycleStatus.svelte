@@ -65,9 +65,9 @@
     color: #8a8c95;
   }
   .stage-chip.current {
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
-    border-color: var(--accent, #4a9eff);
+    border-color: var(--accent);
   }
   .failed-badge {
     color: #d93838;

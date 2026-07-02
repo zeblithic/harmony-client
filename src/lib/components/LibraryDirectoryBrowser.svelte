@@ -522,7 +522,7 @@
     font-size: 0.8rem;
   }
   .remove-error { color: #d83c3e; font-size: 0.8rem; margin: 0 0 8px; }
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+  .modal-overlay { position: fixed; inset: 0; background: var(--overlay); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .modal-content { background: var(--bg-secondary); border-radius: 6px; }
   .primary { background: rgba(120,140,200,0.4); padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
 

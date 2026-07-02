@@ -226,7 +226,7 @@
   .cleanup-title {
     margin: 0;
     font-size: 1rem;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-weight: 600;
   }
 
@@ -235,7 +235,7 @@
     align-items: center;
     gap: 6px;
     font-size: 0.8rem;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     cursor: pointer;
   }
 
@@ -251,15 +251,15 @@
     justify-content: space-between;
     gap: 12px;
     padding: 10px 14px;
-    background: color-mix(in srgb, var(--accent, #5865f2) 10%, var(--bg-secondary, #2b2d31));
-    border: 1px solid var(--accent, #5865f2);
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
+    border: 1px solid var(--accent);
     border-radius: 8px;
     flex-wrap: wrap;
   }
 
   .bulk-summary {
     font-size: 0.85rem;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-weight: 500;
   }
 
@@ -271,18 +271,18 @@
 
   .bulk-btn {
     padding: 6px 12px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-tertiary, #232428);
-    color: var(--text-secondary, #b5bac1);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
     font-size: 0.8rem;
     cursor: pointer;
     font: inherit;
   }
 
   .bulk-btn:hover {
-    background: var(--bg-primary, #313338);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-primary);
+    color: var(--text-primary);
   }
 
   .bulk-btn.burn:hover {
@@ -303,7 +303,7 @@
 
   .empty-message {
     text-align: center;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.9rem;
     padding: 32px 16px;
     margin: 0;

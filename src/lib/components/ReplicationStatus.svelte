@@ -76,7 +76,7 @@
 
   .replica-label {
     font-size: 0.8rem;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
   }
 
   .replication-warning {
@@ -89,15 +89,15 @@
   .tier-select {
     padding: 4px 8px;
     border-radius: 4px;
-    border: 1px solid var(--border, #3f4147);
-    background: var(--bg-tertiary, #232428);
-    color: var(--text-primary, #f2f3f5);
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     font-size: 0.85rem;
     cursor: pointer;
   }
 
   .tier-select:focus {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

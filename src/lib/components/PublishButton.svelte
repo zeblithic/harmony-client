@@ -173,17 +173,17 @@
   }
 
   .publish-btn {
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     color: #ffffff;
   }
 
   .publish-btn:hover {
-    background: var(--accent-hover, #4752c4);
+    background: var(--accent-hover);
   }
 
   .release-btn {
-    background: var(--bg-tertiary, #232428);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
   }
 
   .release-btn:hover {
@@ -192,7 +192,7 @@
 
   .publish-btn:focus-visible,
   .release-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

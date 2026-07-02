@@ -3722,7 +3722,7 @@
     align-items: center;
     justify-content: center;
     height: 100%;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   /* ── DM creation: nav sidebar wrapper + button + modal ────────────── */
@@ -3747,9 +3747,9 @@
     width: 100%;
     padding: 8px 12px;
     background: rgba(120, 140, 200, 0.15);
-    color: var(--text-primary, #e8eaed);
+    color: var(--text-primary);
     border: none;
-    border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+    border-top: 1px solid var(--border);
     cursor: pointer;
     font-size: 13px;
     text-align: center;
@@ -3760,14 +3760,14 @@
   .modal-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 100;
   }
   .modal-content {
-    background: var(--bg-secondary, #222);
+    background: var(--bg-secondary);
     border-radius: 8px;
     box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
   }
@@ -3790,11 +3790,11 @@
     bottom: 20px;
     left: 50%;
     transform: translateX(-50%);
-    background: var(--bg-tertiary, #2a2a2a);
-    border: 1px solid var(--border, #444);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
     border-radius: 6px;
     padding: 10px 18px;
-    color: var(--text-primary, #fff);
+    color: var(--text-primary);
     font-size: 0.875rem;
     z-index: 1000;
     pointer-events: none;
@@ -3823,7 +3823,7 @@
 
   /* ZEB-338 / PR #169: startup-error overlay (start_node failed). */
   .startup-error-modal {
-    color: var(--text-primary, #fff);
+    color: var(--text-primary);
     padding: 1.5rem;
     max-width: 520px;
     width: 90%;
@@ -3837,7 +3837,7 @@
     line-height: 1.5;
   }
   .startup-error-modal .error {
-    color: var(--danger, #d9534f);
+    color: var(--danger);
     font-family: var(--font-mono, monospace);
     font-size: 0.85rem;
     word-break: break-word;
@@ -3849,15 +3849,15 @@
   }
   .startup-error-actions button {
     padding: 0.5rem 1rem;
-    border: 1px solid var(--border, #444);
-    background: var(--bg-tertiary, #1f1f1f);
-    color: var(--text-primary, #fff);
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     border-radius: 4px;
     cursor: pointer;
   }
   .startup-error-actions button.primary {
-    background: var(--accent, #5865f2);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    border-color: var(--accent);
   }
 
 </style>

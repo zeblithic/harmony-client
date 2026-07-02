@@ -75,7 +75,7 @@
     font: inherit;
     color: inherit;
     background: transparent;
-    border: 1px solid var(--accent, #5865f2);
+    border: 1px solid var(--accent);
     border-radius: 3px;
     padding: 2px 4px;
   }
@@ -83,6 +83,6 @@
   .file-row-error {
     padding: 2px 12px 6px 48px;
     font-size: 0.8rem;
-    color: var(--danger, #f23f42);
+    color: var(--danger);
   }
 </style>

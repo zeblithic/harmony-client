@@ -227,15 +227,15 @@
   .modal-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 1000;
   }
   .modal-content {
-    background: var(--bg-secondary, #2a2a2a);
-    color: var(--text-primary, #fff);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
     padding: 1.5rem;
     border-radius: 8px;
     max-width: 640px;
@@ -256,9 +256,9 @@
     width: 100%;
     box-sizing: border-box;
     padding: 0.5rem;
-    background: var(--bg-primary, #111);
-    color: var(--text-primary, #fff);
-    border: 1px solid var(--border, #444);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
     border-radius: 4px;
     font-family: monospace;
     font-size: 0.85rem;
@@ -272,8 +272,8 @@
     font-size: 0.9rem;
   }
   .diagnostics-preview {
-    background: var(--bg-primary, #111);
-    color: var(--text-primary, #fff);
+    background: var(--bg-primary);
+    color: var(--text-primary);
     padding: 0.75rem;
     border-radius: 4px;
     max-height: 240px;
@@ -288,11 +288,11 @@
   }
   .loading {
     font-size: 0.85rem;
-    color: var(--text-secondary, #aaa);
+    color: var(--text-secondary);
     margin: 0.5rem 0;
   }
   .toast {
-    background: var(--bg-tertiary, #1f1f1f);
+    background: var(--bg-tertiary);
     padding: 0.5rem 0.75rem;
     border-radius: 4px;
     margin-top: 0.5rem;
@@ -306,15 +306,15 @@
   }
   .actions button {
     padding: 0.5rem 1rem;
-    border: 1px solid var(--border, #444);
-    background: var(--bg-tertiary, #1f1f1f);
-    color: var(--text-primary, #fff);
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     border-radius: 4px;
     cursor: pointer;
   }
   .actions button.primary {
-    background: var(--accent, #5865f2);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    border-color: var(--accent);
   }
   .actions button:disabled {
     opacity: 0.5;

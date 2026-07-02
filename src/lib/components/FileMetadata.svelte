@@ -71,7 +71,7 @@
     margin: 0;
     font-size: 1rem;
     font-weight: 600;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     word-break: break-word;
   }
 
@@ -83,11 +83,11 @@
   }
 
   .metadata-label {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
   }
 
   .metadata-value {
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     text-transform: capitalize;
   }
 </style>

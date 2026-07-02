@@ -157,7 +157,7 @@
   }
   .lineage-ancestor,
   .lineage-descendant {
-    color: var(--text-muted, #888);
+    color: var(--text-muted);
   }
   .lineage-clickable {
     background: none;
@@ -175,12 +175,12 @@
     cursor: default;
   }
   .lineage-empty-hint {
-    color: var(--text-muted, #999);
+    color: var(--text-muted);
     font-style: italic;
     padding-left: 1.5rem;
   }
   .lineage-truncation {
-    color: var(--text-muted, #888);
+    color: var(--text-muted);
     font-style: italic;
     padding-left: 0;
   }

@@ -180,7 +180,7 @@
   }
 
   .filter-section {
-    border-bottom: 1px solid var(--border, #3f4147);
+    border-bottom: 1px solid var(--border);
   }
 
   .filter-section:last-child {
@@ -195,7 +195,7 @@
     padding: 6px 8px;
     border: none;
     background: none;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     font-size: 0.75rem;
     font-weight: 600;
     text-transform: uppercase;
@@ -205,7 +205,7 @@
   }
 
   .section-header:hover {
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
   }
 
   .collapse-icon {
@@ -226,12 +226,12 @@
     align-items: center;
     gap: 6px;
     font-size: 0.8rem;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     cursor: pointer;
   }
 
   .filter-checkbox input[type="checkbox"] {
-    accent-color: var(--accent, #5865f2);
+    accent-color: var(--accent);
   }
 
   .status-buttons,
@@ -243,22 +243,22 @@
 
   .filter-btn {
     padding: 3px 8px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
     background: none;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     font-size: 0.75rem;
     cursor: pointer;
     white-space: nowrap;
   }
 
   .filter-btn:hover {
-    border-color: var(--text-muted, #949ba4);
+    border-color: var(--text-muted);
   }
 
   .filter-btn.active {
-    background: var(--accent, #5865f2);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    border-color: var(--accent);
     color: #fff;
   }
 </style>

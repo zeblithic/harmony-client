@@ -110,7 +110,7 @@
 
 <style>
   .title {
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-size: 1.1rem;
     margin: 0 0 16px;
   }
@@ -121,7 +121,7 @@
 
   .section {
     margin-bottom: 8px;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     font-size: 0.9rem;
   }
 
@@ -131,7 +131,7 @@
   }
 
   .section summary:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
@@ -152,7 +152,7 @@
   }
 
   .section .overflow {
-    color: var(--text-muted, #b5bac1);
+    color: var(--text-muted);
     font-style: italic;
     opacity: 0.85;
   }
@@ -164,9 +164,9 @@
   }
 
   .done-btn {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
-    border: 1px solid var(--border, transparent);
+    background: var(--accent);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
     padding: 6px 14px;
     border-radius: 4px;
     cursor: pointer;
@@ -174,7 +174,7 @@
   }
 
   .done-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

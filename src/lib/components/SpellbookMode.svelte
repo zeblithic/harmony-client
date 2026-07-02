@@ -151,8 +151,8 @@
     align-items: center;
     gap: 12px;
     padding: 8px 12px;
-    border-bottom: 1px solid var(--border, #3f4147);
-    background: var(--bg-secondary, #2b2d31);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
     flex-wrap: wrap;
   }
 
@@ -165,16 +165,16 @@
     padding: 6px 16px;
     border: none;
     border-radius: 4px;
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-muted, #949ba4);
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
     cursor: pointer;
     font-size: 0.8125rem;
     font-weight: 500;
   }
 
   .tab-btn.active {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--accent);
+    color: var(--text-primary);
   }
 
   .toolbar-controls {
@@ -186,10 +186,10 @@
 
   .level-selector select {
     padding: 4px 8px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     font-size: 0.8125rem;
   }
 
@@ -197,16 +197,16 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     font-size: 0.8125rem;
   }
 
   .express-selector select {
     padding: 4px 8px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     font-size: 0.8125rem;
   }
 

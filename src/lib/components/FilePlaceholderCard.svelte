@@ -61,7 +61,7 @@
     display: flex;
     flex-direction: column;
     min-width: 140px;
-    background: var(--bg-secondary, #2b2d31);
+    background: var(--bg-secondary);
     border-radius: 8px;
     padding: 8px;
     border: 2px solid transparent;
@@ -91,7 +91,7 @@
     font-size: 0.85rem;
     color: inherit;
     background: transparent;
-    border: 1px solid var(--accent, #5865f2);
+    border: 1px solid var(--accent);
     border-radius: 3px;
     padding: 2px 4px;
     min-width: 0;
@@ -101,6 +101,6 @@
 
   .file-card-error {
     font-size: 0.75rem;
-    color: var(--danger, #f23f42);
+    color: var(--danger);
   }
 </style>

@@ -203,8 +203,8 @@
 
 <style>
   .recommendation-card {
-    background: var(--bg-secondary, #2b2d31);
-    border: 1px solid var(--border, #3f4147);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px 16px;
     display: flex;
@@ -213,8 +213,8 @@
   }
 
   .recommendation-card.checked {
-    border-color: var(--accent, #5865f2);
-    background: color-mix(in srgb, var(--accent, #5865f2) 5%, var(--bg-secondary, #2b2d31));
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 5%, var(--bg-secondary));
   }
 
   .card-header {
@@ -241,14 +241,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-weight: 500;
   }
 
   .card-size {
     flex-shrink: 0;
     font-size: 0.8rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .card-meta {
@@ -287,12 +287,12 @@
   }
 
   .recoverable {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .staleness-bar-track {
     height: 4px;
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
     border-radius: 2px;
     overflow: hidden;
   }
@@ -307,7 +307,7 @@
   .suggestion {
     margin: 0;
     font-size: 0.78rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     line-height: 1.4;
     font-style: italic;
   }
@@ -320,18 +320,18 @@
 
   .action-btn {
     padding: 4px 10px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-tertiary, #232428);
-    color: var(--text-secondary, #b5bac1);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
     font-size: 0.78rem;
     cursor: pointer;
     font: inherit;
   }
 
   .action-btn:hover {
-    background: var(--bg-primary, #313338);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-primary);
+    color: var(--text-primary);
   }
 
   .action-btn.burn:hover {

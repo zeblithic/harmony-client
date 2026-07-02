@@ -504,7 +504,7 @@
   }
   .nav-empty-cta:hover { filter: brightness(1.1); }
   .nav-empty-cta:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
@@ -603,7 +603,7 @@
     flex-shrink: 0;
   }
   .fab-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .fab-popover {
@@ -615,7 +615,7 @@
     border-radius: 6px;
     padding: 4px;
     min-width: 200px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 4px 12px var(--overlay);
     z-index: 50;
     display: flex;
     flex-direction: column;

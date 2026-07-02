@@ -1225,7 +1225,7 @@
   }
   .author-btn:hover { text-decoration: underline; }
   .author-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
     border-radius: 2px;
   }
@@ -1233,19 +1233,19 @@
   .body { margin: 2px 0 0; color: var(--text-primary); white-space: pre-wrap; word-wrap: break-word; }
   /* ZEB-588: resolved @-mention chip; `.self` = a mention of the viewer. */
   .mention {
-    color: var(--accent, #5865f2);
-    background: color-mix(in srgb, var(--accent, #5865f2) 15%, transparent);
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
     border-radius: 3px;
     padding: 0 0.15rem;
     font-weight: 500;
   }
   .mention.self {
-    background: color-mix(in srgb, var(--accent, #5865f2) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
   }
   /* ZEB-588: subtle row highlight when the viewer is mentioned in a message. */
   .channel-message.mentions-me {
-    background: color-mix(in srgb, var(--accent, #5865f2) 8%, transparent);
-    border-left: 2px solid var(--accent, #5865f2);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-left: 2px solid var(--accent);
   }
   .reactions {
     display: flex;

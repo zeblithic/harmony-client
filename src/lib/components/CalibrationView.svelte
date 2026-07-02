@@ -353,16 +353,16 @@
 
   h2 {
     margin: 0 0 8px;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
   }
 
   .lead {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     line-height: 1.5;
   }
 
   .muted {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.8125rem;
     margin-top: 4px;
   }
@@ -372,26 +372,26 @@
   }
 
   .status {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.9375rem;
   }
 
   .progress-bar {
     width: 100%;
     height: 6px;
-    background: var(--bg-tertiary, #313338);
+    background: var(--bg-tertiary);
     border-radius: 3px;
     overflow: hidden;
   }
 
   .progress-fill {
     height: 100%;
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     transition: width 0.2s ease;
   }
 
   .counter {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.8125rem;
     margin: 0;
   }
@@ -407,17 +407,17 @@
   .syllable-name {
     font-size: 4rem;
     font-weight: 600;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
 
   .syllable-hint {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.875rem;
   }
 
   .instruction {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     text-align: center;
     margin: 0;
     min-height: 1.5em;
@@ -435,9 +435,9 @@
     width: 72px;
     height: 72px;
     border-radius: 50%;
-    border: 3px solid var(--accent, #5865f2);
+    border: 3px solid var(--accent);
     background: transparent;
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -447,8 +447,8 @@
   }
 
   .record-button.active {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--accent);
+    color: var(--text-primary);
     box-shadow: 0 0 20px rgba(88, 101, 242, 0.4);
   }
 
@@ -489,13 +489,13 @@
   }
 
   button.primary {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--accent);
+    color: var(--text-primary);
   }
 
   button.secondary {
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-secondary, #b5bac1);
-    border: 1px solid var(--border, #3f4147);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
   }
 </style>

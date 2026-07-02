@@ -159,7 +159,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }
 
@@ -173,14 +173,14 @@
     border: none;
     border-radius: 4px;
     background: transparent;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
     cursor: pointer;
     font-size: 0.8125rem;
   }
 
   .folder-tab.active {
     background: var(--surface-active, #2a2a2a);
-    color: var(--text-primary, #eee);
+    color: var(--text-primary);
   }
 
   .unread-badge {
@@ -189,7 +189,7 @@
     padding: 0 0.25rem;
     margin-left: 0.25rem;
     border-radius: 8px;
-    background: var(--accent, #5b8def);
+    background: var(--accent);
     color: white;
     font-size: 0.6875rem;
     text-align: center;
@@ -199,7 +199,7 @@
     padding: 0.375rem 0.75rem;
     border: none;
     border-radius: 4px;
-    background: var(--accent, #5b8def);
+    background: var(--accent);
     color: white;
     cursor: pointer;
     font-size: 0.8125rem;
@@ -213,7 +213,7 @@
   .empty-state {
     padding: 2rem;
     text-align: center;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
   }
 
   .mail-row {
@@ -224,9 +224,9 @@
     width: 100%;
     padding: 0.5rem 0.75rem;
     border: none;
-    border-bottom: 1px solid var(--border, #222);
+    border-bottom: 1px solid var(--border);
     background: transparent;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
     cursor: pointer;
     text-align: left;
     font-size: 0.8125rem;
@@ -241,7 +241,7 @@
   }
 
   .mail-row.unread {
-    color: var(--text-primary, #eee);
+    color: var(--text-primary);
     font-weight: 500;
   }
 
@@ -261,7 +261,7 @@
 
   .mail-time {
     font-size: 0.75rem;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
     white-space: nowrap;
   }
 
@@ -279,14 +279,14 @@
   .action-btn {
     border: none;
     background: transparent;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
     cursor: pointer;
     font-size: 1rem;
     padding: 0 0.25rem;
   }
 
   .action-btn:hover {
-    color: var(--text-primary, #eee);
+    color: var(--text-primary);
   }
 
   .sync-controls {
@@ -298,7 +298,7 @@
   .sync-spinner {
     display: inline-block;
     animation: mail-sync-spin 1.5s linear infinite;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
     font-size: 0.9rem;
   }
   @keyframes mail-sync-spin {
@@ -312,15 +312,15 @@
   }
   .sync-refresh-btn {
     background: transparent;
-    border: 1px solid var(--border, #333);
+    border: 1px solid var(--border);
     border-radius: 4px;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
     cursor: pointer;
     padding: 0.125rem 0.4rem;
     font-size: 0.8125rem;
   }
   .sync-refresh-btn:hover {
     background: var(--hover-bg, rgba(255, 255, 255, 0.05));
-    color: var(--text-primary, #ddd);
+    color: var(--text-primary);
   }
 </style>

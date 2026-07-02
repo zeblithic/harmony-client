@@ -73,7 +73,7 @@
   }
 
   .grid-row.active {
-    border-color: var(--accent, #5865f2);
+    border-color: var(--accent);
   }
 
   .grid-row.completed-perfect {

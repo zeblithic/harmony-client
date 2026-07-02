@@ -129,13 +129,13 @@
   .compose-header h3 {
     margin: 0;
     font-size: 1rem;
-    color: var(--text-primary, #eee);
+    color: var(--text-primary);
   }
 
   .cancel-btn {
     border: none;
     background: transparent;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
     cursor: pointer;
     font-size: 1.25rem;
     padding: 0.25rem;
@@ -156,24 +156,24 @@
 
   .field label {
     font-size: 0.75rem;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
 
   .field input, .field textarea {
     padding: 0.5rem 0.625rem;
-    border: 1px solid var(--border, #333);
+    border: 1px solid var(--border);
     border-radius: 4px;
     background: var(--surface, #1a1a1a);
-    color: var(--text-primary, #eee);
+    color: var(--text-primary);
     font-size: 0.875rem;
     font-family: inherit;
   }
 
   .field input:focus, .field textarea:focus {
     outline: none;
-    border-color: var(--accent, #5b8def);
+    border-color: var(--accent);
   }
 
   .body-field {
@@ -201,7 +201,7 @@
     padding: 0.5rem 1.5rem;
     border: none;
     border-radius: 4px;
-    background: var(--accent, #5b8def);
+    background: var(--accent);
     color: white;
     cursor: pointer;
     font-size: 0.875rem;

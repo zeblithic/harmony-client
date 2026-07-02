@@ -95,12 +95,12 @@
   .cap-note { color: #8a8c95; font-size: 0.8rem; margin: 0 0 0.4rem 0; }
   .cap-warning { color: #d9b438; font-size: 0.85rem; }
   .error { color: #d93838; }
-  button { background: var(--accent, #4a9eff); color: #fff; border: 0; padding: 0.35rem 0.9rem; border-radius: 3px; cursor: pointer; }
+  button { background: var(--accent); color: #fff; border: 0; padding: 0.35rem 0.9rem; border-radius: 3px; cursor: pointer; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .confirm-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: grid; place-items: center; z-index: 100; }
+  .confirm-modal { position: fixed; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: 100; }
   .confirm-card { background: var(--panel-bg, #1a1c24); padding: 1.25rem; border-radius: 8px; max-width: 480px; display: flex; flex-direction: column; gap: 0.6rem; }
-  .preview { background: #0e0f15; padding: 0.6rem; border-left: 3px solid var(--accent, #4a9eff); margin: 0; font-style: normal; }
+  .preview { background: #0e0f15; padding: 0.6rem; border-left: 3px solid var(--accent); margin: 0; font-style: normal; }
   .caveat { color: #8a8c95; font-size: 0.8rem; }
   .actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
-  .actions button:last-child { background: var(--accent, #4a9eff); color: #fff; }
+  .actions button:last-child { background: var(--accent); color: #fff; }
 </style>

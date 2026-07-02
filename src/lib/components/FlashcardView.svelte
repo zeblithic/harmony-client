@@ -604,7 +604,7 @@
     align-items: center;
     justify-content: center;
     height: 100%;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .grid-container {
@@ -629,18 +629,18 @@
 
   .hint-toggle {
     padding: 4px 12px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-secondary, #b5bac1);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
     cursor: pointer;
     font-size: 0.8125rem;
   }
 
   .hint-toggle.active {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    color: var(--text-primary);
+    border-color: var(--accent);
   }
 
   .ptt-container {
@@ -653,7 +653,7 @@
 
   .ptt-hint {
     margin: 0;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.8125rem;
     text-align: center;
     max-width: 420px;

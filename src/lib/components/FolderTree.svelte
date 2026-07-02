@@ -172,19 +172,19 @@
     border: none;
     border-radius: 4px;
     background: none;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-size: 0.85rem;
     cursor: pointer;
     text-align: left;
   }
 
   .folder-btn:hover {
-    background: var(--bg-tertiary, #313338);
+    background: var(--bg-tertiary);
   }
 
   .folder-btn.selected,
   .folder-btn[aria-current="true"] {
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     color: #fff;
   }
 
@@ -202,7 +202,7 @@
     display: block;
     padding: 3px 8px 3px 24px;
     font-size: 0.8rem;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

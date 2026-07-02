@@ -91,10 +91,10 @@
     align-items: center;
     gap: 0.6rem;
     padding: 0.45rem 1rem;
-    background: color-mix(in srgb, var(--accent, #4a9eff) 12%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, var(--accent, #4a9eff) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     font-size: 0.85rem;
-    color: var(--text-primary, #fff);
+    color: var(--text-primary);
     flex-shrink: 0;
   }
   .banner-label {
@@ -106,7 +106,7 @@
   }
   .btn-join {
     border: none;
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
     padding: 4px 14px;
     border-radius: 4px;

@@ -87,8 +87,8 @@
   .detail-panel {
     width: 320px;
     flex-shrink: 0;
-    background: var(--bg-secondary, #2b2d31);
-    border-left: 1px solid var(--bg-tertiary, #313338);
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--bg-tertiary);
     overflow-y: auto;
   }
 
@@ -100,7 +100,7 @@
     margin: 0 0 16px;
     font-size: 16px;
     font-weight: 600;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
   }
 
   .summary-stats {
@@ -115,14 +115,14 @@
     align-items: center;
     flex: 1;
     padding: 12px;
-    background: var(--bg-primary, #1e1f22);
+    background: var(--bg-primary);
     border-radius: 8px;
   }
 
   .stat-value {
     font-size: 24px;
     font-weight: 700;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
   }
 
   .stat-label {
@@ -130,11 +130,11 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
   }
 
   .health-breakdown {
-    border-top: 1px solid var(--bg-tertiary, #313338);
+    border-top: 1px solid var(--bg-tertiary);
     padding-top: 12px;
   }
 
@@ -144,7 +144,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
   }
 
   .breakdown-list {
@@ -161,7 +161,7 @@
     align-items: center;
     gap: 8px;
     font-size: 13px;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
   }
 
   .health-dot {
@@ -177,7 +177,7 @@
   }
 
   .breakdown-status {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     text-transform: capitalize;
   }
 </style>

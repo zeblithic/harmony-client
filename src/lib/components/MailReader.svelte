@@ -115,7 +115,7 @@
     align-items: center;
     justify-content: center;
     height: 100%;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
   }
 
   .reader-toolbar {
@@ -128,30 +128,30 @@
 
   .back-btn, .reply-btn {
     padding: 0.375rem 0.75rem;
-    border: 1px solid var(--border, #333);
+    border: 1px solid var(--border);
     border-radius: 4px;
     background: transparent;
-    color: var(--text-primary, #eee);
+    color: var(--text-primary);
     cursor: pointer;
     font-size: 0.8125rem;
   }
 
   .reply-btn {
-    background: var(--accent, #5b8def);
-    border-color: var(--accent, #5b8def);
+    background: var(--accent);
+    border-color: var(--accent);
     color: white;
   }
 
   .reader-header {
     margin-bottom: 1rem;
     padding-bottom: 0.75rem;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border);
   }
 
   .subject {
     margin: 0 0 0.5rem;
     font-size: 1.125rem;
-    color: var(--text-primary, #eee);
+    color: var(--text-primary);
   }
 
   .meta {
@@ -159,19 +159,19 @@
     justify-content: space-between;
     align-items: center;
     font-size: 0.8125rem;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
   }
 
   .from code {
     font-family: monospace;
     font-size: 0.75rem;
-    color: var(--text-primary, #ccc);
+    color: var(--text-primary);
   }
 
   .recipients {
     margin-top: 0.25rem;
     font-size: 0.75rem;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
   }
 
   .reader-body {
@@ -184,20 +184,20 @@
     font-family: inherit;
     font-size: 0.875rem;
     line-height: 1.5;
-    color: var(--text-primary, #ddd);
+    color: var(--text-primary);
     margin: 0;
   }
 
   .attachments {
     margin-top: 1rem;
     padding-top: 0.75rem;
-    border-top: 1px solid var(--border, #333);
+    border-top: 1px solid var(--border);
   }
 
   .attachments h4 {
     margin: 0 0 0.5rem;
     font-size: 0.8125rem;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
   }
 
   .attachment-item {
@@ -208,11 +208,11 @@
   }
 
   .att-name {
-    color: var(--accent, #5b8def);
+    color: var(--accent);
   }
 
   .att-size {
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
   }
 
   .reader-loading,
@@ -224,7 +224,7 @@
     height: 100%;
     gap: 0.5rem;
     padding: 1rem;
-    color: var(--text-secondary, #888);
+    color: var(--text-secondary);
   }
 
   .reader-spinner {

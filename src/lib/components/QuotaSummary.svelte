@@ -70,8 +70,8 @@
 <style>
   .quota-summary {
     padding: 16px;
-    background: var(--bg-secondary, #2b2d31);
-    border-bottom: 1px solid var(--border, #3f4147);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
   }
 
   .quota-header {
@@ -84,13 +84,13 @@
   .quota-title {
     margin: 0;
     font-size: 0.95rem;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-weight: 600;
   }
 
   .quota-text {
     font-size: 0.8rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .category-bar {
@@ -98,7 +98,7 @@
     height: 8px;
     border-radius: 4px;
     overflow: hidden;
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
     gap: 1px;
   }
 
@@ -137,11 +137,11 @@
   }
 
   .legend-label {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     text-transform: capitalize;
   }
 
   .legend-size {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 </style>

@@ -38,7 +38,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 8px 12px;
-    border-top: 1px solid var(--border, #3f4147);
+    border-top: 1px solid var(--border);
   }
 
   .buddy-info {
@@ -46,16 +46,16 @@
     align-items: center;
     gap: 6px;
     font-size: 0.8rem;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
   }
 
   .buddy-count {
     font-weight: 600;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
   }
 
   .buddy-separator {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .buddy-online {
@@ -68,7 +68,7 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--text-muted, #949ba4);
+    background: var(--text-muted);
   }
 
   .online-dot.has-online {
@@ -77,16 +77,16 @@
 
   .manage-btn {
     padding: 3px 10px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
     background: none;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     font-size: 0.75rem;
     cursor: pointer;
   }
 
   .manage-btn:hover {
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
   }
 </style>

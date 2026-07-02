@@ -50,7 +50,7 @@
   .stats-title {
     font-size: 0.875rem;
     font-weight: 600;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     margin: 0 0 12px;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -71,13 +71,13 @@
 
   .stat-label {
     font-size: 0.8125rem;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
   }
 
   .stat-value {
     font-size: 0.875rem;
     font-weight: 600;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-family: 'Courier New', Courier, monospace;
     margin: 0;
   }

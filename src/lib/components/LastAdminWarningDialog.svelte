@@ -123,11 +123,11 @@
     line-height: 1.5;
   }
   .warning-body a {
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     text-decoration: underline;
   }
   .warning-body a:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
     border-radius: 2px;
   }
@@ -157,7 +157,7 @@
     box-sizing: border-box;
   }
   .token-input:focus {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -1px;
   }
   .token-input:disabled {
@@ -212,7 +212,7 @@
   }
   .cancel-btn:focus-visible,
   .proceed-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .spinner {

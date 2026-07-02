@@ -207,7 +207,7 @@
   }
   .ballot-footer { margin-top: 0.75rem; display: flex; justify-content: flex-end; gap: 0.75rem; align-items: center; }
   .ballot-footer button {
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
     border: 0;
     padding: 0.35rem 0.9rem;
@@ -220,7 +220,7 @@
   .confirm-modal {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: grid;
     place-items: center;
     z-index: 100;
@@ -239,7 +239,7 @@
   .caveat { color: #8a8c95; font-size: 0.8rem; }
   .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
   .confirm-actions button:last-child {
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
   }
 </style>

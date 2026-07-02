@@ -154,12 +154,12 @@
     width: 100%;
     border-collapse: collapse;
     font-size: 13px;
-    color: var(--text-primary, #dcddde);
-    background: var(--bg-primary, #1e1f22);
+    color: var(--text-primary);
+    background: var(--bg-primary);
   }
 
   thead {
-    background: var(--bg-secondary, #2f3136);
+    background: var(--bg-secondary);
     position: sticky;
     top: 0;
     z-index: 1;
@@ -168,9 +168,9 @@
   th {
     text-align: left;
     padding: 0;
-    border-bottom: 1px solid var(--bg-tertiary, #40444b);
+    border-bottom: 1px solid var(--bg-tertiary);
     font-weight: 600;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -193,28 +193,28 @@
   }
 
   .sort-button:hover {
-    color: var(--text-primary, #dcddde);
-    background: var(--bg-tertiary, #40444b);
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
   }
 
   .sort-button:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
     border-radius: 2px;
   }
 
   .trust-row {
-    border-bottom: 1px solid var(--bg-secondary, #2f3136);
+    border-bottom: 1px solid var(--bg-secondary);
   }
 
   .trust-row:hover {
-    background: var(--bg-secondary, #2f3136);
+    background: var(--bg-secondary);
   }
 
   td {
     padding: 6px 12px;
     white-space: nowrap;
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .name-cell {

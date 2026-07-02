@@ -105,7 +105,7 @@
   .link-detail {
     padding: 16px;
     font-size: 13px;
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .detail-header {
@@ -119,21 +119,21 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .endpoint {
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .separator {
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
     font-size: 14px;
   }
 
   .meta-line {
     margin: 0 0 16px;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
     font-size: 12px;
   }
 
@@ -149,7 +149,7 @@
   }
 
   .metric {
-    background: var(--bg-secondary, #2f3136);
+    background: var(--bg-secondary);
     border-radius: 6px;
     padding: 8px 10px;
   }
@@ -166,13 +166,13 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
   }
 
   .metric-value {
     font-size: 13px;
     font-weight: 500;
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .throughput-values {
@@ -187,7 +187,7 @@
   }
 
   .throughput-down {
-    color: #5865f2;
+    color: var(--accent);
   }
 
   .encrypted-badge {

@@ -130,13 +130,13 @@
   .published-title {
     margin: 0;
     font-size: 1rem;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-weight: 600;
   }
 
   .item-count {
     font-size: 0.8rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .published-controls {
@@ -150,20 +150,20 @@
     padding: 6px 10px;
     font: inherit;
     font-size: 0.85rem;
-    background: var(--bg-tertiary, #232428);
-    color: var(--text-primary, #f2f3f5);
-    border: 1px solid var(--border, #3f4147);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
     border-radius: 4px;
     outline: none;
     box-sizing: border-box;
   }
 
   .search-input::placeholder {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .search-input:focus {
-    border-color: var(--accent, #5865f2);
+    border-color: var(--accent);
   }
 
   .category-filters {
@@ -174,10 +174,10 @@
 
   .filter-btn {
     padding: 3px 8px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
     background: none;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     cursor: pointer;
     white-space: nowrap;
     font: inherit;
@@ -185,12 +185,12 @@
   }
 
   .filter-btn:hover {
-    border-color: var(--text-muted, #949ba4);
+    border-color: var(--text-muted);
   }
 
   .filter-btn.active {
-    background: var(--accent, #5865f2);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    border-color: var(--accent);
     color: #fff;
   }
 
@@ -208,11 +208,11 @@
     gap: 8px;
     padding: 8px 10px;
     border-radius: 4px;
-    background: var(--bg-secondary, #2b2d31);
+    background: var(--bg-secondary);
   }
 
   .published-row:hover {
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
   }
 
   .publish-mode {
@@ -236,26 +236,26 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 0.85rem;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
   }
 
   .item-size {
     flex-shrink: 0;
     font-size: 0.8rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .item-date {
     flex-shrink: 0;
     font-size: 0.8rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     min-width: 50px;
     text-align: right;
   }
 
   .empty-message {
     text-align: center;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.9rem;
     padding: 32px 16px;
     margin: 0;

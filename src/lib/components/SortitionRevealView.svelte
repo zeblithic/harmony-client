@@ -76,7 +76,7 @@
 
 <style>
   .selected-banner {
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
     padding: 0.5rem 0.75rem;
     border-radius: 4px;
@@ -84,7 +84,7 @@
   }
   .backup-banner {
     background: rgba(74, 158, 255, 0.15);
-    color: var(--accent, #4a9eff);
+    color: var(--accent);
     padding: 0.5rem 0.75rem;
     border-radius: 4px;
   }

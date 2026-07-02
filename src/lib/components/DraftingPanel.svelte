@@ -146,7 +146,7 @@
   .candidate-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 0.25rem; }
   .approval-count { color: #8a8c95; font-size: 0.8rem; }
   .candidate-actions button {
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
     border: 0;
     padding: 0.25rem 0.6rem;
@@ -166,7 +166,7 @@
   .form-footer { display: flex; justify-content: space-between; align-items: center; }
   .char-count { color: #8a8c95; font-size: 0.75rem; }
   .form-footer button {
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
     border: 0;
     padding: 0.3rem 0.8rem;

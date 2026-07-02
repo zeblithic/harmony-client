@@ -22,10 +22,10 @@
     display: flex;
     align-items: center;
     padding: 4px 12px;
-    background: var(--bg-secondary, #2b2d31);
-    border-top: 1px solid var(--bg-tertiary, #313338);
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--bg-tertiary);
     font-size: 12px;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
   }
 
   .health-summary {

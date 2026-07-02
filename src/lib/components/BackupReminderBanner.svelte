@@ -145,25 +145,25 @@
     gap: 0.5rem;
     padding: 0.5rem 0.75rem;
     background: var(--warn-bg, #4a3a1a);
-    color: var(--text-primary, #fff);
+    color: var(--text-primary);
     font-size: 0.85rem;
-    border-bottom: 1px solid var(--border, #444);
+    border-bottom: 1px solid var(--border);
   }
   .warn { flex: 0 0 auto; }
   .backup-banner button {
     padding: 0.25rem 0.6rem;
-    border: 1px solid var(--border, #444);
-    background: var(--bg-tertiary, #1f1f1f);
-    color: var(--text-primary, #fff);
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     border-radius: 4px;
     cursor: pointer;
   }
   .backup-banner button.ghost { background: transparent; }
   .backup-banner input {
     padding: 0.25rem 0.5rem;
-    background: var(--bg-primary, #111);
-    color: var(--text-primary, #fff);
-    border: 1px solid var(--border, #444);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
     border-radius: 4px;
   }
   .error { color: crimson; }

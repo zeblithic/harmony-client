@@ -103,12 +103,12 @@
     align-items: center;
     gap: 12px;
     padding: 4px 12px;
-    border-bottom: 1px solid var(--border, #3f4147);
+    border-bottom: 1px solid var(--border);
   }
 
   .file-list-header span {
     font-size: 0.75rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     font-weight: 600;

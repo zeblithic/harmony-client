@@ -45,7 +45,7 @@
   }
 
   .sensitivity-badge.private {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     background: rgba(181, 186, 193, 0.1);
   }
 
