@@ -209,7 +209,10 @@
     cursor: pointer;
   }
   .contact:hover {
-    background: var(--hover-bg);
+    /* Deliberate visual fix (the one exception to this sweep's zero-visual-change
+       rule): hover previously matched the .contact-list fill exactly, so rows had
+       no visible hover state. Use the app-standard row-hover token instead. */
+    background: var(--bg-hover);
   }
   .empty {
     padding: 12px;
