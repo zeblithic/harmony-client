@@ -18682,6 +18682,11 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
             return 1;
         }
 
+        // ZEB-613: headless presence parity — engage beacon + roster for
+        // every joined community so presence-kick recovery works on serve
+        // nodes without a manual `api subscribe_community_presence`.
+        let _ = auto_subscribe_presence_all_communities(state.as_ref()).await;
+
         let port = api_port
             .or_else(|| {
                 std::env::var("HARMONY_API_PORT")
@@ -19080,6 +19085,109 @@ mod zeb393_communities_for_nav_tests {
     #[test]
     fn empty_state_yields_empty() {
         assert!(communities_for_nav(&OwnerState::default()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod zeb613_auto_subscribe_tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    /// The one live, non-pending, non-left community in the fixture below.
+    const LIVE_COMMUNITY_ID_BYTES: [u8; 16] = [1u8; 16];
+
+    // Fixture builders copied from `zeb393_communities_for_nav_tests` (same
+    // `Space` shape, `SpaceKind::Community`, `left_at` / `pending_join_at`
+    // markers) so this module is self-contained.
+    fn hlc() -> Hlc {
+        Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn community_space(id: u8, name: &str, invite_only: bool, pending: bool, left: bool) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: name.into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: if left { Some(hlc()) } else { None },
+            created_at: hlc(),
+            updated_at: hlc(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([7u8; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([9u8; 16])),
+            is_invite_only: Some(invite_only),
+            shared_in_profile: false,
+            pending_join_at: if pending { Some(hlc()) } else { None },
+        }
+    }
+
+    fn folder_space(id: u8, name: &str) -> Space {
+        let mut s = community_space(id, name, false, false, false);
+        s.kind = SpaceKind::Folder;
+        s.current_epoch = None;
+        s.current_epoch_key = None;
+        s.admin_addr = None;
+        s.is_invite_only = None;
+        s
+    }
+
+    /// ZEB-613: the helper subscribes exactly the live (joined,
+    /// non-pending, non-left) communities and reports the count.
+    #[tokio::test]
+    async fn auto_subscribe_covers_live_communities_only() {
+        let mut owner_state = OwnerState::default();
+        for s in [
+            community_space(1, "Open Town", false, false, false), // live → subscribed
+            community_space(2, "Secret Club", true, true, false), // pending → skipped
+            community_space(3, "Left Behind", false, false, true), // left → excluded
+            folder_space(4, "Root"),                              // non-community → excluded
+        ] {
+            owner_state.spaces.insert(s.id, s);
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = std::sync::Mutex::new(NodeState::default());
+        {
+            let mut g = state.lock().unwrap();
+            g.crdt_state = Some(std::sync::Arc::new(tokio::sync::Mutex::new(owner_state)));
+            g.community_presence_request_tx = Some(tx);
+        }
+
+        let n = auto_subscribe_presence_all_communities(&state).await;
+        assert_eq!(n, 1);
+
+        let req = rx.try_recv().expect("one Subscribe expected");
+        // `CommunityPresenceRequest` derives no `Debug`, so match exhaustively
+        // rather than panic-format the `other` arm.
+        match req {
+            crate::event_loop::CommunityPresenceRequest::Subscribe { community_id } => {
+                assert_eq!(community_id, LIVE_COMMUNITY_ID_BYTES);
+            }
+            crate::event_loop::CommunityPresenceRequest::Unsubscribe { .. } => {
+                panic!("expected Subscribe, got Unsubscribe");
+            }
+        }
+        assert!(rx.try_recv().is_err(), "no extra subscriptions");
+    }
+
+    /// No owner loaded (no crdt_state) → 0, no panic.
+    #[tokio::test]
+    async fn auto_subscribe_no_owner_is_graceful() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        assert_eq!(auto_subscribe_presence_all_communities(&state).await, 0);
     }
 }
 
@@ -28116,6 +28224,13 @@ pub(crate) async fn redeem_invite_impl(
     // committed + registered above.
     force_reachability_republish(state);
 
+    // ZEB-613: engage presence for the freshly-joined community now.
+    // The GUI also subscribes from the frontend; the event loop's
+    // dup-guard makes the double Subscribe a no-op.
+    if let Err(e) = subscribe_community_presence_impl(state, dto.community_id.clone()).await {
+        tracing::warn!(error = %e, "ZEB-613: post-join presence subscribe failed");
+    }
+
     Ok(dto)
 }
 
@@ -28330,6 +28445,13 @@ pub(crate) async fn join_open_community_impl(
             pending: None,
         },
     );
+
+    // ZEB-613: engage presence for the freshly-joined community now.
+    // The GUI also subscribes from the frontend; the event loop's
+    // dup-guard makes the double Subscribe a no-op.
+    if let Err(e) = subscribe_community_presence_impl(state, dto.community_id.clone()).await {
+        tracing::warn!(error = %e, "ZEB-613: post-join presence subscribe failed");
+    }
 
     Ok(dto)
 }
@@ -31285,6 +31407,40 @@ pub(crate) async fn get_cached_member_card_impl(
         g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?
     };
     Ok(cache.get_cached(subscription_id).await)
+}
+
+/// ZEB-613: subscribe community presence for every live (non-pending,
+/// non-left) joined community. Headless parity with the GUI's
+/// subscribe-all (`App.svelte` boot path): without this a `serve` node
+/// publishes no beacon and builds no roster, so the #384 presence-kick
+/// backfill re-arm — and Phase 3's presence-triggered re-dial — are
+/// inert for it. Errors are logged, never fatal: presence is a
+/// self-healing enhancement, not a boot dependency. Returns the number
+/// of communities subscribed.
+pub(crate) async fn auto_subscribe_presence_all_communities(
+    state: &std::sync::Mutex<NodeState>,
+) -> usize {
+    let dtos = match list_owner_communities_impl(state).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "ZEB-613: presence auto-subscribe: cannot enumerate communities");
+            return 0;
+        }
+    };
+    let mut subscribed = 0usize;
+    for dto in dtos.into_iter().filter(|d| !d.pending) {
+        match subscribe_community_presence_impl(state, dto.space_id.clone()).await {
+            Ok(()) => subscribed += 1,
+            Err(e) => {
+                tracing::warn!(community = %dto.space_id, error = %e, "ZEB-613: presence auto-subscribe failed");
+            }
+        }
+    }
+    tracing::info!(
+        subscribed,
+        "ZEB-613: presence auto-subscribed for joined communities"
+    );
+    subscribed
 }
 
 /// IPC: ZEB-537. Subscribe to a community's presence roster (keyed by the
