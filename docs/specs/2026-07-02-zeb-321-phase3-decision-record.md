@@ -157,7 +157,7 @@
 - H2. Relay selection/failover policy + asymmetric-relay-isolation risk (report Q2).
 - H3. pkarr relay pool posture is settled (q8.fyi primary, ZEB-513) — only revisit if H1 changes topology.
 
-## Area G — protocol versioning/evolution: PROVISIONAL PROPOSAL (needs Jake)
+## Area G — protocol versioning/evolution: blessed 2026-07-01
 
 Current state: five per-protocol ALPNs suffixed /v1 (zenoh, tunnel, handshake, ping, friend-pex).
 QUIC/TLS ALPN negotiation is server-picks-from-client-list, but iroh connect() takes ONE alpn per
@@ -177,7 +177,7 @@ attempt → cross-version fallback via ALPN = extra connect round-trips.
 - **CRDT/payload rule codified**: additive-only fields, unknown-field tolerance (serde defaults) —
   already de-facto; write it down as a spec rule.
 
-## Area H — relay/infra strategy: PROVISIONAL PROPOSAL (needs Jake)
+## Area H — relay/infra strategy: blessed 2026-07-01
 
 - **v1: stay on n0 STABLE relays** (post canary-pin/Area 0). Fleet is ~4 nodes; free tier fine;
   self-hosting is ops burden without current need. Keep i.q8.fyi decommissioned.
@@ -301,7 +301,7 @@ attempt → cross-version fallback via ALPN = extra connect round-trips.
   upgrade slice sequenced BEFORE area-B observability (B builds on the redesigned 1.0 path API
   once); Area A supervisor is iroh-API-light and may proceed in parallel; ZEB-615 closes with the
   upgrade slice (root cause = upstream #4124, documented on the ticket 2026-07-01).
-- **2026-07-01 Area D: PROVISIONAL (Jake AFK at ask; recommended option adopted, veto welcome)** —
+- **2026-07-01 Area D: blessed 2026-07-01 (recommended option adopted while AFK, then blessed)** —
   D1 root-driver parity (mail-root + community-root get ZEB-584 persisted floor + #384
   presence-kick); D2 supervisor owns boot seeds (persisted peers seed supervisor as Disconnected,
   dialed via the ladder with C's staleness gate, prioritized by recency + shared-community count,
