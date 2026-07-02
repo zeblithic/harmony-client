@@ -149,8 +149,8 @@ impl IrohEndpoint {
     }
 
     /// This endpoint's stable identity, derived from the persistent
-    /// secret key. In iroh 0.98 this is `EndpointId`, a type alias
-    /// for `iroh::PublicKey` (was `NodeId` in earlier versions).
+    /// secret key. `EndpointId` is a type alias for `iroh::PublicKey`
+    /// (named `NodeId` before iroh 0.94).
     pub fn node_id(&self) -> EndpointId {
         self.inner.id()
     }

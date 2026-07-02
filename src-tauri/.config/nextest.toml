@@ -37,5 +37,5 @@
 iroh-endpoint = { max-threads = 4 }
 
 [[profile.default.overrides]]
-filter = 'test(iroh) | test(zenoh) | test(tunnel) | test(reachability) | test(dial) | binary(~iroh) | binary(~zenoh) | binary(~referral) | binary(~network_health) | binary(~friend_token) | binary(~open_join)'
+filter = 'test(iroh) | test(zenoh) | test(tunnel) | test(reachability) | test(dial) | binary(~iroh) | binary(~zenoh) | binary(~referral) | binary(~network_health) | binary(~friend_token) | binary(~open_join) | binary(~api_server) | binary(~profile_isolation)'
 test-group = 'iroh-endpoint'
