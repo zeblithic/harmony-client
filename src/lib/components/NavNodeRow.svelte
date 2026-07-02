@@ -210,7 +210,7 @@
 </div>
 
 <style>
-  /* ZEB-600: nav presence dot — solid var(--net-ok-deep) when the resolver reports online. */
+  /* ZEB-600: nav presence dot — solid var(--presence-online) when the resolver reports online. */
   .nav-presence-dot {
     flex-shrink: 0;
     width: 7px;

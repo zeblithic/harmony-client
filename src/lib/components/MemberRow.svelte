@@ -273,7 +273,7 @@
     border-bottom: none;
   }
   /* ZEB-537: online-presence indicator. Muted/hollow when offline, solid
-     var(--net-ok-deep) when online. Sized to align with the row's avatar/text. */
+     var(--presence-online) when online. Sized to align with the row's avatar/text. */
   .presence-dot {
     flex-shrink: 0;
     width: 8px;
