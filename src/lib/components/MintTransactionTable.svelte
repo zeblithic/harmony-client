@@ -44,8 +44,8 @@
 
 <style>
   .mint-tx-table { width: 100%; border-collapse: collapse; }
-  .mint-tx-table th, .mint-tx-table td { padding: 0.4rem 0.6rem; text-align: left; border-bottom: 1px solid var(--color-border, #eee); }
+  .mint-tx-table th, .mint-tx-table td { padding: 0.4rem 0.6rem; text-align: left; border-bottom: 1px solid var(--color-border-soft); }
   .amount { font-variant-numeric: tabular-nums; text-align: right; }
   .metadata code { font-size: 0.85em; }
-  .empty { text-align: center; color: var(--color-text-secondary, #888); padding: 2rem; }
+  .empty { text-align: center; color: var(--color-text-secondary); padding: 2rem; }
 </style>

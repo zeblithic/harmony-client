@@ -136,18 +136,18 @@
     justify-content: space-between;
     gap: 0.75rem;
     padding: 0.5rem 0.75rem;
-    background: var(--input-bg, #0e0f15);
+    background: var(--input-bg);
     border-radius: 4px;
     margin-bottom: 0.4rem;
   }
   .candidate-body { flex: 1; }
   .candidate-body .text { margin: 0; }
-  .candidate-body .proposer { margin: 0.15rem 0 0; color: #8a8c95; font-size: 0.8rem; }
+  .candidate-body .proposer { margin: 0.15rem 0 0; color: var(--text-faint); font-size: 0.8rem; }
   .candidate-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 0.25rem; }
-  .approval-count { color: #8a8c95; font-size: 0.8rem; }
+  .approval-count { color: var(--text-faint); font-size: 0.8rem; }
   .candidate-actions button {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
     border: 0;
     padding: 0.25rem 0.6rem;
     border-radius: 3px;
@@ -156,24 +156,24 @@
   .candidate-actions button:disabled { opacity: 0.6; cursor: not-allowed; }
   .propose-form { margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.4rem; }
   .propose-form textarea {
-    background: var(--input-bg, #0e0f15);
+    background: var(--input-bg);
     color: inherit;
-    border: 1px solid #2a2c34;
+    border: 1px solid var(--chip-bg);
     border-radius: 4px;
     padding: 0.4rem 0.5rem;
     width: 100%;
   }
   .form-footer { display: flex; justify-content: space-between; align-items: center; }
-  .char-count { color: #8a8c95; font-size: 0.75rem; }
+  .char-count { color: var(--text-faint); font-size: 0.75rem; }
   .form-footer button {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
     border: 0;
     padding: 0.3rem 0.8rem;
     border-radius: 3px;
     cursor: pointer;
   }
   .form-footer button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .empty { color: #8a8c95; }
-  .error { color: #d93838; }
+  .empty { color: var(--text-faint); }
+  .error { color: var(--danger-alt); }
 </style>

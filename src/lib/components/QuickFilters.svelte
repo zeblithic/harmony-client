@@ -259,6 +259,6 @@
   .filter-btn.active {
     background: var(--accent);
     border-color: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
   }
 </style>

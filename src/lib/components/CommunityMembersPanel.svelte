@@ -420,7 +420,7 @@
     color: var(--text-secondary);
   }
   .error {
-    color: #cc7a7a;
+    color: var(--danger-text-muted);
   }
   .member-list {
     list-style: none;

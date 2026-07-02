@@ -77,13 +77,13 @@
 <style>
   .selected-banner {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
     padding: 0.5rem 0.75rem;
     border-radius: 4px;
     font-weight: 500;
   }
   .backup-banner {
-    background: rgba(74, 158, 255, 0.15);
+    background: color-mix(in srgb, var(--info) 15%, transparent);
     color: var(--accent);
     padding: 0.5rem 0.75rem;
     border-radius: 4px;
@@ -101,15 +101,15 @@
     align-items: center;
     font-size: 0.85rem;
     padding: 0.15rem 0.4rem;
-    background: var(--input-bg, #0e0f15);
+    background: var(--input-bg);
     border-radius: 3px;
   }
   .roster li.declined code { text-decoration: line-through; opacity: 0.6; }
-  .roster li.self { background: rgba(74, 158, 255, 0.1); }
+  .roster li.self { background: color-mix(in srgb, var(--info) 10%, transparent); }
   .tag {
     font-size: 0.7rem;
-    color: #8a8c95;
-    background: #2a2c34;
+    color: var(--text-faint);
+    background: var(--chip-bg);
     padding: 0 0.35rem;
     border-radius: 2px;
   }

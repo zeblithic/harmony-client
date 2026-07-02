@@ -143,7 +143,7 @@
     opacity: 0.45;
   }
   .reaction-emoji-failed {
-    color: #d83c3e;
+    color: var(--danger-muted);
     opacity: 0.85;
   }
 </style>

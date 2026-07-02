@@ -279,7 +279,7 @@
     color: var(--accent);
     font-size: 0.75rem;
     font-weight: 600;
-    background: rgba(88, 101, 242, 0.15);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
     padding: 2px 8px;
     border-radius: 10px;
   }
@@ -293,7 +293,7 @@
     align-items: center;
     gap: 4px;
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     border: none;
     padding: 6px 12px;
     border-radius: 6px;
@@ -390,7 +390,7 @@
     align-items: center;
     gap: 6px;
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     border: none;
     padding: 8px 16px;
     border-radius: 6px;

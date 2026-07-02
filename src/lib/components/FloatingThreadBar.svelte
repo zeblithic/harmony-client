@@ -93,7 +93,7 @@
 
   .thread-entry.active {
     border-color: var(--accent);
-    background: rgba(88, 101, 242, 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
     color: var(--accent);
   }
 

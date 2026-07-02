@@ -3714,7 +3714,7 @@
   }
 
   :global(.text-message.highlight) {
-    background: rgba(88, 101, 242, 0.15) !important;
+    background: color-mix(in srgb, var(--accent) 15%, transparent) !important;
   }
 
   .file-detail-empty {
@@ -3746,7 +3746,7 @@
     flex-shrink: 0;
     width: 100%;
     padding: 8px 12px;
-    background: rgba(120, 140, 200, 0.15);
+    background: color-mix(in srgb, var(--library-accent) 15%, transparent);
     color: var(--text-primary);
     border: none;
     border-top: 1px solid var(--border);
@@ -3755,7 +3755,7 @@
     text-align: center;
   }
   .new-dm-button:hover {
-    background: rgba(120, 140, 200, 0.3);
+    background: color-mix(in srgb, var(--library-accent) 30%, transparent);
   }
   .modal-overlay {
     position: fixed;
@@ -3769,7 +3769,7 @@
   .modal-content {
     background: var(--bg-secondary);
     border-radius: 8px;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+    box-shadow: 0 4px 24px var(--shadow-strong);
   }
 
   /* ZEB-345 Task 10: floating host for the long-form profile panel. Pins the
@@ -3781,7 +3781,7 @@
     right: 0;
     height: 100vh;
     z-index: 90;
-    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.3);
+    box-shadow: -4px 0 16px var(--shadow-mid);
   }
 
   /* ZEB-254: transient join-status banner (pending vs joined). */

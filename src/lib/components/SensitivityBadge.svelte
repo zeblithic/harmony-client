@@ -40,22 +40,22 @@
   }
 
   .sensitivity-badge.public {
-    color: #43b581;
-    background: rgba(67, 181, 129, 0.12);
+    color: var(--success-deep);
+    background: color-mix(in srgb, var(--success-deep) 12%, transparent);
   }
 
   .sensitivity-badge.private {
     color: var(--text-secondary);
-    background: rgba(181, 186, 193, 0.1);
+    background: color-mix(in srgb, var(--text-secondary) 10%, transparent);
   }
 
   .sensitivity-badge.intimate {
-    color: #e67e22;
-    background: rgba(230, 126, 34, 0.12);
+    color: var(--cat-orange);
+    background: color-mix(in srgb, var(--cat-orange) 12%, transparent);
   }
 
   .sensitivity-badge.confidential {
-    color: #f1c40f;
-    background: rgba(241, 196, 15, 0.12);
+    color: var(--cat-yellow);
+    background: color-mix(in srgb, var(--cat-yellow) 12%, transparent);
   }
 </style>

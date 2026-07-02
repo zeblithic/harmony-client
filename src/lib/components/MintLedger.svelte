@@ -269,13 +269,13 @@
     background: none;
     border: 1px dashed transparent;
     padding: 0.2rem 0.4rem;
-    color: var(--color-text-secondary, #888);
+    color: var(--color-text-secondary);
     font-size: 0.9rem;
     cursor: pointer;
     border-radius: 4px;
   }
   .default-currency:hover {
-    border-color: var(--color-border, #ccc);
+    border-color: #ccc;
   }
   .default-currency-edit {
     display: inline-flex;
@@ -287,13 +287,13 @@
     width: 4.5rem;
   }
   .actions { display: flex; gap: 0.5rem; }
-  .error { color: var(--color-error, #c53030); }
+  .error { color: var(--color-error); }
   .operation-error {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     padding: 0.5rem 0.75rem;
-    background: var(--color-bg-warning, #fff8e1);
+    background: var(--color-bg-warning);
     border-radius: 4px;
     margin-bottom: 0.75rem;
   }

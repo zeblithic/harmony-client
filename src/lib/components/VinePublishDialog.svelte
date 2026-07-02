@@ -189,7 +189,7 @@
     border-radius: 12px;
     width: 100%;
     max-width: 420px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    box-shadow: 0 8px 32px var(--shadow-strong);
   }
 
   .dialog-header {
@@ -303,7 +303,7 @@
   }
 
   .picked-check {
-    color: #3ba55d;
+    color: var(--presence-online);
     font-weight: 700;
   }
 
@@ -364,7 +364,7 @@
   }
 
   .error-text {
-    color: #ed4245;
+    color: var(--text-danger);
     font-size: 0.75rem;
   }
 
@@ -397,7 +397,7 @@
 
   .btn-primary {
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
   }
 
   .btn-primary:disabled {

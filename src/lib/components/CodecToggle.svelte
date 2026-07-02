@@ -100,7 +100,7 @@
   }
 
   .codec-option:hover:not(.selected):not([aria-disabled='true']) {
-    background: rgba(88, 101, 242, 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
 
   .codec-option[aria-disabled='true'] {

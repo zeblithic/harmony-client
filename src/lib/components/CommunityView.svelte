@@ -721,7 +721,7 @@
     border: 1px solid var(--border);
     max-width: 640px;
     width: 100%;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    box-shadow: 0 8px 24px var(--shadow-heavy);
     overflow: hidden;
   }
   .community-members-overlay-header {

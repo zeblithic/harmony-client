@@ -58,7 +58,7 @@
     cursor: pointer;
     font-size: 0.875rem;
   }
-  .confirm-btn.danger { background: #d83c3e; }
+  .confirm-btn.danger { background: var(--danger-muted); }
   .cancel-btn {
     background: var(--bg-tertiary);
     color: var(--text-secondary);

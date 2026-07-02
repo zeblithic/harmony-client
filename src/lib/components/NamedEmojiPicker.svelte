@@ -143,7 +143,7 @@
   .named-emoji-picker { display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem; min-width: 14rem; max-width: 18rem; }
   .named-search, .named-rename { width: 100%; box-sizing: border-box; padding: 0.25rem 0.4rem; }
   .named-rename-wrap { display: inline-flex; flex-direction: column; gap: 0.1rem; }
-  .named-rename-error { font-size: 0.7em; color: #d83c3e; }
+  .named-rename-error { font-size: 0.7em; color: var(--danger-muted); }
   .named-grid { display: flex; flex-wrap: wrap; gap: 0.35rem; }
   .named-tile { display: inline-flex; align-items: center; gap: 0.15rem; }
   .named-pick { display: inline-flex; align-items: center; gap: 0.25rem; cursor: pointer; }

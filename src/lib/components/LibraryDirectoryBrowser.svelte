@@ -469,7 +469,7 @@
   .close-btn { background: none; border: none; font-size: 1.1rem; cursor: pointer; }
   .empty { text-align: center; padding: 24px; }
   .libraries-bar { display: flex; flex-wrap: wrap; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
-  .lib-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; background: rgba(120,140,200,0.2); border-radius: 12px; font-size: 0.75rem; font-family: monospace; }
+  .lib-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; background: color-mix(in srgb, var(--library-accent) 20%, transparent); border-radius: 12px; font-size: 0.75rem; font-family: monospace; }
   .lib-remove { background: none; border: none; cursor: pointer; padding: 0 2px; }
   .add-lib-btn { padding: 2px 8px; font-size: 0.75rem; }
   .empty-catalog { color: var(--text-secondary); padding: 16px; text-align: center; }
@@ -478,11 +478,11 @@
   .row-title { font-weight: 600; }
   .row-desc { color: var(--text-secondary); font-size: 0.85rem; margin: 4px 0; }
   .topics { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-  .topic-chip { font-size: 0.7rem; padding: 1px 6px; background: rgba(120,140,200,0.15); border-radius: 8px; }
+  .topic-chip { font-size: 0.7rem; padding: 1px 6px; background: color-mix(in srgb, var(--library-accent) 15%, transparent); border-radius: 8px; }
   .row-meta { font-size: 0.7rem; color: var(--text-secondary); margin-top: 4px; }
-  .join-btn { align-self: center; padding: 6px 12px; background: rgba(120,140,200,0.4); border: none; border-radius: 4px; cursor: pointer; }
+  .join-btn { align-self: center; padding: 6px 12px; background: color-mix(in srgb, var(--library-accent) 40%, transparent); border: none; border-radius: 4px; cursor: pointer; }
   .join-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .join-error { color: #d83c3e; font-size: 0.85rem; margin-top: 8px; }
+  .join-error { color: var(--danger-muted); font-size: 0.85rem; margin-top: 8px; }
   /* Cold-start "still searching" — non-blocking, in-progress (NOT an error).
      Neutral/secondary styling with the same spinner the redeem flow uses. */
   .searching-banner {
@@ -516,15 +516,15 @@
     margin-top: 8px;
     padding: 8px 10px;
     background: var(--bg-tertiary);
-    border: 1px solid #d83c3e;
+    border: 1px solid var(--danger-muted);
     border-radius: 4px;
-    color: #d83c3e;
+    color: var(--danger-muted);
     font-size: 0.8rem;
   }
-  .remove-error { color: #d83c3e; font-size: 0.8rem; margin: 0 0 8px; }
+  .remove-error { color: var(--danger-muted); font-size: 0.8rem; margin: 0 0 8px; }
   .modal-overlay { position: fixed; inset: 0; background: var(--overlay); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .modal-content { background: var(--bg-secondary); border-radius: 6px; }
-  .primary { background: rgba(120,140,200,0.4); padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
+  .primary { background: color-mix(in srgb, var(--library-accent) 40%, transparent); padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
 
   /* ZEB-279 Sub-D Phase 2: discovered libraries panel. */
   .discovered-section { margin: 0.5rem 0 0.75rem; }
@@ -569,14 +569,14 @@
   }
   .discovered-add {
     padding: 4px 10px;
-    background: rgba(120,140,200,0.4);
+    background: color-mix(in srgb, var(--library-accent) 40%, transparent);
     border: none;
     border-radius: 4px;
     cursor: pointer;
   }
   .discovered-add:disabled { opacity: 0.4; cursor: not-allowed; }
   .discovered-error {
-    color: #d83c3e;
+    color: var(--danger-muted);
     font-size: 0.8rem;
     width: 100%;
   }

@@ -346,7 +346,7 @@
     padding: 16px;
     min-width: 240px;
     max-width: 300px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 4px 16px var(--shadow-mid);
   }
 
   .popover-header {

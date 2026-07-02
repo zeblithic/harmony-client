@@ -67,16 +67,16 @@
 </aside>
 
 <style>
-  .bridging-panel { background: #0e1118; padding: 0.75rem; border-radius: 6px; }
-  .subtitle { color: #8a8c95; font-size: 0.8rem; margin: 0 0 0.5rem 0; }
+  .bridging-panel { background: var(--panel-bg-deep); padding: 0.75rem; border-radius: 6px; }
+  .subtitle { color: var(--text-faint); font-size: 0.8rem; margin: 0 0 0.5rem 0; }
   ol { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.4rem; }
-  .card { position: relative; padding: 0.5rem; background: #1a1c24; border-radius: 4px; overflow: hidden; }
-  .heat-bar { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(to right, rgba(74, 217, 122, 0.18), rgba(74, 217, 122, 0)); z-index: 0; }
+  .card { position: relative; padding: 0.5rem; background: var(--panel-bg); border-radius: 4px; overflow: hidden; }
+  .heat-bar { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(to right, color-mix(in srgb, var(--success-gov) 18%, transparent), color-mix(in srgb, var(--success-gov) 0%, transparent)); z-index: 0; }
   .content { position: relative; z-index: 1; }
   .text { margin: 0; font-weight: 500; }
-  .meta { margin-top: 0.3rem; display: flex; gap: 0.5rem; font-size: 0.75rem; color: #8a8c95; align-items: center; }
-  .chip { padding: 0.05rem 0.35rem; background: #2a2c34; border-radius: 2px; }
-  .chip.agree { color: #4ad97a; }
-  .empty { color: #8a8c95; font-style: italic; }
-  .error { color: #d93838; }
+  .meta { margin-top: 0.3rem; display: flex; gap: 0.5rem; font-size: 0.75rem; color: var(--text-faint); align-items: center; }
+  .chip { padding: 0.05rem 0.35rem; background: var(--chip-bg); border-radius: 2px; }
+  .chip.agree { color: var(--success-gov); }
+  .empty { color: var(--text-faint); font-style: italic; }
+  .error { color: var(--danger-alt); }
 </style>

@@ -271,7 +271,7 @@
     border-radius: 6px;
     font-size: 0.8rem;
   }
-  .attachment-chip.error { border-color: #d83c3e; }
+  .attachment-chip.error { border-color: var(--danger-muted); }
   .att-icon { flex: 0 0 auto; }
   .att-name {
     flex: 1 1 auto;
@@ -293,9 +293,9 @@
     padding: 2px 8px;
     font: inherit;
   }
-  .att-download:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); }
+  .att-download:hover:not(:disabled) { background: var(--bg-hover-subtle); }
   .att-download:disabled { opacity: 0.6; cursor: default; }
-  .att-error { color: #d83c3e; font-size: 0.72rem; padding: 0 8px; max-width: 420px; }
+  .att-error { color: var(--danger-muted); font-size: 0.72rem; padding: 0 8px; max-width: 420px; }
   .att-preview-btn {
     flex: 0 0 auto;
     background: transparent;
@@ -306,7 +306,7 @@
     padding: 2px 8px;
     font: inherit;
   }
-  .att-preview-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); }
+  .att-preview-btn:hover:not(:disabled) { background: var(--bg-hover-subtle); }
   .att-preview-btn:disabled { opacity: 0.6; cursor: default; }
   .att-preview-img {
     display: block;

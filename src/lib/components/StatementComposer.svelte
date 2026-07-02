@@ -88,19 +88,19 @@
 {/if}
 
 <style>
-  .composer { background: var(--panel-bg, #1a1c24); padding: 0.75rem; border-radius: 6px; }
-  textarea { width: 100%; min-height: 80px; padding: 0.4rem; background: #0e0f15; color: inherit; border: 1px solid #2a2c34; border-radius: 3px; }
+  .composer { background: var(--panel-bg); padding: 0.75rem; border-radius: 6px; }
+  textarea { width: 100%; min-height: 80px; padding: 0.4rem; background: var(--input-bg); color: inherit; border: 1px solid var(--chip-bg); border-radius: 3px; }
   .footer { display: flex; justify-content: space-between; align-items: center; margin-top: 0.4rem; }
-  .char-count { color: #8a8c95; font-size: 0.85rem; }
-  .cap-note { color: #8a8c95; font-size: 0.8rem; margin: 0 0 0.4rem 0; }
+  .char-count { color: var(--text-faint); font-size: 0.85rem; }
+  .cap-note { color: var(--text-faint); font-size: 0.8rem; margin: 0 0 0.4rem 0; }
   .cap-warning { color: #d9b438; font-size: 0.85rem; }
-  .error { color: #d93838; }
-  button { background: var(--accent); color: #fff; border: 0; padding: 0.35rem 0.9rem; border-radius: 3px; cursor: pointer; }
+  .error { color: var(--danger-alt); }
+  button { background: var(--accent); color: var(--text-bright); border: 0; padding: 0.35rem 0.9rem; border-radius: 3px; cursor: pointer; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .confirm-modal { position: fixed; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: 100; }
-  .confirm-card { background: var(--panel-bg, #1a1c24); padding: 1.25rem; border-radius: 8px; max-width: 480px; display: flex; flex-direction: column; gap: 0.6rem; }
-  .preview { background: #0e0f15; padding: 0.6rem; border-left: 3px solid var(--accent); margin: 0; font-style: normal; }
-  .caveat { color: #8a8c95; font-size: 0.8rem; }
+  .confirm-card { background: var(--panel-bg); padding: 1.25rem; border-radius: 8px; max-width: 480px; display: flex; flex-direction: column; gap: 0.6rem; }
+  .preview { background: var(--input-bg); padding: 0.6rem; border-left: 3px solid var(--accent); margin: 0; font-style: normal; }
+  .caveat { color: var(--text-faint); font-size: 0.8rem; }
   .actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
-  .actions button:last-child { background: var(--accent); color: #fff; }
+  .actions button:last-child { background: var(--accent); color: var(--text-bright); }
 </style>

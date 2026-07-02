@@ -111,7 +111,7 @@
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
   .primary, .secondary { padding: 6px 12px; border-radius: 4px; border: 1px solid var(--border);
     cursor: pointer; font-size: 13px; }
-  .primary { background: var(--accent); color: white; border-color: var(--accent); }
+  .primary { background: var(--accent); color: var(--text-bright); border-color: var(--accent); }
   .secondary { background: var(--bg-primary); color: var(--text-primary); }
   .error { color: var(--danger); font-size: 13px; margin: 8px 0; }
   .hint { font-size: 12px; color: var(--text-muted); margin: 4px 0; }

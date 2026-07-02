@@ -245,8 +245,8 @@
   }
   .warn {
     color: var(--text-primary);
-    background: rgba(216, 60, 62, 0.12);
-    border: 1px solid #d83c3e;
+    background: color-mix(in srgb, var(--danger-muted) 12%, transparent);
+    border: 1px solid var(--danger-muted);
     border-radius: 4px;
     padding: 8px 12px;
     font-size: 0.85rem;
@@ -270,7 +270,7 @@
     margin-bottom: 12px;
   }
   .error {
-    color: #ff6b6b;
+    color: var(--fg-error);
     font-size: 0.85rem;
     margin: 0 0 12px;
   }
@@ -291,8 +291,8 @@
     border-color: var(--accent);
   }
   .actions .primary.danger {
-    background: #d83c3e;
-    border-color: #d83c3e;
+    background: var(--danger-muted);
+    border-color: var(--danger-muted);
   }
   .actions .primary:disabled {
     opacity: 0.4;

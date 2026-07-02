@@ -138,25 +138,25 @@
 </section>
 
 <style>
-  .vote-list { background: #0e1118; padding: 0.75rem; border-radius: 6px; }
+  .vote-list { background: var(--panel-bg-deep); padding: 0.75rem; border-radius: 6px; }
   header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.5rem; }
-  .filter-toggle { font-size: 0.85rem; color: #8a8c95; cursor: pointer; }
+  .filter-toggle { font-size: 0.85rem; color: var(--text-faint); cursor: pointer; }
   ol { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.4rem; }
-  .row { padding: 0.5rem; background: #1a1c24; border-radius: 4px; }
+  .row { padding: 0.5rem; background: var(--panel-bg); border-radius: 4px; }
   .text { font-weight: 500; }
-  .meta { font-size: 0.75rem; color: #8a8c95; margin-top: 0.2rem; }
+  .meta { font-size: 0.75rem; color: var(--text-faint); margin-top: 0.2rem; }
   .tri-button { margin-top: 0.4rem; display: flex; gap: 0.3rem; }
   .tri-button button {
-    background: #2a2c34; color: #d6d6d6; border: 1px solid transparent;
+    background: var(--chip-bg); color: var(--text-chip); border: 1px solid transparent;
     padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.8rem; cursor: pointer;
   }
   .tri-button button.active { border-color: var(--accent); }
   .tri-button button:disabled { opacity: 0.5; cursor: not-allowed; }
   .chips { margin-top: 0.4rem; display: flex; gap: 0.4rem; font-size: 0.8rem; }
-  .chip { padding: 0.1rem 0.4rem; background: #2a2c34; border-radius: 2px; color: #8a8c95; }
-  .chip.agree { color: #4ad97a; }
-  .chip.disagree { color: #d93838; }
-  .chip.own { color: #d6d6d6; background: #3a3c44; }
-  .empty { color: #8a8c95; font-style: italic; }
-  .error { color: #d93838; }
+  .chip { padding: 0.1rem 0.4rem; background: var(--chip-bg); border-radius: 2px; color: var(--text-faint); }
+  .chip.agree { color: var(--success-gov); }
+  .chip.disagree { color: var(--danger-alt); }
+  .chip.own { color: var(--text-chip); background: var(--chip-bg-active); }
+  .empty { color: var(--text-faint); font-style: italic; }
+  .error { color: var(--danger-alt); }
 </style>

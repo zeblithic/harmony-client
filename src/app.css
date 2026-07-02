@@ -20,6 +20,97 @@
   --success: #4ade80; /* positive/confirmed states */
   --warning: #d8a200; /* caution, staleness, pending-attention */
 
+  /* Adopted seams (ZEB-604 sweep 2): components already referenced these
+     names via var(--name, fallback) with the variable undefined — the
+     fallback was the de-facto value. Defined here at exactly those values;
+     the fallbacks are dropped component-side. Names kept as the components
+     chose them; the Commons flip / Track H may converge or rename. */
+  --bg-tertiary-hover: #35373c;
+  --border-default: #555;
+  --buddy-bg: rgba(35, 165, 90, 0.08);
+  --buddy-bg-hover: rgba(35, 165, 90, 0.14);
+  --chip-bg: #2a2c34;
+  --chip-fg: #c8c9d1;
+  --color-bg: #fff; /* mint namespace */
+  --color-bg-warning: #fff8e1;
+  --color-error: #c53030;
+  --color-text-secondary: #888;
+  --fg-error: #ff6b6b;
+  --hover-bg: rgba(255, 255, 255, 0.05);
+  --input-bg: #0e0f15;
+  --muted: #666;
+  --panel-bg: #1a1c24;
+  --share-bg: rgba(88, 101, 242, 0.08);
+  --share-bg-hover: rgba(88, 101, 242, 0.14);
+  --success-bg: rgba(74, 217, 122, 0.15);
+  --surface: #1a1a1a;
+  --surface-active: #2a2a2a;
+  --surface-highlight: rgba(255, 200, 0, 0.1);
+  --surface-hover: #1a1a1a;
+  --text-danger: #ed4245;
+  --text-link: #5c8fff;
+  --text-warning: #f0b232;
+  --toast-bg: rgba(20, 22, 30, 0.95);
+  --toast-fg: #fff;
+  --warn-border: #f0c870;
+  --warn-fg: #5c4400;
+
+  /* Status/role families (ZEB-604 sweep 2) — distinct drifted values get
+     distinct tokens so this stays pixel-identical; convergence is a Commons
+     flip decision, not a sweep decision. */
+  --danger-muted: #d83c3e; /* de-facto form-error red (52 uses) */
+  --danger-alt: #d93838; /* governance-panel error red */
+  --danger-deep: #c00;
+  --danger-vivid: #e74c3c;
+  --danger-text-muted: #cc7a7a;
+  --danger-border-muted: #553333;
+  --mail-danger: #c83c3c; /* only used as tints in MailReader */
+  --mail-error-text: #c66;
+  --warning-bright: #fbbf24; /* conviction threshold */
+  --role-mod: #ffb84a;
+  --success-deep: #43b581;
+  --success-gov: #4ad97a;
+  --success-alt: #23a55a;
+  --presence-online: #3ba55d;
+  --gov-purple: #b29bff; /* sortition/Tier-3 accent */
+  --sortition-bg: rgba(170, 130, 255, 0.08);
+  --flashcard-correct: #57f287;
+  --flashcard-hint: #fee75c;
+  --library-accent: #788cc8; /* only used as tints in library browser */
+  --cat-orange: #e67e22; /* recommendation/sensitivity categories */
+  --cat-yellow: #f1c40f;
+  --cat-blue: #3498db;
+  --cat-purple: #9b59b6;
+  --net-ok-bg: #1a4a1a;
+  --net-ok-fg: #5cb85c;
+  --net-ok-deep: green;
+  --net-warn-bg: #4a3a00;
+  --net-warn-fg: #f0a020;
+
+  /* Text extras */
+  --text-bright: #fff; /* white text on colored/dark fills */
+  --text-faint: #8a8c95;
+  --text-dim: #999;
+  --text-chip: #d6d6d6;
+  --text-doc: #ddd;
+  --text-inverse-dark: #1a1a1a; /* dark text on bright badges */
+
+  /* Surface extras */
+  --panel-bg-deep: #0e1118;
+  --chip-bg-active: #3a3c44;
+  --color-border-soft: #eee; /* mint namespace */
+
+  /* Subtle fills & bright borders */
+  --bg-hover-subtle: rgba(255, 255, 255, 0.06);
+  --bg-highlight-faint: rgba(255, 255, 255, 0.03);
+  --border-bright: rgba(255, 255, 255, 0.3);
+
+  /* Shadow tiers (Commons flip maps these to its elevation system) */
+  --shadow-soft: rgba(0, 0, 0, 0.2);
+  --shadow-mid: rgba(0, 0, 0, 0.3);
+  --shadow-strong: rgba(0, 0, 0, 0.4);
+  --shadow-heavy: rgba(0, 0, 0, 0.6);
+
   --avatar-size-micro: 24px;
   --avatar-size-mini: 20px;
   --nav-width: 240px;

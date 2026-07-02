@@ -267,11 +267,11 @@
         font-weight: 600;
     }
     .time {
-        color: #999;
+        color: var(--text-dim);
         font-size: 0.9em;
     }
     .muted {
-        color: #999;
+        color: var(--text-dim);
     }
     .error {
         color: #c33;

@@ -156,7 +156,7 @@
   .level-option input[type='radio']:checked + .level-value {
     background: var(--accent);
     border-color: var(--accent);
-    color: #ffffff;
+    color: var(--text-bright);
   }
 
   .level-option input[type='radio']:focus-visible + .level-value {

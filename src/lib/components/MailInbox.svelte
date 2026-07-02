@@ -179,7 +179,7 @@
   }
 
   .folder-tab.active {
-    background: var(--surface-active, #2a2a2a);
+    background: var(--surface-active);
     color: var(--text-primary);
   }
 
@@ -190,7 +190,7 @@
     margin-left: 0.25rem;
     border-radius: 8px;
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     font-size: 0.6875rem;
     text-align: center;
   }
@@ -200,7 +200,7 @@
     border: none;
     border-radius: 4px;
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     cursor: pointer;
     font-size: 0.8125rem;
   }
@@ -233,11 +233,11 @@
   }
 
   .mail-row:hover {
-    background: var(--surface-hover, #1a1a1a);
+    background: var(--surface-hover);
   }
 
   .mail-row.selected {
-    background: var(--surface-active, #2a2a2a);
+    background: var(--surface-active);
   }
 
   .mail-row.unread {
@@ -306,7 +306,7 @@
     to { transform: rotate(360deg); }
   }
   .sync-error-icon {
-    color: #c66;
+    color: var(--mail-error-text);
     cursor: help;
     font-size: 0.95rem;
   }
@@ -320,7 +320,7 @@
     font-size: 0.8125rem;
   }
   .sync-refresh-btn:hover {
-    background: var(--hover-bg, rgba(255, 255, 255, 0.05));
+    background: var(--hover-bg);
     color: var(--text-primary);
   }
 </style>

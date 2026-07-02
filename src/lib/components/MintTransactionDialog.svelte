@@ -261,7 +261,7 @@
   }
 
   .error {
-    color: var(--color-error, #c53030);
+    color: var(--color-error);
     font-size: 0.875rem;
     margin: 0;
   }

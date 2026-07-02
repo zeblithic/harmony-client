@@ -177,7 +177,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 4px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 2px 8px var(--shadow-mid);
     z-index: 1000;
     min-width: 140px;
     padding: 4px 0;
@@ -194,5 +194,5 @@
     font-size: 0.85rem;
   }
   .context-menu button:hover { background: var(--bg-tertiary); }
-  .context-menu button.destructive { color: #d83c3e; }
+  .context-menu button.destructive { color: var(--danger-muted); }
 </style>

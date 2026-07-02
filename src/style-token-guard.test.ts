@@ -31,13 +31,27 @@ const ALLOWLIST_PATH = join(SRC_ROOT, 'style-token-allowlist.json');
 
 const STYLE_BLOCK = /<style[^>]*>([\s\S]*?)<\/style>/g;
 const CSS_COMMENT = /\/\*[\s\S]*?\*\//g;
-// Hex, color functions (legacy + modern), and common named colors in value
-// position. `transparent`/`currentcolor` are deliberately not counted — they
-// are compositional keywords, not themeable colors. Named-color matching
-// requires a value-ish left boundary so selectors like `.text-red` and
-// properties like `white-space` don't false-positive.
-const COLOR_LITERAL =
-  /#[0-9a-f]{3,8}\b|\b(?:rgb|rgba|hsl|hsla|oklch|oklab|lab|lch|hwb|color-mix)\(|(?<=[:\s,(])(?:white|black|red|green|blue|yellow|orange|purple|pink|(?:dark|light)?gr[ae]y)(?=[\s;,)}!])/gi;
+// Hex, raw color functions, and common named colors in value position.
+// `transparent`/`currentcolor` are deliberately not counted — they are
+// compositional keywords, not themeable colors. Named-color matching requires
+// a value-ish left boundary so selectors like `.text-red` and properties like
+// `white-space` don't false-positive.
+const COLOR_FN =
+  /\b(?:rgb|rgba|hsl|hsla|oklch|oklab|lab|lch|hwb|color-mix)\(((?:[^()]|\([^()]*\))*)\)/gi;
+const HEX = /#[0-9a-f]{3,8}\b/gi;
+const NAMED =
+  /(?<=[:\s,(])(?:white|black|red|green|blue|yellow|orange|purple|pink|(?:dark|light)?gr[ae]y)(?=[\s;,)}!])/gi;
+
+// A color function only counts as raw if its arguments carry raw color
+// components. `color-mix(in srgb, var(--accent) 15%, transparent)` is
+// token-driven styling — the encouraged idiom, not debt.
+function isRawFunctionArgs(args: string): boolean {
+  const cleaned = args
+    .replace(/var\(\s*--[\w-]+\s*\)/g, '')
+    .replace(/\d+(?:\.\d+)?%/g, '')
+    .replace(/\bin\s+[\w-]+/g, '');
+  return /[0-9#]/.test(cleaned) || new RegExp(NAMED.source, 'i').test(cleaned);
+}
 
 function svelteFiles(dir: string): string[] {
   const out: string[] = [];
@@ -53,7 +67,13 @@ function countRawColors(source: string): number {
   let count = 0;
   for (const block of source.matchAll(STYLE_BLOCK)) {
     const css = block[1].replace(CSS_COMMENT, '');
-    count += [...css.matchAll(COLOR_LITERAL)].length;
+    // Functions first (raw ones counted once, then removed so their inner
+    // hex/named components aren't double-counted), then bare hex/named.
+    const rest = css.replace(COLOR_FN, (_m, args: string) => {
+      if (isRawFunctionArgs(args)) count += 1;
+      return ' ';
+    });
+    count += [...rest.matchAll(HEX)].length + [...rest.matchAll(NAMED)].length;
   }
   return count;
 }

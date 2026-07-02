@@ -449,7 +449,7 @@
   .record-button.active {
     background: var(--accent);
     color: var(--text-primary);
-    box-shadow: 0 0 20px rgba(88, 101, 242, 0.4);
+    box-shadow: 0 0 20px color-mix(in srgb, var(--accent) 40%, transparent);
   }
 
   .done-ui {
@@ -469,12 +469,12 @@
   }
 
   .error-msg {
-    color: var(--text-danger, #ed4245);
+    color: var(--text-danger);
     max-width: 480px;
   }
 
   .persistence-warning {
-    color: var(--text-warning, #f0b232);
+    color: var(--text-warning);
     max-width: 480px;
     text-align: center;
   }

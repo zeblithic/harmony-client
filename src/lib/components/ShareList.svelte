@@ -128,11 +128,11 @@
     gap: 8px;
     padding: 4px 8px;
     border-radius: 4px;
-    background: var(--share-bg, rgba(88, 101, 242, 0.08));
+    background: var(--share-bg);
   }
 
   .peer-row:hover {
-    background: var(--share-bg-hover, rgba(88, 101, 242, 0.14));
+    background: var(--share-bg-hover);
   }
 
   .peer-name {

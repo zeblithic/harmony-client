@@ -258,7 +258,7 @@
     width: fit-content;
     transition: background 0.15s, color 0.15s;
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     border: 1px solid var(--accent);
   }
 
@@ -273,8 +273,8 @@
   }
 
   .follow-btn.following:hover {
-    border-color: #e74c3c;
-    color: #e74c3c;
+    border-color: var(--danger-vivid);
+    color: var(--danger-vivid);
   }
 
   .card-like-row {

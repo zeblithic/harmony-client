@@ -570,7 +570,7 @@
     flex-direction: column;
     gap: 0.75rem;
     padding: 1rem;
-    background: var(--panel-bg, #1a1c24);
+    background: var(--panel-bg);
     border-radius: 8px;
     margin-bottom: 1.5rem;
   }
@@ -581,9 +581,9 @@
     align-items: center;
   }
   textarea, select, input[type="number"] {
-    background: var(--input-bg, #0e0f15);
+    background: var(--input-bg);
     color: inherit;
-    border: 1px solid #2a2c34;
+    border: 1px solid var(--chip-bg);
     border-radius: 4px;
     padding: 0.4rem 0.5rem;
     font: inherit;
@@ -591,7 +591,7 @@
   button[type="submit"] {
     align-self: flex-start;
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
     border: 0;
     padding: 0.5rem 1rem;
     border-radius: 4px;
@@ -607,7 +607,7 @@
     z-index: 100;
   }
   .confirm-card {
-    background: var(--panel-bg, #1a1c24);
+    background: var(--panel-bg);
     padding: 1.25rem 1.5rem;
     border-radius: 8px;
     display: flex;
@@ -618,11 +618,11 @@
   .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
   .confirm-actions button:last-child {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
   }
   .list-heading { margin-top: 1.5rem; font-size: 1rem; }
   .poll-list { list-style: none; padding: 0; }
-  .poll-row { display: flex; gap: 0.5rem; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid #2a2c34; }
+  .poll-row { display: flex; gap: 0.5rem; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--chip-bg); }
   .poll-row-button {
     flex: 1;
     background: transparent;
@@ -637,7 +637,7 @@
     padding: 0.25rem 0.5rem;
     border-radius: 4px;
   }
-  .poll-row-button.selected { background: rgba(74, 158, 255, 0.1); }
+  .poll-row-button.selected { background: color-mix(in srgb, var(--info) 10%, transparent); }
   .proposal-text { font-weight: 500; }
   .retry-btn {
     background: transparent;
@@ -650,13 +650,13 @@
   .detail-pane {
     margin-top: 1.5rem;
     padding: 1rem;
-    background: var(--panel-bg, #1a1c24);
+    background: var(--panel-bg);
     border-radius: 8px;
   }
-  .stage-label { color: #8a8c95; font-size: 0.85rem; margin-top: -0.25rem; }
-  .error { color: #d93838; }
-  .empty { color: #8a8c95; }
-  .failed-detail { color: #d93838; }
+  .stage-label { color: var(--text-faint); font-size: 0.85rem; margin-top: -0.25rem; }
+  .error { color: var(--danger-alt); }
+  .empty { color: var(--text-faint); }
+  .failed-detail { color: var(--danger-alt); }
   /* ZEB-295 Phase 6 Task 11: ballot-secret affordances. Lock-icon chip
      on the list row, help text under the create-form privacy toggle,
      and the awaiting-tally banner on the ratification detail pane. */
@@ -665,10 +665,10 @@
     padding: 0.05rem 0.35rem;
     border-radius: 3px;
     background: rgba(170, 130, 255, 0.12);
-    color: #b29bff;
+    color: var(--gov-purple);
   }
   .help-text {
-    color: #8a8c95;
+    color: var(--text-faint);
     font-size: 0.8rem;
     margin: -0.4rem 0 0;
     line-height: 1.4;
@@ -676,10 +676,10 @@
   .awaiting-tally {
     margin: 0.75rem 0;
     padding: 0.6rem 0.8rem;
-    background: rgba(170, 130, 255, 0.08);
-    border-left: 3px solid #b29bff;
+    background: var(--sortition-bg);
+    border-left: 3px solid var(--gov-purple);
     border-radius: 3px;
-    color: #ddd;
+    color: var(--text-doc);
     font-size: 0.9rem;
   }
   .finalized-result { margin-top: 1rem; }
@@ -692,8 +692,8 @@
     margin-right: 0.4rem;
     font-weight: 500;
   }
-  .badge.winner { background: var(--success-bg, rgba(74, 217, 122, 0.15)); color: #4ad97a; }
-  .badge.runner-up { background: rgba(74, 158, 255, 0.15); color: var(--accent); }
-  .finalists { margin-top: 0.5rem; color: #8a8c95; font-size: 0.85rem; }
+  .badge.winner { background: var(--success-bg); color: var(--success-gov); }
+  .badge.runner-up { background: color-mix(in srgb, var(--info) 15%, transparent); color: var(--accent); }
+  .finalists { margin-top: 0.5rem; color: var(--text-faint); font-size: 0.85rem; }
   .finalists ol { margin: 0.25rem 0; padding-left: 1.25rem; }
 </style>

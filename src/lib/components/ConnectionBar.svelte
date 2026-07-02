@@ -136,7 +136,7 @@
     border: none;
     border-radius: 4px;
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     font-size: 11px;
     font-weight: 600;
     cursor: pointer;

@@ -234,8 +234,8 @@
     box-sizing: border-box;
   }
   .presence-dot.online {
-    background: #3ba55d;
-    border-color: #3ba55d;
+    background: var(--presence-online);
+    border-color: var(--presence-online);
   }
   .avatar-trigger {
     background: none;
@@ -274,5 +274,5 @@
     color: var(--text-secondary);
   }
   .role[data-role="admin"] { color: var(--accent); }
-  .role[data-role="mod"] { color: #ffb84a; }
+  .role[data-role="mod"] { color: var(--role-mod); }
 </style>

@@ -197,7 +197,7 @@
     font-size: 0.9rem; text-align: center; font-family: monospace;
   }
   .error-banner {
-    background: var(--bg-tertiary); border: 1px solid #d83c3e; color: #d83c3e;
+    background: var(--bg-tertiary); border: 1px solid var(--danger-muted); color: var(--danger-muted);
     padding: 8px 10px; border-radius: 4px; font-size: 0.8rem; margin-bottom: 12px;
   }
   .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }

@@ -63,12 +63,12 @@
     background: var(--bg-secondary);
     color: var(--text-primary);
     border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 4px 12px var(--shadow-mid);
     z-index: 1000;
   }
   .title { font-weight: 600; margin-bottom: 0.5rem; }
   .error {
-    color: var(--fg-error, #ff6b6b);
+    color: var(--fg-error);
     font-size: 0.875rem;
     margin-bottom: 0.5rem;
   }
@@ -76,7 +76,7 @@
   .actions button {
     padding: 0.375rem 0.75rem;
     border-radius: 4px;
-    border: 1px solid var(--border-default, #555);
+    border: 1px solid var(--border-default);
     background: transparent;
     color: inherit;
     cursor: pointer;

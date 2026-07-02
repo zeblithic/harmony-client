@@ -170,7 +170,7 @@
     margin: 4px 0 0;
   }
   .error {
-    color: #cc7a7a;
+    color: var(--danger-text-muted);
     font-size: 0.8rem;
     margin: 8px 0 0;
   }
@@ -203,8 +203,8 @@
     cursor: not-allowed;
   }
   .proceed-btn {
-    background: #d83c3e;
-    color: #fff;
+    background: var(--danger-muted);
+    color: var(--text-bright);
   }
   .proceed-btn:disabled {
     opacity: 0.55;
@@ -219,8 +219,8 @@
     display: inline-block;
     width: 12px;
     height: 12px;
-    border: 2px solid rgba(255, 255, 255, 0.3);
-    border-top-color: #fff;
+    border: 2px solid var(--border-bright);
+    border-top-color: var(--text-bright);
     border-radius: 50%;
     animation: spin 0.6s linear infinite;
     flex-shrink: 0;

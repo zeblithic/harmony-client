@@ -286,13 +286,13 @@
   }
 
   .bulk-btn.burn:hover {
-    border-color: #d83c3e;
-    color: #d83c3e;
+    border-color: var(--danger-muted);
+    color: var(--danger-muted);
   }
 
   .bulk-btn.publish:hover {
-    border-color: #43b581;
-    color: #43b581;
+    border-color: var(--success-deep);
+    color: var(--success-deep);
   }
 
   .recommendations-list {

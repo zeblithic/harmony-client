@@ -351,7 +351,7 @@
 
   .error-label {
     font-size: 0.85rem;
-    color: #ed4245;
+    color: var(--text-danger);
   }
 
   .cid-label {
@@ -408,7 +408,7 @@
   }
 
   .reshare-error {
-    color: #ed4245;
+    color: var(--text-danger);
     font-size: 0.75rem;
   }
 
@@ -437,8 +437,8 @@
   }
 
   .like-btn.liked {
-    color: #ed4245;
-    border-color: rgba(237, 66, 69, 0.3);
+    color: var(--text-danger);
+    border-color: color-mix(in srgb, var(--text-danger) 30%, transparent);
   }
 
   .heart {

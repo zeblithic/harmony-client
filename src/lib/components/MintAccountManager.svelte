@@ -145,15 +145,15 @@
 
 <style>
   .mint-dialog { position: fixed; inset: 0; background: var(--overlay); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-  .dialog-body { background: var(--color-bg, #fff); padding: 1.5rem; border-radius: 8px; min-width: 480px; max-width: 90vw; display: flex; flex-direction: column; gap: 0.75rem; }
+  .dialog-body { background: var(--color-bg); padding: 1.5rem; border-radius: 8px; min-width: 480px; max-width: 90vw; display: flex; flex-direction: column; gap: 0.75rem; }
   .new-account { display: flex; gap: 0.5rem; }
   .new-account input { flex: 1; }
   .accounts-list { list-style: none; padding: 0; margin: 0; }
-  .accounts-list li { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-bottom: 1px solid var(--color-border, #eee); }
+  .accounts-list li { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-bottom: 1px solid var(--color-border-soft); }
   .name { flex: 1; }
-  .count { color: var(--color-text-secondary, #888); font-size: 0.85em; }
-  .confirm-delete { padding: 0.75rem; background: var(--color-bg-warning, #fff8e1); border-radius: 4px; }
+  .count { color: var(--color-text-secondary); font-size: 0.85em; }
+  .confirm-delete { padding: 0.75rem; background: var(--color-bg-warning); border-radius: 4px; }
   .dialog-actions { display: flex; justify-content: flex-end; }
-  .error { color: var(--color-error, #c53030); }
+  .error { color: var(--color-error); }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 </style>

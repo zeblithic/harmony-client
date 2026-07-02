@@ -663,7 +663,7 @@
     border: 1px solid var(--border);
     max-width: 640px;
     width: 100%;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    box-shadow: 0 8px 24px var(--shadow-heavy);
   }
   .header {
     padding: 16px 20px;
@@ -709,10 +709,10 @@
     font-weight: bold;
   }
   .role-badge[data-role="member"] { background: var(--bg-tertiary); color: var(--text-secondary); }
-  .role-badge[data-role="mod"] { background: #ffb84a; color: #1a1a1a; }
+  .role-badge[data-role="mod"] { background: var(--role-mod); color: var(--text-inverse-dark); }
   .role-badge[data-role="admin"] { background: var(--accent); color: var(--text-primary); }
   .healthy { color: #7acc7a; }
-  .degraded { color: #ffb84a; }
+  .degraded { color: var(--role-mod); }
   .muted { color: var(--text-secondary); }
   .member-list { display: flex; flex-direction: column; }
   .member-row {
@@ -752,13 +752,13 @@
   }
   .kick {
     background: var(--bg-tertiary);
-    color: #cc7a7a;
-    border: 1px solid #553333;
+    color: var(--danger-text-muted);
+    border: 1px solid var(--danger-border-muted);
   }
   .leave-btn {
     background: var(--bg-tertiary);
-    color: #cc7a7a;
-    border: 1px solid #553333;
+    color: var(--danger-text-muted);
+    border: 1px solid var(--danger-border-muted);
     padding: 6px 14px;
     border-radius: 4px;
     cursor: pointer;
@@ -854,7 +854,7 @@
   }
   .fork-error {
     font-size: 0.7rem;
-    color: #cc7a7a;
+    color: var(--danger-text-muted);
     margin: 8px 0 0;
   }
   /* ZEB-250: admin governance section */
@@ -884,7 +884,7 @@
   /* ZEB-250: member-row pending badge */
   .pending-badge {
     font-size: 0.65rem;
-    color: #ffb84a;
+    color: var(--role-mod);
     white-space: nowrap;
   }
 </style>

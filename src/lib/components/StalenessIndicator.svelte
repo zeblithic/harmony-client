@@ -46,14 +46,14 @@
   }
 
   .staleness-dot.yellow {
-    background: #f0b232;
+    background: var(--text-warning);
   }
 
   .staleness-dot.orange {
-    background: #e67e22;
+    background: var(--cat-orange);
   }
 
   .staleness-dot.red {
-    background: #d83c3e;
+    background: var(--danger-muted);
   }
 </style>
