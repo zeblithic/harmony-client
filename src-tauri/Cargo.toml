@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Harmony Network Client"
 authors = ["zeblithic"]
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.91"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -157,14 +157,14 @@ rust_decimal = "1"
 csv = "1"
 chrono = "0.4"
 frost-ristretto255 = { version = "3.0.0", features = ["serde"] }
-# ZEB-321 Phase 1 Task 4: iroh endpoint used by the upcoming
-# zenoh-over-iroh transport and the harmony device handshake. Version
-# pinned at 0.98 (latest stable as of 2026-05). The harmony-* workspace
-# crates we depend on do NOT pull iroh transitively (verified upstream),
-# so we have free choice of version. Note the 0.98 API surface differs
-# from the plan's draft (NodeId→EndpointId, builder takes a Preset, etc);
-# adaptations are documented in `src/iroh_endpoint.rs`.
-iroh = "0.98"
+# ZEB-321 Phase 1 Task 4 (upgraded ZEB-619): iroh endpoint used by the
+# zenoh-over-iroh transport and the harmony device handshakes. Pinned at
+# 1.0 (wire-frozen major: any v1.x endpoint interoperates with any other
+# v1.x; v1 CANNOT talk to v0.98 — fleet upgrades are flag-day). The
+# harmony-* workspace crates we depend on do NOT pull iroh transitively
+# (verified 2026-07-01), so we have free choice of version. MSRV floor
+# 1.91 comes from this crate.
+iroh = "1.0"
 # ZEB-321 Phase 1 Task 7: network-interface change watcher used by
 # `reachability_publisher` to debounce republishes on IP / link
 # transitions. `if-watch` v3 exposes its tokio adapter via
