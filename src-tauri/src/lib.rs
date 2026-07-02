@@ -5151,6 +5151,12 @@ pub async fn start_node_inner(
                                     );
                                 }
                             })),
+                            // ZEB-618: presence-driven reachability kick for
+                            // every spawned engine's root-fetch driver — the
+                            // same watch the channel-log backfill drivers get
+                            // (wired into ChannelLogRegistryConfig below). The
+                            // registry clones the receiver per driver.
+                            presence_resync_rx: Some(presence_resync_rx.clone()),
                         };
                         std::sync::Arc::new(
                             crate::community_state_sync::CommunitySyncRegistry::new(cfg),
@@ -24215,6 +24221,7 @@ mod create_community_inner_tests {
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
                 nav_emitter: None,
+                presence_resync_rx: None,
             }));
 
         // Community adapter channel — receiver kept alive so try_send
@@ -26253,6 +26260,7 @@ mod list_bootstrap_hint_tests {
             signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
             crdt_state: None,
             nav_emitter: None,
+            presence_resync_rx: None,
         }));
 
         let (pub_tx, _pub_rx) = mpsc::channel(8);
@@ -28689,6 +28697,7 @@ mod redeem_invite_inner_tests {
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
                 nav_emitter: None,
+                presence_resync_rx: None,
             }));
 
         let (community_adapter_tx, _community_adapter_rx) =
@@ -30085,6 +30094,7 @@ mod zeb436_orphan_adoption_tests {
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
                 nav_emitter: None,
+                presence_resync_rx: None,
             }));
 
         let (community_adapter_tx, _community_adapter_rx) =
@@ -58282,6 +58292,7 @@ mod owner_loaded_tests {
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
                 nav_emitter: None,
+                presence_resync_rx: None,
             }));
 
         let (community_adapter_request_tx, community_adapter_rx) =

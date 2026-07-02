@@ -3944,6 +3944,14 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
     }
 }
 
+/// ZEB-618: sidecar dir for a community's root-fetch resync stamp —
+/// the community's own engine dir (same layout `paths_for`/PersistPaths
+/// derives). Free fn so the config-derivation unit test can pin the
+/// layout without a registry instance.
+fn community_root_resync_dir(identity_dir: &std::path::Path, id: &SpaceId) -> std::path::PathBuf {
+    identity_dir.join("communities").join(hex::encode(id.0))
+}
+
 /// Test-only re-export of `classify_incoming_error`. Lets the unit
 /// test pin the reason_tag → variant mapping without exposing the
 /// internal function as part of the public API.
@@ -4022,6 +4030,12 @@ pub struct CommunityRegistryConfig {
     /// Tauri `AppHandle`. `None` for tests and for registries that don't
     /// handle joiner-side pending-clear events.
     pub nav_emitter: Option<NavPendingClearEmitter>,
+
+    /// ZEB-618: presence-driven reachability kick for each engine's
+    /// root-fetch driver (ZEB-599 D1 parity with the channel-log
+    /// drivers). Cloned per spawned driver. `None` for tests/callers
+    /// without presence.
+    pub presence_resync_rx: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
 /// Multi-community engine lifecycle manager. Owns
@@ -4837,26 +4851,90 @@ impl CommunitySyncRegistry {
                     }
                 }
             };
+            // ZEB-618: restart-aware anti-entropy floor for THIS community's
+            // root fetch (ZEB-599 parity with the channel-log backfill
+            // drivers). Sidecar lives in the community's own engine dir. The
+            // interval is a SINGLE jittered draw shared between the persisted
+            // first-deadline and the driver arg — so the two can never
+            // diverge (mirrors the mail-root pair built by Task 5). Any
+            // missing piece degrades to the legacy interval-from-spawn floor.
+            let (root_interval_ms, root_persist) = {
+                let dir = community_root_resync_dir(&self.cfg.identity_dir, &community_id);
+                // Async create_dir_all (ZEB-467: no blocking fs on the spawn
+                // path). The community dir is created lazily on first CRDT
+                // persist, so ensure it exists now — otherwise the floor's
+                // `save` callback (which does NOT create_dir_all) has nowhere
+                // to write and forfeits restart-awareness every cycle.
+                match tokio::fs::create_dir_all(&dir).await {
+                    Ok(()) => {
+                        let interval_ms = crate::channel_backfill::periodic_resync_interval_ms();
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let last =
+                            crate::community_channel_log::ChannelBackfillState::load_async(&dir)
+                                .await
+                                .map(|s| s.last_full_reconcile_ms);
+                        let first_deadline_ms = crate::channel_backfill::first_resync_deadline(
+                            last,
+                            interval_ms,
+                            now_ms,
+                        );
+                        let persist_dir = dir.clone();
+                        (
+                            interval_ms,
+                            Some(crate::channel_backfill::ResyncPersist {
+                                first_deadline_ms,
+                                on_full_reconcile: std::sync::Arc::new(move |fired_at_ms| {
+                                    let dir = persist_dir.clone();
+                                    // Tiny sidecar write off the driver task
+                                    // (same shape as the mail-root / channel-log
+                                    // ZEB-599 callbacks).
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Err(e) =
+                                            crate::community_channel_log::ChannelBackfillState::save(
+                                                &dir,
+                                                fired_at_ms,
+                                            )
+                                        {
+                                            tracing::debug!(error = %e, "community-root resync persist failed (hint only)");
+                                        }
+                                    });
+                                }),
+                            }),
+                        )
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "community-root resync dir create failed; legacy floor");
+                        (crate::channel_backfill::periodic_resync_interval_ms(), None)
+                    }
+                }
+            };
             tokio::spawn(crate::channel_backfill::run_root_fetch_driver(
                 crate::channel_backfill::RootFetchLatch::new(),
                 request_root,
                 driver_shutdown_rx,
                 transport_epoch_rx,
-                // ZEB-618: presence-kick wiring lands in Tasks 5-6.
-                None,
+                // ZEB-618: presence kick — the registry-level receiver cloned
+                // per spawned driver (same watch the channel-log drivers get).
+                // `None` when the caller wired no presence source.
+                self.cfg.presence_resync_rx.clone(),
                 // ZEB-425: anti-entropy floor — re-arm the community root
                 // fetch ~hourly (jittered per driver to avoid a startup
                 // thundering herd) even with no epoch bump (router-only
-                // gateways / late queryables / same-zid reconnects).
-                Some(crate::channel_backfill::periodic_resync_interval_ms()),
+                // gateways / late queryables / same-zid reconnects). ZEB-618:
+                // the interval is the single draw shared with `root_persist`.
+                Some(root_interval_ms),
                 || {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0)
                 },
-                // ZEB-618: restart-aware persisted floor lands in Tasks 5-6.
-                None,
+                // ZEB-618: restart-aware persisted floor (Some in production,
+                // None when the sidecar dir couldn't be prepared).
+                root_persist,
             ));
         }
 
@@ -5245,6 +5323,18 @@ mod tests {
         }
     }
 
+    /// ZEB-618: the per-community resync sidecar path derives from
+    /// `identity_dir` exactly like `paths_for`/PersistPaths does.
+    #[test]
+    fn community_root_resync_dir_matches_engine_layout() {
+        let sid = SpaceId([0x77; 16]);
+        let dir = community_root_resync_dir(std::path::Path::new("/tmp/idroot"), &sid);
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from(format!("/tmp/idroot/communities/{}", hex::encode(sid.0)))
+        );
+    }
+
     // ---- ZEB-339 Task 9: publisher-auth via materialized enrolled keys ----
 
     /// Build a signed `CommunityRootPublishPayload` for `publisher_addr`,
@@ -5408,6 +5498,7 @@ mod tests {
             signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
             crdt_state: None,
             nav_emitter: None,
+            presence_resync_rx: None,
         }));
 
         // Adapter-request bridge: `spawn_engine_with_guard` will

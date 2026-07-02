@@ -230,6 +230,7 @@ async fn setup_one_community(
         signing_key: signing_key_from(admin),
         crdt_state: None,
         nav_emitter: None,
+        presence_resync_rx: None,
     });
 
     let community_id = SpaceId(cid_bytes);

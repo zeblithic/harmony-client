@@ -106,6 +106,7 @@ async fn seeded_registry(
         signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
         crdt_state: None,
         nav_emitter: None,
+        presence_resync_rx: None,
     }));
 
     // Keep the tempdir alive for the test's lifetime — leak it (test process is
