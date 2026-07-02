@@ -2728,6 +2728,8 @@ pub async fn run(
                 request_root,
                 mail_shutdown_rx,
                 epoch_rx_mail,
+                // ZEB-618: presence-kick wiring lands in Tasks 5-6.
+                None,
                 // ZEB-425: anti-entropy floor — re-arm the mail-root fetch
                 // ~hourly (jittered per driver to avoid a startup thundering
                 // herd) even with no epoch bump (router-only gateways / late
@@ -2739,6 +2741,8 @@ pub async fn run(
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0)
                 },
+                // ZEB-618: restart-aware persisted floor lands in Tasks 5-6.
+                None,
             ));
         }
     }

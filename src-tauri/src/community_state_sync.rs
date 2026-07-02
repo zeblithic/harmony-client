@@ -4842,6 +4842,8 @@ impl CommunitySyncRegistry {
                 request_root,
                 driver_shutdown_rx,
                 transport_epoch_rx,
+                // ZEB-618: presence-kick wiring lands in Tasks 5-6.
+                None,
                 // ZEB-425: anti-entropy floor — re-arm the community root
                 // fetch ~hourly (jittered per driver to avoid a startup
                 // thundering herd) even with no epoch bump (router-only
@@ -4853,6 +4855,8 @@ impl CommunitySyncRegistry {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0)
                 },
+                // ZEB-618: restart-aware persisted floor lands in Tasks 5-6.
+                None,
             ));
         }
 
@@ -7013,6 +7017,8 @@ mod tests {
                 request_root.clone(),
                 shutdown_rx,
                 None,
+                // no presence watch
+                None,
                 // resync disabled (epoch None too): the driver must return
                 // on Idle once satisfied, as this test's 30 s timeout
                 // assumes.
@@ -7025,6 +7031,8 @@ mod tests {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0)
                 },
+                // no persist sink
+                None,
             ),
         )
         .await
