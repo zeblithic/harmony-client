@@ -1024,24 +1024,32 @@ pub async fn run(
 
     // ZEB-616 Component C: bound how long a silently-dead path's zenoh face
     // can linger when no reconnect arrives to trigger the accept-loop teardown
-    // (zenoh_iroh_transport.rs, Component A). In zenoh 1.9.0 `keep_alive` is
-    // the number of keep-alive probes per lease (probe interval = lease /
-    // keep_alive): lease 4000ms with keep_alive 4 → a probe every 1s, a dead
-    // path's face reaped within ~4s (vs the ~10s default lease). Conservative
-    // — large enough not to false-positive a briefly-quiet healthy link, small
-    // enough to shrink the stale-face window and speed post-partition
-    // convergence. keep_alive=4 matches the current default but is set
+    // (zenoh_iroh_transport.rs, Component A). GATED on iroh being enabled:
+    // this tuning targets the iroh stale-face case, and zenoh's
+    // `transport/link/tx` lease is transport-GLOBAL (not per-link-kind), so
+    // applying it only on iroh-enabled runs keeps the blast radius off
+    // pure-non-iroh runs — matching the config-scope discipline of PR#188/#268
+    // (which preserved other listeners in this same block). Within an
+    // iroh-enabled run the shortened lease also covers any coexisting LAN/TCP
+    // links, which is benign (keep_alive probes every 1s ≪ the 4s lease keep a
+    // healthy link alive) and consistent with faster mesh convergence. In
+    // zenoh 1.9.0 `keep_alive` is the number of keep-alive probes per lease
+    // (probe interval = lease / keep_alive): lease 4000ms with keep_alive 4 →
+    // a probe every 1s, a dead path's face reaped within ~4s (vs the ~10s
+    // default lease). keep_alive=4 matches the current default but is set
     // explicitly so the probe cadence is pinned against a future default
     // change.
-    if let Err(e) = config.insert_json5("transport/link/tx/lease", "4000") {
-        let e = format!("zenoh config error (tx/lease): {e}");
-        let _ = ready_tx.send(Err(e));
-        return;
-    }
-    if let Err(e) = config.insert_json5("transport/link/tx/keep_alive", "4") {
-        let e = format!("zenoh config error (tx/keep_alive): {e}");
-        let _ = ready_tx.send(Err(e));
-        return;
+    if iroh_handles.is_some() {
+        if let Err(e) = config.insert_json5("transport/link/tx/lease", "4000") {
+            let e = format!("zenoh config error (tx/lease): {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+        if let Err(e) = config.insert_json5("transport/link/tx/keep_alive", "4") {
+            let e = format!("zenoh config error (tx/keep_alive): {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
     }
 
     let (zenoh_runtime, session) =
