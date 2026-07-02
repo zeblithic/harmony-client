@@ -16,7 +16,7 @@ On a mid-session drop, teardown of the surviving peer's stale zenoh face relies 
 
 The inbound accept loop admits a reconnect's fresh link **without first closing the old connection** for that peer. The zenoh-ALPN branch (`zenoh_iroh_transport.rs:399-421`) builds a new `IrohZenohLink` per inbound connection and sends it straight into zenoh's transport stack via `new_link_tx`, with no lookup of any prior connection for the same `peer_id`. When the reconnect's handshake completes and zenoh discovers the (identical, stable) zid, the new session's resource re-declarations collide with the lingering face's resource-id mappings, and upstream zenoh emits a burst of:
 
-```
+```text
 zenoh::net::routing::dispatcher::resource: north/<peer>:N Resource K remapped. Remapping unsupported!
 ```
 
@@ -87,25 +87,29 @@ The exact "is this still the live connection?" comparison is settled in the plan
 
 ### Component C — keepalive/lease config (defense-in-depth)
 
-Add to the zenoh `Config` block (`event_loop.rs:925-1023`), alongside the existing `insert_json5` keys:
+Add to the zenoh `Config` block (`event_loop.rs:925-1023`), **gated on iroh being enabled** (`iroh_handles.is_some()`) so the tuning only applies on runs that actually use the iroh transport whose stale faces it targets:
 
 ```rust
 // ZEB-616: bound how long a silently-dead path's face can linger when no
 // reconnect arrives to trigger the accept-loop teardown (Component A).
-// keep_alive probes detect a dead path; a shorter lease reaps its face
-// sooner. In zenoh 1.9.0 `keep_alive` is a divisor of `lease` (probe
-// interval = lease / keep_alive). Proposed starting values: lease 4000ms
-// (down from the ~10s default) with the default keep_alive divisor of 4
+// GATED on iroh: zenoh's `transport/link/tx` lease is transport-GLOBAL (not
+// per-link-kind), so applying it only on iroh-enabled runs keeps the blast
+// radius off pure-non-iroh runs. keep_alive probes detect a dead path; a
+// shorter lease reaps its face sooner. In zenoh 1.9.0 `keep_alive` is the
+// number of keep-alive probes per lease (probe interval = lease /
+// keep_alive): lease 4000ms (down from the ~10s default) with keep_alive 4
 // → a probe every 1s, face reaped within ~4s of a dead path.
-config.insert_json5("transport/link/tx/lease", "4000")?;
-config.insert_json5("transport/link/tx/keep_alive", "4")?;
+if iroh_handles.is_some() {
+    config.insert_json5("transport/link/tx/lease", "4000")?;
+    config.insert_json5("transport/link/tx/keep_alive", "4")?;
+}
 ```
 
-The proposed values are conservative — large enough not to false-positive a briefly-quiet healthy link, small enough to shrink the stale-face window — and are validated in the plan (a too-aggressive lease could reap a healthy-but-idle link). This does not eliminate the reconnect-before-expiry race — that is Component A's job — but it caps the worst case for a peer that drops and does not reconnect, and it makes the whole mesh converge faster after any partition.
+The values are conservative — large enough not to false-positive a briefly-quiet healthy link, small enough to shrink the stale-face window — and are validated in the plan (a too-aggressive lease could reap a healthy-but-idle link). Within an iroh-enabled run the transport-global lease also covers any coexisting LAN/TCP links, which is benign (1s keepalive probes ≪ the 4s lease keep a healthy link alive) and consistent with faster mesh convergence. This does not eliminate the reconnect-before-expiry race — that is Component A's job — but it caps the worst case for a peer that drops and does not reconnect, and it makes the whole mesh converge faster after any partition.
 
 ## Data flow
 
-```
+```text
 peer path drops  ──►  (silently-dead: no error until next I/O or keepalive)
                        Component C keepalive probe eventually errors the link ──► zenoh reaps face
 peer reconnects  ──►  inbound QUIC accept (zenoh ALPN)

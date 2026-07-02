@@ -260,6 +260,21 @@ impl IrohZenohLinkManager {
         self.zenoh_conns.lock().unwrap().insert(peer_id, conn)
     }
 
+    /// ZEB-616: is `conn_id` still the registered live connection for
+    /// `peer_id`? The accept path uses this after `accept_bi()` to drop a
+    /// stale link when a same-zid reconnect superseded this connection while
+    /// its bi stream was being accepted — same identity predicate the
+    /// drop-watcher applies via [`should_evict_on_close`]. Best-effort
+    /// (lock-check, no mutation): worst case on a race is today's behavior.
+    fn is_active_zenoh_conn(&self, peer_id: EndpointId, conn_id: usize) -> bool {
+        self.zenoh_conns
+            .lock()
+            .unwrap()
+            .get(&peer_id)
+            .map(|c| c.stable_id())
+            == Some(conn_id)
+    }
+
     /// ZEB-418 P1: install the butler-deposit acceptor used by the accept
     /// loop to route inbound `harmony/butler-deposit/v1` connections.
     /// Install-once (mirrors the handshake dispatcher's lifecycle); a second
@@ -487,10 +502,34 @@ impl IrohZenohLinkManager {
                         let (send, recv) = match conn.accept_bi().await {
                             Ok(s) => s,
                             Err(e) => {
+                                // ZEB-616: accept_bi failed. If this is still the
+                                // registered connection for the peer, close it so
+                                // the drop-watcher evicts the registry entry — a
+                                // stream-level failure can leave the connection
+                                // open, and we must not leave a faceless
+                                // connection occupying the peer's slot. Guarded so
+                                // it's a no-op if a reconnect already superseded
+                                // us (that reconnect's swap already closed us).
                                 tracing::warn!("iroh accept_bi failed: {e}");
+                                if mgr.is_active_zenoh_conn(peer_id, conn_id) {
+                                    conn.close(0u32.into(), b"zeb616-accept-bi-failed");
+                                }
                                 return;
                             }
                         };
+                        // ZEB-616: a same-zid reconnect may have superseded this
+                        // connection while accept_bi() was awaiting (its swap
+                        // closed us and installed a newer conn). Do NOT admit a
+                        // stale link — that would re-introduce the collision this
+                        // fix prevents. Only the current registry entry proceeds.
+                        if !mgr.is_active_zenoh_conn(peer_id, conn_id) {
+                            tracing::debug!(
+                                peer = %peer_id,
+                                "ZEB-616: connection superseded during accept_bi; \
+                                 dropping stale link"
+                            );
+                            return;
+                        }
                         let src = locator_from_endpoint_id(&mgr.endpoint.node_id());
                         let dst = locator_from_endpoint_id(&peer_id);
                         let link: Arc<dyn LinkUnicastTrait> =
