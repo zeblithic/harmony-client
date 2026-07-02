@@ -47,11 +47,13 @@ use crate::iroh_dial_driver::PeerDialer;
 use crate::network_health::DialTelemetry;
 use crate::reachability_resolver::ReachabilityResolver;
 
-/// Fractional jitter added to every scheduled delay: the realized delay is
-/// `nominal × (1.0 + rand[0, JITTER_FRACTION])`, i.e. jitter only ever *extends*
-/// a delay (never shortens it below the nominal rung), spreading a herd of
-/// simultaneous re-arms without dialing more eagerly than the ladder intends.
-const JITTER_FRACTION: f64 = 0.1;
+/// Multiplicative jitter applied to every scheduled delay: the realized delay is
+/// `nominal × U[JITTER_LO, JITTER_HI)`, a uniform multiplier over a full-width
+/// window centred on the nominal rung. Unlike a one-sided extension, a rung may
+/// fire earlier *or* later than nominal, decorrelating a herd of simultaneous
+/// re-arms in both directions. Deterministic under `SupervisorConfig.jitter_seed`.
+const JITTER_LO: f64 = 0.5;
+const JITTER_HI: f64 = 1.5;
 
 /// Why a peer needs attention. Kicks are idempotent — duplicates are harmless
 /// (the dirty set coalesces them). On merge the *strongest* trigger wins:
@@ -161,12 +163,12 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            retry_base: Duration::from_secs(2),
-            retry_cap: Duration::from_secs(60),
-            dormant_after: Duration::from_secs(15 * 60),
-            presence_sweep_cooldown: Duration::from_secs(30),
-            max_concurrent_dials: 8,
-            higher_id_fallback_delay: Duration::from_secs(3),
+            retry_base: Duration::from_secs(1),
+            retry_cap: Duration::from_secs(300),
+            dormant_after: Duration::from_secs(900),
+            presence_sweep_cooldown: Duration::from_secs(60),
+            max_concurrent_dials: 4,
+            higher_id_fallback_delay: Duration::from_secs(5),
             jitter_seed: None,
         }
     }
@@ -305,7 +307,7 @@ fn nominal_delay(attempt: u32, role: DialRole, config: &SupervisorConfig) -> Dur
     config.retry_base.saturating_mul(mult).min(config.retry_cap)
 }
 
-/// Realized delay = nominal extended by up to [`JITTER_FRACTION`].
+/// Realized delay = nominal × a uniform multiplier in `[JITTER_LO, JITTER_HI)`.
 fn schedule_delay(
     attempt: u32,
     role: DialRole,
@@ -313,8 +315,8 @@ fn schedule_delay(
     rng: &mut ChaCha8Rng,
 ) -> Duration {
     let nominal = nominal_delay(attempt, role, config);
-    let frac: f64 = rng.gen_range(0.0..=JITTER_FRACTION);
-    nominal + nominal.mul_f64(frac)
+    let mult: f64 = rng.gen_range(JITTER_LO..JITTER_HI);
+    nominal.mul_f64(mult)
 }
 
 /// Deterministic-locator form used for every dial (`iroh/<hex(node_id)>`); the
@@ -761,17 +763,19 @@ mod tests {
         );
     }
 
-    /// Jitter only ever *extends* a delay by up to `JITTER_FRACTION`, so the
-    /// observed gap for a nominal rung lies in `[nominal, nominal·1.1]`. We add a
-    /// small slack for scheduler dispatch latency (≈0 under a paused clock).
+    /// Jitter multiplies each nominal rung by a uniform factor in
+    /// `[JITTER_LO, JITTER_HI)`, so the realized delay for a nominal rung lies in
+    /// `[JITTER_LO·nominal, JITTER_HI·nominal)`. The high bound adds a small slack
+    /// for scheduler dispatch latency (≈0 under a paused clock); the low bound is
+    /// the exact envelope floor (dispatch latency only ever lengthens the gap).
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)
     }
     fn rung_lo(nominal_ms: u64) -> Duration {
-        ms(nominal_ms)
+        ms((nominal_ms as f64 * JITTER_LO) as u64)
     }
     fn rung_hi(nominal_ms: u64) -> Duration {
-        ms((nominal_ms as f64 * (1.0 + JITTER_FRACTION)) as u64 + 60)
+        ms((nominal_ms as f64 * JITTER_HI) as u64 + 60)
     }
 
     // ---- tests -----------------------------------------------------------
@@ -857,8 +861,11 @@ mod tests {
         tokio::time::sleep(ms(2_000)).await;
 
         let times = dialer.times_for(p);
-        let after = *times.last().unwrap();
         assert!(times.len() > before, "Dropped kick should produce a dial");
+        // `before` dials preceded the kick (quiescent above), so the first dial
+        // after it is the re-armed base dial. Under wide jitter a further ladder
+        // dial may follow inside the 2s window, so index the first, not the last.
+        let after = times[before];
         assert_between(
             after - kick_at,
             rung_lo(1_000),
@@ -889,9 +896,12 @@ mod tests {
         handle.kick(p, ReconnectTrigger::NewPeer);
         tokio::time::sleep(ms(100_000)).await;
         let dormant_count = dialer.count_for(p);
+        // Jitter is U[0.5,1.5): the 10s dormancy line can be crossed as early as
+        // the 3rd failed dial (rungs near 1.5x) or as late as the 5th (rungs near
+        // 0.5x), so the envelope-honest count is 3..=5.
         assert!(
-            (3..=4).contains(&dormant_count),
-            "expected ~4 pre-dormant dials, got {dormant_count}"
+            (3..=5).contains(&dormant_count),
+            "expected 3..=5 pre-dormant dials, got {dormant_count}"
         );
         // Long quiescent window: no dials once dormant.
         tokio::time::sleep(ms(100_000)).await;
@@ -902,9 +912,12 @@ mod tests {
         handle.kick(p, ReconnectTrigger::NewPeer);
         tokio::time::sleep(ms(2_000)).await;
         let times = dialer.times_for(p);
-        assert_eq!(times.len(), dormant_count + 1, "revival produces one dial");
+        // A revived peer re-arms at the base rung; under wide jitter a second
+        // ladder dial can also fall inside the 2s window, so assert the *first*
+        // post-revival dial (not an exact count) lands at base.
+        assert!(times.len() > dormant_count, "revival produces a dial");
         assert_between(
-            *times.last().unwrap() - revive_at,
+            times[dormant_count] - revive_at,
             rung_lo(1_000),
             rung_hi(1_000),
             "revived dial at base",
