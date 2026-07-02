@@ -467,6 +467,13 @@ pub async fn run_reconnect_supervisor(
                             let ok = dialer.dial(peer, iroh_locator(&peer)).await;
                             if ok {
                                 telemetry.record_succeeded(peer, owner);
+                                // ZEB-620 Task 6: the supervisor only dials a
+                                // non-Connected peer, so a success is always a
+                                // (re)connection — mark it for the Network Health
+                                // panel's recent state-transition feed. Additive:
+                                // the succeeded counter/hit above are unchanged;
+                                // this only appends a "reconnected" ring marker.
+                                telemetry.record_reconnected(peer, owner);
                             } else {
                                 telemetry.record_failed(peer, owner);
                             }

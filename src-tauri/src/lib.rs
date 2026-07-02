@@ -9545,6 +9545,16 @@ pub async fn start_node_inner(
                                 prod_dial,
                                 prod_relay,
                             );
+                            // ZEB-620 Task 6: dial-state telemetry source. Reads
+                            // the reconnect supervisor's `states_snapshot` lazily
+                            // via the resolver's installed handle (event_loop wires
+                            // it at boot) — feeds the panel's retrying/dormant/
+                            // connected counts + the PeerHealth last-seen fallback.
+                            nh.set_supervisor_source(std::sync::Arc::new(
+                                crate::network_health::ProdSupervisorSnapshot::new(
+                                    reachability_resolver.clone(),
+                                ),
+                            ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks

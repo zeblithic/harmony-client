@@ -125,6 +125,15 @@ impl ReachabilityResolver {
         *self.supervisor.write().expect("supervisor lock") = Some(handle);
     }
 
+    /// ZEB-620 Task 6: read the installed reconnect-supervisor handle, if any.
+    /// `None` until boot installs it via [`set_supervisor`](Self::set_supervisor).
+    /// Read-only clone of the shared handle — the Network Health snapshot uses it
+    /// to read `states_snapshot` for dial-state telemetry (`SupervisorHandle` is
+    /// a cheap `Arc`-backed clone).
+    pub fn supervisor(&self) -> Option<SupervisorHandle> {
+        self.supervisor.read().expect("supervisor lock").clone()
+    }
+
     /// LWW update — higher HLC wins; ties broken by announced_at_ms then
     /// lexicographic iroh_node_id. See spec §5.4.
     ///
