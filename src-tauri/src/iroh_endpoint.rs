@@ -16,17 +16,21 @@
 //!   - [`alpn::HARMONY_ZENOH_V1`] — zenoh wire protocol carrier
 //!   - [`alpn::HARMONY_HANDSHAKE_V1`] — harmony device handshake (Task 7+)
 //!
-//! ## API adaptations from the plan draft
+//! ## API surface notes (iroh 1.0)
 //!
 //! The plan's draft was written against an older iroh API surface.
-//! We are targeting `iroh = "0.98"`, where:
+//! We target `iroh = "1.0"`, where:
 //!
-//! - `iroh::NodeId` is renamed to `iroh::EndpointId` (a type alias for
+//! - `iroh::NodeId` is `iroh::EndpointId` (a type alias for
 //!   `iroh::PublicKey`).
 //! - `Endpoint::builder` takes a `Preset` argument; we use
-//!   `iroh::endpoint::presets::N0` for production (n0's STUN/discovery
-//!   defaults; the preset's canary relay map is overridden by the
-//!   ZEB-617 stable-relay pin).
+//!   `iroh::endpoint::presets::N0` for production. In iroh 1.0 the N0
+//!   preset's default relay map is n0's STABLE production cluster
+//!   (`use1-1.relay.n0.iroh.link.` etc.), so the production path takes
+//!   the preset defaults with no `.relay_mode()` override — ZEB-619
+//!   retired the ZEB-617 stable-relay pin that 0.98's canary default
+//!   required here. The `default_relay_map_is_stable_non_canary` test
+//!   guards that default against a future regression back to canary.
 //! - `RelayMode::Disabled` is reached via `.relay_mode(RelayMode::Disabled)`
 //!   on the builder — used only by hermetic tests.
 //! - The endpoint accessor for the local id is `.id()`, not `.node_id()`.
@@ -119,36 +123,13 @@ pub enum IrohEndpointError {
     Vault { context: String },
 }
 
-/// ZEB-617: n0's STABLE production relay cluster. iroh 0.98.2's
-/// `presets::N0` hard-codes the CANARY cluster (`*.iroh-canary.*`,
-/// no prod SLA — the fleet landed there by default, see ZEB-615);
-/// these are the hostnames iroh 1.0's stable defaults use. The
-/// ZEB-619 upgrade slice supersedes this pin.
-const STABLE_RELAY_URLS: [&str; 4] = [
-    "https://use1-1.relay.n0.iroh.link.",
-    "https://usw1-1.relay.n0.iroh.link.",
-    "https://euc1-1.relay.n0.iroh.link.",
-    "https://aps1-1.relay.n0.iroh.link.",
-];
-
-/// Relay mode pinning the stable cluster. Overrides the preset's
-/// canary map the same way `presets::N0DisableRelay` overrides it
-/// with `Disabled` — a `.relay_mode(..)` call AFTER the preset wins.
-pub(crate) fn stable_relay_mode() -> iroh::RelayMode {
-    iroh::RelayMode::custom(STABLE_RELAY_URLS.iter().map(|u| {
-        u.parse()
-            .expect("STABLE_RELAY_URLS are compile-time constants and must parse")
-    }))
-}
-
 impl IrohEndpoint {
     /// Build and bind an endpoint using `secret_key` as the persistent
-    /// identity. Registers both harmony ALPNs and pins the n0 STABLE
-    /// relay cluster (ZEB-617 — the 0.98 preset default is canary).
+    /// identity. Registers the harmony ALPNs and takes the `presets::N0`
+    /// relay defaults — in iroh 1.0 the N0 preset's default relay map is
+    /// n0's stable production cluster (ZEB-619 retired the ZEB-617 pin).
     pub async fn new_with_secret(secret_key: SecretKey) -> Result<Self, IrohEndpointError> {
         let inner = Endpoint::builder(presets::N0)
-            // ZEB-617: pin off the canary relay cluster the N0 preset defaults to.
-            .relay_mode(stable_relay_mode())
             .secret_key(secret_key)
             .alpns(vec![
                 alpn::HARMONY_ZENOH_V1.to_vec(),
@@ -393,7 +374,7 @@ mod tests {
 
     /// Lifecycle smoke test against an ephemeral secret with relays
     /// disabled — keeps the test hermetic. Production callers
-    /// (`new_with_secret`) pin the n0 STABLE relay cluster (ZEB-617).
+    /// (`new_with_secret`) use the `presets::N0` stable relay defaults.
     #[tokio::test]
     async fn iroh_endpoint_inits_with_ephemeral_secret() {
         let secret = SecretKey::generate();
@@ -434,28 +415,24 @@ mod tests {
         ep.shutdown().await;
     }
 
-    /// ZEB-617: the pinned relay map must be the n0 STABLE cluster —
-    /// exactly 4 relays, none canary. Guards against a silent revert to
-    /// `presets::N0`'s canary default on an iroh bump (until ZEB-619
-    /// supersedes this pin with 1.0's stable defaults).
+    /// ZEB-617 regression guard, retargeted by ZEB-619: iroh 1.0's default
+    /// (preset N0) relay map must be the stable production cluster. 0.98's
+    /// preset silently put the fleet on n0's CANARY relays (no SLA,
+    /// decommissioned 2026-09-30); if a future iroh bump regresses the
+    /// default, this must fail loudly.
     #[test]
-    fn stable_relay_mode_pins_four_non_canary_relays() {
-        let mode = stable_relay_mode();
-        let map = mode.relay_map();
-        let urls: Vec<String> = map
-            .urls::<Vec<_>>()
-            .into_iter()
-            .map(|u| u.to_string())
-            .collect();
-        assert_eq!(urls.len(), 4, "expected 4 stable relays, got {urls:?}");
-        for u in &urls {
+    fn default_relay_map_is_stable_non_canary() {
+        let map = iroh::RelayMode::Default.relay_map();
+        let urls: Vec<String> = map.urls::<Vec<_>>().iter().map(|u| u.to_string()).collect();
+        assert!(!urls.is_empty(), "default relay map must not be empty");
+        for url in &urls {
             assert!(
-                !u.contains("canary"),
-                "canary relay leaked into stable pin: {u}"
+                !url.contains("canary"),
+                "canary relay leaked into defaults: {url}"
             );
             assert!(
-                u.contains(".relay.n0.iroh.link"),
-                "unexpected relay host: {u}"
+                url.contains(".relay.n0.iroh.link."),
+                "unexpected relay host: {url}"
             );
         }
     }
