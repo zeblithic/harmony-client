@@ -956,6 +956,14 @@ impl Default for RootFetchLatch {
 ///   SENDER drops, the driver degrades to the no-epoch contract (keeps
 ///   any backoff retries running; returns on Idle only if resync is also
 ///   disabled) instead of exiting mid-latch.
+/// - `full_resync_rx` (ZEB-599 Direction 1, parity with
+///   [`run_backfill_driver`]) is the presence-driven reachability watch. A
+///   bump re-arms the latch (`reset()`) — for a page-less root fetch,
+///   `reset()` IS the full re-fetch, so a relay-mediated cross-WAN peer's
+///   below-watermark state heals within seconds of the peer appearing
+///   instead of waiting the ~1h floor. Same cooldown + sender-drop
+///   degradation as `epoch_rx`; `None` disables it (used by tests / callers
+///   with no presence signal).
 /// - `resync_interval_ms = Some(ms)` arms the ZEB-425 anti-entropy floor:
 ///   a satisfied latch re-arms (`reset()`) every `ms` even with NO epoch
 ///   bump, covering holders the never-seen-zid signal misses (router-only
@@ -966,27 +974,71 @@ impl Default for RootFetchLatch {
 ///   [`PERIODIC_RESYNC_FLOOR_MS`]).
 /// - `now_ms` injects the wall clock (paused-time testability — same
 ///   precedent as `run_backfill_driver`).
+/// - `resync_persist` (ZEB-599) makes the floor restart-aware — the first
+///   fire lands at an absolute (persisted) deadline and every fire
+///   persists a fresh timestamp. `None` = exact legacy behaviour. See
+///   [`ResyncPersist`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_root_fetch_driver<Rq, RqFut>(
     mut latch: RootFetchLatch,
     request_root: Rq,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    // ZEB-618: presence-driven reachability kick (ZEB-599 D1 parity
+    // with run_backfill_driver). A kick re-arms the latch — for a
+    // root fetch, reset() IS the full re-fetch. Cooldown-gated like
+    // the epoch arm; sender-drop degrades to None.
+    mut full_resync_rx: Option<tokio::sync::watch::Receiver<u64>>,
     resync_interval_ms: Option<u64>,
     now_ms: impl Fn() -> u64,
+    // ZEB-618: Some(..) makes the floor restart-aware (ZEB-584 parity):
+    // first fire at the persisted absolute deadline, each fire persists.
+    resync_persist: Option<ResyncPersist>,
 ) where
     Rq: Fn() -> RqFut,
     RqFut: std::future::Future<Output = RootFetch>,
 {
     let mut last_request_at: Option<u64> = None;
+    // ZEB-618: absolute-deadline resync when a persistence sink is
+    // wired. Seeded from the caller's restart-aware first deadline;
+    // advanced by `resync_interval_ms` after each fire. `None` (no
+    // persist) leaves the legacy interval-from-spawn path untouched.
+    let mut resync_deadline: Option<u64> = resync_persist.as_ref().map(|p| p.first_deadline_ms);
+    // ZEB-599 D3: `harmony_channel` debug events pin which re-arm path a
+    // recovery came through on a live fleet (RUST_LOG=info,harmony_channel=debug).
+    tracing::debug!(
+        target: "harmony_channel",
+        floor_deadline_ms = ?resync_deadline,
+        restart_aware = resync_persist.is_some(),
+        "root fetch driver started"
+    );
     loop {
         if *shutdown_rx.borrow() {
             return;
         }
         match latch.next_action(now_ms()) {
             RootFetchAction::Idle => {
-                if epoch_rx.is_none() && !matches!(resync_interval_ms, Some(ms) if ms > 0) {
+                if epoch_rx.is_none()
+                    && full_resync_rx.is_none()
+                    && !matches!(resync_interval_ms, Some(ms) if ms > 0)
+                {
                     return;
                 }
+                // ZEB-618: with a persist sink, arm the floor at the
+                // absolute (restart-aware) deadline, recomputed each Idle
+                // entry so epoch-churn can't postpone it. Without a sink,
+                // fall back to the legacy interval-measured-from-now.
+                let resync_arg = match (&resync_persist, resync_deadline) {
+                    (Some(_), Some(deadline)) => match resync_interval_ms {
+                        Some(ms) if ms > 0 => {
+                            Some(deadline.saturating_sub(now_ms()).max(MIN_RESYNC_WAKE_MS))
+                        }
+                        // Sink wired but floor disabled — respect disable.
+                        _ => None,
+                    },
+                    // Legacy: interval measured from now (or disabled).
+                    _ => resync_interval_ms,
+                };
                 tokio::select! {
                     bumped = epoch_bump(&mut epoch_rx) => {
                         if !bumped {
@@ -1000,15 +1052,63 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "root re-arm: transport-epoch bump"
+                        );
                         latch.reset();
                     }
-                    _ = resync_tick(resync_interval_ms) => {
+                    kicked = epoch_bump(&mut full_resync_rx) => {
+                        // ZEB-618 (ZEB-599 D1): a presence-driven reachability
+                        // kick re-arms the root latch — for a page-less root
+                        // fetch, `reset()` IS the full re-fetch (the fast,
+                        // relay-mediated analogue of the periodic floor).
+                        // Cooldown-gated like the epoch arm so presence churn
+                        // can't storm; the ~1h floor stays the ultimate
+                        // backstop and its persisted deadline is deliberately
+                        // untouched here (a presence reconcile is a bonus, not
+                        // a floor fire).
+                        if !kicked {
+                            // Presence sender dropped: degrade to no-presence
+                            // mode (mirrors the epoch-sender-drop path above).
+                            full_resync_rx = None;
+                            continue;
+                        }
+                        if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
+                            return;
+                        }
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "root re-arm: presence kick"
+                        );
+                        latch.reset();
+                    }
+                    _ = resync_tick(resync_arg) => {
                         // ZEB-425 anti-entropy floor: re-arm regardless of
                         // epoch bumps. No cooldown — see the
                         // `resync_interval_ms` doc (the interval is the rate
                         // limit; a re-armed no-responder latch backs off via
                         // WaitUntil, never straight back to Idle).
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "root re-arm: periodic floor fired"
+                        );
                         latch.reset();
+                        // ZEB-618: record + persist this full reconcile,
+                        // then set the next deadline a full interval out.
+                        if let Some(p) = resync_persist.as_ref() {
+                            let fired_at = now_ms();
+                            (p.on_full_reconcile)(fired_at);
+                            if let Some(ms) = resync_interval_ms {
+                                resync_deadline = Some(fired_at.saturating_add(ms));
+                                tracing::debug!(
+                                    target: "harmony_channel",
+                                    fired_at_ms = fired_at,
+                                    next_deadline_ms = ?resync_deadline,
+                                    "root floor fire persisted; next absolute deadline set"
+                                );
+                            }
+                        }
                     }
                     changed = shutdown_rx.changed() => {
                         // Err = sender dropped (registry entry gone):
@@ -1037,6 +1137,27 @@ pub async fn run_root_fetch_driver<Rq, RqFut>(
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "root re-arm: transport-epoch bump mid-backoff"
+                        );
+                        latch.reset();
+                    }
+                    kicked = epoch_bump(&mut full_resync_rx) => {
+                        // ZEB-618 (ZEB-599 D1): a presence kick mid-backoff — a
+                        // new holder just became reachable, so re-arm now (see
+                        // the Idle arm). Cooldown-gated like the epoch arm.
+                        if !kicked {
+                            full_resync_rx = None;
+                            continue;
+                        }
+                        if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
+                            return;
+                        }
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            "root re-arm: presence kick mid-backoff"
+                        );
                         latch.reset();
                     }
                     changed = shutdown_rx.changed() => {
@@ -2040,7 +2161,9 @@ mod tests {
             shutdown_rx,
             Some(epoch_rx),
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Request #1 fires at spawn (no sleep involved) — yield until
         // it lands. NOTE: a bare `while < 2 { yield_now }` would
@@ -2087,7 +2210,9 @@ mod tests {
             shutdown_rx,
             None,
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
+            None,
         )
         .await;
         // If we get here without hanging, the driver returned on Idle.
@@ -2113,7 +2238,9 @@ mod tests {
             shutdown_rx,
             Some(epoch_rx),
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Wait deterministically until the request has been answered,
         // then let the driver advance from the completed request into
@@ -2148,7 +2275,9 @@ mod tests {
             shutdown_rx,
             Some(epoch_rx),
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
+            None,
         )
         .await;
         assert_eq!(
@@ -2178,7 +2307,9 @@ mod tests {
             shutdown_rx,
             Some(epoch_rx),
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Wait for request #1 to fire.
         while requests.load(Ordering::SeqCst) < 1 {
@@ -2222,7 +2353,9 @@ mod tests {
             shutdown_rx,
             Some(epoch_rx),
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Request #1 fires (NoReply) and the driver enters its 30s backoff.
         while requests.load(Ordering::SeqCst) < 1 {
@@ -2290,7 +2423,9 @@ mod tests {
             shutdown_rx,
             Some(epoch_rx),
             None,
+            None,
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         // Wait for request #1 (answered → satisfied). `last_request_at`
         // is stamped at this point, which is t ≈ 0 under paused time.
@@ -2642,8 +2777,10 @@ mod tests {
             request_root,
             shutdown_rx,
             None,            // no epoch watch
+            None,            // no presence watch
             Some(RESYNC_MS), // periodic floor is the only re-arm
             move || start.elapsed().as_millis() as u64,
+            None,
         ));
         while requests.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
@@ -2669,6 +2806,184 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+        driver.abort();
+    }
+
+    // ── ZEB-618: run_root_fetch_driver presence-kick + persisted floor ──
+
+    /// ZEB-618: a presence kick while Idle re-arms the root latch
+    /// (cooldown-gated), producing a fresh Request — parity with
+    /// `run_backfill_driver`'s Direction-1 presence arm.
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_presence_kick_rearms() {
+        let (kick_tx, kick_rx) = tokio::sync::watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::Answered
+            }
+        };
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            None,          // no epoch watch
+            Some(kick_rx), // presence kick wired
+            None,          // floor disabled
+            move || start.elapsed().as_millis() as u64,
+            None, // no persist
+        ));
+        // Request #1 fires at spawn → answered → parks on Idle.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        // Presence kick → re-arm. Cooldown (60s since request #1 at t≈0)
+        // defers the re-query; advancing past it lets request #2 fire.
+        kick_tx.send_modify(|e| *e = e.wrapping_add(1));
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "presence kick must re-arm the root fetch after cooldown"
+        );
+        driver.abort();
+    }
+
+    /// ZEB-618: with a persist sink the FIRST floor fire lands at the
+    /// absolute (restart-aware) deadline — NOT `spawn + interval` — and
+    /// the fire invokes `on_full_reconcile` with the fire wall-ms.
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_persisted_floor_first_fire_at_deadline() {
+        const DEADLINE_MS: u64 = 5_000;
+        const INTERVAL_MS: u64 = 60_000;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::Answered // satisfied → parks
+            }
+        };
+        let fired: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
+        let fired_cb = Arc::clone(&fired);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            None,              // no epoch watch
+            None,              // no presence watch
+            Some(INTERVAL_MS), // floor: only the persisted deadline can re-arm
+            move || start.elapsed().as_millis() as u64,
+            Some(ResyncPersist {
+                first_deadline_ms: DEADLINE_MS,
+                on_full_reconcile: Arc::new(move |ts| fired_cb.lock().unwrap().push(ts)),
+            }),
+        ));
+        // Req #1 (initial pull) satisfies → parks on the persisted deadline.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Just shy of the 5s deadline: no fire. (Legacy interval-from-spawn
+        // would fire at 60s, so any fire at 5s proves the absolute deadline.)
+        tokio::time::advance(Duration::from_millis(DEADLINE_MS - 1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "floor must not fire before the absolute deadline"
+        );
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "nothing persisted before the first fire"
+        );
+        // Cross 5s → first floor fire: re-arm + persist.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        let stamps = fired.lock().unwrap();
+        assert_eq!(stamps.len(), 1, "exactly one persist per floor fire");
+        assert!(
+            stamps[0] >= DEADLINE_MS,
+            "persisted timestamp is the fire wall-clock (>= deadline)"
+        );
+        driver.abort();
+    }
+
+    /// ZEB-618: presence-kick sender drop degrades to None — the driver
+    /// keeps running on the periodic floor (mirrors epoch-sender-drop).
+    #[tokio::test(start_paused = true)]
+    async fn root_driver_presence_sender_drop_degrades() {
+        const RESYNC_MS: u64 = 200_000;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::Answered // satisfied → parks
+            }
+        };
+        let (kick_tx, kick_rx) = tokio::sync::watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            None,            // no epoch watch
+            Some(kick_rx),   // presence kick wired...
+            Some(RESYNC_MS), // ...but the floor is the backstop
+            move || start.elapsed().as_millis() as u64,
+            None,
+        ));
+        // Req #1 fires → answered → parks on Idle.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Drop the presence sender; the driver must degrade to no-presence
+        // mode (not exit) and keep parking on the floor.
+        drop(kick_tx);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "presence sender drop must not end the driver"
+        );
+        // The floor still re-arms after the presence watch is gone.
+        tokio::time::advance(Duration::from_millis(RESYNC_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "floor must still re-arm after presence sender drop"
+        );
         driver.abort();
     }
 

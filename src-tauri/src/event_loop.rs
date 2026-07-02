@@ -889,6 +889,16 @@ pub async fn run(
     // callers that don't exercise presence pass a receiver-less sender (bump is
     // then a no-op), same as `transport_epoch_tx`.
     presence_resync_tx: tokio::sync::watch::Sender<u64>,
+    // ZEB-618: restart-aware anti-entropy floor for the mail-root fetch
+    // (ZEB-584 parity). `Some((interval_ms, persist))` makes the mail-root
+    // driver's periodic full-refetch survive restarts: the interval is a
+    // SINGLE jittered draw (built by `start_node_inner` where `app_data_dir`
+    // is in scope) used for BOTH the persisted first-deadline computation and
+    // the driver's interval arg — never two different draws. `persist` seeds
+    // the first fire from `<data>/mail/backfill_state.cbor` and re-persists on
+    // each fire. `None` (every test caller and any node without a mail dir)
+    // keeps the legacy interval-from-spawn floor with a fresh per-spawn draw.
+    mail_resync: Option<(u64, crate::channel_backfill::ResyncPersist)>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -2723,22 +2733,39 @@ pub async fn run(
                     map_mail_root_outcome(&result)
                 }
             };
+            // ZEB-618: use the caller-built persist pair when present. Its
+            // `interval_ms` is a SINGLE jittered draw shared with the persisted
+            // first-deadline (see `mail_resync` param) — so the deadline and the
+            // driver arg can never diverge. The `None` (test / no-mail-dir) path
+            // keeps the legacy ZEB-425 floor with a fresh per-spawn jitter draw.
+            let (mail_interval_ms, mail_persist) = match &mail_resync {
+                Some((ms, p)) => (Some(*ms), Some(p.clone())),
+                None => (
+                    Some(crate::channel_backfill::periodic_resync_interval_ms()),
+                    None,
+                ),
+            };
             tokio::spawn(crate::channel_backfill::run_root_fetch_driver(
                 crate::channel_backfill::RootFetchLatch::new(),
                 request_root,
                 mail_shutdown_rx,
                 epoch_rx_mail,
-                // ZEB-425: anti-entropy floor — re-arm the mail-root fetch
-                // ~hourly (jittered per driver to avoid a startup thundering
-                // herd) even with no epoch bump (router-only gateways / late
-                // queryables / same-zid reconnects).
-                Some(crate::channel_backfill::periodic_resync_interval_ms()),
+                // ZEB-618: presence kick — same watch the channel-log drivers
+                // get. `subscribe()` here is legal because this spawn precedes
+                // the sender's move into the presence task (~:3030).
+                Some(presence_resync_tx.subscribe()),
+                // ZEB-425 anti-entropy floor: re-arm the mail-root fetch
+                // ~hourly even with no epoch bump (router-only gateways / late
+                // queryables / same-zid reconnects). ZEB-618: restart-aware
+                // when the persist pair is wired.
+                mail_interval_ms,
                 || {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0)
                 },
+                mail_persist,
             ));
         }
     }

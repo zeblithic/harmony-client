@@ -436,6 +436,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         signing_key: Arc::clone(&alice_comm_sk),
         crdt_state: None,
         nav_emitter: None,
+        presence_resync_rx: None,
     }));
     let registry_bob = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "bob-dev".into(),
@@ -449,6 +450,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         signing_key: Arc::clone(&bob_comm_sk),
         crdt_state: None,
         nav_emitter: None,
+        presence_resync_rx: None,
     }));
 
     // Spawn Alice's engine + insert her bootstrap Join.
