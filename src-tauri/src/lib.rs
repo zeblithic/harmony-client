@@ -270,6 +270,10 @@ pub mod iroh_zenoh_registration;
 // ZEB-373: dynamic mid-session iroh dial driver — consumes DialHints, dedups,
 // dials via PeerDialer with bounded backoff.
 pub mod iroh_dial_driver;
+// ZEB-620: reconnect supervisor — per-peer retry state machine, jittered
+// exponential ladder, coalescing dirty-set kicks, lower-NodeId dial-role gate,
+// bounded dial concurrency. Pure logic; producers are wired in later tasks.
+pub mod reconnect_supervisor;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
 /// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets
