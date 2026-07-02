@@ -94,8 +94,8 @@
 <style>
   .invite-manager { font-size: 0.875rem; }
   .explanation { color: var(--text-secondary); font-size: 0.8rem; margin: 0 0 12px; }
-  .warning { color: #ffb84a; font-size: 0.8rem; margin: 0 0 12px; }
-  .error { color: #d83c3e; font-size: 0.8rem; margin: 0 0 12px; }
+  .warning { color: var(--role-mod); font-size: 0.8rem; margin: 0 0 12px; }
+  .error { color: var(--danger-muted); font-size: 0.8rem; margin: 0 0 12px; }
   .url-row {
     display: flex;
     align-items: center;

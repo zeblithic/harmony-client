@@ -210,13 +210,13 @@
 </div>
 
 <style>
-  /* ZEB-600: nav presence dot — solid green when the resolver reports online. */
+  /* ZEB-600: nav presence dot — solid var(--presence-online) when the resolver reports online. */
   .nav-presence-dot {
     flex-shrink: 0;
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: #3ba55d;
+    background: var(--presence-online);
   }
   .nav-row {
     position: relative;
@@ -350,7 +350,7 @@
 
   .unread-badge {
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     font-size: 11px;
     font-weight: 700;
     padding: 1px 6px;

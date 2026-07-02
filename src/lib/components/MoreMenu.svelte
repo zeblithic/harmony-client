@@ -215,7 +215,7 @@
     display: flex;
     flex-direction: column;
     padding: 4px 0;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 4px 12px var(--shadow-mid);
   }
   .menu-section {
     margin: 0;

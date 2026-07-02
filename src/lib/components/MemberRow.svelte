@@ -273,7 +273,7 @@
     border-bottom: none;
   }
   /* ZEB-537: online-presence indicator. Muted/hollow when offline, solid
-     green when online. Sized to align with the row's avatar/text. */
+     var(--presence-online) when online. Sized to align with the row's avatar/text. */
   .presence-dot {
     flex-shrink: 0;
     width: 8px;
@@ -284,8 +284,8 @@
     box-sizing: border-box;
   }
   .presence-dot.online {
-    background: #3ba55d;
-    border-color: #3ba55d;
+    background: var(--presence-online);
+    border-color: var(--presence-online);
   }
   /* ZEB-600: self row while "Appear offline" is on — hollow with a dashed ring
      so it reads as a deliberate state, not an offline peer. */
@@ -342,8 +342,8 @@
     flex-shrink: 0;
   }
   .tier-badge[data-status="banned"] {
-    background: #553333;
-    color: #cc7a7a;
+    background: var(--danger-border-muted);
+    color: var(--danger-text-muted);
   }
   .tier-badge[data-power="100"] {
     background: var(--accent);
@@ -420,6 +420,6 @@
     outline-offset: -2px;
   }
   .menu-item.danger {
-    color: #cc7a7a;
+    color: var(--danger-text-muted);
   }
 </style>

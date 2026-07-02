@@ -152,7 +152,7 @@
     padding: 0.25rem 0;
   }
   .lineage-self {
-    background: var(--surface-highlight, rgba(255, 200, 0, 0.1));
+    background: var(--surface-highlight);
     font-weight: 600;
   }
   .lineage-ancestor,
@@ -162,7 +162,7 @@
   .lineage-clickable {
     background: none;
     border: none;
-    color: var(--text-link, #5c8fff);
+    color: var(--text-link);
     cursor: pointer;
     padding: 0;
     font: inherit;

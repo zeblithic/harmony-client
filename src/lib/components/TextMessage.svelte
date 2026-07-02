@@ -214,7 +214,7 @@
   }
 
   .delete-btn:hover {
-    color: #d83c3e;
+    color: var(--danger-muted);
   }
 
   .delete-btn:focus-visible {

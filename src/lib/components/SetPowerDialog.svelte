@@ -83,7 +83,7 @@
   .role-preview { text-align: center; margin-bottom: 12px; }
   .role-badge { padding: 3px 14px; border-radius: 12px; font-size: 0.75rem; font-weight: bold; }
   .role-badge[data-role="member"] { background: var(--bg-tertiary); color: var(--text-secondary); }
-  .role-badge[data-role="mod"] { background: #ffb84a; color: #1a1a1a; }
+  .role-badge[data-role="mod"] { background: var(--role-mod); color: var(--text-inverse-dark); }
   .role-badge[data-role="admin"] { background: var(--accent); color: var(--text-primary); }
   .control-row { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }
   .slider { flex: 1; }
@@ -108,7 +108,7 @@
   }
   .threshold { text-align: center; }
   .threshold.member { color: var(--text-secondary); }
-  .threshold.mod { color: #ffb84a; }
+  .threshold.mod { color: var(--role-mod); }
   .threshold.admin { color: var(--accent); }
   .threshold .bar { display: block; }
   .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }

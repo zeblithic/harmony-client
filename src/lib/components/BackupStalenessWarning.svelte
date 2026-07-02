@@ -66,12 +66,12 @@
 
 <style>
   .backup-staleness-banner {
-    background: var(--warn-bg, #fff8e1);
-    border: 1px solid var(--warn-border, #f0c870);
+    background: var(--color-bg-warning);
+    border: 1px solid var(--warn-border);
     border-radius: 6px;
     padding: 0.75rem 1rem;
     margin: 0.5rem 1rem;
-    color: var(--warn-fg, #5c4400);
+    color: var(--warn-fg);
   }
   .actions {
     display: flex;

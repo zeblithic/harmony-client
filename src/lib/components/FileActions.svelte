@@ -106,7 +106,7 @@
   }
 
   .action-btn:hover {
-    background: var(--bg-tertiary-hover, #35373c);
+    background: var(--bg-tertiary-hover);
     color: var(--accent);
   }
 
@@ -116,13 +116,13 @@
   }
 
   .action-btn.destructive {
-    background: #d83c3e;
-    color: #ffffff;
+    background: var(--danger-muted);
+    color: var(--text-bright);
   }
 
   .action-btn.destructive:hover {
     background: #c23234;
-    color: #ffffff;
+    color: var(--text-bright);
   }
 
   .action-icon {

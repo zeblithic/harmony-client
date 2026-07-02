@@ -185,7 +185,7 @@
     margin-bottom: 8px;
   }
   .chip {
-    background: rgba(120, 140, 200, 0.2);
+    background: color-mix(in srgb, var(--library-accent) 20%, transparent);
     border-radius: 12px;
     padding: 2px 8px;
     font-size: 12px;
@@ -196,7 +196,7 @@
     max-height: 200px;
     overflow-y: auto;
     border-radius: 4px;
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--hover-bg);
     margin-bottom: 8px;
   }
   .contact {
@@ -209,7 +209,10 @@
     cursor: pointer;
   }
   .contact:hover {
-    background: rgba(255, 255, 255, 0.05);
+    /* Deliberate visual fix (the one exception to this sweep's zero-visual-change
+       rule): hover previously matched the .contact-list fill exactly, so rows had
+       no visible hover state. Use the app-standard row-hover token instead. */
+    background: var(--bg-hover);
   }
   .empty {
     padding: 12px;
@@ -254,7 +257,7 @@
     padding: 6px 12px;
   }
   .primary {
-    background: rgba(120, 140, 200, 0.4);
+    background: color-mix(in srgb, var(--library-accent) 40%, transparent);
   }
   .primary:disabled {
     opacity: 0.4;

@@ -531,7 +531,7 @@
 
   .error-text {
     font-size: 12px;
-    color: #d83c3e;
+    color: var(--danger-muted);
     margin: 4px 0 8px;
   }
 
@@ -565,13 +565,13 @@
   }
 
   .badge-healthy {
-    background: #1a4a1a;
-    color: #5cb85c;
+    background: var(--net-ok-bg);
+    color: var(--net-ok-fg);
   }
 
   .badge-cooling {
-    background: #4a3a00;
-    color: #f0a020;
+    background: var(--net-warn-bg);
+    color: var(--net-warn-fg);
   }
 
   .relay-remove {

@@ -144,7 +144,7 @@
   }
   .markdown-preview {
     background: #111;
-    color: #fff;
+    color: var(--text-bright);
     padding: 1rem;
     border-radius: 4px;
     max-height: 320px;

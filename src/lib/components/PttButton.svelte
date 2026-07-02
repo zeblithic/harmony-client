@@ -132,13 +132,13 @@
   }
 
   .ptt-button:hover:not(:disabled) {
-    background: rgba(88, 101, 242, 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
 
   .ptt-button.active {
     background: var(--accent);
     color: var(--text-primary);
-    box-shadow: 0 0 20px rgba(88, 101, 242, 0.4);
+    box-shadow: 0 0 20px color-mix(in srgb, var(--accent) 40%, transparent);
   }
 
   .ptt-button.processing {

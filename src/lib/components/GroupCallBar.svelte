@@ -276,7 +276,7 @@
   .ctrl.active {
     background: var(--accent);
     border-color: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
   }
   .ptt-hold {
     touch-action: none;
@@ -286,7 +286,7 @@
     margin-left: auto;
     border: none;
     background: var(--danger);
-    color: #fff;
+    color: var(--text-bright);
     padding: 4px 14px;
     border-radius: 4px;
     font-size: 0.85rem;

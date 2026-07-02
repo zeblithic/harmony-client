@@ -144,7 +144,7 @@
     align-items: center;
     gap: 0.5rem;
     padding: 0.5rem 0.75rem;
-    background: var(--warn-bg, #4a3a1a);
+    background: #4a3a1a;
     color: var(--text-primary);
     font-size: 0.85rem;
     border-bottom: 1px solid var(--border);

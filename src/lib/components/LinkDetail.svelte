@@ -183,7 +183,7 @@
   }
 
   .throughput-up {
-    color: #43b581;
+    color: var(--success-deep);
   }
 
   .throughput-down {

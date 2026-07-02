@@ -263,14 +263,14 @@
   }
   .error-banner {
     background: var(--bg-tertiary);
-    border: 1px solid #d83c3e;
+    border: 1px solid var(--danger-muted);
     padding: 10px 12px;
     border-radius: 4px;
     margin-bottom: 12px;
   }
   .error-banner .summary {
     margin: 0 0 4px 0;
-    color: #d83c3e;
+    color: var(--danger-muted);
     font-size: 0.85rem;
   }
   .error-banner .hint {

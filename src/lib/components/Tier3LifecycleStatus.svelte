@@ -57,26 +57,26 @@
   .stage-chip {
     padding: 0.25rem 0.6rem;
     border-radius: 999px;
-    background: var(--chip-bg, #2a2c34);
-    color: var(--chip-fg, #c8c9d1);
+    background: var(--chip-bg);
+    color: var(--chip-fg);
     border: 1px solid transparent;
   }
   .stage-chip.past {
-    color: #8a8c95;
+    color: var(--text-faint);
   }
   .stage-chip.current {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
     border-color: var(--accent);
   }
   .failed-badge {
-    color: #d93838;
+    color: var(--danger-alt);
     font-weight: 600;
   }
   .finalized-badge {
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    color: #4ad97a;
+    color: var(--success-gov);
   }
 </style>

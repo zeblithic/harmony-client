@@ -67,11 +67,11 @@
   }
 
   .replica-indicator.met {
-    color: #43b581;
+    color: var(--success-deep);
   }
 
   .replica-indicator.under {
-    color: #f0b232;
+    color: var(--text-warning);
   }
 
   .replica-label {
@@ -82,7 +82,7 @@
   .replication-warning {
     margin: 0;
     font-size: 0.8rem;
-    color: #f0b232;
+    color: var(--text-warning);
     font-weight: 500;
   }
 

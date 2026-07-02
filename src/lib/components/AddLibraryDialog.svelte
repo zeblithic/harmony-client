@@ -74,15 +74,15 @@
     background: var(--bg-tertiary); border: 1px solid var(--border);
     color: var(--text-primary); border-radius: 4px;
   }
-  .addr-input.invalid { border-color: #d83c3e; }
-  .validation { color: #d83c3e; font-size: 0.75rem; margin-top: 4px; }
+  .addr-input.invalid { border-color: var(--danger-muted); }
+  .validation { color: var(--danger-muted); font-size: 0.75rem; margin-top: 4px; }
   .error-banner {
-    background: var(--bg-tertiary); border: 1px solid #d83c3e;
-    color: #d83c3e; padding: 8px 10px; border-radius: 4px;
+    background: var(--bg-tertiary); border: 1px solid var(--danger-muted);
+    color: var(--danger-muted); padding: 8px 10px; border-radius: 4px;
     font-size: 0.8rem; margin-top: 8px;
   }
   .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
   .actions button { padding: 6px 12px; }
-  .primary { background: rgba(120,140,200,0.4); }
+  .primary { background: color-mix(in srgb, var(--library-accent) 40%, transparent); }
   .primary:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>

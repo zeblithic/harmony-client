@@ -139,7 +139,7 @@
   .reply-btn {
     background: var(--accent);
     border-color: var(--accent);
-    color: white;
+    color: var(--text-bright);
   }
 
   .reader-header {
@@ -238,12 +238,12 @@
   }
 
   .reader-error .error-msg {
-    background: rgba(200, 60, 60, 0.08);
-    border: 1px solid rgba(200, 60, 60, 0.3);
+    background: color-mix(in srgb, var(--mail-danger) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--mail-danger) 30%, transparent);
     border-radius: 4px;
     padding: 0.5rem;
     font-size: 0.8125rem;
-    color: #c66;
+    color: var(--mail-error-text);
     white-space: pre-wrap;
     word-break: break-word;
     max-width: 40rem;

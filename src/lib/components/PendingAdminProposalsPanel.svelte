@@ -226,9 +226,9 @@
   .admin-proposals-panel { margin-block: 1rem; }
   .proposal-card { border: 1px solid var(--border); padding: 0.75rem; margin-block: 0.5rem; }
   .summary { font-weight: 600; }
-  .meta { font-size: 0.9em; color: var(--muted, #666); margin-block: 0.25rem; }
+  .meta { font-size: 0.9em; color: var(--muted); margin-block: 0.25rem; }
   .reason { font-style: italic; margin-block: 0.25rem; }
-  .error { color: var(--error, #c00); }
+  .error { color: var(--danger-deep); }
   .effective { opacity: 0.7; }
   .expired { opacity: 0.5; }
 </style>

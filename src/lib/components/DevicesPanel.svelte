@@ -602,7 +602,7 @@
   }
   .primary {
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     border-color: var(--accent);
   }
   .secondary {
@@ -688,7 +688,7 @@
     height: 32px;
     border-radius: 6px;
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -720,7 +720,7 @@
     margin-top: 2px;
   }
   .trust-badge.full { color: var(--success); }
-  .trust-badge.provisional { color: #fbbf24; }
+  .trust-badge.provisional { color: var(--warning-bright); }
   .trust-badge.refused { color: var(--danger); }
   .separator { margin: 0 6px; color: var(--text-muted); }
   .fingerprint { font-family: monospace; }

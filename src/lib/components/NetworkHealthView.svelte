@@ -385,10 +385,10 @@
     max-width: 800px;
   }
   .muted {
-    color: #888;
+    color: var(--color-text-secondary);
   }
   .status-reachable {
-    color: green;
+    color: var(--net-ok-deep);
   }
   .status-degraded {
     color: orange;
@@ -432,7 +432,7 @@
     gap: 1rem;
   }
   .dial-ok {
-    color: green;
+    color: var(--net-ok-deep);
   }
   .dial-fail {
     color: crimson;
@@ -451,12 +451,12 @@
     margin-left: 6px;
   }
   .badge-healthy {
-    background: #1a4a1a;
-    color: #5cb85c;
+    background: var(--net-ok-bg);
+    color: var(--net-ok-fg);
   }
   .badge-cooling {
-    background: #4a3a00;
-    color: #f0a020;
+    background: var(--net-warn-bg);
+    color: var(--net-warn-fg);
   }
   .pkarr-relays ul {
     list-style: none;

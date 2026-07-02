@@ -93,6 +93,6 @@
     border-bottom: 1px solid var(--border);
     padding-bottom: 8px;
     margin-bottom: 4px;
-    background: rgba(88, 101, 242, 0.04);
+    background: color-mix(in srgb, var(--accent) 4%, transparent);
   }
 </style>

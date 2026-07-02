@@ -72,7 +72,7 @@
   }
 
   .online-dot.has-online {
-    background: #23a55a;
+    background: var(--success-alt);
   }
 
   .manage-btn {

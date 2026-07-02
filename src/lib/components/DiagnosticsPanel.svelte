@@ -222,7 +222,7 @@
 
 <style>
   .connectivity-diagnostics {
-    border: 1px dashed #888;
+    border: 1px dashed var(--color-text-secondary);
     padding: 1em;
     margin: 1em;
     font-family: monospace;
@@ -260,6 +260,6 @@
   .pkarr-fallback-log {
     margin-top: 8px;
     padding-top: 8px;
-    border-top: 1px dashed #666;
+    border-top: 1px dashed var(--muted);
   }
 </style>

@@ -77,11 +77,11 @@
   }
 
   .grid-row.completed-perfect {
-    background: rgba(87, 242, 135, 0.05);
+    background: color-mix(in srgb, var(--flashcard-correct) 5%, transparent);
   }
 
   .grid-row.completed-express {
-    background: rgba(254, 231, 92, 0.05);
+    background: color-mix(in srgb, var(--flashcard-hint) 5%, transparent);
   }
 
   .byte-cell {
@@ -100,23 +100,23 @@
   }
 
   .byte-cell.green {
-    background: rgba(87, 242, 135, 0.2);
-    color: #57f287;
+    background: color-mix(in srgb, var(--flashcard-correct) 20%, transparent);
+    color: var(--flashcard-correct);
   }
 
   .byte-cell.yellow {
-    background: rgba(254, 231, 92, 0.2);
-    color: #fee75c;
+    background: color-mix(in srgb, var(--flashcard-hint) 20%, transparent);
+    color: var(--flashcard-hint);
   }
 
   .byte-cell.red {
-    background: rgba(237, 66, 69, 0.3);
-    color: #ed4245;
+    background: color-mix(in srgb, var(--text-danger) 30%, transparent);
+    color: var(--text-danger);
     animation: flash-red 0.3s ease;
   }
 
   @keyframes flash-red {
-    0% { background: rgba(237, 66, 69, 0.6); }
-    100% { background: rgba(237, 66, 69, 0.3); }
+    0% { background: color-mix(in srgb, var(--text-danger) 60%, transparent); }
+    100% { background: color-mix(in srgb, var(--text-danger) 30%, transparent); }
   }
 </style>

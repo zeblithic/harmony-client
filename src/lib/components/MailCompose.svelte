@@ -165,7 +165,7 @@
     padding: 0.5rem 0.625rem;
     border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--surface, #1a1a1a);
+    background: var(--surface);
     color: var(--text-primary);
     font-size: 0.875rem;
     font-family: inherit;
@@ -187,7 +187,7 @@
   }
 
   .error-msg {
-    color: var(--error, #e55);
+    color: #e55;
     font-size: 0.8125rem;
   }
 
@@ -202,7 +202,7 @@
     border: none;
     border-radius: 4px;
     background: var(--accent);
-    color: white;
+    color: var(--text-bright);
     cursor: pointer;
     font-size: 0.875rem;
   }

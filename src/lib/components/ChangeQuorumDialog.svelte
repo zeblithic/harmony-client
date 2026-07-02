@@ -127,7 +127,7 @@
   .control-row { display: flex; align-items: center; gap: 0.75rem; margin-block: 1rem; }
   .control-row input[type="range"] { flex: 1; }
   .control-row input[type="number"] { width: 5rem; }
-  .of-label { white-space: nowrap; font-size: 0.9rem; color: var(--muted, #666); }
+  .of-label { white-space: nowrap; font-size: 0.9rem; color: var(--muted); }
   .actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
-  .error { color: var(--error, #c00); }
+  .error { color: var(--danger-deep); }
 </style>

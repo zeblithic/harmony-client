@@ -1295,7 +1295,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    color: #d83c3e;
+    color: var(--danger-muted);
     font-size: 0.75rem;
     padding: 4px 12px;
   }
@@ -1322,7 +1322,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 6px;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 1px 4px var(--shadow-mid);
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.08s ease;
@@ -1373,7 +1373,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 6px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    box-shadow: 0 2px 8px var(--shadow-strong);
     z-index: 10;
   }
   /* The picker is a 5-col grid; `grid-column: 1 / -1` drops the checkbox + hint
@@ -1415,15 +1415,15 @@
   }
   .name-this:hover { opacity: 1; }
   .name-this-input { width: 7rem; }
-  .name-this-error { font-size: 0.7rem; color: #d83c3e; margin-left: 4px; }
+  .name-this-error { font-size: 0.7rem; color: var(--danger-muted); margin-left: 4px; }
   .compose {
     border-top: 1px solid var(--border);
     padding: 8px 16px 12px;
   }
   .compose-error {
     background: var(--bg-tertiary);
-    border: 1px solid #d83c3e;
-    color: #d83c3e;
+    border: 1px solid var(--danger-muted);
+    color: var(--danger-muted);
     padding: 6px 8px;
     border-radius: 4px;
     font-size: 0.75rem;
@@ -1450,8 +1450,8 @@
   .compose-input:disabled { opacity: 0.6; }
   .load-error {
     background: var(--bg-tertiary);
-    border: 1px solid #d83c3e;
-    color: #d83c3e;
+    border: 1px solid var(--danger-muted);
+    color: var(--danger-muted);
     padding: 10px 14px;
     border-radius: 4px;
     margin: 8px 16px;
@@ -1514,7 +1514,7 @@
     font-size: 1rem;
     line-height: 1;
   }
-  .attach-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.06); }
+  .attach-btn:hover:not(:disabled) { background: var(--bg-hover-subtle); }
   .attach-btn:disabled { opacity: 0.6; cursor: default; }
   .pending-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
   .pending-chip {

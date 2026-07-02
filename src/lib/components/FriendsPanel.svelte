@@ -1194,8 +1194,8 @@
   }
 
   .unfriend-btn:hover:not(:disabled) {
-    border-color: #d83c3e;
-    color: #d83c3e;
+    border-color: var(--danger-muted);
+    color: var(--danger-muted);
   }
 
   .unfriend-btn:disabled {
@@ -1213,7 +1213,7 @@
     border-radius: 4px;
     border: 1px solid var(--accent);
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
     cursor: pointer;
   }
 
@@ -1266,7 +1266,7 @@
 
   .error-text {
     font-size: 12px;
-    color: #d83c3e;
+    color: var(--danger-muted);
     margin: 4px 0 8px;
   }
 
@@ -1329,7 +1329,7 @@
 
   .accept-btn:hover:not(:disabled) {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
   }
 
   .accept-btn:disabled {

@@ -114,7 +114,7 @@
   }
 
   .card-header:hover {
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--bg-highlight-faint);
   }
 
   .card-sender {

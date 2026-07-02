@@ -45,9 +45,9 @@ Heard:    {heardLine}</pre>
 <style>
   .mismatch {
     font-family: 'Courier New', Courier, monospace;
-    color: var(--text-warning, #f0b232);
+    color: var(--text-warning);
     padding: 8px 12px;
-    background: rgba(240, 178, 50, 0.08);
+    background: color-mix(in srgb, var(--text-warning) 8%, transparent);
     border-radius: 4px;
     max-width: fit-content;
     margin: 0 auto;

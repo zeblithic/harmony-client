@@ -76,7 +76,7 @@
   }
 
   .confirm-btn.destructive {
-    background: #d83c3e;
+    background: var(--danger-muted);
   }
 
   .confirm-btn:disabled {

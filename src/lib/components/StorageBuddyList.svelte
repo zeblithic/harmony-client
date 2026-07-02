@@ -135,11 +135,11 @@
     gap: 8px;
     padding: 4px 8px;
     border-radius: 4px;
-    background: var(--buddy-bg, rgba(35, 165, 90, 0.08));
+    background: var(--buddy-bg);
   }
 
   .buddy-row:hover {
-    background: var(--buddy-bg-hover, rgba(35, 165, 90, 0.14));
+    background: var(--buddy-bg-hover);
   }
 
   .buddy-name {
@@ -172,7 +172,7 @@
   }
 
   .online-indicator.online {
-    background: #23a55a;
+    background: var(--success-alt);
   }
 
   .remove-btn {

@@ -54,10 +54,10 @@
     align-items: center;
     gap: 0.75rem;
     padding: 0.75rem 1rem;
-    background: var(--toast-bg, rgba(20, 22, 30, 0.95));
-    color: var(--toast-fg, #fff);
+    background: var(--toast-bg);
+    color: var(--toast-fg);
     border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 4px 12px var(--shadow-soft);
     min-width: 280px;
     max-width: 380px;
     font-size: 0.9rem;
@@ -114,14 +114,14 @@
   }
   .btn-accept {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
   }
   .btn-accept:hover {
     filter: brightness(1.1);
   }
   .btn-decline {
     background: var(--danger);
-    color: #fff;
+    color: var(--text-bright);
   }
   .btn-decline:hover {
     filter: brightness(1.1);

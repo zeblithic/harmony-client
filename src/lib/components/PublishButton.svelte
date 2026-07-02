@@ -174,7 +174,7 @@
 
   .publish-btn {
     background: var(--accent);
-    color: #ffffff;
+    color: var(--text-bright);
   }
 
   .publish-btn:hover {
@@ -187,7 +187,7 @@
   }
 
   .release-btn:hover {
-    background: var(--bg-tertiary-hover, #35373c);
+    background: var(--bg-tertiary-hover);
   }
 
   .publish-btn:focus-visible,

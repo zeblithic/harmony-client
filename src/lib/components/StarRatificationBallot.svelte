@@ -172,17 +172,17 @@
 
 <style>
   .ratification-ballot { margin-top: 1rem; }
-  .instructions { color: #8a8c95; font-size: 0.85rem; }
+  .instructions { color: var(--text-faint); font-size: 0.85rem; }
   /* ZEB-295 Phase 6 Task 11: ballot-secret affordance — lock-icon banner
      above the per-candidate sliders so the voter knows the ballot will
      be encrypted before submitting. */
   .encryption-banner {
     margin: 0.5rem 0 0.75rem;
     padding: 0.6rem 0.8rem;
-    background: rgba(170, 130, 255, 0.08);
-    border-left: 3px solid #b29bff;
+    background: var(--sortition-bg);
+    border-left: 3px solid var(--gov-purple);
     border-radius: 3px;
-    color: #ddd;
+    color: var(--text-doc);
     font-size: 0.9rem;
     line-height: 1.4;
   }
@@ -199,24 +199,24 @@
   .score-input input[type="range"] { width: 140px; }
   .score-input input[type="number"] {
     width: 50px;
-    background: var(--input-bg, #0e0f15);
+    background: var(--input-bg);
     color: inherit;
-    border: 1px solid #2a2c34;
+    border: 1px solid var(--chip-bg);
     border-radius: 3px;
     padding: 0.2rem 0.3rem;
   }
   .ballot-footer { margin-top: 0.75rem; display: flex; justify-content: flex-end; gap: 0.75rem; align-items: center; }
   .ballot-footer button {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
     border: 0;
     padding: 0.35rem 0.9rem;
     border-radius: 3px;
     cursor: pointer;
   }
   .ballot-footer button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .success { color: #4ad97a; font-size: 0.85rem; }
-  .error { color: #d93838; }
+  .success { color: var(--success-gov); font-size: 0.85rem; }
+  .error { color: var(--danger-alt); }
   .confirm-modal {
     position: fixed;
     inset: 0;
@@ -226,7 +226,7 @@
     z-index: 100;
   }
   .confirm-card {
-    background: var(--panel-bg, #1a1c24);
+    background: var(--panel-bg);
     padding: 1.25rem 1.5rem;
     border-radius: 8px;
     display: flex;
@@ -236,10 +236,10 @@
   }
   .ballot-summary { list-style: none; padding: 0; margin: 0; }
   .ballot-summary li { padding: 0.1rem 0; }
-  .caveat { color: #8a8c95; font-size: 0.8rem; }
+  .caveat { color: var(--text-faint); font-size: 0.8rem; }
   .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
   .confirm-actions button:last-child {
     background: var(--accent);
-    color: #fff;
+    color: var(--text-bright);
   }
 </style>

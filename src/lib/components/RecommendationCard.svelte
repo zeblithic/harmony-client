@@ -267,23 +267,23 @@
   }
 
   .reason-badge.stale {
-    color: #e67e22;
-    background: rgba(230, 126, 34, 0.12);
+    color: var(--cat-orange);
+    background: color-mix(in srgb, var(--cat-orange) 12%, transparent);
   }
 
   .reason-badge.duplicate-of-public {
-    color: #3498db;
-    background: rgba(52, 152, 219, 0.12);
+    color: var(--cat-blue);
+    background: color-mix(in srgb, var(--cat-blue) 12%, transparent);
   }
 
   .reason-badge.over-replicated {
-    color: #9b59b6;
-    background: rgba(155, 89, 182, 0.12);
+    color: var(--cat-purple);
+    background: color-mix(in srgb, var(--cat-purple) 12%, transparent);
   }
 
   .reason-badge.expired {
-    color: #d83c3e;
-    background: rgba(216, 60, 62, 0.12);
+    color: var(--danger-muted);
+    background: color-mix(in srgb, var(--danger-muted) 12%, transparent);
   }
 
   .recoverable {
@@ -299,7 +299,7 @@
 
   .staleness-bar-fill {
     height: 100%;
-    background: #e67e22;
+    background: var(--cat-orange);
     border-radius: 2px;
     transition: width 0.3s;
   }
@@ -335,17 +335,17 @@
   }
 
   .action-btn.burn:hover {
-    border-color: #d83c3e;
-    color: #d83c3e;
+    border-color: var(--danger-muted);
+    color: var(--danger-muted);
   }
 
   .action-btn.publish:hover {
-    border-color: #43b581;
-    color: #43b581;
+    border-color: var(--success-deep);
+    color: var(--success-deep);
   }
 
   .action-btn.pin:hover {
-    border-color: #f1c40f;
-    color: #f1c40f;
+    border-color: var(--cat-yellow);
+    color: var(--cat-yellow);
   }
 </style>
