@@ -48,10 +48,10 @@
     border-radius: 4px;
   }
   .dismiss:hover {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--bg-hover);
   }
   .dismiss:focus-visible {
-    outline: 2px solid var(--accent, #4a9eff);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

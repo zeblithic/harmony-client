@@ -89,15 +89,15 @@
   .modal-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 1000;
   }
   .modal-content {
-    background: var(--bg-secondary, #2a2a2a);
-    color: var(--text-primary, #fff);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
     padding: 1.5rem;
     border-radius: 8px;
     max-width: 420px;
@@ -112,16 +112,16 @@
     line-height: 1.5;
   }
   .version code {
-    background: var(--bg-tertiary, #1f1f1f);
+    background: var(--bg-tertiary);
     padding: 0.1rem 0.3rem;
     border-radius: 3px;
   }
   .license {
     font-size: 0.85rem;
-    color: var(--text-secondary, #aaa);
+    color: var(--text-secondary);
   }
   .modal-content a {
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     text-decoration: none;
   }
   .modal-content a:hover {
@@ -134,9 +134,9 @@
   }
   .actions button {
     padding: 0.5rem 1rem;
-    border: 1px solid var(--border, #444);
-    background: var(--bg-tertiary, #1f1f1f);
-    color: var(--text-primary, #fff);
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     border-radius: 4px;
     cursor: pointer;
   }

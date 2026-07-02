@@ -76,7 +76,7 @@
 <style>
   .codec-toggle {
     display: inline-flex;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 6px;
     overflow: hidden;
     font-size: 0.75rem;
@@ -85,18 +85,18 @@
   .codec-option {
     padding: 4px 10px;
     cursor: pointer;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     transition: all 0.15s ease;
     user-select: none;
   }
 
   .codec-option:not(:last-child) {
-    border-right: 1px solid var(--border, #3f4147);
+    border-right: 1px solid var(--border);
   }
 
   .codec-option.selected {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--accent);
+    color: var(--text-primary);
   }
 
   .codec-option:hover:not(.selected):not([aria-disabled='true']) {
@@ -109,7 +109,7 @@
   }
 
   .codec-option:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 </style>

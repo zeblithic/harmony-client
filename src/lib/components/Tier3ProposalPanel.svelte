@@ -590,7 +590,7 @@
   }
   button[type="submit"] {
     align-self: flex-start;
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
     border: 0;
     padding: 0.5rem 1rem;
@@ -601,7 +601,7 @@
   .confirm-modal {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: grid;
     place-items: center;
     z-index: 100;
@@ -617,7 +617,7 @@
   }
   .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
   .confirm-actions button:last-child {
-    background: var(--accent, #4a9eff);
+    background: var(--accent);
     color: #fff;
   }
   .list-heading { margin-top: 1.5rem; font-size: 1rem; }
@@ -641,8 +641,8 @@
   .proposal-text { font-weight: 500; }
   .retry-btn {
     background: transparent;
-    color: var(--accent, #4a9eff);
-    border: 1px solid var(--accent, #4a9eff);
+    color: var(--accent);
+    border: 1px solid var(--accent);
     padding: 0.25rem 0.6rem;
     border-radius: 4px;
     cursor: pointer;
@@ -693,7 +693,7 @@
     font-weight: 500;
   }
   .badge.winner { background: var(--success-bg, rgba(74, 217, 122, 0.15)); color: #4ad97a; }
-  .badge.runner-up { background: rgba(74, 158, 255, 0.15); color: var(--accent, #4a9eff); }
+  .badge.runner-up { background: rgba(74, 158, 255, 0.15); color: var(--accent); }
   .finalists { margin-top: 0.5rem; color: #8a8c95; font-size: 0.85rem; }
   .finalists ol { margin: 0.25rem 0; padding-left: 1.25rem; }
 </style>

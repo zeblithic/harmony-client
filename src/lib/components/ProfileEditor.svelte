@@ -581,7 +581,7 @@
 
   .avatar-error {
     font-size: 12px;
-    color: var(--danger, #d9534f);
+    color: var(--danger);
   }
 
   .avatar-notice {
@@ -612,7 +612,7 @@
   }
 
   .about-remove-pending {
-    color: var(--danger, #d9534f);
+    color: var(--danger);
     font-style: normal;
   }
 
@@ -622,13 +622,13 @@
     border: 1px solid var(--border);
     border-radius: 4px;
     background: var(--bg-primary);
-    color: var(--danger, #d9534f);
+    color: var(--danger);
     font-size: 12px;
     cursor: pointer;
   }
 
   .remove-page-btn:hover {
-    border-color: var(--danger, #d9534f);
+    border-color: var(--danger);
   }
 
   .bio-input {
@@ -644,7 +644,7 @@
   }
 
   .char-counter.over-limit {
-    color: var(--danger, #d9534f);
+    color: var(--danger);
   }
 
   .repeat-list {
@@ -678,8 +678,8 @@
   }
 
   .repeat-remove:hover {
-    color: var(--danger, #d9534f);
-    border-color: var(--danger, #d9534f);
+    color: var(--danger);
+    border-color: var(--danger);
   }
 
   .repeat-add {

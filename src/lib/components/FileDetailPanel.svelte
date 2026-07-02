@@ -113,14 +113,14 @@
 
 <style>
   .file-detail-panel {
-    background: var(--bg-secondary, #2b2d31);
+    background: var(--bg-secondary);
     overflow-y: auto;
     padding: 0 16px;
   }
 
   .panel-section {
     padding: 12px 0;
-    border-bottom: 1px solid var(--border, #3f4147);
+    border-bottom: 1px solid var(--border);
   }
 
   .panel-section:last-child {
@@ -141,25 +141,25 @@
   }
 
   .staleness-label {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
   }
 
   .staleness-value {
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-weight: 600;
   }
 
   .staleness-bar-track {
     height: 4px;
     border-radius: 2px;
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
     overflow: hidden;
   }
 
   .staleness-bar-fill {
     height: 100%;
     border-radius: 2px;
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     transition: width 0.2s ease;
   }
 </style>

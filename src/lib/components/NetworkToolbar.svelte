@@ -50,8 +50,8 @@
     align-items: center;
     gap: 4px;
     padding: 4px 8px;
-    background: var(--bg-secondary, #2b2d31);
-    border-bottom: 1px solid var(--bg-tertiary, #313338);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--bg-tertiary);
   }
 
   .spacer {
@@ -62,8 +62,8 @@
     padding: 4px 10px;
     border: none;
     border-radius: 4px;
-    background: var(--bg-primary, #1e1f22);
-    color: var(--text-secondary, #b5bac1);
+    background: var(--bg-primary);
+    color: var(--text-secondary);
     font: inherit;
     font-size: 12px;
     cursor: pointer;
@@ -75,12 +75,12 @@
   }
 
   .toolbar-btn:hover:not(:disabled) {
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
   }
 
   .toolbar-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

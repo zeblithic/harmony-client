@@ -649,7 +649,7 @@
   .panel-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: flex;
     align-items: flex-start;
     justify-content: center;
@@ -784,10 +784,10 @@
   }
   .manage-members-btn:hover {
     color: var(--text-primary);
-    border-color: var(--accent, #5865f2);
+    border-color: var(--accent);
   }
   .manage-members-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .member-search { margin-bottom: 12px; }
@@ -809,7 +809,7 @@
   .leave-btn:focus-visible,
   .set-role:focus-visible,
   .kick:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .toggle-row {
@@ -846,10 +846,10 @@
   }
   .fork-btn:hover {
     color: var(--text-primary);
-    border-color: var(--accent, #5865f2);
+    border-color: var(--accent);
   }
   .fork-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .fork-error {
@@ -875,10 +875,10 @@
   }
   .change-quorum-btn:hover {
     color: var(--text-primary);
-    border-color: var(--accent, #5865f2);
+    border-color: var(--accent);
   }
   .change-quorum-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   /* ZEB-250: member-row pending badge */

@@ -719,7 +719,7 @@
     color: var(--text-secondary);
     margin-top: 2px;
   }
-  .trust-badge.full { color: #4ade80; }
+  .trust-badge.full { color: var(--success); }
   .trust-badge.provisional { color: #fbbf24; }
   .trust-badge.refused { color: var(--danger); }
   .separator { margin: 0 6px; color: var(--text-muted); }

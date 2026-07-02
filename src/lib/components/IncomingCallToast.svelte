@@ -85,14 +85,14 @@
   }
   .caller-name {
     font-weight: 600;
-    color: var(--text-primary, #fff);
+    color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .call-label {
     font-size: 0.8rem;
-    color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+    color: var(--text-secondary);
   }
   .call-actions {
     display: flex;
@@ -113,14 +113,14 @@
     justify-content: center;
   }
   .btn-accept {
-    background: var(--accent, #22c55e);
+    background: var(--accent);
     color: #fff;
   }
   .btn-accept:hover {
     filter: brightness(1.1);
   }
   .btn-decline {
-    background: var(--danger, #ef4444);
+    background: var(--danger);
     color: #fff;
   }
   .btn-decline:hover {

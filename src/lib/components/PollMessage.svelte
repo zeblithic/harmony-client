@@ -259,7 +259,7 @@
     letter-spacing: 0.05em;
   }
   .poll-lifecycle.open {
-    color: var(--accent, #4ade80);
+    color: var(--accent);
   }
   .poll-options {
     list-style: none;
@@ -286,15 +286,15 @@
     font: inherit;
   }
   .poll-option-btn:hover:not(:disabled) {
-    border-color: var(--accent, #4ade80);
+    border-color: var(--accent);
   }
   .poll-option-btn:disabled {
     cursor: not-allowed;
     opacity: 0.7;
   }
   .poll-option-btn.selected {
-    border-color: var(--accent, #4ade80);
-    background: color-mix(in srgb, var(--accent, #4ade80) 10%, var(--bg-primary));
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-primary));
   }
   .poll-option-label {
     grid-column: 1;
@@ -317,7 +317,7 @@
   .poll-option-bar-fill {
     display: block;
     height: 100%;
-    background: var(--accent, #4ade80);
+    background: var(--accent);
     transition: width 200ms ease;
   }
   .poll-footer {
@@ -332,7 +332,7 @@
     letter-spacing: 0.05em;
   }
   .poll-error {
-    color: var(--danger, #f87171);
+    color: var(--danger);
     font-size: 0.85rem;
     margin: 4px 0 0;
   }

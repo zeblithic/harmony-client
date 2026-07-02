@@ -1123,9 +1123,9 @@
     margin: 8px 12px;
     padding: 8px 12px;
     border-radius: 4px;
-    background: color-mix(in srgb, var(--danger, #ed4245) 12%, transparent);
-    border: 1px solid var(--danger, #ed4245);
-    color: var(--text-primary, #f2f3f5);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    border: 1px solid var(--danger);
+    color: var(--text-primary);
     font-size: 0.85rem;
   }
 

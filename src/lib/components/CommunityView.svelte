@@ -707,7 +707,7 @@
   .community-members-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: flex;
     align-items: flex-start;
     justify-content: center;
@@ -745,7 +745,7 @@
     cursor: pointer;
   }
   .community-members-overlay-close:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

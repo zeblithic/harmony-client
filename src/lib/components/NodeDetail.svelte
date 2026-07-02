@@ -215,7 +215,7 @@
   .node-detail {
     padding: 16px;
     font-size: 13px;
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .detail-header {
@@ -231,7 +231,7 @@
     height: 36px;
     border-radius: 50%;
     overflow: hidden;
-    background: var(--bg-tertiary, #40444b);
+    background: var(--bg-tertiary);
   }
 
   .header-info {
@@ -245,7 +245,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .status-dot {
@@ -260,27 +260,27 @@
     display: inline-block;
     margin-top: 2px;
     padding: 2px 8px;
-    border: 1px solid var(--bg-tertiary, #40444b);
+    border: 1px solid var(--bg-tertiary);
     border-radius: 10px;
-    background: var(--bg-secondary, #2f3136);
-    color: var(--text-secondary, #b9bbbe);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
     font-family: monospace;
     font-size: 11px;
     cursor: pointer;
   }
 
   .address-chip:hover {
-    background: var(--bg-tertiary, #40444b);
+    background: var(--bg-tertiary);
   }
 
   .address-chip:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
   .meta-line {
     margin: 0 0 16px;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
     font-size: 12px;
   }
 
@@ -292,7 +292,7 @@
   }
 
   .metric {
-    background: var(--bg-secondary, #2f3136);
+    background: var(--bg-secondary);
     border-radius: 6px;
     padding: 8px 10px;
   }
@@ -309,17 +309,17 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
   }
 
   .metric-value {
     font-size: 13px;
     font-weight: 500;
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .links-section {
-    border-top: 1px solid var(--bg-tertiary, #40444b);
+    border-top: 1px solid var(--bg-tertiary);
     padding-top: 12px;
   }
 
@@ -329,7 +329,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
   }
 
   .links-list {
@@ -349,19 +349,19 @@
     padding: 6px 10px;
     border: none;
     border-radius: 4px;
-    background: var(--bg-secondary, #2f3136);
-    color: var(--text-primary, #dcddde);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
     font: inherit;
     font-size: 12px;
     cursor: pointer;
   }
 
   .link-item:hover {
-    background: var(--bg-tertiary, #40444b);
+    background: var(--bg-tertiary);
   }
 
   .link-item:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 
@@ -372,7 +372,7 @@
   }
 
   .link-stats {
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
     font-size: 12px;
   }
 </style>

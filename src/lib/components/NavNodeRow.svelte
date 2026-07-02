@@ -301,7 +301,7 @@
     color: var(--text-primary);
   }
   .community-chevron:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
     border-radius: 2px;
   }

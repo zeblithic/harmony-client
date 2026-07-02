@@ -98,7 +98,7 @@
 
 <style>
   .title {
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-size: 1.1rem;
     margin: 0 0 16px;
   }
@@ -106,7 +106,7 @@
   .progress-bar {
     width: 100%;
     height: 8px;
-    background: var(--bg-tertiary, #1e1f22);
+    background: var(--bg-tertiary);
     border-radius: 4px;
     overflow: hidden;
     margin-bottom: 12px;
@@ -114,7 +114,7 @@
 
   .progress-bar-fill {
     height: 100%;
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     transition: width 0.2s;
   }
 
@@ -130,7 +130,7 @@
   }
 
   .counter {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     font-size: 0.9rem;
     margin: 0 0 8px;
   }
@@ -138,7 +138,7 @@
   .current-path {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 0.8rem;
-    color: var(--text-muted, #b5bac1);
+    color: var(--text-muted);
     word-break: break-all;
     margin: 0 0 16px;
     opacity: 0.85;
@@ -151,9 +151,9 @@
   }
 
   .cancel-btn {
-    background: var(--bg-tertiary, #1e1f22);
-    color: var(--text-primary, #f2f3f5);
-    border: 1px solid var(--border, transparent);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
     padding: 6px 14px;
     border-radius: 4px;
     cursor: pointer;
@@ -161,7 +161,7 @@
   }
 
   .cancel-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 

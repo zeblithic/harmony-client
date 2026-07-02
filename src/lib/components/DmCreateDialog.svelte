@@ -235,13 +235,13 @@
     border: none;
     padding: 0;
     margin-left: 4px;
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     cursor: pointer;
     font-size: inherit;
     text-decoration: underline;
   }
   .convert-link:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
   .actions {

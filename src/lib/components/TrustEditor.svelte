@@ -94,7 +94,7 @@
   .trust-editor {
     padding: 12px;
     font-size: 13px;
-    color: var(--text-primary, #dcddde);
+    color: var(--text-primary);
   }
 
   .editor-heading {
@@ -103,7 +103,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
   }
 
   .dimension {
@@ -115,7 +115,7 @@
   .dimension-label {
     font-size: 12px;
     font-weight: 500;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
     margin-bottom: 4px;
   }
 
@@ -144,28 +144,28 @@
     justify-content: center;
     width: 32px;
     height: 28px;
-    border: 1px solid var(--bg-tertiary, #40444b);
+    border: 1px solid var(--bg-tertiary);
     border-radius: 4px;
-    background: var(--bg-secondary, #2f3136);
-    color: var(--text-secondary, #b9bbbe);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
     font-size: 12px;
     font-weight: 500;
     transition: background 0.1s, border-color 0.1s;
   }
 
   .level-option input[type='radio']:checked + .level-value {
-    background: var(--accent, #5865f2);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    border-color: var(--accent);
     color: #ffffff;
   }
 
   .level-option input[type='radio']:focus-visible + .level-value {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
   .level-value:hover {
-    background: var(--bg-tertiary, #40444b);
+    background: var(--bg-tertiary);
   }
 
   .score-footer {
@@ -174,36 +174,36 @@
     align-items: center;
     margin-top: 12px;
     padding-top: 8px;
-    border-top: 1px solid var(--bg-tertiary, #40444b);
+    border-top: 1px solid var(--bg-tertiary);
   }
 
   .overall-score {
     font-family: monospace;
     font-size: 12px;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
   }
 
   .fraction {
-    color: var(--text-muted, #72767d);
+    color: var(--text-muted);
   }
 
   .clear-button {
     padding: 4px 12px;
-    border: 1px solid var(--bg-tertiary, #40444b);
+    border: 1px solid var(--bg-tertiary);
     border-radius: 4px;
-    background: var(--bg-secondary, #2f3136);
-    color: var(--text-secondary, #b9bbbe);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
     font: inherit;
     font-size: 12px;
     cursor: pointer;
   }
 
   .clear-button:hover {
-    background: var(--bg-tertiary, #40444b);
+    background: var(--bg-tertiary);
   }
 
   .clear-button:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 </style>

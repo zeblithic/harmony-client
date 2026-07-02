@@ -466,7 +466,7 @@
 
   .toggle-hint {
     font-size: 11px;
-    color: var(--text-muted, var(--text-secondary));
+    color: var(--text-muted);
     line-height: 1.4;
   }
 
@@ -497,16 +497,16 @@
     width: 32px;
     height: 18px;
     border-radius: 9px;
-    background: var(--bg-tertiary, #444);
-    border: 1px solid var(--border, #555);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
     transition: background 0.15s;
     position: relative;
     flex-shrink: 0;
   }
 
   .toggle-track.on {
-    background: var(--accent, #5865f2);
-    border-color: var(--accent, #5865f2);
+    background: var(--accent);
+    border-color: var(--accent);
   }
 
   .toggle-thumb {
@@ -515,7 +515,7 @@
     width: 12px;
     height: 12px;
     border-radius: 50%;
-    background: var(--text-primary, #fff);
+    background: var(--text-primary);
     transition: transform 0.15s;
   }
 
@@ -590,9 +590,9 @@
     flex: 1;
     font-size: 12px;
     padding: 3px 6px;
-    background: var(--bg-tertiary, #333);
-    color: var(--text-primary, #eee);
-    border: 1px solid var(--border, #555);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
     border-radius: 3px;
   }
 

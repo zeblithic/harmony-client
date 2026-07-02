@@ -344,9 +344,9 @@
      blocked/absent and the session joined without a sender. Amber/informational,
      visually distinct from the red `.voice-error` alert. */
   .voice-mic-blocked {
-    background: color-mix(in srgb, var(--warning, #d8a200) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
-    color: var(--warning, #d8a200);
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+    color: var(--warning);
     padding: 8px 14px;
     border-radius: 4px;
     margin: 8px 16px;
@@ -517,9 +517,9 @@
      media transport is re-establishing. */
   .reconnecting {
     font-size: 0.78rem;
-    color: var(--warning, #d8a200);
-    background: color-mix(in srgb, var(--warning, #d8a200) 14%, transparent);
-    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
     padding: 3px 9px;
     border-radius: 999px;
     white-space: nowrap;
@@ -550,7 +550,7 @@
   .mod-btn:hover { color: var(--text-primary); }
   .mod-btn.danger { color: var(--danger); border-color: var(--danger); }
   .mod-badge { position: absolute; top: 6px; left: 6px; font-size: 0.7rem; line-height: 1; }
-  .voice-mod-note { background: color-mix(in srgb, var(--warning, #d8a200) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
-    color: var(--warning, #d8a200); padding: 6px 14px; border-radius: 4px; margin: 0 16px 8px; font-size: 0.85rem; }
+  .voice-mod-note { background: color-mix(in srgb, var(--warning) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+    color: var(--warning); padding: 6px 14px; border-radius: 4px; margin: 0 16px 8px; font-size: 0.85rem; }
 </style>

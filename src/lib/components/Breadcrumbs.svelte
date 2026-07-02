@@ -51,11 +51,11 @@
     align-items: center;
     gap: 4px;
     padding: 8px 12px;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
   }
 
   .separator {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-size: 0.85rem;
     user-select: none;
   }
@@ -66,23 +66,23 @@
     padding: 2px 4px;
     font: inherit;
     font-size: 0.85rem;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     cursor: pointer;
     border-radius: 2px;
   }
 
   .breadcrumb-segment:hover {
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     text-decoration: underline;
   }
 
   .breadcrumb-segment:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
   .breadcrumb-segment:last-child {
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     font-weight: 600;
   }
 </style>

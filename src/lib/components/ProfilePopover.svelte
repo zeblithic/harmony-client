@@ -401,7 +401,7 @@
     border-color: var(--border);
   }
   .popover-ownerid:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .ownerid-hex {
@@ -433,7 +433,7 @@
     margin-top: 6px;
     font-size: 12px;
     font-weight: 600;
-    color: var(--danger, var(--text-muted));
+    color: var(--danger);
   }
 
   .popover-view-profile {
@@ -443,7 +443,7 @@
     padding: 6px 8px;
     font-size: 12px;
     font-weight: 600;
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     background: transparent;
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -454,7 +454,7 @@
     background: var(--bg-secondary);
   }
   .popover-view-profile:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 

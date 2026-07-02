@@ -188,8 +188,8 @@
     height: 40px;
     border: none;
     border-radius: 8px;
-    background: var(--bg-tertiary, #1f1f1f);
-    color: var(--text-primary, #fff);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     font-size: 16px;
     cursor: pointer;
     display: flex;
@@ -197,7 +197,7 @@
     justify-content: center;
   }
   .more-icon-button:hover {
-    background: var(--accent, #5865f2);
+    background: var(--accent);
   }
   .more-caret {
     font-size: 0.7rem;
@@ -208,8 +208,8 @@
     bottom: calc(100% + 4px);
     left: 0;
     min-width: 180px;
-    background: var(--bg-secondary, #2a2a2a);
-    border: 1px solid var(--border, #444);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
     border-radius: 4px;
     z-index: 100;
     display: flex;
@@ -220,7 +220,7 @@
   .menu-section {
     margin: 0;
     padding: 6px 12px 2px;
-    color: var(--text-muted, #888);
+    color: var(--text-muted);
     font-size: 0.7rem;
     font-weight: 600;
     text-transform: uppercase;
@@ -230,20 +230,20 @@
     padding: 8px 12px;
     border: none;
     background: transparent;
-    color: var(--text-primary, #fff);
+    color: var(--text-primary);
     text-align: left;
     cursor: pointer;
     font-size: 0.875rem;
   }
   .more-dropdown button:hover {
-    background: var(--bg-tertiary, #1f1f1f);
+    background: var(--bg-tertiary);
   }
   .more-dropdown button.active {
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     font-weight: 600;
   }
   .more-dropdown button:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 </style>

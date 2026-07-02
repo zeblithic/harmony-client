@@ -369,9 +369,9 @@
   }
   .dw-revoke {
     padding: 4px 12px;
-    border: 1px solid var(--danger, #f87171);
+    border: 1px solid var(--danger);
     background: transparent;
-    color: var(--danger, #f87171);
+    color: var(--danger);
     border-radius: 4px;
     cursor: pointer;
     font: inherit;
@@ -383,8 +383,8 @@
   .dw-apply,
   .dw-confirm {
     padding: 4px 12px;
-    border: 1px solid var(--accent, #4ade80);
-    background: var(--accent, #4ade80);
+    border: 1px solid var(--accent);
+    background: var(--accent);
     color: var(--bg-primary);
     border-radius: 4px;
     cursor: pointer;
@@ -410,7 +410,7 @@
     flex-direction: column;
     gap: 8px;
     padding: 10px 12px;
-    border: 1px solid var(--danger, #f87171);
+    border: 1px solid var(--danger);
     border-radius: 4px;
     background: var(--bg-primary);
   }
@@ -428,12 +428,12 @@
     max-width: 160px;
   }
   .dw-typed-input:focus {
-    outline: 1px solid var(--accent, #4ade80);
+    outline: 1px solid var(--accent);
     outline-offset: 1px;
   }
   .dw-error {
     margin: 0;
-    color: var(--danger, #f87171);
+    color: var(--danger);
     font-size: 0.85rem;
   }
 </style>

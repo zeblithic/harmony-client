@@ -106,18 +106,18 @@
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
-    background: var(--bg-secondary, #2f3136);
-    border-bottom: 1px solid var(--bg-tertiary, #40444b);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--bg-tertiary);
     font-size: 12px;
   }
 
   .endpoint-input {
     width: 200px;
     padding: 4px 8px;
-    border: 1px solid var(--bg-tertiary, #40444b);
+    border: 1px solid var(--bg-tertiary);
     border-radius: 4px;
-    background: var(--bg-primary, #1e1f22);
-    color: var(--text-primary, #dcddde);
+    background: var(--bg-primary);
+    color: var(--text-primary);
     font-family: monospace;
     font-size: 11px;
   }
@@ -127,7 +127,7 @@
   }
 
   .endpoint-input:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -1px;
   }
 
@@ -135,7 +135,7 @@
     padding: 4px 12px;
     border: none;
     border-radius: 4px;
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     color: white;
     font-size: 11px;
     font-weight: 600;
@@ -146,12 +146,12 @@
   .connect-btn:hover { opacity: 0.9; }
 
   .connect-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
 
   .connect-btn.disconnect {
-    background: var(--bg-tertiary, #40444b);
+    background: var(--bg-tertiary);
   }
 
   .connect-btn:disabled {
@@ -164,7 +164,7 @@
     align-items: center;
     gap: 6px;
     margin-left: auto;
-    color: var(--text-secondary, #b9bbbe);
+    color: var(--text-secondary);
   }
 
   .status-dot {

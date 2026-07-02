@@ -132,7 +132,7 @@
     line-height: 1.4;
   }
   .reason-textarea:focus {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -1px;
   }
   .reason-textarea:disabled {
@@ -177,7 +177,7 @@
     color: #fff;
   }
   .primary-btn.unban {
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     color: var(--text-primary);
   }
   .primary-btn:disabled {
@@ -186,7 +186,7 @@
   }
   .cancel-btn:focus-visible,
   .primary-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .spinner {

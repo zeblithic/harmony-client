@@ -292,7 +292,7 @@
   .presence-dot.self-invisible {
     background: transparent;
     border-style: dashed;
-    border-color: var(--text-muted, var(--text-secondary));
+    border-color: var(--text-muted);
   }
   .member-info {
     flex: 1;
@@ -321,7 +321,7 @@
     text-decoration: underline;
   }
   .name-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
     border-radius: 2px;
   }
@@ -384,7 +384,7 @@
     border-color: var(--border);
   }
   .kebab-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .menu {
@@ -394,7 +394,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 4px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 4px 12px var(--overlay);
     list-style: none;
     margin: 0;
     padding: 4px 0;
@@ -416,7 +416,7 @@
     background: var(--bg-tertiary);
   }
   .menu-item:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
   .menu-item.danger {

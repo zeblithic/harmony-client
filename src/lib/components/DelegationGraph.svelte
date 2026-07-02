@@ -301,10 +301,10 @@
     font-size: 0.85rem;
   }
   .dg-error {
-    color: var(--danger, #f87171);
+    color: var(--danger);
   }
   .dg-node {
-    fill: var(--accent, #4ade80);
+    fill: var(--accent);
     stroke: var(--text-primary);
     stroke-width: 1;
   }

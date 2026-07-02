@@ -144,7 +144,7 @@
 </div>
 
 <style>
-  .mint-dialog { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+  .mint-dialog { position: fixed; inset: 0; background: var(--overlay); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .dialog-body { background: var(--color-bg, #fff); padding: 1.5rem; border-radius: 8px; min-width: 480px; max-width: 90vw; display: flex; flex-direction: column; gap: 0.75rem; }
   .new-account { display: flex; gap: 0.5rem; }
   .new-account input { flex: 1; }

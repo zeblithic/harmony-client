@@ -101,7 +101,7 @@
     margin: 0;
     font-size: 0.8rem;
     font-weight: 600;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
   }
 
   .header-icon {
@@ -109,13 +109,13 @@
   }
 
   .header-detail {
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     font-weight: 400;
   }
 
   .empty-state {
     font-size: 0.8rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     margin: 4px 0;
     font-style: italic;
   }
@@ -144,7 +144,7 @@
 
   .buddy-name {
     font-size: 0.85rem;
-    color: var(--text-primary, #f2f3f5);
+    color: var(--text-primary);
     flex: 1;
     min-width: 0;
     overflow: hidden;
@@ -154,7 +154,7 @@
 
   .buddy-storage {
     font-size: 0.75rem;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     flex-shrink: 0;
   }
 
@@ -167,7 +167,7 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--text-muted, #949ba4);
+    background: var(--text-muted);
     flex-shrink: 0;
   }
 
@@ -177,22 +177,22 @@
 
   .remove-btn {
     padding: 2px 8px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
     background: none;
-    color: var(--text-secondary, #b5bac1);
+    color: var(--text-secondary);
     font-size: 0.7rem;
     cursor: pointer;
     flex-shrink: 0;
   }
 
   .remove-btn:hover {
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
   }
 
   .remove-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
@@ -203,16 +203,16 @@
   .peer-picker {
     width: 100%;
     padding: 4px 8px;
-    border: 1px solid var(--border, #3f4147);
+    border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-tertiary, #313338);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     font-size: 0.8rem;
     cursor: pointer;
   }
 
   .peer-picker:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 

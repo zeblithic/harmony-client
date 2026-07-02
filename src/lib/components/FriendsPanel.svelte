@@ -1056,7 +1056,7 @@
     flex-wrap: wrap;
     gap: 12px;
     padding: 6px 0;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border);
   }
 
   .friend-id {
@@ -1107,15 +1107,15 @@
     font-size: 12px;
     padding: 4px 6px;
     border-radius: 4px;
-    border: 1px solid var(--border, #555);
-    background: var(--bg-secondary, #1e1e1e);
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
     color: var(--text-primary);
   }
 
   .referrals-row {
     list-style: none;
     padding: 4px 0 8px 12px;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border);
   }
 
   .referrals-list {
@@ -1144,9 +1144,9 @@
     font-size: 10px;
     padding: 1px 6px;
     border-radius: 8px;
-    background: var(--bg-tertiary, #1e1e1e);
+    background: var(--bg-tertiary);
     color: var(--text-secondary);
-    border: 1px solid var(--border, #2a2a2a);
+    border: 1px solid var(--border);
   }
 
   .friend-name {
@@ -1177,7 +1177,7 @@
     color: var(--text-primary);
   }
   .identity-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
     border-radius: 2px;
   }
@@ -1187,7 +1187,7 @@
     font-size: 12px;
     padding: 4px 10px;
     border-radius: 4px;
-    border: 1px solid var(--border, #555);
+    border: 1px solid var(--border);
     background: transparent;
     color: var(--text-secondary);
     cursor: pointer;
@@ -1211,8 +1211,8 @@
     font-size: 13px;
     padding: 6px 12px;
     border-radius: 4px;
-    border: 1px solid var(--accent, #5865f2);
-    background: var(--accent, #5865f2);
+    border: 1px solid var(--accent);
+    background: var(--accent);
     color: #fff;
     cursor: pointer;
   }
@@ -1226,7 +1226,7 @@
     font-size: 13px;
     padding: 6px 12px;
     border-radius: 4px;
-    border: 1px solid var(--border, #555);
+    border: 1px solid var(--border);
     background: transparent;
     color: var(--text-primary);
     cursor: pointer;
@@ -1245,8 +1245,8 @@
     font-size: 12px;
     padding: 6px 8px;
     border-radius: 4px;
-    border: 1px solid var(--border, #555);
-    background: var(--bg-tertiary, #1e1e1e);
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
     color: var(--text-primary);
     font-family: var(--font-mono, monospace);
   }
@@ -1283,7 +1283,7 @@
     padding: 0;
     border: none;
     background: none;
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     text-decoration: underline;
     cursor: pointer;
   }
@@ -1298,7 +1298,7 @@
   .subsection {
     margin-top: 16px;
     padding-top: 12px;
-    border-top: 1px solid var(--border, #2a2a2a);
+    border-top: 1px solid var(--border);
   }
 
   .subsection-title {
@@ -1321,14 +1321,14 @@
     font-size: 12px;
     padding: 4px 10px;
     border-radius: 4px;
-    border: 1px solid var(--accent, #5865f2);
+    border: 1px solid var(--accent);
     background: transparent;
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     cursor: pointer;
   }
 
   .accept-btn:hover:not(:disabled) {
-    background: var(--accent, #5865f2);
+    background: var(--accent);
     color: #fff;
   }
 

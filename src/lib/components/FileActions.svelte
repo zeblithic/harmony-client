@@ -97,8 +97,8 @@
     padding: 8px;
     border-radius: 4px;
     border: none;
-    background: var(--bg-tertiary, #232428);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     font-size: 0.85rem;
     cursor: pointer;
     font: inherit;
@@ -107,11 +107,11 @@
 
   .action-btn:hover {
     background: var(--bg-tertiary-hover, #35373c);
-    color: var(--accent, #5865f2);
+    color: var(--accent);
   }
 
   .action-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 

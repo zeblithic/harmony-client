@@ -60,8 +60,8 @@
     right: 1rem;
     max-width: 380px;
     padding: 0.75rem 1rem;
-    background: var(--bg-secondary, #2a2a2a);
-    color: var(--text-primary, #fff);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
     border-radius: 6px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
     z-index: 1000;
@@ -83,7 +83,7 @@
     font-size: 0.875rem;
   }
   .actions button:hover:not(:disabled) {
-    background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+    background: var(--bg-hover);
   }
   .actions button:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>

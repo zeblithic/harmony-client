@@ -150,7 +150,7 @@
     background: #2a2c34; color: #d6d6d6; border: 1px solid transparent;
     padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.8rem; cursor: pointer;
   }
-  .tri-button button.active { border-color: var(--accent, #4a9eff); }
+  .tri-button button.active { border-color: var(--accent); }
   .tri-button button:disabled { opacity: 0.5; cursor: not-allowed; }
   .chips { margin-top: 0.4rem; display: flex; gap: 0.4rem; font-size: 0.8rem; }
   .chip { padding: 0.1rem 0.4rem; background: #2a2c34; border-radius: 2px; color: #8a8c95; }

@@ -186,7 +186,7 @@
   .mint-dialog {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -194,7 +194,7 @@
   }
 
   .dialog-body {
-    background: var(--bg-secondary, #fff);
+    background: var(--bg-secondary);
     padding: 1.5rem;
     border-radius: 8px;
     min-width: 400px;
@@ -226,7 +226,7 @@
     padding: 6px 8px;
     border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-primary, #fff);
+    background: var(--bg-primary);
     color: var(--text-primary);
   }
 
@@ -251,8 +251,8 @@
   }
 
   .dialog-actions button:last-child {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #fff);
+    background: var(--accent);
+    color: var(--text-primary);
   }
 
   .dialog-actions button:disabled {

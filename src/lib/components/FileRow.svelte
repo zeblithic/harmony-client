@@ -135,16 +135,16 @@
   }
 
   .file-row:hover {
-    background: var(--bg-tertiary, #232428);
+    background: var(--bg-tertiary);
   }
 
   .file-row:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 
   .file-row.selected {
-    background: color-mix(in srgb, var(--accent, #5865f2) 10%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
 
   .file-row-icon {
@@ -171,7 +171,7 @@
     font: inherit;
     color: inherit;
     background: transparent;
-    border: 1px solid var(--accent, #5865f2);
+    border: 1px solid var(--accent);
     border-radius: 3px;
     padding: 2px 4px;
   }
@@ -181,7 +181,7 @@
   .file-row-replication {
     flex-shrink: 0;
     font-size: 0.8rem;
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     min-width: 60px;
     text-align: right;
   }

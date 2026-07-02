@@ -165,11 +165,11 @@
     flex-direction: column;
     gap: 0.5rem;
     padding: 0.6rem 1rem;
-    background: var(--bg-secondary, rgba(20, 22, 30, 0.97));
-    border-top: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
     z-index: 50;
     font-size: 0.875rem;
-    color: var(--text-primary, #fff);
+    color: var(--text-primary);
   }
   .bar-head {
     display: flex;
@@ -184,15 +184,15 @@
     white-space: nowrap;
   }
   .elapsed {
-    color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+    color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
   .reconnecting {
     font-size: 0.78rem;
-    color: var(--warning, #d8a200);
-    background: color-mix(in srgb, var(--warning, #d8a200) 14%, transparent);
-    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
     padding: 2px 8px;
     border-radius: 999px;
     white-space: nowrap;
@@ -212,7 +212,7 @@
     gap: 0.4rem;
     padding: 4px 10px 4px 4px;
     border-radius: 999px;
-    background: var(--bg-tertiary, rgba(255, 255, 255, 0.05));
+    background: var(--bg-tertiary);
     position: relative;
   }
   /* Ringing/declined rows are greyed; declined is dimmer still. */
@@ -223,8 +223,8 @@
     opacity: 0.4;
   }
   .tile.speaking {
-    outline: 2px solid var(--accent, #4a9eff);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #4a9eff) 30%, transparent);
+    outline: 2px solid var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
   }
   .tile .avatar {
     width: 28px;
@@ -235,8 +235,8 @@
     flex-shrink: 0;
   }
   .avatar-fallback {
-    background: var(--bg-secondary, rgba(255, 255, 255, 0.1));
-    border: 1px solid var(--border, rgba(255, 255, 255, 0.15));
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
   }
   .tile .name {
     font-size: 0.8rem;
@@ -251,7 +251,7 @@
   }
   .tile .pending-label {
     font-size: 0.72rem;
-    color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+    color: var(--text-secondary);
     font-style: italic;
   }
 
@@ -261,21 +261,21 @@
     gap: 0.4rem;
   }
   .ctrl {
-    border: 1px solid var(--border, rgba(255, 255, 255, 0.15));
-    background: var(--bg-tertiary, rgba(255, 255, 255, 0.05));
-    color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
     padding: 4px 12px;
     border-radius: 4px;
     font-size: 0.8rem;
     cursor: pointer;
   }
   .ctrl:hover {
-    background: var(--bg-hover, rgba(255, 255, 255, 0.1));
-    color: var(--text-primary, #fff);
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
   .ctrl.active {
-    background: var(--accent, #4a9eff);
-    border-color: var(--accent, #4a9eff);
+    background: var(--accent);
+    border-color: var(--accent);
     color: #fff;
   }
   .ptt-hold {
@@ -285,7 +285,7 @@
   .btn-leave {
     margin-left: auto;
     border: none;
-    background: var(--danger, #ef4444);
+    background: var(--danger);
     color: #fff;
     padding: 4px 14px;
     border-radius: 4px;

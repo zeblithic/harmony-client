@@ -24,13 +24,13 @@
     padding: 6px 12px;
     font-family: 'Courier New', Courier, monospace;
     font-size: 1.1rem;
-    color: var(--text-secondary, #b5bac1);
-    border-top: 1px solid var(--border, #3f4147);
-    background: var(--bg-secondary, #2b2d31);
+    color: var(--text-secondary);
+    border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
   }
 
   .hint-placeholder {
-    color: var(--text-muted, #949ba4);
+    color: var(--text-muted);
     font-style: italic;
   }
 </style>

@@ -254,7 +254,7 @@
     color: var(--text-primary);
   }
   .panel-close:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
 
@@ -301,7 +301,7 @@
     border-color: var(--border);
   }
   .panel-ownerid:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   .ownerid-hex {
@@ -354,7 +354,7 @@
   .links-list a,
   .links-list .profile-link {
     font-size: 13px;
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     text-decoration: none;
     word-break: break-all;
   }
@@ -375,7 +375,7 @@
     text-align: left;
   }
   .links-list .profile-link:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
   /* T11: a link with a non-allowlisted scheme renders as inert text (no href,

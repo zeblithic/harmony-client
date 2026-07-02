@@ -333,15 +333,15 @@
   .modal-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 1000;
   }
   .modal-content {
-    background: var(--bg-secondary, #2a2a2a);
-    color: var(--text-primary, #fff);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
     padding: 1.5rem;
     border-radius: 8px;
     max-width: 520px;
@@ -349,45 +349,45 @@
   }
   .modal-content h2 { margin: 0 0 1rem; font-size: 1.25rem; }
   .modal-content p { margin: 0 0 1rem; line-height: 1.5; }
-  .muted { color: var(--text-secondary, #aaa); font-size: 0.9rem; }
+  .muted { color: var(--text-secondary); font-size: 0.9rem; }
   label { display: block; margin-bottom: 0.4rem; font-size: 0.9rem; }
   input {
     width: 100%;
     box-sizing: border-box;
     padding: 0.5rem;
-    background: var(--bg-primary, #111);
-    color: var(--text-primary, #fff);
-    border: 1px solid var(--border, #444);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
     border-radius: 4px;
     margin-bottom: 0.5rem;
   }
   .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
   .actions button {
     padding: 0.5rem 1rem;
-    border: 1px solid var(--border, #444);
-    background: var(--bg-tertiary, #1f1f1f);
-    color: var(--text-primary, #fff);
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     border-radius: 4px;
     cursor: pointer;
   }
-  .actions button.primary { background: var(--accent, #5865f2); border-color: var(--accent, #5865f2); }
-  .actions button.danger { background: var(--danger, #d9534f); border-color: var(--danger, #d9534f); }
+  .actions button.primary { background: var(--accent); border-color: var(--accent); }
+  .actions button.danger { background: var(--danger); border-color: var(--danger); }
   .actions button:disabled { opacity: 0.5; cursor: default; }
   .error { color: crimson; font-size: 0.85rem; margin: 0 0 0.5rem; }
   .mint-error-summary { margin: 0 0 0.35rem; }
-  .mint-error details { color: var(--text-secondary, #aaa); }
+  .mint-error details { color: var(--text-secondary); }
   .mint-error summary { cursor: pointer; }
   .mint-error .raw-error {
     margin: 0.35rem 0 0;
     padding: 0.4rem 0.5rem;
-    background: var(--bg-tertiary, rgba(0, 0, 0, 0.2));
+    background: var(--bg-tertiary);
     border-radius: 4px;
     font-size: 0.78rem;
     white-space: pre-wrap;
     word-break: break-word;
   }
   footer { margin-top: 1rem; font-size: 0.85rem; }
-  .version { display: inline-block; margin-right: 1rem; color: var(--text-secondary, #aaa); opacity: 0.7; }
-  footer a { color: var(--accent, #5865f2); text-decoration: none; }
+  .version { display: inline-block; margin-right: 1rem; color: var(--text-secondary); opacity: 0.7; }
+  footer a { color: var(--accent); text-decoration: none; }
   footer a:hover { text-decoration: underline; }
 </style>

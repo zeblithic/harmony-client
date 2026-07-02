@@ -120,9 +120,9 @@
     width: 72px;
     height: 72px;
     border-radius: 50%;
-    border: 3px solid var(--accent, #5865f2);
+    border: 3px solid var(--accent);
     background: transparent;
-    color: var(--accent, #5865f2);
+    color: var(--accent);
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -136,8 +136,8 @@
   }
 
   .ptt-button.active {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #f2f3f5);
+    background: var(--accent);
+    color: var(--text-primary);
     box-shadow: 0 0 20px rgba(88, 101, 242, 0.4);
   }
 
@@ -149,7 +149,7 @@
   .ptt-button:disabled {
     opacity: 0.3;
     cursor: not-allowed;
-    border-color: var(--text-muted, #949ba4);
+    border-color: var(--text-muted);
   }
 
   .ptt-icon {

@@ -257,7 +257,7 @@
     letter-spacing: 0.05em;
     font-weight: 600;
   }
-  .cp-lifecycle.open { color: var(--accent, #4ade80); }
+  .cp-lifecycle.open { color: var(--accent); }
   .cp-lifecycle.threshold { color: #fbbf24; }
   .cp-lifecycle.finalized { color: var(--text-secondary); }
   .cp-text {
@@ -282,7 +282,7 @@
   }
   .cp-bar-fill {
     height: 100%;
-    background: var(--accent, #4ade80);
+    background: var(--accent);
     transition: width 250ms ease;
   }
   .cp-bar-fill.past-threshold {
@@ -320,18 +320,18 @@
     cursor: pointer;
   }
   .cp-signal-btn:hover:not(:disabled) {
-    border-color: var(--accent, #4ade80);
+    border-color: var(--accent);
   }
   .cp-signal-btn:disabled {
     cursor: not-allowed;
     opacity: 0.6;
   }
   .cp-signal-btn.supporting {
-    border-color: var(--accent, #4ade80);
-    background: color-mix(in srgb, var(--accent, #4ade80) 12%, var(--bg-primary));
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
   }
   .cp-error {
-    color: var(--danger, #f87171);
+    color: var(--danger);
     font-size: 0.85rem;
   }
   .cp-override-pill {
