@@ -123,6 +123,12 @@ const HANDSHAKE_PENDING_QUEUE_CAP: usize = 32;
 /// them would only write a JoinCountersign into a closed connection.
 const HANDSHAKE_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
+/// ZEB-616: how long to wait for a stale connection's close to complete
+/// before admitting the reconnect anyway. Bounded so a wedged old connection
+/// can't stall the accept path; on timeout we proceed and fall back to today's
+/// behavior (stale face lingers until the lease reaps it).
+const STALE_CONN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Plug-in link manager that lets Zenoh open + accept links over an
 /// iroh `Endpoint`, using [`ReachabilityResolver`] to translate a
 /// locator's iroh `EndpointId` into a dialable [`EndpointAddr`].
@@ -201,6 +207,27 @@ pub struct IrohZenohLinkManager {
     /// delivery worse). Typed as the generic `IrohHandshakeDispatcher` trait
     /// object so the transport layer stays decoupled from the tunnel module.
     tunnel_acceptor: std::sync::OnceLock<Arc<dyn IrohHandshakeDispatcher>>,
+    /// ZEB-616: the live inbound zenoh-ALPN iroh `Connection` per peer, keyed
+    /// by the peer's iroh `EndpointId` (== its deterministic zenoh zid). A
+    /// same-zid reconnect for a peer already present here closes the prior
+    /// connection before the new link is admitted, so the stale zenoh face is
+    /// reaped before the reconnect's declarations install — avoiding the
+    /// upstream "Remapping unsupported" collision (ZEB-390 gives every node a
+    /// stable zid, so a reconnect reuses it). A `std::sync::Mutex` is correct:
+    /// it is only ever held for synchronous map ops, never across an `.await`
+    /// (the async close operates on the *returned* prior connection after the
+    /// guard is dropped).
+    zenoh_conns: std::sync::Mutex<std::collections::HashMap<EndpointId, Connection>>,
+}
+
+/// ZEB-616 identity guard for the drop-watcher: only evict a peer's registry
+/// entry if the currently-stored connection IS the one whose watcher is firing.
+/// `stored` is the registered connection's `stable_id` (None if the peer has no
+/// entry); `watcher` is the firing connection's `stable_id`. Prevents a
+/// superseded connection's watcher from evicting the live connection that
+/// replaced it.
+fn should_evict_on_close(stored: Option<usize>, watcher: usize) -> bool {
+    stored == Some(watcher)
 }
 
 impl IrohZenohLinkManager {
@@ -221,7 +248,16 @@ impl IrohZenohLinkManager {
             community_relay_deposit_acceptor: std::sync::OnceLock::new(),
             community_relay_pull_acceptor: std::sync::OnceLock::new(),
             tunnel_acceptor: std::sync::OnceLock::new(),
+            zenoh_conns: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// ZEB-616: register `conn` as the live zenoh-ALPN connection for
+    /// `peer_id`, returning the prior connection (if any) for the caller to
+    /// close. Pure synchronous map op — the lock is not held across any await;
+    /// the async close + await happens on the returned connection.
+    fn swap_zenoh_conn(&self, peer_id: EndpointId, conn: Connection) -> Option<Connection> {
+        self.zenoh_conns.lock().unwrap().insert(peer_id, conn)
     }
 
     /// ZEB-418 P1: install the butler-deposit acceptor used by the accept
@@ -397,6 +433,57 @@ impl IrohZenohLinkManager {
                     // sub-protocols on the same endpoint.
                     let alpn_used = conn.alpn();
                     if alpn_used == alpn::HARMONY_ZENOH_V1 {
+                        // ZEB-616: `remote_id()` is available immediately
+                        // post-handshake (before the bi stream), so swap this
+                        // connection into the per-peer registry FIRST and close
+                        // the stale one it replaces. Doing it here — one beat
+                        // before the reconnect opens its bi stream and zenoh
+                        // re-declares resources — reaps the old face ahead of
+                        // the collision window (avoids "Remapping
+                        // unsupported"). Reordered above `accept_bi()` from the
+                        // pre-ZEB-616 code, which read `remote_id()` after it.
+                        let peer_id = conn.remote_id();
+                        let conn_id = conn.stable_id();
+                        if let Some(old) = mgr.swap_zenoh_conn(peer_id, conn.clone()) {
+                            tracing::debug!(
+                                peer = %peer_id,
+                                "ZEB-616: same-zid reconnect; closing stale zenoh \
+                                 connection before admitting new link"
+                            );
+                            old.close(0u32.into(), b"zeb616-reconnect");
+                            // Bounded: guarantee the old iroh conn is gone (→
+                            // its zenoh link read-errors → zenoh reaps the stale
+                            // face) before admitting the new link's
+                            // declarations. Best-effort on timeout.
+                            if tokio::time::timeout(STALE_CONN_CLOSE_TIMEOUT, old.closed())
+                                .await
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    peer = %peer_id,
+                                    "ZEB-616: stale connection close timed out; \
+                                     admitting new link anyway"
+                                );
+                            }
+                        }
+                        // ZEB-616: evict this peer's registry entry when THIS
+                        // connection finally closes, so the map stays bounded to
+                        // live peers and a drop-and-never-return peer still has
+                        // its face reaped. Identity-guarded so a superseded
+                        // connection's watcher can't evict its replacement.
+                        {
+                            let mgr_for_watch = Arc::clone(&mgr);
+                            let conn_for_watch = conn.clone();
+                            tokio::spawn(async move {
+                                conn_for_watch.closed().await;
+                                let mut map = mgr_for_watch.zenoh_conns.lock().unwrap();
+                                let stored = map.get(&peer_id).map(|c| c.stable_id());
+                                if should_evict_on_close(stored, conn_id) {
+                                    map.remove(&peer_id);
+                                }
+                            });
+                        }
+
                         let (send, recv) = match conn.accept_bi().await {
                             Ok(s) => s,
                             Err(e) => {
@@ -404,7 +491,6 @@ impl IrohZenohLinkManager {
                                 return;
                             }
                         };
-                        let peer_id = conn.remote_id();
                         let src = locator_from_endpoint_id(&mgr.endpoint.node_id());
                         let dst = locator_from_endpoint_id(&peer_id);
                         let link: Arc<dyn LinkUnicastTrait> =
@@ -669,16 +755,18 @@ mod tests {
     /// (which uses `presets::N0` + pkarr + DNS and hangs offline)
     /// stays untouched.
     async fn build_hermetic_iroh_endpoint() -> Arc<IrohEndpoint> {
-        // ZEB-325 PR #159 R2: register BOTH ALPNs so the accept loop
-        // can route handshake-ALPN connections through the dispatcher
-        // dispatcher OR enqueue path. Production binds the same set
-        // (see iroh_endpoint.rs:88, :252). Older callers in this
-        // module only needed HARMONY_ZENOH_V1 (their tests exercise
-        // the new_link path); the new boot-window test exercises the
-        // handshake ALPN path.
         let mut buf = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut buf);
-        let secret = SecretKey::from_bytes(&buf);
+        build_hermetic_iroh_endpoint_with_secret(SecretKey::from_bytes(&buf)).await
+    }
+
+    /// ZEB-616: like `build_hermetic_iroh_endpoint` but with a
+    /// caller-supplied identity. Two endpoints built from the SAME secret
+    /// share one `EndpointId` (hence one deterministic zenoh zid) — the
+    /// shape of a reconnect after a socket rebind. Registers BOTH ALPNs so
+    /// the accept loop routes zenoh + handshake connections (mirrors the
+    /// production bind set, iroh_endpoint.rs:88/:252).
+    async fn build_hermetic_iroh_endpoint_with_secret(secret: SecretKey) -> Arc<IrohEndpoint> {
         let inner = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
             .alpns(vec![
@@ -693,6 +781,188 @@ mod tests {
             .await
             .expect("bind iroh endpoint");
         Arc::new(IrohEndpoint::from_endpoint_for_test(inner))
+    }
+
+    /// ZEB-616 Component B identity guard (pure): a connection's drop-watcher
+    /// may only evict the registry entry when the entry still points at THAT
+    /// connection. A superseded watcher (stored != its own id) must not evict
+    /// the connection that replaced it.
+    #[test]
+    fn should_evict_on_close_is_identity_guarded() {
+        assert!(
+            should_evict_on_close(Some(7), 7),
+            "own conn still stored → evict"
+        );
+        assert!(
+            !should_evict_on_close(Some(9), 7),
+            "superseded (9 replaced 7) → keep"
+        );
+        assert!(
+            !should_evict_on_close(None, 7),
+            "already gone → nothing to evict"
+        );
+    }
+
+    /// ZEB-616 Component A: a same-zid reconnect closes the stale connection
+    /// it replaces before admitting the new link, and the registry ends with
+    /// exactly the reconnect (no stale duplicate). The two bob endpoints
+    /// share one secret → one `EndpointId` → one deterministic zid, modelling
+    /// a silent mid-session drop + socket rebind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zenoh_reconnect_closes_stale_connection() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            zenoh_reconnect_closes_stale_connection_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn zenoh_reconnect_closes_stale_connection_inner() {
+        // Alice: link manager + accept loop.
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            ReachabilityResolver::new(),
+            new_link_tx,
+        ));
+        let _accept = alice_mgr.spawn_accept_loop();
+
+        // Bob's stable identity across two endpoints (a rebind that keeps the
+        // node-id → same deterministic zid). `buf` is Copy, so re-deriving the
+        // key three times avoids depending on `SecretKey: Clone`.
+        let mut buf = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut buf);
+        let bob_id = SecretKey::from_bytes(&buf).public();
+        let bob_ep1 = build_hermetic_iroh_endpoint_with_secret(SecretKey::from_bytes(&buf)).await;
+        let bob_ep2 = build_hermetic_iroh_endpoint_with_secret(SecretKey::from_bytes(&buf)).await;
+
+        // Alice's dialable loopback address.
+        let alice_node_id = alice_ep.node_id();
+        let alice_socket = *alice_ep
+            .bound_sockets()
+            .first()
+            .expect("alice has a bound socket");
+        let alice_addr = EndpointAddr::new(alice_node_id).with_ip_addr(alice_socket);
+
+        // First connection → alice registers bob under his node-id.
+        let conn1 = bob_ep1
+            .inner()
+            .connect(alice_addr.clone(), alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("bob1 dial alice on zenoh ALPN");
+        for _ in 0..300 {
+            if alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "alice must register bob's first connection"
+        );
+        assert!(
+            conn1.close_reason().is_none(),
+            "conn1 open before reconnect"
+        );
+
+        // Reconnect: second endpoint, SAME node-id.
+        let conn2 = bob_ep2
+            .inner()
+            .connect(alice_addr, alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("bob2 dial alice on zenoh ALPN (same node-id)");
+
+        // THE FIX: alice closes the stale conn1 on the reconnect. Pre-fix this
+        // times out (alice never closes it).
+        tokio::time::timeout(Duration::from_secs(10), conn1.closed())
+            .await
+            .expect("ZEB-616: alice must close the stale connection on reconnect");
+
+        // The reconnect stays live; registry holds exactly one entry for bob.
+        assert!(conn2.close_reason().is_none(), "reconnect must stay open");
+        for _ in 0..300 {
+            if alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            alice_mgr.zenoh_conns.lock().unwrap().len(),
+            1,
+            "registry holds exactly the reconnect, no stale duplicate"
+        );
+
+        alice_ep.shutdown().await;
+        bob_ep1.shutdown().await;
+        bob_ep2.shutdown().await;
+    }
+
+    /// ZEB-616 Component B: when a registered connection closes, its watcher
+    /// evicts the registry entry (map stays bounded to live peers).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zenoh_conn_registry_evicts_on_drop() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            zenoh_conn_registry_evicts_on_drop_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn zenoh_conn_registry_evicts_on_drop_inner() {
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            ReachabilityResolver::new(),
+            new_link_tx,
+        ));
+        let _accept = alice_mgr.spawn_accept_loop();
+
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+        let bob_id = bob_ep.node_id();
+
+        let alice_socket = *alice_ep
+            .bound_sockets()
+            .first()
+            .expect("alice has a bound socket");
+        let alice_addr = EndpointAddr::new(alice_ep.node_id()).with_ip_addr(alice_socket);
+
+        let conn = bob_ep
+            .inner()
+            .connect(alice_addr, alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("bob dial alice on zenoh ALPN");
+        for _ in 0..300 {
+            if alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "alice must register bob's connection"
+        );
+
+        // Bob closes → alice's watcher evicts the entry.
+        conn.close(0u32.into(), b"test-drop");
+        for _ in 0..300 {
+            if !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "watcher must evict the registry entry when the connection closes"
+        );
+
+        alice_ep.shutdown().await;
+        bob_ep.shutdown().await;
     }
 
     /// Resolver-miss → `new_link` returns an error. This is the only
