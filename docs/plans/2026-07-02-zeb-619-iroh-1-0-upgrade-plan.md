@@ -221,7 +221,7 @@ cd src-tauri && cargo build --locked --bin harmony-app
 - [ ] **Step 2: Run the three scenarios serially (commit-before-gate does not apply — no diffs; but background + poll, total budget ~20 min)**
 
 ```bash
-cd e2e-harness && cargo nextest run --features e2e --test-threads 1 \
+cd e2e-harness && cargo nextest run --locked --features e2e --test-threads 1 \
   -E 'test(s1_invite_join_roster_convergence) | test(s3_offline_channel_reconnect_catchup) | test(s4_restart_durability)'
 ```
 
@@ -244,10 +244,16 @@ Expected: 3/3 PASS. On failure: retry the failing scenario ONCE (first-contact r
 ```bash
 cd src-tauri && HARMONY_PROFILE=zeb619-smoke HARMONY_DISABLE_KEYCHAIN=1 HARMONY_PASSPHRASE=zeb619 \
   RUST_LOG=info,iroh=info ./target/debug/harmony-app serve --api-port 7621 > /tmp/zeb619-smoke.log 2>&1 & \
-SMOKE_PID=$!; sleep 90; kill "$SMOKE_PID"
+SMOKE_PID=$!
+# Wait for the API to come up (readiness poll) rather than trusting a fixed
+# boot delay, THEN hold a fixed observation window for relay negotiation.
+for i in $(seq 1 30); do curl -s -o /dev/null "http://127.0.0.1:7621/health" && break; sleep 2; done
+sleep 60
+kill "$SMOKE_PID"
 ```
 
-(One shell invocation so `$!` stays valid. 90s is enough for relay handshake + pkarr publish.)
+(One shell invocation so `$!` stays valid. The poll bounds boot variance; the
+60s window after readiness is for relay handshake + pkarr publish.)
 
 - [ ] **Step 2: Assert the smoke criteria against the log**
 

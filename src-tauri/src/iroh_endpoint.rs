@@ -415,14 +415,18 @@ mod tests {
         ep.shutdown().await;
     }
 
-    /// ZEB-617 regression guard, retargeted by ZEB-619: iroh 1.0's default
-    /// (preset N0) relay map must be the stable production cluster. 0.98's
-    /// preset silently put the fleet on n0's CANARY relays (no SLA,
-    /// decommissioned 2026-09-30); if a future iroh bump regresses the
-    /// default, this must fail loudly.
+    /// ZEB-617 regression guard, retargeted by ZEB-619: the relay map the
+    /// production builder actually gets must be the stable production
+    /// cluster. `presets::N0::apply` sets
+    /// `builder.relay_mode(default_relay_mode())` (iroh 1.0.1
+    /// endpoint/presets.rs:136), so asserting on that same public function
+    /// couples this test to the exact production path. 0.98's preset
+    /// silently put the fleet on n0's CANARY relays (no SLA, decommissioned
+    /// 2026-09-30); if a future iroh bump regresses the default, this must
+    /// fail loudly.
     #[test]
     fn default_relay_map_is_stable_non_canary() {
-        let map = iroh::RelayMode::Default.relay_map();
+        let map = iroh::endpoint::default_relay_mode().relay_map();
         let urls: Vec<String> = map.urls::<Vec<_>>().iter().map(|u| u.to_string()).collect();
         assert!(!urls.is_empty(), "default relay map must not be empty");
         for url in &urls {
@@ -430,8 +434,11 @@ mod tests {
                 !url.contains("canary"),
                 "canary relay leaked into defaults: {url}"
             );
+            // No trailing dot in the needle: RelayUrl's Display currently
+            // keeps the FQDN root dot, but the guard must not depend on
+            // that canonicalization detail.
             assert!(
-                url.contains(".relay.n0.iroh.link."),
+                url.contains(".relay.n0.iroh.link"),
                 "unexpected relay host: {url}"
             );
         }
