@@ -23,3 +23,19 @@
 #
 # No profile config is needed today; this file is kept as the home for any
 # future nextest configuration.
+
+# ZEB-619 (iroh 0.98.2 -> 1.0.1): iroh 1.0 moved endpoint drain off the
+# awaited close() path onto Drop, so every hermetic test process pays a
+# ~57s background teardown (netwatch blocking socket-close + per-endpoint
+# netmon monitor) AFTER its test body finishes. Under nextest's default
+# full-CPU parallelism those drains contend and serialize into a
+# ~330-360s-per-test plateau (54min suite, one outer-timeout failure).
+# Capping concurrency for endpoint-heavy tests keeps the drains from
+# stampeding; the ~57s/process floor itself is upstream behavior — a
+# follow-up ticket tracks cutting it (endpoint pool or an iroh knob).
+[test-groups]
+iroh-endpoint = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'test(iroh) | test(zenoh) | test(tunnel) | test(reachability) | test(dial) | binary(~iroh) | binary(~zenoh) | binary(~referral) | binary(~network_health) | binary(~friend_token) | binary(~open_join)'
+test-group = 'iroh-endpoint'
