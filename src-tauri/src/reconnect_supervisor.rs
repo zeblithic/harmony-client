@@ -281,6 +281,24 @@ impl SupervisorHandle {
             .map(|(peer, slot)| (*peer, slot.state.to_wire(now)))
             .collect()
     }
+
+    /// Test-only read accessor for the coalescing dirty set: the pending
+    /// (not-yet-drained) trigger for `peer`, or `None` if the peer has no
+    /// pending kick. Parallels [`Self::states_snapshot`] (which reads `states`);
+    /// this reads `dirty`. Read-only — never mutates and exposes no mutation
+    /// capability — so it does not weaken the production type. Gated to
+    /// `cfg(test)`: only in-crate unit tests (the transport drop-watcher tests,
+    /// ZEB-620 Task 3) observe raised kicks through it, since a `kick` writes
+    /// `dirty` (not `states`) and there is no production reader of `dirty`.
+    #[cfg(test)]
+    pub fn pending_trigger(&self, peer: [u8; 32]) -> Option<ReconnectTrigger> {
+        self.inner
+            .dirty
+            .lock()
+            .expect("dirty lock")
+            .get(&peer)
+            .copied()
+    }
 }
 
 /// ZEB-485 gate, generalized: the lexicographically lower NodeId dials
