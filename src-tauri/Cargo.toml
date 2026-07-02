@@ -136,11 +136,17 @@ dirs = "6"
 # Pin pre-release PQ crypto deps to match the harmony workspace.
 # These RC crates have breaking changes between point releases; without
 # exact pins Cargo resolves to newer (incompatible) versions.
-# ml-dsa held at rc.8 (not 0.1.1): rc.8 accepts pkcs8 0.11 final (required
-# by iroh 1.0.1's ed25519-dalek tier) while keeping the sha3 0.11-rc.8 XOF
-# path, so the harmony workspace's keccak =0.2.0-rc.2 pin stays valid. 0.1.1
-# switched to shake -> keccak 0.2.0 stable, which conflicts (ZEB-619).
-ml-dsa = "=0.1.0-rc.8"
+# Nothing in THIS crate uses ml-dsa/ml-kem directly — these entries exist
+# only to pin resolution for harmony-crypto's benefit.
+# ml-dsa: default-features = false is load-bearing (ZEB-619). Defaults
+# enable ml-dsa's `pkcs8` feature, whose shim is source-incompatible with
+# the pkcs8 0.11 FINAL that iroh 1.0.1's ed25519 tier forces into the
+# lock; every ml-dsa new enough to fix it drops the sha3-rc XOF path the
+# harmony workspace's keccak =0.2.0-rc.2 pin depends on. With defaults
+# off, feature unification leaves harmony-crypto's set (rand_core,
+# zeroize) — the same surface harmony's own workspace builds — and the
+# broken shim (plus its pkcs8 dependency edge) is never compiled.
+ml-dsa = { version = "=0.1.0-rc.7", default-features = false }
 ml-kem = "=0.3.0-rc.0"
 sha3 = "=0.11.0-rc.8"
 keccak = "=0.2.0-rc.2"
