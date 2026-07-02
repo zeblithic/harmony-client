@@ -9701,3 +9701,35 @@ mod zeb616_lease_config_tests {
             .expect("transport/link/tx/keep_alive must be a valid zenoh config key");
     }
 }
+
+#[cfg(test)]
+mod zeb620_event_listener_pin_tests {
+    /// ZEB-620 schema pin: the reconnect supervisor consumes zenoh's unstable
+    /// transport/link event-listener surface (enabled via the `unstable`
+    /// feature on the `zenoh` dependency). This is a pure name-resolution check
+    /// — constructing a `Session` needs a runtime, so we only force these paths
+    /// to resolve and their signatures to match. The explicit fn-pointer types
+    /// pin the method name, receiver, and return builder type in one shot. If a
+    /// zenoh bump renames or drops the surface, this fails here, not deep in the
+    /// supervisor wiring.
+    #[test]
+    fn zenoh_unstable_event_listener_surface_exists() {
+        use zenoh::handlers::DefaultHandler;
+        use zenoh::session::{
+            LinkEvent, LinkEventsListenerBuilder, SessionInfo, TransportEvent,
+            TransportEventsListenerBuilder,
+        };
+
+        // The builder-returning accessors the supervisor calls to subscribe.
+        let _transport_listener: fn(
+            &SessionInfo,
+        ) -> TransportEventsListenerBuilder<'_, DefaultHandler> =
+            SessionInfo::transport_events_listener;
+        let _link_listener: fn(&SessionInfo) -> LinkEventsListenerBuilder<'_, DefaultHandler> =
+            SessionInfo::link_events_listener;
+
+        // The event payload types the supervisor matches on (Put/Delete).
+        let _ = core::mem::size_of::<TransportEvent>();
+        let _ = core::mem::size_of::<LinkEvent>();
+    }
+}
