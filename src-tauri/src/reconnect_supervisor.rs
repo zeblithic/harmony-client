@@ -265,9 +265,7 @@ impl SupervisorHandle {
                 epoch: 0,
             });
             slot.epoch = slot.epoch.wrapping_add(1);
-            slot.state = PeerState::Connected {
-                since_ms: now_ms(),
-            };
+            slot.state = PeerState::Connected { since_ms: now_ms() };
         }
         self.inner.notify.notify_one();
     }
@@ -396,14 +394,23 @@ pub async fn run_reconnect_supervisor(
                 if peer == self_node_id {
                     continue; // self-dial guard
                 }
-                apply_trigger(&mut states, peer, trigger, now, &self_node_id, &config, &mut rng);
+                apply_trigger(
+                    &mut states,
+                    peer,
+                    trigger,
+                    now,
+                    &self_node_id,
+                    &config,
+                    &mut rng,
+                );
             }
 
             for (peer, slot) in states.iter_mut() {
                 if slot.dial_in_flight {
                     continue;
                 }
-                let due = matches!(slot.state, PeerState::Retrying { next_at, .. } if next_at <= now);
+                let due =
+                    matches!(slot.state, PeerState::Retrying { next_at, .. } if next_at <= now);
                 if !due {
                     continue;
                 }
@@ -546,9 +553,7 @@ fn ladder_after_failure(
 ) {
     slot.dial_in_flight = false;
     if now.duration_since(slot.last_fresh_trigger) > config.dormant_after {
-        slot.state = PeerState::Dormant {
-            since_ms: now_ms(),
-        };
+        slot.state = PeerState::Dormant { since_ms: now_ms() };
         return;
     }
     let attempt = match slot.state {
@@ -583,11 +588,16 @@ fn apply_result(
         return; // superseded — the fresher schedule/state already stands
     }
     if result.ok {
-        slot.state = PeerState::Connected {
-            since_ms: now_ms(),
-        };
+        slot.state = PeerState::Connected { since_ms: now_ms() };
     } else {
-        ladder_after_failure(slot, Instant::now(), self_node_id, &result.peer, config, rng);
+        ladder_after_failure(
+            slot,
+            Instant::now(),
+            self_node_id,
+            &result.peer,
+            config,
+            rng,
+        );
     }
 }
 
@@ -885,11 +895,7 @@ mod tests {
         );
         // Long quiescent window: no dials once dormant.
         tokio::time::sleep(ms(100_000)).await;
-        assert_eq!(
-            dialer.count_for(p),
-            dormant_count,
-            "no dials while dormant"
-        );
+        assert_eq!(dialer.count_for(p), dormant_count, "no dials while dormant");
 
         // A fresh kick revives at the base rung.
         let revive_at = Instant::now();
@@ -943,10 +949,19 @@ mod tests {
 
         // Cooldown lapses (~15s from first sweep) -> deferred sweep fires -> dial ~16s.
         tokio::time::sleep(ms(10_000)).await; // now ~20s
-        assert_eq!(dialer.count_for(p), 3, "deferred sweep fired at cooldown lapse");
+        assert_eq!(
+            dialer.count_for(p),
+            3,
+            "deferred sweep fired at cooldown lapse"
+        );
 
         let times = dialer.times_for(p);
-        assert_between(times[0] - start, rung_lo(1_000), rung_hi(1_000), "initial dial");
+        assert_between(
+            times[0] - start,
+            rung_lo(1_000),
+            rung_hi(1_000),
+            "initial dial",
+        );
         // Deferred sweep dial lands well after the immediate one (cooldown gap).
         assert!(
             times[2] - times[1] >= ms(9_000),
