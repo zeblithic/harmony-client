@@ -21,15 +21,6 @@ use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
 use crate::reachability_record::ReachabilityAnnouncePayload;
 use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
 
-/// ZEB-373: emitted the first time the resolver learns a `(owner, node_id)`, so the
-/// dynamic dial driver can dial a peer discovered strictly mid-session. Dedup of a
-/// node-id seen under multiple owners is the driver's responsibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DialHint {
-    pub node_id: [u8; 32],
-    pub owner: OwnerAddr,
-}
-
 /// Async fallback called by `resolve_async` when the in-memory CRDT cache has
 /// no entry for a given owner. Implemented by `PkarrResolverAdapter` (case C)
 /// and by test stubs. The concrete impl is injected at boot via
@@ -82,13 +73,10 @@ pub struct ReachabilityResolver {
     /// `RwLock` — wiring the fallback via `set_fallback_source` on any
     /// clone is immediately visible to all others (CodeRabbit PR #158 round 2).
     fallback_source: Arc<RwLock<Option<Arc<dyn ReachabilityFallback>>>>,
-    // ZEB-373: optional notify seam to the dynamic dial driver. None until boot
-    // installs it; behind Option so every existing caller/test is unaffected.
-    dial_hint_tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<DialHint>>>>,
     // ZEB-620: optional reconnect-supervisor handle. None until boot installs it
-    // via `set_supervisor`; additive to `dial_hint_tx` (which event_loop still
-    // consumes until Task 5). Kicked `NewPeer` on first-learn and `RecordChanged`
-    // on a material LWW record change.
+    // via `set_supervisor`. Kicked `NewPeer` on first-learn and `RecordChanged`
+    // on a material LWW record change — the sole successor to ZEB-373's retired
+    // `DialHint` mpsc (the dial-once dial driver).
     supervisor: Arc<RwLock<Option<SupervisorHandle>>>,
 }
 
@@ -106,7 +94,6 @@ impl Default for ReachabilityResolver {
         Self {
             inner: Arc::new(RwLock::new(BTreeMap::new())),
             fallback_source: Arc::new(RwLock::new(None)),
-            dial_hint_tx: Arc::new(RwLock::new(None)),
             supervisor: Arc::new(RwLock::new(None)),
         }
     }
@@ -120,7 +107,6 @@ impl Clone for ReachabilityResolver {
             // Wiring the fallback on any clone is visible to all others
             // (CodeRabbit PR #158 round 2 correctness fix).
             fallback_source: Arc::clone(&self.fallback_source),
-            dial_hint_tx: Arc::clone(&self.dial_hint_tx),
             supervisor: Arc::clone(&self.supervisor),
         }
     }
@@ -131,17 +117,10 @@ impl ReachabilityResolver {
         Self::default()
     }
 
-    /// Install the dial-hint sender. Called once at boot (event_loop) after the
-    /// dynamic dial driver's bounded channel is created.
-    pub fn set_dial_hint_sender(&self, tx: tokio::sync::mpsc::Sender<DialHint>) {
-        *self.dial_hint_tx.write().expect("dial hint tx lock") = Some(tx);
-    }
-
-    /// ZEB-620: install the reconnect-supervisor handle. Called once at boot,
-    /// alongside (and eventually replacing) [`set_dial_hint_sender`](Self::set_dial_hint_sender).
-    /// Additive — the legacy dial-hint path stays live until Task 5 removes the
-    /// event_loop consumer, so both fire during the transition. Thread-safe;
-    /// latest install wins.
+    /// ZEB-620: install the reconnect-supervisor handle. Called once at boot
+    /// (event_loop, right after the supervisor is spawned). The sole first-learn /
+    /// record-change notify seam since ZEB-373's `DialHint` mpsc was retired.
+    /// Thread-safe; latest install wins.
     pub fn set_supervisor(&self, handle: SupervisorHandle) {
         *self.supervisor.write().expect("supervisor lock") = Some(handle);
     }
@@ -200,28 +179,11 @@ impl ReachabilityResolver {
             map.insert(key, next);
         }
         drop(map);
-        // ZEB-373: notify the dial driver the FIRST time we learn this (owner,node_id).
-        // `try_send` (non-blocking, lossy) so this never blocks `update()` and the
-        // bounded channel can't grow unbounded under a flood; the driver dedups, so a
-        // dropped hint under back-pressure is not correctness-critical.
-        if !was_present {
-            if let Some(tx) = self
-                .dial_hint_tx
-                .read()
-                .expect("dial hint tx lock")
-                .as_ref()
-            {
-                let _ = tx.try_send(DialHint {
-                    node_id,
-                    owner: actor,
-                });
-            }
-        }
-        // ZEB-620: reconnect-supervisor triggers, additive to the legacy dial-hint
-        // above (which event_loop still consumes until Task 5). A first-learn kicks
-        // `NewPeer`; a material record change on an already-known peer kicks
-        // `RecordChanged`. Mutually exclusive by construction (`was_present`), so at
-        // most one fires per update; `kick` is lossless and non-blocking.
+        // ZEB-620: reconnect-supervisor triggers (the successor to ZEB-373's
+        // retired `DialHint` mpsc). A first-learn kicks `NewPeer`; a material
+        // record change on an already-known peer kicks `RecordChanged`. Mutually
+        // exclusive by construction (`was_present`), so at most one fires per
+        // update; `kick` is lossless and non-blocking.
         if let Some(sup) = self.supervisor.read().expect("supervisor lock").as_ref() {
             if !was_present {
                 sup.kick(node_id, ReconnectTrigger::NewPeer);
@@ -879,40 +841,6 @@ mod tests {
         assert_eq!(r.remove_owner(&actor), 1);
         // Second remove is a no-op — also 0.
         assert_eq!(r.remove_owner(&actor), 0);
-    }
-
-    #[test]
-    fn dial_hint_fires_once_on_first_learn() {
-        let r = ReachabilityResolver::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        r.set_dial_hint_sender(tx);
-        let owner = OwnerAddr([0xAA; 16]);
-        let mut payload = make_payload(0x11, 1000);
-        payload.iroh_node_id = [0x11; 32];
-        let hlc = make_hlc(1, 0, "a");
-        r.update(owner, payload.clone(), hlc.clone());
-        let hint = rx.try_recv().expect("hint on first learn");
-        assert_eq!(hint.node_id, [0x11; 32]);
-        assert_eq!(hint.owner, owner);
-        // Second update with a higher HLC replaces the entry but must NOT
-        // fire another hint — the (owner, node_id) key was already known.
-        let hlc2 = make_hlc(2, 0, "a");
-        r.update(owner, payload, hlc2);
-        assert!(
-            rx.try_recv().is_err(),
-            "no hint on hlc-replace of known peer"
-        );
-    }
-
-    #[test]
-    fn dial_hint_silent_when_sender_unset() {
-        let r = ReachabilityResolver::new();
-        // No sender installed — must not panic.
-        r.update(
-            OwnerAddr([0xAA; 16]),
-            make_payload(0x11, 1000),
-            make_hlc(1, 0, "a"),
-        );
     }
 
     // ---- ZEB-620 Task 4: reconnect-supervisor triggers -------------------

@@ -267,8 +267,9 @@ pub mod zenoh_iroh_transport;
 // ZEB-368: registers harmony's IrohZenohLinkManager with the vendored
 // zenoh-link factory and forwards accepted inbound links into Zenoh.
 pub mod iroh_zenoh_registration;
-// ZEB-373: dynamic mid-session iroh dial driver — consumes DialHints, dedups,
-// dials via PeerDialer with bounded backoff.
+// ZEB-373/ZEB-620: iroh dial primitives — the `PeerDialer` trait,
+// `RuntimePeerDialer` (over a live zenoh Runtime), and `deterministic_zid_hex`.
+// The dial-once `run_dial_driver` was retired for the reconnect supervisor.
 pub mod iroh_dial_driver;
 // ZEB-620: reconnect supervisor — per-peer retry state machine, jittered
 // exponential ladder, coalescing dirty-set kicks, lower-NodeId dial-role gate,

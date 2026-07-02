@@ -62,7 +62,7 @@ const JITTER_HI: f64 = 1.5;
 /// `NewPeer`/`RecordChanged`/`PresenceSweep` merely refresh its interest stamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectTrigger {
-    /// Resolver first-learn of a peer (today's `DialHint`).
+    /// Resolver first-learn of a peer.
     NewPeer,
     /// Resolver LWW-replaced an existing record with new relay/addresses.
     RecordChanged,
@@ -298,6 +298,19 @@ impl SupervisorHandle {
             .expect("dirty lock")
             .get(&peer)
             .copied()
+    }
+
+    /// Test-only read accessor for the pending-sweep flag: `true` once
+    /// [`Self::kick_sweep`] has been called and before the loop drains it.
+    /// Parallels [`Self::pending_trigger`] (which reads `dirty`); this reads
+    /// `sweep_requested`. Read-only — never mutates, exposes no mutation
+    /// capability — so it does not weaken the production type. Gated to
+    /// `cfg(test)`: only in-crate unit tests (the presence-edge wiring test,
+    /// ZEB-620 Task 5) observe a raised sweep through it, since `kick_sweep`
+    /// writes `sweep_requested` and there is no production reader of it.
+    #[cfg(test)]
+    pub fn sweep_pending(&self) -> bool {
+        self.inner.sweep_requested.load(Ordering::Acquire)
     }
 }
 

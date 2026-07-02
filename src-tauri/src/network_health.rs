@@ -577,8 +577,8 @@ pub trait DialSnapshot: Send + Sync {
     fn dial_summary(&self) -> DialHealthSummary;
 }
 
-/// Production source: reads the shared `DialTelemetry` written by the dial
-/// driver (`crate::iroh_dial_driver::run_dial_driver`).
+/// Production source: reads the shared `DialTelemetry` written by the reconnect
+/// supervisor's dials (`crate::reconnect_supervisor::run_reconnect_supervisor`).
 pub struct ProdDialSnapshot {
     pub telemetry: std::sync::Arc<DialTelemetry>,
 }

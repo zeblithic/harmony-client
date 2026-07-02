@@ -252,6 +252,8 @@ async fn invisible_inner() {
         Arc::clone(&now_ms),
         // ZEB-599 Direction 1: throwaway resync sender (no receivers → no-op).
         tokio::sync::watch::channel(0u64).0,
+        // ZEB-620 Task 5: no reconnect supervisor in this link-layer test.
+        None,
     );
 
     // Match A's session to B's REMOTE subscriber first, so a later "no beacon"
@@ -410,6 +412,8 @@ async fn run_inner() {
         Arc::clone(&now_ms),
         // ZEB-599 Direction 1: throwaway resync sender (no receivers → no-op).
         tokio::sync::watch::channel(0u64).0,
+        // ZEB-620 Task 5: no reconnect supervisor in this link-layer test.
+        None,
     );
 
     // Deterministically wait until A's session has discovered B's REMOTE presence

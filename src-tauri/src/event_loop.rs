@@ -697,6 +697,24 @@ async fn spawn_dataset_sync_zenoh_adapter(
     }
 }
 
+/// ZEB-620: build the zenoh `connect/endpoints` locator list. Unlike ZEB-368
+/// (which merged every resolver-known iroh peer into the static connect set),
+/// this carries ONLY the optional LAN/Reticulum connect endpoint — boot peers
+/// now enter the reconnect supervisor as `NewPeer` kicks (see
+/// [`crate::iroh_zenoh_registration::seed_boot_peers_into_supervisor`]). It takes
+/// no resolver, so a known peer structurally cannot leak an `iroh/` locator into
+/// zenoh's static connect set. Each entry is JSON-quoted for `insert_json5`.
+fn build_connect_endpoints(endpoint: Option<&str>) -> Result<Vec<String>, String> {
+    let mut connect_eps: Vec<String> = Vec::new();
+    if let Some(ep) = endpoint {
+        // Already-quoted JSON string form (mirrors the prior inline build).
+        let ep_json =
+            serde_json::to_string(ep).map_err(|e| format!("endpoint serialize error: {e}"))?;
+        connect_eps.push(ep_json);
+    }
+    Ok(connect_eps)
+}
+
 /// Run the NodeRuntime event loop as a background task.
 ///
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
@@ -916,21 +934,12 @@ pub async fn run(
         };
     }
 
-    // ZEB-373: install the dial-hint sender on the resolver BEFORE the static-seed
-    // snapshot (`iroh_connect_locators` below) and before `zenoh::open`, so a peer
-    // learned during the whole config-build + open window is captured — either it
-    // lands before the snapshot (→ static seed) or after (→ buffered DialHint). The
-    // accept loop runs on its own task, so `resolver.update()` can race this
-    // synchronous build; installing first closes that window. A peer caught in the
-    // tiny overlap (after install, before snapshot) gets both a seed entry and a
-    // hint — harmless, the driver dedups by node-id. (Cursor, PR #190.)
-    let mut dial_hint_rx = None;
-    if let (Some(ref ih), Some(_)) = (&iroh_handles, &dial_telemetry) {
-        let (hint_tx, hint_rx) =
-            tokio::sync::mpsc::channel(crate::iroh_dial_driver::DIAL_HINT_CHANNEL_CAP);
-        ih.link_manager.resolver().set_dial_hint_sender(hint_tx);
-        dial_hint_rx = Some(hint_rx);
-    }
+    // ZEB-620: the reconnect supervisor handle, built + spawned after `zenoh::open`
+    // (it needs the live Runtime for its dialer) and threaded to the presence
+    // subscribers below (presence-sweep kicks). Declared here so its lifetime spans
+    // the whole event loop. Replaces ZEB-373's dial-hint mpsc install: the resolver
+    // now kicks the supervisor directly (`set_supervisor`, installed post-open).
+    let mut reconnect_supervisor: Option<crate::reconnect_supervisor::SupervisorHandle> = None;
 
     let mut config = zenoh::Config::default();
     // Test/diagnostic seam (ZEB-468 dial probe): when HARMONY_ZENOH_DISABLE_MULTICAST
@@ -967,38 +976,21 @@ pub async fn run(
             return;
         }
     }
-    // ZEB-368: merge the LAN/Reticulum connect endpoint with every iroh peer the
-    // resolver knows, so the orchestrator's startup connect dials them through our
-    // factory manager's new_link(). Dynamic mid-session dial is deferred to ZEB-373.
-    //
-    // Boot-ordering (ZEB-368, verified): the resolver read below is the SAME
-    // Arc-backed store that start_node's reachability boot-replay
-    // (lib.rs ReachabilityResolver bootstrap) populates from persisted
-    // ReachabilityAnnounce history. That replay runs in straight-line code BEFORE
-    // the runtime-thread spawn that invokes this `event_loop::run` → `zenoh::open`,
-    // so on warm/persisted boots the resolver is already populated and seeding is
-    // effective. On a cold first boot the resolver is empty (no persisted peers
-    // yet) → seeding is a no-op; the node still accepts inbound (Task 4 listener)
-    // and dials on the next boot once reachability persists + replays. Full
-    // dynamic mid-session dial is ZEB-373.
-    let mut connect_eps: Vec<String> = Vec::new();
-    if let Some(ref ep) = endpoint {
-        match serde_json::to_string(ep) {
-            Ok(ep_json) => connect_eps.push(ep_json), // already JSON-quoted
-            Err(e) => {
-                let e = format!("endpoint serialize error: {e}");
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
+    // ZEB-620: the LAN/Reticulum connect endpoint is the ONLY thing seeded into
+    // zenoh's static `connect/endpoints`. ZEB-368 also injected every
+    // resolver-known iroh peer here (`iroh_connect_locators`); that static seed is
+    // retired — boot peers now enter the reconnect supervisor as `NewPeer` kicks
+    // after `zenoh::open` (see `seed_boot_peers_into_supervisor` below), so a peer
+    // whose first dial fails or later drops is reconnected indefinitely rather than
+    // dialed once at boot. `merge_iroh_listen_endpoints` (the LISTEN side) is
+    // unchanged.
+    let connect_eps = match build_connect_endpoints(endpoint.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
         }
-    }
-    if let Some(ref ih) = iroh_handles {
-        let resolver = ih.link_manager.resolver();
-        let self_nid = *ih.endpoint.node_id().as_bytes();
-        for loc in crate::iroh_zenoh_registration::iroh_connect_locators(&resolver, &self_nid) {
-            connect_eps.push(format!("\"{loc}\"")); // JSON-quote the iroh locator
-        }
-    }
+    };
     if !connect_eps.is_empty() {
         let arr = format!("[{}]", connect_eps.join(","));
         if let Err(e) = config.insert_json5("connect/endpoints", &arr) {
@@ -1082,23 +1074,124 @@ pub async fn run(
         };
     tracing::info!("Zenoh session opened");
 
-    // ZEB-373: spawn the dial driver to dial newly-learned peers via the live zenoh
-    // Runtime. The hint sender was installed on the resolver BEFORE open (above);
-    // inbound + static-seed (ZEB-368) are unchanged.
-    if let (Some(ref ih), Some(ref telemetry), Some(hint_rx)) =
-        (&iroh_handles, &dial_telemetry, dial_hint_rx)
-    {
+    // ZEB-620: the reconnect supervisor OWNS all dialing. Build one supervisor per
+    // node session, wire it as the single dial authority, and spawn its loop:
+    //  - resolver `set_supervisor`: first-learn → `NewPeer`, record change →
+    //    `RecordChanged` kicks (ZEB-620 Task 4);
+    //  - link-manager `set_reconnect_handle`: registry drop-watcher → `Dropped`
+    //    kick + successful-swap `mark_connected` (Task 3);
+    //  - boot seeding: every resolver-known peer enters as a `NewPeer` kick
+    //    (recency-ordered) instead of ZEB-368's static `connect/endpoints` seed;
+    //  - zenoh transport-events listener: a transport `Delete` → `Dropped` kick,
+    //    a non-fatal secondary drop source behind the registry watchers.
+    if let (Some(ref ih), Some(ref telemetry)) = (&iroh_handles, &dial_telemetry) {
+        use crate::reconnect_supervisor::{
+            run_reconnect_supervisor, SupervisorConfig, SupervisorHandle,
+        };
+
         let self_nid = *ih.endpoint.node_id().as_bytes();
+        let handle = SupervisorHandle::new();
+        let resolver = ih.link_manager.resolver();
+
+        // Install the handle on both producers (resolver kicks + registry
+        // drop/connect events) before spawning the loop.
+        resolver.set_supervisor(handle.clone());
+        if ih
+            .link_manager
+            .set_reconnect_handle(handle.clone())
+            .is_err()
+        {
+            tracing::warn!(
+                "ZEB-620: reconnect handle already installed on the link manager; \
+                 keeping the existing one"
+            );
+        }
+
         let dialer = std::sync::Arc::new(crate::iroh_dial_driver::RuntimePeerDialer::new(
             zenoh_runtime.clone(),
         ));
-        tokio::spawn(crate::iroh_dial_driver::run_dial_driver(
-            hint_rx,
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
             dialer,
+            std::sync::Arc::new(resolver.clone()),
             std::sync::Arc::clone(telemetry),
             self_nid,
-            std::time::Duration::from_secs(1),
+            SupervisorConfig::default(),
         ));
+
+        // Boot seed: every peer the resolver already knows enters the supervisor
+        // as a `NewPeer` kick (recency-ordered), so a peer whose first dial fails
+        // or later drops is reconnected indefinitely — not dialed once at boot.
+        let seeded = crate::iroh_zenoh_registration::seed_boot_peers_into_supervisor(
+            &resolver, &self_nid, &handle,
+        );
+        if !seeded.is_empty() {
+            tracing::info!(
+                "ZEB-620: seeded {} boot peer(s) into the reconnect supervisor",
+                seeded.len()
+            );
+        }
+
+        // Zenoh transport-events listener: a transport `Delete` maps the peer's
+        // zid back to its iroh node-id (via the resolver + the deterministic
+        // zid derivation) and kicks `Dropped`. The registry drop-watchers are the
+        // primary drop source; this is a non-fatal secondary that also catches a
+        // face zenoh reaps without a registry eviction. Listener-declare failure
+        // is warned once and the task exits (reconnect still works via the
+        // watchers).
+        let listener_session = session.clone();
+        let listener_resolver = resolver.clone();
+        let listener_handle = handle.clone();
+        tokio::spawn(async move {
+            use zenoh::sample::SampleKind;
+            let listener = match listener_session.info().transport_events_listener().await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(
+                        "ZEB-620: zenoh transport-events listener unavailable ({e}); \
+                         relying on registry drop-watchers for reconnect kicks"
+                    );
+                    return;
+                }
+            };
+            // zid (canonical hex) -> node-id, rebuilt from the resolver on a miss
+            // (a peer learned after the last refresh is picked up on its Delete).
+            let mut zid_to_node: std::collections::HashMap<String, [u8; 32]> =
+                std::collections::HashMap::new();
+            while let Ok(event) = listener.recv_async().await {
+                if event.kind() != SampleKind::Delete {
+                    continue;
+                }
+                let zid = event.transport().zid().to_string();
+                let node_id = match zid_to_node.get(&zid).copied() {
+                    Some(n) => Some(n),
+                    None => {
+                        zid_to_node = listener_resolver
+                            .list_active_peers()
+                            .into_iter()
+                            .map(|(_owner, p)| {
+                                (
+                                    crate::iroh_dial_driver::deterministic_zid_hex(&p.iroh_node_id),
+                                    p.iroh_node_id,
+                                )
+                            })
+                            .collect();
+                        zid_to_node.get(&zid).copied()
+                    }
+                };
+                match node_id {
+                    Some(n) => listener_handle
+                        .kick(n, crate::reconnect_supervisor::ReconnectTrigger::Dropped),
+                    None => tracing::debug!(
+                        "ZEB-620: transport Delete for zid {zid} not a resolver-known iroh peer; \
+                         no reconnect kick"
+                    ),
+                }
+            }
+            tracing::debug!("ZEB-620: zenoh transport-events listener stopped (session closed)");
+        });
+
+        reconnect_supervisor = Some(handle);
     }
 
     // Own Zenoh session ID — attached to capacity publications so receivers
@@ -3055,6 +3148,10 @@ pub async fn run(
             // ZEB-599 Direction 1: presence-driven full-reconcile sender —
             // moved into the presence task, cloned per subscriber below.
             let presence_resync_tx_for_presence = presence_resync_tx;
+            // ZEB-620 Task 5: reconnect-supervisor handle threaded the same way, so
+            // a roster device-set change also kicks a presence sweep (re-arm all
+            // non-connected peers). `None` on iroh-disabled runs.
+            let supervisor_for_presence = reconnect_supervisor.clone();
             tokio::spawn(async move {
                 use std::collections::HashMap;
                 let mut handles: HashMap<
@@ -3145,6 +3242,9 @@ pub async fn run(
                                     // when this community's roster gains a
                                     // device (a new potential holder).
                                     presence_resync_tx_for_presence.clone(),
+                                    // ZEB-620 Task 5: same roster edge kicks the
+                                    // reconnect supervisor into a presence sweep.
+                                    supervisor_for_presence.clone(),
                                 );
                             handles.insert(community_id, (pub_handle, sub_handle));
                             // Emit an INITIAL empty roster so the UI has a
@@ -9731,5 +9831,88 @@ mod zeb620_event_listener_pin_tests {
         // The event payload types the supervisor matches on (Put/Delete).
         let _ = core::mem::size_of::<TransportEvent>();
         let _ = core::mem::size_of::<LinkEvent>();
+    }
+}
+
+#[cfg(test)]
+mod zeb620_boot_seed_tests {
+    use super::build_connect_endpoints;
+    use crate::iroh_zenoh_registration::seed_boot_peers_into_supervisor;
+    use crate::owner_state_types::{Hlc, OwnerAddr};
+    use crate::reachability_record::ReachabilityAnnouncePayload;
+    use crate::reachability_resolver::ReachabilityResolver;
+    use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
+
+    fn payload(node_id: [u8; 32], announced_at_ms: u64) -> ReachabilityAnnouncePayload {
+        ReachabilityAnnouncePayload {
+            iroh_node_id: node_id,
+            home_relay_url: String::new(),
+            direct_addresses: vec![],
+            announced_at_ms,
+            identity_signature: [0; 64],
+            butler_set: vec![],
+            bs_at: 0,
+        }
+    }
+
+    fn hlc(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: String::new(),
+        }
+    }
+
+    /// ZEB-620 Task 5: boot peers enter the reconnect supervisor as `NewPeer`
+    /// kicks (recency-ordered, newest first) — NOT zenoh's `connect/endpoints`
+    /// static seed. The connect-endpoints builder takes no resolver, so a known
+    /// peer structurally cannot leak an `iroh/` locator into the zenoh config.
+    #[test]
+    fn boot_seeds_kick_supervisor_not_config() {
+        let resolver = ReachabilityResolver::new();
+        let older = [0x11u8; 32];
+        let newer = [0x22u8; 32];
+        // Two known peers; `newer` has the fresher announced_at_ms.
+        resolver.update(OwnerAddr([0xA1; 16]), payload(older, 1_000), hlc(1_000));
+        resolver.update(OwnerAddr([0xA2; 16]), payload(newer, 2_000), hlc(2_000));
+        let self_nid = [0xEEu8; 32]; // not among the peers
+
+        // (1) Boot seeding kicks the supervisor `NewPeer` for each peer, ordered
+        // newest-first.
+        let handle = SupervisorHandle::new();
+        let ordered = seed_boot_peers_into_supervisor(&resolver, &self_nid, &handle);
+        assert_eq!(ordered, vec![newer, older], "seeds ordered newest-first");
+        assert_eq!(
+            handle.pending_trigger(older),
+            Some(ReconnectTrigger::NewPeer),
+            "older peer seeded as NewPeer"
+        );
+        assert_eq!(
+            handle.pending_trigger(newer),
+            Some(ReconnectTrigger::NewPeer),
+            "newer peer seeded as NewPeer"
+        );
+
+        // (2) `connect/endpoints` carries only the LAN endpoint — never an iroh
+        // locator — even though the resolver knows peers. The builder takes no
+        // resolver, so this is structural, not incidental.
+        let connect_eps =
+            build_connect_endpoints(Some("tcp/192.0.2.7:7447")).expect("connect eps build");
+        assert!(
+            connect_eps.iter().all(|e| !e.contains("iroh/")),
+            "no iroh locator in connect/endpoints: {connect_eps:?}"
+        );
+        assert!(
+            connect_eps.iter().any(|e| e.contains("192.0.2.7")),
+            "LAN connect endpoint preserved: {connect_eps:?}"
+        );
+
+        // No endpoint → no connect/endpoints entries at all.
+        assert!(
+            build_connect_endpoints(None)
+                .expect("empty build")
+                .is_empty(),
+            "no endpoint yields no connect/endpoints"
+        );
     }
 }
