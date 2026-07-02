@@ -8901,6 +8901,46 @@ pub async fn start_node_inner(
                 let ep_clone = endpoint.clone();
                 let app_clone = app.clone();
                 let mail_mgr_clone = mail_mgr.clone();
+                // ZEB-618: restart-aware anti-entropy floor for the mail-root
+                // fetch (ZEB-584 parity). Sidecar: <data>/mail/backfill_state.cbor.
+                // The mail dir already exists here — `MailManager::load` (above)
+                // create_dir_all'd it on the only path that assigns `mail_mgr`.
+                // The interval is drawn ONCE and shared between the first-deadline
+                // computation and the driver arg (never two jittered draws).
+                let mail_resync = {
+                    let mail_dir = app_data_dir.join("mail");
+                    let interval_ms = crate::channel_backfill::periodic_resync_interval_ms();
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = crate::community_channel_log::ChannelBackfillState::load(&mail_dir)
+                        .map(|s| s.last_full_reconcile_ms);
+                    let first_deadline_ms =
+                        crate::channel_backfill::first_resync_deadline(last, interval_ms, now_ms);
+                    let persist_dir = mail_dir.clone();
+                    Some((
+                        interval_ms,
+                        crate::channel_backfill::ResyncPersist {
+                            first_deadline_ms,
+                            on_full_reconcile: std::sync::Arc::new(move |fired_at_ms| {
+                                let dir = persist_dir.clone();
+                                // Tiny sidecar write off the driver task (same
+                                // shape as the channel-log engine's ZEB-599 cb).
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(e) =
+                                        crate::community_channel_log::ChannelBackfillState::save(
+                                            &dir,
+                                            fired_at_ms,
+                                        )
+                                    {
+                                        tracing::debug!(error = %e, "mail-root resync persist failed (hint only)");
+                                    }
+                                });
+                            }),
+                        },
+                    ))
+                };
                 let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
                 let cas_op_tx_for_loop = cas_op_tx.clone();
                 let sync_handles_for_loop = sync_handles_opt;
@@ -9097,6 +9137,10 @@ pub async fn start_node_inner(
                                 // community presence subscriber, bumped when a
                                 // new roster device (potential holder) appears.
                                 presence_resync_tx,
+                                // ZEB-618: restart-aware persisted floor for the
+                                // mail-root fetch (single jittered interval draw
+                                // shared with the persisted first deadline).
+                                mail_resync,
                             )
                             .await;
                         });

@@ -219,6 +219,7 @@ async fn spawn_test_runtime() -> TestHarness {
                     None, // ZEB-418 P2: routing_republish not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
+                    None, // ZEB-618: mail-root persist pair not exercised
                 )
                 .await;
             });
