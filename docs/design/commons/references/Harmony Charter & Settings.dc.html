@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</helmet>
+
+<!-- TITLE -->
+<div data-drags-parent="0" style="position:absolute; left:80px; top:60px; width:1000px;">
+  <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:rgba(60,55,45,.6);">Harmony · Community settings &amp; charter · hi-fi · "Commons"</div>
+  <div style="font:500 34px 'Newsreader',serif; color:#2a2519; margin-top:4px;">The rules, made legible</div>
+  <div style="font:400 14px/1.55 'Public Sans'; color:#6b6256; margin-top:8px; max-width:84ch;">Today the governing rules are scattered through a "Manage community" modal — roles as raw power numbers, an admin quorum buried under "Admin governance." This thread keeps that operator panel faithful, but adds a member-facing <strong>Charter</strong>: the same rules rendered as a readable constitution that every member can see and amend. Roles (Member / Mod / Admin) stay mapped to power; the admin quorum stays a k-of-n multisig; everything here is changeable by a proposal.</div>
+</div>
+
+<!-- ===== FRAME A · THE CHARTER (hero) ===== -->
+<div style="position:absolute; left:80px; top:250px; width:1180px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#b9742c;">A · The Charter <span style="color:#8a8472; font-weight:400;">— a community's constitution, generated from its real governance rules</span></div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:38px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px; gap:10px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span><span style="margin:0 auto; font:500 12px 'IBM Plex Mono'; color:#8a8472;">Cascadia Commons · charter</span></div>
+    <div style="display:grid; grid-template-columns:240px 1fr; height:880px;">
+      <!-- nav -->
+      <div style="background:#efeadf; border-right:1px solid #e3ddcf; padding:14px 8px;">
+        <div style="display:flex; align-items:center; gap:9px; padding:0 8px 12px;"><svg width="22" height="22" viewBox="0 0 92 92"><circle cx="46" cy="34" r="22" fill="none" stroke="#466b4c" stroke-width="5"/><circle cx="32" cy="56" r="22" fill="none" stroke="#283450" stroke-width="5"/><circle cx="60" cy="56" r="22" fill="none" stroke="#c56a46" stroke-width="5"/></svg><span style="font:500 18px 'Newsreader',serif; color:#20241c;">Harmony</span></div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px;"><span style="width:22px; height:22px; border-radius:6px; background:#466b4c; color:#fff; font:600 11px 'Public Sans'; display:flex; align-items:center; justify-content:center;">C</span><span style="font:600 14px 'Public Sans'; color:#20241c;">Cascadia Commons</span></div>
+        <div style="padding-left:6px;">
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="color:#b3ad9c;">#</span> general</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; color:#766f5c; font:500 13.5px 'Public Sans';"><span style="color:#b9742c;">⚖</span> proposals</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; background:#e4ece2; border-radius:6px; color:#2f4a35; font:600 13.5px 'Public Sans';"><span style="color:#466b4c;">📜</span> charter</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; color:#766f5c; font:500 13.5px 'Public Sans';"><span style="color:#b9742c;">⑂</span> lineage</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="color:#b3ad9c;">🔊</span> Town Hall</div>
+        </div>
+      </div>
+      <!-- charter body -->
+      <div style="background:#fbf9f4; overflow-y:auto;">
+        <div style="max-width:780px; margin:0 auto; padding:30px 40px 48px;">
+          <!-- header -->
+          <div style="display:flex; align-items:flex-start; gap:14px; padding-bottom:20px; border-bottom:1px solid #ece7da;">
+            <span style="font-size:30px;">📜</span>
+            <div style="flex:1;">
+              <h1 style="margin:0; font:500 32px/1.1 'Newsreader',serif; color:#20241c; letter-spacing:-.01em;">The Cascadia Commons Charter</h1>
+              <div style="display:flex; align-items:center; gap:10px; margin-top:8px; font:500 12px 'IBM Plex Mono'; color:#8a8472;"><span style="color:#2f4a35; background:#e4ece2; padding:2px 8px; border-radius:20px;">✓ Ratified v4</span><span>amended 12 days ago · P-12</span><span>142 members bound</span></div>
+            </div>
+            <button style="padding:9px 15px; border:1px solid #e6cfa3; border-radius:7px; background:#f1e2cc; color:#5a4321; font:600 12.5px 'Public Sans'; cursor:pointer;">✎ Propose amendment</button>
+          </div>
+
+          <!-- preamble -->
+          <div style="margin-top:24px;">
+            <div style="font:600 11px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Preamble</div>
+            <p style="margin:8px 0 0; font:400 15.5px/1.65 'Newsreader',serif; color:#3a3e34; font-style:italic;">Cascadia Commons stewards a shared mutual-aid treasury, a community space, and the agreements that bind us. This charter is our constitution. Every clause is visible to every member, and every clause can be changed by the members it governs.</p>
+          </div>
+
+          <!-- roles -->
+          <div style="margin-top:30px;">
+            <div style="font:600 11px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Article I · Membership &amp; roles</div>
+            <p style="margin:6px 0 14px; font:400 13.5px/1.55 'Public Sans'; color:#767a6c;">Roles are earned, granted, and revoked as a numeric power level. Three named bands:</p>
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px;">
+              <div style="background:#fff; border:1px solid #e3ddcf; border-radius:9px; padding:15px;"><div style="display:flex; align-items:center; gap:8px;"><span style="font:600 10px 'IBM Plex Mono'; color:#5a5345; background:#e6e0d0; padding:3px 8px; border-radius:20px;">MEMBER</span><span style="margin-left:auto; font:500 11px 'IBM Plex Mono'; color:#a39e8e;">power 0</span></div><div style="font:400 12px/1.5 'Public Sans'; color:#767a6c; margin-top:9px;">Everyone who joins. Posts, votes, proposes, delegates — and may fork at any time.</div></div>
+              <div style="background:#fff; border:1px solid #e6cfa3; border-radius:9px; padding:15px;"><div style="display:flex; align-items:center; gap:8px;"><span style="font:600 10px 'IBM Plex Mono'; color:#5a4321; background:#f1e2cc; padding:3px 8px; border-radius:20px;">MODERATOR</span><span style="margin-left:auto; font:500 11px 'IBM Plex Mono'; color:#a39e8e;">power ≥ 50</span></div><div style="font:400 12px/1.5 'Public Sans'; color:#767a6c; margin-top:9px;">Tends the space: channels, invites, join requests, and removing members below their level.</div></div>
+              <div style="background:#fff; border:1px solid #c9d6c6; border-radius:9px; padding:15px;"><div style="display:flex; align-items:center; gap:8px;"><span style="font:600 10px 'IBM Plex Mono'; color:#fff; background:#466b4c; padding:3px 8px; border-radius:20px;">ADMIN</span><span style="margin-left:auto; font:500 11px 'IBM Plex Mono'; color:#a39e8e;">power ≥ 100</span></div><div style="font:400 12px/1.5 'Public Sans'; color:#767a6c; margin-top:9px;">Sets roles, changes the decision rules, and co-signs admin actions under quorum.</div></div>
+            </div>
+
+            <!-- permissions matrix -->
+            <div style="margin-top:16px; border:1px solid #e3ddcf; border-radius:9px; overflow:hidden;">
+              <div style="display:grid; grid-template-columns:1fr 92px 92px 92px; background:#efeadf; border-bottom:1px solid #e3ddcf;">
+                <div style="padding:9px 14px; font:600 11px 'Public Sans'; color:#8a8472;">Capability</div>
+                <div style="padding:9px 0; text-align:center; font:600 10px 'IBM Plex Mono'; color:#5a5345;">MEMBER</div>
+                <div style="padding:9px 0; text-align:center; font:600 10px 'IBM Plex Mono'; color:#5a4321;">MOD</div>
+                <div style="padding:9px 0; text-align:center; font:600 10px 'IBM Plex Mono'; color:#2f4a35;">ADMIN</div>
+              </div>
+              <div style="display:grid; grid-template-columns:1fr 92px 92px 92px; font:400 12.5px 'Public Sans'; color:#3a3e34;">
+                <div style="padding:9px 14px; border-top:1px solid #f0ebdf;">Post, vote &amp; propose</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div>
+                <div style="padding:9px 14px; border-top:1px solid #f0ebdf;">Delegate &amp; recall votes</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div>
+                <div style="padding:9px 14px; border-top:1px solid #f0ebdf;">Fork the community</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div>
+                <div style="padding:9px 14px; border-top:1px solid #f0ebdf;">Manage channels &amp; invites</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#cdc6b4;">—</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div>
+                <div style="padding:9px 14px; border-top:1px solid #f0ebdf;">Approve joins · remove members</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#cdc6b4;">—</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div>
+                <div style="padding:9px 14px; border-top:1px solid #f0ebdf;">Set roles · change decision rules</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#cdc6b4;">—</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#cdc6b4;">—</div><div style="padding:9px 0; text-align:center; border-top:1px solid #f0ebdf; color:#466b4c;">●</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- decision rules -->
+          <div style="margin-top:30px;">
+            <div style="font:600 11px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Article II · How we decide</div>
+            <p style="margin:6px 0 14px; font:400 13.5px/1.55 'Public Sans'; color:#767a6c;">Proposals move through three tiers. Higher stakes, higher bar.</p>
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px;">
+              <div style="background:#fff; border:1px solid #e3ddcf; border-radius:9px; padding:15px;"><div style="font:600 13px 'Public Sans'; color:#20241c;">Tier 1 · Pulse</div><div style="font:400 11.5px/1.5 'Public Sans'; color:#767a6c; margin-top:6px;">Non-binding sentiment checks. No quorum. Anyone can open.</div></div>
+              <div style="background:#fff; border:1px solid #e6dcc6; border-radius:9px; padding:15px;"><div style="font:600 13px 'Public Sans'; color:#20241c;">Tier 2 · Motion</div><div style="font:400 11.5px/1.5 'Public Sans'; color:#767a6c; margin-top:6px;">Binding. <strong>Simple majority + 50% quorum.</strong> Conviction grows with time held. Delegable.</div></div>
+              <div style="background:#fff; border:1px solid #c9d6c6; border-radius:9px; padding:15px;"><div style="font:600 13px 'Public Sans'; color:#20241c;">Tier 3 · Charter</div><div style="font:400 11.5px/1.5 'Public Sans'; color:#767a6c; margin-top:6px;">Amends this charter. <strong>⅔ supermajority + 60% quorum</strong>, 7-day floor.</div></div>
+            </div>
+            <!-- quorums -->
+            <div style="margin-top:14px; display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+              <div style="background:#efeadf; border:1px solid #e3ddcf; border-radius:9px; padding:15px;"><div style="display:flex; align-items:center; gap:8px;"><span style="font:600 11px 'Public Sans'; color:#20241c;">Proposal quorum</span><span style="margin-left:auto; font:600 14px 'IBM Plex Mono'; color:#466b4c;">71 / 142</span></div><div style="margin-top:8px; height:7px; border-radius:4px; background:#e0dccd; overflow:hidden;"><span style="display:block; width:50%; height:100%; background:#466b4c;"></span></div><div style="font:400 11px 'Public Sans'; color:#767a6c; margin-top:7px;">50% of members must vote for a Tier-2 motion to count.</div></div>
+              <div style="background:#efeadf; border:1px solid #e3ddcf; border-radius:9px; padding:15px;"><div style="display:flex; align-items:center; gap:8px;"><span style="font:600 11px 'Public Sans'; color:#20241c;">Admin quorum</span><span style="margin-left:auto; font:600 14px 'IBM Plex Mono'; color:#466b4c;">3 of 4</span></div><div style="margin-top:8px; display:flex; gap:5px;"><span style="flex:1; height:7px; border-radius:4px; background:#466b4c;"></span><span style="flex:1; height:7px; border-radius:4px; background:#466b4c;"></span><span style="flex:1; height:7px; border-radius:4px; background:#466b4c;"></span><span style="flex:1; height:7px; border-radius:4px; background:#cdc6b4;"></span></div><div style="font:400 11px 'Public Sans'; color:#767a6c; margin-top:7px;">3 of 4 admins must co-sign admin actions. No single admin can act alone.</div></div>
+            </div>
+          </div>
+
+          <!-- amendment -->
+          <div style="margin-top:30px; padding:18px 20px; background:#e4ece2; border:1px solid #c9d6c6; border-radius:10px;">
+            <div style="display:flex; align-items:center; gap:9px;"><span style="font-size:16px;">✎</span><span style="font:600 14px 'Public Sans'; color:#2f4a35;">Article III · Amendment</span></div>
+            <p style="margin:8px 0 0; font:400 13.5px/1.6 'Public Sans'; color:#3a4d3a;">No clause here is permanent. Any member may open a <strong>Tier-3 proposal</strong> to amend the charter; if it passes, the new version is ratified and signed by the membership. Every prior version stays on the record — the charter is versioned, never overwritten. <span style="color:#2f4a35; font-weight:600;">v1 → v4, 3 amendments, all public.</span></p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div data-drags-parent="0" style="position:absolute; left:1292px; top:320px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(1.1deg);"><strong>The charter is the product's thesis made visible.</strong> Power numbers become named roles; the buried admin quorum becomes a headline "3 of 4 · no single admin can act alone." Members can <em>read their own constitution</em> — and the "Propose amendment" button means they can change it.</div>
+<div data-drags-parent="0" style="position:absolute; left:1292px; top:560px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(-1.2deg);">Tiers map onto what's already in the code (Tier 2 motions, Tier 3 / conviction). I invented the ⅔/60% numbers as sensible defaults — every one should be a charter field, editable per community.</div>
+
+<!-- ===== FRAME B · MANAGE COMMUNITY (faithful settings) ===== -->
+<div style="position:absolute; left:1580px; top:250px; width:560px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">B · Manage community <span style="color:#8a8472; font-weight:400;">— the operator panel, faithful to today's sections</span></div>
+  <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:12px; box-shadow:0 18px 48px rgba(40,30,10,.22); overflow:hidden; font-family:'Public Sans',system-ui; height:880px; display:flex; flex-direction:column;">
+    <div style="padding:18px 22px; border-bottom:1px solid #ece7da; display:flex; align-items:flex-start; gap:12px;">
+      <div style="flex:1;"><div style="font:500 20px 'Newsreader',serif; color:#20241c;">Manage community</div><div style="font:400 12.5px 'Public Sans'; color:#767a6c;">Cascadia Commons</div></div>
+      <span style="color:#a39e8e; font-size:18px; cursor:pointer;">✕</span>
+    </div>
+    <div style="flex:1; overflow-y:auto; padding:18px 22px;">
+      <!-- info -->
+      <div style="font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Info</div>
+      <div style="margin-top:9px; display:grid; grid-template-columns:auto 1fr; gap:7px 16px; font:400 13px 'Public Sans'; color:#3a3e34;">
+        <span style="color:#767a6c;">Name</span><span style="color:#20241c; font-weight:600;">Cascadia Commons</span>
+        <span style="color:#767a6c;">Type</span><span>Invite-only</span>
+        <span style="color:#767a6c;">Members</span><span>142 joined</span>
+        <span style="color:#767a6c;">Your role</span><span><span style="font:600 10px 'IBM Plex Mono'; color:#fff; background:#466b4c; padding:2px 8px; border-radius:20px;">ADMIN</span> <span style="color:#767a6c; font-family:'IBM Plex Mono'; font-size:11px;">(power 100)</span></span>
+        <span style="color:#767a6c;">Sync status</span><span style="color:#2f8a4e;">● Healthy</span>
+      </div>
+
+      <!-- public profile -->
+      <div style="margin-top:20px; font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Public profile</div>
+      <label style="margin-top:9px; display:flex; align-items:center; gap:11px; background:#fff; border:1px solid #e3ddcf; border-radius:8px; padding:11px 13px;"><span style="width:36px; height:20px; border-radius:20px; background:#466b4c; position:relative; flex-shrink:0;"><span style="position:absolute; top:2px; right:2px; width:16px; height:16px; border-radius:50%; background:#fff;"></span></span><div style="flex:1;"><div style="font:600 12.5px 'Public Sans'; color:#20241c;">Show on my profile</div><div style="font:400 11px 'Public Sans'; color:#767a6c;">Let others see you're a member of this community.</div></div></label>
+
+      <!-- members -->
+      <div style="margin-top:20px; font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Members (142)</div>
+      <div style="margin-top:9px; display:flex; align-items:center; gap:8px; background:#fff; border:1px solid #e3ddcf; border-radius:7px; padding:8px 11px;"><span style="color:#a39e8e;">⌕</span><span style="font:400 12.5px 'Public Sans'; color:#a39e8e;">Search members…</span></div>
+      <div style="margin-top:9px; display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; align-items:center; gap:10px; padding:8px 6px;"><span style="width:30px; height:30px; border-radius:50%; background:#466b4c; color:#fff; font:600 11px 'Public Sans'; display:flex; align-items:center; justify-content:center;">JE</span><div style="flex:1; min-width:0;"><div style="font:600 13px 'Public Sans'; color:#20241c;">jake.eth <span style="font:400 11px 'Public Sans'; color:#a39e8e;">(you)</span></div><div style="font:400 10px 'IBM Plex Mono'; color:#a39e8e; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">7f3a…b2e1</div></div><span style="font:600 9px 'IBM Plex Mono'; color:#fff; background:#466b4c; padding:2px 7px; border-radius:20px;">ADMIN</span></div>
+        <div style="display:flex; align-items:center; gap:10px; padding:8px 6px;"><span style="width:30px; height:30px; border-radius:50%; background:#c9bfa6;"></span><div style="flex:1; min-width:0;"><div style="font:600 13px 'Public Sans'; color:#20241c;">Mara Okafor</div><div style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">a91c…44df</div></div><span style="font:600 9px 'IBM Plex Mono'; color:#5a4321; background:#f1e2cc; padding:2px 7px; border-radius:20px;">MOD</span><button style="font:600 11px 'Public Sans'; color:#466b4c; background:none; border:none; cursor:pointer;">Set role</button></div>
+        <div style="display:flex; align-items:center; gap:10px; padding:8px 6px;"><span style="width:30px; height:30px; border-radius:50%; background:#a9bcc4;"></span><div style="flex:1; min-width:0;"><div style="font:600 13px 'Public Sans'; color:#20241c;">Devin Ross</div><div style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">2b80…91aa</div></div><span style="font:600 9px 'IBM Plex Mono'; color:#5a5345; background:#e6e0d0; padding:2px 7px; border-radius:20px;">MEMBER</span><button style="font:600 11px 'Public Sans'; color:#466b4c; background:none; border:none; cursor:pointer;">Set role</button><button style="font:600 11px 'Public Sans'; color:#b1402f; background:none; border:none; cursor:pointer;">Kick</button></div>
+      </div>
+
+      <!-- invites -->
+      <div style="margin-top:20px; font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Invites</div>
+      <div style="margin-top:9px; display:flex; align-items:center; gap:8px; background:#fff; border:1px solid #e3ddcf; border-radius:7px; padding:9px 12px;"><span style="font:500 12px 'IBM Plex Mono'; color:#466b4c; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">harmony://invite/cascadia/7Fk2…9aQ</span><button style="padding:6px 11px; border:1px solid #d8d1c1; border-radius:6px; background:#fff; font:600 11px 'Public Sans'; color:#20241c; cursor:pointer;">⧉ Copy</button><button style="padding:6px 11px; border:none; border-radius:6px; background:#466b4c; color:#fff; font:600 11px 'Public Sans'; cursor:pointer;">New</button></div>
+
+      <!-- admin governance -->
+      <div style="margin-top:20px; font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Admin governance</div>
+      <div style="margin-top:9px; background:#e8eef0; border:1px solid #cdd9dd; border-radius:8px; padding:13px 15px;"><div style="font:400 12.5px/1.5 'Public Sans'; color:#3d5560;">Admin quorum: <strong style="color:#20241c;">3 of 4 admins</strong> required to approve admin actions. We recommend at least N+1 admins for survivability.</div><button style="margin-top:10px; padding:8px 13px; border:1px solid #cdd9dd; border-radius:6px; background:#fff; font:600 12px 'Public Sans'; color:#3d5560; cursor:pointer;">Change quorum…</button></div>
+
+      <!-- forks -->
+      <div style="margin-top:20px; font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e;">Forks</div>
+      <div style="margin-top:9px; font:400 12px/1.5 'Public Sans'; color:#767a6c;">Any member can fork this community at any time, creating a new one with a snapshot of its history. <strong style="color:#20241c;">2 forks · 1 fork-of-fork.</strong></div>
+      <div style="margin-top:9px; display:flex; gap:8px;"><button style="flex:1; padding:9px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; font:600 12px 'Public Sans'; color:#20241c; cursor:pointer;">View lineage</button><button style="flex:1; padding:9px; border:1px solid #e6cfa3; border-radius:7px; background:#f1e2cc; font:600 12px 'Public Sans'; color:#5a4321; cursor:pointer;">⑂ Fork…</button></div>
+
+      <!-- danger -->
+      <div style="margin-top:20px; font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#b1402f;">Danger zone</div>
+      <button style="margin-top:9px; width:100%; padding:11px; border:1px solid #e0b9b1; border-radius:8px; background:#fdf6f4; color:#b1402f; font:600 12.5px 'Public Sans'; cursor:pointer;">Leave community</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== FRAME C · DIALOGS ===== -->
+<div style="position:absolute; left:2220px; top:250px; width:460px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">C · Governance dialogs</div>
+  <!-- set role -->
+  <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:12px; box-shadow:0 12px 36px rgba(40,30,10,.2); overflow:hidden; font-family:'Public Sans',system-ui; margin-bottom:20px;">
+    <div style="padding:16px 20px; border-bottom:1px solid #ece7da; display:flex; align-items:center; gap:11px;"><span style="width:34px; height:34px; border-radius:50%; background:#c9bfa6; flex-shrink:0;"></span><div><div style="font:500 17px 'Newsreader',serif; color:#20241c;">Set role · Mara Okafor</div><div style="font:400 11px 'IBM Plex Mono'; color:#a39e8e;">a91c…44df</div></div></div>
+    <div style="padding:18px 20px;">
+      <div style="display:flex; align-items:baseline; justify-content:space-between;"><span style="font:600 12px 'Public Sans'; color:#20241c;">Power level</span><span style="font:600 18px 'IBM Plex Mono'; color:#466b4c;">50</span></div>
+      <!-- slider track with role bands -->
+      <div style="margin-top:10px; position:relative; height:10px; border-radius:6px; overflow:hidden; display:flex;"><span style="width:50%; background:#e6e0d0;"></span><span style="width:50%; background:#f1e2cc;"></span><span style="width:0%; background:#e4ece2;"></span></div>
+      <div style="position:relative; height:0;"><span style="position:absolute; left:calc(50% - 9px); top:-15px; width:18px; height:18px; border-radius:50%; background:#fff; border:3px solid #b9742c; box-shadow:0 1px 4px rgba(40,30,10,.25);"></span></div>
+      <div style="display:flex; justify-content:space-between; margin-top:16px; font:600 9.5px 'IBM Plex Mono'; color:#a39e8e;"><span>0 · MEMBER</span><span style="color:#5a4321;">50 · MOD</span><span>100 · ADMIN</span></div>
+      <div style="margin-top:14px; display:flex; gap:8px;"><span style="font:500 11.5px 'Public Sans'; color:#767a6c; flex:1;">Moderator can manage channels, invites &amp; join requests.</span></div>
+      <div style="display:flex; gap:9px; margin-top:16px;"><button style="flex:1; padding:10px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; color:#767a6c; font:600 12.5px 'Public Sans'; cursor:pointer;">Cancel</button><button style="flex:1; padding:10px; border:none; border-radius:7px; background:#466b4c; color:#fff; font:600 12.5px 'Public Sans'; cursor:pointer;">Set role</button></div>
+    </div>
+  </div>
+  <!-- change quorum -->
+  <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:12px; box-shadow:0 12px 36px rgba(40,30,10,.2); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="padding:16px 20px; border-bottom:1px solid #ece7da;"><div style="font:500 17px 'Newsreader',serif; color:#20241c;">Change admin quorum</div></div>
+    <div style="padding:18px 20px;">
+      <p style="margin:0 0 16px; font:400 12.5px/1.55 'Public Sans'; color:#767a6c;">Currently <strong style="color:#20241c;">3 of 4</strong> admin signatures are required to approve actions. We recommend at least <strong style="color:#20241c;">N+1</strong> admins so no single departure blocks future proposals.</p>
+      <div style="display:flex; align-items:center; gap:14px;">
+        <div style="flex:1; position:relative; height:10px; border-radius:6px; background:#e0dccd; overflow:hidden;"><span style="display:block; width:75%; height:100%; background:#466b4c;"></span></div>
+        <span style="position:relative;"><span style="font:600 20px 'IBM Plex Mono'; color:#466b4c;">3</span></span>
+        <span style="font:500 12px 'Public Sans'; color:#767a6c;">of 4 admins</span>
+      </div>
+      <div style="margin-top:12px; display:flex; align-items:flex-start; gap:9px; background:#f1e2cc; border:1px solid #e6cfa3; border-radius:8px; padding:11px 13px;"><span>⚖</span><div style="font:400 11.5px/1.5 'Public Sans'; color:#6b5226;">This change is itself an admin action — it needs the current 3-of-4 quorum to take effect.</div></div>
+      <div style="display:flex; gap:9px; margin-top:16px;"><button style="flex:1; padding:10px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; color:#767a6c; font:600 12.5px 'Public Sans'; cursor:pointer;">Cancel</button><button style="flex:1; padding:10px; border:none; border-radius:7px; background:#466b4c; color:#fff; font:600 12.5px 'Public Sans'; cursor:pointer;">Propose change</button></div>
+    </div>
+  </div>
+</div>
+<div data-drags-parent="0" style="position:absolute; left:2220px; top:780px; width:240px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(-1deg);"><strong>The role slider shows the bands</strong> so an admin sees exactly where MEMBER→MOD→ADMIN fall — and crossing into ADMIN triggers the existing confirm step (it's near-irreversible). Changing the quorum is honestly self-referential: it needs the current quorum to pass.</div>
+
+<div data-drags-parent="0" style="position:absolute; left:80px; top:1200px; width:860px; font:400 13px/1.6 'Public Sans'; color:#5a5347;">Charter + settings + the governance dialogs round out the community-management surface. Ready when you are for the developer handoff — I'll map this whole system (tokens, components, the Assembly rail, charter) back onto your actual harmony-client Svelte files so your devs/agents can adopt it incrementally.</div>
+</x-dc>
+</body>
+</html>

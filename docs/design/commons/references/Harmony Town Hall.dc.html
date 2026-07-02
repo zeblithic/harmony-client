@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</helmet>
+
+<!-- TITLE -->
+<div data-drags-parent="0" style="position:absolute; left:80px; top:60px; width:1000px;">
+  <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:rgba(60,55,45,.6);">Harmony · Town Hall &amp; voice · hi-fi · "Commons"</div>
+  <div style="font:500 34px 'Newsreader',serif; color:#2a2519; margin-top:4px;">Where the commons gathers to speak</div>
+  <div style="font:400 14px/1.55 'Public Sans'; color:#6b6256; margin-top:8px; max-width:84ch;">The codebase already ships a real voice channel — join-muted, a Mute / PTT / Deafen / Leave bar, an avatar-grid stage that collapses to a list past 12, speaking rings, and power-gated mod controls. This thread restyles that faithfully <strong>and</strong> proposes the distinctly-Harmony surface above it: the <strong>Town Hall</strong>, where voice and the Assembly fuse — a community deliberates live, a moderator runs a speaker queue, and any member can <strong>call a motion from the floor</strong> that opens a real proposal without leaving the room.</div>
+</div>
+
+<!-- ===== FRAME A · TOWN HALL (hero) ===== -->
+<div style="position:absolute; left:80px; top:250px; width:1440px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#b9742c;">A · Town Hall <span style="color:#8a8472; font-weight:400;">— live voice fused with the Assembly: deliberate, queue to speak, call a motion from the floor</span></div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:38px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px; gap:10px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span><span style="margin:0 auto; font:500 12px 'IBM Plex Mono'; color:#8a8472;">Cascadia Commons · 🔊 Town Hall · live</span></div>
+    <div style="display:grid; grid-template-columns:240px 1fr 320px; height:740px;">
+      <!-- nav -->
+      <div style="background:#efeadf; border-right:1px solid #e3ddcf; padding:14px 8px;">
+        <div style="display:flex; align-items:center; gap:9px; padding:0 8px 12px;"><svg width="22" height="22" viewBox="0 0 92 92"><circle cx="46" cy="34" r="22" fill="none" stroke="#466b4c" stroke-width="5"/><circle cx="32" cy="56" r="22" fill="none" stroke="#283450" stroke-width="5"/><circle cx="60" cy="56" r="22" fill="none" stroke="#c56a46" stroke-width="5"/></svg><span style="font:500 18px 'Newsreader',serif; color:#20241c;">Harmony</span></div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px;"><span style="width:22px; height:22px; border-radius:6px; background:#466b4c; color:#fff; font:600 11px 'Public Sans'; display:flex; align-items:center; justify-content:center;">C</span><span style="font:600 14px 'Public Sans'; color:#20241c;">Cascadia Commons</span></div>
+        <div style="padding-left:6px;">
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="color:#b3ad9c;">#</span> general</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; color:#766f5c; font:500 13.5px 'Public Sans';"><span style="color:#b9742c;">⚖</span> proposals</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="color:#b3ad9c;">📜</span> charter</div>
+          <div style="font:600 10px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; padding:12px 12px 5px;">Voice</div>
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; background:#e4ece2; border-radius:6px; color:#2f4a35; font:600 13.5px 'Public Sans';"><span style="color:#466b4c;">🔊</span> Town Hall <span style="margin-left:auto; display:flex; align-items:center; gap:4px;"><span style="width:6px; height:6px; border-radius:50%; background:#b1402f;"></span><span style="font:600 10px 'IBM Plex Mono'; color:#466b4c;">23</span></span></div>
+          <div style="display:flex; align-items:center; gap:8px; padding:6px 12px; color:#767a6c; font:400 13.5px 'Public Sans';"><span style="color:#b3ad9c;">🔊</span> Co-work</div>
+        </div>
+        <!-- mini "in this room" -->
+        <div style="margin-top:14px; padding:11px 10px; background:#fbf9f4; border:1px solid #e3ddcf; border-radius:9px;">
+          <div style="font:600 10px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#a39e8e;">You</div>
+          <div style="display:flex; align-items:center; gap:8px; margin-top:8px;"><span style="position:relative;"><span style="width:30px; height:30px; border-radius:50%; background:#466b4c; color:#fff; font:600 11px 'Public Sans'; display:flex; align-items:center; justify-content:center;">JE</span></span><div style="line-height:1.2;"><div style="font:600 12.5px 'Public Sans'; color:#20241c;">jake.eth</div><div style="font:400 10px 'IBM Plex Mono'; color:#8aa68d;">🔇 listening</div></div></div>
+        </div>
+      </div>
+
+      <!-- STAGE -->
+      <div style="background:#fbf9f4; display:flex; flex-direction:column; min-width:0;">
+        <!-- header -->
+        <div style="padding:15px 22px; border-bottom:1px solid #ece7da; display:flex; align-items:center; gap:11px;">
+          <span style="font:500 19px 'Newsreader',serif; color:#20241c;">Town Hall</span>
+          <span style="display:flex; align-items:center; gap:6px; font:600 11px 'IBM Plex Mono'; color:#b1402f; background:#f3ddd7; padding:3px 9px; border-radius:20px;"><span style="width:6px; height:6px; border-radius:50%; background:#b1402f;"></span>LIVE · 23</span>
+          <span style="font:400 13px 'Public Sans'; color:#959183;">Monthly assembly · agenda: winter budget</span>
+          <span style="margin-left:auto; font:500 12px 'IBM Plex Mono'; color:#8a8472;">⏱ 32:14</span>
+        </div>
+
+        <!-- speaker spotlight + stage grid -->
+        <div style="flex:1; overflow-y:auto; padding:18px 22px;">
+          <div style="font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; margin-bottom:10px;">On the floor</div>
+          <!-- active speaker -->
+          <div style="display:flex; gap:14px; background:#fff; border:1px solid #c9d6c6; border-radius:12px; padding:16px; box-shadow:0 0 0 3px rgba(70,107,76,.14);">
+            <span style="width:56px; height:56px; border-radius:50%; background:#7a6a52; flex-shrink:0; box-shadow:0 0 0 3px #fbf9f4, 0 0 0 6px #466b4c;"></span>
+            <div style="flex:1;"><div style="display:flex; align-items:center; gap:8px;"><span style="font:600 15px 'Public Sans'; color:#20241c;">Theo Lind</span><span style="font:500 9px 'IBM Plex Mono'; color:#5a4321; background:#f1e2cc; padding:1px 6px; border-radius:20px;">MOD</span><span style="font:600 10px 'IBM Plex Mono'; color:#466b4c;">🎙 speaking</span><span style="margin-left:auto; font:500 11px 'IBM Plex Mono'; color:#8a8472;">2:40 / 3:00</span></div>
+              <div style="font:400 13px/1.5 'Public Sans'; color:#3a3e34; margin-top:7px;">"…so the proposal on the floor is to lift the reserve floor to $2,000 before we vote on heating. Hearing strong support — I'd like to move this to a formal motion. Anyone want to speak against before we do?"</div>
+              <!-- live waveform -->
+              <div style="display:flex; align-items:center; gap:3px; margin-top:10px; height:18px;"><span style="width:3px; height:6px; background:#7fa886; border-radius:2px;"></span><span style="width:3px; height:14px; background:#466b4c; border-radius:2px;"></span><span style="width:3px; height:10px; background:#7fa886; border-radius:2px;"></span><span style="width:3px; height:17px; background:#466b4c; border-radius:2px;"></span><span style="width:3px; height:8px; background:#7fa886; border-radius:2px;"></span><span style="width:3px; height:13px; background:#466b4c; border-radius:2px;"></span><span style="width:3px; height:5px; background:#7fa886; border-radius:2px;"></span><span style="width:3px; height:11px; background:#466b4c; border-radius:2px;"></span><span style="width:3px; height:15px; background:#466b4c; border-radius:2px;"></span><span style="width:3px; height:7px; background:#7fa886; border-radius:2px;"></span></div>
+            </div>
+          </div>
+
+          <!-- listeners grid -->
+          <div style="font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; margin:18px 0 10px;">In the room · 23</div>
+          <div style="display:grid; grid-template-columns:repeat(6, 1fr); gap:12px 8px;">
+            <!-- speaking -->
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="position:relative;"><span style="width:46px; height:46px; border-radius:50%; background:#c9bfa6; box-shadow:0 0 0 2.5px #fbf9f4, 0 0 0 5px #466b4c;"></span></span><span style="font:500 11px 'Public Sans'; color:#3a3e34; max-width:64px; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Mara</span></div>
+            <!-- hand raised -->
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="position:relative;"><span style="width:46px; height:46px; border-radius:50%; background:#a9bcc4;"></span><span style="position:absolute; top:-4px; right:-4px; width:20px; height:20px; border-radius:50%; background:#b9742c; color:#fff; font-size:11px; display:flex; align-items:center; justify-content:center; border:2px solid #fbf9f4;">✋</span></span><span style="font:500 11px 'Public Sans'; color:#3a3e34; max-width:64px; text-align:center;">Priya</span></div>
+            <!-- muted listeners -->
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="position:relative;"><span style="width:46px; height:46px; border-radius:50%; background:#bdb39a;"></span><span style="position:absolute; bottom:-2px; right:-2px; width:18px; height:18px; border-radius:50%; background:#efeadf; color:#767a6c; font-size:9px; display:flex; align-items:center; justify-content:center; border:2px solid #fbf9f4;">🔇</span></span><span style="font:500 11px 'Public Sans'; color:#767a6c; max-width:64px; text-align:center;">Devin</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="position:relative;"><span style="width:46px; height:46px; border-radius:50%; background:#a9bcc4;"></span><span style="position:absolute; bottom:-2px; right:-2px; width:18px; height:18px; border-radius:50%; background:#efeadf; color:#767a6c; font-size:9px; display:flex; align-items:center; justify-content:center; border:2px solid #fbf9f4;">🔇</span></span><span style="font:500 11px 'Public Sans'; color:#767a6c;">Sam</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="width:46px; height:46px; border-radius:50%; background:#c9bfa6;"></span><span style="font:500 11px 'Public Sans'; color:#767a6c;">Lena</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="width:46px; height:46px; border-radius:50%; background:#bdb39a;"></span><span style="font:500 11px 'Public Sans'; color:#767a6c;">Omar</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="width:46px; height:46px; border-radius:50%; background:#a9bcc4;"></span><span style="font:500 11px 'Public Sans'; color:#767a6c;">Ada</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="width:46px; height:46px; border-radius:50%; background:#c9bfa6;"></span><span style="font:500 11px 'Public Sans'; color:#767a6c;">Ravi</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="width:46px; height:46px; border-radius:50%; background:#bdb39a;"></span><span style="font:500 11px 'Public Sans'; color:#767a6c;">Nour</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="width:46px; height:46px; border-radius:50%; background:#a9bcc4;"></span><span style="font:500 11px 'Public Sans'; color:#767a6c;">Kit</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="width:46px; height:46px; border-radius:50%; background:#c9bfa6;"></span><span style="font:500 11px 'Public Sans'; color:#767a6c;">Iris</span></div>
+            <div style="display:flex; flex-direction:column; align-items:center; gap:6px;"><span style="width:46px; height:46px; border-radius:50%; background:#e9e3d6; display:flex; align-items:center; justify-content:center; font:600 12px 'IBM Plex Mono'; color:#8a8472;">+13</span><span style="font:500 11px 'Public Sans'; color:#767a6c;">more</span></div>
+          </div>
+        </div>
+
+        <!-- control bar -->
+        <div style="padding:12px 22px; border-top:1px solid #ece7da; background:#f6f3ec; display:flex; align-items:center; gap:10px;">
+          <button style="display:flex; align-items:center; gap:8px; padding:11px 18px; border:none; border-radius:9px; background:#466b4c; color:#fff; font:600 13px 'Public Sans'; cursor:pointer;">🎙 Unmute</button>
+          <button style="padding:11px 15px; border:1px solid #d8d1c1; border-radius:9px; background:#fff; color:#20241c; font:600 13px 'Public Sans'; cursor:pointer;">PTT</button>
+          <button style="padding:11px 15px; border:1px solid #d8d1c1; border-radius:9px; background:#fff; color:#20241c; font:600 13px 'Public Sans'; cursor:pointer;">🎧 Deafen</button>
+          <button style="display:flex; align-items:center; gap:7px; padding:11px 16px; border:1px solid #e6cfa3; border-radius:9px; background:#f1e2cc; color:#5a4321; font:600 13px 'Public Sans'; cursor:pointer;">✋ Raise hand</button>
+          <button style="margin-left:auto; padding:11px 16px; border:1px solid #e0b9b1; border-radius:9px; background:#fff; color:#b1402f; font:600 13px 'Public Sans'; cursor:pointer;">Leave</button>
+        </div>
+      </div>
+
+      <!-- ASSEMBLY / FLOOR RAIL -->
+      <div style="background:#efeadf; border-left:1px solid #e3ddcf; display:flex; flex-direction:column; overflow-y:auto;">
+        <div style="padding:15px 18px 12px; border-bottom:1px solid #e3ddcf; display:flex; align-items:center; gap:8px;"><span style="color:#b9742c;">⚖</span><span style="font:500 16px 'Newsreader',serif; color:#20241c;">The Floor</span></div>
+        <div style="padding:14px 18px;">
+          <!-- speaker queue -->
+          <div style="font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; margin-bottom:9px;">Speaker queue · 2</div>
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <div style="display:flex; align-items:center; gap:9px; background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:9px 11px;"><span style="width:18px; text-align:center; font:600 12px 'IBM Plex Mono'; color:#b9742c;">1</span><span style="width:26px; height:26px; border-radius:50%; background:#a9bcc4;"></span><div style="flex:1; line-height:1.15;"><div style="font:600 12.5px 'Public Sans'; color:#20241c;">Priya Nair</div><div style="font:400 10px 'Public Sans'; color:#767a6c;">wants to speak ✋</div></div><button style="padding:5px 10px; border:none; border-radius:6px; background:#466b4c; color:#fff; font:600 10.5px 'Public Sans'; cursor:pointer;">Invite</button></div>
+            <div style="display:flex; align-items:center; gap:9px; background:#fbf9f4; border:1px solid #e3ddcf; border-radius:8px; padding:9px 11px;"><span style="width:18px; text-align:center; font:600 12px 'IBM Plex Mono'; color:#a39e8e;">2</span><span style="width:26px; height:26px; border-radius:50%; background:#c9bfa6;"></span><div style="flex:1; line-height:1.15;"><div style="font:600 12.5px 'Public Sans'; color:#20241c;">Ravi O.</div><div style="font:400 10px 'Public Sans'; color:#767a6c;">wants to speak ✋</div></div><button style="padding:5px 10px; border:1px solid #d8d1c1; border-radius:6px; background:#fff; color:#767a6c; font:600 10.5px 'Public Sans'; cursor:pointer;">Invite</button></div>
+          </div>
+
+          <!-- motion from the floor (THE hero moment) -->
+          <div style="margin-top:18px; font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; margin-bottom:9px;">Motion on the floor</div>
+          <div style="background:#fbf6ec; border:1px solid #e6dcc6; border-radius:10px; padding:14px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+            <div style="display:flex; align-items:center; gap:7px;"><span style="font:600 10px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:2px 6px; border-radius:3px;">DRAFT</span><span style="font:500 11px 'IBM Plex Mono'; color:#959183; margin-left:auto;">live · 23 present</span></div>
+            <div style="font:600 14px/1.35 'Public Sans'; color:#5a4321; margin-top:9px;">Set the reserve floor to $2,000 before the heating vote</div>
+            <div style="font:400 11.5px/1.5 'Public Sans'; color:#767a6c; margin-top:6px;">Raised verbally by Theo Lind · quorum to vote live: <strong style="color:#20241c;">requires 72 present</strong></div>
+            <div style="margin-top:11px; display:flex; align-items:center; gap:8px;"><div style="flex:1; height:7px; border-radius:4px; background:#eadfc8; overflow:hidden;"><span style="display:block; width:32%; height:100%; background:#b9742c;"></span></div><span style="font:600 10.5px 'IBM Plex Mono'; color:#b9742c;">23 / 72</span></div>
+            <div style="font:400 11px/1.45 'Public Sans'; color:#8a8472; margin-top:7px;">Not enough present for a live vote — open it as a 48-hour async proposal instead.</div>
+            <button style="width:100%; margin-top:11px; padding:10px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 12.5px 'Public Sans'; cursor:pointer;">⚖ Call this to a motion</button>
+          </div>
+
+          <!-- live chat sidebar -->
+          <div style="margin-top:18px; font:600 10.5px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; margin-bottom:9px;">Backchannel</div>
+          <div style="display:flex; flex-direction:column; gap:9px;">
+            <div style="font:400 12px/1.4 'Public Sans'; color:#3a3e34;"><strong style="color:#20241c;">Devin</strong> +1 to $2,000, we burned through reserves twice last winter</div>
+            <div style="font:400 12px/1.4 'Public Sans'; color:#3a3e34;"><strong style="color:#20241c;">Lena</strong> can we earmark some for the heater library too?</div>
+          </div>
+          <div style="margin-top:10px; display:flex; align-items:center; gap:8px; border:1px solid #e3ddcf; background:#fbf9f4; border-radius:8px; padding:8px 11px;"><span style="color:#b3ad9c; font-size:13px;">＋</span><span style="font:400 12px 'Public Sans'; color:#a39e8e; flex:1;">Message the room…</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div data-drags-parent="0" style="position:absolute; left:1556px; top:320px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(1.1deg);"><strong>This is the screen Discord can't have.</strong> Voice isn't just hanging out — it's a deliberative body. The speaker queue, the active-speaker spotlight, and "Call this to a motion" turn a conversation into a binding decision without anyone leaving the room.</div>
+<div data-drags-parent="0" style="position:absolute; left:1556px; top:560px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(-1.3deg);"><strong>Quorum-aware.</strong> If enough members are present, the motion can be voted live; if not, it gracefully becomes a 48-hour async proposal — so a sparsely-attended call can't railroad the whole commons.</div>
+
+<!-- ===== FRAME B · VOICE CHANNEL (faithful to VoiceChannelView) ===== -->
+<div style="position:absolute; left:80px; top:1080px; width:880px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">B · Voice channel <span style="color:#8a8472; font-weight:400;">— a faithful restyle of today's VoiceChannelView (grid ≤12, control bar, mod controls)</span></div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:38px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px; gap:10px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span><span style="margin:0 auto; font:500 12px 'IBM Plex Mono'; color:#8a8472;">Cascadia Commons · 🔊 Co-work</span></div>
+    <div style="background:#fbf9f4; padding:0; height:520px; display:flex; flex-direction:column;">
+      <!-- header -->
+      <div style="padding:15px 22px; border-bottom:1px solid #ece7da; display:flex; align-items:center; gap:10px;"><span style="font-size:17px;">🔊</span><span style="font:600 16px 'Public Sans'; color:#20241c;">Co-work</span><span style="font:600 10.5px 'IBM Plex Mono'; color:#466b4c; background:#e4ece2; padding:3px 9px; border-radius:20px;">● 5 here</span><span style="font:400 12.5px 'Public Sans'; color:#959183;">Quiet focus room · mics optional</span></div>
+      <!-- grid stage -->
+      <div style="flex:1; padding:22px; display:flex; align-items:flex-start;">
+        <div style="display:grid; grid-template-columns:repeat(5, 1fr); gap:16px; width:100%;">
+          <!-- speaking -->
+          <div style="display:flex; flex-direction:column; align-items:center; gap:9px; background:#fff; border:1px solid #c9d6c6; border-radius:12px; padding:18px 10px; box-shadow:0 0 0 2px rgba(70,107,76,.16);"><span style="width:58px; height:58px; border-radius:50%; background:#466b4c; color:#fff; font:600 19px 'Public Sans'; display:flex; align-items:center; justify-content:center; box-shadow:0 0 0 3px #fff, 0 0 0 6px #466b4c;">JE</span><span style="font:600 12.5px 'Public Sans'; color:#20241c;">jake.eth</span><span style="font:500 10px 'IBM Plex Mono'; color:#466b4c;">🎙 you</span></div>
+          <!-- muted -->
+          <div style="display:flex; flex-direction:column; align-items:center; gap:9px; background:#fff; border:1px solid #e3ddcf; border-radius:12px; padding:18px 10px;"><span style="position:relative;"><span style="width:58px; height:58px; border-radius:50%; background:#c9bfa6;"></span><span style="position:absolute; bottom:-2px; right:-2px; width:20px; height:20px; border-radius:50%; background:#efeadf; color:#767a6c; font-size:10px; display:flex; align-items:center; justify-content:center; border:2px solid #fff;">🔇</span></span><span style="font:600 12.5px 'Public Sans'; color:#20241c;">Mara</span><span style="font:500 10px 'IBM Plex Mono'; color:#a39e8e;">muted</span></div>
+          <!-- mod-muted -->
+          <div style="display:flex; flex-direction:column; align-items:center; gap:9px; background:#fff; border:1px solid #e3ddcf; border-radius:12px; padding:18px 10px;"><span style="position:relative;"><span style="width:58px; height:58px; border-radius:50%; background:#a9bcc4;"></span><span style="position:absolute; bottom:-2px; right:-2px; width:22px; height:20px; border-radius:11px; background:#f3ddd7; color:#b1402f; font-size:10px; display:flex; align-items:center; justify-content:center; border:2px solid #fff;">🛡</span></span><span style="font:600 12.5px 'Public Sans'; color:#20241c;">Devin</span><span style="font:500 10px 'IBM Plex Mono'; color:#b1402f;">mod-muted</span></div>
+          <!-- speaking other -->
+          <div style="display:flex; flex-direction:column; align-items:center; gap:9px; background:#fff; border:1px solid #c9d6c6; border-radius:12px; padding:18px 10px; box-shadow:0 0 0 2px rgba(70,107,76,.16);"><span style="width:58px; height:58px; border-radius:50%; background:#7a6a52; box-shadow:0 0 0 3px #fff, 0 0 0 6px #466b4c;"></span><span style="font:600 12.5px 'Public Sans'; color:#20241c;">Priya</span><span style="font:500 10px 'IBM Plex Mono'; color:#466b4c;">🎙 speaking</span></div>
+          <!-- listener -->
+          <div style="display:flex; flex-direction:column; align-items:center; gap:9px; background:#fff; border:1px solid #e3ddcf; border-radius:12px; padding:18px 10px;"><span style="width:58px; height:58px; border-radius:50%; background:#bdb39a;"></span><span style="font:600 12.5px 'Public Sans'; color:#20241c;">Sam</span><span style="font:500 10px 'IBM Plex Mono'; color:#a39e8e;">listening</span></div>
+        </div>
+      </div>
+      <!-- mod controls hint + control bar -->
+      <div style="padding:11px 22px; border-top:1px solid #ece7da; background:#f6f3ec; display:flex; align-items:center; gap:10px;">
+        <button style="display:flex; align-items:center; gap:8px; padding:11px 18px; border:none; border-radius:9px; background:#466b4c; color:#fff; font:600 13px 'Public Sans'; cursor:pointer;">🎙 Live</button>
+        <button style="padding:11px 15px; border:1px solid #d8d1c1; border-radius:9px; background:#fff; color:#20241c; font:600 13px 'Public Sans'; cursor:pointer;">PTT</button>
+        <button style="padding:11px 15px; border:1px solid #d8d1c1; border-radius:9px; background:#fff; color:#20241c; font:600 13px 'Public Sans'; cursor:pointer;">🎧 Deafen</button>
+        <span style="margin-left:auto; font:400 11px 'Public Sans'; color:#8a8472;">Hover a tile to Mute / Remove (mods)</span>
+        <button style="padding:11px 16px; border:1px solid #e0b9b1; border-radius:9px; background:#fff; color:#b1402f; font:600 13px 'Public Sans'; cursor:pointer;">Leave</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== FRAME C · STATES ===== -->
+<div style="position:absolute; left:1010px; top:1080px; width:430px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">C · Voice states</div>
+  <div style="display:flex; flex-direction:column; gap:14px;">
+    <!-- join pane -->
+    <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:10px; padding:20px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+      <div style="font:600 10.5px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#a39e8e; margin-bottom:12px;">Join pane (idle)</div>
+      <div style="text-align:center; padding:14px 0;">
+        <div style="font-size:30px;">🔊</div>
+        <div style="font:600 16px 'Public Sans'; color:#20241c; margin-top:6px;">Co-work</div>
+        <button style="margin-top:13px; padding:11px 26px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 13.5px 'Public Sans'; cursor:pointer;">Join Voice</button>
+        <div style="font:400 12px 'Public Sans'; color:#767a6c; margin-top:9px;">You'll join muted — unmute when you're ready.</div>
+      </div>
+    </div>
+    <!-- PTT active -->
+    <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:10px; padding:16px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+      <div style="font:600 10.5px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#a39e8e; margin-bottom:11px;">Push-to-talk · held</div>
+      <button style="width:100%; padding:13px; border:none; border-radius:9px; background:#466b4c; color:#fff; font:600 13.5px 'Public Sans'; box-shadow:0 0 0 3px rgba(70,107,76,.2); cursor:pointer;">🎙 Transmitting… (hold Space)</button>
+      <div style="font:400 11px 'Public Sans'; color:#8a8472; margin-top:8px;">Release to go quiet. Replaces the mute toggle while PTT mode is on.</div>
+    </div>
+    <!-- mod-muted self -->
+    <div style="background:#fdf6f4; border:1px solid #e0b9b1; border-radius:10px; padding:16px;">
+      <div style="font:600 10.5px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#b1402f; margin-bottom:9px;">Silenced by a moderator</div>
+      <div style="display:flex; align-items:center; gap:9px;"><span style="font-size:16px;">🛡</span><div style="font:400 12.5px/1.45 'Public Sans'; color:#9a5347;">You've been muted by a moderator. Your talk controls are disabled until they unmute you.</div></div>
+    </div>
+    <!-- channel full -->
+    <div style="background:#f1e2cc; border:1px solid #e6cfa3; border-radius:10px; padding:16px;">
+      <div style="font:600 10.5px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#6b5226; margin-bottom:9px;">Soft-cap bounce</div>
+      <div style="font:400 12.5px/1.45 'Public Sans'; color:#7a6230;">Voice channel full — try again later. (The join was refused; you're back at idle.)</div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== FRAME D · MOBILE TOWN HALL ===== -->
+<div style="position:absolute; left:1490px; top:1080px; width:412px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">D · Mobile Town Hall</div>
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 12px 40px rgba(40,30,10,.22);">
+    <div style="background:#fbf9f4; border-radius:36px; overflow:hidden; height:844px; display:flex; flex-direction:column; font-family:'Public Sans',system-ui; position:relative;">
+      <div style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#20241c; flex-shrink:0;"><span>9:41</span><span style="font-size:11px;">●●● ▆ 􀛨</span></div>
+      <div style="padding:4px 18px 12px; border-bottom:1px solid #ece7da;">
+        <div style="display:flex; align-items:center; gap:8px;"><span style="color:#767a6c; font-size:18px;">‹</span><span style="font:500 20px 'Newsreader',serif; color:#20241c;">Town Hall</span><span style="display:flex; align-items:center; gap:5px; font:600 10px 'IBM Plex Mono'; color:#b1402f; background:#f3ddd7; padding:3px 8px; border-radius:20px; margin-left:auto;"><span style="width:5px; height:5px; border-radius:50%; background:#b1402f;"></span>LIVE 23</span></div>
+        <div style="font:400 11px 'Public Sans'; color:#959183; margin-top:3px;">Monthly assembly · winter budget · ⏱ 32:14</div>
+      </div>
+      <div style="flex:1; overflow-y:auto; padding:14px 18px;">
+        <!-- active speaker -->
+        <div style="display:flex; gap:11px; background:#fff; border:1px solid #c9d6c6; border-radius:12px; padding:13px; box-shadow:0 0 0 3px rgba(70,107,76,.14);"><span style="width:46px; height:46px; border-radius:50%; background:#7a6a52; flex-shrink:0; box-shadow:0 0 0 2.5px #fff, 0 0 0 5px #466b4c;"></span><div style="flex:1;"><div style="display:flex; align-items:center; gap:6px;"><span style="font:600 13.5px 'Public Sans'; color:#20241c;">Theo Lind</span><span style="font:500 8px 'IBM Plex Mono'; color:#5a4321; background:#f1e2cc; padding:1px 5px; border-radius:20px;">MOD</span><span style="margin-left:auto; font:600 9px 'IBM Plex Mono'; color:#466b4c;">🎙 2:40</span></div><div style="font:400 12px/1.45 'Public Sans'; color:#3a3e34; margin-top:5px;">"…I'd like to move this to a formal motion. Anyone want to speak against?"</div></div></div>
+        <!-- motion card -->
+        <div style="margin-top:14px; background:#fbf6ec; border:1px solid #e6dcc6; border-radius:11px; padding:14px;">
+          <div style="display:flex; align-items:center; gap:7px;"><span style="font:600 9px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:2px 6px; border-radius:3px;">DRAFT</span><span style="font:500 10px 'IBM Plex Mono'; color:#959183; margin-left:auto;">on the floor</span></div>
+          <div style="font:600 14px/1.3 'Public Sans'; color:#5a4321; margin-top:8px;">Set reserve floor to $2,000 before heating vote</div>
+          <div style="margin-top:10px; display:flex; align-items:center; gap:8px;"><div style="flex:1; height:7px; border-radius:4px; background:#eadfc8; overflow:hidden;"><span style="display:block; width:32%; height:100%; background:#b9742c;"></span></div><span style="font:600 10px 'IBM Plex Mono'; color:#b9742c;">23/72</span></div>
+          <button style="width:100%; margin-top:10px; padding:10px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 12.5px 'Public Sans';">⚖ Call to a motion</button>
+        </div>
+        <!-- in the room -->
+        <div style="margin-top:16px; font:600 10px 'Public Sans'; letter-spacing:.08em; text-transform:uppercase; color:#a39e8e; margin-bottom:9px;">In the room · 23</div>
+        <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:12px 6px;">
+          <div style="display:flex; flex-direction:column; align-items:center; gap:5px;"><span style="width:42px; height:42px; border-radius:50%; background:#c9bfa6; box-shadow:0 0 0 2px #fbf9f4, 0 0 0 4px #466b4c;"></span><span style="font:500 10px 'Public Sans'; color:#3a3e34;">Mara</span></div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:5px;"><span style="position:relative;"><span style="width:42px; height:42px; border-radius:50%; background:#a9bcc4;"></span><span style="position:absolute; top:-3px; right:-3px; width:18px; height:18px; border-radius:50%; background:#b9742c; color:#fff; font-size:9px; display:flex; align-items:center; justify-content:center; border:2px solid #fbf9f4;">✋</span></span><span style="font:500 10px 'Public Sans'; color:#3a3e34;">Priya</span></div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:5px;"><span style="width:42px; height:42px; border-radius:50%; background:#bdb39a;"></span><span style="font:500 10px 'Public Sans'; color:#767a6c;">Devin</span></div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:5px;"><span style="width:42px; height:42px; border-radius:50%; background:#c9bfa6;"></span><span style="font:500 10px 'Public Sans'; color:#767a6c;">Lena</span></div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:5px;"><span style="width:42px; height:42px; border-radius:50%; background:#e9e3d6; display:flex; align-items:center; justify-content:center; font:600 11px 'IBM Plex Mono'; color:#8a8472;">+19</span><span style="font:500 10px 'Public Sans'; color:#767a6c;">more</span></div>
+        </div>
+      </div>
+      <!-- control bar -->
+      <div style="padding:10px 14px; border-top:1px solid #ece7da; background:#f6f3ec; display:flex; align-items:center; gap:8px;">
+        <button style="flex:1; padding:13px; border:none; border-radius:10px; background:#466b4c; color:#fff; font:600 13px 'Public Sans';">🎙 Unmute</button>
+        <button style="padding:13px 15px; border:1px solid #e6cfa3; border-radius:10px; background:#f1e2cc; color:#5a4321; font:600 13px 'Public Sans';">✋</button>
+        <button style="padding:13px 15px; border:1px solid #d8d1c1; border-radius:10px; background:#fff; color:#20241c; font:600 13px 'Public Sans';">🎧</button>
+        <button style="padding:13px 15px; border:1px solid #e0b9b1; border-radius:10px; background:#fff; color:#b1402f; font:600 13px 'Public Sans';">Leave</button>
+      </div>
+      <div style="height:20px; background:#f6f3ec;"></div>
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#20241c; opacity:.25;"></div>
+    </div>
+  </div>
+</div>
+
+<div data-drags-parent="0" style="position:absolute; left:80px; top:1650px; width:860px; font:400 13px/1.6 'Public Sans'; color:#5a5347;">Town Hall (deliberation + motion-from-the-floor), the faithful voice channel, the real states (join-muted, PTT held, mod-muted, channel-full), and mobile. Next up, per your plan: <strong>Vines + Files</strong>. (Mint waits for the Bezelbaum / FinanceStudio "ReplaceMint" session.)</div>
+</x-dc>
+</body>
+</html>

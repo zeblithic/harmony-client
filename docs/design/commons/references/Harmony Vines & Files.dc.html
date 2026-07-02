@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</helmet>
+
+<!-- TITLE -->
+<div data-drags-parent="0" style="position:absolute; left:80px; top:60px; width:1040px;">
+  <div style="font:600 11px 'IBM Plex Mono'; letter-spacing:.16em; text-transform:uppercase; color:rgba(60,55,45,.6);">Harmony · Vines &amp; Files · hi-fi · "Commons"</div>
+  <div style="font:500 34px 'Newsreader',serif; color:#2a2519; margin-top:4px;">One engine. Many feeds. Vines first.</div>
+  <div style="font:400 14px/1.55 'Public Sans'; color:#6b6256; margin-top:8px; max-width:88ch;">Underneath everything is one content-addressed store — every video, image, and post is just a CID. A <strong>feed</strong> is a lens over that store, filtered by media type. Swap the lens and the same surface becomes a different "app": 6-second loops → <strong>Vines</strong> · images → a gallery · short text → a microblog. The codebase already ships Vines for real (Following / Discover, All / Unviewed, reshare-with-attribution, reactions, an immersive player) — this restyles that faithfully and shows where the one-engine idea goes next. We launch with Vines because nothing else fills that gap anymore; the other two already exist elsewhere.</div>
+</div>
+
+<!-- ===== THESIS STRIP ===== -->
+<div style="position:absolute; left:80px; top:250px; width:1040px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#b9742c;">The thesis · one store, swappable lenses</div>
+  <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:10px; box-shadow:0 2px 10px rgba(40,30,10,.08); padding:24px 28px; font-family:'Public Sans',system-ui;">
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:18px;">
+      <div style="border:1px solid #c9d6c6; background:#e4ece2; border-radius:10px; padding:16px;">
+        <div style="display:flex; align-items:center; gap:8px;"><span style="font-size:18px;">🎞</span><span style="font:600 14px 'Public Sans'; color:#2f4a35;">Vines</span><span style="margin-left:auto; font:600 9px 'IBM Plex Mono'; color:#fff; background:#466b4c; padding:2px 7px; border-radius:20px;">LAUNCH</span></div>
+        <div style="font:400 12px/1.5 'Public Sans'; color:#3a4d3a; margin-top:8px;">Lens = <span style="font-family:'IBM Plex Mono';">video/*, ≤6s, loops</span>. Chronological. The format that died with Vine in 2017 — no one else offers it.</div>
+      </div>
+      <div style="border:1px solid #e3ddcf; background:#f6f3ec; border-radius:10px; padding:16px;">
+        <div style="display:flex; align-items:center; gap:8px;"><span style="font-size:18px;">🖼</span><span style="font:600 14px 'Public Sans'; color:#20241c;">Gallery</span><span style="margin-left:auto; font:600 9px 'IBM Plex Mono'; color:#8a8472; background:#efeadf; padding:2px 7px; border-radius:20px;">LATER</span></div>
+        <div style="font:400 12px/1.5 'Public Sans'; color:#767a6c; margin-top:8px;">Lens = <span style="font-family:'IBM Plex Mono';">image/*</span>. Grid layout. Same follows, same reshare, same store — an Instagram-shape.</div>
+      </div>
+      <div style="border:1px solid #e3ddcf; background:#f6f3ec; border-radius:10px; padding:16px;">
+        <div style="display:flex; align-items:center; gap:8px;"><span style="font-size:18px;">✍</span><span style="font:600 14px 'Public Sans'; color:#20241c;">Posts</span><span style="margin-left:auto; font:600 9px 'IBM Plex Mono'; color:#8a8472; background:#efeadf; padding:2px 7px; border-radius:20px;">LATER</span></div>
+        <div style="font:400 12px/1.5 'Public Sans'; color:#767a6c; margin-top:8px;">Lens = <span style="font-family:'IBM Plex Mono';">text, ≤280</span>. Threaded. Same engine, a Twitter-shape.</div>
+      </div>
+    </div>
+    <div style="margin-top:16px; display:flex; align-items:center; gap:12px; padding:12px 16px; background:#20241c; border-radius:9px;">
+      <span style="font:600 11px 'IBM Plex Mono'; color:#8aa68d; letter-spacing:.05em;">content-addressed store</span>
+      <span style="font:500 11px 'IBM Plex Mono'; color:#c4bdab;">cid:bafy…7f3a · cid:bafy…c91d · cid:bafy…b2e1 · …</span>
+      <span style="margin-left:auto; font:400 11px 'Public Sans'; color:#a39e8e;">one copy of each artifact · feeds just point at it</span>
+    </div>
+  </div>
+</div>
+
+<!-- ===== FRAME A · VINES FEED (faithful) ===== -->
+<div style="position:absolute; left:80px; top:560px; width:1180px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">A · Vines feed <span style="color:#8a8472; font-weight:400;">— Following / Discover · All / Unviewed · reshare + reactions (faithful to VineFeed)</span></div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:38px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px; gap:10px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span><span style="margin:0 auto; font:500 12px 'IBM Plex Mono'; color:#8a8472;">Harmony · Vines</span></div>
+    <div style="display:grid; grid-template-columns:240px 1fr; height:760px;">
+      <!-- nav -->
+      <div style="background:#efeadf; border-right:1px solid #e3ddcf; padding:14px 8px;">
+        <div style="display:flex; align-items:center; gap:9px; padding:0 8px 12px;"><svg width="22" height="22" viewBox="0 0 92 92"><circle cx="46" cy="34" r="22" fill="none" stroke="#466b4c" stroke-width="5"/><circle cx="32" cy="56" r="22" fill="none" stroke="#283450" stroke-width="5"/><circle cx="60" cy="56" r="22" fill="none" stroke="#c56a46" stroke-width="5"/></svg><span style="font:500 18px 'Newsreader',serif; color:#20241c;">Harmony</span></div>
+        <button style="display:flex; align-items:center; gap:9px; width:100%; padding:8px 10px; border:none; background:transparent; border-radius:6px; cursor:pointer; color:#767a6c; font:500 13.5px 'Public Sans'; text-align:left;">📝 Notes</button>
+        <div style="font:600 10px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; padding:12px 10px 5px;">Feeds</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; background:#e4ece2; border-radius:6px; color:#2f4a35; font:600 13.5px 'Public Sans';">🎞 Vines <span style="margin-left:auto; font:600 10px 'IBM Plex Mono'; color:#fff; background:#466b4c; padding:1px 6px; border-radius:9px;">7</span></div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';">🖼 Gallery <span style="margin-left:auto; font:500 9px 'IBM Plex Mono'; color:#a39e8e;">soon</span></div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';">✍ Posts <span style="margin-left:auto; font:500 9px 'IBM Plex Mono'; color:#a39e8e;">soon</span></div>
+        <div style="font:600 10px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; padding:12px 10px 5px;">Storage</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';">🗂 Files</div>
+        <div style="margin-top:auto;"></div>
+      </div>
+      <!-- feed -->
+      <div style="background:#fbf9f4; display:flex; flex-direction:column; min-width:0;">
+        <div style="padding:18px 24px 0;">
+          <div style="display:flex; align-items:center; gap:11px;">
+            <span style="font:500 26px 'Newsreader',serif; color:#20241c;">Vines</span>
+            <span style="font:600 11px 'IBM Plex Mono'; color:#fff; background:#b9742c; padding:3px 9px; border-radius:20px;">3 new</span>
+            <button style="margin-left:auto; display:flex; align-items:center; gap:7px; padding:9px 15px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 13px 'Public Sans'; cursor:pointer;"><span style="font-size:15px;">＋</span> New vine</button>
+          </div>
+          <!-- tabs -->
+          <div style="display:flex; gap:4px; margin-top:16px; border-bottom:1px solid #ece7da;">
+            <span style="font:600 13.5px 'Public Sans'; color:#20241c; padding:9px 14px; border-bottom:2px solid #466b4c;">Following</span>
+            <span style="font:500 13.5px 'Public Sans'; color:#767a6c; padding:9px 14px;">Discover</span>
+            <div style="margin-left:auto; display:flex; gap:6px; align-self:center; padding-bottom:6px;"><span style="font:600 11px 'Public Sans'; color:#2f4a35; background:#e4ece2; padding:5px 12px; border-radius:20px;">All</span><span style="font:500 11px 'Public Sans'; color:#767a6c; background:#efeadf; padding:5px 12px; border-radius:20px;">Unviewed (3)</span></div>
+          </div>
+        </div>
+        <!-- feed list -->
+        <div style="flex:1; overflow-y:auto; padding:18px 24px; display:flex; flex-direction:column; gap:16px;">
+          <!-- vine card 1 (unviewed) -->
+          <div style="display:flex; gap:14px; background:#fff; border:1px solid #e6dcc6; border-radius:12px; padding:14px; box-shadow:0 1px 3px rgba(40,30,10,.06);">
+            <!-- looping thumb -->
+            <div style="position:relative; width:160px; height:160px; border-radius:10px; overflow:hidden; flex-shrink:0; background:linear-gradient(135deg,#3a5a48,#6a8a6a);">
+              <div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center;"><span style="width:46px; height:46px; border-radius:50%; background:rgba(255,255,255,.85); display:flex; align-items:center; justify-content:center; font-size:18px; color:#20241c;">▶</span></div>
+              <div style="position:absolute; top:8px; left:8px; font:600 10px 'IBM Plex Mono'; color:#fff; background:rgba(20,22,15,.6); padding:2px 7px; border-radius:20px;">0:06 ↻</div>
+              <div style="position:absolute; top:8px; right:8px; width:8px; height:8px; border-radius:50%; background:#b9742c; box-shadow:0 0 0 2px rgba(255,255,255,.5);"></div>
+            </div>
+            <div style="flex:1; min-width:0; display:flex; flex-direction:column;">
+              <div style="display:flex; align-items:center; gap:9px;"><span style="width:30px; height:30px; border-radius:50%; background:#7a6a52;"></span><div style="line-height:1.2;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">Mara Okafor</div><div style="font:400 10.5px 'IBM Plex Mono'; color:#a39e8e;">@mara · 2h</div></div><button style="margin-left:auto; padding:6px 13px; border:1px solid #c9d6c6; border-radius:7px; background:#fff; font:600 11.5px 'Public Sans'; color:#466b4c; cursor:pointer;">Following</button></div>
+              <div style="font:500 14.5px/1.4 'Public Sans'; color:#20241c; margin-top:11px;">First frost on the community greenhouse 🌿</div>
+              <div style="margin-top:auto; display:flex; align-items:center; gap:18px; padding-top:12px;">
+                <span style="display:flex; align-items:center; gap:6px; font:600 12px 'Public Sans'; color:#b1402f;">♥ 24</span>
+                <span style="display:flex; align-items:center; gap:6px; font:500 12px 'Public Sans'; color:#767a6c;">↻ 5 reshares</span>
+                <span style="display:flex; align-items:center; gap:6px; font:500 12px 'Public Sans'; color:#767a6c;">▶ 312 loops</span>
+              </div>
+            </div>
+          </div>
+          <!-- vine card 2: a reshare (attribution) -->
+          <div style="display:flex; gap:14px; background:#fff; border:1px solid #e3ddcf; border-radius:12px; padding:14px;">
+            <div style="position:relative; width:160px; height:160px; border-radius:10px; overflow:hidden; flex-shrink:0; background:linear-gradient(135deg,#5a4a6a,#8a6a8a);">
+              <div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center;"><span style="width:46px; height:46px; border-radius:50%; background:rgba(255,255,255,.85); display:flex; align-items:center; justify-content:center; font-size:18px; color:#20241c;">▶</span></div>
+              <div style="position:absolute; top:8px; left:8px; font:600 10px 'IBM Plex Mono'; color:#fff; background:rgba(20,22,15,.6); padding:2px 7px; border-radius:20px;">0:05 ↻</div>
+            </div>
+            <div style="flex:1; min-width:0; display:flex; flex-direction:column;">
+              <div style="font:400 10.5px 'Public Sans'; color:#8a8472; display:flex; align-items:center; gap:5px; margin-bottom:8px;">↻ Devin reshared · <span style="color:#466b4c; font-weight:600; cursor:pointer;">view original by @kit</span></div>
+              <div style="display:flex; align-items:center; gap:9px;"><span style="width:30px; height:30px; border-radius:50%; background:#a9bcc4;"></span><div style="line-height:1.2;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">Kit Alvarez</div><div style="font:400 10.5px 'IBM Plex Mono'; color:#a39e8e;">@kit · original · 6h</div></div><button style="margin-left:auto; padding:6px 13px; border:none; border-radius:7px; background:#466b4c; color:#fff; font:600 11.5px 'Public Sans'; cursor:pointer;">Follow</button></div>
+              <div style="font:500 14.5px/1.4 'Public Sans'; color:#20241c; margin-top:11px;">The cat decided the keyboard was hers now</div>
+              <div style="margin-top:auto; display:flex; align-items:center; gap:18px; padding-top:12px;">
+                <span style="display:flex; align-items:center; gap:6px; font:600 12px 'Public Sans'; color:#767a6c;">♡ 88</span>
+                <span style="display:flex; align-items:center; gap:6px; font:500 12px 'Public Sans'; color:#767a6c;">↻ 41 reshares</span>
+                <span style="display:flex; align-items:center; gap:6px; font:500 12px 'Public Sans'; color:#767a6c;">▶ 2.1k loops</span>
+              </div>
+            </div>
+          </div>
+          <!-- vine card 3 (viewed, dim) -->
+          <div style="display:flex; gap:14px; background:#fbf8f1; border:1px solid #e3ddcf; border-radius:12px; padding:14px; opacity:.82;">
+            <div style="position:relative; width:160px; height:160px; border-radius:10px; overflow:hidden; flex-shrink:0; background:linear-gradient(135deg,#6a5a3a,#a88a5a);">
+              <div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center;"><span style="width:46px; height:46px; border-radius:50%; background:rgba(255,255,255,.8); display:flex; align-items:center; justify-content:center; font-size:18px; color:#20241c;">▶</span></div>
+              <div style="position:absolute; top:8px; left:8px; font:600 10px 'IBM Plex Mono'; color:#fff; background:rgba(20,22,15,.6); padding:2px 7px; border-radius:20px;">0:06 ↻</div>
+            </div>
+            <div style="flex:1; min-width:0; display:flex; flex-direction:column;">
+              <div style="display:flex; align-items:center; gap:9px;"><span style="width:30px; height:30px; border-radius:50%; background:#c9bfa6;"></span><div style="line-height:1.2;"><div style="font:600 13.5px 'Public Sans'; color:#20241c;">Priya Nair</div><div style="font:400 10.5px 'IBM Plex Mono'; color:#a39e8e;">@priya · viewed · 1d</div></div><button style="margin-left:auto; padding:6px 13px; border:1px solid #c9d6c6; border-radius:7px; background:#fff; font:600 11.5px 'Public Sans'; color:#466b4c; cursor:pointer;">Following</button></div>
+              <div style="font:500 14.5px/1.4 'Public Sans'; color:#20241c; margin-top:11px;">6 seconds of pure bread-rising satisfaction</div>
+              <div style="margin-top:auto; display:flex; align-items:center; gap:18px; padding-top:12px;">
+                <span style="display:flex; align-items:center; gap:6px; font:600 12px 'Public Sans'; color:#b1402f;">♥ 56</span>
+                <span style="display:flex; align-items:center; gap:6px; font:500 12px 'Public Sans'; color:#767a6c;">↻ 12 reshares</span>
+                <span style="display:flex; align-items:center; gap:6px; font:500 12px 'Public Sans'; color:#767a6c;">▶ 904 loops</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div data-drags-parent="0" style="position:absolute; left:1292px; top:620px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(1.1deg);"><strong>Faithful to the real component.</strong> Following/Discover tabs, the All/Unviewed filter, "3 new", reshare-with-attribution ("view original by @kit"), reactions and loop counts — all already in <span style="font-family:'IBM Plex Mono'; font-size:11px;">VineFeed.svelte</span>. The clay dot marks unviewed; viewed cards dim.</div>
+<div data-drags-parent="0" style="position:absolute; left:1292px; top:850px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(-1.2deg);">The loop is the unit. Every thumbnail shows its duration + ↻; the format promise (≤6s, seamless loop) is visible before you even press play.</div>
+
+<!-- ===== FRAME B · IMMERSIVE PLAYER + PUBLISH ===== -->
+<div style="position:absolute; left:80px; top:1420px; width:1180px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">B · Immersive player &amp; publish</div>
+  <div style="display:grid; grid-template-columns:1fr 480px; gap:24px; align-items:start;">
+    <!-- player -->
+    <div style="background:#15140f; border:1px solid #2a2620; border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,.4); overflow:hidden; font-family:'Public Sans',system-ui; height:600px; display:flex; flex-direction:column;">
+      <div style="flex:1; position:relative; background:linear-gradient(150deg,#3a5a48,#23332a); display:flex; align-items:center; justify-content:center;">
+        <span style="width:70px; height:70px; border-radius:50%; background:rgba(255,255,255,.16); backdrop-filter:blur(4px); display:flex; align-items:center; justify-content:center; font-size:26px; color:#fff;">❚❚</span>
+        <!-- loop progress ring at top -->
+        <div style="position:absolute; top:0; left:0; right:0; height:3px; background:rgba(255,255,255,.2);"><div style="width:62%; height:100%; background:#7fa886;"></div></div>
+        <div style="position:absolute; top:16px; left:16px; font:600 11px 'IBM Plex Mono'; color:#fff; background:rgba(0,0,0,.4); padding:3px 10px; border-radius:20px;">↻ looping · 0:06</div>
+        <!-- side actions -->
+        <div style="position:absolute; right:16px; bottom:90px; display:flex; flex-direction:column; gap:18px; align-items:center;">
+          <div style="text-align:center;"><div style="width:46px; height:46px; border-radius:50%; background:rgba(255,255,255,.16); display:flex; align-items:center; justify-content:center; font-size:20px;">♥</div><div style="font:600 10px 'IBM Plex Mono'; color:#fff; margin-top:3px;">24</div></div>
+          <div style="text-align:center;"><div style="width:46px; height:46px; border-radius:50%; background:rgba(255,255,255,.16); display:flex; align-items:center; justify-content:center; font-size:18px;">↻</div><div style="font:600 10px 'IBM Plex Mono'; color:#fff; margin-top:3px;">5</div></div>
+          <div style="text-align:center;"><div style="width:46px; height:46px; border-radius:50%; background:rgba(255,255,255,.16); display:flex; align-items:center; justify-content:center; font-size:18px;">↗</div><div style="font:600 10px 'IBM Plex Mono'; color:#fff; margin-top:3px;">share</div></div>
+        </div>
+        <!-- nav hints -->
+        <div style="position:absolute; left:16px; top:50%; transform:translateY(-50%); width:38px; height:38px; border-radius:50%; background:rgba(255,255,255,.14); display:flex; align-items:center; justify-content:center; color:#fff; font-size:16px;">‹</div>
+        <div style="position:absolute; right:16px; top:50%; transform:translateY(-50%); width:38px; height:38px; border-radius:50%; background:rgba(255,255,255,.14); display:flex; align-items:center; justify-content:center; color:#fff; font-size:16px;">›</div>
+      </div>
+      <!-- caption bar -->
+      <div style="padding:16px 20px; background:#15140f;">
+        <div style="display:flex; align-items:center; gap:10px;"><span style="width:34px; height:34px; border-radius:50%; background:#7a6a52;"></span><div style="line-height:1.2;"><div style="font:600 13.5px 'Public Sans'; color:#f0ece2;">Mara Okafor</div><div style="font:400 10.5px 'IBM Plex Mono'; color:#8f897a;">@mara · 2h</div></div><button style="margin-left:auto; padding:7px 15px; border:1px solid #4a4639; border-radius:7px; background:transparent; color:#c4bdab; font:600 11.5px 'Public Sans'; cursor:pointer;">Following</button></div>
+        <div style="font:400 13.5px/1.45 'Public Sans'; color:#d4cdbf; margin-top:10px;">First frost on the community greenhouse 🌿</div>
+        <div style="font:400 10px 'IBM Plex Mono'; color:#6f6a5c; margin-top:8px;">cid:bafy…7f3a · video/mp4 · 6.0s loop · replicated ×8</div>
+      </div>
+    </div>
+    <!-- publish dialog -->
+    <div style="background:#fbf9f4; border:1px solid #e3ddcf; border-radius:12px; box-shadow:0 12px 36px rgba(40,30,10,.2); overflow:hidden; font-family:'Public Sans',system-ui;">
+      <div style="padding:18px 22px; border-bottom:1px solid #ece7da; display:flex; align-items:center; gap:11px;"><span style="width:34px; height:34px; border-radius:9px; background:#e4ece2; display:flex; align-items:center; justify-content:center; font-size:16px;">🎞</span><div><div style="font:500 18px 'Newsreader',serif; color:#20241c;">Share a vine</div><div style="font:400 11.5px 'Public Sans'; color:#767a6c;">≤ 6 seconds · loops forever</div></div><span style="margin-left:auto; color:#a39e8e; font-size:18px; cursor:pointer;">✕</span></div>
+      <div style="padding:20px 22px;">
+        <!-- drop / pick -->
+        <div style="border:1.5px dashed #c9d6c6; background:#f3f6f1; border-radius:10px; padding:22px; text-align:center;">
+          <div style="position:relative; width:120px; height:120px; margin:0 auto; border-radius:10px; overflow:hidden; background:linear-gradient(135deg,#3a5a48,#6a8a6a);">
+            <div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-size:22px;">▶</div>
+            <div style="position:absolute; bottom:0; left:0; right:0; height:3px; background:rgba(255,255,255,.3);"><div style="width:48%; height:100%; background:#7fa886;"></div></div>
+          </div>
+          <div style="font:600 12.5px 'Public Sans'; color:#2f4a35; margin-top:11px;">greenhouse-frost.mp4 · 6.0s ✓</div>
+          <div style="font:400 11px 'Public Sans'; color:#767a6c; margin-top:3px;">Trimmed to 6s · ingested to content store</div>
+          <button style="margin-top:9px; padding:6px 13px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; font:600 11.5px 'Public Sans'; color:#20241c; cursor:pointer;">Replace clip</button>
+        </div>
+        <label style="display:block; font:600 12px 'Public Sans'; color:#20241c; margin-top:18px;">Caption <span style="color:#a39e8e; font-weight:400;">(optional)</span></label>
+        <div style="margin-top:7px; border:1px solid #466b4c; background:#fff; border-radius:8px; padding:11px 13px; font:400 13.5px 'Public Sans'; color:#20241c; box-shadow:0 0 0 3px rgba(70,107,76,.12);">First frost on the community greenhouse 🌿<span style="border-left:1.5px solid #466b4c; margin-left:1px;">&nbsp;</span></div>
+        <div style="display:flex; align-items:center; gap:9px; margin-top:14px; background:#e8eef0; border:1px solid #cdd9dd; border-radius:8px; padding:11px 13px;"><span>🔑</span><div style="font:400 11.5px/1.5 'Public Sans'; color:#3d5560;">Posts to your sovereign identity and replicates peer-to-peer. There's no central server to take it down — only you can delete it.</div></div>
+        <div style="display:flex; gap:10px; margin-top:18px;"><button style="flex:1; padding:11px; border:1px solid #d8d1c1; border-radius:8px; background:#fff; color:#767a6c; font:600 13px 'Public Sans'; cursor:pointer;">Cancel</button><button style="flex:2; padding:11px; border:none; border-radius:8px; background:#466b4c; color:#fff; font:600 13px 'Public Sans'; cursor:pointer;">Publish vine</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== FRAME C · FILES BROWSER ===== -->
+<div style="position:absolute; left:80px; top:2120px; width:1180px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">C · Files <span style="color:#8a8472; font-weight:400;">— the content store made browsable: every artifact, its CID, replication health</span></div>
+  <div style="background:#f4f1ea; border:1px solid #d8d1c1; border-radius:9px; box-shadow:0 8px 30px rgba(40,30,10,.16); overflow:hidden; font-family:'Public Sans',system-ui;">
+    <div style="height:38px; background:#e8e3d8; border-bottom:1px solid #ddd6c6; display:flex; align-items:center; padding:0 14px; gap:10px;"><span style="display:flex; gap:7px;"><span style="width:11px; height:11px; border-radius:50%; background:#d98377;"></span><span style="width:11px; height:11px; border-radius:50%; background:#d3b15a;"></span><span style="width:11px; height:11px; border-radius:50%; background:#8aaf8d;"></span></span><span style="margin:0 auto; font:500 12px 'IBM Plex Mono'; color:#8a8472;">Harmony · Files</span></div>
+    <div style="display:grid; grid-template-columns:240px 1fr 300px; height:600px;">
+      <!-- nav -->
+      <div style="background:#efeadf; border-right:1px solid #e3ddcf; padding:14px 8px;">
+        <div style="display:flex; align-items:center; gap:9px; padding:0 8px 12px;"><svg width="22" height="22" viewBox="0 0 92 92"><circle cx="46" cy="34" r="22" fill="none" stroke="#466b4c" stroke-width="5"/><circle cx="32" cy="56" r="22" fill="none" stroke="#283450" stroke-width="5"/><circle cx="60" cy="56" r="22" fill="none" stroke="#c56a46" stroke-width="5"/></svg><span style="font:500 18px 'Newsreader',serif; color:#20241c;">Harmony</span></div>
+        <div style="font:600 10px 'Public Sans'; letter-spacing:.1em; text-transform:uppercase; color:#a39e8e; padding:8px 10px 5px;">Storage</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; background:#e4ece2; border-radius:6px; color:#2f4a35; font:600 13.5px 'Public Sans';">🗂 All files</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';">🎞 Videos</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';">🖼 Images</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';">📄 Documents</div>
+        <div style="display:flex; align-items:center; gap:9px; padding:7px 10px; color:#767a6c; font:400 13.5px 'Public Sans';">📌 Pinned by me</div>
+        <!-- storage budget -->
+        <div style="margin-top:14px; padding:12px; background:#fbf9f4; border:1px solid #e3ddcf; border-radius:9px;">
+          <div style="font:600 10px 'Public Sans'; letter-spacing:.06em; text-transform:uppercase; color:#a39e8e;">Your contribution</div>
+          <div style="display:flex; align-items:baseline; gap:5px; margin-top:6px;"><span style="font:500 22px 'Newsreader',serif; color:#466b4c;">8.2</span><span style="font:400 11px 'Public Sans'; color:#767a6c;">of 20 GB shared</span></div>
+          <div style="margin-top:7px; height:7px; border-radius:4px; background:#e0dccd; overflow:hidden;"><span style="display:block; width:41%; height:100%; background:#466b4c;"></span></div>
+          <div style="font:400 10.5px/1.4 'Public Sans'; color:#8a8472; margin-top:7px;">You host pieces for 3 storage buddies. Healthy.</div>
+        </div>
+      </div>
+      <!-- file list -->
+      <div style="background:#fbf9f4; display:flex; flex-direction:column; min-width:0;">
+        <div style="padding:15px 22px; border-bottom:1px solid #ece7da; display:flex; align-items:center; gap:10px;">
+          <div style="flex:1; display:flex; align-items:center; gap:8px; background:#fff; border:1px solid #e3ddcf; border-radius:7px; padding:8px 11px;"><span style="color:#a39e8e;">⌕</span><span style="font:400 12.5px 'Public Sans'; color:#a39e8e;">Search files or paste a CID…</span></div>
+          <button style="padding:9px 14px; border:none; border-radius:7px; background:#466b4c; color:#fff; font:600 12.5px 'Public Sans'; cursor:pointer;">⤓ Add files</button>
+          <span style="font:500 11px 'IBM Plex Mono'; color:#a39e8e;">⊞ ☰</span>
+        </div>
+        <!-- column header -->
+        <div style="display:grid; grid-template-columns:1fr 92px 110px 80px; padding:9px 22px; border-bottom:1px solid #ece7da; font:600 10.5px 'Public Sans'; letter-spacing:.04em; text-transform:uppercase; color:#a39e8e;">
+          <span>Name</span><span>Size</span><span>Replication</span><span></span>
+        </div>
+        <div style="flex:1; overflow-y:auto;">
+          <div style="display:grid; grid-template-columns:1fr 92px 110px 80px; align-items:center; padding:11px 22px; border-bottom:1px solid #f0ebdf; background:#fbf6ec;">
+            <div style="display:flex; align-items:center; gap:11px; min-width:0;"><span style="width:34px; height:34px; border-radius:8px; background:linear-gradient(135deg,#3a5a48,#6a8a6a); flex-shrink:0;"></span><div style="min-width:0;"><div style="font:600 13px 'Public Sans'; color:#20241c; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">greenhouse-frost.mp4</div><div style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">cid:bafy…7f3a</div></div></div>
+            <span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">4.1 MB</span>
+            <span style="display:flex; align-items:center; gap:6px; font:600 11px 'IBM Plex Mono'; color:#2f4a35;"><span style="width:7px; height:7px; border-radius:50%; background:#466b4c;"></span>×8 healthy</span>
+            <span style="font:500 11px 'Public Sans'; color:#a39e8e; text-align:right;">⋯</span>
+          </div>
+          <div style="display:grid; grid-template-columns:1fr 92px 110px 80px; align-items:center; padding:11px 22px; border-bottom:1px solid #f0ebdf;">
+            <div style="display:flex; align-items:center; gap:11px; min-width:0;"><span style="width:34px; height:34px; border-radius:8px; background:linear-gradient(135deg,#5a4a6a,#8a6a8a); flex-shrink:0;"></span><div style="min-width:0;"><div style="font:600 13px 'Public Sans'; color:#20241c;">budget-2026.pdf</div><div style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">cid:bafy…c91d</div></div></div>
+            <span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">220 KB</span>
+            <span style="display:flex; align-items:center; gap:6px; font:600 11px 'IBM Plex Mono'; color:#2f4a35;"><span style="width:7px; height:7px; border-radius:50%; background:#466b4c;"></span>×12 healthy</span>
+            <span style="font:500 11px 'Public Sans'; color:#a39e8e; text-align:right;">⋯</span>
+          </div>
+          <div style="display:grid; grid-template-columns:1fr 92px 110px 80px; align-items:center; padding:11px 22px; border-bottom:1px solid #f0ebdf;">
+            <div style="display:flex; align-items:center; gap:11px; min-width:0;"><span style="width:34px; height:34px; border-radius:8px; background:linear-gradient(135deg,#6a5a3a,#a88a5a); flex-shrink:0;"></span><div style="min-width:0;"><div style="font:600 13px 'Public Sans'; color:#20241c;">charter-v4.md</div><div style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">cid:bafy…b2e1</div></div></div>
+            <span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">11 KB</span>
+            <span style="display:flex; align-items:center; gap:6px; font:600 11px 'IBM Plex Mono'; color:#6b5226;"><span style="width:7px; height:7px; border-radius:50%; background:#b9742c;"></span>×3 at risk</span>
+            <span style="font:500 11px 'Public Sans'; color:#a39e8e; text-align:right;">⋯</span>
+          </div>
+          <div style="display:grid; grid-template-columns:1fr 92px 110px 80px; align-items:center; padding:11px 22px; border-bottom:1px solid #f0ebdf;">
+            <div style="display:flex; align-items:center; gap:11px; min-width:0;"><span style="width:34px; height:34px; border-radius:8px; background:linear-gradient(135deg,#3a4a6a,#6a7a9a); flex-shrink:0;"></span><div style="min-width:0;"><div style="font:600 13px 'Public Sans'; color:#20241c;">town-hall-oct.webm</div><div style="font:400 10px 'IBM Plex Mono'; color:#a39e8e;">cid:bafy…4d8a</div></div></div>
+            <span style="font:500 12px 'IBM Plex Mono'; color:#767a6c;">86 MB</span>
+            <span style="display:flex; align-items:center; gap:6px; font:600 11px 'IBM Plex Mono'; color:#2f4a35;"><span style="width:7px; height:7px; border-radius:50%; background:#466b4c;"></span>×6 healthy</span>
+            <span style="font:500 11px 'Public Sans'; color:#a39e8e; text-align:right;">⋯</span>
+          </div>
+        </div>
+      </div>
+      <!-- detail panel -->
+      <div style="background:#efeadf; border-left:1px solid #e3ddcf; padding:18px; overflow-y:auto;">
+        <div style="width:100%; height:150px; border-radius:10px; background:linear-gradient(135deg,#3a5a48,#6a8a6a); position:relative; overflow:hidden;"><div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-size:24px;">▶</div><div style="position:absolute; top:8px; left:8px; font:600 10px 'IBM Plex Mono'; color:#fff; background:rgba(20,22,15,.6); padding:2px 7px; border-radius:20px;">0:06 ↻</div></div>
+        <div style="font:600 15px 'Public Sans'; color:#20241c; margin-top:13px;">greenhouse-frost.mp4</div>
+        <div style="font:400 10.5px 'IBM Plex Mono'; color:#8a8472; margin-top:4px; word-break:break-all;">cid:bafybeig…7f3a9c2</div>
+        <div style="margin-top:14px; display:flex; flex-direction:column; gap:9px; font:400 12px 'Public Sans';">
+          <div style="display:flex; justify-content:space-between;"><span style="color:#767a6c;">Type</span><span style="color:#20241c; font-family:'IBM Plex Mono'; font-size:11px;">video/mp4</span></div>
+          <div style="display:flex; justify-content:space-between;"><span style="color:#767a6c;">Size</span><span style="color:#20241c; font-family:'IBM Plex Mono'; font-size:11px;">4.1 MB</span></div>
+          <div style="display:flex; justify-content:space-between;"><span style="color:#767a6c;">Added</span><span style="color:#20241c; font-family:'IBM Plex Mono'; font-size:11px;">2h ago</span></div>
+          <div style="display:flex; justify-content:space-between;"><span style="color:#767a6c;">Used by</span><span style="color:#466b4c; font-family:'IBM Plex Mono'; font-size:11px;">1 vine</span></div>
+        </div>
+        <div style="margin-top:14px; padding:12px; background:#e4ece2; border:1px solid #c9d6c6; border-radius:9px;">
+          <div style="font:600 10.5px 'Public Sans'; letter-spacing:.05em; text-transform:uppercase; color:#5a6a55;">Replication</div>
+          <div style="display:flex; align-items:center; gap:7px; margin-top:6px;"><span style="font:600 14px 'IBM Plex Mono'; color:#2f4a35;">×8</span><span style="font:400 11.5px 'Public Sans'; color:#3a4d3a;">copies across your peers</span></div>
+          <div style="font:400 10.5px/1.45 'Public Sans'; color:#5a6a55; margin-top:6px;">Above the ×5 target — safe even if several peers go offline.</div>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:14px;"><button style="flex:1; padding:9px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; font:600 12px 'Public Sans'; color:#20241c; cursor:pointer;">⧉ Copy CID</button><button style="flex:1; padding:9px; border:1px solid #d8d1c1; border-radius:7px; background:#fff; font:600 12px 'Public Sans'; color:#20241c; cursor:pointer;">📌 Pin</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div data-drags-parent="0" style="position:absolute; left:1292px; top:2180px; width:210px; background:#fef4a8; padding:14px 15px; font:400 12.5px/1.55 'Public Sans'; color:#5a5326; box-shadow:0 2px 6px rgba(0,0,0,.12); transform:rotate(1deg);"><strong>Files is the store, unveiled.</strong> Same CIDs the feeds point at — here you see size, type, what uses each artifact, and its <strong>replication health</strong> (×8 healthy / ×3 at risk). The "storage buddies" model from the codebase becomes a tangible contribution meter.</div>
+
+<!-- ===== FRAME D · MOBILE VINES ===== -->
+<div style="position:absolute; left:1600px; top:560px; width:412px;">
+  <div data-drags-parent="1" style="position:absolute; top:-28px; font:600 13px 'Public Sans'; color:#466b4c;">D · Mobile Vines <span style="color:#8a8472; font-weight:400;">— full-bleed loop player</span></div>
+  <div style="background:#1c1a16; border-radius:46px; padding:11px; box-shadow:0 12px 40px rgba(40,30,10,.22);">
+    <div style="background:#15140f; border-radius:36px; overflow:hidden; height:844px; display:flex; flex-direction:column; font-family:'Public Sans',system-ui; position:relative;">
+      <!-- full bleed video -->
+      <div style="position:absolute; inset:0; background:linear-gradient(160deg,#3a5a48,#1f2b24);"></div>
+      <!-- loop ring -->
+      <div style="position:absolute; top:0; left:0; right:0; height:3px; background:rgba(255,255,255,.2); z-index:3;"><div style="width:55%; height:100%; background:#7fa886;"></div></div>
+      <div style="height:44px; display:flex; align-items:center; justify-content:space-between; padding:0 26px; font:600 13px 'Public Sans'; color:#fff; flex-shrink:0; position:relative; z-index:3;"><span>9:41</span><span style="font-size:11px;">●●● ▆ 􀛨</span></div>
+      <!-- top tabs -->
+      <div style="position:relative; z-index:3; display:flex; justify-content:center; gap:18px; padding:6px 0;"><span style="font:600 14px 'Public Sans'; color:rgba(255,255,255,.55);">Following</span><span style="font:600 14px 'Public Sans'; color:#fff; border-bottom:2px solid #fff; padding-bottom:3px;">Discover</span></div>
+      <div style="flex:1;"></div>
+      <!-- right actions -->
+      <div style="position:absolute; right:14px; bottom:150px; z-index:3; display:flex; flex-direction:column; gap:20px; align-items:center;">
+        <div style="text-align:center;"><div style="width:50px; height:50px; border-radius:50%; background:rgba(255,255,255,.18); display:flex; align-items:center; justify-content:center; font-size:22px;">♥</div><div style="font:600 10px 'IBM Plex Mono'; color:#fff; margin-top:3px;">24</div></div>
+        <div style="text-align:center;"><div style="width:50px; height:50px; border-radius:50%; background:rgba(255,255,255,.18); display:flex; align-items:center; justify-content:center; font-size:20px;">↻</div><div style="font:600 10px 'IBM Plex Mono'; color:#fff; margin-top:3px;">5</div></div>
+        <div style="text-align:center;"><div style="width:50px; height:50px; border-radius:50%; background:rgba(255,255,255,.18); display:flex; align-items:center; justify-content:center; font-size:18px;">↗</div></div>
+      </div>
+      <!-- bottom caption -->
+      <div style="position:relative; z-index:3; padding:0 18px 14px;">
+        <div style="display:flex; align-items:center; gap:9px;"><span style="width:34px; height:34px; border-radius:50%; background:#7a6a52; border:2px solid #fff;"></span><span style="font:600 14px 'Public Sans'; color:#fff;">@mara</span><button style="margin-left:8px; padding:5px 14px; border:1px solid rgba(255,255,255,.5); border-radius:7px; background:transparent; color:#fff; font:600 11.5px 'Public Sans';">Follow</button><span style="margin-left:auto; font:600 10px 'IBM Plex Mono'; color:#fff; background:rgba(0,0,0,.4); padding:3px 9px; border-radius:20px;">↻ 0:06</span></div>
+        <div style="font:400 13.5px/1.4 'Public Sans'; color:#fff; margin-top:9px;">First frost on the community greenhouse 🌿</div>
+      </div>
+      <!-- tab bar -->
+      <div style="position:relative; z-index:3; display:flex; padding:6px 8px 26px; background:rgba(20,19,15,.7); backdrop-filter:blur(8px);">
+        <div style="flex:1; text-align:center; color:rgba(255,255,255,.6);"><div style="font-size:19px;">💬</div><div style="font:500 10px 'Public Sans';">Chat</div></div>
+        <div style="flex:1; text-align:center; color:rgba(255,255,255,.6);"><div style="font-size:19px;">⚖</div><div style="font:500 10px 'Public Sans';">Assembly</div></div>
+        <div style="flex:1; text-align:center; color:#fff;"><div style="font-size:19px;">🎞</div><div style="font:600 10px 'Public Sans';">Vines</div></div>
+        <div style="flex:1; text-align:center; color:rgba(255,255,255,.6);"><div style="font-size:19px;">👤</div><div style="font:500 10px 'Public Sans';">You</div></div>
+      </div>
+      <div style="position:absolute; bottom:9px; left:50%; transform:translateX(-50%); width:134px; height:5px; border-radius:3px; background:#fff; opacity:.5; z-index:4;"></div>
+    </div>
+  </div>
+</div>
+
+<div data-drags-parent="0" style="position:absolute; left:80px; top:2790px; width:880px; font:400 13px/1.6 'Public Sans'; color:#5a5347;">Vines (faithful feed + immersive player + publish), Files (the content store with replication health), the one-engine thesis, and mobile. That covers your planned side-modes. Mint stays parked for the Bezelbaum / FinanceStudio "ReplaceMint" session. Want these folded into the dev handoff (tokens + screenshots) like the others?</div>
+</x-dc>
+</body>
+</html>
