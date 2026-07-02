@@ -136,7 +136,11 @@ dirs = "6"
 # Pin pre-release PQ crypto deps to match the harmony workspace.
 # These RC crates have breaking changes between point releases; without
 # exact pins Cargo resolves to newer (incompatible) versions.
-ml-dsa = "=0.1.0-rc.7"
+# ml-dsa held at rc.8 (not 0.1.1): rc.8 accepts pkcs8 0.11 final (required
+# by iroh 1.0.1's ed25519-dalek tier) while keeping the sha3 0.11-rc.8 XOF
+# path, so the harmony workspace's keccak =0.2.0-rc.2 pin stays valid. 0.1.1
+# switched to shake -> keccak 0.2.0 stable, which conflicts (ZEB-619).
+ml-dsa = "=0.1.0-rc.8"
 ml-kem = "=0.3.0-rc.0"
 sha3 = "=0.11.0-rc.8"
 keccak = "=0.2.0-rc.2"
