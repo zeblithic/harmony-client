@@ -1352,6 +1352,14 @@ pub struct NodeState {
     /// gone — accepted links are forwarded into Zenoh by the registration
     /// factory's forwarder, which exits when the Zenoh session closes.)
     pub iroh_accept_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-621 Task 6: `JoinHandle` of the sleep/wake resume detector's
+    /// spawned tokio task. Held so `clear_iroh_handles` can `abort()` it —
+    /// without abort the detector's infinite loop outlives `stop_node`, and
+    /// its `on_resume` closure pins an `Arc<IrohEndpoint>` clone alive, so the
+    /// old endpoint leaks and `network_change()` keeps firing on it every wake
+    /// (one leaked task + endpoint per `stop_node`→`start_node` restart cycle).
+    /// Mirrors `iroh_publisher_handle` teardown exactly.
+    pub iroh_resume_detector_handle: Option<tokio::task::JoinHandle<()>>,
 
     // ── ZEB-323 Phase 2b: pkarr policy handles ───────────────────────────
     //
@@ -1476,6 +1484,14 @@ impl NodeState {
             h.abort();
         }
         if let Some(h) = self.iroh_accept_handle.take() {
+            h.abort();
+        }
+        // ZEB-621 Task 6: abort the sleep/wake resume detector loop. Its
+        // `on_resume` closure holds an `Arc<IrohEndpoint>` clone, so without
+        // this the detector task survives a restart, pins the old endpoint
+        // Arc forever, and fires `network_change()` on it every wake — one
+        // leaked task + endpoint per restart cycle.
+        if let Some(h) = self.iroh_resume_detector_handle.take() {
             h.abort();
         }
         // ZEB-368: clear the process-global iroh session ctx so a restart
@@ -1723,6 +1739,9 @@ impl Default for NodeState {
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_accept_handle: None,
+            // ZEB-621 Task 6: resume detector handle stays None until
+            // start_node wires it; cleared + aborted in clear_iroh_handles.
+            iroh_resume_detector_handle: None,
             // ZEB-323 Phase 2b: pkarr policy handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             pkarr_publisher: None,
@@ -4010,6 +4029,12 @@ pub async fn start_node_inner(
         // endpoint Arc alive, and continues firing if-watch/idle ticks
         // across restart cycles (Qodo finding).
         let mut iroh_publisher_handle: Option<tokio::task::JoinHandle<()>> = None;
+        // ZEB-621 Task 6: capture the resume detector's spawn JoinHandle so
+        // clear_iroh_handles can abort it. Without abort the detector loop
+        // outlives stop_node, and its on_resume closure pins the old iroh
+        // endpoint Arc alive, firing network_change() on it every wake — one
+        // leaked task + endpoint per restart cycle.
+        let mut iroh_resume_detector_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // ZEB-492: obtain the fleet KeyTree from EITHER the master seed (minting
         // device — authoritative) OR the distributed material persisted at
@@ -7097,11 +7122,16 @@ pub async fn start_node_inner(
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0)
                             });
-                        tokio::spawn(crate::resume_detector::run_resume_detector(
-                            resume_now_ms,
-                            crate::resume_detector::RESUME_DETECTOR_TICK,
-                            on_resume,
-                        ));
+                        // Capture the JoinHandle (stashed on NodeState below)
+                        // so clear_iroh_handles can abort the loop on stop —
+                        // otherwise it outlives stop_node and pins the old
+                        // endpoint Arc via on_resume across restart cycles.
+                        iroh_resume_detector_handle =
+                            Some(tokio::spawn(crate::resume_detector::run_resume_detector(
+                                resume_now_ms,
+                                crate::resume_detector::RESUME_DETECTOR_TICK,
+                                on_resume,
+                            )));
 
                         iroh_publisher_arc = Some(publisher);
                     }
@@ -9564,6 +9594,10 @@ pub async fn start_node_inner(
                         // publisher in particular is identity-gated).
                         guard.iroh_publisher_handle = iroh_publisher_handle.take();
                         guard.iroh_accept_handle = iroh_accept_handle.take();
+                        // ZEB-621 Task 6: move the resume detector handle into
+                        // NodeState so clear_iroh_handles aborts it alongside
+                        // the publisher/accept tasks. `.take()` — single owner.
+                        guard.iroh_resume_detector_handle = iroh_resume_detector_handle.take();
                         // ZEB-323 Phase 2b: stash pkarr policy handles.
                         guard.pkarr_publisher = pkarr_publisher_for_state.take();
                         guard.pkarr_friend_publisher = pkarr_friend_publisher_for_state.take();
@@ -56367,6 +56401,8 @@ mod start_node_race_tests {
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_accept_handle: None,
+            // ZEB-621 Task 6: resume detector handle unused in race tests.
+            iroh_resume_detector_handle: None,
             // ZEB-323 Phase 2b: pkarr handles unused in race tests.
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
