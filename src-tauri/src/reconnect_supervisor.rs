@@ -197,6 +197,18 @@ struct PeerSlot {
     last_fresh_trigger: Instant,
     dial_in_flight: bool,
     epoch: u64,
+    /// ZEB-622: true once this peer has reached `Connected` at least once (set on
+    /// every →Connected edge: `mark_connected` and the `apply_result` ok-arm).
+    /// Gates the `reconnected` ring marker so a peer's FIRST-ever connect is not
+    /// mis-counted as a recovery.
+    ever_connected: bool,
+    /// ZEB-622: set by `mark_connected` when an inbound connect lands on a peer
+    /// that has connected before and is not currently `Connected` — a real
+    /// (non-Connected)→Connected recovery edge. `mark_connected` has no
+    /// resolver/telemetry access, so it defers the `reconnected` marker; the
+    /// supervisor loop drains this flag on its next pass (owner via the resolver,
+    /// marker via telemetry) and clears it.
+    pending_reconnected_marker: bool,
 }
 
 /// Message from a spawned dial task back to the supervisor loop.
@@ -280,9 +292,22 @@ impl SupervisorHandle {
                 last_fresh_trigger: Instant::now(),
                 dial_in_flight: false,
                 epoch: 0,
+                ever_connected: false,
+                pending_reconnected_marker: false,
             });
+            // ZEB-622: a (non-Connected)→Connected inbound edge on a peer that has
+            // connected before is a real recovery. `mark_connected` can't reach
+            // the resolver/telemetry, so defer the `reconnected` marker for the
+            // loop's next pass to drain. (A fresh slot is inserted `Connected`
+            // with `ever_connected: false`, so a first connect takes neither the
+            // `was_connected` nor the `ever_connected` branch — no marker.)
+            let was_connected = matches!(slot.state, PeerState::Connected { .. });
+            if slot.ever_connected && !was_connected {
+                slot.pending_reconnected_marker = true;
+            }
             slot.epoch = slot.epoch.wrapping_add(1);
             slot.state = PeerState::Connected { since_ms: now_ms() };
+            slot.ever_connected = true;
             // The epoch bump voids any outstanding dial's result, so the flag
             // must not outlive it: left set, it would suppress the first
             // re-dial after a subsequent `Dropped` until that stale dial
@@ -456,7 +481,25 @@ pub async fn run_reconnect_supervisor(
                     &self_node_id,
                     &config,
                     &mut rng,
+                    &telemetry,
+                    &resolver,
                 );
+            }
+
+            // --- drain inbound-reconnect markers (ZEB-622) -----------------
+            // `mark_connected` can't reach the resolver/telemetry, so a real
+            // (non-Connected)→Connected inbound edge leaves
+            // `pending_reconnected_marker` set; emit it here with the owner +
+            // telemetry in hand. No live routing record ⇒ skip the marker (no
+            // invented owner).
+            for (peer, slot) in states.iter_mut() {
+                if !slot.pending_reconnected_marker {
+                    continue;
+                }
+                slot.pending_reconnected_marker = false;
+                if let Some(owner) = resolver.resolve_by_node_id(peer).map(|(o, _)| o.0) {
+                    telemetry.record_reconnected(*peer, owner);
+                }
             }
 
             let mut dial_capacity_exhausted = false;
@@ -484,6 +527,11 @@ pub async fn run_reconnect_supervisor(
                             }
                         };
                         slot.epoch = slot.epoch.wrapping_add(1);
+                        // ZEB-622: read the ever-connected bit BEFORE marking the
+                        // dial in-flight and thread it into the task: a success
+                        // when this was already true is a recovery (marker), a
+                        // first-ever connect is not.
+                        let ever_connected_before = slot.ever_connected;
                         slot.dial_in_flight = true;
                         let epoch = slot.epoch;
                         let peer = *peer;
@@ -508,15 +556,15 @@ pub async fn run_reconnect_supervisor(
                             );
                             if ok {
                                 telemetry.record_succeeded(peer, owner);
-                                // NOTE: no "reconnected" ring marker here — a
-                                // supervisor dial success includes a peer's
-                                // FIRST-ever connect, so emitting it 1:1 with
-                                // "succeeded" both over-counts recoveries and
-                                // duplicates ring entries. The recorder exists
-                                // (record_reconnected); wiring it — gated on an
-                                // ever-connected bit, together with the
-                                // retrying/dormant markers — belongs to the
-                                // liveness slice that owns real state edges.
+                                // ZEB-622: a dial success on a peer that has
+                                // connected before is a recovery — emit the
+                                // `reconnected` marker (gated on the ever-connected
+                                // bit read at dispatch). The first-ever connect
+                                // (`ever_connected_before == false`) emits none, so
+                                // the marker no longer duplicates every `succeeded`.
+                                if ever_connected_before {
+                                    telemetry.record_reconnected(peer, owner);
+                                }
                             } else {
                                 telemetry.record_failed(peer, owner);
                             }
@@ -527,7 +575,16 @@ pub async fn run_reconnect_supervisor(
                         // No live routing record: soft-fail (no dial, no telemetry)
                         // and advance the ladder, so an evicted peer eventually
                         // falls dormant instead of dialing into the void.
-                        ladder_after_failure(slot, now, &self_node_id, peer, &config, &mut rng);
+                        ladder_after_failure(
+                            slot,
+                            now,
+                            &self_node_id,
+                            peer,
+                            &config,
+                            &mut rng,
+                            &telemetry,
+                            &resolver,
+                        );
                     }
                 }
             }
@@ -549,7 +606,7 @@ pub async fn run_reconnect_supervisor(
         tokio::select! {
             biased;
             Some(result) = res_rx.recv() => {
-                apply_result(&inner, result, &self_node_id, &config, &mut rng);
+                apply_result(&inner, result, &self_node_id, &config, &mut rng, &telemetry, &resolver);
             }
             _ = inner.notify.notified() => {}
             _ = sleep_until_opt(deadline) => {}
@@ -561,6 +618,7 @@ pub async fn run_reconnect_supervisor(
 /// base rung. For a known peer: `Dropped` (from any state) and any trigger on a
 /// non-`Connected` peer re-arm at base; `NewPeer`/`RecordChanged`/`PresenceSweep`
 /// on a `Connected` peer only refresh the interest stamp (no dial).
+#[allow(clippy::too_many_arguments)]
 fn apply_trigger(
     states: &mut HashMap<[u8; 32], PeerSlot>,
     peer: [u8; 32],
@@ -569,6 +627,8 @@ fn apply_trigger(
     self_node_id: &[u8; 32],
     config: &SupervisorConfig,
     rng: &mut ChaCha8Rng,
+    telemetry: &DialTelemetry,
+    resolver: &ReachabilityResolver,
 ) {
     let role = dial_role(self_node_id, &peer);
     match states.get_mut(&peer) {
@@ -584,6 +644,8 @@ fn apply_trigger(
                     last_fresh_trigger: now,
                     dial_in_flight: false,
                     epoch: 0,
+                    ever_connected: false,
+                    pending_reconnected_marker: false,
                 },
             );
         }
@@ -593,6 +655,18 @@ fn apply_trigger(
             if record_only {
                 slot.last_fresh_trigger = now;
             } else {
+                // ZEB-622: `connected` here means a `Dropped`-driven
+                // Connected→Retrying edge (a Connected peer only reaches this
+                // branch via `Dropped`; record-only triggers took the branch
+                // above) — the SINGLE edge that emits `retrying`. Re-arming an
+                // already-Retrying/Dormant peer (every other ladder rung, and
+                // dormant revival) emits none. No live routing record ⇒ skip the
+                // marker (no invented owner).
+                if connected {
+                    if let Some(owner) = resolver.resolve_by_node_id(&peer).map(|(o, _)| o.0) {
+                        telemetry.record_retrying(peer, owner);
+                    }
+                }
                 // Re-arm at base. Bump the epoch so any in-flight dial's result is
                 // discarded (it belongs to the pre-re-arm schedule).
                 slot.epoch = slot.epoch.wrapping_add(1);
@@ -635,6 +709,7 @@ fn do_sweep(
 /// Advance a peer one ladder rung after a failed (or record-less) attempt, or
 /// transition it to `Dormant` once `dormant_after` has elapsed since the last
 /// fresh trigger.
+#[allow(clippy::too_many_arguments)]
 fn ladder_after_failure(
     slot: &mut PeerSlot,
     now: Instant,
@@ -642,10 +717,19 @@ fn ladder_after_failure(
     peer: &[u8; 32],
     config: &SupervisorConfig,
     rng: &mut ChaCha8Rng,
+    telemetry: &DialTelemetry,
+    resolver: &ReachabilityResolver,
 ) {
     slot.dial_in_flight = false;
     if now.duration_since(slot.last_fresh_trigger) > config.dormant_after {
         slot.state = PeerState::Dormant { since_ms: now_ms() };
+        // ZEB-622: emit `dormant` once per Retrying→Dormant transition — this fn
+        // is only reached from a Retrying slot (dispatch soft-fail or a failed
+        // dial result), so the marker fires per-transition, not per-rung. No live
+        // routing record ⇒ skip the marker (no invented owner).
+        if let Some(owner) = resolver.resolve_by_node_id(peer).map(|(o, _)| o.0) {
+            telemetry.record_dormant(*peer, owner);
+        }
         return;
     }
     let attempt = match slot.state {
@@ -669,6 +753,8 @@ fn apply_result(
     self_node_id: &[u8; 32],
     config: &SupervisorConfig,
     rng: &mut ChaCha8Rng,
+    telemetry: &DialTelemetry,
+    resolver: &ReachabilityResolver,
 ) {
     let mut states = inner.states.lock().expect("states lock");
     let slot = match states.get_mut(&result.peer) {
@@ -681,6 +767,11 @@ fn apply_result(
     }
     if result.ok {
         slot.state = PeerState::Connected { since_ms: now_ms() };
+        // ZEB-622: a successful dial is a →Connected edge; arm the recovery bit
+        // so the NEXT reconnect (dial or inbound) counts as a recovery. The
+        // `reconnected` marker for THIS dial was already emitted by the dial task
+        // (gated on the ever-connected bit read before the dial).
+        slot.ever_connected = true;
     } else {
         ladder_after_failure(
             slot,
@@ -689,6 +780,8 @@ fn apply_result(
             &result.peer,
             config,
             rng,
+            telemetry,
+            resolver,
         );
     }
 }
@@ -1373,5 +1466,156 @@ mod tests {
             rung_hi(1_000),
             "dial at base after Dropped",
         );
+    }
+
+    /// Chronological (oldest→newest) list of ring-marker/dial outcomes.
+    fn outcomes(telemetry: &DialTelemetry) -> Vec<String> {
+        telemetry
+            .summary()
+            .recent
+            .iter()
+            .map(|h| h.outcome.clone())
+            .collect()
+    }
+
+    /// ZEB-622: the three ring markers fire only on REAL state edges. A first
+    /// connect emits no `reconnected`; a `Connected`→`Retrying` drop emits
+    /// exactly one `retrying`; a later dial success (with `ever_connected`
+    /// already set) emits `reconnected`.
+    #[tokio::test(start_paused = true)]
+    async fn ring_markers_fire_on_real_edges_only() {
+        let dialer = RecordingDialer::succeeding();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let handle = SupervisorHandle::new();
+        // self = 0 < p = 1 -> Dialer; dormancy far off so only edges we drive fire.
+        let config = cfg(1_000, 64_000, 3_600_000, 30_000, 8, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // First dial succeeds — first-ever connect, so NO `reconnected` marker.
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(3_000)).await;
+        assert_eq!(
+            outcomes(&telemetry),
+            vec!["succeeded"],
+            "first connect: succeeded only, no reconnected marker"
+        );
+
+        // Drop the (now Connected) peer -> exactly one `retrying` marker, then the
+        // re-armed dial succeeds -> `reconnected` (ever_connected was true).
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(ms(3_000)).await;
+        assert_eq!(
+            outcomes(&telemetry),
+            vec!["succeeded", "retrying", "succeeded", "reconnected"],
+            "drop emits one retrying; recovery dial emits reconnected"
+        );
+    }
+
+    /// ZEB-622: `dormant` is emitted once per `Retrying`→`Dormant` transition —
+    /// not once per ladder rung. A revival that fails back into dormancy emits a
+    /// second marker.
+    #[tokio::test(start_paused = true)]
+    async fn dormant_marker_fires_once_on_dormancy() {
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let handle = SupervisorHandle::new();
+        // dormant_after = 10s: ladder fails a handful of rungs then goes dormant.
+        let config = cfg(1_000, 64_000, 10_000, 30_000, 8, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(100_000)).await;
+        let dormant_1 = outcomes(&telemetry)
+            .iter()
+            .filter(|o| *o == "dormant")
+            .count();
+        assert_eq!(dormant_1, 1, "exactly one dormant marker per transition");
+
+        // Revive: re-arm at base, fail back up the ladder into a SECOND dormancy.
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(100_000)).await;
+        let dormant_2 = outcomes(&telemetry)
+            .iter()
+            .filter(|o| *o == "dormant")
+            .count();
+        assert_eq!(
+            dormant_2, 2,
+            "a second dormancy emits a second marker (per-transition, not per-rung)"
+        );
+    }
+
+    /// ZEB-622: an inbound reconnect (via `mark_connected`, no dial success) emits
+    /// `reconnected` — the marker is deferred by `mark_connected` (no resolver /
+    /// telemetry there) and drained by the loop's next pass. A first connect emits
+    /// none; the intervening drop emits `retrying`.
+    #[tokio::test(start_paused = true)]
+    async fn inbound_reconnect_emits_marker_via_mark_connected() {
+        // Parking dialer: outbound dials never succeed, so every marker here comes
+        // from the mark_connected / drop edges, not a dial-success arm.
+        let dialer = RecordingDialer::parking();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let handle = SupervisorHandle::new();
+        let config = cfg(1_000, 64_000, 3_600_000, 30_000, 4, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // First inbound connect (no marker) — mark_connected lands before the loop
+        // arms a dial, so the NewPeer kick only refreshes interest.
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        handle.mark_connected(p);
+        tokio::time::sleep(ms(500)).await;
+        assert!(
+            outcomes(&telemetry).is_empty(),
+            "first connect emits no marker, got {:?}",
+            outcomes(&telemetry)
+        );
+
+        // Drop -> `retrying` (Connected->Retrying edge).
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(ms(500)).await;
+        assert_eq!(
+            outcomes(&telemetry),
+            vec!["retrying"],
+            "drop of a connected peer emits retrying"
+        );
+
+        // Inbound reconnect -> `reconnected`, drained by the loop with the resolver.
+        handle.mark_connected(p);
+        tokio::time::sleep(ms(500)).await;
+        assert_eq!(
+            outcomes(&telemetry),
+            vec!["retrying", "reconnected"],
+            "inbound reconnect emits reconnected via the loop drain"
+        );
+        dialer.release();
     }
 }
