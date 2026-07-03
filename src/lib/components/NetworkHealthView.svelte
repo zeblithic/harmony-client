@@ -480,12 +480,12 @@
   .peer-incompat {
     display: inline-block;
     padding: 1px 6px;
-    border: 1px solid crimson;
+    border: 1px solid var(--net-danger-fg);
     border-radius: 3px;
     font-size: 11px;
     font-weight: 600;
-    color: crimson;
-    background: rgba(220, 20, 60, 0.06);
+    color: var(--net-danger-fg);
+    background: var(--net-danger-bg);
     margin-left: 4px;
     cursor: help;
   }

@@ -86,6 +86,8 @@
   --net-ok-deep: green;
   --net-warn-bg: #4a3a00;
   --net-warn-fg: #f0a020;
+  --net-danger-bg: rgba(220, 20, 60, 0.06); /* crimson tint, matches .transport-disabled */
+  --net-danger-fg: crimson;
 
   /* Text extras */
   --text-bright: #fff; /* white text on colored/dark fills */
