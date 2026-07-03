@@ -9775,6 +9775,15 @@ pub async fn start_node_inner(
                             nh.set_presence_source(std::sync::Arc::clone(
                                 &network_health_presence_cache,
                             ));
+                            // ZEB-623: per-peer protocol-compat registry. Share
+                            // the SAME Arc NodeState holds (published just above
+                            // from the tunnel-acceptor install block, or the
+                            // empty default on a deposit-only node) so the panel
+                            // surfaces exactly what the TunnelManager recorded
+                            // during hello negotiation.
+                            nh.set_protocol_compat_source(std::sync::Arc::clone(
+                                &guard.protocol_compat,
+                            ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks

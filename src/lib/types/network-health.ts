@@ -32,6 +32,11 @@ export interface PeerHealth {
   rttMs: number | null;
   lastSeenMs: number | null;
   reachabilityRecordAgeMs: number | null;
+  // ZEB-623: set when the tunnel-v2 hello negotiation recorded this peer as
+  // protocol-incompatible; carries the reason the panel shows in a loud badge.
+  // `null` when compatible. Rust serializes it unconditionally (present as
+  // `null` when None), so it is always on the wire for a schema-v4 snapshot.
+  protocolIncompatReason: string | null;
 }
 
 // ZEB-595: three-state so the panel can distinguish a clean "not published

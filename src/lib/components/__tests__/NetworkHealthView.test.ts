@@ -123,6 +123,38 @@ function readySnapWithDegradedPeer(): NetworkHealthSnapshot {
         rttMs: null,
         lastSeenMs: null,
         reachabilityRecordAgeMs: null,
+        protocolIncompatReason: null,
+      },
+    ],
+  };
+}
+
+// ZEB-623: a snapshot with one protocol-incompatible peer (the tunnel-v2 hello
+// negotiation flagged it) beside one compatible peer, so the panel's loud
+// per-peer badge and its absence are both exercised.
+function readySnapWithIncompatiblePeer(): NetworkHealthSnapshot {
+  return {
+    ...readySnap(),
+    peers: [
+      {
+        ownerAddr: 'baddecaf'.repeat(8),
+        displayName: null,
+        sharedCommunities: ['c0ffee'],
+        connectionMode: 'noConnection',
+        rttMs: null,
+        lastSeenMs: null,
+        reachabilityRecordAgeMs: null,
+        protocolIncompatReason: 'tunnel hello v0 < min supported v1',
+      },
+      {
+        ownerAddr: 'facefeed'.repeat(8),
+        displayName: null,
+        sharedCommunities: ['c0ffee'],
+        connectionMode: 'direct',
+        rttMs: 12,
+        lastSeenMs: null,
+        reachabilityRecordAgeMs: null,
+        protocolIncompatReason: null,
       },
     ],
   };
@@ -223,6 +255,33 @@ describe('NetworkHealthView', () => {
     expect(icon.getAttribute('title')).toContain('degraded');
     // The mode label still reads "degraded" in the row body.
     expect(screen.getByTestId('nh-peer').textContent).toContain('degraded');
+  });
+
+  it('renders a loud incompatible badge only for the protocol-incompatible peer (ZEB-623)', async () => {
+    mockInvoke.mockResolvedValue(readySnapWithIncompatiblePeer());
+    render(NetworkHealthView);
+    await waitFor(() => screen.getAllByTestId('nh-peer'));
+
+    // Exactly one badge: the incompatible peer gets it, the compatible peer none.
+    const badges = screen.getAllByTestId('nh-peer-incompat');
+    expect(badges.length).toBe(1);
+    const badge = badges[0];
+    expect(badge.textContent).toContain('⚠ incompatible');
+    // Loud signal for assistive tech, mirroring the transport-disabled banner.
+    expect(badge.getAttribute('role')).toBe('alert');
+    // The reason rides on the hover title.
+    expect(badge.getAttribute('title')).toContain(
+      'tunnel hello v0 < min supported v1',
+    );
+
+    // Two peer rows total; the compatible one carries no badge.
+    const rows = screen.getAllByTestId('nh-peer');
+    expect(rows.length).toBe(2);
+    const compatibleRow = rows.find((r) =>
+      r.textContent?.includes('12ms'),
+    );
+    expect(compatibleRow).toBeTruthy();
+    expect(compatibleRow?.querySelector('[data-testid="nh-peer-incompat"]')).toBeNull();
   });
 
   it('renders idle dial state when there are no recent hits', async () => {
