@@ -1088,6 +1088,27 @@ pub async fn run(
     //    (recency-ordered) instead of ZEB-368's static `connect/endpoints` seed;
     //  - zenoh transport-events listener: a transport `Delete` → `Dropped` kick,
     //    a non-fatal secondary drop source behind the registry watchers.
+    // ZEB-622: peer-liveness state machine. Constructed unconditionally (it is
+    // useful even if the supervisor block's install-order gate trips below) and
+    // wired to the SAME transport epoch as the zid-poll gate, so a registry or
+    // zenoh transport up-edge re-arms the backfill latches exactly like a new
+    // zid does. `set_transport_epoch_tx` is install-once; the resolver + link-
+    // manager installs mirror the supervisor wiring (the resolver clone shares
+    // state via its inner `Arc`). Order between the installs and the epoch-tx
+    // wiring is irrelevant — each is an independent install-once seam.
+    let liveness = crate::peer_liveness::LivenessHandle::new();
+    liveness.set_transport_epoch_tx(transport_epoch_tx.clone());
+    if let Some(ref ih) = iroh_handles {
+        if ih
+            .link_manager
+            .set_liveness_handle(liveness.clone())
+            .is_err()
+        {
+            tracing::error!("ZEB-622: liveness handle already installed; keeping the existing one");
+        }
+        ih.link_manager.resolver().set_liveness(liveness.clone());
+    }
+
     if let (Some(ref ih), Some(ref telemetry)) = (&iroh_handles, &dial_telemetry) {
         use crate::reconnect_supervisor::{
             run_reconnect_supervisor, SupervisorConfig, SupervisorHandle,
@@ -1152,6 +1173,7 @@ pub async fn run(
             let listener_session = session.clone();
             let listener_resolver = resolver.clone();
             let listener_handle = handle.clone();
+            let listener_liveness = liveness.clone();
             tokio::spawn(async move {
                 use zenoh::sample::SampleKind;
                 let listener = match listener_session.info().transport_events_listener().await {
@@ -1169,9 +1191,11 @@ pub async fn run(
                 let mut zid_to_node: std::collections::HashMap<String, [u8; 32]> =
                     std::collections::HashMap::new();
                 while let Ok(event) = listener.recv_async().await {
-                    if event.kind() != SampleKind::Delete {
-                        continue;
-                    }
+                    // Resolve the peer's zid → iroh node-id ONCE via the shared
+                    // `zid_to_node` cache (rebuilt from the resolver on a miss),
+                    // then dispatch on the event kind. `SampleKind` is a closed
+                    // two-variant enum, so Put/Delete are exhaustive (no `_` arm
+                    // — one would be an unreachable-pattern error under -D warnings).
                     let zid = event.transport().zid().to_string();
                     let node_id = match zid_to_node.get(&zid).copied() {
                         Some(n) => Some(n),
@@ -1191,13 +1215,26 @@ pub async fn run(
                             zid_to_node.get(&zid).copied()
                         }
                     };
-                    match node_id {
-                        Some(n) => listener_handle
-                            .kick(n, crate::reconnect_supervisor::ReconnectTrigger::Dropped),
-                        None => tracing::debug!(
+                    match event.kind() {
+                        // Down-edge (ZEB-620): kick the reconnect supervisor.
+                        SampleKind::Delete => match node_id {
+                            Some(n) => listener_handle
+                                .kick(n, crate::reconnect_supervisor::ReconnectTrigger::Dropped),
+                            None => tracing::debug!(
                         "ZEB-620: transport Delete for zid {zid} not a resolver-known iroh peer; \
                          no reconnect kick"
                     ),
+                        },
+                        // Up-edge (ZEB-622): raise an external liveness up-edge
+                        // (acts only if the peer is absent/Disconnected — never
+                        // clobbers a conn-backed registry state).
+                        SampleKind::Put => match node_id {
+                            Some(n) => listener_liveness.on_transport_up_external(n),
+                            None => tracing::debug!(
+                        "ZEB-622: transport Put for zid {zid} not a resolver-known iroh peer; \
+                         no liveness up-edge"
+                    ),
+                        },
                     }
                 }
                 tracing::debug!(
@@ -2893,15 +2930,15 @@ pub async fn run(
         .await
         .map(|z| z.to_string())
         .collect();
-    // ZEB-434 D6: accumulating set of every zenoh session id ever seen
-    // this event-loop lifetime, kept SEPARATE from the overwrite-style
-    // `direct_peer_zids` above (whose hop-distance consumers need the
-    // current-snapshot semantics). SEEDED from the same boot-time
-    // snapshot WITHOUT bumping the transport epoch: boot-time peers are
-    // not "recovered" — the per-community spawn-time latch query
-    // already covers them, and a bump here would just burn the fetch
-    // drivers' first cooldown window for no benefit.
-    let mut transport_seen_zids: std::collections::HashSet<String> = direct_peer_zids.clone();
+    // ZEB-622: previous zid-poll snapshot, kept SEPARATE from the overwrite-
+    // style `direct_peer_zids` above (whose hop-distance consumers need the
+    // current-snapshot semantics). SEEDED from the same boot-time snapshot
+    // WITHOUT bumping the transport epoch: boot-time peers are not "recovered"
+    // — the per-community spawn-time latch query already covers them, and a
+    // bump here would just burn the fetch drivers' first cooldown window for no
+    // benefit. `detect_up_edges` REPLACES this each poll, so a same-zid
+    // reconnect after a drop re-fires (unlike the old accumulating seen-set).
+    let mut transport_prev_zids: std::collections::HashSet<String> = direct_peer_zids.clone();
     let mut peer_refresh_counter: u64 = 0;
 
     // ZEB-418 P2 Task 7 (D16): periodic routing-record re-publish, counted
@@ -3404,10 +3441,11 @@ pub async fn run(
                         .await
                         .map(|z| z.to_string())
                         .collect();
-                    // ZEB-434 D6: any never-seen zid bumps the transport
-                    // epoch — community root-fetch / channel-backfill /
-                    // mail-root latches re-arm (their drivers subscribe).
-                    if merge_peers_detect_new(&mut transport_seen_zids, &refreshed) {
+                    // ZEB-622: any up-edge (a zid absent last poll, present now)
+                    // bumps the transport epoch — community root-fetch /
+                    // channel-backfill / mail-root latches re-arm (their drivers
+                    // subscribe). A same-zid reconnect after a drop now re-fires.
+                    if detect_up_edges(&mut transport_prev_zids, &refreshed) {
                         transport_epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
                     }
                     direct_peer_zids = refreshed.into_iter().collect();
@@ -6353,46 +6391,16 @@ where
 /// behavior. See CodeRabbit R2 on PR #125.
 const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// ZEB-434 D6: fold a fresh peers_zid() snapshot into the accumulating
-/// seen-set; true iff at least one never-before-seen zid appeared.
-///
-/// Why an ACCUMULATING set (separate from the overwrite-style
-/// `direct_peer_zids` the hop-distance logic uses): zenoh session ids
-/// are per-session, so a REBOOTED peer always shows up with a fresh
-/// zid — "new zid" reliably means peer arrival/recovery. Conversely, a
-/// link that flaps down/up within one peer session re-presents the SAME
-/// zid; because the seen-set never forgets, a flap does not re-bump the
-/// transport epoch (the fetch drivers' 60s cooldown is then a
-/// second-layer defense, not the only one).
-/// Cap on the accumulated seen-zid set. Zenoh session ids are
-/// per-session, so reconnect churn would grow the set forever on a
-/// long-lived node if left unpruned (PR #230 review, Qodo). Overflow
-/// prunes to the current snapshot: a departed zid that later RETURNS
-/// (link flap, surviving session) then re-bumps the epoch — a
-/// legitimate "transport recovered" signal, and re-arm queries are
-/// cooldown-limited per driver (spec D7), so the prune trades
-/// unbounded memory for at most one extra re-query per flap.
-pub(crate) const TRANSPORT_SEEN_ZIDS_CAP: usize = 4096;
-
-pub(crate) fn merge_peers_detect_new(
-    seen: &mut std::collections::HashSet<String>,
-    refreshed: &[String],
-) -> bool {
-    let mut any_new = false;
-    for zid in refreshed {
-        // contains-then-insert is deliberate (not the single-lookup
-        // `insert(zid.clone())` form): it clones only never-seen zids,
-        // while insert-with-clone would allocate for EVERY zid on
-        // every 5s refresh tick.
-        if !seen.contains(zid) {
-            seen.insert(zid.clone());
-            any_new = true;
-        }
-    }
-    if seen.len() > TRANSPORT_SEEN_ZIDS_CAP {
-        let current: std::collections::HashSet<&String> = refreshed.iter().collect();
-        seen.retain(|z| current.contains(z));
-    }
+/// ZEB-622: up-edge detector over zid-poll snapshots. Replaces the accumulating
+/// seen-zid set (which never forgot, so a same-zid reconnect never re-armed the
+/// backfill epoch). An up-edge = a zid present now that was absent in the
+/// previous snapshot; `prev` is REPLACED by the current snapshot each call, so
+/// a flap longer than one poll interval (~5s) re-fires. Sub-interval LAN flaps
+/// can be missed here — iroh peers are covered event-driven by peer_liveness.
+fn detect_up_edges(prev: &mut std::collections::HashSet<String>, current: &[String]) -> bool {
+    let cur: std::collections::HashSet<String> = current.iter().cloned().collect();
+    let any_new = current.iter().any(|z| !prev.contains(z));
+    *prev = cur;
     any_new
 }
 
@@ -6440,51 +6448,49 @@ mod mail_root_outcome_tests {
 
 #[cfg(test)]
 mod transport_epoch_tests {
-    use super::merge_peers_detect_new;
+    use super::detect_up_edges;
 
+    /// A never-before-seen zid in the current snapshot is an up-edge.
     #[test]
-    fn transport_epoch_bumps_only_on_new_zids() {
-        let mut seen: std::collections::HashSet<String> =
-            ["a".to_string(), "b".to_string()].into_iter().collect();
-        // Same set → no bump.
-        assert!(!merge_peers_detect_new(
-            &mut seen,
+    fn detect_up_edges_new_zid_fires() {
+        let mut prev: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert!(detect_up_edges(
+            &mut prev,
             &["a".to_string(), "b".to_string()]
-        ));
-        // Peer disappears → no bump (loss is not recovery).
-        assert!(!merge_peers_detect_new(&mut seen, &["a".to_string()]));
-        // New zid (rebooted peer = fresh session zid) → bump.
-        assert!(merge_peers_detect_new(
-            &mut seen,
-            &["a".to_string(), "c".to_string()]
-        ));
-        // Accumulating: c stays known even after flapping out and back —
-        // a flapping link does not re-bump; genuine new sessions do.
-        assert!(!merge_peers_detect_new(&mut seen, &["c".to_string()]));
-        assert!(!merge_peers_detect_new(
-            &mut seen,
-            &["a".to_string(), "c".to_string()]
         ));
     }
 
-    /// PR #230 review (Qodo): the seen-set must not grow without bound
-    /// under session churn on a long-lived node. Overflow past
-    /// [`super::TRANSPORT_SEEN_ZIDS_CAP`] prunes to the current
-    /// snapshot; a pruned zid returning later re-bumps (accepted —
-    /// cooldown-limited "transport recovered" signal).
+    /// An identical snapshot re-fires nothing.
     #[test]
-    fn seen_set_prunes_to_current_snapshot_when_over_cap() {
-        let mut seen: std::collections::HashSet<String> = (0..=super::TRANSPORT_SEEN_ZIDS_CAP)
-            .map(|i| format!("z{i}"))
-            .collect();
-        let refreshed = vec!["z0".to_string(), "fresh".to_string()];
-        // "fresh" is new → bump; the merged set overflows the cap and
-        // prunes down to exactly the current snapshot.
-        assert!(merge_peers_detect_new(&mut seen, &refreshed));
-        assert_eq!(seen.len(), 2);
-        assert!(seen.contains("z0") && seen.contains("fresh"));
-        // A pruned zid coming back re-bumps — accepted semantics.
-        assert!(merge_peers_detect_new(&mut seen, &["z1".to_string()]));
+    fn detect_up_edges_unchanged_no_fire() {
+        let mut prev: std::collections::HashSet<String> =
+            ["a".to_string(), "b".to_string()].into_iter().collect();
+        assert!(!detect_up_edges(
+            &mut prev,
+            &["a".to_string(), "b".to_string()]
+        ));
+    }
+
+    /// The regression the accumulating gate failed: a zid that drops out of the
+    /// snapshot and RETURNS a poll later re-fires, because `prev` is REPLACED by
+    /// each snapshot. The old seen-set never forgot, so a same-zid reconnect was
+    /// silently swallowed and the backfill epoch never re-armed.
+    #[test]
+    fn detect_up_edges_drop_then_return_refires() {
+        let mut prev: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        // "a" drops out → not an up-edge, and `prev` becomes empty.
+        assert!(!detect_up_edges(&mut prev, &[]));
+        // "a" returns → up-edge (absent in the previous snapshot).
+        assert!(detect_up_edges(&mut prev, &["a".to_string()]));
+    }
+
+    /// A snapshot that simultaneously loses one zid and gains another still
+    /// fires on the newcomer (and then quiesces on the unchanged repeat).
+    #[test]
+    fn detect_up_edges_simultaneous_add_remove_fires() {
+        let mut prev: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert!(detect_up_edges(&mut prev, &["b".to_string()]));
+        assert!(!detect_up_edges(&mut prev, &["b".to_string()]));
     }
 }
 
