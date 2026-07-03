@@ -353,8 +353,9 @@ fn schedule_delay(
 /// Deterministic-locator form used for every dial (`iroh/<hex(node_id)>`); the
 /// iroh transport resolves relay/addrs from the NodeId via its own discovery,
 /// so the locator does not embed the record's relay — the record's role here is
-/// purely freshness gating. Mirrors `iroh_dial_driver::iroh_locator` (kept
-/// local so this task touches no other source file).
+/// purely freshness gating. (Originally mirrored a same-named helper in
+/// `iroh_dial_driver`, since deleted with the dial-once machinery — this is
+/// now the only copy.)
 fn iroh_locator(node_id: &[u8; 32]) -> String {
     format!("iroh/{}", hex::encode(node_id))
 }
