@@ -68,8 +68,55 @@ pub struct ResolverEntry {
     pub source: ReachabilitySource,
 }
 
+/// Dual-slot storage for one `(OwnerAddr, iroh_node_id)` key (ZEB-621).
+///
+/// The durable-CRDT record and the live-pkarr record for the same peer are held
+/// in SEPARATE cells rather than competing for a single slot: each source writes
+/// only its own slot (same-source replacement is ordinary [`lww_newer`] LWW), so
+/// a pkarr cache-back can never evict a durable record and vice versa. Two views
+/// derive from the pair:
+/// - [`durable_preferred`](Self::durable_preferred) — the butler / diagnostics
+///   authority. The durable slot's seal-targets stay valid even when the
+///   recipient's primary is long-offline (window-EXEMPT, ZEB-488), so butler /
+///   diag / e2e consumers keep seeing it whenever it exists.
+/// - [`freshest`](Self::freshest) — the DIAL authority. A dialer wants the
+///   record with the most recent addressing, whichever source carries it, so a
+///   fresher pkarr blob can win the route while the durable slot still backs the
+///   butler view.
+#[derive(Debug, Clone, Default)]
+struct ResolverSlots {
+    durable: Option<ResolverEntry>,
+    pkarr: Option<ResolverEntry>,
+}
+
+impl ResolverSlots {
+    /// Dial authority: the entry whose payload was announced most recently
+    /// (greater `payload.announced_at_ms`); ties resolve to the durable slot.
+    /// `None` only for an empty pair (never stored — `update_with_source` writes
+    /// at least one slot before any entry lands in the map).
+    fn freshest(&self) -> Option<&ResolverEntry> {
+        match (&self.durable, &self.pkarr) {
+            (Some(d), Some(p)) => {
+                if p.payload.announced_at_ms > d.payload.announced_at_ms {
+                    Some(p)
+                } else {
+                    Some(d)
+                }
+            }
+            (Some(d), None) => Some(d),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        }
+    }
+
+    /// Butler / diagnostics authority: the durable slot if present, else pkarr.
+    fn durable_preferred(&self) -> Option<&ResolverEntry> {
+        self.durable.as_ref().or(self.pkarr.as_ref())
+    }
+}
+
 pub struct ReachabilityResolver {
-    inner: Arc<RwLock<BTreeMap<ResolverKey, ResolverEntry>>>,
+    inner: Arc<RwLock<BTreeMap<ResolverKey, ResolverSlots>>>,
     /// Wrapped in an outer `Arc` so that all clones share the same
     /// `RwLock` — wiring the fallback via `set_fallback_source` on any
     /// clone is immediately visible to all others (CodeRabbit PR #158 round 2).
@@ -184,44 +231,48 @@ impl ReachabilityResolver {
     ) {
         let key: ResolverKey = (actor, payload.iroh_node_id);
         let node_id = payload.iroh_node_id;
-        let mut map = self.inner.write().expect("resolver write lock");
-        let was_present = map.contains_key(&key);
         let next = ResolverEntry {
             payload,
             hlc,
             source,
         };
-        // Track whether an existing record is LWW-replaced by one whose iroh
-        // relay URL or direct-address SET materially differs — the signal the
-        // reconnect supervisor re-dials on (ZEB-620). Computed BEFORE the
-        // overwrite (the prior payload is gone afterwards) and only inside the
-        // `should_replace` branch, so a byte-identical beacon republish and an
-        // LWW-rejected stale record both leave it false (no ladder thrash).
-        let mut record_changed = false;
-        let do_replace = match map.get(&key) {
-            Some(prev) => {
-                let replace = should_replace(prev, &next);
-                if replace {
-                    record_changed = addressing_differs(&prev.payload, &next.payload);
-                }
-                replace
-            }
+        let mut map = self.inner.write().expect("resolver write lock");
+        let slots = map.entry(key).or_default();
+        // The reconnect-supervisor kick gate (ZEB-620/621) is evaluated against
+        // the FRESHEST dial view, snapshotted before AND after the slot write:
+        // `was_present` = any slot existed beforehand. Deriving `RecordChanged`
+        // from the pre/post freshest addressing means a fresher pkarr record that
+        // shifts the effective route fires it — the stale-route-unpin payoff —
+        // while an LWW-rejected or byte-identical write leaves the view unchanged
+        // and silent (no ladder thrash).
+        let was_present = slots.durable.is_some() || slots.pkarr.is_some();
+        let before_view = slots.freshest().map(|e| e.payload.clone());
+        // Each source writes ONLY its own slot; same-source replacement is LWW.
+        let target = match source {
+            ReachabilitySource::DurableCrdt => &mut slots.durable,
+            ReachabilitySource::PkarrLive => &mut slots.pkarr,
+        };
+        let do_replace = match target.as_ref() {
+            Some(prev) => lww_newer(prev, &next),
             None => true,
         };
         if do_replace {
-            map.insert(key, next);
+            *target = Some(next);
         }
+        let after_view = slots.freshest().map(|e| e.payload.clone());
         drop(map);
-        // ZEB-620: reconnect-supervisor triggers (the successor to ZEB-373's
-        // retired `DialHint` mpsc). A first-learn kicks `NewPeer`; a material
-        // record change on an already-known peer kicks `RecordChanged`. Mutually
-        // exclusive by construction (`was_present`), so at most one fires per
-        // update; `kick` is lossless and non-blocking.
+        // ZEB-620/621: reconnect-supervisor triggers (the successor to ZEB-373's
+        // retired `DialHint` mpsc). A first-learn kicks `NewPeer`; a change in the
+        // effective dial addressing on an already-known peer kicks
+        // `RecordChanged`. Mutually exclusive by construction (`was_present`), so
+        // at most one fires per update; `kick` is lossless and non-blocking.
         if let Some(sup) = self.supervisor.read().expect("supervisor lock").as_ref() {
-            if !was_present {
-                sup.kick(node_id, ReconnectTrigger::NewPeer);
-            } else if record_changed {
-                sup.kick(node_id, ReconnectTrigger::RecordChanged);
+            match (was_present, before_view, after_view) {
+                (false, _, Some(_)) => sup.kick(node_id, ReconnectTrigger::NewPeer),
+                (true, Some(before), Some(after)) if addressing_differs(&before, &after) => {
+                    sup.kick(node_id, ReconnectTrigger::RecordChanged)
+                }
+                _ => {}
             }
         }
     }
@@ -233,14 +284,16 @@ impl ReachabilityResolver {
     pub fn resolve(&self, actor: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
         let map = self.inner.read().expect("resolver read lock");
         map.range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
-            .map(|(_, v)| v.payload.clone())
+            .filter_map(|(_, v)| v.durable_preferred().map(|e| e.payload.clone()))
             .collect()
     }
 
     pub fn list_active_peers(&self) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload)> {
         let map = self.inner.read().expect("resolver read lock");
         map.iter()
-            .map(|((owner, _node_id), v)| (*owner, v.payload.clone()))
+            .filter_map(|((owner, _node_id), v)| {
+                v.durable_preferred().map(|e| (*owner, e.payload.clone()))
+            })
             .collect()
     }
 
@@ -253,7 +306,10 @@ impl ReachabilityResolver {
     ) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload, ReachabilitySource)> {
         let map = self.inner.read().expect("resolver read lock");
         map.iter()
-            .map(|((owner, _node_id), v)| (*owner, v.payload.clone(), v.source))
+            .filter_map(|((owner, _node_id), v)| {
+                v.durable_preferred()
+                    .map(|e| (*owner, e.payload.clone(), e.source))
+            })
             .collect()
     }
 
@@ -276,7 +332,24 @@ impl ReachabilityResolver {
         let map = self.inner.read().expect("resolver read lock");
         map.iter()
             .find(|((_, key_node_id), _)| key_node_id == node_id_bytes)
-            .map(|((owner, _), v)| (*owner, v.payload.clone()))
+            .and_then(|((owner, _), v)| v.freshest().map(|e| (*owner, e.payload.clone())))
+    }
+
+    /// Freshest-view reverse lookup for the DIAL path (ZEB-621; consumed by
+    /// Task 2). Like [`resolve_by_node_id`](Self::resolve_by_node_id) but returns
+    /// the full [`ResolverEntry`] — source + HLC + timestamps — so the dialer can
+    /// inspect the winning record's provenance and freshness, not just its
+    /// payload. Returns the entry with the most recent `announced_at_ms` across
+    /// the peer's durable and pkarr slots (ties → durable), matching
+    /// `resolve_by_node_id`'s freshest-wins dial semantics.
+    pub fn resolve_entry_by_node_id(
+        &self,
+        node_id_bytes: &[u8; 32],
+    ) -> Option<(OwnerAddr, ResolverEntry)> {
+        let map = self.inner.read().expect("resolver read lock");
+        map.iter()
+            .find(|((_, key_node_id), _)| key_node_id == node_id_bytes)
+            .and_then(|((owner, _), v)| v.freshest().map(|e| (*owner, e.clone())))
     }
 
     /// Evict every device record for `actor`. Called from the membership-
@@ -338,8 +411,10 @@ impl ReachabilityResolver {
     /// seed through `update()` would mis-tag it `DurableCrdt`). Uses the same HLC
     /// construction pattern as `resolve_async`'s cache population
     /// (`wall_ms = payload.announced_at_ms, logical = 0, device_id = ""`); a
-    /// later durable-CRDT record for the same `(owner, node_id)` then takes over
-    /// the slot via the source-priority guard in `should_replace`.
+    /// later durable-CRDT record for the same `(owner, node_id)` installs into
+    /// its own durable slot (ZEB-621 dual-slot storage), so the butler view
+    /// (durable-preferred) returns it while the dial view (freshest) keeps
+    /// whichever record was announced most recently.
     ///
     /// `async` for API alignment with the Task 3 IPC handler (which
     /// `.await`s this call between two sync-locked sections). The
@@ -411,7 +486,7 @@ impl ReachabilityResolver {
     ) -> Vec<(ReachabilityAnnouncePayload, ReachabilitySource)> {
         let map = self.inner.read().expect("resolver read lock");
         map.range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
-            .map(|(_, v)| (v.payload.clone(), v.source))
+            .filter_map(|(_, v)| v.durable_preferred().map(|e| (e.payload.clone(), e.source)))
             .collect()
     }
 
@@ -479,27 +554,21 @@ fn addressing_differs(
     prev_addrs != next_addrs
 }
 
-/// LWW comparator. `Hlc` does not derive `Ord` (canonical-CBOR keying
-/// constraints — see `owner_state_types.rs::Hlc`), so we compare by the
-/// same lexicographic tuple `(wall_ms, logical, device_id)` used by
-/// `Hlc::is_strictly_newer_than`. Ties on HLC fall through to
+/// LWW comparator for SAME-SOURCE slot replacement. `Hlc` does not derive `Ord`
+/// (canonical-CBOR keying constraints — see `owner_state_types.rs::Hlc`), so we
+/// compare by the same lexicographic tuple `(wall_ms, logical, device_id)` used
+/// by `Hlc::is_strictly_newer_than`. Ties on HLC fall through to
 /// `announced_at_ms` then lex `iroh_node_id`, per spec §5.4.
-fn should_replace(prev: &ResolverEntry, next: &ResolverEntry) -> bool {
-    // Source-priority guard (ZEB-488; Qodo "Pkarr evicts durable reachability").
-    // Durable-CRDT seal-targets are authoritative and window-EXEMPT, so the
-    // single LWW slot per `(owner, iroh_node_id)` must never let a pkarr
-    // cache-back evict a durable record — otherwise the entry becomes
-    // `PkarrLive`, the 15-min freshness window re-applies, and a fully-offline
-    // recipient's seal-targets vanish after the window (the exact gap this PR
-    // closes). Conversely a durable announce that replicates LATER (with an
-    // older `announced_at_ms` than a frequently-refreshed pkarr blob) must still
-    // take over the slot, so an HLC-blind upgrade is required. Same-source
-    // updates fall through to the HLC/announced_at/node_id LWW below.
-    match (prev.source, next.source) {
-        (ReachabilitySource::DurableCrdt, ReachabilitySource::PkarrLive) => return false,
-        (ReachabilitySource::PkarrLive, ReachabilitySource::DurableCrdt) => return true,
-        _ => {}
-    }
+///
+/// ZEB-621 dual-slot split: durable-CRDT and live-pkarr records for the same
+/// `(owner, iroh_node_id)` now live in SEPARATE cells ([`ResolverSlots`]), and
+/// each source writes only its own slot — so this comparator only ever sees
+/// `prev`/`next` of the SAME source. The old cross-source source-priority guard
+/// (ZEB-488) is gone: its intent is now structural rather than a comparator
+/// special-case. The durable slot is the butler authority and stays
+/// window-EXEMPT (a pkarr write can never touch it); the freshest view across
+/// both slots is the dial authority.
+fn lww_newer(prev: &ResolverEntry, next: &ResolverEntry) -> bool {
     let prev_key = (
         prev.hlc.wall_ms,
         prev.hlc.logical,
@@ -549,6 +618,13 @@ mod tests {
         }
     }
 
+    /// The composite key's node-id half for a payload minted by
+    /// [`make_payload`] with byte `b` — must match `make_payload`'s
+    /// `iroh_node_id: [b; 32]` convention so ids agree across helpers.
+    fn node_id_bytes(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
     /// ZEB-622: the liveness seam mirrors the supervisor seam — `liveness()` is
     /// `None` until `set_liveness`, then returns a handle sharing the installed
     /// state, so an up-edge raised through the returned clone is visible via a
@@ -592,42 +668,14 @@ mod tests {
         assert_eq!(records[0].announced_at_ms, 2000);
     }
 
-    /// Q1 / ZEB-488: a fresher pkarr cache-back must NOT evict a durable record.
-    /// The durable entry's butler-set is window-exempt; letting a 15-min-windowed
-    /// pkarr entry overwrite the slot reopens "empty seal-targets after 15 min".
-    #[test]
-    fn durable_not_evicted_by_fresher_pkarr() {
-        let r = ReachabilityResolver::new();
-        let actor = OwnerAddr([0x11; 16]);
-        r.update_with_source(
-            actor,
-            make_payload(1, 1000),
-            make_hlc(1000, 0, "a"),
-            ReachabilitySource::DurableCrdt,
-        );
-        // Fresher pkarr cache-back for the SAME (owner, node_id).
-        r.update_with_source(
-            actor,
-            make_payload(1, 9000),
-            make_hlc(9000, 0, "a"),
-            ReachabilitySource::PkarrLive,
-        );
-        let tagged = r.resolve_with_source(&actor);
-        assert_eq!(tagged.len(), 1);
-        assert_eq!(
-            tagged[0].1,
-            ReachabilitySource::DurableCrdt,
-            "durable record must survive a fresher pkarr cache-back"
-        );
-        assert_eq!(
-            tagged[0].0.announced_at_ms, 1000,
-            "durable payload retained, not the pkarr one"
-        );
-    }
-
-    /// Q1 / ZEB-488: a durable announce that replicates LATER — with an OLDER
-    /// announced_at than a frequently-refreshed pkarr blob — must still take over
-    /// the slot. The pkarr→durable upgrade is HLC-blind by design.
+    /// ZEB-621: durable and pkarr now occupy SEPARATE slots. A durable announce
+    /// that replicates LATER (with an OLDER `announced_at` than a
+    /// frequently-refreshed pkarr blob) installs into its OWN slot: the butler
+    /// view (durable-preferred) flips to the durable record, while the dial view
+    /// (freshest) stays with the fresher pkarr record. (Supersedes the old
+    /// single-slot `durable_not_evicted_by_fresher_pkarr` /
+    /// `pkarr_upgraded_by_older_durable` source-guard pair; the butler-view half
+    /// is now pinned by `butler_view_stays_durable_despite_fresher_pkarr`.)
     #[test]
     fn pkarr_upgraded_by_older_durable() {
         let r = ReachabilityResolver::new();
@@ -644,14 +692,23 @@ mod tests {
             make_hlc(1000, 0, "a"),
             ReachabilitySource::DurableCrdt,
         );
+        // Butler view: durable-preferred → the durable slot, tagged DurableCrdt.
         let tagged = r.resolve_with_source(&actor);
         assert_eq!(tagged.len(), 1);
         assert_eq!(
             tagged[0].1,
             ReachabilitySource::DurableCrdt,
-            "durable must upgrade the slot regardless of HLC ordering"
+            "butler view flips to durable once its own slot is installed"
         );
         assert_eq!(tagged[0].0.announced_at_ms, 1000);
+        // Dial view: freshest → the fresher pkarr slot survives.
+        let (_, dial) = r
+            .resolve_by_node_id(&node_id_bytes(1))
+            .expect("dial record");
+        assert_eq!(
+            dial.announced_at_ms, 9000,
+            "dial view keeps the fresher pkarr record"
+        );
     }
 
     /// The source guard governs only cross-source collisions; same-source updates
@@ -818,7 +875,7 @@ mod tests {
         let actor = OwnerAddr([0x11; 16]);
         let hlc = make_hlc(1000, 0, "a");
         // Same device, same announced_at_ms, same HLC — second `update`
-        // is a no-op (should_replace returns false on full equality).
+        // is a no-op (lww_newer returns false on full equality).
         r.update(actor, make_payload(0x01, 2000), hlc.clone());
         r.update(actor, make_payload(0x01, 2000), hlc);
         let records = r.resolve(&actor);
@@ -970,7 +1027,7 @@ mod tests {
         r.update(owner, make_payload(0x11, 1000), make_hlc(1000, 0, "a"));
         let sup = SupervisorHandle::new();
         r.set_supervisor(sup.clone());
-        // Same key, newer HLC (so should_replace succeeds), IDENTICAL addressing.
+        // Same key, newer HLC (so lww_newer succeeds), IDENTICAL addressing.
         r.update(owner, make_payload(0x11, 1000), make_hlc(2000, 0, "a"));
         assert_eq!(
             sup.pending_trigger(node_id),
@@ -979,7 +1036,7 @@ mod tests {
         );
     }
 
-    /// An LWW-rejected stale record (`should_replace == false`) must NOT kick,
+    /// An LWW-rejected stale record (`lww_newer == false`) must NOT kick,
     /// even though its addressing differs — the slot is unchanged, so there is
     /// nothing to re-arm on.
     #[test]
@@ -1000,6 +1057,151 @@ mod tests {
             None,
             "LWW-rejected stale record must not kick"
         );
+    }
+
+    // ---- ZEB-621: dual-slot storage + freshest-wins dial view ------------
+
+    /// ZEB-621: dial view (resolve_by_node_id) prefers the FRESHER record across
+    /// sources — a fresher pkarr record beats a stale durable one at dial time.
+    #[test]
+    fn dial_view_prefers_fresher_pkarr_over_stale_durable() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        let durable = make_payload(7, 1_000); // announced_at_ms = 1_000 (stale)
+        r.update(owner, durable, make_hlc(1_000, 0, "dev-a"));
+        let mut pkarr = make_payload(7, 50_000); // same node, fresher
+        pkarr.home_relay_url = "https://fresh.relay/".to_string();
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(owner, pkarr, hlc, ReachabilitySource::PkarrLive);
+
+        let (o, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(o, owner);
+        assert_eq!(p.home_relay_url, "https://fresh.relay/");
+        assert_eq!(p.announced_at_ms, 50_000);
+    }
+
+    /// ZEB-621 + ZEB-488 pin: the durable slot is NEVER evicted by pkarr — the
+    /// butler/diag view (resolve_with_source) still returns the durable entry,
+    /// tagged DurableCrdt, even when a fresher pkarr record wins the dial view.
+    #[test]
+    fn butler_view_stays_durable_despite_fresher_pkarr() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(
+            owner,
+            make_payload(7, 50_000),
+            hlc,
+            ReachabilitySource::PkarrLive,
+        );
+
+        let v = r.resolve_with_source(&owner);
+        assert_eq!(v.len(), 1, "one view per (owner,node), durable-preferred");
+        assert_eq!(v[0].1, ReachabilitySource::DurableCrdt);
+        assert_eq!(v[0].0.announced_at_ms, 1_000);
+    }
+
+    /// ZEB-621: an OLDER pkarr record loses the dial view to a fresher durable.
+    #[test]
+    fn dial_view_keeps_fresher_durable_over_stale_pkarr() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        let hlc = Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(
+            owner,
+            make_payload(7, 1_000),
+            hlc,
+            ReachabilitySource::PkarrLive,
+        );
+        r.update(owner, make_payload(7, 50_000), make_hlc(50_000, 0, "dev-a"));
+
+        let (_, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(p.announced_at_ms, 50_000);
+    }
+
+    /// ZEB-621: a fresher pkarr record that changes effective addressing kicks
+    /// RecordChanged (the stale-route-unpin payoff). The supervisor is installed
+    /// AFTER the first learn (as in the existing kick tests) so the NewPeer kick
+    /// is never recorded and cannot mask the RecordChanged assertion —
+    /// `pending_trigger` is a read-only accessor and does not drain.
+    #[test]
+    fn fresher_pkarr_with_new_addressing_kicks_record_changed() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        let mut pkarr = make_payload(7, 50_000);
+        pkarr.home_relay_url = "https://fresh.relay/".to_string();
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(owner, pkarr, hlc, ReachabilitySource::PkarrLive);
+        assert_eq!(
+            sup.pending_trigger(node_id_bytes(7)),
+            Some(ReconnectTrigger::RecordChanged)
+        );
+    }
+
+    /// ZEB-621: a fresher pkarr record with IDENTICAL addressing does NOT kick
+    /// (no ladder thrash on a byte-identical refresh). Supervisor installed after
+    /// the first learn so no NewPeer kick is pending to confound the assertion.
+    #[test]
+    fn fresher_pkarr_same_addressing_does_not_kick() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(
+            owner,
+            make_payload(7, 50_000),
+            hlc,
+            ReachabilitySource::PkarrLive,
+        );
+        assert_eq!(sup.pending_trigger(node_id_bytes(7)), None);
+    }
+
+    /// ZEB-621: remove_owner clears BOTH slots.
+    #[test]
+    fn remove_owner_clears_both_slots() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(
+            owner,
+            make_payload(7, 50_000),
+            hlc,
+            ReachabilitySource::PkarrLive,
+        );
+        assert_eq!(r.remove_owner(&owner), 1); // one composite entry (both slots)
+        assert!(r.resolve_by_node_id(&node_id_bytes(7)).is_none());
+        assert!(r.resolve(&owner).is_empty());
     }
 }
 
