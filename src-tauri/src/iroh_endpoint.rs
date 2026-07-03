@@ -113,6 +113,16 @@ const KEYCHAIN_USER: &str = "iroh.secret_key";
 #[derive(Clone, Debug)]
 pub struct IrohEndpoint {
     inner: Endpoint,
+    /// ZEB-624: authoritative, in-process view of the endpoint's CONFIGURED
+    /// relay URLs. iroh 1.0.1's `Endpoint` exposes relay-map *mutators*
+    /// ([`Endpoint::insert_relay`]/[`Endpoint::remove_relay`]) but no reader of
+    /// the full configured map (only `home_relay_status()`, the
+    /// negotiated/connected subset), so we track the configured set here: seeded
+    /// at build (the custom list, or the `presets::N0` default relay map) and
+    /// kept in lock-step by [`Self::apply_relay_urls`] — the ONLY path that
+    /// mutates the endpoint's relay map. Shared via `Arc` so every `Clone` of
+    /// this wrapper observes the same live set.
+    relay_urls: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<RelayUrl>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,8 +146,25 @@ impl IrohEndpoint {
     /// identity. Registers the harmony ALPNs and takes the `presets::N0`
     /// relay defaults — in iroh 1.0 the N0 preset's default relay map is
     /// n0's stable production cluster (ZEB-619 retired the ZEB-617 pin).
+    ///
+    /// Delegates to [`Self::new_with_secret_and_relays`] with `None` (follow the
+    /// preset defaults); ZEB-624 introduced the custom-relay variant for the
+    /// user-configurable iroh relay list.
     pub async fn new_with_secret(secret_key: SecretKey) -> Result<Self, IrohEndpointError> {
-        let inner = Endpoint::builder(presets::N0)
+        Self::new_with_secret_and_relays(secret_key, None).await
+    }
+
+    /// ZEB-624: build + bind like [`Self::new_with_secret`] but with an optional
+    /// user-configured custom relay list. `None` (or an empty list) follows the
+    /// `presets::N0` default relay map (n0 stable); `Some(non-empty)` pins
+    /// exactly those relays via `RelayMode::custom`. The CONFIGURED relay set is
+    /// recorded in `relay_urls` so [`Self::relay_map_urls`] can report it and
+    /// [`Self::apply_relay_urls`] can diff against it for live relay-map edits.
+    pub async fn new_with_secret_and_relays(
+        secret_key: SecretKey,
+        custom_relays: Option<Vec<RelayUrl>>,
+    ) -> Result<Self, IrohEndpointError> {
+        let builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![
                 alpn::HARMONY_ZENOH_V1.to_vec(),
@@ -150,11 +177,101 @@ impl IrohEndpoint {
                 alpn::HARMONY_COMMUNITY_RELAY_PULL_V1.to_vec(),
                 alpn::HARMONY_TUNNEL_V1.to_vec(),
                 alpn::HARMONY_TUNNEL_V2.to_vec(),
-            ])
+            ]);
+        // Seed the tracked configured-relay set from the SAME source the builder
+        // binds with: the custom list, else the `presets::N0` default relay map.
+        let (builder, configured): (_, std::collections::BTreeSet<RelayUrl>) = match custom_relays {
+            Some(urls) if !urls.is_empty() => {
+                let set = urls.iter().cloned().collect();
+                (
+                    builder.relay_mode(iroh::endpoint::RelayMode::custom(urls)),
+                    set,
+                )
+            }
+            _ => {
+                let set = iroh::endpoint::default_relay_mode()
+                    .relay_map()
+                    .urls::<Vec<RelayUrl>>()
+                    .into_iter()
+                    .collect();
+                (builder, set)
+            }
+        };
+        let inner = builder
             .bind()
             .await
             .map_err(|e| IrohEndpointError::Bind(Box::new(e)))?;
-        Ok(Self { inner })
+        Ok(Self::from_parts(inner, configured))
+    }
+
+    /// Wrap an already-bound iroh [`Endpoint`] with the given CONFIGURED relay
+    /// set. The single struct-literal constructor so the `relay_urls` tracking
+    /// invariant lives in one place.
+    fn from_parts(inner: Endpoint, relay_urls: std::collections::BTreeSet<RelayUrl>) -> Self {
+        Self {
+            inner,
+            relay_urls: std::sync::Arc::new(std::sync::Mutex::new(relay_urls)),
+        }
+    }
+
+    /// ZEB-624: the endpoint's CONFIGURED relay URLs as normalized strings,
+    /// sorted. Reads the tracked set (`relay_urls`) — the authoritative view of
+    /// what the endpoint's relay map holds, since iroh 1.0.1's `Endpoint` has no
+    /// reader for the full configured map. The trailing slash `RelayUrl`'s
+    /// `Display` adds (a relay is a host-only base) is stripped so this matches
+    /// the persisted / validated wire form (`connectivity_settings`'
+    /// `validate_iroh_relay_urls` normalizes the same way) — the two feed the
+    /// same `get_iroh_relays` field, so they must agree. The strings still
+    /// round-trip through `RelayUrl::from_str` (URL parsing re-adds the root
+    /// path), which is how callers reconstruct `RelayUrl`s from them.
+    pub fn relay_map_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = {
+            let guard = self.relay_urls.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .iter()
+                .map(|u| u.to_string().trim_end_matches('/').to_string())
+                .collect()
+        };
+        urls.sort();
+        urls
+    }
+
+    /// ZEB-624: reconcile the endpoint's relay map to exactly `target` — insert
+    /// each target relay not already configured, remove each configured relay not
+    /// in `target` — updating the tracked set in lock-step. Returns `(inserted,
+    /// removed)` counts; `(0, 0)` when already reconciled (idempotent).
+    /// `insert_relay`/`remove_relay` no-op on a closed endpoint (torn-down node),
+    /// which the counts still reflect so a caller's log matches the intended diff.
+    pub async fn apply_relay_urls(&self, target: &[RelayUrl]) -> (usize, usize) {
+        let current: std::collections::BTreeSet<RelayUrl> = {
+            let guard = self.relay_urls.lock().unwrap_or_else(|p| p.into_inner());
+            guard.clone()
+        };
+        let target_set: std::collections::BTreeSet<RelayUrl> = target.iter().cloned().collect();
+        let mut inserted = 0usize;
+        let mut removed = 0usize;
+        for url in &target_set {
+            if !current.contains(url) {
+                self.inner
+                    .insert_relay(
+                        url.clone(),
+                        std::sync::Arc::new(iroh::RelayConfig::from(url.clone())),
+                    )
+                    .await;
+                inserted += 1;
+            }
+        }
+        for url in &current {
+            if !target_set.contains(url) {
+                self.inner.remove_relay(url).await;
+                removed += 1;
+            }
+        }
+        if inserted > 0 || removed > 0 {
+            let mut guard = self.relay_urls.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = target_set;
+        }
+        (inserted, removed)
     }
 
     /// This endpoint's stable identity, derived from the persistent
@@ -243,7 +360,10 @@ impl IrohEndpoint {
     #[allow(dead_code)] // Only consumed by `#[cfg(test)]` modules; unused
                         // under bare `--features test-fixtures` builds (e.g. clippy --all-targets).
     pub(crate) fn from_endpoint_for_test(inner: Endpoint) -> Self {
-        Self { inner }
+        // Hermetic test endpoints bind with `RelayMode::Disabled` (empty relay
+        // map), so seed an empty tracked set. Tests that exercise the relay-map
+        // surface go through `new_with_secret_and_relays` instead.
+        Self::from_parts(inner, std::collections::BTreeSet::new())
     }
 
     /// Public alias of [`Self::from_endpoint_for_test`] for integration
@@ -435,7 +555,7 @@ mod tests {
             .bind()
             .await
             .expect("bind ephemeral endpoint");
-        let ep = IrohEndpoint { inner };
+        let ep = IrohEndpoint::from_parts(inner, std::collections::BTreeSet::new());
 
         // Identity round-trips through the secret key we generated.
         assert_eq!(ep.node_id(), expected_id);
@@ -477,6 +597,71 @@ mod tests {
                 "unexpected relay host: {url}"
             );
         }
+    }
+
+    /// Parse `relay_map_urls()` output back into a `RelayUrl` set — the
+    /// round-trip comparison the ZEB-624 endpoint tests use so they don't depend
+    /// on iroh's exact URL string canonicalization (trailing slash / FQDN dot).
+    fn relay_url_set(ep: &IrohEndpoint) -> std::collections::BTreeSet<RelayUrl> {
+        ep.relay_map_urls()
+            .iter()
+            .map(|s| s.parse::<RelayUrl>().expect("relay_map_urls round-trips"))
+            .collect()
+    }
+
+    /// ZEB-624: a custom relay list supplied at build overrides the n0 preset
+    /// default map — the configured relay map is EXACTLY the custom list.
+    /// Asserts via `RelayUrl` round-trip equality (not a raw string literal) so
+    /// the test is agnostic to iroh's URL canonicalization.
+    #[tokio::test]
+    async fn custom_relay_list_overrides_default_map() {
+        let secret = SecretKey::generate();
+        let custom: RelayUrl = "https://relay.example.com"
+            .parse()
+            .expect("parse custom relay url");
+        let ep = IrohEndpoint::new_with_secret_and_relays(secret, Some(vec![custom.clone()]))
+            .await
+            .expect("bind endpoint with custom relay");
+        assert_eq!(
+            relay_url_set(&ep),
+            std::collections::BTreeSet::from([custom.clone()])
+        );
+        ep.shutdown().await;
+    }
+
+    /// ZEB-624: `apply_relay_urls` diffs the target against the configured set —
+    /// one insert + one remove when swapping [A] → [B], then a no-op when the
+    /// same target is re-applied (idempotent). No relay traffic is generated by
+    /// merely holding a relay map, so this stays hermetic.
+    #[tokio::test]
+    async fn apply_relay_urls_diffs_insert_and_remove() {
+        let secret = SecretKey::generate();
+        let a: RelayUrl = "https://relay-a.example.com".parse().expect("parse A");
+        let b: RelayUrl = "https://relay-b.example.com".parse().expect("parse B");
+        let ep = IrohEndpoint::new_with_secret_and_relays(secret, Some(vec![a.clone()]))
+            .await
+            .expect("bind endpoint with [A]");
+        assert_eq!(
+            relay_url_set(&ep),
+            std::collections::BTreeSet::from([a.clone()])
+        );
+
+        // Swap to [B]: B inserted, A removed.
+        let (inserted, removed) = ep.apply_relay_urls(&[b.clone()]).await;
+        assert_eq!((inserted, removed), (1, 1));
+        assert_eq!(
+            relay_url_set(&ep),
+            std::collections::BTreeSet::from([b.clone()])
+        );
+
+        // Re-applying the same target is a no-op.
+        let (inserted2, removed2) = ep.apply_relay_urls(&[b.clone()]).await;
+        assert_eq!((inserted2, removed2), (0, 0));
+        assert_eq!(
+            relay_url_set(&ep),
+            std::collections::BTreeSet::from([b.clone()])
+        );
+        ep.shutdown().await;
     }
 
     #[test]

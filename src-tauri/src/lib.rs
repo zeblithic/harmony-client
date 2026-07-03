@@ -3951,7 +3951,26 @@ pub async fn start_node_inner(
             match crate::iroh_endpoint::load_or_create_secret_key() {
                 Ok((secret, fc)) => {
                     freshly_created = fc;
-                    match crate::iroh_endpoint::IrohEndpoint::new_with_secret(secret).await {
+                    // ZEB-624: apply the persisted custom iroh relay list at
+                    // endpoint build. Empty persisted list → None = follow the
+                    // preset defaults (n0 stable); a custom list is parsed to
+                    // `RelayUrl`s (sanitize already dropped malformed entries, so
+                    // any parse failure here is unexpected — `parse_iroh_relay_urls`
+                    // warns + skips it). A concurrent `set_iroh_relays` IPC that
+                    // lands after this read is reconciled by the boot pass below.
+                    let iroh_settings =
+                        connectivity_settings::ConnectivitySettings::load_or_default(
+                            &app_data_dir.join("connectivity-settings.json"),
+                        );
+                    let custom_iroh_relays =
+                        connectivity_settings::effective_iroh_relays(&iroh_settings)
+                            .map(|urls| parse_iroh_relay_urls(&urls));
+                    match crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays(
+                        secret,
+                        custom_iroh_relays,
+                    )
+                    .await
+                    {
                         Ok(ep) => {
                             let ep_arc = std::sync::Arc::new(ep);
                             let (new_link_tx, new_link_rx) =
@@ -10272,6 +10291,56 @@ pub async fn start_node_inner(
                         // listeners refetch, otherwise they'd show the
                         // pre-reconcile list until the next manual refresh.
                         app.emit("connectivity-relays-changed", serde_json::Value::Null);
+                    }
+                }
+            }
+
+            // ZEB-624: reconcile the live iroh relay map against persisted
+            // settings now that the endpoint handle is stashed and visible. A
+            // set/add/remove/reset_iroh_relays IPC may have persisted a newer
+            // `iroh_relays` list while boot was still building the endpoint (at
+            // which point `iroh_endpoint` was still None on NodeState, so that
+            // IPC's live diff-apply was skipped) — without this the endpoint's
+            // relay map would lag connectivity-settings.json until the next
+            // mutation or restart. Hold the same write lock the mutators take;
+            // the generation guard skips an endpoint a newer start_node owns. The
+            // diff is `RelayUrl`-valued (`apply_relay_urls`), so it's a genuine
+            // no-op when the relay set already matches — the common path applies
+            // nothing.
+            {
+                let _relay_boot_guard = iroh_relay_write_lock().lock().await;
+                let target = {
+                    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                    if guard.generation != our_gen {
+                        None
+                    } else {
+                        match (
+                            guard.iroh_endpoint.as_ref(),
+                            guard.connectivity_settings_path.as_ref(),
+                        ) {
+                            (Some(ep), Some(path)) => {
+                                Some((std::sync::Arc::clone(ep), path.clone()))
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some((ep, path)) = target {
+                    let settings =
+                        connectivity_settings::ConnectivitySettings::load_or_default(&path);
+                    let want = parse_iroh_relay_urls(&iroh_target_relay_urls(&settings));
+                    let (inserted, removed) = ep.apply_relay_urls(&want).await;
+                    if inserted > 0 || removed > 0 {
+                        tracing::info!(
+                            inserted,
+                            removed,
+                            "ZEB-624: iroh relay settings changed during boot; \
+                             reconciled live relay map to persisted set"
+                        );
+                        // Mirror the mutators: a relay-map change must emit so the
+                        // Settings listener refetches rather than showing the
+                        // pre-reconcile list until the next manual refresh.
+                        app.emit("iroh-relays-changed", serde_json::Value::Null);
                     }
                 }
             }
@@ -47165,6 +47234,245 @@ async fn get_pkarr_relays(
     Ok(relays)
 }
 
+// ─── ZEB-624: user-configurable iroh transport relay list ───────────────────
+//
+// The iroh mirror of the pkarr relay verbs above. Distinct from the pkarr pool
+// (`relays`): the pkarr pool steers identity publish/resolve, whereas
+// `iroh_relays` steers iroh's transport home-relay selection. Persisted in the
+// SAME `connectivity-settings.json`; an EMPTY list is the sentinel for "follow
+// the iroh preset's default relay map" (n0 stable), so `reset` writes `[]` and
+// `set` requires >=1 (`validate_iroh_relay_urls` rejects empty). Mutations are
+// serialized by `iroh_relay_write_lock()` (separate from the NodeState mutex, so
+// no lock-ordering concern), persisted, then live-diff-applied to the running
+// endpoint (no restart) and announced via `iroh-relays-changed`.
+
+/// ZEB-624: the wire shape every iroh-relay verb returns. `relays` is the
+/// EFFECTIVE relay URL list (the custom list, or the materialized preset
+/// defaults); `custom` is whether a user override is persisted (empty = follow
+/// defaults). `#[serde(rename_all = "camelCase")]` so the JS side reads
+/// `{ relays, custom }`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IrohRelayWire {
+    pub relays: Vec<String>,
+    pub custom: bool,
+}
+
+/// ZEB-624: parse persisted iroh relay URL strings into `RelayUrl`s, dropping
+/// (with a `warn!`) any that fail to parse. `sanitize_iroh_relay_urls` /
+/// `validate_iroh_relay_urls` already reject unparseable entries, so a failure
+/// here is unexpected — we skip rather than abort so one bad entry can't strand
+/// the whole transport. Shared by the boot builder and the live diff-apply.
+fn parse_iroh_relay_urls(urls: &[String]) -> Vec<iroh::RelayUrl> {
+    urls.iter()
+        .filter_map(|s| match s.parse::<iroh::RelayUrl>() {
+            Ok(u) => Some(u),
+            Err(e) => {
+                tracing::warn!(url = %s, error = %e, "ZEB-624: dropping unparseable iroh relay URL");
+                None
+            }
+        })
+        .collect()
+}
+
+/// ZEB-624: the iroh preset's default relay map URLs (n0 stable), normalized +
+/// sorted. The materialized form of the "follow defaults" sentinel — used when
+/// no custom list is persisted, and as the base that `add`/`remove` mutate on a
+/// defaults-following node.
+fn iroh_default_relay_urls() -> Vec<String> {
+    // Strip the trailing slash `RelayUrl`'s `Display` adds so this matches the
+    // persisted/validated wire form (and `IrohEndpoint::relay_map_urls`), keeping
+    // `get_iroh_relays` consistent across its live and defaults branches.
+    let mut urls: Vec<String> = iroh::endpoint::default_relay_mode()
+        .relay_map()
+        .urls::<Vec<iroh::RelayUrl>>()
+        .into_iter()
+        .map(|u| u.to_string().trim_end_matches('/').to_string())
+        .collect();
+    urls.sort();
+    urls
+}
+
+/// ZEB-624: the EFFECTIVE iroh relay URL list for a persisted settings value —
+/// the custom list when one is configured (non-empty after sanitize), else the
+/// preset defaults. The single source both `get_iroh_relays` and the live
+/// diff-apply compute their target from, so they can't disagree.
+fn iroh_target_relay_urls(settings: &connectivity_settings::ConnectivitySettings) -> Vec<String> {
+    connectivity_settings::effective_iroh_relays(settings).unwrap_or_else(iroh_default_relay_urls)
+}
+
+/// ZEB-624: serializes all iroh-relay settings mutations (add/remove/set/reset)
+/// so a concurrent read-modify-write from another window can't lose an update.
+/// Process-global (single per-process settings file); separate from both the
+/// NodeState mutex and `PKARR_RELAY_WRITE_LOCK`, so no lock-ordering concern.
+static IROH_RELAY_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn iroh_relay_write_lock() -> &'static tokio::sync::Mutex<()> {
+    IROH_RELAY_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// ZEB-624: persist an ALREADY-VALIDATED iroh relay list (empty = reset =
+/// follow-defaults sentinel), live-diff-apply the effective target to the
+/// running endpoint if any, emit `iroh-relays-changed`, and return the wire.
+/// The iroh mirror of `apply_pkarr_relays`. Callers hold `iroh_relay_write_lock()`.
+async fn apply_iroh_relays<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &tauri::State<'_, Mutex<NodeState>>,
+    validated: Vec<String>,
+) -> Result<IrohRelayWire, String> {
+    let (settings_path, endpoint) = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            guard.connectivity_settings_path.clone(),
+            guard.iroh_endpoint.clone(),
+        )
+    };
+    let path = connectivity_settings_path(settings_path)?;
+    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+    settings.iroh_relays = validated.clone();
+    settings
+        .save(&path)
+        .map_err(|e| format!("save connectivity-settings: {e}"))?;
+    let custom = !validated.is_empty();
+    // The effective target the endpoint must hold (custom list, or defaults).
+    let target = iroh_target_relay_urls(&settings);
+    if let Some(ep) = endpoint {
+        let (inserted, removed) = ep.apply_relay_urls(&parse_iroh_relay_urls(&target)).await;
+        if inserted > 0 || removed > 0 {
+            tracing::info!(
+                inserted,
+                removed,
+                "ZEB-624: iroh relay map diff-applied live"
+            );
+        }
+    }
+    if let Err(e) = app.emit("iroh-relays-changed", ()) {
+        tracing::warn!(error = %e, "apply_iroh_relays: emit failed");
+    }
+    Ok(IrohRelayWire {
+        relays: target,
+        custom,
+    })
+}
+
+/// ZEB-624: current iroh relay list + whether it's a user override. Prefers the
+/// live endpoint's configured map (so a just-applied edit is reflected); falls
+/// back to the effective persisted target pre-wiring. `custom` is always read
+/// from the persisted setting (empty = follow defaults).
+#[tauri::command]
+async fn get_iroh_relays(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<IrohRelayWire, String> {
+    let (settings_path, endpoint) = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            guard.connectivity_settings_path.clone(),
+            guard.iroh_endpoint.clone(),
+        )
+    };
+    let path = connectivity_settings_path(settings_path)?;
+    let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+    let custom = connectivity_settings::effective_iroh_relays(&settings).is_some();
+    let relays = match endpoint {
+        Some(ep) => ep.relay_map_urls(),
+        None => iroh_target_relay_urls(&settings),
+    };
+    Ok(IrohRelayWire { relays, custom })
+}
+
+/// ZEB-624: replace the custom iroh relay list. Validates (>=1, https/loopback,
+/// parses as `RelayUrl`, dedups, caps), persists, then hot-swaps the live
+/// endpoint's relay map (no restart). Empty input is rejected — use
+/// `reset_iroh_relays` to follow the preset defaults.
+#[tauri::command]
+async fn set_iroh_relays<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    relays: Vec<String>,
+) -> Result<IrohRelayWire, String> {
+    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let validated = connectivity_settings::validate_iroh_relay_urls(relays)?;
+    apply_iroh_relays(&app, &state, validated).await
+}
+
+/// ZEB-624: clear the custom iroh relay list (persist `[]`) so the endpoint
+/// follows the iroh preset's default relay map (n0 stable), live-applied.
+#[tauri::command]
+async fn reset_iroh_relays<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<IrohRelayWire, String> {
+    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    apply_iroh_relays(&app, &state, Vec::new()).await
+}
+
+/// ZEB-624: add a single relay to the custom iroh list (server-authoritative
+/// read-modify-write). On a defaults-following node the current EFFECTIVE list
+/// is the materialized preset defaults, so the added relay turns the node into a
+/// custom list of defaults+new; `validate_iroh_relay_urls` dedups (re-adding is a
+/// no-op) and caps at `MAX_IROH_RELAYS`.
+#[tauri::command]
+async fn add_iroh_relay<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<IrohRelayWire, String> {
+    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let settings_path = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard.connectivity_settings_path.clone()
+    };
+    let path = connectivity_settings_path(settings_path)?;
+    let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+    let mut relays = iroh_target_relay_urls(&settings);
+    relays.push(url);
+    let validated = connectivity_settings::validate_iroh_relay_urls(relays)?;
+    apply_iroh_relays(&app, &state, validated).await
+}
+
+/// ZEB-624: remove a single relay from the custom iroh list (server-authoritative
+/// read-modify-write). Operates on the EFFECTIVE list (materialized defaults on a
+/// defaults-following node, so an unwanted default can be dropped). Removing the
+/// LAST relay of a custom list is rejected — the user should `reset_iroh_relays`
+/// to follow the preset defaults rather than persist an empty custom list (which
+/// would strand the endpoint with no relays).
+#[tauri::command]
+async fn remove_iroh_relay<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<IrohRelayWire, String> {
+    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let settings_path = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard.connectivity_settings_path.clone()
+    };
+    let path = connectivity_settings_path(settings_path)?;
+    let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+    let target = url.trim().trim_end_matches('/');
+    let remaining: Vec<String> = iroh_target_relay_urls(&settings)
+        .into_iter()
+        .filter(|r| r.trim_end_matches('/') != target)
+        .collect();
+    if remaining.is_empty() {
+        return Err(
+            "cannot remove the last iroh relay; use reset to follow the built-in defaults instead"
+                .to_string(),
+        );
+    }
+    let validated = connectivity_settings::validate_iroh_relay_urls(remaining)?;
+    apply_iroh_relays(&app, &state, validated).await
+}
+
 /// Look up a peer's current iroh routing via case-B (identity-keyed) pkarr
 /// lookup. `identity_pub_hex` is the 64-byte harmony identity pub in hex.
 ///
@@ -49956,6 +50264,65 @@ mod friend_ipc_tests {
     }
 
     #[test]
+    fn iroh_relay_set_persist_roundtrip() {
+        // ZEB-624: the iroh-relay `set` verb's pure pieces (validate + persist +
+        // effective) round-trip through a temp settings file, mirroring
+        // `set_pkarr_relays_validation_and_persist_round_trip`.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Invalid input is rejected (http for a remote host); no persist.
+        assert!(crate::connectivity_settings::validate_iroh_relay_urls(vec![
+            "http://relay.evil.example".into()
+        ])
+        .is_err());
+
+        // Valid input persists + reloads, and `effective_iroh_relays` returns it.
+        let validated = crate::connectivity_settings::validate_iroh_relay_urls(vec![
+            "https://use1-1.relay.n0.iroh.link".into(),
+        ])
+        .expect("valid");
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.iroh_relays = validated.clone();
+        settings.save(&path).expect("save");
+        let reloaded = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        assert_eq!(reloaded.iroh_relays, validated);
+        assert_eq!(
+            crate::connectivity_settings::effective_iroh_relays(&reloaded),
+            Some(validated)
+        );
+    }
+
+    #[test]
+    fn iroh_relay_reset_clears_to_defaults_sentinel() {
+        // ZEB-624: `reset_iroh_relays` persists `[]` — the sentinel for "follow
+        // the iroh preset defaults" — so `effective_iroh_relays` reloads as None.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Seed a custom list first.
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.iroh_relays = vec!["https://use1-1.relay.n0.iroh.link".into()];
+        settings.save(&path).expect("save custom");
+        assert!(crate::connectivity_settings::effective_iroh_relays(
+            &crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+        )
+        .is_some());
+
+        // Reset writes the empty sentinel.
+        let mut cleared =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        cleared.iroh_relays = Vec::new();
+        cleared.save(&path).expect("save reset");
+
+        let reloaded = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        assert!(reloaded.iroh_relays.is_empty());
+        assert!(crate::connectivity_settings::effective_iroh_relays(&reloaded).is_none());
+    }
+
+    #[test]
     fn add_remove_pkarr_relay_read_modify_write() {
         // Exercises the pure read-modify-write pieces of the two new IPCs
         // (add_pkarr_relay / remove_pkarr_relay) against a temp settings file,
@@ -51682,6 +52049,12 @@ pub fn run() {
             reset_pkarr_relays,
             add_pkarr_relay,
             remove_pkarr_relay,
+            // ZEB-624: iroh transport relay configuration IPCs.
+            get_iroh_relays,
+            set_iroh_relays,
+            add_iroh_relay,
+            remove_iroh_relay,
+            reset_iroh_relays,
             // ZEB-417 SP1: owner-private Notes IPCs.
             notes_commands::notes_list,
             notes_commands::notes_upsert,
@@ -51778,6 +52151,12 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         reset_pkarr_relays,
         add_pkarr_relay,
         remove_pkarr_relay,
+        // ZEB-624: iroh transport relay configuration IPCs.
+        get_iroh_relays,
+        set_iroh_relays,
+        add_iroh_relay,
+        remove_iroh_relay,
+        reset_iroh_relays,
     ])
 }
 
