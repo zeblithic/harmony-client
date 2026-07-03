@@ -275,6 +275,10 @@ pub mod iroh_dial_driver;
 // exponential ladder, coalescing dirty-set kicks, lower-NodeId dial-role gate,
 // bounded dial concurrency. Pure logic; producers are wired in later tasks.
 pub mod reconnect_supervisor;
+// ZEB-622: peer liveness — passive per-peer transport state machine fusing
+// registry connect/drop edges, iroh path events, and zenoh transport events
+// into Connected/Degraded/Disconnected. Pure logic; producers wired in later tasks.
+pub mod peer_liveness;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
 /// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets
