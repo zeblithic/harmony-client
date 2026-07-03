@@ -514,6 +514,15 @@ pub async fn run_reconnect_supervisor(
                 }
                 match resolver.resolve_by_node_id(peer) {
                     Some((owner, _payload)) => {
+                        // ZEB-621: if this peer's freshest record is >24h stale,
+                        // kick off a fire-and-forget async pkarr re-resolve to
+                        // heal a dial route pinned to a long-dead address. Sync +
+                        // non-blocking (staleness/cooldown checks inline, network
+                        // in a spawned task), so it never gates the dial
+                        // dispatched just below. `now_ms()` (wall clock) matches
+                        // the record's `announced_at_ms` epoch — not the paused
+                        // scheduler `Instant`.
+                        resolver.maybe_refresh_stale(owner, *peer, now_ms());
                         // Acquire the permit BEFORE spawning: this bounds live
                         // tasks (not just active dials), so a large due set
                         // can't park a task per peer that later dials a stale
@@ -817,6 +826,7 @@ mod tests {
     use super::*;
     use crate::owner_state_types::{Hlc, OwnerAddr};
     use crate::reachability_record::ReachabilityAnnouncePayload;
+    use crate::reachability_resolver::ReachabilityFallback;
     use std::sync::atomic::AtomicUsize;
 
     // ---- helpers ---------------------------------------------------------
@@ -825,8 +835,50 @@ mod tests {
         [n; 32]
     }
 
+    /// A `ReachabilityFallback` that counts every `resolve` call (ZEB-621 Task
+    /// 2). Used to prove the supervisor dispatch pass invokes
+    /// `maybe_refresh_stale` for a stale peer; the empty payload set leaves the
+    /// dial view untouched so the assertion isolates the fallback firing.
+    struct CountingFallback {
+        calls: Arc<AtomicUsize>,
+        payloads: Vec<ReachabilityAnnouncePayload>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReachabilityFallback for CountingFallback {
+        async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.payloads.clone()
+        }
+    }
+
     /// Seed a live routing record so the record-gated supervisor will dial `p`.
     fn seed(resolver: &ReachabilityResolver, p: [u8; 32]) {
+        resolver.update(
+            OwnerAddr([0xAA; 16]),
+            ReachabilityAnnouncePayload {
+                iroh_node_id: p,
+                home_relay_url: String::new(),
+                direct_addresses: vec![],
+                announced_at_ms: 1,
+                identity_signature: [0u8; 64],
+                butler_set: vec![],
+                bs_at: 0,
+            },
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: String::new(),
+            },
+        );
+    }
+
+    /// Like [`seed`], but pins `announced_at_ms` to an ancient value so the
+    /// record is unconditionally >24h stale against the wall-clock `now_ms()`
+    /// the supervisor feeds `maybe_refresh_stale` (which reads real time, not
+    /// the paused test clock). Drives the ZEB-621 stale-refresh path
+    /// independently of `seed`'s incidental timestamp choice.
+    fn seed_stale(resolver: &ReachabilityResolver, p: [u8; 32]) {
         resolver.update(
             OwnerAddr([0xAA; 16]),
             ReachabilityAnnouncePayload {
@@ -1617,5 +1669,47 @@ mod tests {
             "inbound reconnect emits reconnected via the loop drain"
         );
         dialer.release();
+    }
+
+    /// ZEB-621: the dispatch pass calls `maybe_refresh_stale` for every peer it
+    /// resolves, so a peer whose freshest record is >24h stale kicks off an
+    /// async pkarr re-resolve as a fire-and-forget side effect of being dialed.
+    /// The dial still dispatches (the refresh never gates it), and the counting
+    /// fallback firing at least once proves the hook is wired.
+    #[tokio::test(start_paused = true)]
+    async fn stale_record_dispatch_triggers_pkarr_refresh() {
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed_stale(&resolver, p);
+        let counter = Arc::new(AtomicUsize::new(0));
+        resolver.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![],
+        }));
+        let handle = SupervisorHandle::new();
+        // self = 0 < p = 1 -> Dialer, so the first dial fires at the base rung.
+        let config = cfg(1_000, 64_000, 3_600_000, 30_000, 8, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(2_000)).await;
+
+        // The stale peer is still dialed — the fire-and-forget refresh must not
+        // gate the dispatch.
+        assert!(dialer.count_for(p) >= 1, "stale peer is still dialed");
+        // …and dispatching it kicked off the async pkarr re-resolve.
+        assert!(
+            counter.load(Ordering::SeqCst) >= 1,
+            "stale record must trigger an async pkarr refresh on dispatch"
+        );
     }
 }

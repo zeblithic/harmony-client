@@ -22,6 +22,20 @@ use crate::peer_liveness::LivenessHandle;
 use crate::reachability_record::ReachabilityAnnouncePayload;
 use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
 
+/// ZEB-621: a freshest dial view whose `announced_at_ms` is older than this
+/// (24h) is considered stale enough that the dial route may be pinned to a
+/// long-dead address — [`ReachabilityResolver::maybe_refresh_stale`] then kicks
+/// off an async pkarr re-resolve to heal it.
+pub(crate) const STALE_RECORD_REFRESH_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// ZEB-621: minimum spacing between async pkarr re-resolves for the same owner.
+/// A stale record that the supervisor re-observes on every dispatch must not
+/// hammer pkarr — after one refresh fires, further `maybe_refresh_stale` calls
+/// for that owner are suppressed until this cooldown lapses (measured on the
+/// paused-time-testable `tokio::time::Instant` clock).
+pub(crate) const PKARR_REFRESH_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+
 /// Async fallback called by `resolve_async` when the in-memory CRDT cache has
 /// no entry for a given owner. Implemented by `PkarrResolverAdapter` (case C)
 /// and by test stubs. The concrete impl is injected at boot via
@@ -131,6 +145,14 @@ pub struct ReachabilityResolver {
     // install wins, read-only clone getter); the Network Health snapshot reads
     // its `states_snapshot` for per-peer liveness telemetry.
     liveness: Arc<RwLock<Option<LivenessHandle>>>,
+    // ZEB-621: per-owner cooldown clock for `maybe_refresh_stale`'s async pkarr
+    // re-resolve. Shared across clones (`Arc`) like the other fields, so a
+    // refresh fired through one clone rate-limits every clone. Keyed by owner
+    // (not `(owner, node_id)`) so one owner's whole address set re-resolves at
+    // most once per `PKARR_REFRESH_COOLDOWN`. `tokio::time::Instant` → paused-
+    // time testable.
+    refresh_cooldowns:
+        Arc<std::sync::Mutex<std::collections::HashMap<OwnerAddr, tokio::time::Instant>>>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -149,6 +171,7 @@ impl Default for ReachabilityResolver {
             fallback_source: Arc::new(RwLock::new(None)),
             supervisor: Arc::new(RwLock::new(None)),
             liveness: Arc::new(RwLock::new(None)),
+            refresh_cooldowns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -163,6 +186,7 @@ impl Clone for ReachabilityResolver {
             fallback_source: Arc::clone(&self.fallback_source),
             supervisor: Arc::clone(&self.supervisor),
             liveness: Arc::clone(&self.liveness),
+            refresh_cooldowns: Arc::clone(&self.refresh_cooldowns),
         }
     }
 }
@@ -350,6 +374,81 @@ impl ReachabilityResolver {
         map.iter()
             .find(|((_, key_node_id), _)| key_node_id == node_id_bytes)
             .and_then(|((owner, _), v)| v.freshest().map(|e| (*owner, e.clone())))
+    }
+
+    /// ZEB-621: heal a stale dial route by kicking off an async pkarr
+    /// re-resolve. Sync + non-blocking: the staleness + cooldown checks run
+    /// inline, and the actual pkarr `resolve` + cache write happen in a spawned
+    /// task, so the caller (the supervisor dispatch pass) is never gated or
+    /// delayed by network I/O.
+    ///
+    /// The staleness gate is the FRESHEST dial view's age, source-agnostic
+    /// (Decision, ZEB-621): a >24h pkarr record is as worth re-resolving as a
+    /// durable one. The refresh feeds [`update_with_source`](Self::update_with_source)
+    /// tagged [`ReachabilitySource::PkarrLive`], so a fresher record changes the
+    /// dial view and auto-fires the `RecordChanged` supervisor kick through Task
+    /// 1's gate — this seam adds no kick logic of its own.
+    pub fn maybe_refresh_stale(&self, owner: OwnerAddr, node_id: [u8; 32], now_ms: u64) {
+        // (1) Staleness gate against the freshest view's age. No record ⇒
+        //     nothing to heal. A future-dated `announced_at_ms` (clock skew /
+        //     bogus record) has no plausible age, so `checked_sub` yields `None`
+        //     and it is treated as stale — worth a re-resolve. For realistic
+        //     data (`announced_at_ms <= now_ms`) this is exactly
+        //     `now_ms - announced_at_ms`.
+        let Some((_, entry)) = self.resolve_entry_by_node_id(&node_id) else {
+            return;
+        };
+        match now_ms.checked_sub(entry.payload.announced_at_ms) {
+            Some(age) if age <= STALE_RECORD_REFRESH_MS => return, // fresh
+            _ => {} // stale (older than the window) or implausibly future-dated
+        }
+
+        // (2) Per-owner cooldown check-and-set. Insert BEFORE spawning so two
+        //     concurrent callers (e.g. two due dials in one dispatch pass) can't
+        //     both fire a refresh for the same owner inside one window.
+        {
+            let mut cooldowns = self
+                .refresh_cooldowns
+                .lock()
+                .expect("refresh_cooldowns lock");
+            let now = tokio::time::Instant::now();
+            if let Some(&last) = cooldowns.get(&owner) {
+                if now.saturating_duration_since(last) < PKARR_REFRESH_COOLDOWN {
+                    return; // a refresh for this owner fired within the cooldown
+                }
+            }
+            cooldowns.insert(owner, now);
+        }
+
+        // (3) Clone the fallback Arc (as `resolve_async` does). No fallback
+        //     wired ⇒ nothing to re-resolve with.
+        let fb = {
+            let guard = self
+                .fallback_source
+                .read()
+                .expect("fallback_source poisoned");
+            guard.clone()
+        };
+        let Some(fb) = fb else {
+            return;
+        };
+
+        // (4) Fire-and-forget async re-resolve. Each returned payload is fed
+        //     through `update_with_source(.., PkarrLive)` with the same HLC
+        //     synthesis as `resolve_async` (wall_ms = announced_at_ms, logical
+        //     0, device_id "").
+        let resolver = self.clone();
+        tokio::spawn(async move {
+            let payloads = fb.resolve(&owner).await;
+            for payload in payloads {
+                let hlc = Hlc {
+                    wall_ms: payload.announced_at_ms,
+                    logical: 0,
+                    device_id: String::new(),
+                };
+                resolver.update_with_source(owner, payload, hlc, ReachabilitySource::PkarrLive);
+            }
+        });
     }
 
     /// Evict every device record for `actor`. Called from the membership-
@@ -1420,5 +1519,85 @@ mod fallback_tests {
         assert_eq!(from_clone.len(), 1, "clone must share fallback_source Arc");
         assert_eq!(from_orig[0].iroh_node_id, stub_payload.iroh_node_id);
         assert_eq!(from_clone[0].iroh_node_id, stub_payload.iroh_node_id);
+    }
+
+    // ---- ZEB-621 Task 2: stale-record async pkarr refresh ----------------
+
+    fn make_hlc(wall_ms: u64, logical: u32, device: &str) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical,
+            device_id: device.into(),
+        }
+    }
+
+    fn node_id_bytes(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    /// A `ReachabilityFallback` that counts every `resolve` call and returns a
+    /// fixed payload set — the counting analogue of [`StubFallback`], used to
+    /// assert `maybe_refresh_stale` fires the fallback exactly the expected
+    /// number of times under the staleness + cooldown gates.
+    struct CountingFallback {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        payloads: Vec<ReachabilityAnnouncePayload>,
+    }
+
+    #[async_trait]
+    impl ReachabilityFallback for CountingFallback {
+        async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.payloads.clone()
+        }
+    }
+
+    /// ZEB-621: a stale freshest view (>24h) triggers exactly one async pkarr
+    /// refresh; a second call inside the cooldown window is suppressed.
+    #[tokio::test(start_paused = true)]
+    async fn stale_record_triggers_refresh_once_per_cooldown() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![make_payload(7, 90_000_000_000)],
+        }));
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+
+        let now = 1_000 + STALE_RECORD_REFRESH_MS + 1;
+        r.maybe_refresh_stale(owner, node_id_bytes(7), now);
+        tokio::task::yield_now().await; // let the spawned refresh run
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // refresh result installed into the pkarr slot → dial view updated
+        let (_, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(p.announced_at_ms, 90_000_000_000);
+
+        // second call within the cooldown: suppressed even though still "stale"
+        r.maybe_refresh_stale(owner, node_id_bytes(7), now + 1);
+        tokio::task::yield_now().await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // advance past the cooldown: fires again
+        tokio::time::advance(PKARR_REFRESH_COOLDOWN + std::time::Duration::from_secs(1)).await;
+        r.maybe_refresh_stale(owner, node_id_bytes(7), now + 2);
+        tokio::task::yield_now().await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A fresh record (<24h) never fires the fallback.
+    #[tokio::test(start_paused = true)]
+    async fn fresh_record_never_triggers_refresh() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![],
+        }));
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        r.maybe_refresh_stale(owner, node_id_bytes(7), 1_000 + STALE_RECORD_REFRESH_MS);
+        tokio::task::yield_now().await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
