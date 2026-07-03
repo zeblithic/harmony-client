@@ -9600,17 +9600,58 @@ pub async fn start_node_inner(
                             // poll the resolver for it (every 500ms, up to 60s);
                             // once present, forward each `changed` tick into
                             // `notify()` (rate-limited downstream by the limiter
-                            // spawned just above). Exits when the watch sender is
-                            // dropped (node shutdown).
+                            // spawned just above).
+                            //
+                            // Drop-graph discipline (must stay acyclic or the task
+                            // leaks across every in-process stop/start): the task
+                            // holds ONLY the `watch::Receiver` + a
+                            // `Weak<NetworkHealthService>`. It must NOT retain the
+                            // `LivenessHandle` nor any `ReachabilityResolver`
+                            // clone, because both transitively own the `changed_tx`
+                            // sender this task parks on — the handle IS the sender's
+                            // `Arc<Inner>`, and a resolver clone shares the
+                            // `Arc<RwLock<Option<LivenessHandle>>>` `liveness` cell.
+                            // A held `Arc<NetworkHealthService>` is just as fatal:
+                            // its `ProdLivenessSnapshot` owns a resolver clone →
+                            // liveness cell → handle → sender, a cycle through the
+                            // task itself.
+                            //
+                            // Long-term sender owners (all released at stop_node):
+                            //   * the transport link-manager's
+                            //     `Arc<OnceLock<LivenessHandle>>`
+                            //     (zenoh_iroh_transport.rs) — dropped when the iroh
+                            //     session tears down;
+                            //   * the resolver `liveness` cell (shared across every
+                            //     resolver clone) — dropped when the LAST clone
+                            //     goes: `guard.reachability_resolver` cleared in
+                            //     `clear_iroh_handles`, this task's clone dropped
+                            //     below, the `NetworkHealthService`'s snapshot clone
+                            //     dropped when `guard.network_health` + the hook
+                            //     cell are cleared, and the event-loop thread locals
+                            //     dropped as that thread winds down.
+                            // A `watch::Receiver` never keeps a sender alive, so
+                            // once those owners are gone `rx.changed()` returns Err.
+                            //
+                            // Exit conditions (both real): `rx.changed()` errors
+                            // (last sender dropped — node teardown), OR
+                            // `nh_weak.upgrade()` is None (the service was torn down
+                            // and a tick arrived before the sender drop — nothing
+                            // left to notify).
                             {
+                                // Downgrade BEFORE spawning: the task must never own
+                                // a strong `Arc<NetworkHealthService>`.
+                                let nh_weak = std::sync::Arc::downgrade(&nh_arc);
                                 let resolver_for_bridge = reachability_resolver.clone();
-                                let nh_for_bridge = std::sync::Arc::clone(&nh_arc);
                                 tokio::spawn(async move {
-                                    let lh = {
+                                    // Bounded poll for the not-yet-installed handle.
+                                    // Subscribe, then drop the resolver clone (and
+                                    // the transient handle) so the forward loop
+                                    // holds ONLY `rx` + `nh_weak`.
+                                    let mut rx = {
                                         let mut waited_ms: u64 = 0;
-                                        loop {
+                                        let rx = loop {
                                             if let Some(lh) = resolver_for_bridge.liveness() {
-                                                break lh;
+                                                break lh.changed_rx();
                                             }
                                             if waited_ms >= 60_000 {
                                                 return;
@@ -9620,14 +9661,18 @@ pub async fn start_node_inner(
                                             ))
                                             .await;
                                             waited_ms += 500;
-                                        }
+                                        };
+                                        drop(resolver_for_bridge);
+                                        rx
                                     };
-                                    let mut rx = lh.changed_rx();
                                     loop {
                                         if rx.changed().await.is_err() {
                                             break;
                                         }
-                                        nh_for_bridge.notify();
+                                        let Some(nh) = nh_weak.upgrade() else {
+                                            break;
+                                        };
+                                        nh.notify();
                                     }
                                 });
                             }
