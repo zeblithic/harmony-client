@@ -9654,6 +9654,12 @@ pub async fn start_node_inner(
                                                 break lh.changed_rx();
                                             }
                                             if waited_ms >= 60_000 {
+                                                tracing::warn!(
+                                                    "ZEB-622: liveness handle not installed \
+                                                     after 60s; liveness→network-health \
+                                                     bridge exiting (panel won't receive \
+                                                     liveness-driven updates this session)"
+                                                );
                                                 return;
                                             }
                                             tokio::time::sleep(std::time::Duration::from_millis(

@@ -200,7 +200,7 @@
       case 'retrying':
         return '…';
       case 'dormant':
-        return 'zzz';
+        return '💤';
       case 'failed':
       default:
         return '✗';

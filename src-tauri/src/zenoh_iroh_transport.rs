@@ -287,17 +287,27 @@ impl IrohZenohLinkManager {
     /// close. Pure synchronous map op — the lock is not held across any await;
     /// the async close + await happens on the returned connection.
     fn swap_zenoh_conn(&self, peer_id: EndpointId, conn: Connection) -> Option<Connection> {
-        let prev = self
-            .zenoh_conns
-            .lock()
-            .unwrap()
-            .insert(peer_id, conn.clone());
+        let mut map = self.zenoh_conns.lock().unwrap();
+        let prev = map.insert(peer_id, conn.clone());
         // ZEB-622 Task 2: this is the single choke point BOTH the inbound accept
         // and outbound `new_link` paths pass through with the `Connection` in
         // hand, so raise the liveness up-edge and spawn exactly one path watcher
         // for the new conn here. `on_transport_up` keys off `stable_id`, so a
         // superseding swap (same peer, new conn) re-arms as a fresh up-edge; the
         // superseded conn's watcher is silenced by the slot's conn-id guard.
+        //
+        // The up-edge is raised while STILL holding the map lock so per-peer
+        // liveness installs serialize in map-insert order. `on_transport_up`
+        // rebinds the slot on ANY differing conn id (a superseding swap must
+        // win), so an insert-A/insert-B/notify-B/notify-A interleave — possible
+        // when an inbound accept races an outbound dial for the same peer —
+        // would bind the slot to the evicted conn, silencing the live conn's
+        // path reports AND its eventual down-edge (conn-id mismatch), which
+        // would in turn skip the epoch re-arm on the next reconnect. Lock order
+        // is one-way (conn-map → liveness slots): liveness never takes the
+        // conn-map lock, and the drop watcher releases the map lock before its
+        // identity-guarded down-edge. Nothing here awaits under the lock —
+        // `on_transport_up` and `tokio::spawn` are synchronous.
         if let Some(lh) = self.liveness.get() {
             lh.on_transport_up(*peer_id.as_bytes(), conn.stable_id());
             tokio::spawn(crate::peer_liveness::run_conn_path_watcher(
