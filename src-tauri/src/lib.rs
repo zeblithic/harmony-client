@@ -7005,6 +7005,13 @@ pub async fn start_node_inner(
                             crate::reachability_publisher::ReachabilityPublisher::new(
                                 std::sync::Arc::clone(ep_arc_for_publisher),
                                 publish_fn,
+                                // ZEB-621: feed iroh's own address watcher so a
+                                // home-relay flap republishes within the 2s
+                                // debounce instead of waiting on the idle
+                                // backstop. `watch_addr_stream` skips the
+                                // current value, so it never doubles the
+                                // startup publish.
+                                Some(ep_arc_for_publisher.watch_addr_stream()),
                             ),
                         );
                         // Spawn the publisher loop. The JoinHandle is
@@ -58080,7 +58087,9 @@ mod zeb_321_connectivity_ipc_tests {
         });
 
         let ep = build_hermetic_iroh_endpoint().await;
-        let publisher = std::sync::Arc::new(ReachabilityPublisher::new(ep, publish));
+        // Third parameter (iroh addr stream) is `None`: this IPC test only
+        // drives the force-republish path (ZEB-621 Task 3).
+        let publisher = std::sync::Arc::new(ReachabilityPublisher::new(ep, publish, None));
         let force_handle = publisher.force_handle();
         let _publisher_loop = std::sync::Arc::clone(&publisher).spawn();
 

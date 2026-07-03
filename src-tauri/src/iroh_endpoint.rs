@@ -182,6 +182,31 @@ impl IrohEndpoint {
         self.inner.bound_sockets()
     }
 
+    /// A `'static` stream of [`iroh::EndpointAddr`] updates sourced from
+    /// iroh's own `watch_addr` watcher, boxed so the reachability publisher
+    /// can merge it into its network-change arm (ZEB-621).
+    ///
+    /// Uses `stream_updates_only`, which **skips the watcher's current
+    /// value** — subscribing at boot does not itself emit an item, so the
+    /// publisher's unconditional startup publish is never doubled. Only
+    /// genuine subsequent changes (home-relay flap, direct-address churn)
+    /// drive the stream. The stream ends when the last [`iroh::Endpoint`]
+    /// clone drops.
+    pub fn watch_addr_stream(&self) -> futures::stream::BoxStream<'static, iroh::EndpointAddr> {
+        use futures::StreamExt as _;
+        use iroh::Watcher as _;
+        self.inner.watch_addr().stream_updates_only().boxed()
+    }
+
+    /// Nudge iroh to re-probe the local network (interfaces + relays).
+    ///
+    /// Thin passthrough to [`iroh::Endpoint::network_change`]. Added here in
+    /// ZEB-621 Task 3; the address-change pipeline (Task 6) calls it so a
+    /// locally-detected change prompts iroh to refresh before we republish.
+    pub async fn network_change(&self) {
+        self.inner.network_change().await;
+    }
+
     /// Escape hatch for in-crate callers that need the full iroh API
     /// (e.g. the zenoh-over-iroh transport in later tasks, which calls
     /// `.connect()` / `.accept()` directly). Kept `pub(crate)` so the
