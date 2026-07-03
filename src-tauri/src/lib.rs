@@ -229,6 +229,7 @@ pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
+pub mod protocol_versioning;
 pub mod referral_catalog;
 pub mod relay_hold_persist;
 pub mod relay_optin_persist;

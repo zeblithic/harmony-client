@@ -92,6 +92,14 @@ pub mod alpn {
     /// `IrohZenohLinkManager::install_tunnel_acceptor`); connections arriving
     /// before install are closed (the sender's deposit fallback covers it).
     pub const HARMONY_TUNNEL_V1: &[u8] = b"harmony/tunnel/v1";
+    /// ZEB-623: tunnel ALPN *generation 2* — a wire-incompatible framing bump
+    /// (first frame is now the versioned `protocol_versioning::TunnelHello`
+    /// capabilities hello). Registered alongside `/v1` during the N/N-1
+    /// deprecation window so a one-generation-behind peer still connects; a
+    /// dialer tries the newest generation first and falls back to `/v1` on
+    /// connect-failure. Retire `/v1` only after
+    /// `protocol_versioning::MIN_SUPPORTED_TUNNEL_ALPN_GENERATION` advances to 2.
+    pub const HARMONY_TUNNEL_V2: &[u8] = b"harmony/tunnel/v2";
 }
 
 /// OS keychain coordinates for the persistent iroh `SecretKey`.
@@ -141,6 +149,7 @@ impl IrohEndpoint {
                 alpn::HARMONY_COMMUNITY_RELAY_DEPOSIT_V1.to_vec(),
                 alpn::HARMONY_COMMUNITY_RELAY_PULL_V1.to_vec(),
                 alpn::HARMONY_TUNNEL_V1.to_vec(),
+                alpn::HARMONY_TUNNEL_V2.to_vec(),
             ])
             .bind()
             .await
@@ -420,6 +429,7 @@ mod tests {
                 alpn::HARMONY_COMMUNITY_RELAY_DEPOSIT_V1.to_vec(),
                 alpn::HARMONY_COMMUNITY_RELAY_PULL_V1.to_vec(),
                 alpn::HARMONY_TUNNEL_V1.to_vec(),
+                alpn::HARMONY_TUNNEL_V2.to_vec(),
             ])
             .relay_mode(RelayMode::Disabled)
             .bind()
