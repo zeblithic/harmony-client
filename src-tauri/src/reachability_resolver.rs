@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
+use crate::peer_liveness::LivenessHandle;
 use crate::reachability_record::ReachabilityAnnouncePayload;
 use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
 
@@ -78,6 +79,11 @@ pub struct ReachabilityResolver {
     // on a material LWW record change — the sole successor to ZEB-373's retired
     // `DialHint` mpsc (the dial-once dial driver).
     supervisor: Arc<RwLock<Option<SupervisorHandle>>>,
+    // ZEB-622: optional peer-liveness handle. None until boot installs it via
+    // `set_liveness`. Mirrors `supervisor` exactly (shared `Arc<RwLock>`, latest
+    // install wins, read-only clone getter); the Network Health snapshot reads
+    // its `states_snapshot` for per-peer liveness telemetry.
+    liveness: Arc<RwLock<Option<LivenessHandle>>>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -95,6 +101,7 @@ impl Default for ReachabilityResolver {
             inner: Arc::new(RwLock::new(BTreeMap::new())),
             fallback_source: Arc::new(RwLock::new(None)),
             supervisor: Arc::new(RwLock::new(None)),
+            liveness: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -108,6 +115,7 @@ impl Clone for ReachabilityResolver {
             // (CodeRabbit PR #158 round 2 correctness fix).
             fallback_source: Arc::clone(&self.fallback_source),
             supervisor: Arc::clone(&self.supervisor),
+            liveness: Arc::clone(&self.liveness),
         }
     }
 }
@@ -132,6 +140,22 @@ impl ReachabilityResolver {
     /// a cheap `Arc`-backed clone).
     pub fn supervisor(&self) -> Option<SupervisorHandle> {
         self.supervisor.read().expect("supervisor lock").clone()
+    }
+
+    /// ZEB-622: install the peer-liveness handle. Called once at boot
+    /// (event_loop, alongside the reconnect-supervisor install). Mirrors
+    /// [`set_supervisor`](Self::set_supervisor): thread-safe, latest install wins.
+    pub fn set_liveness(&self, handle: LivenessHandle) {
+        *self.liveness.write().expect("liveness lock") = Some(handle);
+    }
+
+    /// ZEB-622: read the installed peer-liveness handle, if any. `None` until
+    /// boot installs it via [`set_liveness`](Self::set_liveness). Read-only clone
+    /// of the shared handle — the Network Health snapshot uses it to read
+    /// `states_snapshot` for per-peer liveness telemetry (`LivenessHandle` is a
+    /// cheap `Arc`-backed clone).
+    pub fn liveness(&self) -> Option<LivenessHandle> {
+        self.liveness.read().expect("liveness lock").clone()
     }
 
     /// LWW update — higher HLC wins; ties broken by announced_at_ms then
@@ -523,6 +547,24 @@ mod tests {
             logical,
             device_id: device.into(),
         }
+    }
+
+    /// ZEB-622: the liveness seam mirrors the supervisor seam — `liveness()` is
+    /// `None` until `set_liveness`, then returns a handle sharing the installed
+    /// state, so an up-edge raised through the returned clone is visible via a
+    /// fresh getter's `states_snapshot()`.
+    #[test]
+    fn set_liveness_roundtrip_snapshot() {
+        let r = ReachabilityResolver::new();
+        assert!(r.liveness().is_none());
+        r.set_liveness(crate::peer_liveness::LivenessHandle::new());
+        let got = r.liveness().expect("liveness installed");
+        assert!(got.states_snapshot().is_empty());
+        // Raise an external up-edge through the returned clone…
+        got.on_transport_up_external([7u8; 32]);
+        // …and observe it via an independently-fetched clone (shared state).
+        let snap = r.liveness().expect("still installed").states_snapshot();
+        assert!(snap.iter().any(|(p, _)| *p == [7u8; 32]));
     }
 
     /// Same owner, SAME device (same iroh_node_id) — later HLC wins per LWW.

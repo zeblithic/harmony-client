@@ -10,7 +10,10 @@ export type NatClass =
   | 'symmetric'
   | 'unknown';
 
-export type ConnectionMode = 'direct' | 'relay' | 'noConnection';
+// ZEB-622: `degraded` — the transport link is up but no selected path is known
+// yet (an up-edge before the first path report, or a lost-path report on a
+// still-live conn). Mirrors Rust `ConnectionMode::Degraded` (wire `"degraded"`).
+export type ConnectionMode = 'direct' | 'relay' | 'noConnection' | 'degraded';
 
 export interface MyNetworkSummary {
   irohNodeId: string;
@@ -74,7 +77,10 @@ export interface PkarrHealthSummary {
 export interface DynamicDialHit {
   nodeIdShort: string;
   ownerShort: string;
-  outcome: string; // "succeeded" | "failed"
+  // ZEB-620/622 dial-ring markers. Dial outcomes: "succeeded" | "failed";
+  // reconnect-supervisor state transitions: "reconnected" | "retrying" |
+  // "dormant".
+  outcome: string;
   capturedAtMs: number;
 }
 
@@ -83,6 +89,13 @@ export interface DialHealthSummary {
   succeeded: number;
   failed: number;
   skippedDuplicate: number;
+  // ZEB-620: live per-peer-state counts from the reconnect supervisor, folded
+  // into the dial summary. Rust `#[serde(default)]`, so a pre-field snapshot
+  // (or old cached WS data) may omit them — optional here; coalesce with `?? 0`
+  // at the render site.
+  retrying?: number;
+  dormant?: number;
+  connected?: number;
   recent: DynamicDialHit[];
 }
 

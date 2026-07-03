@@ -275,6 +275,10 @@ pub mod iroh_dial_driver;
 // exponential ladder, coalescing dirty-set kicks, lower-NodeId dial-role gate,
 // bounded dial concurrency. Pure logic; producers are wired in later tasks.
 pub mod reconnect_supervisor;
+// ZEB-622: peer liveness — passive per-peer transport state machine fusing
+// registry connect/drop edges, iroh path events, and zenoh transport events
+// into Connected/Degraded/Disconnected. Pure logic; producers wired in later tasks.
+pub mod peer_liveness;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
 /// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets
@@ -3722,9 +3726,19 @@ pub async fn start_node_inner(
         // keeps `community_presence_map_for_state`.
         let (community_presence_request_tx, community_presence_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::CommunityPresenceRequest>(64);
-        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::community_presence::CommunityPresenceMap::new(),
-        ));
+        // ZEB-622: network-health presence last-seen cache. Created here so it can
+        // be (a) wired into the presence map below — every verified beacon's
+        // `apply` feeds it — and (b) installed on the NetworkHealthService at the
+        // boot block far below (`set_presence_source`), which max-merges it into
+        // each peer's `last_seen_ms`. A plain `Arc`; the map holds one clone, the
+        // service another.
+        let network_health_presence_cache =
+            std::sync::Arc::new(crate::network_health::PresenceLastSeenCache::new());
+        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new({
+            let mut m = crate::community_presence::CommunityPresenceMap::new();
+            m.set_last_seen_cache(std::sync::Arc::clone(&network_health_presence_cache));
+            m
+        }));
         let community_presence_map_for_state = std::sync::Arc::clone(&community_presence_map);
 
         // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
@@ -9555,6 +9569,22 @@ pub async fn start_node_inner(
                                     reachability_resolver.clone(),
                                 ),
                             ));
+                            // ZEB-622: peer-liveness state source. Reads the live
+                            // LivenessHandle lazily via the resolver's installed
+                            // handle (event_loop wires it via `set_liveness`
+                            // before the supervisor block) — feeds the per-peer
+                            // live connection-mode/rtt join, the last-seen
+                            // freshness fold, and the relay-RTT fallback.
+                            nh.set_liveness_source(std::sync::Arc::new(
+                                crate::network_health::ProdLivenessSnapshot::new(
+                                    reachability_resolver.clone(),
+                                ),
+                            ));
+                            // ZEB-622: presence last-seen cache (fed by the
+                            // community-presence subscriber's `apply`).
+                            nh.set_presence_source(std::sync::Arc::clone(
+                                &network_health_presence_cache,
+                            ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
@@ -9564,6 +9594,94 @@ pub async fn start_node_inner(
 
                             let nh_arc = std::sync::Arc::new(nh);
                             guard.network_health = Some(std::sync::Arc::clone(&nh_arc));
+                            // ZEB-622: bridge peer-liveness slot changes into the
+                            // network-health-changed pipeline. The LivenessHandle
+                            // is installed by event_loop after this boot block, so
+                            // poll the resolver for it (every 500ms, up to 60s);
+                            // once present, forward each `changed` tick into
+                            // `notify()` (rate-limited downstream by the limiter
+                            // spawned just above).
+                            //
+                            // Drop-graph discipline (must stay acyclic or the task
+                            // leaks across every in-process stop/start): the task
+                            // holds ONLY the `watch::Receiver` + a
+                            // `Weak<NetworkHealthService>`. It must NOT retain the
+                            // `LivenessHandle` nor any `ReachabilityResolver`
+                            // clone, because both transitively own the `changed_tx`
+                            // sender this task parks on — the handle IS the sender's
+                            // `Arc<Inner>`, and a resolver clone shares the
+                            // `Arc<RwLock<Option<LivenessHandle>>>` `liveness` cell.
+                            // A held `Arc<NetworkHealthService>` is just as fatal:
+                            // its `ProdLivenessSnapshot` owns a resolver clone →
+                            // liveness cell → handle → sender, a cycle through the
+                            // task itself.
+                            //
+                            // Long-term sender owners (all released at stop_node):
+                            //   * the transport link-manager's
+                            //     `Arc<OnceLock<LivenessHandle>>`
+                            //     (zenoh_iroh_transport.rs) — dropped when the iroh
+                            //     session tears down;
+                            //   * the resolver `liveness` cell (shared across every
+                            //     resolver clone) — dropped when the LAST clone
+                            //     goes: `guard.reachability_resolver` cleared in
+                            //     `clear_iroh_handles`, this task's clone dropped
+                            //     below, the `NetworkHealthService`'s snapshot clone
+                            //     dropped when `guard.network_health` + the hook
+                            //     cell are cleared, and the event-loop thread locals
+                            //     dropped as that thread winds down.
+                            // A `watch::Receiver` never keeps a sender alive, so
+                            // once those owners are gone `rx.changed()` returns Err.
+                            //
+                            // Exit conditions (both real): `rx.changed()` errors
+                            // (last sender dropped — node teardown), OR
+                            // `nh_weak.upgrade()` is None (the service was torn down
+                            // and a tick arrived before the sender drop — nothing
+                            // left to notify).
+                            {
+                                // Downgrade BEFORE spawning: the task must never own
+                                // a strong `Arc<NetworkHealthService>`.
+                                let nh_weak = std::sync::Arc::downgrade(&nh_arc);
+                                let resolver_for_bridge = reachability_resolver.clone();
+                                tokio::spawn(async move {
+                                    // Bounded poll for the not-yet-installed handle.
+                                    // Subscribe, then drop the resolver clone (and
+                                    // the transient handle) so the forward loop
+                                    // holds ONLY `rx` + `nh_weak`.
+                                    let mut rx = {
+                                        let mut waited_ms: u64 = 0;
+                                        let rx = loop {
+                                            if let Some(lh) = resolver_for_bridge.liveness() {
+                                                break lh.changed_rx();
+                                            }
+                                            if waited_ms >= 60_000 {
+                                                tracing::warn!(
+                                                    "ZEB-622: liveness handle not installed \
+                                                     after 60s; liveness→network-health \
+                                                     bridge exiting (panel won't receive \
+                                                     liveness-driven updates this session)"
+                                                );
+                                                return;
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                500,
+                                            ))
+                                            .await;
+                                            waited_ms += 500;
+                                        };
+                                        drop(resolver_for_bridge);
+                                        rx
+                                    };
+                                    loop {
+                                        if rx.changed().await.is_err() {
+                                            break;
+                                        }
+                                        let Some(nh) = nh_weak.upgrade() else {
+                                            break;
+                                        };
+                                        nh.notify();
+                                    }
+                                });
+                            }
                             // ZEB-329: publish the service into the
                             // shared cell so the on_epoch_event
                             // closure's notify hook (captured at
