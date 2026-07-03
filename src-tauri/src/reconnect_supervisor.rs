@@ -1659,6 +1659,13 @@ mod tests {
     /// async pkarr re-resolve as a fire-and-forget side effect of being dialed.
     /// The dial still dispatches (the refresh never gates it), and the counting
     /// fallback firing at least once proves the hook is wired.
+    ///
+    /// NOTE: `start_paused` controls only the tokio scheduler clock — the
+    /// staleness gate itself receives `now_ms()` (real `SystemTime`), and this
+    /// test exercises it only because `seed`'s `announced_at_ms: 1` is ancient
+    /// against ANY wall clock. A refactor moving the gate onto virtual time
+    /// would silently stop testing the stale path here — re-derive the
+    /// timestamps if that ever happens.
     #[tokio::test(start_paused = true)]
     async fn stale_record_dispatch_triggers_pkarr_refresh() {
         let dialer = RecordingDialer::failing();

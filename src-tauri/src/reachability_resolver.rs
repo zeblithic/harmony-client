@@ -1681,6 +1681,29 @@ mod fallback_tests {
         }
     }
 
+    /// Drive the current-thread scheduler until `counter` reaches `want` (or a
+    /// bounded number of polls elapses; the assertion after the call reports the
+    /// failure). Robust against the spawned refresh gaining new suspension
+    /// points (semaphore acquire, fallback awaits), unlike a single
+    /// `yield_now()` — same idiom as `future_record_clamped_and_healed_by_refresh`.
+    async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, want: usize) {
+        for _ in 0..50 {
+            if counter.load(std::sync::atomic::Ordering::SeqCst) >= want {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Give any (erroneously) spawned refresh task ample chance to run before a
+    /// NEGATIVE assertion — a handful of yields, since "poll until it appears"
+    /// can't prove absence.
+    async fn yield_a_few() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// ZEB-621: a stale freshest view (>24h) triggers exactly one async pkarr
     /// refresh; a second call inside the cooldown window is suppressed.
     #[tokio::test(start_paused = true)]
@@ -1696,7 +1719,7 @@ mod fallback_tests {
 
         let now = 1_000 + STALE_RECORD_REFRESH_MS + 1;
         r.maybe_refresh_stale(owner, node_id_bytes(7), now);
-        tokio::task::yield_now().await; // let the spawned refresh run
+        wait_for_count(&counter, 1).await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
         // refresh result installed into the pkarr slot → dial view updated
         let (_, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
@@ -1704,13 +1727,13 @@ mod fallback_tests {
 
         // second call within the cooldown: suppressed even though still "stale"
         r.maybe_refresh_stale(owner, node_id_bytes(7), now + 1);
-        tokio::task::yield_now().await;
+        yield_a_few().await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // advance past the cooldown: fires again
         tokio::time::advance(PKARR_REFRESH_COOLDOWN + std::time::Duration::from_secs(1)).await;
         r.maybe_refresh_stale(owner, node_id_bytes(7), now + 2);
-        tokio::task::yield_now().await;
+        wait_for_count(&counter, 2).await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -1726,7 +1749,7 @@ mod fallback_tests {
         let owner = OwnerAddr([1u8; 16]);
         r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
         r.maybe_refresh_stale(owner, node_id_bytes(7), 1_000 + STALE_RECORD_REFRESH_MS);
-        tokio::task::yield_now().await;
+        yield_a_few().await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
