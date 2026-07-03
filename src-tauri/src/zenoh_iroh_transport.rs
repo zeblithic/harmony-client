@@ -2305,21 +2305,25 @@ mod tests {
         bob_ep.shutdown().await;
     }
 
-    /// ZEB-622 acceptance (transport half): a real link registers Connected with
-    /// a live mode + RTT in the liveness map; an explicit remote close lands
-    /// Disconnected; a re-link (same zid) re-registers Connected — and every
-    /// up-edge bumps the registered transport-epoch watch (the same-zid flap the
-    /// seen-zid gate could never re-arm).
+    /// ZEB-622 acceptance (full production chain): a real link registers
+    /// Connected with a live mode + RTT in the liveness map; an explicit remote
+    /// close lands Disconnected; and — with ZERO manual intervention — the real
+    /// reconnect supervisor autonomously re-dials the same peer, re-registering
+    /// Connected and re-arming the transport-epoch watch. Every up-edge bumps the
+    /// registered epoch (the same-zid flap the accumulating seen-zid gate could
+    /// never re-fire), proving the end-to-end chain: drop → supervisor re-dial →
+    /// same-zid reinstall → liveness up-edge → transport-epoch re-arm.
     ///
-    /// Modeled on `supervisor_redials_after_drop_and_get_answers` for endpoint /
-    /// manager construction and `poll_until`, but drives `new_link` DIRECTLY —
-    /// no supervisor — so the assertions isolate the liveness wiring added to
-    /// `swap_zenoh_conn` (up-edge + path watcher) and `spawn_drop_watcher`
-    /// (down-edge). alice = the dialer with the liveness handle installed; bob =
-    /// a bare acceptor. Runtime is ~60-120s: two real iroh handshakes (establish
-    /// + re-link) under the `iroh-endpoint` nextest-group throttle plus iroh
-    /// 1.0's Drop-drain teardown. Generous outer budget + fat per-phase poll
-    /// windows per the ZEB-616/620 idiom.
+    /// The full topology of `supervisor_redials_after_drop_and_get_answers` PLUS
+    /// the liveness handle: alice installs BOTH `set_reconnect_handle` (drives
+    /// dials + recovery through the `SupervisorLinkDialer` registry seam) and
+    /// `set_liveness_handle` (owns the up/down edges wired into `swap_zenoh_conn`
+    /// and `spawn_drop_watcher`); bob = a bare acceptor. The establish is a
+    /// supervisor `NewPeer` kick; the recovery is driven only by the
+    /// drop-watcher's `Dropped` kick — no manual re-link. Runtime is ~60-120s:
+    /// two real iroh handshakes (establish + re-dial) under the `iroh-endpoint`
+    /// nextest-group throttle plus iroh 1.0's Drop-drain teardown. Generous outer
+    /// budget + fat per-phase poll windows per the ZEB-616/620 idiom.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn liveness_tracks_link_lifecycle_and_flap_bumps_epoch() {
         crate::iroh_endpoint::warm_up_iroh_global_init().await;
@@ -2332,10 +2336,13 @@ mod tests {
     }
 
     async fn liveness_tracks_link_lifecycle_and_flap_bumps_epoch_inner() {
+        use crate::network_health::DialTelemetry;
         use crate::peer_liveness::{LivenessHandle, LivenessMode, LivenessStateWire};
+        use crate::reconnect_supervisor::{run_reconnect_supervisor, SupervisorConfig};
 
-        // ── Alice: the dialer under test — manager + accept loop + a liveness
-        // handle whose transport-epoch sink is wired. ──
+        // ── Alice: the dialer under test — manager + accept loop + BOTH the
+        // reconnect supervisor (drives dials + autonomous recovery) and a
+        // liveness handle whose transport-epoch sink is wired. ──
         let alice_ep = build_hermetic_iroh_endpoint().await;
         let alice_id = alice_ep.node_id();
         let alice_resolver = ReachabilityResolver::new();
@@ -2345,8 +2352,17 @@ mod tests {
             alice_resolver.clone(),
             alice_tx,
         ));
-        let _alice_accept = alice_mgr.spawn_accept_loop();
 
+        // Install BOTH production handles before the accept loop and the first
+        // dial: the reconnect supervisor owns dials + autonomous recovery, the
+        // liveness handle owns the up/down edges and the transport-epoch watch.
+        // This is the full production topology — the recovery under test is
+        // driven end-to-end, with zero manual re-link.
+        let handle = SupervisorHandle::new();
+        assert!(
+            alice_mgr.set_reconnect_handle(handle.clone()).is_ok(),
+            "install the reconnect handle once"
+        );
         let liveness = LivenessHandle::new();
         let (etx, erx) = tokio::sync::watch::channel(0u64);
         liveness.set_transport_epoch_tx(etx);
@@ -2354,6 +2370,8 @@ mod tests {
             alice_mgr.set_liveness_handle(liveness.clone()).is_ok(),
             "install the liveness handle once"
         );
+
+        let _alice_accept = alice_mgr.spawn_accept_loop();
 
         // ── Bob: a bare acceptor — manager + accept loop, no liveness. Alice
         // dials bob; bob only accepts. ──
@@ -2392,6 +2410,39 @@ mod tests {
             },
         );
 
+        // ── Real reconnect supervisor on alice, dialing through the registry
+        // seam — the same `SupervisorLinkDialer` + config as the ZEB-620
+        // acceptance test (`supervisor_redials_after_drop_and_get_answers`).
+        // This is what turns the DROP into an autonomous recovery: no manual
+        // re-link, just the drop-watcher's `Dropped` kick re-arming the ladder. ──
+        let dialer = Arc::new(SupervisorLinkDialer {
+            mgr: Arc::clone(&alice_mgr),
+        });
+        let config = SupervisorConfig {
+            retry_base: Duration::from_millis(400),
+            retry_cap: Duration::from_secs(4),
+            dormant_after: Duration::from_secs(3600),
+            presence_sweep_cooldown: Duration::from_secs(30),
+            max_concurrent_dials: 4,
+            // Real-time test over live endpoints under the nextest iroh-endpoint
+            // throttle group: a slow-but-progressing `new_link` is NOT a hung
+            // dial. A tight bound would cancel it mid-`open_bi` — after the
+            // registry swap already marked the peer Connected — recording a
+            // spurious `failed` whose stale-epoch result is discarded, so no
+            // retry ever fires. Keep the bound far above worst contention.
+            dial_timeout: Duration::from_secs(300),
+            higher_id_fallback_delay: Duration::from_millis(400),
+            jitter_seed: Some(0x2E_B6_20),
+        };
+        let _supervisor = tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer,
+            Arc::new(alice_resolver.clone()),
+            Arc::new(DialTelemetry::new()),
+            *alice_id.as_bytes(),
+            config,
+        ));
+
         let bob_peer = *bob_id.as_bytes();
         let is_connected_direct = |liveness: &LivenessHandle| {
             liveness.states_snapshot().iter().any(|(p, s)| {
@@ -2407,15 +2458,15 @@ mod tests {
             })
         };
 
-        // ── Phase 1: establish. Alice dials bob directly through `new_link`; the
-        // swap's up-edge + spawned path watcher land bob in the liveness map. The
-        // watcher promotes Degraded → Connected once a path is selected — a
-        // hermetic loopback link with RelayMode::Disabled selects a direct Ip
-        // path (mode Direct). ──
-        alice_mgr
-            .new_link(locator_from_endpoint_id(&bob_id).to_endpoint())
-            .await
-            .expect("alice's first new_link to bob establishes");
+        // ── Phase 1: establish. A first-learn `NewPeer` kick drives the
+        // supervisor to dial bob through the `SupervisorLinkDialer` registry seam
+        // (`new_link`); the swap's up-edge + spawned path watcher land bob in the
+        // liveness map. The watcher promotes Degraded → Connected once a path is
+        // selected — a hermetic loopback link with RelayMode::Disabled selects a
+        // direct Ip path (mode Direct). Kicking directly keeps the establish
+        // deterministic; the recovery under test is driven by the REAL
+        // drop-watcher wiring, not this kick. ──
+        handle.kick(*bob_id.as_bytes(), ReconnectTrigger::NewPeer);
         let connected_1 = poll_until(
             || is_connected_direct(&liveness),
             Duration::from_secs(60),
@@ -2475,25 +2526,15 @@ mod tests {
             "a down-edge is not an up-edge — the transport epoch stays at 1"
         );
 
-        // ── Phase 3: re-link (same zid). The flap re-arms as a FRESH up-edge —
-        // the exact same-zid case the accumulating seen-zid gate could never
-        // re-fire. Wait for alice's registry to go empty for bob first so the
-        // re-dial is a genuine fresh install (a stale entry would make the swap a
-        // same-conn no-op). ──
-        let evicted = poll_until(
-            || !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
-            Duration::from_secs(15),
-            Duration::from_millis(25),
-        )
-        .await;
-        assert!(
-            evicted,
-            "alice's registry must be empty for bob before the re-link"
-        );
-        alice_mgr
-            .new_link(locator_from_endpoint_id(&bob_id).to_endpoint())
-            .await
-            .expect("alice's re-link to bob establishes");
+        // ── Phase 3: recovery — WITHOUT manual intervention. The drop-watcher's
+        // `Dropped` kick (raised in the same guarded block as the eviction +
+        // down-edge above) re-armed the supervisor's ladder; it autonomously
+        // re-dials bob through the registry seam, whose swap raises a FRESH
+        // up-edge — the exact same-zid case the accumulating seen-zid gate could
+        // never re-fire. Observing Disconnected already proved the eviction (the
+        // down-edge fires only on a guard-passing removal), so this reinstall is
+        // a genuine fresh install, not a same-conn no-op — confirmed by the epoch
+        // bump below (a no-op swap would never bump it). ──
         let connected_2 = poll_until(
             || is_connected_direct(&liveness),
             Duration::from_secs(60),
@@ -2502,11 +2543,11 @@ mod tests {
         .await;
         assert!(
             connected_2,
-            "the re-link must re-register bob Connected(Direct, rtt)"
+            "the supervisor's autonomous re-dial must re-register bob Connected(Direct, rtt)"
         );
-        // The re-link's up-edge bumps the epoch 1 → 2 (the transport-level flap
-        // re-arm proof). The bump fires synchronously in `swap_zenoh_conn`, so it
-        // is visible once `new_link` returns; poll defensively for scheduling.
+        // The re-dial's up-edge bumps the epoch 1 → 2 (the transport-level flap
+        // re-arm proof). The bump fires synchronously in `swap_zenoh_conn`; poll
+        // defensively for scheduling.
         let epoch_re_armed = poll_until(
             || *erx.borrow() == 2,
             Duration::from_secs(15),
@@ -2517,6 +2558,24 @@ mod tests {
             epoch_re_armed,
             "the same-zid flap re-arms the transport epoch (1 → 2), got {}",
             *erx.borrow()
+        );
+        // The supervisor's own state machine agrees: bob is Connected
+        // post-recovery — the full chain (drop → re-dial → reinstall → up-edge →
+        // epoch re-arm) closed with zero manual intervention.
+        let supervisor_agrees = poll_until(
+            || {
+                handle
+                    .states_snapshot()
+                    .iter()
+                    .any(|(p, s)| *p == bob_peer && matches!(s, PeerStateWire::Connected { .. }))
+            },
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            supervisor_agrees,
+            "the supervisor's states_snapshot must report bob Connected post-recovery"
         );
 
         alice_ep.shutdown().await;
