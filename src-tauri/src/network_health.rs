@@ -26,6 +26,9 @@ use std::sync::Mutex;
 // ZEB-620 Task 6: the reconnect-supervisor's per-peer state projection feeds the
 // dial-state counts and the PeerHealth last-seen fallback.
 use crate::reconnect_supervisor::PeerStateWire;
+// ZEB-622: the peer-liveness state machine's per-peer transport projection is
+// joined into PeerHealth (live mode/rtt) and folds into the last-seen freshness.
+use crate::peer_liveness::{LivenessMode, LivenessStateWire};
 
 // ── Public data types (wire shape for IPC) ──────────────────────────
 
@@ -389,6 +392,10 @@ pub enum NatClass {
 pub enum ConnectionMode {
     Direct,
     Relay,
+    /// ZEB-622: the transport link is up but no selected path is known yet (a
+    /// liveness `Degraded` state — e.g. an up-edge before the first path report,
+    /// or a lost-path report on a still-live conn). Wire tag `"degraded"`.
+    Degraded,
     NoConnection,
 }
 
@@ -431,7 +438,7 @@ impl NetworkHealthSnapshot {
     /// `peers: []` → "no peers yet"; `pkarr_status` zeroed.
     pub fn empty() -> Self {
         Self {
-            schema_version: 3,
+            schema_version: 4,
             captured_at_ms: now_ms(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -694,6 +701,81 @@ impl SupervisorSnapshot for ProdSupervisorSnapshot {
     }
 }
 
+/// ZEB-622: source of the peer-liveness state machine's per-peer transport
+/// projection, read once per network-health snapshot to (a) join live
+/// `connection_mode`/`rtt_ms` onto each `PeerHealth` (by `iroh_node_id`) and
+/// (b) fold `Connected.since_ms` into the peer's `last_seen_ms` freshness, plus
+/// (c) supply `MyNetworkSummary.relay_rtt_ms` when iroh exposes none. Mirrors
+/// the [`SupervisorSnapshot`] source-trait pattern.
+pub trait LivenessSnapshot: Send + Sync {
+    fn peer_states(&self) -> Vec<([u8; 32], LivenessStateWire)>;
+    fn min_relay_rtt_ms(&self) -> Option<u32>;
+}
+
+/// Production source: reads the live [`LivenessHandle`] the resolver holds
+/// (installed at boot by `event_loop`'s `set_liveness`, before the supervisor
+/// block). Lazy — the handle is `None` until the liveness machine is wired, so a
+/// pre-boot snapshot reports empty states + no relay RTT. The resolver is a
+/// cheap `Arc`-backed clone; all clones share the same handle cell — the exact
+/// [`ProdSupervisorSnapshot`] pattern.
+///
+/// [`LivenessHandle`]: crate::peer_liveness::LivenessHandle
+pub struct ProdLivenessSnapshot {
+    resolver: crate::reachability_resolver::ReachabilityResolver,
+}
+impl ProdLivenessSnapshot {
+    pub fn new(resolver: crate::reachability_resolver::ReachabilityResolver) -> Self {
+        Self { resolver }
+    }
+}
+impl LivenessSnapshot for ProdLivenessSnapshot {
+    fn peer_states(&self) -> Vec<([u8; 32], LivenessStateWire)> {
+        self.resolver
+            .liveness()
+            .map(|h| h.states_snapshot())
+            .unwrap_or_default()
+    }
+    fn min_relay_rtt_ms(&self) -> Option<u32> {
+        self.resolver.liveness().and_then(|h| h.min_relay_rtt_ms())
+    }
+}
+
+/// ZEB-622: presence-beacon last-seen cache. Fed by `CommunityPresenceMap::apply`
+/// on EVERY verified, member-gated beacon that reaches it (even a stale/duplicate
+/// refresh that leaves the roster unchanged — still fresh evidence we just heard
+/// from that owner), and read by [`NetworkHealthService::snapshot`] to max-merge
+/// each peer's `last_seen_ms`. Keyed by owner addr (`[u8; 16]`); values are
+/// wall-clock ms. A `std::sync::RwLock` (not the presence map's `tokio::Mutex`)
+/// so the synchronous snapshot read path stays `.await`-free.
+#[derive(Debug, Default)]
+pub struct PresenceLastSeenCache {
+    inner: std::sync::RwLock<std::collections::HashMap<[u8; 16], u64>>,
+}
+
+impl PresenceLastSeenCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `owner`'s presence beacon was observed at `last_seen_ms`.
+    /// Max-merge: a stale (lower) timestamp never regresses a fresher recorded
+    /// one. A poisoned lock is RECOVERED rather than treated as a no-op (the
+    /// critical section is a panic-free map op) — matches `MembershipProjection`'s
+    /// ZEB-495 recovery.
+    pub fn note_seen(&self, owner: [u8; 16], last_seen_ms: u64) {
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let slot = g.entry(owner).or_insert(last_seen_ms);
+        *slot = (*slot).max(last_seen_ms);
+    }
+
+    /// Freshest recorded presence-beacon wall-clock for `owner`, if any.
+    /// Poisoned lock recovered (see [`note_seen`](Self::note_seen)).
+    pub fn last_seen(&self, owner: &[u8; 16]) -> Option<u64> {
+        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        g.get(owner).copied()
+    }
+}
+
 /// ZEB-380: per-relay health source for the snapshot. Mirrors `DialSnapshot`.
 /// Returns the core `harmony_pkarr::RelayHealth`; `snapshot()` maps it to the
 /// camelCase wire DTO.
@@ -735,6 +817,15 @@ pub struct NetworkHealthService {
     /// Installed at boot via [`set_supervisor_source`](Self::set_supervisor_source),
     /// mirroring how `notify_tx` is wired by `spawn_rate_limiter`.
     supervisor: Option<std::sync::Arc<dyn SupervisorSnapshot>>,
+    /// ZEB-622: peer-liveness state source. `None` in unit tests that don't
+    /// exercise transport telemetry (then the liveness join + relay-RTT fallback
+    /// are inert). Installed at boot via
+    /// [`set_liveness_source`](Self::set_liveness_source).
+    liveness: Option<std::sync::Arc<dyn LivenessSnapshot>>,
+    /// ZEB-622: presence last-seen cache. `None` in unit tests that don't exercise
+    /// presence freshness. Installed at boot via
+    /// [`set_presence_source`](Self::set_presence_source).
+    presence: Option<std::sync::Arc<PresenceLastSeenCache>>,
     last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
     /// Channel into the rate-limiter task. `None` until `spawn_rate_limiter`
     /// is called at boot; `notify()` is a no-op while None so unit tests
@@ -759,6 +850,8 @@ impl NetworkHealthService {
             dial,
             relay,
             supervisor: None,
+            liveness: None,
+            presence: None,
             last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             notify_tx: None,
         }
@@ -772,10 +865,36 @@ impl NetworkHealthService {
         self.supervisor = Some(src);
     }
 
+    /// ZEB-622: install the peer-liveness state source. Called once at boot after
+    /// the liveness handle reaches the resolver (event_loop). Additive — when
+    /// unset, the liveness join is a no-op and `relay_rtt_ms` keeps the iroh
+    /// value (existing behavior).
+    pub fn set_liveness_source(&mut self, src: std::sync::Arc<dyn LivenessSnapshot>) {
+        self.liveness = Some(src);
+    }
+
+    /// ZEB-622: install the presence last-seen cache. Called once at boot. When
+    /// unset, the presence contribution to `last_seen_ms` is inert.
+    pub fn set_presence_source(&mut self, src: std::sync::Arc<PresenceLastSeenCache>) {
+        self.presence = Some(src);
+    }
+
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
     /// fails — empty/None fields render gracefully in the UI.
     pub async fn snapshot(&self) -> NetworkHealthSnapshot {
         let now = now_ms();
+
+        // ZEB-622: one read of the peer-liveness projection, reused for the
+        // per-peer connection-mode/rtt join, the last-seen freshness fold, and
+        // the `MyNetworkSummary.relay_rtt_ms` fallback. Empty when no liveness
+        // source is installed (unit tests, pre-boot) → every use is inert.
+        let liveness_states: std::collections::HashMap<[u8; 32], LivenessStateWire> = self
+            .liveness
+            .as_ref()
+            .map(|s| s.peer_states().into_iter().collect())
+            .unwrap_or_default();
+        let liveness_min_relay = self.liveness.as_ref().and_then(|s| s.min_relay_rtt_ms());
+
         // Build MyNetworkSummary with a placeholder reachability so we
         // can pass it through derive_reachability_status once peers are
         // known. The two-pass shape keeps derive_reachability_status'
@@ -789,7 +908,10 @@ impl NetworkHealthService {
                 reachability: ReachabilityStatus::Reachable, // patched below
                 nat_classification: self.iroh.nat_classification(),
                 home_relay_url: self.iroh.home_relay_url(),
-                relay_rtt_ms: self.iroh.relay_rtt_ms(),
+                // ZEB-622: iroh exposes no stable relay-RTT hook today (always
+                // None) — fall back to the liveness machine's min relay RTT
+                // across live peers so the panel still surfaces a number.
+                relay_rtt_ms: self.iroh.relay_rtt_ms().or(liveness_min_relay),
                 direct_addresses: self.iroh.direct_addresses(),
             });
 
@@ -826,15 +948,15 @@ impl NetworkHealthService {
             }
         }
 
-        let mut peers = filter_peers_by_shared_membership(records, &*self.membership, now);
-
-        // ZEB-595: enrich each peer's connection_mode + rtt_ms from the most
+        // ZEB-595: enrich each record's connection_mode + rtt_ms from the most
         // recent self-test's per-peer ping results (NO new network call — the
         // self-test already measured them; matched by owner-addr hex). Only a
-        // Pass updates the peer; Fail/Skipped leave the NoConnection/None
-        // defaults. Done BEFORE derive_reachability_status so the overall
-        // status reflects real per-peer connectivity too. No-op until a
-        // self-test has run (empty cache → peers keep their defaults).
+        // Pass updates the record; Fail/Skipped leave the NoConnection/None
+        // defaults. No-op until a self-test has run.
+        //
+        // ZEB-622: this overlay runs at the RECORD level and BEFORE the liveness
+        // join below, so live transport data (`liveness_states`) wins over a
+        // stale cached self-test for the same peer.
         {
             let last = self.last_self_test.read().await;
             if let Some(report) = last.as_ref() {
@@ -843,18 +965,64 @@ impl NetworkHealthService {
                     .iter()
                     .map(|p| (p.owner_addr.as_str(), p))
                     .collect();
-                for peer in &mut peers {
-                    if let Some(ping) = by_owner.get(peer.owner_addr.as_str()) {
+                for record in &mut records {
+                    let owner_hex = hex::encode(record.owner_addr);
+                    if let Some(ping) = by_owner.get(owner_hex.as_str()) {
                         if let StepOutcome::Pass { duration_ms } = &ping.outcome {
-                            peer.rtt_ms = Some(*duration_ms);
+                            record.rtt_ms = Some(*duration_ms);
                             if let Some(mode) = ping.mode {
-                                peer.connection_mode = mode;
+                                record.connection_mode = mode;
                             }
                         }
                     }
                 }
             }
         }
+
+        // ZEB-622: join the live peer-liveness transport state onto each record
+        // (by `iroh_node_id`). Runs AFTER the self-test overlay so live data
+        // wins. `Connected` sets Direct/Relay + the live rtt; `Degraded` marks
+        // the new Degraded mode (rtt untouched); `Disconnected`/absent leave the
+        // record's current mode (NoConnection default, or a self-test value).
+        if !liveness_states.is_empty() {
+            for record in &mut records {
+                match liveness_states.get(&record.iroh_node_id) {
+                    Some(LivenessStateWire::Connected { mode, rtt_ms, .. }) => {
+                        record.connection_mode = match mode {
+                            LivenessMode::Direct => ConnectionMode::Direct,
+                            LivenessMode::Relay => ConnectionMode::Relay,
+                        };
+                        record.rtt_ms = *rtt_ms;
+                    }
+                    Some(LivenessStateWire::Degraded { .. }) => {
+                        record.connection_mode = ConnectionMode::Degraded;
+                    }
+                    Some(LivenessStateWire::Disconnected { .. }) | None => {}
+                }
+            }
+        }
+
+        // ZEB-622: fold the freshest last-seen evidence into each record. The
+        // supervisor `Connected.since_ms` fallback (above) fills a record that
+        // had none; here we additionally max-merge the liveness `Connected
+        // .since_ms` and the presence-beacon cache so a fresher signal from
+        // either advances the record's own value (never regresses it).
+        for record in &mut records {
+            let mut best = record.last_seen_ms;
+            if let Some(LivenessStateWire::Connected { since_ms, .. }) =
+                liveness_states.get(&record.iroh_node_id)
+            {
+                best = Some(best.map_or(*since_ms, |b| b.max(*since_ms)));
+            }
+            if let Some(cache) = self.presence.as_ref() {
+                if let Some(seen) = cache.last_seen(&record.owner_addr) {
+                    best = Some(best.map_or(seen, |b| b.max(seen)));
+                }
+            }
+            record.last_seen_ms = best;
+        }
+
+        let peers = filter_peers_by_shared_membership(records, &*self.membership, now);
 
         // Patch reachability status now that we have peers.
         let my_network = my_network.map(|mut my| {
@@ -863,7 +1031,7 @@ impl NetworkHealthService {
         });
 
         NetworkHealthSnapshot {
-            schema_version: 3,
+            schema_version: 4,
             captured_at_ms: now,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -1015,6 +1183,7 @@ pub fn format_export_markdown(
             let mode_marker = match p.connection_mode {
                 ConnectionMode::Direct => "direct",
                 ConnectionMode::Relay => "relay",
+                ConnectionMode::Degraded => "degraded",
                 ConnectionMode::NoConnection => "none",
             };
             let rtt = p.rtt_ms.map(|v| format!(" {}ms", v)).unwrap_or_default();
@@ -2249,7 +2418,7 @@ mod tests {
     #[test]
     fn network_health_snapshot_empty_is_well_formed() {
         let s = NetworkHealthSnapshot::empty();
-        assert_eq!(s.schema_version, 3);
+        assert_eq!(s.schema_version, 4);
         assert!(s.my_network.is_none());
         assert!(s.peers.is_empty());
         assert_eq!(s.pkarr_status.community_publish_count, 0);
@@ -2305,7 +2474,7 @@ mod tests {
 
     fn fixture_snapshot_with_full_ids() -> NetworkHealthSnapshot {
         NetworkHealthSnapshot {
-            schema_version: 3,
+            schema_version: 4,
             captured_at_ms: 1_700_000_000_000,
             app_version: "0.1.0-alpha.1".into(),
             platform: "darwin/aarch64".into(),
@@ -2455,7 +2624,7 @@ mod tests {
         // schemaVersion were omitted (captured_at_ms contains "1").
         // Bind to the literal emitted token.
         assert!(
-            md.contains("schemaVersion: 3"),
+            md.contains("schemaVersion: 4"),
             "schema version token must appear verbatim; output was:\n{}",
             md
         );
@@ -2577,7 +2746,7 @@ mod tests {
         let snap = svc.snapshot().await;
         assert!(snap.my_network.is_none());
         assert!(snap.peers.is_empty());
-        assert_eq!(snap.schema_version, 3);
+        assert_eq!(snap.schema_version, 4);
     }
 
     #[tokio::test]
@@ -2910,6 +3079,252 @@ mod tests {
         assert_eq!(snap.peers.len(), 1);
         assert_eq!(snap.peers[0].rtt_ms, None);
         assert_eq!(snap.peers[0].connection_mode, ConnectionMode::NoConnection);
+    }
+
+    // ── ZEB-622 Task 5: liveness fusion + Degraded + presence last-seen ──
+
+    /// Test `LivenessSnapshot` double: replays a scripted per-peer state list +
+    /// a fixed min relay RTT.
+    struct FakeLiveness {
+        states: Vec<([u8; 32], LivenessStateWire)>,
+        min_relay: Option<u32>,
+    }
+    impl LivenessSnapshot for FakeLiveness {
+        fn peer_states(&self) -> Vec<([u8; 32], LivenessStateWire)> {
+            self.states.clone()
+        }
+        fn min_relay_rtt_ms(&self) -> Option<u32> {
+            self.min_relay
+        }
+    }
+
+    /// Iroh double that is READY (has a node id) but reports no relay RTT — the
+    /// production reality today (`ProdIrohSnapshot::relay_rtt_ms` is hardcoded
+    /// None), so the liveness fallback is what actually fills the field.
+    struct FakeIrohNoRelayRtt;
+    impl IrohSnapshot for FakeIrohNoRelayRtt {
+        fn iroh_node_id_hex(&self) -> Option<String> {
+            Some("a3f9e1c2".repeat(8))
+        }
+        fn home_relay_url(&self) -> Option<String> {
+            Some("https://derp.example/".into())
+        }
+        fn relay_rtt_ms(&self) -> Option<u32> {
+            None
+        }
+        fn direct_addresses(&self) -> Vec<String> {
+            vec![]
+        }
+        fn nat_classification(&self) -> NatClass {
+            NatClass::Unknown
+        }
+    }
+
+    /// (a) One Connected(Relay, 42), one Degraded, one absent → the three fused
+    /// connection modes + rtts land on the right peers.
+    #[tokio::test]
+    async fn snapshot_fuses_liveness_states_into_peer_health() {
+        let mut table = std::collections::HashMap::new();
+        for b in [0x11u8, 0x22, 0x33] {
+            table.insert([b; 16], vec!["c1".to_string()]);
+        }
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![
+                    make_record(0x11, ConnectionMode::NoConnection, Some(1)),
+                    make_record(0x22, ConnectionMode::NoConnection, Some(1)),
+                    make_record(0x33, ConnectionMode::NoConnection, Some(1)),
+                ],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_liveness_source(std::sync::Arc::new(FakeLiveness {
+            states: vec![
+                (
+                    [0x11u8; 32],
+                    LivenessStateWire::Connected {
+                        mode: LivenessMode::Relay,
+                        rtt_ms: Some(42),
+                        since_ms: 5,
+                    },
+                ),
+                ([0x22u8; 32], LivenessStateWire::Degraded { since_ms: 5 }),
+                // 0x33 absent from the liveness projection.
+            ],
+            min_relay: None,
+        }));
+        let snap = svc.snapshot().await;
+        let get = |b: u8| {
+            snap.peers
+                .iter()
+                .find(|p| p.owner_addr == hex::encode([b; 16]))
+                .expect("peer present")
+        };
+        let p11 = get(0x11);
+        assert_eq!(p11.connection_mode, ConnectionMode::Relay);
+        assert_eq!(p11.rtt_ms, Some(42));
+        let p22 = get(0x22);
+        assert_eq!(p22.connection_mode, ConnectionMode::Degraded);
+        assert_eq!(p22.rtt_ms, None, "Degraded leaves rtt untouched");
+        let p33 = get(0x33);
+        assert_eq!(p33.connection_mode, ConnectionMode::NoConnection);
+        assert_eq!(p33.rtt_ms, None);
+    }
+
+    /// (b) Live liveness data wins over a stale cached self-test for the same
+    /// peer — the self-test says Direct/37, liveness says Relay/99 → Relay/99.
+    #[tokio::test]
+    async fn liveness_overrides_stale_self_test_mode() {
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xAA, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0xAA]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        *svc.last_self_test.write().await = Some(SelfTestReport {
+            started_at_ms: 0,
+            finished_at_ms: 100,
+            steps: vec![],
+            peer_results: vec![PeerPingResult {
+                owner_addr: hex::encode([0xAA; 16]),
+                outcome: StepOutcome::Pass { duration_ms: 37 },
+                mode: Some(ConnectionMode::Direct),
+            }],
+        });
+        svc.set_liveness_source(std::sync::Arc::new(FakeLiveness {
+            states: vec![(
+                [0xAAu8; 32],
+                LivenessStateWire::Connected {
+                    mode: LivenessMode::Relay,
+                    rtt_ms: Some(99),
+                    since_ms: 5,
+                },
+            )],
+            min_relay: None,
+        }));
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(
+            snap.peers[0].connection_mode,
+            ConnectionMode::Relay,
+            "live liveness mode wins over stale self-test Direct"
+        );
+        assert_eq!(snap.peers[0].rtt_ms, Some(99), "live rtt wins too");
+    }
+
+    /// (c) `MyNetworkSummary.relay_rtt_ms` falls back to the liveness min when
+    /// iroh reports None; when iroh HAS a value it wins.
+    #[tokio::test]
+    async fn relay_rtt_falls_back_to_liveness_min() {
+        // iroh None → liveness min fills it.
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIrohNoRelayRtt),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_liveness_source(std::sync::Arc::new(FakeLiveness {
+            states: vec![],
+            min_relay: Some(77),
+        }));
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.my_network.expect("ready").relay_rtt_ms, Some(77));
+
+        // iroh Some(24) → iroh wins, liveness min ignored.
+        let mut svc2 = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc2.set_liveness_source(std::sync::Arc::new(FakeLiveness {
+            states: vec![],
+            min_relay: Some(77),
+        }));
+        let snap2 = svc2.snapshot().await;
+        assert_eq!(snap2.my_network.expect("ready").relay_rtt_ms, Some(24));
+    }
+
+    /// (d) `last_seen_ms` prefers the freshest of {record ts, presence cache,
+    /// liveness Connected.since_ms}. Record < presence cache → cache wins; both
+    /// < since_ms → since_ms wins.
+    #[tokio::test]
+    async fn last_seen_prefers_freshest_source() {
+        // Case 1: presence cache (5_000) fresher than record (1_000), no liveness.
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0x77, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0x77]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        let cache = std::sync::Arc::new(PresenceLastSeenCache::new());
+        cache.note_seen([0x77; 16], 5_000);
+        svc.set_presence_source(std::sync::Arc::clone(&cache));
+        let snap = svc.snapshot().await;
+        assert_eq!(
+            snap.peers[0].last_seen_ms,
+            Some(5_000),
+            "presence cache is fresher than the record → cache wins"
+        );
+
+        // Case 2: add liveness Connected.since_ms (9_000) — fresher than both.
+        svc.set_liveness_source(std::sync::Arc::new(FakeLiveness {
+            states: vec![(
+                [0x77u8; 32],
+                LivenessStateWire::Connected {
+                    mode: LivenessMode::Direct,
+                    rtt_ms: Some(3),
+                    since_ms: 9_000,
+                },
+            )],
+            min_relay: None,
+        }));
+        let snap2 = svc.snapshot().await;
+        assert_eq!(
+            snap2.peers[0].last_seen_ms,
+            Some(9_000),
+            "liveness Connected.since_ms is freshest → since_ms wins"
+        );
+    }
+
+    /// (e) Serde pin: the new `ConnectionMode::Degraded` variant serializes to
+    /// the wire tag `"degraded"` (the TS DTO in Task 6 reads this).
+    #[test]
+    fn connection_mode_degraded_serde_pin() {
+        let v = serde_json::to_value(ConnectionMode::Degraded).expect("serialize");
+        assert_eq!(v, serde_json::json!("degraded"));
+    }
+
+    /// (g) `PresenceLastSeenCache` max-merges: a stale (lower) note never
+    /// regresses a fresher recorded value; a fresher note advances it.
+    #[test]
+    fn presence_last_seen_cache_max_merges() {
+        let c = PresenceLastSeenCache::new();
+        assert_eq!(c.last_seen(&[1; 16]), None);
+        c.note_seen([1; 16], 100);
+        assert_eq!(c.last_seen(&[1; 16]), Some(100));
+        c.note_seen([1; 16], 50); // stale → must not regress
+        assert_eq!(c.last_seen(&[1; 16]), Some(100));
+        c.note_seen([1; 16], 200); // fresher → advances
+        assert_eq!(c.last_seen(&[1; 16]), Some(200));
+        // A different owner is independent.
+        assert_eq!(c.last_seen(&[2; 16]), None);
     }
 
     #[tokio::test]
@@ -3680,7 +4095,7 @@ mod tests {
             std::sync::Arc::new(FakeRelaySnapshot(vec![relay.clone()])),
         );
         let snap = svc.snapshot().await;
-        assert_eq!(snap.schema_version, 3);
+        assert_eq!(snap.schema_version, 4);
         assert_eq!(snap.pkarr_status.relays.len(), 1);
         assert_eq!(snap.pkarr_status.relays[0].url, "https://relay.pkarr.org");
         assert_eq!(

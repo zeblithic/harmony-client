@@ -3726,9 +3726,19 @@ pub async fn start_node_inner(
         // keeps `community_presence_map_for_state`.
         let (community_presence_request_tx, community_presence_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::CommunityPresenceRequest>(64);
-        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::community_presence::CommunityPresenceMap::new(),
-        ));
+        // ZEB-622: network-health presence last-seen cache. Created here so it can
+        // be (a) wired into the presence map below — every verified beacon's
+        // `apply` feeds it — and (b) installed on the NetworkHealthService at the
+        // boot block far below (`set_presence_source`), which max-merges it into
+        // each peer's `last_seen_ms`. A plain `Arc`; the map holds one clone, the
+        // service another.
+        let network_health_presence_cache =
+            std::sync::Arc::new(crate::network_health::PresenceLastSeenCache::new());
+        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new({
+            let mut m = crate::community_presence::CommunityPresenceMap::new();
+            m.set_last_seen_cache(std::sync::Arc::clone(&network_health_presence_cache));
+            m
+        }));
         let community_presence_map_for_state = std::sync::Arc::clone(&community_presence_map);
 
         // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
@@ -9559,6 +9569,22 @@ pub async fn start_node_inner(
                                     reachability_resolver.clone(),
                                 ),
                             ));
+                            // ZEB-622: peer-liveness state source. Reads the live
+                            // LivenessHandle lazily via the resolver's installed
+                            // handle (event_loop wires it via `set_liveness`
+                            // before the supervisor block) — feeds the per-peer
+                            // live connection-mode/rtt join, the last-seen
+                            // freshness fold, and the relay-RTT fallback.
+                            nh.set_liveness_source(std::sync::Arc::new(
+                                crate::network_health::ProdLivenessSnapshot::new(
+                                    reachability_resolver.clone(),
+                                ),
+                            ));
+                            // ZEB-622: presence last-seen cache (fed by the
+                            // community-presence subscriber's `apply`).
+                            nh.set_presence_source(std::sync::Arc::clone(
+                                &network_health_presence_cache,
+                            ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
@@ -9568,6 +9594,43 @@ pub async fn start_node_inner(
 
                             let nh_arc = std::sync::Arc::new(nh);
                             guard.network_health = Some(std::sync::Arc::clone(&nh_arc));
+                            // ZEB-622: bridge peer-liveness slot changes into the
+                            // network-health-changed pipeline. The LivenessHandle
+                            // is installed by event_loop after this boot block, so
+                            // poll the resolver for it (every 500ms, up to 60s);
+                            // once present, forward each `changed` tick into
+                            // `notify()` (rate-limited downstream by the limiter
+                            // spawned just above). Exits when the watch sender is
+                            // dropped (node shutdown).
+                            {
+                                let resolver_for_bridge = reachability_resolver.clone();
+                                let nh_for_bridge = std::sync::Arc::clone(&nh_arc);
+                                tokio::spawn(async move {
+                                    let lh = {
+                                        let mut waited_ms: u64 = 0;
+                                        loop {
+                                            if let Some(lh) = resolver_for_bridge.liveness() {
+                                                break lh;
+                                            }
+                                            if waited_ms >= 60_000 {
+                                                return;
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                500,
+                                            ))
+                                            .await;
+                                            waited_ms += 500;
+                                        }
+                                    };
+                                    let mut rx = lh.changed_rx();
+                                    loop {
+                                        if rx.changed().await.is_err() {
+                                            break;
+                                        }
+                                        nh_for_bridge.notify();
+                                    }
+                                });
+                            }
                             // ZEB-329: publish the service into the
                             // shared cell so the on_epoch_event
                             // closure's notify hook (captured at
