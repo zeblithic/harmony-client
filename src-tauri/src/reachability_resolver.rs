@@ -36,6 +36,32 @@ pub(crate) const STALE_RECORD_REFRESH_MS: u64 = 24 * 60 * 60 * 1000;
 pub(crate) const PKARR_REFRESH_COOLDOWN: std::time::Duration =
     std::time::Duration::from_secs(15 * 60);
 
+/// ZEB-621: forward clock-skew allowance for freshness timestamps. A record
+/// claiming to be authored more than this far in the future (benign clock skew
+/// or a bogus/hostile record) is clamped to `now + FUTURE_SKEW_TOLERANCE_MS` at
+/// insert time so it cannot permanently dominate the freshest dial view or
+/// same-source LWW and starve out later, correct records. For realistic records
+/// (`announced_at_ms <= now`) the clamp is a no-op.
+pub(crate) const FUTURE_SKEW_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+
+/// ZEB-621: maximum number of concurrent background pkarr refresh network calls
+/// across the whole resolver (see [`ReachabilityResolver::maybe_refresh_stale`]).
+/// Bounds instantaneous fan-out when a reconnect sweep finds many stale peers due
+/// at once; per-owner cooldowns separately bound the per-owner rate.
+pub(crate) const PKARR_REFRESH_MAX_CONCURRENT: usize = 4;
+
+/// Default wall clock for [`ReachabilityResolver`]: milliseconds since the Unix
+/// epoch. Injectable via `set_clock` in tests so the future-skew clamp
+/// (ZEB-621) can be driven against a controllable "now".
+fn default_clock() -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    })
+}
+
 /// Async fallback called by `resolve_async` when the in-memory CRDT cache has
 /// no entry for a given owner. Implemented by `PkarrResolverAdapter` (case C)
 /// and by test stubs. The concrete impl is injected at boot via
@@ -80,6 +106,15 @@ pub struct ResolverEntry {
     pub payload: ReachabilityAnnouncePayload,
     pub hlc: Hlc,
     pub source: ReachabilitySource,
+    /// ZEB-621: `payload.announced_at_ms` clamped to at most
+    /// `now + FUTURE_SKEW_TOLERANCE_MS`, computed once at insert time in
+    /// [`ReachabilityResolver::update_with_source`]. The freshest dial view
+    /// ([`ResolverSlots::freshest`]) and the
+    /// [`maybe_refresh_stale`](ReachabilityResolver::maybe_refresh_stale)
+    /// staleness gate compare THIS rather than the raw announced time, so a
+    /// future-dated record cannot permanently pin the dial route. For realistic
+    /// records (`announced_at_ms <= now`) it equals `payload.announced_at_ms`.
+    pub effective_announced_at_ms: u64,
 }
 
 /// Dual-slot storage for one `(OwnerAddr, iroh_node_id)` key (ZEB-621).
@@ -105,13 +140,14 @@ struct ResolverSlots {
 
 impl ResolverSlots {
     /// Dial authority: the entry whose payload was announced most recently
-    /// (greater `payload.announced_at_ms`); ties resolve to the durable slot.
-    /// `None` only for an empty pair (never stored — `update_with_source` writes
-    /// at least one slot before any entry lands in the map).
+    /// (greater `effective_announced_at_ms` — the future-skew-clamped announce
+    /// time, ZEB-621); ties resolve to the durable slot. `None` only for an empty
+    /// pair (never stored — `update_with_source` writes at least one slot before
+    /// any entry lands in the map).
     fn freshest(&self) -> Option<&ResolverEntry> {
         match (&self.durable, &self.pkarr) {
             (Some(d), Some(p)) => {
-                if p.payload.announced_at_ms > d.payload.announced_at_ms {
+                if p.effective_announced_at_ms > d.effective_announced_at_ms {
                     Some(p)
                 } else {
                     Some(d)
@@ -153,6 +189,20 @@ pub struct ReachabilityResolver {
     // time testable.
     refresh_cooldowns:
         Arc<std::sync::Mutex<std::collections::HashMap<OwnerAddr, tokio::time::Instant>>>,
+    // ZEB-621: wall clock (Unix-epoch ms) consulted by `update_with_source` to
+    // compute each entry's `effective_announced_at_ms` (future-skew clamp).
+    // Wrapped `Arc<RwLock<Arc<..>>>` so it is (a) shared across clones like the
+    // other fields — every clone reads the same clock — and (b) swappable via
+    // `set_clock` in tests without a `&mut self`. Production keeps `default_clock`
+    // (`SystemTime`); tests inject a controllable "now".
+    clock: Arc<RwLock<Arc<dyn Fn() -> u64 + Send + Sync>>>,
+    // ZEB-621: bounds the instantaneous fan-out of background pkarr refresh I/O.
+    // A post-address-change `kick_sweep` can make the whole roster due in one
+    // dispatch pass, so many `maybe_refresh_stale` calls could each spawn a pkarr
+    // `resolve` at once. The per-owner cooldown bounds the RATE per owner; this
+    // semaphore bounds the total number of refresh network calls in flight across
+    // all owners. Shared across clones (`Arc`) so the bound is global.
+    refresh_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -172,6 +222,8 @@ impl Default for ReachabilityResolver {
             supervisor: Arc::new(RwLock::new(None)),
             liveness: Arc::new(RwLock::new(None)),
             refresh_cooldowns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            clock: Arc::new(RwLock::new(default_clock())),
+            refresh_permits: Arc::new(tokio::sync::Semaphore::new(PKARR_REFRESH_MAX_CONCURRENT)),
         }
     }
 }
@@ -187,6 +239,8 @@ impl Clone for ReachabilityResolver {
             supervisor: Arc::clone(&self.supervisor),
             liveness: Arc::clone(&self.liveness),
             refresh_cooldowns: Arc::clone(&self.refresh_cooldowns),
+            clock: Arc::clone(&self.clock),
+            refresh_permits: Arc::clone(&self.refresh_permits),
         }
     }
 }
@@ -194,6 +248,23 @@ impl Clone for ReachabilityResolver {
 impl ReachabilityResolver {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// ZEB-621: current wall-clock time (Unix-epoch ms) as seen by the future-skew
+    /// clamp. Reads the injectable [`clock`](Self::clock); production uses
+    /// [`default_clock`] (`SystemTime`).
+    fn now_ms(&self) -> u64 {
+        let clock = Arc::clone(&*self.clock.read().expect("resolver clock lock"));
+        clock()
+    }
+
+    /// ZEB-621 (test-only): swap the wall clock consulted by the future-skew
+    /// clamp so paused-time tests can drive a controllable "now". Shared across
+    /// clones via the same `Arc<RwLock<..>>`, so an injection on any clone is
+    /// visible to all.
+    #[cfg(test)]
+    pub(crate) fn set_clock(&self, f: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        *self.clock.write().expect("resolver clock lock") = f;
     }
 
     /// ZEB-620: install the reconnect-supervisor handle. Called once at boot
@@ -255,10 +326,26 @@ impl ReachabilityResolver {
     ) {
         let key: ResolverKey = (actor, payload.iroh_node_id);
         let node_id = payload.iroh_node_id;
+        // ZEB-621 future-skew clamp: bound the announce time (and, for the
+        // SYNTHETIC pkarr HLC only, the HLC wall time) to `now + skew` so a
+        // future-dated record cannot permanently dominate the freshest dial view
+        // (`effective_announced_at_ms`) or same-source LWW (pkarr `hlc.wall_ms`)
+        // and block later correct records from installing. Durable-CRDT HLCs are
+        // authored by the owner's own device and are left untouched.
+        let skew_ceiling = self.now_ms().saturating_add(FUTURE_SKEW_TOLERANCE_MS);
+        let effective_announced_at_ms = payload.announced_at_ms.min(skew_ceiling);
+        let hlc = match source {
+            ReachabilitySource::PkarrLive => Hlc {
+                wall_ms: hlc.wall_ms.min(skew_ceiling),
+                ..hlc
+            },
+            ReachabilitySource::DurableCrdt => hlc,
+        };
         let next = ResolverEntry {
             payload,
             hlc,
             source,
+            effective_announced_at_ms,
         };
         let mut map = self.inner.write().expect("resolver write lock");
         let slots = map.entry(key).or_default();
@@ -372,9 +459,10 @@ impl ReachabilityResolver {
     /// Task 2). Like [`resolve_by_node_id`](Self::resolve_by_node_id) but returns
     /// the full [`ResolverEntry`] — source + HLC + timestamps — so the dialer can
     /// inspect the winning record's provenance and freshness, not just its
-    /// payload. Returns the entry with the most recent `announced_at_ms` across
-    /// the peer's durable and pkarr slots (ties → durable), matching
-    /// `resolve_by_node_id`'s freshest-wins dial semantics.
+    /// payload. Returns the entry with the most recent `effective_announced_at_ms`
+    /// (future-skew-clamped announce time, ZEB-621) across the peer's durable and
+    /// pkarr slots (ties → durable), matching `resolve_by_node_id`'s freshest-wins
+    /// dial semantics.
     pub fn resolve_entry_by_node_id(
         &self,
         node_id_bytes: &[u8; 32],
@@ -398,16 +486,18 @@ impl ReachabilityResolver {
     /// dial view and auto-fires the `RecordChanged` supervisor kick through Task
     /// 1's gate — this seam adds no kick logic of its own.
     pub fn maybe_refresh_stale(&self, owner: OwnerAddr, node_id: [u8; 32], now_ms: u64) {
-        // (1) Staleness gate against the freshest view's age. No record ⇒
-        //     nothing to heal. A future-dated `announced_at_ms` (clock skew /
-        //     bogus record) has no plausible age, so `checked_sub` yields `None`
-        //     and it is treated as stale — worth a re-resolve. For realistic
-        //     data (`announced_at_ms <= now_ms`) this is exactly
-        //     `now_ms - announced_at_ms`.
+        // (1) Staleness gate against the freshest view's clamped age. No record ⇒
+        //     nothing to heal. The comparison uses `effective_announced_at_ms`
+        //     (`announced_at_ms` clamped to `now + FUTURE_SKEW_TOLERANCE_MS` at
+        //     insert time, ZEB-621 future-skew fix): a bogus future-dated record's
+        //     effective time is at most `skew` ahead of `now_ms`, which still
+        //     yields `None` from `checked_sub` and so is treated as stale — worth
+        //     a re-resolve. For realistic data (`effective <= now_ms`) this is
+        //     exactly `now_ms - effective_announced_at_ms`.
         let Some((_, entry)) = self.resolve_entry_by_node_id(&node_id) else {
             return;
         };
-        match now_ms.checked_sub(entry.payload.announced_at_ms) {
+        match now_ms.checked_sub(entry.effective_announced_at_ms) {
             Some(age) if age <= STALE_RECORD_REFRESH_MS => return, // fresh
             _ => {} // stale (older than the window) or implausibly future-dated
         }
@@ -448,8 +538,20 @@ impl ReachabilityResolver {
         //     through `update_with_source(.., PkarrLive)` with the same HLC
         //     synthesis as `resolve_async` (wall_ms = announced_at_ms, logical
         //     0, device_id "").
+        //
+        //     The global refresh-concurrency permit is acquired INSIDE the task,
+        //     just before the network call (ZEB-621): task spawn stays cheap, but
+        //     the number of pkarr `resolve` calls actually in flight is bounded by
+        //     `PKARR_REFRESH_MAX_CONCURRENT` even when a reconnect sweep makes the
+        //     whole roster due at once. A closed semaphore (never closed in
+        //     practice) just skips the refresh.
         let resolver = self.clone();
+        let permits = Arc::clone(&self.refresh_permits);
         tokio::spawn(async move {
+            let _permit = match permits.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
             let payloads = fb.resolve(&owner).await;
             for payload in payloads {
                 let hlc = Hlc {
@@ -1626,5 +1728,165 @@ mod fallback_tests {
         r.maybe_refresh_stale(owner, node_id_bytes(7), 1_000 + STALE_RECORD_REFRESH_MS);
         tokio::task::yield_now().await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// ZEB-621 (Qodo #1) regression: a far-future pkarr record initially wins the
+    /// dial view, but its effective freshness is CLAMPED at insert time, so a
+    /// later refresh returning a sane payload can replace it in the pkarr slot and
+    /// the dial view moves off the future record. Without the clamp the future
+    /// HLC would stay LWW-newest forever and the route would pin to the bogus
+    /// address. The timeline is written as named consts so the arithmetic is
+    /// auditable.
+    #[tokio::test(start_paused = true)]
+    async fn future_record_clamped_and_healed_by_refresh() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        // Timeline (Unix-epoch ms).
+        const T: u64 = 1_000_000; // injected "now" at insert time
+        const FUTURE_ANNOUNCED: u64 = T + 10_000_000_000; // ~116 days in the future
+        const CLAMP_CEIL: u64 = T + FUTURE_SKEW_TOLERANCE_MS; // effective at insert
+                                                              // "now" at refresh: past the 24h window measured from the CLAMPED effective
+                                                              // time, so the future record reads as stale and a refresh fires.
+        const NOW_REFRESH: u64 = T + FUTURE_SKEW_TOLERANCE_MS + STALE_RECORD_REFRESH_MS + 1;
+        // Sane refresh payload: authored just before NOW_REFRESH (not future → not
+        // clamped) and above the old clamped wall_ms, so it wins same-source LWW.
+        const SANE_ANNOUNCED: u64 = NOW_REFRESH - 1;
+
+        let r = ReachabilityResolver::new();
+        let clock = Arc::new(AtomicU64::new(T));
+        let c2 = Arc::clone(&clock);
+        r.set_clock(Arc::new(move || c2.load(Ordering::SeqCst)));
+
+        // (a) Insert the far-future pkarr record at clock = T. The dial view shows
+        //     it (raw announce preserved), but effective freshness + synthetic HLC
+        //     wall are both clamped to now + skew.
+        let owner = OwnerAddr([1u8; 16]);
+        r.update_with_source(
+            owner,
+            make_payload(7, FUTURE_ANNOUNCED),
+            make_hlc(FUTURE_ANNOUNCED, 0, ""),
+            ReachabilitySource::PkarrLive,
+        );
+        let (_, entry) = r
+            .resolve_entry_by_node_id(&node_id_bytes(7))
+            .expect("future record wins the dial view");
+        assert_eq!(
+            entry.payload.announced_at_ms, FUTURE_ANNOUNCED,
+            "raw announce preserved"
+        );
+        assert_eq!(
+            entry.effective_announced_at_ms, CLAMP_CEIL,
+            "effective clamped to now + skew"
+        );
+        assert_eq!(
+            entry.hlc.wall_ms, CLAMP_CEIL,
+            "synthetic pkarr HLC wall_ms clamped too"
+        );
+
+        // (b) Register a sane-payload fallback, advance the clock past the window,
+        //     and fire the refresh.
+        let counter = Arc::new(AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![make_payload(7, SANE_ANNOUNCED)],
+        }));
+        clock.store(NOW_REFRESH, Ordering::SeqCst);
+        r.maybe_refresh_stale(owner, node_id_bytes(7), NOW_REFRESH);
+        for _ in 0..50 {
+            if counter.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "stale future record triggers exactly one refresh"
+        );
+
+        // The sane payload replaced the future record; the dial view has moved.
+        let (_, healed) = r
+            .resolve_entry_by_node_id(&node_id_bytes(7))
+            .expect("healed record");
+        assert_eq!(
+            healed.payload.announced_at_ms, SANE_ANNOUNCED,
+            "dial view moved off the future record onto the sane payload"
+        );
+        assert_eq!(
+            healed.effective_announced_at_ms, SANE_ANNOUNCED,
+            "effective is the sane (unclamped) time"
+        );
+    }
+
+    /// ZEB-621 (Qodo #3): a burst of stale-refresh spawns is bounded by
+    /// [`PKARR_REFRESH_MAX_CONCURRENT`]. Ten owners due at once never put more than
+    /// four pkarr `resolve` calls in flight simultaneously, yet all ten resolve.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_fan_out_bounded_by_semaphore() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct InFlightFallback {
+            in_flight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            done: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ReachabilityFallback for InFlightFallback {
+            async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+                let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(cur, Ordering::SeqCst);
+                // Hold the permit across a brief (paused) network delay so the
+                // concurrent-in-flight count is observable.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                self.done.fetch_add(1, Ordering::SeqCst);
+                Vec::new()
+            }
+        }
+
+        let r = ReachabilityResolver::new();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(InFlightFallback {
+            in_flight: Arc::clone(&in_flight),
+            peak: Arc::clone(&peak),
+            done: Arc::clone(&done),
+        }));
+
+        // Ten distinct owners, each with a >24h-stale record (default real-epoch
+        // clock ⇒ announced_at 1_000 is far past the 24h window).
+        const N: u8 = 10;
+        for i in 0..N {
+            r.update(
+                OwnerAddr([i; 16]),
+                make_payload(i, 1_000),
+                make_hlc(1_000, 0, "d"),
+            );
+        }
+        let now = 1_000 + STALE_RECORD_REFRESH_MS + 1;
+        for i in 0..N {
+            r.maybe_refresh_stale(OwnerAddr([i; 16]), node_id_bytes(i), now);
+        }
+
+        // Drive paused time until every refresh has drained.
+        for _ in 0..200 {
+            if done.load(Ordering::SeqCst) == N as usize {
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            N as usize,
+            "all ten refreshes eventually resolve"
+        );
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(observed_peak >= 1, "refreshes actually ran");
+        assert!(
+            observed_peak <= PKARR_REFRESH_MAX_CONCURRENT,
+            "fan-out bounded to {} (observed peak {observed_peak})",
+            PKARR_REFRESH_MAX_CONCURRENT
+        );
     }
 }

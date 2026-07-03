@@ -853,32 +853,15 @@ mod tests {
     }
 
     /// Seed a live routing record so the record-gated supervisor will dial `p`.
+    ///
+    /// `announced_at_ms: 1` is deliberately ancient and LOAD-BEARING: against the
+    /// real wall-clock `now_ms()` the supervisor feeds `maybe_refresh_stale`, this
+    /// record is unconditionally >24h stale, which is the precondition
+    /// `stale_record_dispatch_triggers_pkarr_refresh` relies on to exercise the
+    /// ZEB-621 stale-refresh path. Do NOT bump this timestamp to "now" without
+    /// giving that test its own stale seed, or it will silently stop testing the
+    /// refresh trigger.
     fn seed(resolver: &ReachabilityResolver, p: [u8; 32]) {
-        resolver.update(
-            OwnerAddr([0xAA; 16]),
-            ReachabilityAnnouncePayload {
-                iroh_node_id: p,
-                home_relay_url: String::new(),
-                direct_addresses: vec![],
-                announced_at_ms: 1,
-                identity_signature: [0u8; 64],
-                butler_set: vec![],
-                bs_at: 0,
-            },
-            Hlc {
-                wall_ms: 1,
-                logical: 0,
-                device_id: String::new(),
-            },
-        );
-    }
-
-    /// Like [`seed`], but pins `announced_at_ms` to an ancient value so the
-    /// record is unconditionally >24h stale against the wall-clock `now_ms()`
-    /// the supervisor feeds `maybe_refresh_stale` (which reads real time, not
-    /// the paused test clock). Drives the ZEB-621 stale-refresh path
-    /// independently of `seed`'s incidental timestamp choice.
-    fn seed_stale(resolver: &ReachabilityResolver, p: [u8; 32]) {
         resolver.update(
             OwnerAddr([0xAA; 16]),
             ReachabilityAnnouncePayload {
@@ -1682,7 +1665,7 @@ mod tests {
         let resolver = Arc::new(ReachabilityResolver::new());
         let telemetry = Arc::new(DialTelemetry::new());
         let p = peer(1);
-        seed_stale(&resolver, p);
+        seed(&resolver, p);
         let counter = Arc::new(AtomicUsize::new(0));
         resolver.set_fallback_source(Arc::new(CountingFallback {
             calls: Arc::clone(&counter),

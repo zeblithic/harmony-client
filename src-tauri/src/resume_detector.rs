@@ -10,8 +10,11 @@
 //! that samples a monotonic-ish wall clock once per `tick`. Because a single
 //! [`tokio::time::sleep`] of `tick` should advance the wall clock by roughly
 //! `tick`, an observed wall-clock delta far larger than one tick means the
-//! process was frozen (suspended) — or the clock was stepped. Either way the
-//! safe, idempotent response is to re-probe the network path and republish.
+//! process was frozen (suspended) — or the clock was stepped. The detector keys
+//! off the delta's MAGNITUDE (`|cur - prev|`), so a large BACKWARD step (an NTP
+//! correction or a manual clock roll-back) trips it just like a forward suspend
+//! jump. Either way the safe, idempotent response is to re-probe the network
+//! path and republish.
 //!
 //! The loop is deliberately clock-injectable ([`run_resume_detector`] takes a
 //! `now_ms` closure) so the paused-time test can drive a wall clock that jumps
@@ -31,10 +34,12 @@ pub const RESUME_DETECTOR_TICK: Duration = Duration::from_secs(30);
 /// Returns `true` when the wall-clock delta observed across one loop tick is
 /// large enough to conclude the process was suspended (or the clock stepped).
 ///
-/// Rule: `observed_wall_delta_ms > expected_tick*2 + 5_000ms`. Allowing two
-/// ticks plus a 5s margin absorbs ordinary timer jitter and one fully missed
-/// tick without false-firing, while any real multi-minute suspend clears it by
-/// orders of magnitude.
+/// `observed_wall_delta_ms` is a MAGNITUDE (`|cur - prev|`), so this fires on
+/// either a forward suspend jump or a backward clock correction of the same
+/// size. Rule: `observed_wall_delta_ms > expected_tick*2 + 5_000ms`. Allowing
+/// two ticks plus a 5s margin absorbs ordinary timer jitter and one fully missed
+/// tick without false-firing, while any real multi-minute suspend or clock step
+/// clears it by orders of magnitude.
 pub fn resume_gap_detected(expected_tick: Duration, observed_wall_delta_ms: u64) -> bool {
     observed_wall_delta_ms > (expected_tick.as_millis() as u64) * 2 + 5_000
 }
@@ -44,8 +49,9 @@ pub fn resume_gap_detected(expected_tick: Duration, observed_wall_delta_ms: u64)
 /// `now_ms` yields the current wall-clock time in milliseconds; the loop uses it
 /// exclusively (never reads the system clock directly) so tests can inject a
 /// jumpable clock. On each tick the loop sleeps `tick` of *virtual/real* time,
-/// then compares the wall-clock delta against [`resume_gap_detected`]; on a
-/// detected gap it invokes `on_resume`.
+/// then compares the wall-clock delta MAGNITUDE (`|cur - prev|`, so a backward
+/// clock step counts) against [`resume_gap_detected`]; on a detected gap it
+/// invokes `on_resume`.
 pub async fn run_resume_detector(
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
     tick: Duration,
@@ -55,7 +61,10 @@ pub async fn run_resume_detector(
     loop {
         tokio::time::sleep(tick).await;
         let cur = now_ms();
-        let delta = cur.saturating_sub(prev);
+        // Magnitude, not a forward-only difference: a large BACKWARD wall-clock
+        // step (NTP correction / manual roll-back) must trip the detector too, so
+        // `saturating_sub` (which would clamp backward steps to 0) is wrong here.
+        let delta = cur.abs_diff(prev);
         if resume_gap_detected(tick, delta) {
             tracing::info!(
                 observed_wall_delta_ms = delta,
@@ -115,5 +124,46 @@ mod tests {
         tokio::time::advance(tick).await;
         tokio::task::yield_now().await;
         assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Qodo #2 regression: a large BACKWARD wall-clock step (NTP correction /
+    /// manual roll-back) must fire `on_resume`, while a small backward step under
+    /// the threshold must not. Guards against `saturating_sub` clamping backward
+    /// deltas to zero (which would silently swallow the trigger).
+    #[tokio::test(start_paused = true)]
+    async fn loop_fires_on_large_backward_step_not_small() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        // Start well above the largest backward step so the wall never underflows.
+        let wall = Arc::new(AtomicU64::new(10 * 60 * 60 * 1000)); // 10h
+        let w2 = Arc::clone(&wall);
+        let now_ms: Arc<dyn Fn() -> u64 + Send + Sync> =
+            Arc::new(move || w2.load(Ordering::SeqCst));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f2 = Arc::clone(&fired);
+        let on_resume: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            f2.fetch_add(1, Ordering::SeqCst);
+        });
+        let tick = Duration::from_secs(30);
+        tokio::spawn(run_resume_detector(now_ms, tick, on_resume));
+
+        // Small backward step (10s < 65s threshold): |Δ| below the bar → no fire.
+        wall.fetch_sub(10_000, Ordering::SeqCst);
+        tokio::time::advance(tick).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "small backward step must not fire"
+        );
+
+        // Large backward jump (2h ≫ threshold): |Δ| trips the detector → fire.
+        wall.fetch_sub(2 * 60 * 60 * 1000, Ordering::SeqCst);
+        tokio::time::advance(tick).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "large backward jump must fire"
+        );
     }
 }
