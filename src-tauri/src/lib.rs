@@ -884,6 +884,14 @@ pub struct NodeState {
     /// failed (no tunnel transport — DMs stay deposit-only). Cleared on stop_node
     /// so a stale identity's live tunnels never outlive an identity switch.
     tunnel_manager: Option<std::sync::Arc<crate::tunnel_manager::TunnelManager>>,
+    /// ZEB-623: per-peer protocol-compatibility registry. Built once per node
+    /// start (alongside the `TunnelManager`, sharing the SAME `Arc`) and stored
+    /// here so Network Health (Task 3) can surface peers we couldn't speak a
+    /// compatible tunnel protocol with. Deliberately NOT a connection handle:
+    /// `clear_iroh_handles` does not clear it (peer incompatibility is knowledge,
+    /// not a live resource), though an identity switch rebuilds `NodeState`
+    /// anyway. Defaults to an empty registry on a deposit-only node (no iroh).
+    protocol_compat: std::sync::Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
     /// ZEB-217 Sub-C Phase 3 Task 9: sender used by IPC handlers
     /// (`create_community`, `redeem_invite`) to dispatch a
     /// `CommunityAdapterRequest` into the event loop, where it's
@@ -1611,6 +1619,9 @@ impl Default for NodeState {
             dm_local_kem_pubkey: None,
             dm_pq_identity: None,
             tunnel_manager: None,
+            protocol_compat: std::sync::Arc::new(
+                crate::protocol_versioning::ProtocolCompatRegistry::default(),
+            ),
             community_adapter_request_tx: None,
             // ZEB-434 D6: stays None until start_node wires the
             // transport-epoch watch.
@@ -3896,6 +3907,15 @@ pub async fn start_node_inner(
         // bind failed (no tunnel transport) — exactly like the deposit rung.
         let mut tunnel_manager_for_state: Option<
             std::sync::Arc<crate::tunnel_manager::TunnelManager>,
+        > = None;
+        // ZEB-623: the per-peer protocol-compatibility registry, built alongside
+        // the `TunnelManager` below (sharing the SAME `Arc`) and published onto
+        // NodeState only when the tunnel acceptor actually installs — so the
+        // registry NodeState holds always matches the manager driving outbound
+        // dials. Stays `None` (NodeState keeps its default empty registry) on a
+        // deposit-only node.
+        let mut protocol_compat_for_state: Option<
+            std::sync::Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
         > = None;
         // ZEB-321 Phase 1 PR #157 round 4 (Greptile P1): JoinHandle of
         // the iroh accept loop. Captured here (not dropped via
@@ -8230,11 +8250,19 @@ pub async fn start_node_inner(
                                 }
                             });
 
+                            // ZEB-623: build the per-peer compat registry ONCE
+                            // here and share the SAME Arc between the manager
+                            // (which writes it from the initiator loop) and
+                            // NodeState (which Task 3 reads for Network Health).
+                            let protocol_compat = std::sync::Arc::new(
+                                crate::protocol_versioning::ProtocolCompatRegistry::default(),
+                            );
                             let tunnel_manager =
                                 std::sync::Arc::new(crate::tunnel_manager::TunnelManager::new(
                                     (**ep_arc).clone(),
                                     std::sync::Arc::clone(&pq_identity),
                                     tunnel_ingest_tx.clone(),
+                                    std::sync::Arc::clone(&protocol_compat),
                                 ));
                             let tunnel_acceptor: std::sync::Arc<
                                 dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
@@ -8260,6 +8288,10 @@ pub async fn start_node_inner(
                                     // Task 8 DmTransport can route outbound DMs
                                     // through it (wired to the installed acceptor).
                                     tunnel_manager_for_state = Some(tunnel_manager);
+                                    // ZEB-623: publish the SAME compat registry so
+                                    // NodeState's view matches the manager that
+                                    // drives outbound dials.
+                                    protocol_compat_for_state = Some(protocol_compat);
                                 }
                                 Err(_) => {
                                     tracing::warn!(
@@ -9409,6 +9441,12 @@ pub async fn start_node_inner(
                         // `None` if iroh bind failed) so the Task 8 DmTransport
                         // can route outbound DMs through it.
                         guard.tunnel_manager = tunnel_manager_for_state;
+                        // ZEB-623: publish the compat registry shared with the
+                        // installed TunnelManager (kept as an empty default on a
+                        // deposit-only node where no manager installed).
+                        if let Some(pc) = protocol_compat_for_state {
+                            guard.protocol_compat = pc;
+                        }
                         // ZEB-217 Sub-C Phase 3 Task 9: store the adapter-
                         // request sender so create_community / Phase 4
                         // redeem_invite can dispatch on-demand
@@ -12268,7 +12306,12 @@ mod add_space_tunnel_routing_tests {
             &mut rand::rngs::OsRng,
         ));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
-        StdArc::new(TunnelManager::new(endpoint, local_pq, ingest_tx))
+        StdArc::new(TunnelManager::new(
+            endpoint,
+            local_pq,
+            ingest_tx,
+            StdArc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+        ))
     }
 
     /// Build a `NodeState` wired with the DM handles `add_space_impl` snapshots
@@ -56316,6 +56359,9 @@ mod start_node_race_tests {
             dm_local_kem_pubkey: None,
             dm_pq_identity: None,
             tunnel_manager: None,
+            protocol_compat: std::sync::Arc::new(
+                crate::protocol_versioning::ProtocolCompatRegistry::default(),
+            ),
             community_adapter_request_tx: None,
             transport_epoch_rx: None,
             voting_log_adapter_request_tx: None,

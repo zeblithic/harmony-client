@@ -8951,7 +8951,10 @@ mod tests {
         ));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
         let mgr = Arc::new(crate::tunnel_manager::TunnelManager::new(
-            endpoint, local_pq, ingest_tx,
+            endpoint,
+            local_pq,
+            ingest_tx,
+            Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
         ));
 
         // CR4: seed Bob's cached tunnel contact into the transport's resolution

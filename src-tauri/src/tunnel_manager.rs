@@ -115,6 +115,12 @@ pub struct TunnelManager {
     /// comparison. When we initiated and `self_node_id < peer_node_id`, our dial
     /// is the survivor; both peers apply this identical rule.
     self_node_id: [u8; 32],
+    /// ZEB-623: per-peer protocol-compatibility registry, shared with
+    /// `NodeState` (and Network Health). The initiator records an incompatible
+    /// peer here on a rejected tunnel hello and clears it on a later compatible
+    /// handshake. Built once per node start and threaded in so the same registry
+    /// backs both outbound dials and the Network Health surface.
+    compat: Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
 }
 
 /// Derive the 32-byte tunnel NodeId from an ML-DSA-65 public key, matching
@@ -128,6 +134,7 @@ impl TunnelManager {
         endpoint: IrohEndpoint,
         local_pq: Arc<PqPrivateIdentity>,
         ingest_tx: mpsc::Sender<InboundDm>,
+        compat: Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
     ) -> Self {
         let self_node_id =
             node_id_from_dsa_pubkey(&local_pq.public_identity().verifying_key.as_bytes());
@@ -138,6 +145,7 @@ impl TunnelManager {
             local_pq,
             ingest_tx,
             self_node_id,
+            compat,
         }
     }
 
@@ -156,7 +164,12 @@ impl TunnelManager {
     ) -> Self {
         Self {
             self_node_id,
-            ..Self::new(endpoint, local_pq, ingest_tx)
+            ..Self::new(
+                endpoint,
+                local_pq,
+                ingest_tx,
+                Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+            )
         }
     }
 
@@ -169,6 +182,16 @@ impl TunnelManager {
     /// Our own tunnel NodeId (`blake3(our ML-DSA pubkey)`).
     pub fn self_node_id(&self) -> [u8; 32] {
         self.self_node_id
+    }
+
+    /// ZEB-623: the per-peer protocol-compatibility registry this manager shares
+    /// with `NodeState`/Network Health. The initiator loop records an
+    /// incompatible peer here (rejected tunnel hello) and clears it on a later
+    /// compatible handshake.
+    pub(crate) fn compat_registry(
+        &self,
+    ) -> &Arc<crate::protocol_versioning::ProtocolCompatRegistry> {
+        &self.compat
     }
 
     /// Send (or queue) a sealed+signed DM packet to `peer_node_id` over a PQ
@@ -710,7 +733,12 @@ mod tests {
         let (endpoint, local_pq) = test_endpoint_and_pq();
         let (ingest_tx, ingest_rx) = mpsc::channel(16);
         (
-            Arc::new(TunnelManager::new(endpoint, local_pq, ingest_tx)),
+            Arc::new(TunnelManager::new(
+                endpoint,
+                local_pq,
+                ingest_tx,
+                Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+            )),
             ingest_rx,
         )
     }

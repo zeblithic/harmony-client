@@ -441,7 +441,12 @@ mod tests {
         };
         let local_pq = Arc::new(PqPrivateIdentity::generate(&mut rand::rngs::OsRng));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
-        Arc::new(TunnelManager::new(endpoint, local_pq, ingest_tx))
+        Arc::new(TunnelManager::new(
+            endpoint,
+            local_pq,
+            ingest_tx,
+            Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+        ))
     }
 
     /// ZEB-485: `IrohTunnelDmTransport::send` SPAWNS the build + tunnel `send_dm`
