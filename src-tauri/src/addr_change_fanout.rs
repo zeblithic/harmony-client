@@ -24,6 +24,17 @@
 //! supervisor, so firing on boot would be redundant work. Only genuine
 //! post-boot changes fan out.
 //!
+//! ## Filtered-address-set flaps (ZEB-621 M4)
+//!
+//! The `direct_addrs` set observed here is the ZEB-391 *filtered* address set,
+//! so the delta tracks post-filter reachability. A flaky interface enumeration
+//! that transiently drops then re-adds an address therefore produces two
+//! fan-out cycles (re-register + sweep) per flap — bounded by the supervisor
+//! sweep cooldown and the pkarr re-register cost, and acceptable at expected
+//! flap rates. Hardening this against pathological flapping (a cfg-gated
+//! no-if-watch construction seam) is a tracked follow-up, promoted only on
+//! observed flaking.
+//!
 //! `observe` is sync and non-blocking (it locks a `Mutex` only to compare and
 //! swap the snapshot, releasing it before invoking any hook). Both hooks are
 //! plain `Fn()` closures because their targets are all sync: the pkarr

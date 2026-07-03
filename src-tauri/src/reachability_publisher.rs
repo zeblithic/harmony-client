@@ -42,7 +42,8 @@
 //! Each branch's future is polled until it resolves OR another branch
 //! wins; cancellation is cooperative. `biased;` makes the `force`
 //! branch the first one polled each iteration so an IPC force-republish
-//! is never starved by a continuously-firing if-watch stream.
+//! is never starved by a continuously-firing change stream (the merged
+//! if-watch + iroh `watch_addr` network-change source).
 //! `Notify::notified()` is constructed fresh each loop turn (correct —
 //! that future represents "the next notification after this point").
 

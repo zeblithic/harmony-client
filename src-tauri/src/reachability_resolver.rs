@@ -268,9 +268,12 @@ impl ReachabilityResolver {
         // from the pre/post freshest addressing means a fresher pkarr record that
         // shifts the effective route fires it — the stale-route-unpin payoff —
         // while an LWW-rejected or byte-identical write leaves the view unchanged
-        // and silent (no ladder thrash).
+        // and silent (no ladder thrash). The snapshot is the addressing-only
+        // `addr_key` (ZEB-621 M1), not a full `payload.clone()`: that is all the
+        // gate compares, and it keeps the butler_set / signature copies off every
+        // CRDT apply and pkarr cache-back.
         let was_present = slots.durable.is_some() || slots.pkarr.is_some();
-        let before_view = slots.freshest().map(|e| e.payload.clone());
+        let before_view = slots.freshest().map(|e| addr_key(&e.payload));
         // Each source writes ONLY its own slot; same-source replacement is LWW.
         let target = match source {
             ReachabilitySource::DurableCrdt => &mut slots.durable,
@@ -283,7 +286,13 @@ impl ReachabilityResolver {
         if do_replace {
             *target = Some(next);
         }
-        let after_view = slots.freshest().map(|e| e.payload.clone());
+        // When `do_replace` is false the freshest view is unchanged, so the after
+        // snapshot equals the before one — skip re-reading it.
+        let after_view = if do_replace {
+            slots.freshest().map(|e| addr_key(&e.payload))
+        } else {
+            before_view.clone()
+        };
         drop(map);
         // ZEB-620/621: reconnect-supervisor triggers (the successor to ZEB-373's
         // retired `DialHint` mpsc). A first-learn kicks `NewPeer`; a change in the
@@ -293,7 +302,7 @@ impl ReachabilityResolver {
         if let Some(sup) = self.supervisor.read().expect("supervisor lock").as_ref() {
             match (was_present, before_view, after_view) {
                 (false, _, Some(_)) => sup.kick(node_id, ReconnectTrigger::NewPeer),
-                (true, Some(before), Some(after)) if addressing_differs(&before, &after) => {
+                (true, Some(before), Some(after)) if before != after => {
                     sup.kick(node_id, ReconnectTrigger::RecordChanged)
                 }
                 _ => {}
@@ -403,7 +412,22 @@ impl ReachabilityResolver {
             _ => {} // stale (older than the window) or implausibly future-dated
         }
 
-        // (2) Per-owner cooldown check-and-set. Insert BEFORE spawning so two
+        // (2) Clone the fallback Arc (as `resolve_async` does). No fallback
+        //     wired ⇒ nothing to re-resolve with, so bail BEFORE the cooldown
+        //     check-and-set (ZEB-621 M2): a no-fallback path must not burn the
+        //     owner's cooldown or accumulate a map entry it can never act on.
+        let fb = {
+            let guard = self
+                .fallback_source
+                .read()
+                .expect("fallback_source poisoned");
+            guard.clone()
+        };
+        let Some(fb) = fb else {
+            return;
+        };
+
+        // (3) Per-owner cooldown check-and-set. Insert BEFORE spawning so two
         //     concurrent callers (e.g. two due dials in one dispatch pass) can't
         //     both fire a refresh for the same owner inside one window.
         {
@@ -419,19 +443,6 @@ impl ReachabilityResolver {
             }
             cooldowns.insert(owner, now);
         }
-
-        // (3) Clone the fallback Arc (as `resolve_async` does). No fallback
-        //     wired ⇒ nothing to re-resolve with.
-        let fb = {
-            let guard = self
-                .fallback_source
-                .read()
-                .expect("fallback_source poisoned");
-            guard.clone()
-        };
-        let Some(fb) = fb else {
-            return;
-        };
 
         // (4) Fire-and-forget async re-resolve. Each returned payload is fed
         //     through `update_with_source(.., PkarrLive)` with the same HLC
@@ -469,6 +480,14 @@ impl ReachabilityResolver {
         for k in to_remove {
             map.remove(&k);
         }
+        drop(map);
+        // Full per-owner eviction (ZEB-621): drop the stale-refresh cooldown too,
+        // else the map grows monotonically with every stale-dispatched owner over
+        // process lifetime.
+        self.refresh_cooldowns
+            .lock()
+            .expect("refresh_cooldowns lock")
+            .remove(actor);
         n
     }
 
@@ -593,9 +612,10 @@ impl ReachabilityResolver {
     /// hits keep their stored source; on a cache miss the pkarr fallback results
     /// are stored `PkarrLive` and the AUTHORITATIVE post-store resolver view is
     /// re-read and returned — a concurrent durable-CRDT `update()` may have
-    /// landed during the fallback await and won the slot via source-priority, so
-    /// returning the pre-await pkarr vector would mis-tag a now-durable entry as
-    /// `PkarrLive` (Qodo "resolve_async_with_source TOCTOU").
+    /// landed in the durable slot during the fallback await, and the durable-
+    /// preferred read then surfaces it, so returning the pre-await pkarr vector
+    /// would mis-tag a now-durable entry as `PkarrLive` (Qodo
+    /// "resolve_async_with_source TOCTOU").
     pub async fn resolve_async_with_source(
         &self,
         addr: &OwnerAddr,
@@ -627,30 +647,28 @@ impl ReachabilityResolver {
             self.update_with_source(*addr, payload.clone(), hlc, ReachabilitySource::PkarrLive);
         }
         // Re-read the authoritative resolver view rather than returning the
-        // pre-await pkarr vector: source-priority LWW may have kept/installed a
-        // concurrently-arrived durable entry for this `(owner, node_id)`, which
-        // must be returned tagged `DurableCrdt`, not `PkarrLive` (CA3 TOCTOU).
+        // pre-await pkarr vector: a concurrently-arrived durable entry for this
+        // `(owner, node_id)` sits in its own durable slot, and the durable-
+        // preferred read surfaces it, so it must be returned tagged `DurableCrdt`,
+        // not `PkarrLive` (CA3 TOCTOU).
         self.resolve_with_source(addr)
     }
 }
 
-/// Whether two reachability payloads carry materially different addressing, the
-/// gate for the reconnect supervisor's `RecordChanged` trigger (ZEB-620): the
-/// iroh relay URL differs, or the direct-address *set* differs. The direct
-/// addresses are compared order- and duplicate-insensitively (via `BTreeSet`),
-/// so a reordered republish of the same endpoints is not a change; a
-/// byte-identical beacon refresh therefore returns `false` and the supervisor
-/// does not re-arm the peer's backoff ladder for no reason.
-fn addressing_differs(
-    prev: &ReachabilityAnnouncePayload,
-    next: &ReachabilityAnnouncePayload,
-) -> bool {
-    if prev.home_relay_url != next.home_relay_url {
-        return true;
-    }
-    let prev_addrs: BTreeSet<_> = prev.direct_addresses.iter().collect();
-    let next_addrs: BTreeSet<_> = next.direct_addresses.iter().collect();
-    prev_addrs != next_addrs
+/// The addressing fingerprint the reconnect supervisor's `RecordChanged`
+/// trigger compares (ZEB-620): the iroh home-relay URL plus the direct-address
+/// *set*. Direct addresses are collected into a `BTreeSet` so they compare
+/// order- and duplicate-insensitively — a reordered republish of the same
+/// endpoints is not a change, and a byte-identical beacon refresh yields an
+/// equal key, so the supervisor does not re-arm the peer's backoff ladder for no
+/// reason. ZEB-621 M1: the kick gate snapshots this key (not the whole payload)
+/// before/after the slot write, keeping the two snapshots off the butler_set /
+/// signature copy path that every CRDT apply and pkarr cache-back would pay.
+fn addr_key(payload: &ReachabilityAnnouncePayload) -> (String, BTreeSet<std::net::SocketAddr>) {
+    (
+        payload.home_relay_url.clone(),
+        payload.direct_addresses.iter().copied().collect(),
+    )
 }
 
 /// LWW comparator for SAME-SOURCE slot replacement. `Hlc` does not derive `Ord`
@@ -810,8 +828,8 @@ mod tests {
         );
     }
 
-    /// The source guard governs only cross-source collisions; same-source updates
-    /// keep ordinary HLC LWW.
+    /// The dual-slot separation governs only cross-source collisions; same-source
+    /// updates keep ordinary HLC LWW.
     #[test]
     fn same_source_keeps_hlc_lww() {
         let r = ReachabilityResolver::new();
@@ -1298,9 +1316,18 @@ mod tests {
             hlc,
             ReachabilitySource::PkarrLive,
         );
+        // ZEB-621: seed a stale-refresh cooldown so we can assert it is evicted.
+        r.refresh_cooldowns
+            .lock()
+            .unwrap()
+            .insert(owner, tokio::time::Instant::now());
         assert_eq!(r.remove_owner(&owner), 1); // one composite entry (both slots)
         assert!(r.resolve_by_node_id(&node_id_bytes(7)).is_none());
         assert!(r.resolve(&owner).is_empty());
+        assert!(
+            r.refresh_cooldowns.lock().unwrap().is_empty(),
+            "remove_owner evicts the owner's refresh cooldown"
+        );
     }
 }
 

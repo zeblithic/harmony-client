@@ -7101,9 +7101,15 @@ pub async fn start_node_inner(
                         // load-bearing: `network_change()` re-probes iroh's path
                         // FIRST so the addr-delta-gated, 2s-debounced publish
                         // that follows sees post-probe addresses; the immediate
-                        // `force.notify_one()` then covers the case where the
-                        // addresses did NOT change but the 7-day pkarr record
-                        // aged past the suspend and must be re-registered.
+                        // `force.notify_one()` then re-registers the CRDT record
+                        // and Case-D friend slots (the force tick's unconditional
+                        // per-tick coverage), so a wake with no address change
+                        // still refreshes them even if the 7-day pkarr record
+                        // aged past the suspend. Identity/community slots are
+                        // delta-gated and do NOT re-fire on a no-delta wake; the
+                        // event loop's periodic `routing_republish`
+                        // (BUTLER_SET_REFRESH_MS ~= 7.5 min) is their backstop,
+                        // bounding post-wake staleness to <= that interval.
                         let resume_ep = std::sync::Arc::clone(ep_arc_for_publisher);
                         let resume_force = publisher.force_handle();
                         let on_resume: std::sync::Arc<dyn Fn() + Send + Sync> =
