@@ -22,6 +22,46 @@ use crate::peer_liveness::LivenessHandle;
 use crate::reachability_record::ReachabilityAnnouncePayload;
 use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
 
+/// ZEB-621: a freshest dial view whose `announced_at_ms` is older than this
+/// (24h) is considered stale enough that the dial route may be pinned to a
+/// long-dead address — [`ReachabilityResolver::maybe_refresh_stale`] then kicks
+/// off an async pkarr re-resolve to heal it.
+pub(crate) const STALE_RECORD_REFRESH_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// ZEB-621: minimum spacing between async pkarr re-resolves for the same owner.
+/// A stale record that the supervisor re-observes on every dispatch must not
+/// hammer pkarr — after one refresh fires, further `maybe_refresh_stale` calls
+/// for that owner are suppressed until this cooldown lapses (measured on the
+/// paused-time-testable `tokio::time::Instant` clock).
+pub(crate) const PKARR_REFRESH_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+
+/// ZEB-621: forward clock-skew allowance for freshness timestamps. A record
+/// claiming to be authored more than this far in the future (benign clock skew
+/// or a bogus/hostile record) is clamped to `now + FUTURE_SKEW_TOLERANCE_MS` at
+/// insert time so it cannot permanently dominate the freshest dial view or
+/// same-source LWW and starve out later, correct records. For realistic records
+/// (`announced_at_ms <= now`) the clamp is a no-op.
+pub(crate) const FUTURE_SKEW_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+
+/// ZEB-621: maximum number of concurrent background pkarr refresh network calls
+/// across the whole resolver (see [`ReachabilityResolver::maybe_refresh_stale`]).
+/// Bounds instantaneous fan-out when a reconnect sweep finds many stale peers due
+/// at once; per-owner cooldowns separately bound the per-owner rate.
+pub(crate) const PKARR_REFRESH_MAX_CONCURRENT: usize = 4;
+
+/// Default wall clock for [`ReachabilityResolver`]: milliseconds since the Unix
+/// epoch. Injectable via `set_clock` in tests so the future-skew clamp
+/// (ZEB-621) can be driven against a controllable "now".
+fn default_clock() -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    })
+}
+
 /// Async fallback called by `resolve_async` when the in-memory CRDT cache has
 /// no entry for a given owner. Implemented by `PkarrResolverAdapter` (case C)
 /// and by test stubs. The concrete impl is injected at boot via
@@ -66,10 +106,67 @@ pub struct ResolverEntry {
     pub payload: ReachabilityAnnouncePayload,
     pub hlc: Hlc,
     pub source: ReachabilitySource,
+    /// ZEB-621: `payload.announced_at_ms` clamped to at most
+    /// `now + FUTURE_SKEW_TOLERANCE_MS`, computed once at insert time in
+    /// [`ReachabilityResolver::update_with_source`]. The freshest dial view
+    /// ([`ResolverSlots::freshest`]) and the
+    /// [`maybe_refresh_stale`](ReachabilityResolver::maybe_refresh_stale)
+    /// staleness gate compare THIS rather than the raw announced time, so a
+    /// future-dated record cannot permanently pin the dial route. For realistic
+    /// records (`announced_at_ms <= now`) it equals `payload.announced_at_ms`.
+    pub effective_announced_at_ms: u64,
+}
+
+/// Dual-slot storage for one `(OwnerAddr, iroh_node_id)` key (ZEB-621).
+///
+/// The durable-CRDT record and the live-pkarr record for the same peer are held
+/// in SEPARATE cells rather than competing for a single slot: each source writes
+/// only its own slot (same-source replacement is ordinary [`lww_newer`] LWW), so
+/// a pkarr cache-back can never evict a durable record and vice versa. Two views
+/// derive from the pair:
+/// - [`durable_preferred`](Self::durable_preferred) — the butler / diagnostics
+///   authority. The durable slot's seal-targets stay valid even when the
+///   recipient's primary is long-offline (window-EXEMPT, ZEB-488), so butler /
+///   diag / e2e consumers keep seeing it whenever it exists.
+/// - [`freshest`](Self::freshest) — the DIAL authority. A dialer wants the
+///   record with the most recent addressing, whichever source carries it, so a
+///   fresher pkarr blob can win the route while the durable slot still backs the
+///   butler view.
+#[derive(Debug, Clone, Default)]
+struct ResolverSlots {
+    durable: Option<ResolverEntry>,
+    pkarr: Option<ResolverEntry>,
+}
+
+impl ResolverSlots {
+    /// Dial authority: the entry whose payload was announced most recently
+    /// (greater `effective_announced_at_ms` — the future-skew-clamped announce
+    /// time, ZEB-621); ties resolve to the durable slot. `None` only for an empty
+    /// pair (never stored — `update_with_source` writes at least one slot before
+    /// any entry lands in the map).
+    fn freshest(&self) -> Option<&ResolverEntry> {
+        match (&self.durable, &self.pkarr) {
+            (Some(d), Some(p)) => {
+                if p.effective_announced_at_ms > d.effective_announced_at_ms {
+                    Some(p)
+                } else {
+                    Some(d)
+                }
+            }
+            (Some(d), None) => Some(d),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        }
+    }
+
+    /// Butler / diagnostics authority: the durable slot if present, else pkarr.
+    fn durable_preferred(&self) -> Option<&ResolverEntry> {
+        self.durable.as_ref().or(self.pkarr.as_ref())
+    }
 }
 
 pub struct ReachabilityResolver {
-    inner: Arc<RwLock<BTreeMap<ResolverKey, ResolverEntry>>>,
+    inner: Arc<RwLock<BTreeMap<ResolverKey, ResolverSlots>>>,
     /// Wrapped in an outer `Arc` so that all clones share the same
     /// `RwLock` — wiring the fallback via `set_fallback_source` on any
     /// clone is immediately visible to all others (CodeRabbit PR #158 round 2).
@@ -84,6 +181,28 @@ pub struct ReachabilityResolver {
     // install wins, read-only clone getter); the Network Health snapshot reads
     // its `states_snapshot` for per-peer liveness telemetry.
     liveness: Arc<RwLock<Option<LivenessHandle>>>,
+    // ZEB-621: per-owner cooldown clock for `maybe_refresh_stale`'s async pkarr
+    // re-resolve. Shared across clones (`Arc`) like the other fields, so a
+    // refresh fired through one clone rate-limits every clone. Keyed by owner
+    // (not `(owner, node_id)`) so one owner's whole address set re-resolves at
+    // most once per `PKARR_REFRESH_COOLDOWN`. `tokio::time::Instant` → paused-
+    // time testable.
+    refresh_cooldowns:
+        Arc<std::sync::Mutex<std::collections::HashMap<OwnerAddr, tokio::time::Instant>>>,
+    // ZEB-621: wall clock (Unix-epoch ms) consulted by `update_with_source` to
+    // compute each entry's `effective_announced_at_ms` (future-skew clamp).
+    // Wrapped `Arc<RwLock<Arc<..>>>` so it is (a) shared across clones like the
+    // other fields — every clone reads the same clock — and (b) swappable via
+    // `set_clock` in tests without a `&mut self`. Production keeps `default_clock`
+    // (`SystemTime`); tests inject a controllable "now".
+    clock: Arc<RwLock<Arc<dyn Fn() -> u64 + Send + Sync>>>,
+    // ZEB-621: bounds the instantaneous fan-out of background pkarr refresh I/O.
+    // A post-address-change `kick_sweep` can make the whole roster due in one
+    // dispatch pass, so many `maybe_refresh_stale` calls could each spawn a pkarr
+    // `resolve` at once. The per-owner cooldown bounds the RATE per owner; this
+    // semaphore bounds the total number of refresh network calls in flight across
+    // all owners. Shared across clones (`Arc`) so the bound is global.
+    refresh_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -102,6 +221,9 @@ impl Default for ReachabilityResolver {
             fallback_source: Arc::new(RwLock::new(None)),
             supervisor: Arc::new(RwLock::new(None)),
             liveness: Arc::new(RwLock::new(None)),
+            refresh_cooldowns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            clock: Arc::new(RwLock::new(default_clock())),
+            refresh_permits: Arc::new(tokio::sync::Semaphore::new(PKARR_REFRESH_MAX_CONCURRENT)),
         }
     }
 }
@@ -116,6 +238,9 @@ impl Clone for ReachabilityResolver {
             fallback_source: Arc::clone(&self.fallback_source),
             supervisor: Arc::clone(&self.supervisor),
             liveness: Arc::clone(&self.liveness),
+            refresh_cooldowns: Arc::clone(&self.refresh_cooldowns),
+            clock: Arc::clone(&self.clock),
+            refresh_permits: Arc::clone(&self.refresh_permits),
         }
     }
 }
@@ -123,6 +248,23 @@ impl Clone for ReachabilityResolver {
 impl ReachabilityResolver {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// ZEB-621: current wall-clock time (Unix-epoch ms) as seen by the future-skew
+    /// clamp. Reads the injectable [`clock`](Self::clock); production uses
+    /// [`default_clock`] (`SystemTime`).
+    fn now_ms(&self) -> u64 {
+        let clock = Arc::clone(&*self.clock.read().expect("resolver clock lock"));
+        clock()
+    }
+
+    /// ZEB-621 (test-only): swap the wall clock consulted by the future-skew
+    /// clamp so paused-time tests can drive a controllable "now". Shared across
+    /// clones via the same `Arc<RwLock<..>>`, so an injection on any clone is
+    /// visible to all.
+    #[cfg(test)]
+    pub(crate) fn set_clock(&self, f: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        *self.clock.write().expect("resolver clock lock") = f;
     }
 
     /// ZEB-620: install the reconnect-supervisor handle. Called once at boot
@@ -184,44 +326,73 @@ impl ReachabilityResolver {
     ) {
         let key: ResolverKey = (actor, payload.iroh_node_id);
         let node_id = payload.iroh_node_id;
-        let mut map = self.inner.write().expect("resolver write lock");
-        let was_present = map.contains_key(&key);
+        // ZEB-621 future-skew clamp: bound the announce time (and, for the
+        // SYNTHETIC pkarr HLC only, the HLC wall time) to `now + skew` so a
+        // future-dated record cannot permanently dominate the freshest dial view
+        // (`effective_announced_at_ms`) or same-source LWW (pkarr `hlc.wall_ms`)
+        // and block later correct records from installing. Durable-CRDT HLCs are
+        // authored by the owner's own device and are left untouched.
+        let skew_ceiling = self.now_ms().saturating_add(FUTURE_SKEW_TOLERANCE_MS);
+        let effective_announced_at_ms = payload.announced_at_ms.min(skew_ceiling);
+        let hlc = match source {
+            ReachabilitySource::PkarrLive => Hlc {
+                wall_ms: hlc.wall_ms.min(skew_ceiling),
+                ..hlc
+            },
+            ReachabilitySource::DurableCrdt => hlc,
+        };
         let next = ResolverEntry {
             payload,
             hlc,
             source,
+            effective_announced_at_ms,
         };
-        // Track whether an existing record is LWW-replaced by one whose iroh
-        // relay URL or direct-address SET materially differs — the signal the
-        // reconnect supervisor re-dials on (ZEB-620). Computed BEFORE the
-        // overwrite (the prior payload is gone afterwards) and only inside the
-        // `should_replace` branch, so a byte-identical beacon republish and an
-        // LWW-rejected stale record both leave it false (no ladder thrash).
-        let mut record_changed = false;
-        let do_replace = match map.get(&key) {
-            Some(prev) => {
-                let replace = should_replace(prev, &next);
-                if replace {
-                    record_changed = addressing_differs(&prev.payload, &next.payload);
-                }
-                replace
-            }
+        let mut map = self.inner.write().expect("resolver write lock");
+        let slots = map.entry(key).or_default();
+        // The reconnect-supervisor kick gate (ZEB-620/621) is evaluated against
+        // the FRESHEST dial view, snapshotted before AND after the slot write:
+        // `was_present` = any slot existed beforehand. Deriving `RecordChanged`
+        // from the pre/post freshest addressing means a fresher pkarr record that
+        // shifts the effective route fires it — the stale-route-unpin payoff —
+        // while an LWW-rejected or byte-identical write leaves the view unchanged
+        // and silent (no ladder thrash). The snapshot is the addressing-only
+        // `addr_key` (ZEB-621 M1), not a full `payload.clone()`: that is all the
+        // gate compares, and it keeps the butler_set / signature copies off every
+        // CRDT apply and pkarr cache-back.
+        let was_present = slots.durable.is_some() || slots.pkarr.is_some();
+        let before_view = slots.freshest().map(|e| addr_key(&e.payload));
+        // Each source writes ONLY its own slot; same-source replacement is LWW.
+        let target = match source {
+            ReachabilitySource::DurableCrdt => &mut slots.durable,
+            ReachabilitySource::PkarrLive => &mut slots.pkarr,
+        };
+        let do_replace = match target.as_ref() {
+            Some(prev) => lww_newer(prev, &next),
             None => true,
         };
         if do_replace {
-            map.insert(key, next);
+            *target = Some(next);
         }
+        // When `do_replace` is false the freshest view is unchanged, so the after
+        // snapshot equals the before one — skip re-reading it.
+        let after_view = if do_replace {
+            slots.freshest().map(|e| addr_key(&e.payload))
+        } else {
+            before_view.clone()
+        };
         drop(map);
-        // ZEB-620: reconnect-supervisor triggers (the successor to ZEB-373's
-        // retired `DialHint` mpsc). A first-learn kicks `NewPeer`; a material
-        // record change on an already-known peer kicks `RecordChanged`. Mutually
-        // exclusive by construction (`was_present`), so at most one fires per
-        // update; `kick` is lossless and non-blocking.
+        // ZEB-620/621: reconnect-supervisor triggers (the successor to ZEB-373's
+        // retired `DialHint` mpsc). A first-learn kicks `NewPeer`; a change in the
+        // effective dial addressing on an already-known peer kicks
+        // `RecordChanged`. Mutually exclusive by construction (`was_present`), so
+        // at most one fires per update; `kick` is lossless and non-blocking.
         if let Some(sup) = self.supervisor.read().expect("supervisor lock").as_ref() {
-            if !was_present {
-                sup.kick(node_id, ReconnectTrigger::NewPeer);
-            } else if record_changed {
-                sup.kick(node_id, ReconnectTrigger::RecordChanged);
+            match (was_present, before_view, after_view) {
+                (false, _, Some(_)) => sup.kick(node_id, ReconnectTrigger::NewPeer),
+                (true, Some(before), Some(after)) if before != after => {
+                    sup.kick(node_id, ReconnectTrigger::RecordChanged)
+                }
+                _ => {}
             }
         }
     }
@@ -233,14 +404,16 @@ impl ReachabilityResolver {
     pub fn resolve(&self, actor: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
         let map = self.inner.read().expect("resolver read lock");
         map.range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
-            .map(|(_, v)| v.payload.clone())
+            .filter_map(|(_, v)| v.durable_preferred().map(|e| e.payload.clone()))
             .collect()
     }
 
     pub fn list_active_peers(&self) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload)> {
         let map = self.inner.read().expect("resolver read lock");
         map.iter()
-            .map(|((owner, _node_id), v)| (*owner, v.payload.clone()))
+            .filter_map(|((owner, _node_id), v)| {
+                v.durable_preferred().map(|e| (*owner, e.payload.clone()))
+            })
             .collect()
     }
 
@@ -253,7 +426,10 @@ impl ReachabilityResolver {
     ) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload, ReachabilitySource)> {
         let map = self.inner.read().expect("resolver read lock");
         map.iter()
-            .map(|((owner, _node_id), v)| (*owner, v.payload.clone(), v.source))
+            .filter_map(|((owner, _node_id), v)| {
+                v.durable_preferred()
+                    .map(|e| (*owner, e.payload.clone(), e.source))
+            })
             .collect()
     }
 
@@ -276,7 +452,116 @@ impl ReachabilityResolver {
         let map = self.inner.read().expect("resolver read lock");
         map.iter()
             .find(|((_, key_node_id), _)| key_node_id == node_id_bytes)
-            .map(|((owner, _), v)| (*owner, v.payload.clone()))
+            .and_then(|((owner, _), v)| v.freshest().map(|e| (*owner, e.payload.clone())))
+    }
+
+    /// Freshest-view reverse lookup for the DIAL path (ZEB-621; consumed by
+    /// Task 2). Like [`resolve_by_node_id`](Self::resolve_by_node_id) but returns
+    /// the full [`ResolverEntry`] — source + HLC + timestamps — so the dialer can
+    /// inspect the winning record's provenance and freshness, not just its
+    /// payload. Returns the entry with the most recent `effective_announced_at_ms`
+    /// (future-skew-clamped announce time, ZEB-621) across the peer's durable and
+    /// pkarr slots (ties → durable), matching `resolve_by_node_id`'s freshest-wins
+    /// dial semantics.
+    pub fn resolve_entry_by_node_id(
+        &self,
+        node_id_bytes: &[u8; 32],
+    ) -> Option<(OwnerAddr, ResolverEntry)> {
+        let map = self.inner.read().expect("resolver read lock");
+        map.iter()
+            .find(|((_, key_node_id), _)| key_node_id == node_id_bytes)
+            .and_then(|((owner, _), v)| v.freshest().map(|e| (*owner, e.clone())))
+    }
+
+    /// ZEB-621: heal a stale dial route by kicking off an async pkarr
+    /// re-resolve. Sync + non-blocking: the staleness + cooldown checks run
+    /// inline, and the actual pkarr `resolve` + cache write happen in a spawned
+    /// task, so the caller (the supervisor dispatch pass) is never gated or
+    /// delayed by network I/O.
+    ///
+    /// The staleness gate is the FRESHEST dial view's age, source-agnostic
+    /// (Decision, ZEB-621): a >24h pkarr record is as worth re-resolving as a
+    /// durable one. The refresh feeds [`update_with_source`](Self::update_with_source)
+    /// tagged [`ReachabilitySource::PkarrLive`], so a fresher record changes the
+    /// dial view and auto-fires the `RecordChanged` supervisor kick through Task
+    /// 1's gate — this seam adds no kick logic of its own.
+    pub fn maybe_refresh_stale(&self, owner: OwnerAddr, node_id: [u8; 32], now_ms: u64) {
+        // (1) Staleness gate against the freshest view's clamped age. No record ⇒
+        //     nothing to heal. The comparison uses `effective_announced_at_ms`
+        //     (`announced_at_ms` clamped to `now + FUTURE_SKEW_TOLERANCE_MS` at
+        //     insert time, ZEB-621 future-skew fix): a bogus future-dated record's
+        //     effective time is at most `skew` ahead of `now_ms`, which still
+        //     yields `None` from `checked_sub` and so is treated as stale — worth
+        //     a re-resolve. For realistic data (`effective <= now_ms`) this is
+        //     exactly `now_ms - effective_announced_at_ms`.
+        let Some((_, entry)) = self.resolve_entry_by_node_id(&node_id) else {
+            return;
+        };
+        match now_ms.checked_sub(entry.effective_announced_at_ms) {
+            Some(age) if age <= STALE_RECORD_REFRESH_MS => return, // fresh
+            _ => {} // stale (older than the window) or implausibly future-dated
+        }
+
+        // (2) Clone the fallback Arc (as `resolve_async` does). No fallback
+        //     wired ⇒ nothing to re-resolve with, so bail BEFORE the cooldown
+        //     check-and-set (ZEB-621 M2): a no-fallback path must not burn the
+        //     owner's cooldown or accumulate a map entry it can never act on.
+        let fb = {
+            let guard = self
+                .fallback_source
+                .read()
+                .expect("fallback_source poisoned");
+            guard.clone()
+        };
+        let Some(fb) = fb else {
+            return;
+        };
+
+        // (3) Per-owner cooldown check-and-set. Insert BEFORE spawning so two
+        //     concurrent callers (e.g. two due dials in one dispatch pass) can't
+        //     both fire a refresh for the same owner inside one window.
+        {
+            let mut cooldowns = self
+                .refresh_cooldowns
+                .lock()
+                .expect("refresh_cooldowns lock");
+            let now = tokio::time::Instant::now();
+            if let Some(&last) = cooldowns.get(&owner) {
+                if now.saturating_duration_since(last) < PKARR_REFRESH_COOLDOWN {
+                    return; // a refresh for this owner fired within the cooldown
+                }
+            }
+            cooldowns.insert(owner, now);
+        }
+
+        // (4) Fire-and-forget async re-resolve. Each returned payload is fed
+        //     through `update_with_source(.., PkarrLive)` with the same HLC
+        //     synthesis as `resolve_async` (wall_ms = announced_at_ms, logical
+        //     0, device_id "").
+        //
+        //     The global refresh-concurrency permit is acquired INSIDE the task,
+        //     just before the network call (ZEB-621): task spawn stays cheap, but
+        //     the number of pkarr `resolve` calls actually in flight is bounded by
+        //     `PKARR_REFRESH_MAX_CONCURRENT` even when a reconnect sweep makes the
+        //     whole roster due at once. A closed semaphore (never closed in
+        //     practice) just skips the refresh.
+        let resolver = self.clone();
+        let permits = Arc::clone(&self.refresh_permits);
+        tokio::spawn(async move {
+            let _permit = match permits.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let payloads = fb.resolve(&owner).await;
+            for payload in payloads {
+                let hlc = Hlc {
+                    wall_ms: payload.announced_at_ms,
+                    logical: 0,
+                    device_id: String::new(),
+                };
+                resolver.update_with_source(owner, payload, hlc, ReachabilitySource::PkarrLive);
+            }
+        });
     }
 
     /// Evict every device record for `actor`. Called from the membership-
@@ -297,6 +582,14 @@ impl ReachabilityResolver {
         for k in to_remove {
             map.remove(&k);
         }
+        drop(map);
+        // Full per-owner eviction (ZEB-621): drop the stale-refresh cooldown too,
+        // else the map grows monotonically with every stale-dispatched owner over
+        // process lifetime.
+        self.refresh_cooldowns
+            .lock()
+            .expect("refresh_cooldowns lock")
+            .remove(actor);
         n
     }
 
@@ -338,8 +631,10 @@ impl ReachabilityResolver {
     /// seed through `update()` would mis-tag it `DurableCrdt`). Uses the same HLC
     /// construction pattern as `resolve_async`'s cache population
     /// (`wall_ms = payload.announced_at_ms, logical = 0, device_id = ""`); a
-    /// later durable-CRDT record for the same `(owner, node_id)` then takes over
-    /// the slot via the source-priority guard in `should_replace`.
+    /// later durable-CRDT record for the same `(owner, node_id)` installs into
+    /// its own durable slot (ZEB-621 dual-slot storage), so the butler view
+    /// (durable-preferred) returns it while the dial view (freshest) keeps
+    /// whichever record was announced most recently.
     ///
     /// `async` for API alignment with the Task 3 IPC handler (which
     /// `.await`s this call between two sync-locked sections). The
@@ -411,7 +706,7 @@ impl ReachabilityResolver {
     ) -> Vec<(ReachabilityAnnouncePayload, ReachabilitySource)> {
         let map = self.inner.read().expect("resolver read lock");
         map.range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
-            .map(|(_, v)| (v.payload.clone(), v.source))
+            .filter_map(|(_, v)| v.durable_preferred().map(|e| (e.payload.clone(), e.source)))
             .collect()
     }
 
@@ -419,9 +714,10 @@ impl ReachabilityResolver {
     /// hits keep their stored source; on a cache miss the pkarr fallback results
     /// are stored `PkarrLive` and the AUTHORITATIVE post-store resolver view is
     /// re-read and returned — a concurrent durable-CRDT `update()` may have
-    /// landed during the fallback await and won the slot via source-priority, so
-    /// returning the pre-await pkarr vector would mis-tag a now-durable entry as
-    /// `PkarrLive` (Qodo "resolve_async_with_source TOCTOU").
+    /// landed in the durable slot during the fallback await, and the durable-
+    /// preferred read then surfaces it, so returning the pre-await pkarr vector
+    /// would mis-tag a now-durable entry as `PkarrLive` (Qodo
+    /// "resolve_async_with_source TOCTOU").
     pub async fn resolve_async_with_source(
         &self,
         addr: &OwnerAddr,
@@ -453,53 +749,45 @@ impl ReachabilityResolver {
             self.update_with_source(*addr, payload.clone(), hlc, ReachabilitySource::PkarrLive);
         }
         // Re-read the authoritative resolver view rather than returning the
-        // pre-await pkarr vector: source-priority LWW may have kept/installed a
-        // concurrently-arrived durable entry for this `(owner, node_id)`, which
-        // must be returned tagged `DurableCrdt`, not `PkarrLive` (CA3 TOCTOU).
+        // pre-await pkarr vector: a concurrently-arrived durable entry for this
+        // `(owner, node_id)` sits in its own durable slot, and the durable-
+        // preferred read surfaces it, so it must be returned tagged `DurableCrdt`,
+        // not `PkarrLive` (CA3 TOCTOU).
         self.resolve_with_source(addr)
     }
 }
 
-/// Whether two reachability payloads carry materially different addressing, the
-/// gate for the reconnect supervisor's `RecordChanged` trigger (ZEB-620): the
-/// iroh relay URL differs, or the direct-address *set* differs. The direct
-/// addresses are compared order- and duplicate-insensitively (via `BTreeSet`),
-/// so a reordered republish of the same endpoints is not a change; a
-/// byte-identical beacon refresh therefore returns `false` and the supervisor
-/// does not re-arm the peer's backoff ladder for no reason.
-fn addressing_differs(
-    prev: &ReachabilityAnnouncePayload,
-    next: &ReachabilityAnnouncePayload,
-) -> bool {
-    if prev.home_relay_url != next.home_relay_url {
-        return true;
-    }
-    let prev_addrs: BTreeSet<_> = prev.direct_addresses.iter().collect();
-    let next_addrs: BTreeSet<_> = next.direct_addresses.iter().collect();
-    prev_addrs != next_addrs
+/// The addressing fingerprint the reconnect supervisor's `RecordChanged`
+/// trigger compares (ZEB-620): the iroh home-relay URL plus the direct-address
+/// *set*. Direct addresses are collected into a `BTreeSet` so they compare
+/// order- and duplicate-insensitively — a reordered republish of the same
+/// endpoints is not a change, and a byte-identical beacon refresh yields an
+/// equal key, so the supervisor does not re-arm the peer's backoff ladder for no
+/// reason. ZEB-621 M1: the kick gate snapshots this key (not the whole payload)
+/// before/after the slot write, keeping the two snapshots off the butler_set /
+/// signature copy path that every CRDT apply and pkarr cache-back would pay.
+fn addr_key(payload: &ReachabilityAnnouncePayload) -> (String, BTreeSet<std::net::SocketAddr>) {
+    (
+        payload.home_relay_url.clone(),
+        payload.direct_addresses.iter().copied().collect(),
+    )
 }
 
-/// LWW comparator. `Hlc` does not derive `Ord` (canonical-CBOR keying
-/// constraints — see `owner_state_types.rs::Hlc`), so we compare by the
-/// same lexicographic tuple `(wall_ms, logical, device_id)` used by
-/// `Hlc::is_strictly_newer_than`. Ties on HLC fall through to
+/// LWW comparator for SAME-SOURCE slot replacement. `Hlc` does not derive `Ord`
+/// (canonical-CBOR keying constraints — see `owner_state_types.rs::Hlc`), so we
+/// compare by the same lexicographic tuple `(wall_ms, logical, device_id)` used
+/// by `Hlc::is_strictly_newer_than`. Ties on HLC fall through to
 /// `announced_at_ms` then lex `iroh_node_id`, per spec §5.4.
-fn should_replace(prev: &ResolverEntry, next: &ResolverEntry) -> bool {
-    // Source-priority guard (ZEB-488; Qodo "Pkarr evicts durable reachability").
-    // Durable-CRDT seal-targets are authoritative and window-EXEMPT, so the
-    // single LWW slot per `(owner, iroh_node_id)` must never let a pkarr
-    // cache-back evict a durable record — otherwise the entry becomes
-    // `PkarrLive`, the 15-min freshness window re-applies, and a fully-offline
-    // recipient's seal-targets vanish after the window (the exact gap this PR
-    // closes). Conversely a durable announce that replicates LATER (with an
-    // older `announced_at_ms` than a frequently-refreshed pkarr blob) must still
-    // take over the slot, so an HLC-blind upgrade is required. Same-source
-    // updates fall through to the HLC/announced_at/node_id LWW below.
-    match (prev.source, next.source) {
-        (ReachabilitySource::DurableCrdt, ReachabilitySource::PkarrLive) => return false,
-        (ReachabilitySource::PkarrLive, ReachabilitySource::DurableCrdt) => return true,
-        _ => {}
-    }
+///
+/// ZEB-621 dual-slot split: durable-CRDT and live-pkarr records for the same
+/// `(owner, iroh_node_id)` now live in SEPARATE cells ([`ResolverSlots`]), and
+/// each source writes only its own slot — so this comparator only ever sees
+/// `prev`/`next` of the SAME source. The old cross-source source-priority guard
+/// (ZEB-488) is gone: its intent is now structural rather than a comparator
+/// special-case. The durable slot is the butler authority and stays
+/// window-EXEMPT (a pkarr write can never touch it); the freshest view across
+/// both slots is the dial authority.
+fn lww_newer(prev: &ResolverEntry, next: &ResolverEntry) -> bool {
     let prev_key = (
         prev.hlc.wall_ms,
         prev.hlc.logical,
@@ -549,6 +837,13 @@ mod tests {
         }
     }
 
+    /// The composite key's node-id half for a payload minted by
+    /// [`make_payload`] with byte `b` — must match `make_payload`'s
+    /// `iroh_node_id: [b; 32]` convention so ids agree across helpers.
+    fn node_id_bytes(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
     /// ZEB-622: the liveness seam mirrors the supervisor seam — `liveness()` is
     /// `None` until `set_liveness`, then returns a handle sharing the installed
     /// state, so an up-edge raised through the returned clone is visible via a
@@ -592,42 +887,14 @@ mod tests {
         assert_eq!(records[0].announced_at_ms, 2000);
     }
 
-    /// Q1 / ZEB-488: a fresher pkarr cache-back must NOT evict a durable record.
-    /// The durable entry's butler-set is window-exempt; letting a 15-min-windowed
-    /// pkarr entry overwrite the slot reopens "empty seal-targets after 15 min".
-    #[test]
-    fn durable_not_evicted_by_fresher_pkarr() {
-        let r = ReachabilityResolver::new();
-        let actor = OwnerAddr([0x11; 16]);
-        r.update_with_source(
-            actor,
-            make_payload(1, 1000),
-            make_hlc(1000, 0, "a"),
-            ReachabilitySource::DurableCrdt,
-        );
-        // Fresher pkarr cache-back for the SAME (owner, node_id).
-        r.update_with_source(
-            actor,
-            make_payload(1, 9000),
-            make_hlc(9000, 0, "a"),
-            ReachabilitySource::PkarrLive,
-        );
-        let tagged = r.resolve_with_source(&actor);
-        assert_eq!(tagged.len(), 1);
-        assert_eq!(
-            tagged[0].1,
-            ReachabilitySource::DurableCrdt,
-            "durable record must survive a fresher pkarr cache-back"
-        );
-        assert_eq!(
-            tagged[0].0.announced_at_ms, 1000,
-            "durable payload retained, not the pkarr one"
-        );
-    }
-
-    /// Q1 / ZEB-488: a durable announce that replicates LATER — with an OLDER
-    /// announced_at than a frequently-refreshed pkarr blob — must still take over
-    /// the slot. The pkarr→durable upgrade is HLC-blind by design.
+    /// ZEB-621: durable and pkarr now occupy SEPARATE slots. A durable announce
+    /// that replicates LATER (with an OLDER `announced_at` than a
+    /// frequently-refreshed pkarr blob) installs into its OWN slot: the butler
+    /// view (durable-preferred) flips to the durable record, while the dial view
+    /// (freshest) stays with the fresher pkarr record. (Supersedes the old
+    /// single-slot `durable_not_evicted_by_fresher_pkarr` /
+    /// `pkarr_upgraded_by_older_durable` source-guard pair; the butler-view half
+    /// is now pinned by `butler_view_stays_durable_despite_fresher_pkarr`.)
     #[test]
     fn pkarr_upgraded_by_older_durable() {
         let r = ReachabilityResolver::new();
@@ -644,18 +911,27 @@ mod tests {
             make_hlc(1000, 0, "a"),
             ReachabilitySource::DurableCrdt,
         );
+        // Butler view: durable-preferred → the durable slot, tagged DurableCrdt.
         let tagged = r.resolve_with_source(&actor);
         assert_eq!(tagged.len(), 1);
         assert_eq!(
             tagged[0].1,
             ReachabilitySource::DurableCrdt,
-            "durable must upgrade the slot regardless of HLC ordering"
+            "butler view flips to durable once its own slot is installed"
         );
         assert_eq!(tagged[0].0.announced_at_ms, 1000);
+        // Dial view: freshest → the fresher pkarr slot survives.
+        let (_, dial) = r
+            .resolve_by_node_id(&node_id_bytes(1))
+            .expect("dial record");
+        assert_eq!(
+            dial.announced_at_ms, 9000,
+            "dial view keeps the fresher pkarr record"
+        );
     }
 
-    /// The source guard governs only cross-source collisions; same-source updates
-    /// keep ordinary HLC LWW.
+    /// The dual-slot separation governs only cross-source collisions; same-source
+    /// updates keep ordinary HLC LWW.
     #[test]
     fn same_source_keeps_hlc_lww() {
         let r = ReachabilityResolver::new();
@@ -818,7 +1094,7 @@ mod tests {
         let actor = OwnerAddr([0x11; 16]);
         let hlc = make_hlc(1000, 0, "a");
         // Same device, same announced_at_ms, same HLC — second `update`
-        // is a no-op (should_replace returns false on full equality).
+        // is a no-op (lww_newer returns false on full equality).
         r.update(actor, make_payload(0x01, 2000), hlc.clone());
         r.update(actor, make_payload(0x01, 2000), hlc);
         let records = r.resolve(&actor);
@@ -970,7 +1246,7 @@ mod tests {
         r.update(owner, make_payload(0x11, 1000), make_hlc(1000, 0, "a"));
         let sup = SupervisorHandle::new();
         r.set_supervisor(sup.clone());
-        // Same key, newer HLC (so should_replace succeeds), IDENTICAL addressing.
+        // Same key, newer HLC (so lww_newer succeeds), IDENTICAL addressing.
         r.update(owner, make_payload(0x11, 1000), make_hlc(2000, 0, "a"));
         assert_eq!(
             sup.pending_trigger(node_id),
@@ -979,7 +1255,7 @@ mod tests {
         );
     }
 
-    /// An LWW-rejected stale record (`should_replace == false`) must NOT kick,
+    /// An LWW-rejected stale record (`lww_newer == false`) must NOT kick,
     /// even though its addressing differs — the slot is unchanged, so there is
     /// nothing to re-arm on.
     #[test]
@@ -999,6 +1275,160 @@ mod tests {
             sup.pending_trigger(node_id),
             None,
             "LWW-rejected stale record must not kick"
+        );
+    }
+
+    // ---- ZEB-621: dual-slot storage + freshest-wins dial view ------------
+
+    /// ZEB-621: dial view (resolve_by_node_id) prefers the FRESHER record across
+    /// sources — a fresher pkarr record beats a stale durable one at dial time.
+    #[test]
+    fn dial_view_prefers_fresher_pkarr_over_stale_durable() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        let durable = make_payload(7, 1_000); // announced_at_ms = 1_000 (stale)
+        r.update(owner, durable, make_hlc(1_000, 0, "dev-a"));
+        let mut pkarr = make_payload(7, 50_000); // same node, fresher
+        pkarr.home_relay_url = "https://fresh.relay/".to_string();
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(owner, pkarr, hlc, ReachabilitySource::PkarrLive);
+
+        let (o, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(o, owner);
+        assert_eq!(p.home_relay_url, "https://fresh.relay/");
+        assert_eq!(p.announced_at_ms, 50_000);
+    }
+
+    /// ZEB-621 + ZEB-488 pin: the durable slot is NEVER evicted by pkarr — the
+    /// butler/diag view (resolve_with_source) still returns the durable entry,
+    /// tagged DurableCrdt, even when a fresher pkarr record wins the dial view.
+    #[test]
+    fn butler_view_stays_durable_despite_fresher_pkarr() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(
+            owner,
+            make_payload(7, 50_000),
+            hlc,
+            ReachabilitySource::PkarrLive,
+        );
+
+        let v = r.resolve_with_source(&owner);
+        assert_eq!(v.len(), 1, "one view per (owner,node), durable-preferred");
+        assert_eq!(v[0].1, ReachabilitySource::DurableCrdt);
+        assert_eq!(v[0].0.announced_at_ms, 1_000);
+    }
+
+    /// ZEB-621: an OLDER pkarr record loses the dial view to a fresher durable.
+    #[test]
+    fn dial_view_keeps_fresher_durable_over_stale_pkarr() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        let hlc = Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(
+            owner,
+            make_payload(7, 1_000),
+            hlc,
+            ReachabilitySource::PkarrLive,
+        );
+        r.update(owner, make_payload(7, 50_000), make_hlc(50_000, 0, "dev-a"));
+
+        let (_, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(p.announced_at_ms, 50_000);
+    }
+
+    /// ZEB-621: a fresher pkarr record that changes effective addressing kicks
+    /// RecordChanged (the stale-route-unpin payoff). The supervisor is installed
+    /// AFTER the first learn (as in the existing kick tests) so the NewPeer kick
+    /// is never recorded and cannot mask the RecordChanged assertion —
+    /// `pending_trigger` is a read-only accessor and does not drain.
+    #[test]
+    fn fresher_pkarr_with_new_addressing_kicks_record_changed() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        let mut pkarr = make_payload(7, 50_000);
+        pkarr.home_relay_url = "https://fresh.relay/".to_string();
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(owner, pkarr, hlc, ReachabilitySource::PkarrLive);
+        assert_eq!(
+            sup.pending_trigger(node_id_bytes(7)),
+            Some(ReconnectTrigger::RecordChanged)
+        );
+    }
+
+    /// ZEB-621: a fresher pkarr record with IDENTICAL addressing does NOT kick
+    /// (no ladder thrash on a byte-identical refresh). Supervisor installed after
+    /// the first learn so no NewPeer kick is pending to confound the assertion.
+    #[test]
+    fn fresher_pkarr_same_addressing_does_not_kick() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(
+            owner,
+            make_payload(7, 50_000),
+            hlc,
+            ReachabilitySource::PkarrLive,
+        );
+        assert_eq!(sup.pending_trigger(node_id_bytes(7)), None);
+    }
+
+    /// ZEB-621: remove_owner clears BOTH slots.
+    #[test]
+    fn remove_owner_clears_both_slots() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        let hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: String::new(),
+        };
+        r.update_with_source(
+            owner,
+            make_payload(7, 50_000),
+            hlc,
+            ReachabilitySource::PkarrLive,
+        );
+        // ZEB-621: seed a stale-refresh cooldown so we can assert it is evicted.
+        r.refresh_cooldowns
+            .lock()
+            .unwrap()
+            .insert(owner, tokio::time::Instant::now());
+        assert_eq!(r.remove_owner(&owner), 1); // one composite entry (both slots)
+        assert!(r.resolve_by_node_id(&node_id_bytes(7)).is_none());
+        assert!(r.resolve(&owner).is_empty());
+        assert!(
+            r.refresh_cooldowns.lock().unwrap().is_empty(),
+            "remove_owner evicts the owner's refresh cooldown"
         );
     }
 }
@@ -1218,5 +1648,268 @@ mod fallback_tests {
         assert_eq!(from_clone.len(), 1, "clone must share fallback_source Arc");
         assert_eq!(from_orig[0].iroh_node_id, stub_payload.iroh_node_id);
         assert_eq!(from_clone[0].iroh_node_id, stub_payload.iroh_node_id);
+    }
+
+    // ---- ZEB-621 Task 2: stale-record async pkarr refresh ----------------
+
+    fn make_hlc(wall_ms: u64, logical: u32, device: &str) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical,
+            device_id: device.into(),
+        }
+    }
+
+    fn node_id_bytes(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    /// A `ReachabilityFallback` that counts every `resolve` call and returns a
+    /// fixed payload set — the counting analogue of [`StubFallback`], used to
+    /// assert `maybe_refresh_stale` fires the fallback exactly the expected
+    /// number of times under the staleness + cooldown gates.
+    struct CountingFallback {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        payloads: Vec<ReachabilityAnnouncePayload>,
+    }
+
+    #[async_trait]
+    impl ReachabilityFallback for CountingFallback {
+        async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.payloads.clone()
+        }
+    }
+
+    /// Drive the current-thread scheduler until `counter` reaches `want` (or a
+    /// bounded number of polls elapses; the assertion after the call reports the
+    /// failure). Robust against the spawned refresh gaining new suspension
+    /// points (semaphore acquire, fallback awaits), unlike a single
+    /// `yield_now()` — same idiom as `future_record_clamped_and_healed_by_refresh`.
+    async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, want: usize) {
+        for _ in 0..50 {
+            if counter.load(std::sync::atomic::Ordering::SeqCst) >= want {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Give any (erroneously) spawned refresh task ample chance to run before a
+    /// NEGATIVE assertion — a handful of yields, since "poll until it appears"
+    /// can't prove absence.
+    async fn yield_a_few() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// ZEB-621: a stale freshest view (>24h) triggers exactly one async pkarr
+    /// refresh; a second call inside the cooldown window is suppressed.
+    #[tokio::test(start_paused = true)]
+    async fn stale_record_triggers_refresh_once_per_cooldown() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![make_payload(7, 90_000_000_000)],
+        }));
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+
+        let now = 1_000 + STALE_RECORD_REFRESH_MS + 1;
+        r.maybe_refresh_stale(owner, node_id_bytes(7), now);
+        wait_for_count(&counter, 1).await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // refresh result installed into the pkarr slot → dial view updated
+        let (_, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(p.announced_at_ms, 90_000_000_000);
+
+        // second call within the cooldown: suppressed even though still "stale"
+        r.maybe_refresh_stale(owner, node_id_bytes(7), now + 1);
+        yield_a_few().await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // advance past the cooldown: fires again
+        tokio::time::advance(PKARR_REFRESH_COOLDOWN + std::time::Duration::from_secs(1)).await;
+        r.maybe_refresh_stale(owner, node_id_bytes(7), now + 2);
+        wait_for_count(&counter, 2).await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A fresh record (<24h) never fires the fallback.
+    #[tokio::test(start_paused = true)]
+    async fn fresh_record_never_triggers_refresh() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![],
+        }));
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        r.maybe_refresh_stale(owner, node_id_bytes(7), 1_000 + STALE_RECORD_REFRESH_MS);
+        yield_a_few().await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// ZEB-621 (Qodo #1) regression: a far-future pkarr record initially wins the
+    /// dial view, but its effective freshness is CLAMPED at insert time, so a
+    /// later refresh returning a sane payload can replace it in the pkarr slot and
+    /// the dial view moves off the future record. Without the clamp the future
+    /// HLC would stay LWW-newest forever and the route would pin to the bogus
+    /// address. The timeline is written as named consts so the arithmetic is
+    /// auditable.
+    #[tokio::test(start_paused = true)]
+    async fn future_record_clamped_and_healed_by_refresh() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        // Timeline (Unix-epoch ms).
+        const T: u64 = 1_000_000; // injected "now" at insert time
+        const FUTURE_ANNOUNCED: u64 = T + 10_000_000_000; // ~116 days in the future
+        const CLAMP_CEIL: u64 = T + FUTURE_SKEW_TOLERANCE_MS; // effective at insert
+                                                              // "now" at refresh: past the 24h window measured from the CLAMPED effective
+                                                              // time, so the future record reads as stale and a refresh fires.
+        const NOW_REFRESH: u64 = T + FUTURE_SKEW_TOLERANCE_MS + STALE_RECORD_REFRESH_MS + 1;
+        // Sane refresh payload: authored just before NOW_REFRESH (not future → not
+        // clamped) and above the old clamped wall_ms, so it wins same-source LWW.
+        const SANE_ANNOUNCED: u64 = NOW_REFRESH - 1;
+
+        let r = ReachabilityResolver::new();
+        let clock = Arc::new(AtomicU64::new(T));
+        let c2 = Arc::clone(&clock);
+        r.set_clock(Arc::new(move || c2.load(Ordering::SeqCst)));
+
+        // (a) Insert the far-future pkarr record at clock = T. The dial view shows
+        //     it (raw announce preserved), but effective freshness + synthetic HLC
+        //     wall are both clamped to now + skew.
+        let owner = OwnerAddr([1u8; 16]);
+        r.update_with_source(
+            owner,
+            make_payload(7, FUTURE_ANNOUNCED),
+            make_hlc(FUTURE_ANNOUNCED, 0, ""),
+            ReachabilitySource::PkarrLive,
+        );
+        let (_, entry) = r
+            .resolve_entry_by_node_id(&node_id_bytes(7))
+            .expect("future record wins the dial view");
+        assert_eq!(
+            entry.payload.announced_at_ms, FUTURE_ANNOUNCED,
+            "raw announce preserved"
+        );
+        assert_eq!(
+            entry.effective_announced_at_ms, CLAMP_CEIL,
+            "effective clamped to now + skew"
+        );
+        assert_eq!(
+            entry.hlc.wall_ms, CLAMP_CEIL,
+            "synthetic pkarr HLC wall_ms clamped too"
+        );
+
+        // (b) Register a sane-payload fallback, advance the clock past the window,
+        //     and fire the refresh.
+        let counter = Arc::new(AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![make_payload(7, SANE_ANNOUNCED)],
+        }));
+        clock.store(NOW_REFRESH, Ordering::SeqCst);
+        r.maybe_refresh_stale(owner, node_id_bytes(7), NOW_REFRESH);
+        for _ in 0..50 {
+            if counter.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "stale future record triggers exactly one refresh"
+        );
+
+        // The sane payload replaced the future record; the dial view has moved.
+        let (_, healed) = r
+            .resolve_entry_by_node_id(&node_id_bytes(7))
+            .expect("healed record");
+        assert_eq!(
+            healed.payload.announced_at_ms, SANE_ANNOUNCED,
+            "dial view moved off the future record onto the sane payload"
+        );
+        assert_eq!(
+            healed.effective_announced_at_ms, SANE_ANNOUNCED,
+            "effective is the sane (unclamped) time"
+        );
+    }
+
+    /// ZEB-621 (Qodo #3): a burst of stale-refresh spawns is bounded by
+    /// [`PKARR_REFRESH_MAX_CONCURRENT`]. Ten owners due at once never put more than
+    /// four pkarr `resolve` calls in flight simultaneously, yet all ten resolve.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_fan_out_bounded_by_semaphore() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct InFlightFallback {
+            in_flight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            done: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ReachabilityFallback for InFlightFallback {
+            async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+                let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(cur, Ordering::SeqCst);
+                // Hold the permit across a brief (paused) network delay so the
+                // concurrent-in-flight count is observable.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                self.done.fetch_add(1, Ordering::SeqCst);
+                Vec::new()
+            }
+        }
+
+        let r = ReachabilityResolver::new();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(InFlightFallback {
+            in_flight: Arc::clone(&in_flight),
+            peak: Arc::clone(&peak),
+            done: Arc::clone(&done),
+        }));
+
+        // Ten distinct owners, each with a >24h-stale record (default real-epoch
+        // clock ⇒ announced_at 1_000 is far past the 24h window).
+        const N: u8 = 10;
+        for i in 0..N {
+            r.update(
+                OwnerAddr([i; 16]),
+                make_payload(i, 1_000),
+                make_hlc(1_000, 0, "d"),
+            );
+        }
+        let now = 1_000 + STALE_RECORD_REFRESH_MS + 1;
+        for i in 0..N {
+            r.maybe_refresh_stale(OwnerAddr([i; 16]), node_id_bytes(i), now);
+        }
+
+        // Drive paused time until every refresh has drained.
+        for _ in 0..200 {
+            if done.load(Ordering::SeqCst) == N as usize {
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            N as usize,
+            "all ten refreshes eventually resolve"
+        );
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(observed_peak >= 1, "refreshes actually ran");
+        assert!(
+            observed_peak <= PKARR_REFRESH_MAX_CONCURRENT,
+            "fan-out bounded to {} (observed peak {observed_peak})",
+            PKARR_REFRESH_MAX_CONCURRENT
+        );
     }
 }

@@ -7,21 +7,28 @@
 //! ## Triggers implemented
 //!
 //! 1. **Startup** — publish immediately, no debounce.
-//! 2. **Network-interface change** — `if-watch` IfEvent (Up/Down on a local
-//!    `IpNet`), coalesced with a 2-second debounce window so a single
-//!    DHCP rebind that emits Down → Up in milliseconds collapses into
-//!    one publish.
-//! 3. **Idle tick** — every 60 minutes, to refresh against the 24h TTL on
-//!    `ReachabilityRecord` even when nothing has changed.
+//! 2. **Network change** — a single merged stream of two sources, both
+//!    coalesced through one 2-second debounce window. Because they feed one
+//!    debounce-drain, an if-watch tick and a `watch_addr` tick milliseconds
+//!    apart collapse into a single publish by construction (no
+//!    double-publish). The two sources:
+//!    - `if-watch` IfEvent (Up/Down on a local `IpNet`), so a DHCP rebind
+//!      that emits Down → Up in milliseconds collapses into one publish.
+//!    - iroh `Endpoint::watch_addr` updates (home-relay flap, direct-address
+//!      churn) — added in ZEB-621 so a relay change republishes within
+//!      seconds instead of waiting on the idle backstop below.
+//! 3. **Idle backstop** — every 60 minutes, to refresh against the 24h TTL
+//!    on `ReachabilityRecord` even when nothing has changed. ZEB-621
+//!    demoted this from the primary relay-change safety net (see trigger 2)
+//!    to a pure long-interval backstop.
 //! 4. **Force-notify** — `tokio::sync::Notify` wake from
 //!    `connectivity_force_republish` IPC (Task 9) or test code.
 //!
-//! Home-relay-change (spec §5.6 bullet 4) is intentionally NOT handled
-//! here: iroh exposes its watch via `Endpoint::home_relay()` returning a
-//! `Watcher` whose stream surface is awkward to compose with the rest of
-//! the select loop, and the idle-60min cadence backstops the
-//! correctness case. Phase-1 ships without it; revisit in Phase 2 if a
-//! relay-flap is observed dropping calls in practice.
+//! Home-relay-change (spec §5.6 bullet 4) IS handled as of ZEB-621, via the
+//! iroh `watch_addr` arm of trigger 2 above — a boxed `stream_updates_only`
+//! watcher merged into the same debounce window as the interface watcher.
+//! The 60-minute idle tick (trigger 3) no longer carries the relay-flap
+//! correctness case; it is now only the TTL-refresh backstop.
 //!
 //! ## Decoupling
 //!
@@ -35,7 +42,8 @@
 //! Each branch's future is polled until it resolves OR another branch
 //! wins; cancellation is cooperative. `biased;` makes the `force`
 //! branch the first one polled each iteration so an IPC force-republish
-//! is never starved by a continuously-firing if-watch stream.
+//! is never starved by a continuously-firing change stream (the merged
+//! if-watch + iroh `watch_addr` network-change source).
 //! `Notify::notified()` is constructed fresh each loop turn (correct —
 //! that future represents "the next notification after this point").
 
@@ -67,10 +75,10 @@ pub type PublishFn =
 /// Background republish driver. Construct via [`Self::new`], then call
 /// [`Self::spawn`] (consumes the `Arc<Self>`) to start the loop.
 pub struct ReachabilityPublisher {
-    /// Kept as a field for future expansion (home-relay watcher, direct
-    /// addresses watcher) and so the loop's lifetime is tied to the
-    /// endpoint's. Not read by the current loop body — silence the
-    /// dead-code lint until Phase 2 / Task 8 plumbs it through.
+    /// Held so the loop's lifetime is tied to the endpoint's. The iroh
+    /// address watcher is passed to [`Self::new`] pre-boxed (see
+    /// `addr_stream`) rather than derived from this field, so the loop body
+    /// itself never reads it — silence the dead-code lint.
     #[allow(dead_code)]
     endpoint: Arc<IrohEndpoint>,
     publish: PublishFn,
@@ -78,14 +86,25 @@ pub struct ReachabilityPublisher {
     /// `force_handle()` for the `connectivity_force_republish` IPC
     /// (Task 9) and the force-notify test below.
     force: Arc<Notify>,
+    /// Optional iroh `watch_addr` update stream (ZEB-621), taken once by
+    /// [`Self::spawn`] and merged into the network-change arm. Behind a
+    /// `Mutex<Option<_>>` because `spawn` only holds a shared `Arc<Self>`;
+    /// `None` (or after `take()`) means the interface watcher / idle
+    /// backstop carry the loop alone.
+    addr_stream: std::sync::Mutex<Option<futures::stream::BoxStream<'static, iroh::EndpointAddr>>>,
 }
 
 impl ReachabilityPublisher {
-    pub fn new(endpoint: Arc<IrohEndpoint>, publish: PublishFn) -> Self {
+    pub fn new(
+        endpoint: Arc<IrohEndpoint>,
+        publish: PublishFn,
+        addr_stream: Option<futures::stream::BoxStream<'static, iroh::EndpointAddr>>,
+    ) -> Self {
         Self {
             endpoint,
             publish,
             force: Arc::new(Notify::new()),
+            addr_stream: std::sync::Mutex::new(addr_stream),
         }
     }
 
@@ -99,23 +118,82 @@ impl ReachabilityPublisher {
     /// optionally `abort()` on shutdown.
     pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            // Take the iroh addr-update stream handed in at construction (if
+            // any). Behind a `Mutex<Option<_>>` because `spawn` only holds a
+            // shared `Arc<Self>`; `take()` drops the guard on the same line
+            // so it never crosses an await.
+            let addr_stream = self
+                .addr_stream
+                .lock()
+                .expect("addr_stream mutex poisoned")
+                .take();
+
             // 1. On startup, publish immediately.
             (self.publish)().await;
 
-            // 2. Set up the network-change watcher. `if-watch` 3.x
-            //    exposes `IfWatcher` as a sync constructor returning
+            // 2. Set up the interface watcher. `if-watch` 3.x exposes
+            //    `IfWatcher` as a sync constructor returning
             //    `io::Result<Self>`, and the watcher itself implements
-            //    `futures::Stream<Item = io::Result<IfEvent>>` — so we
-            //    drive it with `StreamExt::next()` rather than the
-            //    `poll_fn` ceremony in the plan draft. If init fails
-            //    (e.g. the host has no netlink / SystemConfiguration
-            //    available), we degrade to the idle-only loop.
-            let mut iface_stream = match if_watch::tokio::IfWatcher::new() {
-                Ok(s) => s,
+            //    `futures::Stream<Item = io::Result<IfEvent>>`. If init
+            //    fails (e.g. no netlink / SystemConfiguration), we degrade
+            //    to whatever remains — the iroh addr stream, else idle-only.
+            let iface_stream = match if_watch::tokio::IfWatcher::new() {
+                Ok(s) => Some(s),
                 Err(e) => {
                     tracing::warn!(
-                        "if-watch init failed: {e}; falling back to idle-only republish"
+                        "if-watch init failed: {e}; relying on iroh addr stream / idle-only republish"
                     );
+                    None
+                }
+            };
+
+            // 3. Merge every available change source into ONE stream, each
+            //    event flattened to `()` — the loop only needs to know that
+            //    *something* changed. A single merged stream feeding a single
+            //    debounce-drain means an if-watch tick and a watch_addr tick
+            //    milliseconds apart coalesce into one publish by construction
+            //    (ZEB-621: closes the "if-watch fires, watch_addr fires 500ms
+            //    later → two publishes" hole). `tracing::debug!` inside each
+            //    map names the source that fired.
+            let change_stream: Option<futures::stream::BoxStream<'static, ()>> = match (
+                iface_stream,
+                addr_stream,
+            ) {
+                (Some(iface), Some(addr)) => {
+                    let iface = iface.map(|_ev| {
+                        tracing::debug!("reachability change source: if-watch interface event");
+                    });
+                    let addr = addr.map(|_addr| {
+                        tracing::debug!("reachability change source: iroh watch_addr event");
+                    });
+                    Some(futures::stream::select(iface, addr).boxed())
+                }
+                (Some(iface), None) => Some(
+                    iface
+                        .map(|_ev| {
+                            tracing::debug!("reachability change source: if-watch interface event");
+                        })
+                        .boxed(),
+                ),
+                (None, Some(addr)) => {
+                    // Degraded: interface watcher unavailable, but the
+                    // iroh addr stream still drives fast republishes.
+                    tracing::warn!(
+                            "if-watch unavailable; using iroh watch_addr as the sole network-change source"
+                        );
+                    Some(
+                        addr.map(|_addr| {
+                            tracing::debug!("reachability change source: iroh watch_addr event");
+                        })
+                        .boxed(),
+                    )
+                }
+                (None, None) => None,
+            };
+
+            let mut change_stream = match change_stream {
+                Some(s) => s,
+                None => {
                     self.idle_loop().await;
                     return;
                 }
@@ -132,27 +210,28 @@ impl ReachabilityPublisher {
 
                     // Force republish (IPC trigger or test). Polled
                     // first each iteration so a force is never starved
-                    // by a continuously-firing if-watch stream.
+                    // by a continuously-firing change stream.
                     _ = self.force.notified() => {
                         (self.publish)().await;
                     }
 
-                    // Network-interface change. Drain any rapid
-                    // follow-ups within the debounce window so a single
-                    // DHCP rebind (Down → Up in milliseconds) collapses
-                    // into one publish. `timeout` returns `Err(_)` on
-                    // the elapsed deadline — exactly what we want, so
-                    // we discard its `Result`.
-                    item = iface_stream.next() => {
+                    // Any network change — interface flap OR iroh
+                    // addr/home-relay update. Drain rapid follow-ups
+                    // within the debounce window, from BOTH sources, so a
+                    // single DHCP rebind (Down → Up in ms) or relay flap
+                    // collapses into one publish. `timeout` returns
+                    // `Err(_)` on the elapsed deadline — exactly what we
+                    // want, so we discard its `Result`.
+                    item = change_stream.next() => {
                         if item.is_none() {
-                            // Stream ended (background watcher died) —
+                            // Every source ended (watchers died) —
                             // degrade gracefully to idle-only.
-                            tracing::warn!("if-watch stream terminated; falling back to idle-only republish");
+                            tracing::warn!("network-change stream terminated; falling back to idle-only republish");
                             self.idle_loop().await;
                             return;
                         }
                         let _ = timeout(NETWORK_CHANGE_DEBOUNCE, async {
-                            while iface_stream.next().await.is_some() {
+                            while change_stream.next().await.is_some() {
                                 // Keep draining; we'll publish once the
                                 // debounce window elapses.
                             }
@@ -160,7 +239,7 @@ impl ReachabilityPublisher {
                         (self.publish)().await;
                     }
 
-                    // 60-minute idle refresh.
+                    // 60-minute idle backstop.
                     _ = idle_tick.tick() => {
                         (self.publish)().await;
                     }
@@ -263,7 +342,9 @@ mod tests {
         });
 
         let ep = build_hermetic_iroh_endpoint().await;
-        let publisher = Arc::new(ReachabilityPublisher::new(ep, publish));
+        // No addr stream here: this test exercises only the startup + force
+        // paths, so the third parameter is `None`.
+        let publisher = Arc::new(ReachabilityPublisher::new(ep, publish, None));
         let force = publisher.force_handle();
         let _handle = publisher.spawn();
 
@@ -277,5 +358,120 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), published.notified())
             .await
             .expect("force-notify publish must fire within 2s of notify_one()");
+    }
+
+    /// Build a throwaway `EndpointAddr` from a random identity — enough to
+    /// stand in for a real `watch_addr` update on the fake addr stream. The
+    /// publisher only cares that an item *arrived*, not its contents.
+    fn fake_endpoint_addr() -> iroh::EndpointAddr {
+        iroh::EndpointAddr::new(SecretKey::generate().public())
+    }
+
+    /// Adapt a `tokio::sync::mpsc::Receiver<EndpointAddr>` into the
+    /// `BoxStream` the publisher consumes. `tokio_stream` isn't a dep, so we
+    /// use a small `futures::stream::unfold` over the receiver (per Task 3
+    /// brief). The stream ends when every sender is dropped.
+    fn addr_stream_from_rx(
+        rx: tokio::sync::mpsc::Receiver<iroh::EndpointAddr>,
+    ) -> futures::stream::BoxStream<'static, iroh::EndpointAddr> {
+        Box::pin(futures::stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|a| (a, rx))
+        })) as futures::stream::BoxStream<'static, iroh::EndpointAddr>
+    }
+
+    /// ZEB-621 acceptance: a home-relay change (addr-stream event) triggers a
+    /// publish within the debounce window — NOT the 60-minute backstop.
+    #[tokio::test]
+    async fn addr_change_triggers_publish_within_debounce() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(Duration::from_secs(40), async {
+            let published = Arc::new(Notify::new());
+            let p2 = Arc::clone(&published);
+            let publish: PublishFn = Arc::new(move || {
+                let n = Arc::clone(&p2);
+                Box::pin(async move {
+                    n.notify_one();
+                }) as futures::future::BoxFuture<'static, ()>
+            });
+            let ep = build_hermetic_iroh_endpoint().await;
+            let (tx, rx) = tokio::sync::mpsc::channel::<iroh::EndpointAddr>(8);
+            let addr_stream = addr_stream_from_rx(rx);
+            let publisher = Arc::new(ReachabilityPublisher::new(
+                ep.clone(),
+                publish,
+                Some(addr_stream),
+            ));
+            let _handle = publisher.spawn();
+            // startup publish
+            tokio::time::timeout(Duration::from_secs(5), published.notified())
+                .await
+                .expect("startup publish");
+            // inject an addr change → publish within debounce(2s) + slack
+            tx.send(fake_endpoint_addr())
+                .await
+                .expect("send addr event");
+            tokio::time::timeout(Duration::from_secs(10), published.notified())
+                .await
+                .expect("addr-change publish within 10s (2s debounce + slack)");
+        })
+        .await
+        .expect("test must complete inside outer budget");
+    }
+
+    /// ZEB-621: three addr-stream events inside the debounce window collapse
+    /// into a single publish. The drain arm coalesces rapid follow-ups (from
+    /// *either* source), so a relay flap can't fan out into N republishes.
+    #[tokio::test]
+    async fn addr_flap_coalesces_to_one_publish() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(Duration::from_secs(40), async {
+            let count = Arc::new(AtomicUsize::new(0));
+            let startup = Arc::new(Notify::new());
+            let c2 = Arc::clone(&count);
+            let s2 = Arc::clone(&startup);
+            let publish: PublishFn = Arc::new(move || {
+                let c = Arc::clone(&c2);
+                let s = Arc::clone(&s2);
+                Box::pin(async move {
+                    // The startup publish is the first increment; signal it so
+                    // the test can align before injecting the flap.
+                    if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        s.notify_one();
+                    }
+                }) as futures::future::BoxFuture<'static, ()>
+            });
+            let ep = build_hermetic_iroh_endpoint().await;
+            let (tx, rx) = tokio::sync::mpsc::channel::<iroh::EndpointAddr>(8);
+            let addr_stream = addr_stream_from_rx(rx);
+            let publisher = Arc::new(ReachabilityPublisher::new(
+                ep.clone(),
+                publish,
+                Some(addr_stream),
+            ));
+            let _handle = publisher.spawn();
+            // Wait for the startup publish so the flap injection races nothing.
+            tokio::time::timeout(Duration::from_secs(5), startup.notified())
+                .await
+                .expect("startup publish");
+            // Three events 50ms apart — comfortably inside the 2s window.
+            for _ in 0..3 {
+                tx.send(fake_endpoint_addr())
+                    .await
+                    .expect("send addr event");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Sleep well past the debounce window so the single coalesced
+            // publish has landed.
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            // Startup (1) + exactly one coalesced flap publish (1) = 2.
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                2,
+                "3 rapid addr events must coalesce into a single publish"
+            );
+        })
+        .await
+        .expect("test must complete inside outer budget");
     }
 }

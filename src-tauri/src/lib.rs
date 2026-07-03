@@ -239,11 +239,15 @@ pub mod network_health;
 // ZEB-391: filters stale/virtual addresses out of the advertised iroh direct
 // address set (feeds the reachability-announce publish path below).
 pub mod direct_addr_filter;
+// ZEB-621: delta-gated fan-out — on a real self-address change, republish pkarr
+// slots + kick the reconnect supervisor (wired into the publish callback).
+pub mod addr_change_fanout;
 pub mod reachability_publisher;
 pub mod reachability_record;
 pub mod reachability_resolver;
 pub mod recovery_cli;
 pub mod recovery_policy;
+pub mod resume_detector;
 mod save_dialog;
 pub mod state_snapshot;
 // ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map
@@ -1348,6 +1352,14 @@ pub struct NodeState {
     /// gone — accepted links are forwarded into Zenoh by the registration
     /// factory's forwarder, which exits when the Zenoh session closes.)
     pub iroh_accept_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-621 Task 6: `JoinHandle` of the sleep/wake resume detector's
+    /// spawned tokio task. Held so `clear_iroh_handles` can `abort()` it —
+    /// without abort the detector's infinite loop outlives `stop_node`, and
+    /// its `on_resume` closure pins an `Arc<IrohEndpoint>` clone alive, so the
+    /// old endpoint leaks and `network_change()` keeps firing on it every wake
+    /// (one leaked task + endpoint per `stop_node`→`start_node` restart cycle).
+    /// Mirrors `iroh_publisher_handle` teardown exactly.
+    pub iroh_resume_detector_handle: Option<tokio::task::JoinHandle<()>>,
 
     // ── ZEB-323 Phase 2b: pkarr policy handles ───────────────────────────
     //
@@ -1472,6 +1484,14 @@ impl NodeState {
             h.abort();
         }
         if let Some(h) = self.iroh_accept_handle.take() {
+            h.abort();
+        }
+        // ZEB-621 Task 6: abort the sleep/wake resume detector loop. Its
+        // `on_resume` closure holds an `Arc<IrohEndpoint>` clone, so without
+        // this the detector task survives a restart, pins the old endpoint
+        // Arc forever, and fires `network_change()` on it every wake — one
+        // leaked task + endpoint per restart cycle.
+        if let Some(h) = self.iroh_resume_detector_handle.take() {
             h.abort();
         }
         // ZEB-368: clear the process-global iroh session ctx so a restart
@@ -1719,6 +1739,9 @@ impl Default for NodeState {
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_accept_handle: None,
+            // ZEB-621 Task 6: resume detector handle stays None until
+            // start_node wires it; cleared + aborted in clear_iroh_handles.
+            iroh_resume_detector_handle: None,
             // ZEB-323 Phase 2b: pkarr policy handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             pkarr_publisher: None,
@@ -3533,6 +3556,14 @@ pub async fn start_node_inner(
         // and threaded into event_loop::run for the periodic
         // BUTLER_SET_REFRESH_MS tick. None when no owner identity is loaded.
         let mut routing_republish_opt: Option<std::sync::Arc<dyn Fn() + Send + Sync>> = None;
+        // ZEB-621: delta-gated address-change fan-out hub, constructed in the
+        // owner-block below (so `publish_fn` can call `observe()` and the pkarr
+        // hook-install site can reach it) and threaded into event_loop::run so
+        // the supervisor sweep hook can be installed where the SupervisorHandle
+        // is created. None when no owner identity is loaded.
+        let mut addr_fanout_opt: Option<
+            std::sync::Arc<crate::addr_change_fanout::AddrChangeFanout>,
+        > = None;
         // ZEB-597: late-populated, burst-coalescing handle to `routing_republish`,
         // read by the on_epoch_event delta hook so a freshly-applied EpochRotation/
         // EpochCatchup re-registers the case-C pkarr publications PROMPTLY under the
@@ -3998,6 +4029,12 @@ pub async fn start_node_inner(
         // endpoint Arc alive, and continues firing if-watch/idle ticks
         // across restart cycles (Qodo finding).
         let mut iroh_publisher_handle: Option<tokio::task::JoinHandle<()>> = None;
+        // ZEB-621 Task 6: capture the resume detector's spawn JoinHandle so
+        // clear_iroh_handles can abort it. Without abort the detector loop
+        // outlives stop_node, and its on_resume closure pins the old iroh
+        // endpoint Arc alive, firing network_change() on it every wake — one
+        // leaked task + endpoint per restart cycle.
+        let mut iroh_resume_detector_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // ZEB-492: obtain the fleet KeyTree from EITHER the master seed (minting
         // device — authoritative) OR the distributed material persisted at
@@ -6725,8 +6762,17 @@ pub async fn start_node_inner(
                             std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>,
                         >,
                     > = std::sync::Arc::new(tokio::sync::OnceCell::new());
+                    // ZEB-621: build the address-change fan-out hub HERE (before
+                    // the iroh + pkarr blocks) so `publish_fn` can capture it for
+                    // `observe()` and the pkarr block can install the re-register
+                    // hook onto the same instance. Threaded to event_loop::run via
+                    // `addr_fanout_opt` so the supervisor sweep hook is installed
+                    // where the SupervisorHandle is minted.
+                    let addr_fanout = crate::addr_change_fanout::AddrChangeFanout::new();
+                    addr_fanout_opt = Some(std::sync::Arc::clone(&addr_fanout));
                     if let Some(ep_arc_for_publisher) = iroh_endpoint_arc.as_ref() {
                         let ep_for_cb = std::sync::Arc::clone(ep_arc_for_publisher);
+                        let addr_fanout_for_cb = std::sync::Arc::clone(&addr_fanout);
                         let registry_for_cb = std::sync::Arc::clone(&registry);
                         // ZEB-371: captures for the Case-D friend-slot reconcile
                         // appended to the end of the reachability publish.
@@ -6776,6 +6822,8 @@ pub async fn start_node_inner(
                                     std::sync::Arc::clone(&fleet_net_snapshot_for_pub);
                                 let butler_self_device_id_hash = butler_self_device_id_hash_for_pub;
                                 let butler_self_device_vk = butler_self_device_vk_for_pub;
+                                // ZEB-621 per-invocation clone for the address delta.
+                                let addr_fanout = std::sync::Arc::clone(&addr_fanout_for_cb);
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -6791,6 +6839,20 @@ pub async fn start_node_inner(
                                             ep.direct_addresses(),
                                         )
                                         .await;
+                                    // ZEB-621: convert this publish tick into
+                                    // "self-address ACTUALLY changed". The first
+                                    // observation records the boot snapshot and does
+                                    // NOT fire (boot already registered every pkarr
+                                    // slot + seeded the supervisor); a later home-relay
+                                    // flap or direct-address set change fires the pkarr
+                                    // re-register + supervisor sweep hooks. Cheap sync
+                                    // compare-and-swap (the hooks spawn their own work),
+                                    // so it never blocks this publish. Empty relay
+                                    // string ⇒ None so "no relay" is one canonical value.
+                                    addr_fanout.observe(
+                                        (!home_relay.is_empty()).then(|| home_relay.clone()),
+                                        direct_addrs.iter().copied().collect(),
+                                    );
                                     let announced_at_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
@@ -7005,6 +7067,13 @@ pub async fn start_node_inner(
                             crate::reachability_publisher::ReachabilityPublisher::new(
                                 std::sync::Arc::clone(ep_arc_for_publisher),
                                 publish_fn,
+                                // ZEB-621: feed iroh's own address watcher so a
+                                // home-relay flap republishes within the 2s
+                                // debounce instead of waiting on the idle
+                                // backstop. `watch_addr_stream` skips the
+                                // current value, so it never doubles the
+                                // startup publish.
+                                Some(ep_arc_for_publisher.watch_addr_stream()),
                             ),
                         );
                         // Spawn the publisher loop. The JoinHandle is
@@ -7020,6 +7089,56 @@ pub async fn start_node_inner(
                         // can wake it without holding the publisher
                         // Arc directly.
                         iroh_publisher_handle = Some(std::sync::Arc::clone(&publisher).spawn());
+
+                        // ZEB-621 Task 6: sleep/wake resume detector. No OS
+                        // sleep/wake signal exists in this stack, so a laptop
+                        // waking from hours of suspend would otherwise wait up
+                        // to the publisher's ~60min idle backstop before it
+                        // re-probes and republishes. The detector samples a
+                        // SystemTime-backed wall clock once per tick; a jump far
+                        // larger than one tick means the process was frozen (or
+                        // the clock stepped) and fires `on_resume`. Ordering is
+                        // load-bearing: `network_change()` re-probes iroh's path
+                        // FIRST so the addr-delta-gated, 2s-debounced publish
+                        // that follows sees post-probe addresses; the immediate
+                        // `force.notify_one()` then re-registers the CRDT record
+                        // and Case-D friend slots (the force tick's unconditional
+                        // per-tick coverage), so a wake with no address change
+                        // still refreshes them even if the 7-day pkarr record
+                        // aged past the suspend. Identity/community slots are
+                        // delta-gated and do NOT re-fire on a no-delta wake; the
+                        // event loop's periodic `routing_republish`
+                        // (BUTLER_SET_REFRESH_MS ~= 7.5 min) is their backstop,
+                        // bounding post-wake staleness to <= that interval.
+                        let resume_ep = std::sync::Arc::clone(ep_arc_for_publisher);
+                        let resume_force = publisher.force_handle();
+                        let on_resume: std::sync::Arc<dyn Fn() + Send + Sync> =
+                            std::sync::Arc::new(move || {
+                                let ep = std::sync::Arc::clone(&resume_ep);
+                                let force = std::sync::Arc::clone(&resume_force);
+                                tokio::spawn(async move {
+                                    ep.network_change().await;
+                                    force.notify_one();
+                                });
+                            });
+                        let resume_now_ms: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
+                            std::sync::Arc::new(|| {
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0)
+                            });
+                        // Capture the JoinHandle (stashed on NodeState below)
+                        // so clear_iroh_handles can abort the loop on stop —
+                        // otherwise it outlives stop_node and pins the old
+                        // endpoint Arc via on_resume across restart cycles.
+                        iroh_resume_detector_handle =
+                            Some(tokio::spawn(crate::resume_detector::run_resume_detector(
+                                resume_now_ms,
+                                crate::resume_detector::RESUME_DETECTOR_TICK,
+                                on_resume,
+                            )));
+
                         iroh_publisher_arc = Some(publisher);
                     }
 
@@ -7578,6 +7697,23 @@ pub async fn start_node_inner(
                     // re-register under the new live key. Set-once.
                     epoch_republish_trigger.set(std::sync::Arc::clone(&routing_republish));
 
+                    // ZEB-621: on a REAL self-address change, re-drive the pkarr
+                    // slots IMMEDIATELY instead of waiting the ~3.5-day epoch
+                    // schedule. Reuse the exact ZEB-418/516/597 re-publish closure:
+                    // it re-calls `identity_pub.enable()` (gated on the persisted
+                    // discoverable setting) and re-registers EVERY joined community
+                    // under the live epoch key (plus the fleet-net self-row re-stamp
+                    // and Case-D friend refresh). Each re-register rebuilds its
+                    // record from the shared `blob_builder`, which re-reads the
+                    // CURRENT iroh addresses per publish — so the republished slots
+                    // carry the new address. The closure is a sync `Fn()` that
+                    // `tokio::spawn`s its own async work, so firing it from inside
+                    // `observe()` never blocks the publish tick. Install-once.
+                    {
+                        let rr = std::sync::Arc::clone(&routing_republish);
+                        addr_fanout.set_pkarr_republish(Box::new(move || rr()));
+                    }
+
                     // ── ZEB-418 P2 Task 7: fleet-net snapshot refresh task ──
                     //
                     // Owns the `on_applied` nudge receiver created alongside
@@ -7835,23 +7971,25 @@ pub async fn start_node_inner(
                         // profile display name isn't persisted at start_node
                         // time (it arrives per `publish_profile` IPC), and the
                         // field is only a UX hint on the friend's side.
-                        // ZEB-461 Task 6: build this node's self-reachability so
-                        // the accept it signs advertises our device bundle +
-                        // iroh reachability + PQ keys. Requires the iroh endpoint
-                        // (for node_id / home_relay) — if iroh bind failed, ship
+                        // ZEB-461 Task 6 / ZEB-621: build this node's IMMUTABLE
+                        // self-handshake statics so the accept it signs advertises
+                        // our device bundle + iroh node id + PQ keys. Requires the
+                        // iroh endpoint (for node_id) — if iroh bind failed, ship
                         // the empty bundle (None) rather than a bogus zero id.
-                        // `node_id()` / `home_relay()` / `as_bytes()` are all
-                        // synchronous, so this is safe inside start_node (no new
-                        // event-loop-serviced await → no circular-boot deadlock).
-                        // The PQ pubkey owned copies are still moved into NodeState
-                        // later in this block, so clone them here.
-                        let self_reachability_for_friend = iroh_endpoint_arc.as_ref().map(|ep| {
-                            let home = ep.home_relay().map(|r| r.to_string());
-                            let home = home.filter(|s| !s.is_empty());
-                            crate::iroh_friend_acceptor::SelfHandshakeReachability {
+                        // ZEB-621: the volatile `home_relay_url` is DELIBERATELY not
+                        // captured here — it flaps and iroh's relay round-trip often
+                        // hasn't resolved yet at start_node time, so freezing it left
+                        // peers relay-less (ZEB-504). It is read fresh per accept via
+                        // `with_self_home_relay_refresh` below.
+                        // `node_id()` / `as_bytes()` are synchronous, so this is safe
+                        // inside start_node (no new event-loop-serviced await → no
+                        // circular-boot deadlock). The PQ pubkey owned copies are
+                        // still moved into NodeState later in this block, so clone
+                        // them here.
+                        let self_statics_for_friend = iroh_endpoint_arc.as_ref().map(|ep| {
+                            crate::iroh_friend_acceptor::SelfHandshakeStatics {
                                 identity_pub_64,
                                 iroh_node_id: *ep.node_id().as_bytes(),
-                                home_relay_url: home,
                                 pq_dsa_pubkey: dm_local_dsa_pubkey_owned.clone(),
                                 pq_kem_pubkey: dm_local_kem_pubkey_owned.clone(),
                             }
@@ -7895,17 +8033,19 @@ pub async fn start_node_inner(
                                 &pending_friend_requests_for_state,
                             )))
                             .with_auto_accept_known(friend_auto_accept_known_for_state)
-                            // ZEB-461 Task 6: advertise our device bundle +
-                            // reachability + PQ keys in the accept we sign.
-                            .with_self_reachability(self_reachability_for_friend)
-                            // ZEB-521: wire a LIVE home-relay read so each accept
-                            // refreshes its `home_relay_url` from the (now-resolved)
-                            // endpoint instead of advertising the boot snapshot,
-                            // which is often `None` because `home_relay()` hadn't
-                            // resolved at `start_node` time. The request/redeem
-                            // paths already read this fresh per-dial
-                            // (`build_self_handshake_reachability`); only this
-                            // long-lived acceptor froze it.
+                            // ZEB-461 Task 6 / ZEB-621: advertise our IMMUTABLE
+                            // device bundle + node id + PQ keys in the accept we
+                            // sign (the volatile relay is wired separately below).
+                            .with_self_statics(self_statics_for_friend)
+                            // ZEB-521/621: wire a LIVE home-relay read as the SOLE
+                            // source of each accept's `home_relay_url` — read fresh
+                            // from the (now-resolved / possibly-flapped) endpoint
+                            // instead of a boot snapshot, which was often `None`
+                            // because `home_relay()` hadn't resolved at `start_node`
+                            // time. The request/redeem paths already read this fresh
+                            // per-dial (`build_self_handshake_reachability`); ZEB-621
+                            // brings this long-lived acceptor to parity (it no longer
+                            // freezes the relay at all).
                             .with_self_home_relay_refresh(
                                 iroh_endpoint_arc.as_ref().map(|ep| {
                                     let ep = std::sync::Arc::clone(ep);
@@ -9060,6 +9200,9 @@ pub async fn start_node_inner(
                 // also stores it so `set_butler_pin` can fire an immediate
                 // republish.
                 let routing_republish_for_loop = routing_republish_opt.clone();
+                // ZEB-621: hand the address-change fan-out to event_loop::run so
+                // the supervisor sweep hook is installed where the handle is minted.
+                let addr_fanout_for_loop = addr_fanout_opt.clone();
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -9166,6 +9309,10 @@ pub async fn start_node_inner(
                                 // mail-root fetch (single jittered interval draw
                                 // shared with the persisted first deadline).
                                 mail_resync,
+                                // ZEB-621: address-change fan-out hub (supervisor
+                                // sweep hook installed inside run once the handle
+                                // exists).
+                                addr_fanout_for_loop,
                             )
                             .await;
                         });
@@ -9453,6 +9600,10 @@ pub async fn start_node_inner(
                         // publisher in particular is identity-gated).
                         guard.iroh_publisher_handle = iroh_publisher_handle.take();
                         guard.iroh_accept_handle = iroh_accept_handle.take();
+                        // ZEB-621 Task 6: move the resume detector handle into
+                        // NodeState so clear_iroh_handles aborts it alongside
+                        // the publisher/accept tasks. `.take()` — single owner.
+                        guard.iroh_resume_detector_handle = iroh_resume_detector_handle.take();
                         // ZEB-323 Phase 2b: stash pkarr policy handles.
                         guard.pkarr_publisher = pkarr_publisher_for_state.take();
                         guard.pkarr_friend_publisher = pkarr_friend_publisher_for_state.take();
@@ -56256,6 +56407,8 @@ mod start_node_race_tests {
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_accept_handle: None,
+            // ZEB-621 Task 6: resume detector handle unused in race tests.
+            iroh_resume_detector_handle: None,
             // ZEB-323 Phase 2b: pkarr handles unused in race tests.
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
@@ -58080,7 +58233,9 @@ mod zeb_321_connectivity_ipc_tests {
         });
 
         let ep = build_hermetic_iroh_endpoint().await;
-        let publisher = std::sync::Arc::new(ReachabilityPublisher::new(ep, publish));
+        // Third parameter (iroh addr stream) is `None`: this IPC test only
+        // drives the force-republish path (ZEB-621 Task 3).
+        let publisher = std::sync::Arc::new(ReachabilityPublisher::new(ep, publish, None));
         let force_handle = publisher.force_handle();
         let _publisher_loop = std::sync::Arc::clone(&publisher).spawn();
 
