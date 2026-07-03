@@ -7895,23 +7895,25 @@ pub async fn start_node_inner(
                         // profile display name isn't persisted at start_node
                         // time (it arrives per `publish_profile` IPC), and the
                         // field is only a UX hint on the friend's side.
-                        // ZEB-461 Task 6: build this node's self-reachability so
-                        // the accept it signs advertises our device bundle +
-                        // iroh reachability + PQ keys. Requires the iroh endpoint
-                        // (for node_id / home_relay) — if iroh bind failed, ship
+                        // ZEB-461 Task 6 / ZEB-621: build this node's IMMUTABLE
+                        // self-handshake statics so the accept it signs advertises
+                        // our device bundle + iroh node id + PQ keys. Requires the
+                        // iroh endpoint (for node_id) — if iroh bind failed, ship
                         // the empty bundle (None) rather than a bogus zero id.
-                        // `node_id()` / `home_relay()` / `as_bytes()` are all
-                        // synchronous, so this is safe inside start_node (no new
-                        // event-loop-serviced await → no circular-boot deadlock).
-                        // The PQ pubkey owned copies are still moved into NodeState
-                        // later in this block, so clone them here.
-                        let self_reachability_for_friend = iroh_endpoint_arc.as_ref().map(|ep| {
-                            let home = ep.home_relay().map(|r| r.to_string());
-                            let home = home.filter(|s| !s.is_empty());
-                            crate::iroh_friend_acceptor::SelfHandshakeReachability {
+                        // ZEB-621: the volatile `home_relay_url` is DELIBERATELY not
+                        // captured here — it flaps and iroh's relay round-trip often
+                        // hasn't resolved yet at start_node time, so freezing it left
+                        // peers relay-less (ZEB-504). It is read fresh per accept via
+                        // `with_self_home_relay_refresh` below.
+                        // `node_id()` / `as_bytes()` are synchronous, so this is safe
+                        // inside start_node (no new event-loop-serviced await → no
+                        // circular-boot deadlock). The PQ pubkey owned copies are
+                        // still moved into NodeState later in this block, so clone
+                        // them here.
+                        let self_statics_for_friend = iroh_endpoint_arc.as_ref().map(|ep| {
+                            crate::iroh_friend_acceptor::SelfHandshakeStatics {
                                 identity_pub_64,
                                 iroh_node_id: *ep.node_id().as_bytes(),
-                                home_relay_url: home,
                                 pq_dsa_pubkey: dm_local_dsa_pubkey_owned.clone(),
                                 pq_kem_pubkey: dm_local_kem_pubkey_owned.clone(),
                             }
@@ -7955,17 +7957,19 @@ pub async fn start_node_inner(
                                 &pending_friend_requests_for_state,
                             )))
                             .with_auto_accept_known(friend_auto_accept_known_for_state)
-                            // ZEB-461 Task 6: advertise our device bundle +
-                            // reachability + PQ keys in the accept we sign.
-                            .with_self_reachability(self_reachability_for_friend)
-                            // ZEB-521: wire a LIVE home-relay read so each accept
-                            // refreshes its `home_relay_url` from the (now-resolved)
-                            // endpoint instead of advertising the boot snapshot,
-                            // which is often `None` because `home_relay()` hadn't
-                            // resolved at `start_node` time. The request/redeem
-                            // paths already read this fresh per-dial
-                            // (`build_self_handshake_reachability`); only this
-                            // long-lived acceptor froze it.
+                            // ZEB-461 Task 6 / ZEB-621: advertise our IMMUTABLE
+                            // device bundle + node id + PQ keys in the accept we
+                            // sign (the volatile relay is wired separately below).
+                            .with_self_statics(self_statics_for_friend)
+                            // ZEB-521/621: wire a LIVE home-relay read as the SOLE
+                            // source of each accept's `home_relay_url` — read fresh
+                            // from the (now-resolved / possibly-flapped) endpoint
+                            // instead of a boot snapshot, which was often `None`
+                            // because `home_relay()` hadn't resolved at `start_node`
+                            // time. The request/redeem paths already read this fresh
+                            // per-dial (`build_self_handshake_reachability`); ZEB-621
+                            // brings this long-lived acceptor to parity (it no longer
+                            // freezes the relay at all).
                             .with_self_home_relay_refresh(
                                 iroh_endpoint_arc.as_ref().map(|ep| {
                                     let ep = std::sync::Arc::clone(ep);
