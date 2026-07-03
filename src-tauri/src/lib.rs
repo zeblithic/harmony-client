@@ -239,6 +239,9 @@ pub mod network_health;
 // ZEB-391: filters stale/virtual addresses out of the advertised iroh direct
 // address set (feeds the reachability-announce publish path below).
 pub mod direct_addr_filter;
+// ZEB-621: delta-gated fan-out — on a real self-address change, republish pkarr
+// slots + kick the reconnect supervisor (wired into the publish callback).
+pub mod addr_change_fanout;
 pub mod reachability_publisher;
 pub mod reachability_record;
 pub mod reachability_resolver;
@@ -3533,6 +3536,14 @@ pub async fn start_node_inner(
         // and threaded into event_loop::run for the periodic
         // BUTLER_SET_REFRESH_MS tick. None when no owner identity is loaded.
         let mut routing_republish_opt: Option<std::sync::Arc<dyn Fn() + Send + Sync>> = None;
+        // ZEB-621: delta-gated address-change fan-out hub, constructed in the
+        // owner-block below (so `publish_fn` can call `observe()` and the pkarr
+        // hook-install site can reach it) and threaded into event_loop::run so
+        // the supervisor sweep hook can be installed where the SupervisorHandle
+        // is created. None when no owner identity is loaded.
+        let mut addr_fanout_opt: Option<
+            std::sync::Arc<crate::addr_change_fanout::AddrChangeFanout>,
+        > = None;
         // ZEB-597: late-populated, burst-coalescing handle to `routing_republish`,
         // read by the on_epoch_event delta hook so a freshly-applied EpochRotation/
         // EpochCatchup re-registers the case-C pkarr publications PROMPTLY under the
@@ -6725,8 +6736,17 @@ pub async fn start_node_inner(
                             std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>,
                         >,
                     > = std::sync::Arc::new(tokio::sync::OnceCell::new());
+                    // ZEB-621: build the address-change fan-out hub HERE (before
+                    // the iroh + pkarr blocks) so `publish_fn` can capture it for
+                    // `observe()` and the pkarr block can install the re-register
+                    // hook onto the same instance. Threaded to event_loop::run via
+                    // `addr_fanout_opt` so the supervisor sweep hook is installed
+                    // where the SupervisorHandle is minted.
+                    let addr_fanout = crate::addr_change_fanout::AddrChangeFanout::new();
+                    addr_fanout_opt = Some(std::sync::Arc::clone(&addr_fanout));
                     if let Some(ep_arc_for_publisher) = iroh_endpoint_arc.as_ref() {
                         let ep_for_cb = std::sync::Arc::clone(ep_arc_for_publisher);
+                        let addr_fanout_for_cb = std::sync::Arc::clone(&addr_fanout);
                         let registry_for_cb = std::sync::Arc::clone(&registry);
                         // ZEB-371: captures for the Case-D friend-slot reconcile
                         // appended to the end of the reachability publish.
@@ -6776,6 +6796,8 @@ pub async fn start_node_inner(
                                     std::sync::Arc::clone(&fleet_net_snapshot_for_pub);
                                 let butler_self_device_id_hash = butler_self_device_id_hash_for_pub;
                                 let butler_self_device_vk = butler_self_device_vk_for_pub;
+                                // ZEB-621 per-invocation clone for the address delta.
+                                let addr_fanout = std::sync::Arc::clone(&addr_fanout_for_cb);
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -6791,6 +6813,20 @@ pub async fn start_node_inner(
                                             ep.direct_addresses(),
                                         )
                                         .await;
+                                    // ZEB-621: convert this publish tick into
+                                    // "self-address ACTUALLY changed". The first
+                                    // observation records the boot snapshot and does
+                                    // NOT fire (boot already registered every pkarr
+                                    // slot + seeded the supervisor); a later home-relay
+                                    // flap or direct-address set change fires the pkarr
+                                    // re-register + supervisor sweep hooks. Cheap sync
+                                    // compare-and-swap (the hooks spawn their own work),
+                                    // so it never blocks this publish. Empty relay
+                                    // string ⇒ None so "no relay" is one canonical value.
+                                    addr_fanout.observe(
+                                        (!home_relay.is_empty()).then(|| home_relay.clone()),
+                                        direct_addrs.iter().copied().collect(),
+                                    );
                                     let announced_at_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
@@ -7584,6 +7620,23 @@ pub async fn start_node_inner(
                     // applied epoch rotation can prompt a (coalesced) case-C
                     // re-register under the new live key. Set-once.
                     epoch_republish_trigger.set(std::sync::Arc::clone(&routing_republish));
+
+                    // ZEB-621: on a REAL self-address change, re-drive the pkarr
+                    // slots IMMEDIATELY instead of waiting the ~3.5-day epoch
+                    // schedule. Reuse the exact ZEB-418/516/597 re-publish closure:
+                    // it re-calls `identity_pub.enable()` (gated on the persisted
+                    // discoverable setting) and re-registers EVERY joined community
+                    // under the live epoch key (plus the fleet-net self-row re-stamp
+                    // and Case-D friend refresh). Each re-register rebuilds its
+                    // record from the shared `blob_builder`, which re-reads the
+                    // CURRENT iroh addresses per publish — so the republished slots
+                    // carry the new address. The closure is a sync `Fn()` that
+                    // `tokio::spawn`s its own async work, so firing it from inside
+                    // `observe()` never blocks the publish tick. Install-once.
+                    {
+                        let rr = std::sync::Arc::clone(&routing_republish);
+                        addr_fanout.set_pkarr_republish(Box::new(move || rr()));
+                    }
 
                     // ── ZEB-418 P2 Task 7: fleet-net snapshot refresh task ──
                     //
@@ -9067,6 +9120,9 @@ pub async fn start_node_inner(
                 // also stores it so `set_butler_pin` can fire an immediate
                 // republish.
                 let routing_republish_for_loop = routing_republish_opt.clone();
+                // ZEB-621: hand the address-change fan-out to event_loop::run so
+                // the supervisor sweep hook is installed where the handle is minted.
+                let addr_fanout_for_loop = addr_fanout_opt.clone();
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -9173,6 +9229,10 @@ pub async fn start_node_inner(
                                 // mail-root fetch (single jittered interval draw
                                 // shared with the persisted first deadline).
                                 mail_resync,
+                                // ZEB-621: address-change fan-out hub (supervisor
+                                // sweep hook installed inside run once the handle
+                                // exists).
+                                addr_fanout_for_loop,
                             )
                             .await;
                         });

@@ -204,6 +204,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
+                    None, // ZEB-621: addr_change_fanout not exercised
                 )
                 .await;
             });
@@ -507,6 +508,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
+                    None, // ZEB-621: addr_change_fanout not exercised
                 )
                 .await;
             });
@@ -917,6 +919,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
+                    None, // ZEB-621: addr_change_fanout not exercised
                 )
                 .await;
             });
@@ -1185,6 +1188,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
+                    None, // ZEB-621: addr_change_fanout not exercised
                 )
                 .await;
             });
@@ -1516,6 +1520,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
+                    None, // ZEB-621: addr_change_fanout not exercised
                 )
                 .await;
             });

@@ -262,6 +262,7 @@ fn spawn_event_loop(
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
+                    None, // ZEB-621: addr_change_fanout not exercised
                 )
                 .await;
             });

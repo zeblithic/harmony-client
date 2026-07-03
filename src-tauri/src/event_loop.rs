@@ -917,6 +917,12 @@ pub async fn run(
     // each fire. `None` (every test caller and any node without a mail dir)
     // keeps the legacy interval-from-spawn floor with a fresh per-spawn draw.
     mail_resync: Option<(u64, crate::channel_backfill::ResyncPersist)>,
+    // ZEB-621: delta-gated address-change fan-out hub. `Some` when built by
+    // production `start_node` (owner identity loaded). The reconnect-supervisor
+    // block below installs the sweep hook onto it once the `SupervisorHandle`
+    // exists, so a real self-address change kicks a presence sweep. `None` in
+    // test callers that bypass `start_node` (the fan-out simply never sweeps).
+    addr_change_fanout: Option<std::sync::Arc<crate::addr_change_fanout::AddrChangeFanout>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -1137,6 +1143,16 @@ pub async fn run(
             );
         } else {
             resolver.set_supervisor(handle.clone());
+
+            // ZEB-621: install the supervisor sweep hook onto the address-change
+            // fan-out — the `SupervisorHandle` exists only inside this block. A
+            // real self-address change then kicks a presence sweep (re-arming
+            // every known non-connected peer) instead of waiting on the next idle
+            // cycle. Install-once; absent in test callers (fan-out is `None`).
+            if let Some(ref fanout) = addr_change_fanout {
+                let sweep_handle = handle.clone();
+                fanout.set_supervisor_sweep(Box::new(move || sweep_handle.kick_sweep()));
+            }
 
             let dialer = std::sync::Arc::new(crate::iroh_dial_driver::RuntimePeerDialer::new(
                 zenoh_runtime.clone(),
