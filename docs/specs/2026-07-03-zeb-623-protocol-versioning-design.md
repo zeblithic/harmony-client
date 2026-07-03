@@ -145,7 +145,7 @@ Dialer (tunnel/v2)                         Acceptor (binds tunnel/{v2,v1})
   |<---- TunnelHello{ protocol_version, caps }  |   bytes — no extra RTT)
   |                                             |
   |     each side: check_hello_compatible()     |
-  |       ok  -> intersect capabilities, proceed
+  |       ok  -> proceed (caps reserved: none defined yet → nothing intersected)
   |       err -> note_incompatible(node_id, …)  -> Network Health, close
 ```
 
@@ -158,6 +158,10 @@ Compatibility rules applied to the received hello:
 - `protocol_version >= MIN_SUPPORTED` (including a version *newer* than ours) →
   compatible. The two `capabilities` bitmaps are intersected; unknown bits on
   either side are ignored, so each side uses only features both understand.
+  **Caveat (this slice):** capabilities are reserved — no bits are defined yet, so
+  the code decodes and discards the bitmaps and nothing is actually intersected;
+  the real intersection (feature-gating) begins when the first capability bit is
+  allocated.
 - A well-formed but oversized frame (`> TUNNEL_HELLO_MAX`) is rejected by
   `decode_hello` before any allocation/parse, bounding first-frame cost against a
   hostile peer.

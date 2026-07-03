@@ -100,9 +100,12 @@ pub fn check_hello_compatible(h: &TunnelHello) -> Result<(), String> {
 }
 
 /// Per-peer record of protocol incompatibility so the failure is *visible*
-/// (Network Health) rather than a silent connect drop. Keyed by 32-byte node
-/// id; an entry present means "we could not speak a compatible protocol with
-/// this peer, for this reason".
+/// (Network Health) rather than a silent connect drop. Keyed by the peer's
+/// 32-byte IROH EndpointId (the ed25519 endpoint key Network Health joins on) —
+/// NOT the tunnel node id (`blake3(ML-DSA pubkey)`); the initiator records under
+/// this key so the reader in `network_health.rs` (which looks up by
+/// `record.iroh_node_id`) finds the entry. An entry present means "we could not
+/// speak a compatible protocol with this peer, for this reason".
 #[derive(Default)]
 pub struct ProtocolCompatRegistry {
     inner: Mutex<HashMap<[u8; 32], String>>,
@@ -114,7 +117,7 @@ impl ProtocolCompatRegistry {
     /// Network Health to display.
     pub fn note_incompatible(&self, node_id: [u8; 32], reason: String) {
         tracing::warn!(
-            node_id = ?node_id,
+            node_id = %hex::encode(node_id),
             reason = %reason,
             "peer speaks an incompatible protocol generation; surfacing in network health"
         );

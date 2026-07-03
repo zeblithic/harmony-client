@@ -299,6 +299,12 @@ async fn run_tunnel_initiator_inner(
     ingest_tx: mpsc::Sender<InboundDm>,
     cmd_rx: mpsc::Receiver<TunnelCommand>,
 ) {
+    // ZEB-623: capture the peer's IROH EndpointId (the key Network Health joins
+    // on) before `addr` is moved into the handshake. The compat registry is keyed
+    // by THIS id — not the tunnel `peer_node_id` (`blake3(ML-DSA pubkey)`) — so
+    // the incompat/compat records line up with the reader in `network_health.rs`,
+    // which looks up by `record.iroh_node_id`.
+    let iroh_join_key = *addr.id.as_bytes();
     let handshake = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         initiator_handshake(&endpoint, addr, &peer_pq, &local_pq),
@@ -309,12 +315,14 @@ async fn run_tunnel_initiator_inner(
         Ok(Ok(v)) => v,
         Ok(Err(HandshakeFailure::Incompatible { reason })) => {
             // ZEB-623: the peer speaks a tunnel protocol below our minimum.
-            // Record it LOUDLY (surfaced in Network Health) keyed by the peer
-            // NodeId we know up front, then drop the Dialing handle so DMs fall
-            // back to always-deposit durability. Pass our epoch so a newer
-            // session that replaced us isn't evicted.
+            // Record it LOUDLY (surfaced in Network Health) keyed by the peer's
+            // IROH EndpointId — the key Network Health joins on — then drop the
+            // Dialing handle so DMs fall back to always-deposit durability. The
+            // dial-failure bookkeeping stays on the tunnel `peer_node_id` (the
+            // TunnelManager session-map key); pass our epoch so a newer session
+            // that replaced us isn't evicted.
             mgr.compat_registry()
-                .note_incompatible(peer_node_id, reason);
+                .note_incompatible(iroh_join_key, reason);
             mgr.note_dial_failed(peer_node_id, epoch);
             return;
         }
@@ -332,11 +340,13 @@ async fn run_tunnel_initiator_inner(
 
     // Handshake reached Active. ZEB-623: clear any stale incompatibility record
     // for this peer — a successful handshake, over v1 or v2, proves we can speak
-    // a compatible protocol (e.g. the peer has since upgraded). Then flip the
-    // manager handle to Active and flush any DMs buffered while we were dialing
-    // (applies the lower-NodeId dedup if an inbound session for this peer raced
-    // in).
-    mgr.compat_registry().note_compatible(peer_node_id);
+    // a compatible protocol (e.g. the peer has since upgraded). The record is
+    // keyed by the peer's IROH EndpointId (the Network Health join key), so we
+    // clear it under that same key. Then flip the manager handle to Active
+    // (keyed by the tunnel `peer_node_id`) and flush any DMs buffered while we
+    // were dialing (applies the lower-NodeId dedup if an inbound session for this
+    // peer raced in).
+    mgr.compat_registry().note_compatible(iroh_join_key);
     mgr.note_active(peer_node_id);
 
     run_tunnel_loop(
@@ -1204,6 +1214,17 @@ mod tests {
         let endpoint = crate::iroh_endpoint::IrohEndpoint::from_endpoint_for_test(ep_a.clone());
         let peer_pq = responder_pq.public_identity().clone();
 
+        // ZEB-623: the compat registry is keyed by the peer's IROH EndpointId
+        // (the Network Health join key), which is DISTINCT from the tunnel
+        // `peer_node_id` (`blake3(ML-DSA pubkey)`). `ep_b_addr` is moved into the
+        // driver below, so snapshot the join key first. The two ids must genuinely
+        // differ or the regression assertion below is vacuous.
+        let iroh_join_key = *ep_b_addr.id.as_bytes();
+        assert_ne!(
+            iroh_join_key, peer_node_id,
+            "test fixture must derive distinct iroh EndpointId vs tunnel node id"
+        );
+
         // Drive the real initiator: it must fail Incompatible and record it.
         run_tunnel_initiator_inner(
             endpoint,
@@ -1218,12 +1239,27 @@ mod tests {
         )
         .await;
 
+        // The incompat record MUST land under the peer's IROH EndpointId — the
+        // key `network_health.rs` joins on (`record.iroh_node_id`) — so the badge
+        // can actually fire. Pre-fix (ZEB-623 I-1) the initiator keyed this by the
+        // tunnel `peer_node_id`, which never matches the reader's key: this test
+        // fails against that code (the `is_some()` on the join key would be false,
+        // and the `is_none()` on the tunnel id would be false).
+        assert!(
+            init_mgr
+                .compat_registry()
+                .incompat_reason(&iroh_join_key)
+                .is_some(),
+            "an incompatible peer hello must be recorded under the peer's IROH \
+             EndpointId (the Network Health join key)"
+        );
         assert!(
             init_mgr
                 .compat_registry()
                 .incompat_reason(&peer_node_id)
-                .is_some(),
-            "an incompatible peer hello must be recorded in the compat registry"
+                .is_none(),
+            "the incompat record must NOT be keyed by the tunnel node id \
+             (blake3 of the ML-DSA pubkey) — that key never joins Network Health"
         );
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fake_responder).await;

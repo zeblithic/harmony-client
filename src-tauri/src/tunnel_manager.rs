@@ -118,7 +118,10 @@ pub struct TunnelManager {
     /// ZEB-623: per-peer protocol-compatibility registry, shared with
     /// `NodeState` (and Network Health). The initiator records an incompatible
     /// peer here on a rejected tunnel hello and clears it on a later compatible
-    /// handshake. Built once per node start and threaded in so the same registry
+    /// handshake. Keyed by the peer's IROH EndpointId (the Network Health join
+    /// key) — NOT the tunnel node id (`blake3(ML-DSA pubkey)`) — so the reader in
+    /// `network_health.rs` (which joins by `record.iroh_node_id`) finds the
+    /// entry. Built once per node start and threaded in so the same registry
     /// backs both outbound dials and the Network Health surface.
     compat: Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
 }
@@ -187,7 +190,8 @@ impl TunnelManager {
     /// ZEB-623: the per-peer protocol-compatibility registry this manager shares
     /// with `NodeState`/Network Health. The initiator loop records an
     /// incompatible peer here (rejected tunnel hello) and clears it on a later
-    /// compatible handshake.
+    /// compatible handshake. Records are keyed by the peer's IROH EndpointId (the
+    /// Network Health join key), not the tunnel node id.
     pub(crate) fn compat_registry(
         &self,
     ) -> &Arc<crate::protocol_versioning::ProtocolCompatRegistry> {
