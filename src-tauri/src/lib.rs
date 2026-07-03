@@ -247,6 +247,7 @@ pub mod reachability_record;
 pub mod reachability_resolver;
 pub mod recovery_cli;
 pub mod recovery_policy;
+pub mod resume_detector;
 mod save_dialog;
 pub mod state_snapshot;
 // ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map
@@ -7063,6 +7064,45 @@ pub async fn start_node_inner(
                         // can wake it without holding the publisher
                         // Arc directly.
                         iroh_publisher_handle = Some(std::sync::Arc::clone(&publisher).spawn());
+
+                        // ZEB-621 Task 6: sleep/wake resume detector. No OS
+                        // sleep/wake signal exists in this stack, so a laptop
+                        // waking from hours of suspend would otherwise wait up
+                        // to the publisher's ~60min idle backstop before it
+                        // re-probes and republishes. The detector samples a
+                        // SystemTime-backed wall clock once per tick; a jump far
+                        // larger than one tick means the process was frozen (or
+                        // the clock stepped) and fires `on_resume`. Ordering is
+                        // load-bearing: `network_change()` re-probes iroh's path
+                        // FIRST so the addr-delta-gated, 2s-debounced publish
+                        // that follows sees post-probe addresses; the immediate
+                        // `force.notify_one()` then covers the case where the
+                        // addresses did NOT change but the 7-day pkarr record
+                        // aged past the suspend and must be re-registered.
+                        let resume_ep = std::sync::Arc::clone(ep_arc_for_publisher);
+                        let resume_force = publisher.force_handle();
+                        let on_resume: std::sync::Arc<dyn Fn() + Send + Sync> =
+                            std::sync::Arc::new(move || {
+                                let ep = std::sync::Arc::clone(&resume_ep);
+                                let force = std::sync::Arc::clone(&resume_force);
+                                tokio::spawn(async move {
+                                    ep.network_change().await;
+                                    force.notify_one();
+                                });
+                            });
+                        let resume_now_ms: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
+                            std::sync::Arc::new(|| {
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0)
+                            });
+                        tokio::spawn(crate::resume_detector::run_resume_detector(
+                            resume_now_ms,
+                            crate::resume_detector::RESUME_DETECTOR_TICK,
+                            on_resume,
+                        ));
+
                         iroh_publisher_arc = Some(publisher);
                     }
 
