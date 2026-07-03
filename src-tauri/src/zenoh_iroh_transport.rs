@@ -2066,6 +2066,13 @@ mod tests {
             dormant_after: Duration::from_secs(3600),
             presence_sweep_cooldown: Duration::from_secs(30),
             max_concurrent_dials: 4,
+            // Real-time test over live endpoints under the nextest iroh-endpoint
+            // throttle group: a slow-but-progressing `new_link` is NOT a hung
+            // dial. A tight bound here cancels it mid-`open_bi` — after the
+            // registry swap already marked the peer Connected — recording a
+            // spurious `failed` whose stale-epoch result is discarded, so no
+            // retry ever fires. Keep the bound far above worst contention.
+            dial_timeout: Duration::from_secs(300),
             higher_id_fallback_delay: Duration::from_millis(400),
             jitter_seed: Some(0x2E_B6_20),
         };
@@ -2109,19 +2116,33 @@ mod tests {
             connected_1,
             "supervisor must mark bob Connected after the first dial"
         );
+        // `Connected` becomes visible at the registry swap INSIDE `new_link`,
+        // before the dial task's `record_succeeded` runs (the tail of `new_link`
+        // — `open_bi` — sits between them, and can take seconds under the
+        // throttle group). Poll for the telemetry instead of instant-asserting:
+        // the ring push is the LAST step of `record_succeeded`, so once it is
+        // visible the `succeeded` counter is too.
+        let bob_short = hex::encode(&bob_id.as_bytes()[..4]);
+        let succeeded_recorded = poll_until(
+            || {
+                telemetry
+                    .summary()
+                    .recent
+                    .iter()
+                    .any(|h| h.outcome == "succeeded" && h.node_id_short == bob_short)
+            },
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            succeeded_recorded,
+            "first dial must record a succeeded hit for bob"
+        );
         let succeeded_before = telemetry.summary().succeeded;
         assert!(
             succeeded_before >= 1,
-            "first dial must record a succeeded hit, got {succeeded_before}"
-        );
-        let bob_short = hex::encode(&bob_id.as_bytes()[..4]);
-        assert!(
-            telemetry
-                .summary()
-                .recent
-                .iter()
-                .any(|h| h.outcome == "succeeded" && h.node_id_short == bob_short),
-            "the succeeded hit must be recorded for bob"
+            "succeeded counter must be visible with the ring hit, got {succeeded_before}"
         );
 
         // ── Phase 2: hard-drop on the acceptor side. iroh 1.0 drains on Drop, so

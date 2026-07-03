@@ -186,6 +186,10 @@ async fn inner() {
         dormant_after: Duration::from_secs(3600),
         presence_sweep_cooldown: Duration::from_secs(30),
         max_concurrent_dials: 4,
+        // Real-time test over live endpoints: keep the dial bound far above the
+        // worst contention-stretched dial (nextest iroh-endpoint throttle group)
+        // so it never fires here — a slow hermetic dial is not a hung dial.
+        dial_timeout: Duration::from_secs(300),
         higher_id_fallback_delay: Duration::from_millis(200),
         jitter_seed: Some(0xD1A1),
     };

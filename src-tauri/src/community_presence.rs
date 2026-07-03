@@ -593,7 +593,8 @@ pub fn spawn_community_presence_subscriber(
                     target: "harmony_channel",
                     community = %hex::encode(&community.0[..4]),
                     device = %hex::encode(&signed.beacon.device[..4]),
-                    "presence roster change → full-reconcile kick + supervisor sweep"
+                    supervisor_kicked = supervisor.is_some(),
+                    "presence roster change → full-reconcile kick"
                 );
                 on_presence_roster_change(&resync_tx, supervisor.as_ref());
                 let members = {

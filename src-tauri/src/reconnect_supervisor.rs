@@ -154,6 +154,11 @@ pub struct SupervisorConfig {
     pub presence_sweep_cooldown: Duration,
     /// Upper bound on concurrently in-flight dials.
     pub max_concurrent_dials: usize,
+    /// Wall-clock bound on a single dial attempt. A dial still pending after
+    /// this long is treated as failed (the peer ladders) and its permit is
+    /// released — otherwise `max_concurrent_dials` hung dials would starve
+    /// every other peer's reconnect forever.
+    pub dial_timeout: Duration,
     /// First-attempt delay for a [`DialRole::DelayedDialer`] (higher NodeId).
     pub higher_id_fallback_delay: Duration,
     /// `Some(seed)` makes jitter deterministic (tests); `None` seeds from entropy.
@@ -168,6 +173,7 @@ impl Default for SupervisorConfig {
             dormant_after: Duration::from_secs(900),
             presence_sweep_cooldown: Duration::from_secs(60),
             max_concurrent_dials: 4,
+            dial_timeout: Duration::from_secs(30),
             higher_id_fallback_delay: Duration::from_secs(5),
             jitter_seed: None,
         }
@@ -268,6 +274,11 @@ impl SupervisorHandle {
             });
             slot.epoch = slot.epoch.wrapping_add(1);
             slot.state = PeerState::Connected { since_ms: now_ms() };
+            // The epoch bump voids any outstanding dial's result, so the flag
+            // must not outlive it: left set, it would suppress the first
+            // re-dial after a subsequent `Dropped` until that stale dial
+            // finally resolved.
+            slot.dial_in_flight = false;
         }
         self.inner.notify.notify_one();
     }
@@ -439,6 +450,7 @@ pub async fn run_reconnect_supervisor(
                 );
             }
 
+            let mut dial_capacity_exhausted = false;
             for (peer, slot) in states.iter_mut() {
                 if slot.dial_in_flight {
                     continue;
@@ -450,22 +462,41 @@ pub async fn run_reconnect_supervisor(
                 }
                 match resolver.resolve_by_node_id(peer) {
                     Some((owner, _payload)) => {
+                        // Acquire the permit BEFORE spawning: this bounds live
+                        // tasks (not just active dials), so a large due set
+                        // can't park a task per peer that later dials a stale
+                        // schedule. No permit ⇒ the peer stays due (not
+                        // in-flight) and is picked up on a later pass.
+                        let permit = match Arc::clone(&sem).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                dial_capacity_exhausted = true;
+                                break;
+                            }
+                        };
                         slot.epoch = slot.epoch.wrapping_add(1);
                         slot.dial_in_flight = true;
                         let epoch = slot.epoch;
                         let peer = *peer;
                         let owner = owner.0;
-                        let sem = sem.clone();
+                        let dial_timeout = config.dial_timeout;
                         let dialer = dialer.clone();
                         let telemetry = telemetry.clone();
                         let res_tx = res_tx.clone();
                         tokio::spawn(async move {
-                            let _permit = match sem.acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => return,
-                            };
+                            let _permit = permit;
                             telemetry.record_attempt();
-                            let ok = dialer.dial(peer, iroh_locator(&peer)).await;
+                            // A timed-out dial is a failed dial: dropping the
+                            // future cancels the attempt, the ladder advances,
+                            // and — critically — the permit frees.
+                            let ok = matches!(
+                                tokio::time::timeout(
+                                    dial_timeout,
+                                    dialer.dial(peer, iroh_locator(&peer)),
+                                )
+                                .await,
+                                Ok(true)
+                            );
                             if ok {
                                 telemetry.record_succeeded(peer, owner);
                                 // NOTE: no "reconnected" ring marker here — a
@@ -492,7 +523,16 @@ pub async fn run_reconnect_supervisor(
                 }
             }
 
-            earliest_deadline(&states, now)
+            if dial_capacity_exhausted {
+                // Peers left due-but-undispatched would make `earliest_deadline`
+                // return a past instant and busy-spin the loop. Every held
+                // permit belongs to a task that always reports a `DialResult`
+                // (the dial timeout bounds it), so waking on the result channel
+                // is guaranteed — sleep unbounded until then.
+                None
+            } else {
+                earliest_deadline(&states, now)
+            }
         };
 
         let deadline = min_opt(next_deadline, pending_sweep_at);
@@ -719,6 +759,9 @@ mod tests {
             dormant_after: Duration::from_millis(dormant_ms),
             presence_sweep_cooldown: Duration::from_millis(cooldown_ms),
             max_concurrent_dials: max_dials,
+            // Far above every test's virtual timeline, so parked dials only
+            // time out in tests that override this deliberately.
+            dial_timeout: Duration::from_secs(600),
             higher_id_fallback_delay: Duration::from_millis(fallback_ms),
             jitter_seed: Some(0xC0FFEE),
         }
@@ -1106,6 +1149,96 @@ mod tests {
             dialer.in_flight.load(Ordering::SeqCst),
             max,
             "exactly `max` dials parked in flight"
+        );
+
+        // Permits are acquired before spawn, so the 7 undispatched peers are
+        // deferred (still due), not parked in tasks. As permits free they must
+        // all get their dial — deferral is not loss.
+        dialer.release();
+        tokio::time::sleep(ms(10_000)).await;
+        for n in 1..=10u8 {
+            assert!(
+                dialer.count_for(peer(n)) >= 1,
+                "peer {n} deferred at capacity was never dialed"
+            );
+        }
+    }
+
+    /// Qodo (PR #392): `mark_connected` while a dial is outstanding must clear
+    /// `dial_in_flight` — otherwise a subsequent `Dropped` re-arm is suppressed
+    /// until the stale dial resolves (unbounded if it hangs).
+    #[tokio::test(start_paused = true)]
+    async fn mark_connected_mid_dial_does_not_suppress_redial() {
+        let dialer = RecordingDialer::parking();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let handle = SupervisorHandle::new();
+        let config = cfg(1_000, 64_000, 3_600_000, 30_000, 4, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(rung_hi(1_000)).await;
+        assert_eq!(dialer.count_for(p), 1, "first dial dispatched and parked");
+
+        // Inbound connect races the parked outbound dial, then the link drops.
+        handle.mark_connected(p);
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(rung_hi(1_000) + ms(100)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            2,
+            "re-dial after Dropped despite the stale dial still parked"
+        );
+        dialer.release();
+    }
+
+    /// CodeRabbit (PR #392): a hung dial must not hold its permit forever.
+    /// With `max_concurrent_dials = 1`, the second peer can only ever dial if
+    /// the first peer's hung dial times out and releases the permit.
+    #[tokio::test(start_paused = true)]
+    async fn hung_dial_times_out_ladders_and_frees_permit() {
+        let dialer = RecordingDialer::parking();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let a = peer(1);
+        let b = peer(2);
+        seed(&resolver, a);
+        seed(&resolver, b);
+        let handle = SupervisorHandle::new();
+        let mut config = cfg(1_000, 64_000, 3_600_000, 30_000, 1, 3_000);
+        config.dial_timeout = ms(10_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        handle.kick(a, ReconnectTrigger::NewPeer);
+        handle.kick(b, ReconnectTrigger::NewPeer);
+        // Base rung ≈1s (jittered), then the hung dial times out at +10s and
+        // frees the sole permit for the other peer.
+        tokio::time::sleep(ms(25_000)).await;
+        assert!(
+            dialer.count_for(a) >= 1 && dialer.count_for(b) >= 1,
+            "both peers dialed (a: {}, b: {}) — the permit must free on timeout",
+            dialer.count_for(a),
+            dialer.count_for(b)
+        );
+        assert!(
+            telemetry.summary().failed >= 1,
+            "a timed-out dial is recorded as failed"
         );
         dialer.release();
     }

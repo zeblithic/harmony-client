@@ -940,6 +940,10 @@ pub async fn run(
     // the whole event loop. Replaces ZEB-373's dial-hint mpsc install: the resolver
     // now kicks the supervisor directly (`set_supervisor`, installed post-open).
     let mut reconnect_supervisor: Option<crate::reconnect_supervisor::SupervisorHandle> = None;
+    // The supervisor loop never exits on its own; its JoinHandle is kept so the
+    // shutdown drain can abort it (otherwise it would keep dialing peers after
+    // `run()` returns — CodeRabbit, PR #392).
+    let mut reconnect_supervisor_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut config = zenoh::Config::default();
     // Test/diagnostic seam (ZEB-468 dial probe): when HARMONY_ZENOH_DISABLE_MULTICAST
@@ -1093,105 +1097,116 @@ pub async fn run(
         let handle = SupervisorHandle::new();
         let resolver = ih.link_manager.resolver();
 
-        // Install the handle on both producers (resolver kicks + registry
-        // drop/connect events) before spawning the loop.
-        resolver.set_supervisor(handle.clone());
+        // Install on the transport FIRST — the only fallible install. Installing
+        // on the resolver before knowing the transport accepted would, on
+        // failure, split the producers: resolver/presence kicks feeding a fresh
+        // loop whose `Dropped` events the drop-watchers never deliver (they keep
+        // kicking the previously-installed handle). One `run()` per link manager
+        // makes the failure unreachable in practice; skipping supervisor startup
+        // keeps even that path consistent (CodeRabbit, PR #392).
         if ih
             .link_manager
             .set_reconnect_handle(handle.clone())
             .is_err()
         {
-            tracing::warn!(
-                "ZEB-620: reconnect handle already installed on the link manager; \
-                 keeping the existing one"
+            tracing::error!(
+                "ZEB-620: a reconnect handle is already installed on this link \
+                 manager; skipping reconnect-supervisor startup to avoid split \
+                 producers"
             );
-        }
+        } else {
+            resolver.set_supervisor(handle.clone());
 
-        let dialer = std::sync::Arc::new(crate::iroh_dial_driver::RuntimePeerDialer::new(
-            zenoh_runtime.clone(),
-        ));
-        tokio::spawn(run_reconnect_supervisor(
-            handle.clone(),
-            dialer,
-            std::sync::Arc::new(resolver.clone()),
-            std::sync::Arc::clone(telemetry),
-            self_nid,
-            SupervisorConfig::default(),
-        ));
+            let dialer = std::sync::Arc::new(crate::iroh_dial_driver::RuntimePeerDialer::new(
+                zenoh_runtime.clone(),
+            ));
+            reconnect_supervisor_task = Some(tokio::spawn(run_reconnect_supervisor(
+                handle.clone(),
+                dialer,
+                std::sync::Arc::new(resolver.clone()),
+                std::sync::Arc::clone(telemetry),
+                self_nid,
+                SupervisorConfig::default(),
+            )));
 
-        // Boot seed: every peer the resolver already knows enters the supervisor
-        // as a `NewPeer` kick (recency-ordered), so a peer whose first dial fails
-        // or later drops is reconnected indefinitely — not dialed once at boot.
-        let seeded = crate::iroh_zenoh_registration::seed_boot_peers_into_supervisor(
-            &resolver, &self_nid, &handle,
-        );
-        if !seeded.is_empty() {
-            tracing::info!(
-                "ZEB-620: seeded {} boot peer(s) into the reconnect supervisor",
-                seeded.len()
+            // Boot seed: every peer the resolver already knows enters the supervisor
+            // as a `NewPeer` kick (recency-ordered), so a peer whose first dial fails
+            // or later drops is reconnected indefinitely — not dialed once at boot.
+            let seeded = crate::iroh_zenoh_registration::seed_boot_peers_into_supervisor(
+                &resolver, &self_nid, &handle,
             );
-        }
+            if !seeded.is_empty() {
+                tracing::info!(
+                    "ZEB-620: seeded {} boot peer(s) into the reconnect supervisor",
+                    seeded.len()
+                );
+            }
 
-        // Zenoh transport-events listener: a transport `Delete` maps the peer's
-        // zid back to its iroh node-id (via the resolver + the deterministic
-        // zid derivation) and kicks `Dropped`. The registry drop-watchers are the
-        // primary drop source; this is a non-fatal secondary that also catches a
-        // face zenoh reaps without a registry eviction. Listener-declare failure
-        // is warned once and the task exits (reconnect still works via the
-        // watchers).
-        let listener_session = session.clone();
-        let listener_resolver = resolver.clone();
-        let listener_handle = handle.clone();
-        tokio::spawn(async move {
-            use zenoh::sample::SampleKind;
-            let listener = match listener_session.info().transport_events_listener().await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(
-                        "ZEB-620: zenoh transport-events listener unavailable ({e}); \
+            // Zenoh transport-events listener: a transport `Delete` maps the peer's
+            // zid back to its iroh node-id (via the resolver + the deterministic
+            // zid derivation) and kicks `Dropped`. The registry drop-watchers are the
+            // primary drop source; this is a non-fatal secondary that also catches a
+            // face zenoh reaps without a registry eviction. Listener-declare failure
+            // is warned once and the task exits (reconnect still works via the
+            // watchers).
+            let listener_session = session.clone();
+            let listener_resolver = resolver.clone();
+            let listener_handle = handle.clone();
+            tokio::spawn(async move {
+                use zenoh::sample::SampleKind;
+                let listener = match listener_session.info().transport_events_listener().await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!(
+                            "ZEB-620: zenoh transport-events listener unavailable ({e}); \
                          relying on registry drop-watchers for reconnect kicks"
-                    );
-                    return;
-                }
-            };
-            // zid (canonical hex) -> node-id, rebuilt from the resolver on a miss
-            // (a peer learned after the last refresh is picked up on its Delete).
-            let mut zid_to_node: std::collections::HashMap<String, [u8; 32]> =
-                std::collections::HashMap::new();
-            while let Ok(event) = listener.recv_async().await {
-                if event.kind() != SampleKind::Delete {
-                    continue;
-                }
-                let zid = event.transport().zid().to_string();
-                let node_id = match zid_to_node.get(&zid).copied() {
-                    Some(n) => Some(n),
-                    None => {
-                        zid_to_node = listener_resolver
-                            .list_active_peers()
-                            .into_iter()
-                            .map(|(_owner, p)| {
-                                (
-                                    crate::iroh_dial_driver::deterministic_zid_hex(&p.iroh_node_id),
-                                    p.iroh_node_id,
-                                )
-                            })
-                            .collect();
-                        zid_to_node.get(&zid).copied()
+                        );
+                        return;
                     }
                 };
-                match node_id {
-                    Some(n) => listener_handle
-                        .kick(n, crate::reconnect_supervisor::ReconnectTrigger::Dropped),
-                    None => tracing::debug!(
+                // zid (canonical hex) -> node-id, rebuilt from the resolver on a miss
+                // (a peer learned after the last refresh is picked up on its Delete).
+                let mut zid_to_node: std::collections::HashMap<String, [u8; 32]> =
+                    std::collections::HashMap::new();
+                while let Ok(event) = listener.recv_async().await {
+                    if event.kind() != SampleKind::Delete {
+                        continue;
+                    }
+                    let zid = event.transport().zid().to_string();
+                    let node_id = match zid_to_node.get(&zid).copied() {
+                        Some(n) => Some(n),
+                        None => {
+                            zid_to_node = listener_resolver
+                                .list_active_peers()
+                                .into_iter()
+                                .map(|(_owner, p)| {
+                                    (
+                                        crate::iroh_dial_driver::deterministic_zid_hex(
+                                            &p.iroh_node_id,
+                                        ),
+                                        p.iroh_node_id,
+                                    )
+                                })
+                                .collect();
+                            zid_to_node.get(&zid).copied()
+                        }
+                    };
+                    match node_id {
+                        Some(n) => listener_handle
+                            .kick(n, crate::reconnect_supervisor::ReconnectTrigger::Dropped),
+                        None => tracing::debug!(
                         "ZEB-620: transport Delete for zid {zid} not a resolver-known iroh peer; \
                          no reconnect kick"
                     ),
+                    }
                 }
-            }
-            tracing::debug!("ZEB-620: zenoh transport-events listener stopped (session closed)");
-        });
+                tracing::debug!(
+                    "ZEB-620: zenoh transport-events listener stopped (session closed)"
+                );
+            });
 
-        reconnect_supervisor = Some(handle);
+            reconnect_supervisor = Some(handle);
+        }
     }
 
     // Own Zenoh session ID — attached to capacity publications so receivers
@@ -5519,6 +5534,12 @@ pub async fn run(
     // signaling events into a stale AppHandle during the closing→session-close
     // window or race a subsequent start_node restart.
     if let Some(handle) = voice_signal_sub_handle {
+        handle.abort();
+    }
+    // ZEB-620: abort the reconnect-supervisor loop too — it never exits on its
+    // own, and left running it would keep dialing peers (and holding the zenoh
+    // runtime) after the event loop returns.
+    if let Some(handle) = reconnect_supervisor_task {
         handle.abort();
     }
     let _ = session.close().await;
