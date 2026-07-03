@@ -23,7 +23,7 @@ import type {
   RedemptionOutcome,
   ResolutionProgressEvent,
 } from './types/connectivity';
-import type { RelayHealth } from './types/network-health';
+import type { RelayHealth, IrohRelayInfo } from './types/network-health';
 import type { RedeemInviteResultDto } from './community-service';
 
 /**
@@ -432,6 +432,88 @@ export async function removePkarrRelay(url: string): Promise<RelayHealth[]> {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`remove_pkarr_relay: ${msg}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ZEB-624: iroh transport relay configuration IPCs
+// ---------------------------------------------------------------------------
+//
+// Distinct from the pkarr relay pool above: the iroh wire carries no per-relay
+// health, so every verb returns an `IrohRelayInfo { relays, custom }`.
+// `custom === false` means the node is following iroh's recommended defaults
+// (the returned `relays` shows them); `true` means a materialized custom list.
+// The backend emits `iroh-relays-changed` after every successful mutation.
+
+/**
+ * Returns the current iroh transport relay configuration: the effective relay
+ * URL list plus whether it is a user-materialized custom list (`custom`) or
+ * iroh's recommended defaults (`!custom`).
+ */
+export async function getIrohRelays(): Promise<IrohRelayInfo> {
+  try {
+    return await invoke<IrohRelayInfo>('get_iroh_relays');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`get_iroh_relays: ${msg}`);
+  }
+}
+
+/**
+ * Replaces the iroh relay configuration with the provided URL list. The backend
+ * validates, persists, and hot-swaps the transport relay map, then emits
+ * `iroh-relays-changed`. Returns the NEW authoritative `IrohRelayInfo` so the
+ * caller updates its view from the result with no separate refetch.
+ */
+export async function setIrohRelays(relays: string[]): Promise<IrohRelayInfo> {
+  try {
+    return await invoke<IrohRelayInfo>('set_iroh_relays', { relays });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`set_iroh_relays: ${msg}`);
+  }
+}
+
+/**
+ * Adds a single relay to the iroh relay configuration (server-authoritative
+ * read-modify-write). Adding to a defaults-following node materializes a custom
+ * list. Returns the NEW authoritative `IrohRelayInfo`.
+ */
+export async function addIrohRelay(url: string): Promise<IrohRelayInfo> {
+  try {
+    return await invoke<IrohRelayInfo>('add_iroh_relay', { url });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`add_iroh_relay: ${msg}`);
+  }
+}
+
+/**
+ * Removes a single relay from the iroh relay configuration (server-authoritative
+ * read-modify-write). Removing the last custom relay is rejected server-side
+ * (the error tells the user to reset to recommended). Returns the NEW
+ * authoritative `IrohRelayInfo`.
+ */
+export async function removeIrohRelay(url: string): Promise<IrohRelayInfo> {
+  try {
+    return await invoke<IrohRelayInfo>('remove_iroh_relay', { url });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`remove_iroh_relay: ${msg}`);
+  }
+}
+
+/**
+ * Resets the iroh relay configuration back to iroh's recommended defaults,
+ * persisted + hot-swapped live. Returns the NEW authoritative `IrohRelayInfo`
+ * (with `custom === false`).
+ */
+export async function resetIrohRelays(): Promise<IrohRelayInfo> {
+  try {
+    return await invoke<IrohRelayInfo>('reset_iroh_relays');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`reset_iroh_relays: ${msg}`);
   }
 }
 

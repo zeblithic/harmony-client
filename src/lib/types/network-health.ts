@@ -70,6 +70,16 @@ export interface RelayHealth {
   lastSuccessMs: number | null;
 }
 
+// ZEB-624: iroh transport relay configuration. Distinct from the pkarr relay
+// pool (per-relay RelayHealth) — the iroh wire carries no per-relay health.
+// `custom === false` means the node is following iroh's recommended defaults
+// (the returned `relays` list shows them); `true` means a materialized custom
+// list. Mirrors the Rust `IrohRelayInfo` DTO (serde rename_all = "camelCase").
+export interface IrohRelayInfo {
+  relays: string[];
+  custom: boolean;
+}
+
 export interface PkarrHealthSummary {
   identityPublished: boolean;
   identityLastPublishMs: number | null;

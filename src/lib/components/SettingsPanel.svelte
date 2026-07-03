@@ -24,6 +24,7 @@
   import DevicesPanel from './DevicesPanel.svelte';
   import NotificationSettingsPanel from './NotificationSettingsPanel.svelte';
   import NetworkDiscoverabilitySettings from './NetworkDiscoverabilitySettings.svelte';
+  import IrohRelaySettings from './IrohRelaySettings.svelte';
   import FriendsPanel from './FriendsPanel.svelte';
 
   type SettingsTab = 'profile' | 'account' | 'notifications' | 'network' | 'friends';
@@ -173,6 +174,7 @@
     hidden={activeTab !== 'network'}
   >
     <NetworkDiscoverabilitySettings />
+    <IrohRelaySettings />
   </div>
   <div
     class="tab-content"
