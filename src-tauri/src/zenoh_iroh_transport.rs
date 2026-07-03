@@ -2186,7 +2186,9 @@ mod tests {
                 1,
                 "registry holds exactly one connection after recovery (stale reaped)"
             );
-            let conn = map.get(&bob_id).expect("bob present in registry after recovery");
+            let conn = map
+                .get(&bob_id)
+                .expect("bob present in registry after recovery");
             assert!(
                 conn.close_reason().is_none(),
                 "the reinstalled connection must be live (open bi-stream, GET-ready)"
