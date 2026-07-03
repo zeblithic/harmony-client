@@ -314,9 +314,9 @@
             <!-- ZEB-620/622: live per-peer transport-state tally from the
                  reconnect supervisor (folded into the dial summary). -->
             <li class="dial-peer-states" data-testid="nh-dial-peer-states">
-              Peers: <strong>{dial.connected}</strong> connected ·
-              <strong>{dial.retrying}</strong> retrying ·
-              <strong>{dial.dormant}</strong> dormant
+              Peers: <strong>{dial.connected ?? 0}</strong> connected ·
+              <strong>{dial.retrying ?? 0}</strong> retrying ·
+              <strong>{dial.dormant ?? 0}</strong> dormant
             </li>
           </ul>
           {#if recentHits.length === 0}

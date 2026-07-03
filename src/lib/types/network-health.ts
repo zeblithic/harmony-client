@@ -91,10 +91,11 @@ export interface DialHealthSummary {
   skippedDuplicate: number;
   // ZEB-620: live per-peer-state counts from the reconnect supervisor, folded
   // into the dial summary. Rust `#[serde(default)]`, so a pre-field snapshot
-  // still deserializes (fields simply absent).
-  retrying: number;
-  dormant: number;
-  connected: number;
+  // (or old cached WS data) may omit them — optional here; coalesce with `?? 0`
+  // at the render site.
+  retrying?: number;
+  dormant?: number;
+  connected?: number;
   recent: DynamicDialHit[];
 }
 

@@ -1216,10 +1216,19 @@ pub async fn run(
                         }
                     };
                     match event.kind() {
-                        // Down-edge (ZEB-620): kick the reconnect supervisor.
+                        // Down-edge: kick the reconnect supervisor (ZEB-620) AND
+                        // raise an external liveness down-edge (ZEB-622) so a
+                        // conn-less (zenoh-only) slot leaves Degraded — a
+                        // registry-backed slot is untouched (its Disconnected
+                        // edge is owned by that conn's drop watcher).
                         SampleKind::Delete => match node_id {
-                            Some(n) => listener_handle
-                                .kick(n, crate::reconnect_supervisor::ReconnectTrigger::Dropped),
+                            Some(n) => {
+                                listener_handle.kick(
+                                    n,
+                                    crate::reconnect_supervisor::ReconnectTrigger::Dropped,
+                                );
+                                listener_liveness.on_transport_down_external(n);
+                            }
                             None => tracing::debug!(
                         "ZEB-620: transport Delete for zid {zid} not a resolver-known iroh peer; \
                          no reconnect kick"
@@ -3445,10 +3454,13 @@ pub async fn run(
                     // bumps the transport epoch — community root-fetch /
                     // channel-backfill / mail-root latches re-arm (their drivers
                     // subscribe). A same-zid reconnect after a drop now re-fires.
-                    if detect_up_edges(&mut transport_prev_zids, &refreshed) {
+                    if detect_up_edges(&mut transport_prev_zids, refreshed) {
                         transport_epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
                     }
-                    direct_peer_zids = refreshed.into_iter().collect();
+                    // `detect_up_edges` moved `refreshed` into `transport_prev_zids`
+                    // (now the fresh snapshot); mirror it into the hop-distance set,
+                    // which tracks the same snapshot.
+                    direct_peer_zids = transport_prev_zids.clone();
                 }
 
                 // ZEB-418 P2 Task 7 (D16): periodic routing-record
@@ -6397,10 +6409,12 @@ const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 /// previous snapshot; `prev` is REPLACED by the current snapshot each call, so
 /// a flap longer than one poll interval (~5s) re-fires. Sub-interval LAN flaps
 /// can be missed here — iroh peers are covered event-driven by peer_liveness.
-fn detect_up_edges(prev: &mut std::collections::HashSet<String>, current: &[String]) -> bool {
-    let cur: std::collections::HashSet<String> = current.iter().cloned().collect();
+fn detect_up_edges(prev: &mut std::collections::HashSet<String>, current: Vec<String>) -> bool {
+    // Borrow to compute the up-edge, THEN move `current` into `prev` — no
+    // per-poll string clones (the old `current.iter().cloned().collect()`
+    // allocated a fresh copy of every zid each ~5s poll).
     let any_new = current.iter().any(|z| !prev.contains(z));
-    *prev = cur;
+    *prev = current.into_iter().collect();
     any_new
 }
 
@@ -6456,7 +6470,7 @@ mod transport_epoch_tests {
         let mut prev: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
         assert!(detect_up_edges(
             &mut prev,
-            &["a".to_string(), "b".to_string()]
+            vec!["a".to_string(), "b".to_string()]
         ));
     }
 
@@ -6467,7 +6481,7 @@ mod transport_epoch_tests {
             ["a".to_string(), "b".to_string()].into_iter().collect();
         assert!(!detect_up_edges(
             &mut prev,
-            &["a".to_string(), "b".to_string()]
+            vec!["a".to_string(), "b".to_string()]
         ));
     }
 
@@ -6479,9 +6493,9 @@ mod transport_epoch_tests {
     fn detect_up_edges_drop_then_return_refires() {
         let mut prev: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
         // "a" drops out → not an up-edge, and `prev` becomes empty.
-        assert!(!detect_up_edges(&mut prev, &[]));
+        assert!(!detect_up_edges(&mut prev, vec![]));
         // "a" returns → up-edge (absent in the previous snapshot).
-        assert!(detect_up_edges(&mut prev, &["a".to_string()]));
+        assert!(detect_up_edges(&mut prev, vec!["a".to_string()]));
     }
 
     /// A snapshot that simultaneously loses one zid and gains another still
@@ -6489,8 +6503,8 @@ mod transport_epoch_tests {
     #[test]
     fn detect_up_edges_simultaneous_add_remove_fires() {
         let mut prev: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
-        assert!(detect_up_edges(&mut prev, &["b".to_string()]));
-        assert!(!detect_up_edges(&mut prev, &["b".to_string()]));
+        assert!(detect_up_edges(&mut prev, vec!["b".to_string()]));
+        assert!(!detect_up_edges(&mut prev, vec!["b".to_string()]));
     }
 }
 

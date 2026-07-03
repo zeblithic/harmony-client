@@ -982,7 +982,9 @@ impl NetworkHealthService {
         // ZEB-622: join the live peer-liveness transport state onto each record
         // (by `iroh_node_id`). Runs AFTER the self-test overlay so live data
         // wins. `Connected` sets Direct/Relay + the live rtt; `Degraded` marks
-        // the new Degraded mode (rtt untouched); `Disconnected` clears any stale
+        // the new Degraded mode AND clears rtt (the wire `Degraded` carries no
+        // RTT by design, so a lingering self-test rtt beside `degraded` would be
+        // stale honest-data-violating noise); `Disconnected` clears any stale
         // self-test overlay back to NoConnection/None (liveness KNOWS the peer is
         // down, so a lingering Direct+rtt from a cached self-test would be a lie);
         // an absent peer leaves the record's current mode (NoConnection default,
@@ -999,6 +1001,10 @@ impl NetworkHealthService {
                     }
                     Some(LivenessStateWire::Degraded { .. }) => {
                         record.connection_mode = ConnectionMode::Degraded;
+                        // `LivenessStateWire::Degraded` carries no RTT by design;
+                        // clear any prior self-test overlay so `degraded` never
+                        // ships alongside a stale rtt.
+                        record.rtt_ms = None;
                     }
                     Some(LivenessStateWire::Disconnected { .. }) => {
                         record.connection_mode = ConnectionMode::NoConnection;
@@ -3213,7 +3219,7 @@ mod tests {
         assert_eq!(p11.rtt_ms, Some(42));
         let p22 = get(0x22);
         assert_eq!(p22.connection_mode, ConnectionMode::Degraded);
-        assert_eq!(p22.rtt_ms, None, "Degraded leaves rtt untouched");
+        assert_eq!(p22.rtt_ms, None, "Degraded carries no rtt");
         let p33 = get(0x33);
         assert_eq!(p33.connection_mode, ConnectionMode::NoConnection);
         assert_eq!(p33.rtt_ms, None);
@@ -3307,6 +3313,50 @@ mod tests {
         assert_eq!(
             snap.peers[0].rtt_ms, None,
             "liveness Disconnected clears the stale self-test rtt too"
+        );
+    }
+
+    /// (b3) A stale cached self-test says Direct/37, but liveness reports the
+    /// link `Degraded` (up, no selected path) → the mode becomes Degraded AND the
+    /// stale self-test rtt is cleared (the wire `Degraded` carries no RTT, so a
+    /// lingering value would ship `degraded` beside a phantom rtt).
+    #[tokio::test]
+    async fn liveness_degraded_clears_stale_self_test_rtt() {
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xAA, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0xAA]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        // Self-test overlay set Direct + rtt (the stale value that must be cleared).
+        *svc.last_self_test.write().await = Some(SelfTestReport {
+            started_at_ms: 0,
+            finished_at_ms: 100,
+            steps: vec![],
+            peer_results: vec![PeerPingResult {
+                owner_addr: hex::encode([0xAA; 16]),
+                outcome: StepOutcome::Pass { duration_ms: 37 },
+                mode: Some(ConnectionMode::Direct),
+            }],
+        });
+        svc.set_liveness_source(std::sync::Arc::new(FakeLiveness {
+            states: vec![([0xAAu8; 32], LivenessStateWire::Degraded { since_ms: 5 })],
+            min_relay: None,
+        }));
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(
+            snap.peers[0].connection_mode,
+            ConnectionMode::Degraded,
+            "liveness Degraded wins over the stale self-test Direct"
+        );
+        assert_eq!(
+            snap.peers[0].rtt_ms, None,
+            "liveness Degraded clears the stale self-test rtt (Degraded carries no RTT)"
         );
     }
 

@@ -249,6 +249,29 @@ impl LivenessHandle {
         self.commit(changed, was_up, is_now_up);
     }
 
+    /// Zenoh-view down-edge with no `Connection`. The mirror of
+    /// [`Self::on_transport_up_external`]: a zenoh transport `Delete` is the only
+    /// down-edge a conn-less (zenoh-only) slot will ever get, so honor it by
+    /// dropping to `Disconnected`. Acts ONLY on a currently-up slot whose
+    /// `conn_id.is_none()` — a registry-backed slot (`conn_id.is_some()`) is left
+    /// untouched, since its `Disconnected` edge is owned by that conn's drop
+    /// watcher. Clears `min_relay_rtt_ms` and fires the changed signal; it is NOT
+    /// an up-edge, so no transport epoch bump.
+    pub fn on_transport_down_external(&self, peer: [u8; 32]) {
+        let (changed, was_up, is_now_up) = {
+            let mut slots = self.inner.slots.lock().expect("slots lock");
+            match slots.get_mut(&peer) {
+                Some(slot) if slot.conn_id.is_none() && slot.state.is_up() => {
+                    slot.state = SlotState::Disconnected { since_ms: now_ms() };
+                    slot.min_relay_rtt_ms = None;
+                    (true, true, false)
+                }
+                _ => (false, false, false),
+            }
+        };
+        self.commit(changed, was_up, is_now_up);
+    }
+
     /// Path event for `conn_id`'s connection. Ignored unless the slot's current
     /// conn matches (a superseded conn's watcher is silenced). A selected path
     /// promotes to `Connected` (preserving `since_ms` across a Connected→Connected
@@ -530,6 +553,59 @@ mod tests {
                     ..
                 }
             )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_down_edge_disconnects_and_flap_re_arms() {
+        let h = LivenessHandle::new();
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        h.set_transport_epoch_tx(tx);
+        // External up (zenoh-only, conn-less) → Degraded + epoch 1.
+        h.on_transport_up_external(peer(1));
+        assert_eq!(*rx.borrow(), 1, "external up bumps epoch");
+        // External down → Disconnected, but NOT an up-edge (epoch unchanged).
+        h.on_transport_down_external(peer(1));
+        assert!(
+            matches!(
+                h.states_snapshot().as_slice(),
+                [(_, LivenessStateWire::Disconnected { .. })]
+            ),
+            "external down drops the conn-less slot to Disconnected"
+        );
+        assert_eq!(*rx.borrow(), 1, "external down is not an up-edge");
+        // External up AGAIN — the zenoh-only flap re-arms (epoch 2). Before the
+        // down-edge existed this stuck Degraded forever and future Puts were
+        // no-ops.
+        h.on_transport_up_external(peer(1));
+        assert_eq!(*rx.borrow(), 2, "post-down external up re-bumps the epoch");
+        assert!(matches!(
+            h.states_snapshot().as_slice(),
+            [(_, LivenessStateWire::Degraded { .. })]
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_down_does_not_touch_registry_backed_slot() {
+        let h = LivenessHandle::new();
+        // Registry-backed up-edge (carries a conn_id) → Degraded, conn-backed.
+        h.on_transport_up(peer(1), 11);
+        h.report_path(peer(1), 11, Some((LivenessMode::Direct, 12)), None);
+        // A stray external down MUST NOT clobber a conn-backed slot — its
+        // Disconnected edge is owned by the registry conn's drop watcher.
+        h.on_transport_down_external(peer(1));
+        assert!(
+            matches!(
+                h.states_snapshot().as_slice(),
+                [(
+                    _,
+                    LivenessStateWire::Connected {
+                        mode: LivenessMode::Direct,
+                        ..
+                    }
+                )]
+            ),
+            "external down leaves a registry-backed slot unchanged"
+        );
     }
 
     #[tokio::test(start_paused = true)]
