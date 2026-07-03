@@ -24,6 +24,13 @@ pub struct ConnectivitySettings {
     /// `set_pkarr_relays` (no restart).
     #[serde(default = "default_pkarr_relays")]
     pub relays: Vec<String>,
+    /// ZEB-624: custom iroh relay URL list. EMPTY = follow the iroh preset's
+    /// default relay map (n0 stable). Applied at endpoint build and live via
+    /// insert/remove diff. Distinct from `relays` (the pkarr publish/resolve
+    /// pool): these steer iroh's transport home-relay selection. Serde default is
+    /// empty so an old settings file (no key) keeps the preset defaults.
+    #[serde(default)]
+    pub iroh_relays: Vec<String>,
     /// ZEB-600: user "appear offline" toggle. When true, the node suppresses
     /// its community-presence beacons (others see it offline; it still receives
     /// their presence). Default OFF (visible) — presence is a product default.
@@ -60,13 +67,21 @@ impl Default for ConnectivitySettings {
             identity_discoverable: false,
             friend_auto_accept_known: default_friend_auto_accept_known(),
             relays: default_pkarr_relays(),
+            // Empty = follow the iroh preset's default relay map (n0 stable);
+            // there is no first-run custom iroh pool.
+            iroh_relays: Vec::new(),
             presence_invisible: false,
         }
     }
 }
 
-/// Maximum number of relays a user may configure.
+/// Maximum number of pkarr relays a user may configure.
 pub const MAX_RELAYS: usize = 8;
+
+/// ZEB-624: maximum number of custom iroh relays a user may configure. Mirrors
+/// [`MAX_RELAYS`] — a small ceiling keeps the persisted list bounded and the
+/// endpoint's relay map sane.
+pub const MAX_IROH_RELAYS: usize = 8;
 
 /// Validate + normalize a user-submitted relay list. Rejects an empty list,
 /// blank/malformed URLs, non-`https` remote schemes (`http` allowed only for
@@ -78,21 +93,61 @@ pub const MAX_RELAYS: usize = 8;
 /// [`MAX_RELAYS`]. Dedups on the trailing-slash-normalized URL, preserving
 /// first-seen order. Returns the normalized list on success.
 pub fn validate_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
+    validate_relay_list(input, MAX_RELAYS, validate_single_relay)
+}
+
+/// Shared strict list-walk behind [`validate_relay_urls`] (pkarr) and
+/// [`validate_iroh_relay_urls`] (iroh): reject an empty list, run each trimmed
+/// entry through `validate` (returns the normalized form, or an error that
+/// aborts the whole list), dedup on the normalized value (first-seen wins), and
+/// reject more than `max`. The per-entry `validate` closure carries the
+/// family-specific rule so this validate/dedup/cap walk lives in exactly one
+/// place rather than being copy-pasted per relay family.
+fn validate_relay_list(
+    input: Vec<String>,
+    max: usize,
+    validate: impl Fn(&str) -> Result<String, String>,
+) -> Result<Vec<String>, String> {
     if input.is_empty() {
         return Err("at least one relay is required".to_string());
     }
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for raw in input {
-        let normalized = validate_single_relay(raw.trim())?;
+        let normalized = validate(raw.trim())?;
         if seen.insert(normalized.clone()) {
             out.push(normalized);
         }
     }
-    if out.len() > MAX_RELAYS {
-        return Err(format!("too many relays (max {MAX_RELAYS})"));
+    if out.len() > max {
+        return Err(format!("too many relays (max {max})"));
     }
     Ok(out)
+}
+
+/// ZEB-624: strict validator for a user-submitted custom iroh relay list. Each
+/// entry must satisfy the shared base rule ([`validate_single_relay`]: non-empty,
+/// `https` for remote hosts / `http` only for loopback, no path/query/fragment/
+/// userinfo) AND parse as an [`iroh::RelayUrl`] — a base `url::Url` accepts but
+/// iroh's endpoint builder rejects would otherwise fail silently at connect
+/// time. Rejects an empty list (use "reset" to fall back to the preset
+/// defaults), dedups, and caps at [`MAX_IROH_RELAYS`]. Returns the normalized
+/// list on success.
+pub fn validate_iroh_relay_urls(input: Vec<String>) -> Result<Vec<String>, String> {
+    validate_relay_list(input, MAX_IROH_RELAYS, validate_iroh_single)
+}
+
+/// Per-entry iroh relay rule: the shared pkarr base check
+/// ([`validate_single_relay`], which returns the trailing-slash-normalized base)
+/// plus an [`iroh::RelayUrl`] parse. An iroh relay URL must satisfy BOTH. The
+/// normalized base (not the `RelayUrl`'s re-serialized string, which re-adds a
+/// trailing slash) is returned so the persisted form stays canonical.
+fn validate_iroh_single(trimmed: &str) -> Result<String, String> {
+    let normalized = validate_single_relay(trimmed)?;
+    normalized
+        .parse::<iroh::RelayUrl>()
+        .map_err(|e| format!("invalid iroh relay URL '{normalized}': {e}"))?;
+    Ok(normalized)
 }
 
 /// Validate ONE trimmed relay URL, returning its trailing-slash-normalized form
@@ -145,24 +200,62 @@ fn validate_single_relay(trimmed: &str) -> Result<String, String> {
 /// entries invalid); the caller decides the empty fallback (callers use
 /// [`default_pkarr_relays`]).
 pub fn sanitize_relay_urls(input: Vec<String>) -> Vec<String> {
+    sanitize_relay_list(input, MAX_RELAYS, validate_single_relay)
+}
+
+/// Shared lenient list-walk behind [`sanitize_relay_urls`] (pkarr) and
+/// [`sanitize_iroh_relay_urls`] (iroh): keep every entry that `validate` accepts
+/// (returning its normalized form), silently drop the rest (a single bad
+/// hand-edited URL must not discard an otherwise-good pool), dedup (first-seen
+/// wins), and stop at `max`. May return empty; the caller decides the fallback.
+fn sanitize_relay_list(
+    input: Vec<String>,
+    max: usize,
+    validate: impl Fn(&str) -> Result<String, String>,
+) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for raw in input {
-        match validate_single_relay(raw.trim()) {
+        match validate(raw.trim()) {
             Ok(normalized) => {
                 if seen.insert(normalized.clone()) {
                     out.push(normalized);
-                    if out.len() == MAX_RELAYS {
+                    if out.len() == max {
                         break;
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "ZEB-380: dropping invalid persisted relay URL");
+                tracing::warn!(error = %e, "dropping invalid persisted relay URL");
             }
         }
     }
     out
+}
+
+/// ZEB-624: lenient reader-side sanitizer for a *persisted* iroh relay list — the
+/// iroh mirror of [`sanitize_relay_urls`]. Keeps every entry that passes
+/// [`validate_iroh_single`], drops the malformed ones, dedups, and caps at
+/// [`MAX_IROH_RELAYS`]. May return empty (input empty or all-invalid); the caller
+/// ([`effective_iroh_relays`]) maps empty → `None` = follow the iroh preset
+/// defaults.
+pub fn sanitize_iroh_relay_urls(input: Vec<String>) -> Vec<String> {
+    sanitize_relay_list(input, MAX_IROH_RELAYS, validate_iroh_single)
+}
+
+/// ZEB-624: the EFFECTIVE custom iroh relay pool for endpoint construction.
+/// Sanitizes the persisted `iroh_relays` (drops malformed entries, dedups, caps)
+/// and maps an empty result to `None` = "follow the iroh preset's built-in relay
+/// map" (n0 stable), distinct from `Some(list)` = "use exactly these". Task 5
+/// consumes this at endpoint build and for the live relay-map diff — keep the
+/// name and signature stable.
+pub fn effective_iroh_relays(settings: &ConnectivitySettings) -> Option<Vec<String>> {
+    let sanitized = sanitize_iroh_relay_urls(settings.iroh_relays.clone());
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
 }
 
 /// True for loopback / private / link-local hosts where a plaintext `http://`
@@ -210,6 +303,11 @@ impl ConnectivitySettings {
             identity_discoverable: false,
             friend_auto_accept_known: false,
             relays: default_pkarr_relays(),
+            // ZEB-624: empty = follow the iroh preset defaults. Like `relays`,
+            // iroh relays are operational infrastructure, not a privacy/trust
+            // opt-out, so the fail-closed value is simply "no custom override"
+            // (defaults) rather than a restrictive flip.
+            iroh_relays: Vec::new(),
             // ZEB-600: fail closed = INVISIBLE. A corrupt/unreadable file must
             // never silently re-broadcast a user who had opted to appear offline.
             // This is the INVERSE of identity_discoverable's closed value (false):
@@ -258,7 +356,16 @@ impl ConnectivitySettings {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        // ZEB-624: atomic write — serialize to a sibling temp file, then rename
+        // it into place. A same-directory rename is atomic on macOS/Linux (POSIX
+        // `rename(2)`), so a concurrent reader never observes a half-written
+        // settings file and a crash mid-write leaves the prior file intact. On
+        // Windows `rename` is best-effort (it can fail if the destination exists
+        // or is open), acceptable here: the settings file is written rarely and
+        // by a single writer.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)
     }
 }
 
@@ -266,6 +373,110 @@ impl ConnectivitySettings {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // ---- ZEB-624: iroh relay list ----
+
+    #[test]
+    fn iroh_relays_default_empty_and_roundtrip() {
+        let s = ConnectivitySettings::default();
+        assert!(s.iroh_relays.is_empty()); // empty = follow iroh preset defaults
+                                           // old file without the key parses with empty vec (serde default)
+        let old = r#"{"identity_discoverable":false,"friend_auto_accept_known":true,"relays":["https://pkarr.q8.fyi"],"presence_invisible":false}"#;
+        let parsed: ConnectivitySettings = serde_json::from_str(old).unwrap();
+        assert!(parsed.iroh_relays.is_empty());
+    }
+
+    #[test]
+    fn validate_iroh_relay_urls_rules() {
+        // https accepted + normalized (trailing slash stripped)
+        assert_eq!(
+            validate_iroh_relay_urls(vec!["https://use1-1.relay.n0.iroh.link/".into()]).unwrap(),
+            vec!["https://use1-1.relay.n0.iroh.link".to_string()]
+        );
+        // must also parse as an iroh RelayUrl
+        assert!(validate_iroh_relay_urls(vec!["https://relay example".into()]).is_err());
+        // empty list rejected (use reset for defaults)
+        assert!(validate_iroh_relay_urls(vec![]).is_err());
+        // http only for local hosts; dedup; cap MAX_IROH_RELAYS=8 — mirror the pkarr test matrix
+        assert!(validate_iroh_relay_urls(vec!["http://127.0.0.1:3340".into()]).is_ok());
+        assert!(validate_iroh_relay_urls(vec!["http://relay.evil.example".into()]).is_err());
+    }
+
+    #[test]
+    fn validate_iroh_relay_urls_dedups_and_caps() {
+        // Dedup on the trailing-slash-normalized value (first wins), mirroring the
+        // pkarr matrix; and reject more than MAX_IROH_RELAYS distinct entries.
+        let deduped = validate_iroh_relay_urls(vec![
+            "https://use1-1.relay.n0.iroh.link".into(),
+            "https://use1-1.relay.n0.iroh.link/".into(),
+        ])
+        .expect("dedup");
+        assert_eq!(
+            deduped,
+            vec!["https://use1-1.relay.n0.iroh.link".to_string()]
+        );
+        let many: Vec<String> = (0..(MAX_IROH_RELAYS + 1))
+            .map(|i| format!("https://r{i}.relay.example"))
+            .collect();
+        assert!(validate_iroh_relay_urls(many).is_err());
+    }
+
+    #[test]
+    fn effective_iroh_relays_empty_is_none() {
+        // Empty persisted list → None = "follow the iroh preset's default relay
+        // map" (n0 stable), the sentinel Task 5 consumes at endpoint build.
+        let s = ConnectivitySettings::default();
+        assert!(effective_iroh_relays(&s).is_none());
+    }
+
+    #[test]
+    fn effective_iroh_relays_custom_is_some_sanitized() {
+        // Lenient sanitize: drop the malformed entry, dedup the trailing-slash
+        // duplicate, keep the valid relay — then wrap in Some.
+        let s = ConnectivitySettings {
+            iroh_relays: vec![
+                "https://use1-1.relay.n0.iroh.link".to_string(),
+                "not a url".to_string(),                          // dropped
+                "https://use1-1.relay.n0.iroh.link/".to_string(), // dedup
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_iroh_relays(&s),
+            Some(vec!["https://use1-1.relay.n0.iroh.link".to_string()])
+        );
+    }
+
+    #[test]
+    fn iroh_relays_round_trips() {
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        let s = ConnectivitySettings {
+            iroh_relays: vec!["https://use1-1.relay.n0.iroh.link".to_string()],
+            ..Default::default()
+        };
+        s.save(&path).expect("save");
+        assert_eq!(
+            ConnectivitySettings::load_or_default(&path).iroh_relays,
+            s.iroh_relays
+        );
+    }
+
+    #[test]
+    fn save_is_atomic_tmp_rename() {
+        // save() writes <name>.tmp then renames: after a successful save, no .tmp
+        // sibling remains and the persisted file parses back to an equal value.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        let s = ConnectivitySettings::default();
+        s.save(&path).expect("save");
+        let tmp = path.with_extension("json.tmp");
+        assert!(
+            !tmp.exists(),
+            "atomic-write temp sibling must be renamed away, not left behind"
+        );
+        assert_eq!(ConnectivitySettings::load_or_default(&path), s);
+    }
 
     #[test]
     fn defaults_to_not_discoverable() {
@@ -347,6 +558,7 @@ mod tests {
             identity_discoverable: true,
             friend_auto_accept_known: false,
             relays: vec!["https://relay.pkarr.org".to_string()],
+            iroh_relays: Vec::new(),
             presence_invisible: false,
         };
         settings.save(&path).expect("save");
@@ -397,6 +609,7 @@ mod tests {
             identity_discoverable: false,
             friend_auto_accept_known: true,
             relays: vec!["https://relay.pkarr.org".to_string()],
+            iroh_relays: Vec::new(),
             presence_invisible: false,
         };
         settings.save(&path).expect("save");
