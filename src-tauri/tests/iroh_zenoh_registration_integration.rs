@@ -9,8 +9,8 @@
 //! 2. **Factory wiring** — [`zenoh_link::LinkManagerBuilderUnicast::make`]
 //!    errors (never panics) when no ctx is set, and returns `Ok(manager)`
 //!    once a ctx is installed via [`harmony_app::iroh_zenoh_registration::set_iroh_session_ctx`].
-//! 3. **Outbound builder** — [`harmony_app::iroh_zenoh_registration::iroh_connect_locators`]
-//!    dedups peers and skips self.
+//! 3. **Boot-seed builder** — [`harmony_app::iroh_zenoh_registration::boot_seed_node_ids_by_recency`]
+//!    dedups peers and skips self (ZEB-620 successor to `iroh_connect_locators`).
 //! 4. **Real `zenoh::open`** — a session opened with an `iroh/<hex>` listen
 //!    endpoint succeeds, proving the factory routed the iroh listener through
 //!    Zenoh's transport-manager setup without panicking or bailing.
@@ -36,7 +36,8 @@ use std::time::Duration;
 
 use harmony_app::iroh_endpoint::{alpn, IrohEndpoint};
 use harmony_app::iroh_zenoh_registration::{
-    ensure_iroh_factory_registered, iroh_connect_locators, set_iroh_session_ctx, IrohSessionCtx,
+    boot_seed_node_ids_by_recency, ensure_iroh_factory_registered, set_iroh_session_ctx,
+    IrohSessionCtx,
 };
 use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 use harmony_app::reachability_record::ReachabilityAnnouncePayload;
@@ -149,10 +150,12 @@ async fn make_with_ctx_returns_manager() {
 // (3) Outbound builder
 // ──────────────────────────────────────────────────────────────────────────
 
-/// `iroh_connect_locators` produces one `iroh/<hex>` per distinct peer node id,
-/// deduped, with self skipped.
+/// ZEB-620: `boot_seed_node_ids_by_recency` produces one node-id per distinct
+/// peer, deduped across owners, with self skipped (the successor to ZEB-368's
+/// `iroh_connect_locators`, which returned `iroh/<hex>` strings for zenoh's
+/// static connect set — boot peers now seed the reconnect supervisor instead).
 #[test]
-fn iroh_connect_locators_dedups_and_skips_self() {
+fn boot_seed_node_ids_dedup_and_skip_self() {
     let resolver = ReachabilityResolver::new();
     let hlc = Hlc {
         wall_ms: 1_700_000_000_000,
@@ -174,8 +177,8 @@ fn iroh_connect_locators_dedups_and_skips_self() {
     resolver.update(OwnerAddr([0x02; 16]), mk(peer_nid), hlc.clone());
     resolver.update(OwnerAddr([0x03; 16]), mk(peer_nid), hlc.clone());
     assert_eq!(
-        iroh_connect_locators(&resolver, &self_nid),
-        vec![format!("iroh/{}", hex::encode(peer_nid))]
+        boot_seed_node_ids_by_recency(&resolver, &self_nid),
+        vec![peer_nid]
     );
 }
 

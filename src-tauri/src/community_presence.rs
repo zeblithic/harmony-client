@@ -15,6 +15,7 @@ use crate::community_membership::ChannelId;
 use crate::community_state_sync::CommunitySyncRegistry;
 use crate::owner_state_crypto::canonical_cbor_encode;
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use crate::reconnect_supervisor::SupervisorHandle;
 use crate::voice_crypto::{decrypt_voice_packet, encrypt_voice_packet, COMMUNITY_PRESENCE_AAD};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -485,6 +486,23 @@ pub fn spawn_community_presence_publisher(
     })
 }
 
+/// ZEB-620 Task 5: the side effects fired when a presence apply reports a roster
+/// device-set change — extracted from the subscriber's `if changed` arm so the
+/// edge is unit-testable without standing up a live zenoh session. Bumps the
+/// ZEB-599 channel-log backfill resync watch AND kicks the reconnect supervisor
+/// into a presence sweep (re-arm all non-connected peers). Both are lossless,
+/// non-blocking, and safe with no downstream consumers (`send_modify` with no
+/// receivers is a no-op; `supervisor` is `None` on iroh-disabled runs).
+fn on_presence_roster_change(
+    resync_tx: &tokio::sync::watch::Sender<u64>,
+    supervisor: Option<&SupervisorHandle>,
+) {
+    resync_tx.send_modify(|e| *e = e.wrapping_add(1));
+    if let Some(sup) = supervisor {
+        sup.kick_sweep();
+    }
+}
+
 /// Spawn a community-presence subscriber on `topic`: open the seal (under the
 /// community's current presence key) → verify the device-#2 signature → verify
 /// materialized membership → apply to the shared map → emit `presence-updated`
@@ -508,6 +526,12 @@ pub fn spawn_community_presence_subscriber(
     // analogue of the ~1h anti-entropy floor. A bump with no receivers is a
     // harmless no-op (same as `transport_epoch`).
     resync_tx: tokio::sync::watch::Sender<u64>,
+    // ZEB-620 Task 5: reconnect-supervisor handle. On the same roster-change edge
+    // as `resync_tx`, kicked into a presence sweep (re-arm all non-connected
+    // peers) — the identity-free roster edge that recovers a peer whose transport
+    // dropped without a registry/zenoh Delete reaching us. `None` for iroh-
+    // disabled runs and test callers that bypass `start_node`.
+    supervisor: Option<SupervisorHandle>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let sub = match session.declare_subscriber(&topic).await {
@@ -562,15 +586,17 @@ pub fn spawn_community_presence_subscriber(
                 // potential holder just became reachable cross-WAN → kick every
                 // channel-log backfill driver into a FULL reconcile (the driver
                 // cooldown-gates it, and the ~1h floor stays the backstop).
-                // `send_modify` notifies all watchers; a bump with no receivers
-                // is a harmless no-op (mirrors the transport-epoch bump).
+                // ZEB-620: the same edge also kicks the reconnect supervisor into
+                // a presence sweep. Both side effects live in one helper so the
+                // edge is unit-testable without a live zenoh session.
                 tracing::debug!(
                     target: "harmony_channel",
                     community = %hex::encode(&community.0[..4]),
                     device = %hex::encode(&signed.beacon.device[..4]),
-                    "presence roster change → full-reconcile kick to backfill drivers"
+                    supervisor_kicked = supervisor.is_some(),
+                    "presence roster change → full-reconcile kick"
                 );
-                resync_tx.send_modify(|e| *e = e.wrapping_add(1));
+                on_presence_roster_change(&resync_tx, supervisor.as_ref());
                 let members = {
                     let g = map.lock().await;
                     g.online_owners(&community)
@@ -779,5 +805,50 @@ mod tests {
         m.apply(&c, &b(1, 1, 100, 0), 1_000);
         m.remove_community(&c);
         assert!(m.online_owners(&c).is_empty());
+    }
+
+    /// ZEB-620 Task 5: the subscriber's `if changed` edge (a roster device-set
+    /// change) fires [`on_presence_roster_change`], which both bumps the ZEB-599
+    /// resync watch AND kicks the reconnect supervisor into a presence sweep
+    /// (re-arm all non-connected peers). Drives the same `apply → changed` path
+    /// the subscriber runs, then the extracted edge helper, and observes the
+    /// sweep on a real `SupervisorHandle`.
+    #[test]
+    fn presence_edge_triggers_sweep() {
+        use crate::reconnect_supervisor::SupervisorHandle;
+
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([7u8; 16]);
+        let (resync_tx, resync_rx) = tokio::sync::watch::channel(0u64);
+        let sup = SupervisorHandle::new();
+
+        // A first beacon is a roster device-set change (apply → true): the exact
+        // edge the subscriber fires its side effects on.
+        let changed = m.apply(&c, &b(1, 1, 100, 0), 1_000);
+        assert!(changed, "first-device apply is a roster change");
+        assert!(!sup.sweep_pending(), "no sweep before the edge fires");
+        on_presence_roster_change(&resync_tx, Some(&sup));
+        assert!(
+            sup.sweep_pending(),
+            "roster change must kick a presence sweep"
+        );
+        assert_eq!(
+            *resync_rx.borrow(),
+            1,
+            "resync watch bumped alongside the sweep (ZEB-599 parity preserved)"
+        );
+
+        // A stale re-apply of the SAME beacon is not a roster change (apply →
+        // false), so the subscriber would not reach the edge → no sweep.
+        let sup2 = SupervisorHandle::new();
+        let changed2 = m.apply(&c, &b(1, 1, 100, 0), 2_000);
+        assert!(!changed2, "duplicate-seq re-apply is not a roster change");
+        assert!(
+            !sup2.sweep_pending(),
+            "no sweep without a roster change edge"
+        );
+
+        // No supervisor installed (iroh-disabled / test callers) → no panic.
+        on_presence_roster_change(&resync_tx, None);
     }
 }

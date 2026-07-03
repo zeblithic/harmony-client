@@ -23,6 +23,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+// ZEB-620 Task 6: the reconnect-supervisor's per-peer state projection feeds the
+// dial-state counts and the PeerHealth last-seen fallback.
+use crate::reconnect_supervisor::PeerStateWire;
+
 // ── Public data types (wire shape for IPC) ──────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -180,7 +184,9 @@ impl From<harmony_pkarr::RelayHealth> for RelayHealthWire {
 pub struct DynamicDialHit {
     pub node_id_short: String,
     pub owner_short: String,
-    pub outcome: String, // "succeeded" | "failed"
+    // Dial outcomes ("succeeded" | "failed") plus ZEB-620 supervisor
+    // state-transition markers ("reconnected" | "retrying" | "dormant").
+    pub outcome: String,
     pub captured_at_ms: u64,
 }
 
@@ -191,7 +197,38 @@ pub struct DialHealthSummary {
     pub succeeded: u64,
     pub failed: u64,
     pub skipped_duplicate: u64,
+    // ZEB-620: live per-peer-state counts from the reconnect supervisor's
+    // `states_snapshot` (folded in by `NetworkHealthService::snapshot`, not the
+    // dial ring). `#[serde(default)]` keeps a pre-field snapshot forward-compatible.
+    #[serde(default)]
+    pub retrying: u32,
+    #[serde(default)]
+    pub dormant: u32,
+    #[serde(default)]
+    pub connected: u32,
     pub recent: Vec<DynamicDialHit>,
+}
+
+/// ZEB-620: live per-peer-state tally derived from a supervisor
+/// [`states_snapshot`](crate::reconnect_supervisor::SupervisorHandle::states_snapshot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PeerStateCounts {
+    pub retrying: u32,
+    pub dormant: u32,
+    pub connected: u32,
+}
+
+/// Tally a supervisor state snapshot by kind. Pure — unit-tested directly.
+pub fn count_peer_states(states: &[([u8; 32], PeerStateWire)]) -> PeerStateCounts {
+    let mut counts = PeerStateCounts::default();
+    for (_peer, state) in states {
+        match state {
+            PeerStateWire::Connected { .. } => counts.connected += 1,
+            PeerStateWire::Retrying { .. } => counts.retrying += 1,
+            PeerStateWire::Dormant { .. } => counts.dormant += 1,
+        }
+    }
+    counts
 }
 
 const DIAL_RING_CAP: usize = 32;
@@ -225,6 +262,25 @@ impl DialTelemetry {
         self.failed.fetch_add(1, Ordering::Relaxed);
         self.push(node_id, owner, "failed");
     }
+    /// ZEB-620: record a (re)connection established by a supervisor dial. Appends
+    /// a `"reconnected"` marker to the recent ring WITHOUT touching the
+    /// dial-outcome counters — those track dial results (`record_succeeded`
+    /// already counted this dial); this marks the resulting state transition for
+    /// the panel's recent-events feed.
+    pub fn record_reconnected(&self, node_id: [u8; 32], owner: [u8; 16]) {
+        self.push(node_id, owner, "reconnected");
+    }
+    /// ZEB-620: record a peer entering the retry ladder (ring marker only). The
+    /// live retry COUNT the panel shows is derived from the supervisor state
+    /// snapshot (`DialHealthSummary::retrying`), not this ring.
+    pub fn record_retrying(&self, node_id: [u8; 32], owner: [u8; 16]) {
+        self.push(node_id, owner, "retrying");
+    }
+    /// ZEB-620: record a peer going dormant (ring marker only — see
+    /// [`record_retrying`](Self::record_retrying)).
+    pub fn record_dormant(&self, node_id: [u8; 32], owner: [u8; 16]) {
+        self.push(node_id, owner, "dormant");
+    }
     fn push(&self, node_id: [u8; 32], owner: [u8; 16], outcome: &str) {
         let hit = DynamicDialHit {
             node_id_short: hex::encode(&node_id[..4]),
@@ -244,6 +300,12 @@ impl DialTelemetry {
             succeeded: self.succeeded.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             skipped_duplicate: self.skipped_duplicate.load(Ordering::Relaxed),
+            // Live per-peer-state counts are folded in by
+            // `NetworkHealthService::snapshot` from the supervisor snapshot; the
+            // telemetry ring itself knows nothing about current peer states.
+            retrying: 0,
+            dormant: 0,
+            connected: 0,
             recent: self
                 .recent
                 .lock()
@@ -577,8 +639,8 @@ pub trait DialSnapshot: Send + Sync {
     fn dial_summary(&self) -> DialHealthSummary;
 }
 
-/// Production source: reads the shared `DialTelemetry` written by the dial
-/// driver (`crate::iroh_dial_driver::run_dial_driver`).
+/// Production source: reads the shared `DialTelemetry` written by the reconnect
+/// supervisor's dials (`crate::reconnect_supervisor::run_reconnect_supervisor`).
 pub struct ProdDialSnapshot {
     pub telemetry: std::sync::Arc<DialTelemetry>,
 }
@@ -596,6 +658,39 @@ pub struct EmptyDialSnapshot;
 impl DialSnapshot for EmptyDialSnapshot {
     fn dial_summary(&self) -> DialHealthSummary {
         DialHealthSummary::default()
+    }
+}
+
+/// ZEB-620 Task 6: source of the reconnect-supervisor's per-peer state snapshot.
+/// Read once per network-health snapshot to (a) tally the live
+/// `retrying`/`dormant`/`connected` counts and (b) back-fill a peer's
+/// `last_seen_ms` from `Connected.since_ms` when its resolver record has none.
+/// Mirrors the `DialSnapshot`/`PkarrSnapshot` source-trait pattern.
+pub trait SupervisorSnapshot: Send + Sync {
+    fn peer_states(&self) -> Vec<([u8; 32], PeerStateWire)>;
+}
+
+/// Production source: reads the live [`SupervisorHandle`] the resolver holds
+/// (installed at boot by `event_loop`'s `set_supervisor`). Lazy — the handle is
+/// `None` until the supervisor spawns, so a pre-boot snapshot reports empty
+/// states (zero counts, no fallback). The resolver is a cheap `Arc`-backed
+/// clone; all clones share the same handle cell.
+///
+/// [`SupervisorHandle`]: crate::reconnect_supervisor::SupervisorHandle
+pub struct ProdSupervisorSnapshot {
+    resolver: crate::reachability_resolver::ReachabilityResolver,
+}
+impl ProdSupervisorSnapshot {
+    pub fn new(resolver: crate::reachability_resolver::ReachabilityResolver) -> Self {
+        Self { resolver }
+    }
+}
+impl SupervisorSnapshot for ProdSupervisorSnapshot {
+    fn peer_states(&self) -> Vec<([u8; 32], PeerStateWire)> {
+        self.resolver
+            .supervisor()
+            .map(|h| h.states_snapshot())
+            .unwrap_or_default()
     }
 }
 
@@ -635,6 +730,11 @@ pub struct NetworkHealthService {
     dial: std::sync::Arc<dyn DialSnapshot>,
     /// ZEB-380: per-relay health source.
     relay: std::sync::Arc<dyn RelaySnapshot>,
+    /// ZEB-620: reconnect-supervisor state source. `None` in unit tests that
+    /// don't exercise dial-state telemetry (then `peer_states()` reads empty).
+    /// Installed at boot via [`set_supervisor_source`](Self::set_supervisor_source),
+    /// mirroring how `notify_tx` is wired by `spawn_rate_limiter`.
+    supervisor: Option<std::sync::Arc<dyn SupervisorSnapshot>>,
     last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
     /// Channel into the rate-limiter task. `None` until `spawn_rate_limiter`
     /// is called at boot; `notify()` is a no-op while None so unit tests
@@ -658,9 +758,18 @@ impl NetworkHealthService {
             membership,
             dial,
             relay,
+            supervisor: None,
             last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             notify_tx: None,
         }
+    }
+
+    /// ZEB-620 Task 6: install the reconnect-supervisor state source. Called once
+    /// at boot after the supervisor's handle reaches the resolver. Additive —
+    /// when unset, dial-state counts read zero and the PeerHealth last-seen
+    /// fallback is inert (existing behavior).
+    pub fn set_supervisor_source(&mut self, src: std::sync::Arc<dyn SupervisorSnapshot>) {
+        self.supervisor = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -684,7 +793,39 @@ impl NetworkHealthService {
                 direct_addresses: self.iroh.direct_addresses(),
             });
 
-        let records = self.resolver.list_records();
+        let mut records = self.resolver.list_records();
+
+        // ZEB-620 Task 6: one read of the reconnect-supervisor's per-peer states,
+        // used for BOTH the dial-state counts (below) and the PeerHealth
+        // last-seen fallback (here). A single read keeps the two consistent.
+        let peer_states = self
+            .supervisor
+            .as_ref()
+            .map(|s| s.peer_states())
+            .unwrap_or_default();
+
+        // A resolver record that carries no `last_seen_ms` falls back to when the
+        // supervisor last saw the peer connect (`Connected.since_ms`), joined by
+        // iroh node id. Applied at the record level so the filter's sort and
+        // record-age derivation both see the resolved value; never overrides a
+        // record that already has a `last_seen_ms`.
+        if !peer_states.is_empty() {
+            let connected_since: std::collections::HashMap<[u8; 32], u64> = peer_states
+                .iter()
+                .filter_map(|(node_id, state)| match state {
+                    PeerStateWire::Connected { since_ms } => Some((*node_id, *since_ms)),
+                    _ => None,
+                })
+                .collect();
+            for record in &mut records {
+                if record.last_seen_ms.is_none() {
+                    if let Some(&since_ms) = connected_since.get(&record.iroh_node_id) {
+                        record.last_seen_ms = Some(since_ms);
+                    }
+                }
+            }
+        }
+
         let mut peers = filter_peers_by_shared_membership(records, &*self.membership, now);
 
         // ZEB-595: enrich each peer's connection_mode + rtt_ms from the most
@@ -760,7 +901,16 @@ impl NetworkHealthService {
             },
             // ZEB-373 Task 5: real dynamic-dial telemetry, read from the
             // shared DialTelemetry via the DialSnapshot source.
-            dial_status: self.dial.dial_summary(),
+            // ZEB-620 Task 6: fold in the live per-peer-state counts from the
+            // supervisor snapshot (the ring telemetry knows nothing of states).
+            dial_status: {
+                let mut summary = self.dial.dial_summary();
+                let counts = count_peer_states(&peer_states);
+                summary.retrying = counts.retrying;
+                summary.dormant = counts.dormant;
+                summary.connected = counts.connected;
+                summary
+            },
             // ZEB-450: a live service means transport is up — never disabled.
             // The disabled case has no service and goes through the IPC's
             // empty()-path stamp instead.
@@ -3259,6 +3409,204 @@ mod tests {
         let snap = NetworkHealthSnapshot::empty();
         assert_eq!(snap.dial_status.attempts, 0);
         assert!(snap.dial_status.recent.is_empty());
+    }
+
+    // ── ZEB-620 Task 6: supervisor-state telemetry + PeerHealth feeds ──
+
+    /// Test `SupervisorSnapshot` double: replays a scripted per-peer state list.
+    struct FakeSupervisor(Vec<([u8; 32], crate::reconnect_supervisor::PeerStateWire)>);
+    impl SupervisorSnapshot for FakeSupervisor {
+        fn peer_states(&self) -> Vec<([u8; 32], crate::reconnect_supervisor::PeerStateWire)> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn count_peer_states_tallies_by_kind() {
+        use crate::reconnect_supervisor::PeerStateWire;
+        let states = vec![
+            ([1u8; 32], PeerStateWire::Connected { since_ms: 10 }),
+            ([2u8; 32], PeerStateWire::Connected { since_ms: 20 }),
+            (
+                [3u8; 32],
+                PeerStateWire::Retrying {
+                    attempt: 1,
+                    retry_in_ms: 500,
+                },
+            ),
+            ([4u8; 32], PeerStateWire::Dormant { since_ms: 5 }),
+            (
+                [5u8; 32],
+                PeerStateWire::Retrying {
+                    attempt: 3,
+                    retry_in_ms: 900,
+                },
+            ),
+        ];
+        let c = count_peer_states(&states);
+        assert_eq!(c.connected, 2);
+        assert_eq!(c.retrying, 2);
+        assert_eq!(c.dormant, 1);
+    }
+
+    #[test]
+    fn count_peer_states_empty_is_zero() {
+        let c = count_peer_states(&[]);
+        assert_eq!((c.connected, c.retrying, c.dormant), (0, 0, 0));
+    }
+
+    #[test]
+    fn dial_health_summary_serializes_new_camelcase_fields() {
+        let s = DialHealthSummary {
+            attempts: 3,
+            succeeded: 1,
+            failed: 1,
+            skipped_duplicate: 0,
+            retrying: 4,
+            dormant: 2,
+            connected: 5,
+            recent: vec![],
+        };
+        let v = serde_json::to_value(&s).expect("serialize");
+        // The panel reads these keys off the wire — assert the ACTUAL serialized
+        // spelling (camelCase), not the Rust field identifier.
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("retrying"), "missing `retrying` key: {v}");
+        assert!(obj.contains_key("dormant"), "missing `dormant` key: {v}");
+        assert!(
+            obj.contains_key("connected"),
+            "missing `connected` key: {v}"
+        );
+        assert_eq!(v["retrying"], 4);
+        assert_eq!(v["dormant"], 2);
+        assert_eq!(v["connected"], 5);
+    }
+
+    #[tokio::test]
+    async fn snapshot_folds_supervisor_state_counts_into_dial_status() {
+        use crate::reconnect_supervisor::PeerStateWire;
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_supervisor_source(std::sync::Arc::new(FakeSupervisor(vec![
+            ([1u8; 32], PeerStateWire::Connected { since_ms: 1 }),
+            (
+                [2u8; 32],
+                PeerStateWire::Retrying {
+                    attempt: 0,
+                    retry_in_ms: 100,
+                },
+            ),
+            (
+                [3u8; 32],
+                PeerStateWire::Retrying {
+                    attempt: 1,
+                    retry_in_ms: 200,
+                },
+            ),
+            ([4u8; 32], PeerStateWire::Dormant { since_ms: 2 }),
+        ])));
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.dial_status.connected, 1);
+        assert_eq!(snap.dial_status.retrying, 2);
+        assert_eq!(snap.dial_status.dormant, 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_without_supervisor_source_reports_zero_counts() {
+        // No supervisor source installed → zero state counts, no panic.
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.dial_status.connected, 0);
+        assert_eq!(snap.dial_status.retrying, 0);
+        assert_eq!(snap.dial_status.dormant, 0);
+    }
+
+    #[tokio::test]
+    async fn peer_last_seen_falls_back_to_connected_since() {
+        use crate::reconnect_supervisor::PeerStateWire;
+        let mut table = std::collections::HashMap::new();
+        table.insert([0x55u8; 16], vec!["c1".to_string()]);
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                // Record carries NO last_seen_ms.
+                records: vec![make_record(0x55, ConnectionMode::NoConnection, None)],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_supervisor_source(std::sync::Arc::new(FakeSupervisor(vec![(
+            [0x55u8; 32],
+            PeerStateWire::Connected { since_ms: 7_000 },
+        )])));
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(
+            snap.peers[0].last_seen_ms,
+            Some(7_000),
+            "record lacked last_seen; must fall back to Connected.since_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_last_seen_prefers_record_over_connected_since() {
+        use crate::reconnect_supervisor::PeerStateWire;
+        let mut table = std::collections::HashMap::new();
+        table.insert([0x66u8; 16], vec!["c1".to_string()]);
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                // Record already HAS a last_seen_ms — the fallback must not override it.
+                records: vec![make_record(0x66, ConnectionMode::NoConnection, Some(3_000))],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_supervisor_source(std::sync::Arc::new(FakeSupervisor(vec![(
+            [0x66u8; 32],
+            PeerStateWire::Connected { since_ms: 9_000 },
+        )])));
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(
+            snap.peers[0].last_seen_ms,
+            Some(3_000),
+            "record's own last_seen must win over the supervisor fallback"
+        );
+    }
+
+    #[test]
+    fn dial_telemetry_records_transition_outcomes() {
+        let t = DialTelemetry::new();
+        t.record_reconnected([0x11; 32], [0xAA; 16]);
+        t.record_retrying([0x22; 32], [0xBB; 16]);
+        t.record_dormant([0x33; 32], [0xCC; 16]);
+        let s = t.summary();
+        assert!(s.recent.iter().any(|h| h.outcome == "reconnected"));
+        assert!(s.recent.iter().any(|h| h.outcome == "retrying"));
+        assert!(s.recent.iter().any(|h| h.outcome == "dormant"));
+        // Transition markers are ring-only: they never touch the dial-outcome
+        // counters (attempts/succeeded/failed).
+        assert_eq!(s.attempts, 0);
+        assert_eq!(s.succeeded, 0);
+        assert_eq!(s.failed, 0);
     }
 
     // ── ZEB-595: PkarrFallbackTelemetry tests ───────────────────────

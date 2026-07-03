@@ -78,24 +78,62 @@ pub fn ensure_iroh_factory_registered() {
     });
 }
 
-/// Build the `"iroh/<hex>"` connect-locator strings for every distinct peer the
-/// resolver knows (minus self). Used for static outbound seeding (Task 3, later).
-pub fn iroh_connect_locators(
+/// ZEB-620: recency-ordered node-ids for boot-time reconnect seeding. Every
+/// distinct peer the resolver knows (minus self), newest routing record first
+/// (by `announced_at_ms`, ties broken by node-id for determinism). Same-node-id
+/// records under different owners collapse to one entry keyed on the freshest.
+///
+/// This replaces ZEB-368's `iroh_connect_locators` (which injected `iroh/<hex>`
+/// strings into zenoh's static `connect/endpoints`): boot peers now enter the
+/// reconnect supervisor as `NewPeer` kicks via
+/// [`seed_boot_peers_into_supervisor`], so it returns raw node-ids (the kick
+/// key), not locator strings.
+pub fn boot_seed_node_ids_by_recency(
     resolver: &crate::reachability_resolver::ReachabilityResolver,
     self_node_id: &[u8; 32],
-) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
+) -> Vec<[u8; 32]> {
+    use std::collections::HashMap;
+    // Keep the freshest announced_at_ms per node-id (a peer may be announced
+    // under multiple owners; recency is per-device, not per-owner).
+    let mut newest: HashMap<[u8; 32], u64> = HashMap::new();
     for (_owner, payload) in resolver.list_active_peers() {
         let nid = payload.iroh_node_id;
         if &nid == self_node_id {
             continue;
         }
-        if seen.insert(nid) {
-            out.push(format!("iroh/{}", hex::encode(nid)));
-        }
+        newest
+            .entry(nid)
+            .and_modify(|at| *at = (*at).max(payload.announced_at_ms))
+            .or_insert(payload.announced_at_ms);
     }
-    out
+    let mut ordered: Vec<([u8; 32], u64)> = newest.into_iter().collect();
+    // Newest first; deterministic tie-break on node-id so the seed order is
+    // stable across runs (the HashMap iteration order is not).
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ordered.into_iter().map(|(nid, _)| nid).collect()
+}
+
+/// ZEB-620: seed the reconnect supervisor with every known peer at boot. Each
+/// peer (recency-ordered, newest first) is kicked [`ReconnectTrigger::NewPeer`],
+/// so the supervisor arms its reconnect ladder for it — the successor to
+/// ZEB-368's static `connect/endpoints` seed. Returns the seeded node-ids (in
+/// kick order) for logging/tests.
+///
+/// The kicks land in the supervisor's coalescing dirty set, which drains
+/// unordered; the recency ordering is therefore best-effort at the seed layer
+/// (its realized effect on dial order under the concurrency cap is nil at fleet
+/// scale — see the PR body's documented deviation). Ordering is verified at this
+/// helper's boundary via [`boot_seed_node_ids_by_recency`].
+pub fn seed_boot_peers_into_supervisor(
+    resolver: &crate::reachability_resolver::ReachabilityResolver,
+    self_node_id: &[u8; 32],
+    handle: &crate::reconnect_supervisor::SupervisorHandle,
+) -> Vec<[u8; 32]> {
+    let ordered = boot_seed_node_ids_by_recency(resolver, self_node_id);
+    for nid in &ordered {
+        handle.kick(*nid, crate::reconnect_supervisor::ReconnectTrigger::NewPeer);
+    }
+    ordered
 }
 
 /// Build the `iroh/<hex>` listener locator for this node — adding it to

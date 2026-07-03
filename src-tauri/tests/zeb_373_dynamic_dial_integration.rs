@@ -4,8 +4,9 @@
 //! (built via [`event_loop::open_session_with_runtime`], with the iroh factory +
 //! per-session ctx wired exactly like production in `lib.rs`/`event_loop.rs`)
 //! starts with an EMPTY resolver, then learns peer B **mid-session** via
-//! `resolver_a.update(...)`. That first-learn fires a `DialHint` →
-//! `run_dial_driver` dials B through the live Runtime's `connect_peer`
+//! `resolver_a.update(...)`. That first-learn kicks the reconnect supervisor
+//! (`NewPeer`, ZEB-620, the successor to ZEB-373's `DialHint` dial-once driver) →
+//! `run_reconnect_supervisor` dials B through the live Runtime's `connect_peer`
 //! (`RuntimePeerDialer`) → B's accept loop receives the inbound iroh link.
 //!
 //! ## Why ONE Runtime, not two
@@ -33,7 +34,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harmony_app::iroh_dial_driver::{run_dial_driver, RuntimePeerDialer};
+use harmony_app::iroh_dial_driver::RuntimePeerDialer;
 use harmony_app::iroh_endpoint::{alpn, IrohEndpoint};
 use harmony_app::iroh_zenoh_registration::{
     ensure_iroh_factory_registered, iroh_listen_locator, merge_iroh_listen_endpoints,
@@ -43,6 +44,9 @@ use harmony_app::network_health::DialTelemetry;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 use harmony_app::reachability_record::ReachabilityAnnouncePayload;
 use harmony_app::reachability_resolver::ReachabilityResolver;
+use harmony_app::reconnect_supervisor::{
+    run_reconnect_supervisor, SupervisorConfig, SupervisorHandle,
+};
 use harmony_app::zenoh_iroh_transport::IrohZenohLinkManager;
 
 use iroh::endpoint::{presets, Endpoint, RelayMode};
@@ -167,22 +171,38 @@ async fn inner() {
         .await
         .expect("A opens its zenoh session via open_session_with_runtime");
 
-    // ── 4. Driver on A: install hint sender + spawn run_dial_driver. ───────
+    // ── 4. Supervisor on A: install the handle + spawn run_reconnect_supervisor. ─
+    // ZEB-620: the resolver kicks the supervisor directly (no DialHint mpsc). A
+    // fast config so the first dial fires within the 20s budget regardless of the
+    // A/B NodeId dial-role ordering (base + fallback both ~200ms).
     let telemetry = Arc::new(DialTelemetry::new());
-    let (hint_tx, hint_rx) =
-        tokio::sync::mpsc::channel(harmony_app::iroh_dial_driver::DIAL_HINT_CHANNEL_CAP);
-    resolver_a.set_dial_hint_sender(hint_tx);
+    let handle = SupervisorHandle::new();
+    resolver_a.set_supervisor(handle.clone());
     let dialer = Arc::new(RuntimePeerDialer::new(rt_a.clone()));
     let self_nid = *ep_a.node_id().as_bytes();
-    tokio::spawn(run_dial_driver(
-        hint_rx,
+    let config = SupervisorConfig {
+        retry_base: Duration::from_millis(200),
+        retry_cap: Duration::from_secs(4),
+        dormant_after: Duration::from_secs(3600),
+        presence_sweep_cooldown: Duration::from_secs(30),
+        max_concurrent_dials: 4,
+        // Real-time test over live endpoints: keep the dial bound far above the
+        // worst contention-stretched dial (nextest iroh-endpoint throttle group)
+        // so it never fires here — a slow hermetic dial is not a hung dial.
+        dial_timeout: Duration::from_secs(300),
+        higher_id_fallback_delay: Duration::from_millis(200),
+        jitter_seed: Some(0xD1A1),
+    };
+    tokio::spawn(run_reconnect_supervisor(
+        handle.clone(),
         dialer,
+        Arc::new(resolver_a.clone()),
         Arc::clone(&telemetry),
         self_nid,
-        Duration::from_millis(200),
+        config,
     ));
 
-    // ── 5. MID-SESSION: A learns B. This is the first-learn → fires DialHint. ─
+    // ── 5. MID-SESSION: A learns B → first-learn kicks the supervisor `NewPeer`. ─
     resolver_a.update(OwnerAddr([0xBB; 16]), payload_for(&ep_b, hlc.wall_ms), hlc);
 
     // ── 6. Assert B's accept loop received an inbound link from A's dial. ──
@@ -195,10 +215,10 @@ async fn inner() {
         .expect("rx_b channel closed unexpectedly");
     let _ = link;
 
-    // The driver recorded at least one dial attempt for the mid-session learn.
+    // The supervisor recorded at least one dial attempt for the mid-session learn.
     assert!(
         telemetry.summary().attempts >= 1,
-        "driver must record at least one dial attempt for the mid-session-learned peer"
+        "supervisor must record at least one dial attempt for the mid-session-learned peer"
     );
 
     // Clean shutdown of both endpoints (closes open connections cleanly).

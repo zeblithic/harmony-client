@@ -14,20 +14,12 @@
 //! own latest record independently.
 
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
 use crate::reachability_record::ReachabilityAnnouncePayload;
-
-/// ZEB-373: emitted the first time the resolver learns a `(owner, node_id)`, so the
-/// dynamic dial driver can dial a peer discovered strictly mid-session. Dedup of a
-/// node-id seen under multiple owners is the driver's responsibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DialHint {
-    pub node_id: [u8; 32],
-    pub owner: OwnerAddr,
-}
+use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
 
 /// Async fallback called by `resolve_async` when the in-memory CRDT cache has
 /// no entry for a given owner. Implemented by `PkarrResolverAdapter` (case C)
@@ -81,9 +73,11 @@ pub struct ReachabilityResolver {
     /// `RwLock` — wiring the fallback via `set_fallback_source` on any
     /// clone is immediately visible to all others (CodeRabbit PR #158 round 2).
     fallback_source: Arc<RwLock<Option<Arc<dyn ReachabilityFallback>>>>,
-    // ZEB-373: optional notify seam to the dynamic dial driver. None until boot
-    // installs it; behind Option so every existing caller/test is unaffected.
-    dial_hint_tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<DialHint>>>>,
+    // ZEB-620: optional reconnect-supervisor handle. None until boot installs it
+    // via `set_supervisor`. Kicked `NewPeer` on first-learn and `RecordChanged`
+    // on a material LWW record change — the sole successor to ZEB-373's retired
+    // `DialHint` mpsc (the dial-once dial driver).
+    supervisor: Arc<RwLock<Option<SupervisorHandle>>>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -100,7 +94,7 @@ impl Default for ReachabilityResolver {
         Self {
             inner: Arc::new(RwLock::new(BTreeMap::new())),
             fallback_source: Arc::new(RwLock::new(None)),
-            dial_hint_tx: Arc::new(RwLock::new(None)),
+            supervisor: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -113,7 +107,7 @@ impl Clone for ReachabilityResolver {
             // Wiring the fallback on any clone is visible to all others
             // (CodeRabbit PR #158 round 2 correctness fix).
             fallback_source: Arc::clone(&self.fallback_source),
-            dial_hint_tx: Arc::clone(&self.dial_hint_tx),
+            supervisor: Arc::clone(&self.supervisor),
         }
     }
 }
@@ -123,10 +117,21 @@ impl ReachabilityResolver {
         Self::default()
     }
 
-    /// Install the dial-hint sender. Called once at boot (event_loop) after the
-    /// dynamic dial driver's bounded channel is created.
-    pub fn set_dial_hint_sender(&self, tx: tokio::sync::mpsc::Sender<DialHint>) {
-        *self.dial_hint_tx.write().expect("dial hint tx lock") = Some(tx);
+    /// ZEB-620: install the reconnect-supervisor handle. Called once at boot
+    /// (event_loop, right after the supervisor is spawned). The sole first-learn /
+    /// record-change notify seam since ZEB-373's `DialHint` mpsc was retired.
+    /// Thread-safe; latest install wins.
+    pub fn set_supervisor(&self, handle: SupervisorHandle) {
+        *self.supervisor.write().expect("supervisor lock") = Some(handle);
+    }
+
+    /// ZEB-620 Task 6: read the installed reconnect-supervisor handle, if any.
+    /// `None` until boot installs it via [`set_supervisor`](Self::set_supervisor).
+    /// Read-only clone of the shared handle — the Network Health snapshot uses it
+    /// to read `states_snapshot` for dial-state telemetry (`SupervisorHandle` is
+    /// a cheap `Arc`-backed clone).
+    pub fn supervisor(&self) -> Option<SupervisorHandle> {
+        self.supervisor.read().expect("supervisor lock").clone()
     }
 
     /// LWW update — higher HLC wins; ties broken by announced_at_ms then
@@ -162,28 +167,37 @@ impl ReachabilityResolver {
             hlc,
             source,
         };
-        match map.get(&key) {
-            Some(prev) if !should_replace(prev, &next) => { /* keep prev */ }
-            _ => {
-                map.insert(key, next);
+        // Track whether an existing record is LWW-replaced by one whose iroh
+        // relay URL or direct-address SET materially differs — the signal the
+        // reconnect supervisor re-dials on (ZEB-620). Computed BEFORE the
+        // overwrite (the prior payload is gone afterwards) and only inside the
+        // `should_replace` branch, so a byte-identical beacon republish and an
+        // LWW-rejected stale record both leave it false (no ladder thrash).
+        let mut record_changed = false;
+        let do_replace = match map.get(&key) {
+            Some(prev) => {
+                let replace = should_replace(prev, &next);
+                if replace {
+                    record_changed = addressing_differs(&prev.payload, &next.payload);
+                }
+                replace
             }
+            None => true,
+        };
+        if do_replace {
+            map.insert(key, next);
         }
         drop(map);
-        // ZEB-373: notify the dial driver the FIRST time we learn this (owner,node_id).
-        // `try_send` (non-blocking, lossy) so this never blocks `update()` and the
-        // bounded channel can't grow unbounded under a flood; the driver dedups, so a
-        // dropped hint under back-pressure is not correctness-critical.
-        if !was_present {
-            if let Some(tx) = self
-                .dial_hint_tx
-                .read()
-                .expect("dial hint tx lock")
-                .as_ref()
-            {
-                let _ = tx.try_send(DialHint {
-                    node_id,
-                    owner: actor,
-                });
+        // ZEB-620: reconnect-supervisor triggers (the successor to ZEB-373's
+        // retired `DialHint` mpsc). A first-learn kicks `NewPeer`; a material
+        // record change on an already-known peer kicks `RecordChanged`. Mutually
+        // exclusive by construction (`was_present`), so at most one fires per
+        // update; `kick` is lossless and non-blocking.
+        if let Some(sup) = self.supervisor.read().expect("supervisor lock").as_ref() {
+            if !was_present {
+                sup.kick(node_id, ReconnectTrigger::NewPeer);
+            } else if record_changed {
+                sup.kick(node_id, ReconnectTrigger::RecordChanged);
             }
         }
     }
@@ -420,6 +434,25 @@ impl ReachabilityResolver {
         // must be returned tagged `DurableCrdt`, not `PkarrLive` (CA3 TOCTOU).
         self.resolve_with_source(addr)
     }
+}
+
+/// Whether two reachability payloads carry materially different addressing, the
+/// gate for the reconnect supervisor's `RecordChanged` trigger (ZEB-620): the
+/// iroh relay URL differs, or the direct-address *set* differs. The direct
+/// addresses are compared order- and duplicate-insensitively (via `BTreeSet`),
+/// so a reordered republish of the same endpoints is not a change; a
+/// byte-identical beacon refresh therefore returns `false` and the supervisor
+/// does not re-arm the peer's backoff ladder for no reason.
+fn addressing_differs(
+    prev: &ReachabilityAnnouncePayload,
+    next: &ReachabilityAnnouncePayload,
+) -> bool {
+    if prev.home_relay_url != next.home_relay_url {
+        return true;
+    }
+    let prev_addrs: BTreeSet<_> = prev.direct_addresses.iter().collect();
+    let next_addrs: BTreeSet<_> = next.direct_addresses.iter().collect();
+    prev_addrs != next_addrs
 }
 
 /// LWW comparator. `Hlc` does not derive `Ord` (canonical-CBOR keying
@@ -819,37 +852,111 @@ mod tests {
         assert_eq!(r.remove_owner(&actor), 0);
     }
 
+    // ---- ZEB-620 Task 4: reconnect-supervisor triggers -------------------
+
+    /// First-learn of a `(owner, node_id)` kicks `NewPeer` on the installed
+    /// supervisor handle (the supervisor-side successor to the legacy dial-hint).
     #[test]
-    fn dial_hint_fires_once_on_first_learn() {
+    fn first_learn_kicks_new_peer() {
         let r = ReachabilityResolver::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        r.set_dial_hint_sender(tx);
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
         let owner = OwnerAddr([0xAA; 16]);
-        let mut payload = make_payload(0x11, 1000);
-        payload.iroh_node_id = [0x11; 32];
-        let hlc = make_hlc(1, 0, "a");
-        r.update(owner, payload.clone(), hlc.clone());
-        let hint = rx.try_recv().expect("hint on first learn");
-        assert_eq!(hint.node_id, [0x11; 32]);
-        assert_eq!(hint.owner, owner);
-        // Second update with a higher HLC replaces the entry but must NOT
-        // fire another hint — the (owner, node_id) key was already known.
-        let hlc2 = make_hlc(2, 0, "a");
-        r.update(owner, payload, hlc2);
-        assert!(
-            rx.try_recv().is_err(),
-            "no hint on hlc-replace of known peer"
+        let node_id = [0x11; 32];
+        r.update(owner, make_payload(0x11, 1000), make_hlc(1, 0, "a"));
+        assert_eq!(
+            sup.pending_trigger(node_id),
+            Some(ReconnectTrigger::NewPeer),
+            "first learn must kick NewPeer"
         );
     }
 
+    /// A newer-HLC LWW replace whose iroh relay URL differs kicks `RecordChanged`.
+    /// The supervisor is installed AFTER the first-learn so the assertion observes
+    /// only the changed-record kick (NewPeer and RecordChanged coalesce to equal
+    /// strength, so an un-drained NewPeer would otherwise mask it).
     #[test]
-    fn dial_hint_silent_when_sender_unset() {
+    fn changed_relay_kicks_record_changed() {
         let r = ReachabilityResolver::new();
-        // No sender installed — must not panic.
-        r.update(
-            OwnerAddr([0xAA; 16]),
-            make_payload(0x11, 1000),
-            make_hlc(1, 0, "a"),
+        let owner = OwnerAddr([0xAA; 16]);
+        let node_id = [0x11; 32];
+        // First learn with no supervisor installed — no kick recorded.
+        r.update(owner, make_payload(0x11, 1000), make_hlc(1000, 0, "a"));
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        // Same key, newer HLC, DIFFERENT relay URL.
+        let mut changed = make_payload(0x11, 1000);
+        changed.home_relay_url = "https://other-relay.example/".into();
+        r.update(owner, changed, make_hlc(2000, 0, "a"));
+        assert_eq!(
+            sup.pending_trigger(node_id),
+            Some(ReconnectTrigger::RecordChanged),
+            "changed relay URL must kick RecordChanged"
+        );
+    }
+
+    /// A newer-HLC LWW replace whose direct-address set differs kicks
+    /// `RecordChanged`.
+    #[test]
+    fn changed_direct_addrs_kicks_record_changed() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0xAA; 16]);
+        let node_id = [0x11; 32];
+        // First learn (empty direct-address set) with no supervisor installed.
+        r.update(owner, make_payload(0x11, 1000), make_hlc(1000, 0, "a"));
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        // Same key, newer HLC, DIFFERENT (now non-empty) direct-address set.
+        let mut changed = make_payload(0x11, 1000);
+        changed.direct_addresses = vec!["203.0.113.7:9000".parse().expect("v4 addr")];
+        r.update(owner, changed, make_hlc(2000, 0, "a"));
+        assert_eq!(
+            sup.pending_trigger(node_id),
+            Some(ReconnectTrigger::RecordChanged),
+            "changed direct-address set must kick RecordChanged"
+        );
+    }
+
+    /// A byte-identical addressing replay (newer HLC, same relay + same
+    /// direct-address set — e.g. a beacon republish) must NOT kick: re-arming
+    /// the ladder on an unchanged record is thrash the supervisor must avoid.
+    #[test]
+    fn identical_payload_replay_does_not_kick() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0xAA; 16]);
+        let node_id = [0x11; 32];
+        r.update(owner, make_payload(0x11, 1000), make_hlc(1000, 0, "a"));
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        // Same key, newer HLC (so should_replace succeeds), IDENTICAL addressing.
+        r.update(owner, make_payload(0x11, 1000), make_hlc(2000, 0, "a"));
+        assert_eq!(
+            sup.pending_trigger(node_id),
+            None,
+            "byte-identical addressing replay must not kick"
+        );
+    }
+
+    /// An LWW-rejected stale record (`should_replace == false`) must NOT kick,
+    /// even though its addressing differs — the slot is unchanged, so there is
+    /// nothing to re-arm on.
+    #[test]
+    fn lww_rejected_stale_record_does_not_kick() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0xAA; 16]);
+        let node_id = [0x11; 32];
+        // Establish the winning record at HLC 2000, no supervisor installed.
+        r.update(owner, make_payload(0x11, 1000), make_hlc(2000, 0, "a"));
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        // Older HLC with a DIFFERENT relay — rejected by LWW, so no replace.
+        let mut stale = make_payload(0x11, 1000);
+        stale.home_relay_url = "https://stale-relay.example/".into();
+        r.update(owner, stale, make_hlc(1000, 0, "a"));
+        assert_eq!(
+            sup.pending_trigger(node_id),
+            None,
+            "LWW-rejected stale record must not kick"
         );
     }
 }

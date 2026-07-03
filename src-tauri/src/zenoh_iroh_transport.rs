@@ -93,6 +93,7 @@ use zenoh_result::{zerror, ZResult};
 use crate::iroh_endpoint::{alpn, IrohEndpoint};
 use crate::iroh_invite_acceptor::IrohHandshakeDispatcher;
 use crate::reachability_resolver::ReachabilityResolver;
+use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
 use crate::zenoh_iroh_link::IrohZenohLink;
 
 /// Locator protocol identifier for harmony's zenoh-over-iroh links.
@@ -217,7 +218,24 @@ pub struct IrohZenohLinkManager {
     /// it is only ever held for synchronous map ops, never across an `.await`
     /// (the async close operates on the *returned* prior connection after the
     /// guard is dropped).
-    zenoh_conns: std::sync::Mutex<std::collections::HashMap<EndpointId, Connection>>,
+    ///
+    /// ZEB-620 Task 3: `Arc`-wrapped so a per-connection drop-watcher can be
+    /// spawned from BOTH the inbound accept path (which holds `Arc<Self>`) and
+    /// the outbound `new_link` path (which only holds `&self`) via one shared
+    /// helper — the watcher captures a clone of this map handle, not the whole
+    /// manager.
+    zenoh_conns: Arc<std::sync::Mutex<std::collections::HashMap<EndpointId, Connection>>>,
+    /// ZEB-620 Task 3: optional reconnect supervisor handle. When installed via
+    /// [`Self::set_reconnect_handle`], a registry drop-watcher that evicts a
+    /// genuinely-gone connection `kick`s the supervisor with
+    /// [`ReconnectTrigger::Dropped`] (re-arming the reconnect ladder), and a
+    /// successful inbound-accept / outbound-dial swap `mark_connected`s the peer
+    /// (cancelling further dialing until it drops). Optional (`OnceLock`) so the
+    /// manager boots before the supervisor is wired: pre-install, drop events
+    /// are simply not raised — today's behavior, where a stale face lingers
+    /// until the zenoh lease reaps it. `Arc`-wrapped for the same
+    /// spawn-from-either-path reason as `zenoh_conns`.
+    reconnect: Arc<std::sync::OnceLock<SupervisorHandle>>,
 }
 
 /// ZEB-616 identity guard for the drop-watcher: only evict a peer's registry
@@ -248,7 +266,8 @@ impl IrohZenohLinkManager {
             community_relay_deposit_acceptor: std::sync::OnceLock::new(),
             community_relay_pull_acceptor: std::sync::OnceLock::new(),
             tunnel_acceptor: std::sync::OnceLock::new(),
-            zenoh_conns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            zenoh_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            reconnect: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -273,6 +292,63 @@ impl IrohZenohLinkManager {
             .get(&peer_id)
             .map(|c| c.stable_id())
             == Some(conn_id)
+    }
+
+    /// ZEB-620 Task 3: install the reconnect supervisor handle. Install-once
+    /// (`OnceLock`, mirroring the acceptor-install idiom); a second install
+    /// returns the supplied handle back as `Err`. Once installed, the registry
+    /// drop-watchers spawned by [`Self::spawn_drop_watcher`] kick
+    /// [`ReconnectTrigger::Dropped`] on a guard-passing eviction, and a
+    /// successful swap marks the peer connected via
+    /// [`Self::mark_supervisor_connected`].
+    pub fn set_reconnect_handle(&self, handle: SupervisorHandle) -> Result<(), SupervisorHandle> {
+        self.reconnect.set(handle)
+    }
+
+    /// ZEB-620 Task 3: mark `peer_id` connected on the reconnect supervisor (if
+    /// one is installed), cancelling further dialing until the peer drops.
+    /// Called on a successful inbound-accept / outbound-dial registry swap.
+    /// No-op when no supervisor is installed (pre-wire boot / hermetic tests).
+    fn mark_supervisor_connected(&self, peer_id: EndpointId) {
+        if let Some(handle) = self.reconnect.get() {
+            handle.mark_connected(*peer_id.as_bytes());
+        }
+    }
+
+    /// ZEB-620 Task 3: spawn the identity-guarded drop-watcher for a registered
+    /// zenoh connection, shared verbatim by the inbound accept path and the
+    /// outbound `new_link` path so both register identically. When `conn`
+    /// finally closes, evict the peer's registry entry IFF it still points at
+    /// THIS connection ([`should_evict_on_close`]) — and only when that eviction
+    /// fires, `kick` the reconnect supervisor with [`ReconnectTrigger::Dropped`]
+    /// so a genuinely-gone transport is re-armed. The guard doubles as kick
+    /// suppression: a superseded connection's watcher neither evicts nor kicks
+    /// the live connection that replaced it. Captures clones of the `Arc`-backed
+    /// registry + supervisor handles (not `Arc<Self>`) so the outbound path,
+    /// which only has `&self`, can spawn it too.
+    fn spawn_drop_watcher(&self, peer_id: EndpointId, conn_id: usize, conn: Connection) {
+        let conns = Arc::clone(&self.zenoh_conns);
+        let reconnect = Arc::clone(&self.reconnect);
+        tokio::spawn(async move {
+            conn.closed().await;
+            let evicted = {
+                let mut map = conns.lock().unwrap();
+                let stored = map.get(&peer_id).map(|c| c.stable_id());
+                if should_evict_on_close(stored, conn_id) {
+                    map.remove(&peer_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            // Kick only on a guard-passing eviction: a superseded watcher must
+            // not re-arm a peer whose live connection replaced this one.
+            if evicted {
+                if let Some(handle) = reconnect.get() {
+                    handle.kick(*peer_id.as_bytes(), ReconnectTrigger::Dropped);
+                }
+            }
+        });
     }
 
     /// ZEB-418 P1: install the butler-deposit acceptor used by the accept
@@ -481,23 +557,17 @@ impl IrohZenohLinkManager {
                                 );
                             }
                         }
-                        // ZEB-616: evict this peer's registry entry when THIS
-                        // connection finally closes, so the map stays bounded to
-                        // live peers and a drop-and-never-return peer still has
-                        // its face reaped. Identity-guarded so a superseded
-                        // connection's watcher can't evict its replacement.
-                        {
-                            let mgr_for_watch = Arc::clone(&mgr);
-                            let conn_for_watch = conn.clone();
-                            tokio::spawn(async move {
-                                conn_for_watch.closed().await;
-                                let mut map = mgr_for_watch.zenoh_conns.lock().unwrap();
-                                let stored = map.get(&peer_id).map(|c| c.stable_id());
-                                if should_evict_on_close(stored, conn_id) {
-                                    map.remove(&peer_id);
-                                }
-                            });
-                        }
+                        // ZEB-620 Task 3: the swap registered this connection —
+                        // mark the peer connected so the supervisor cancels
+                        // dialing until it drops.
+                        mgr.mark_supervisor_connected(peer_id);
+                        // ZEB-616/620: evict this peer's registry entry when THIS
+                        // connection finally closes (map stays bounded to live
+                        // peers; a drop-and-never-return peer still gets its face
+                        // reaped) AND kick the supervisor `Dropped`. Identity-
+                        // guarded so a superseded connection's watcher can neither
+                        // evict nor kick for the connection that replaced it.
+                        mgr.spawn_drop_watcher(peer_id, conn_id, conn.clone());
 
                         let (send, recv) = match conn.accept_bi().await {
                             Ok(s) => s,
@@ -737,10 +807,51 @@ impl LinkManagerUnicastTrait for IrohZenohLinkManager {
             .connect(addr, alpn::HARMONY_ZENOH_V1)
             .await
             .map_err(|e| zerror!("iroh connect: {e}"))?;
-        let (send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| zerror!("iroh open_bi: {e}"))?;
+
+        // ZEB-620 Task 3: register this outbound connection in the per-peer
+        // zenoh registry with the SAME semantics as the inbound accept path
+        // (ZEB-616) — swap it in, close-stale-first so the old face is reaped
+        // before the new stream declares, mark the peer connected, and spawn the
+        // identity-guarded drop-watcher. Without this an outbound-dialed peer
+        // never joined the registry, so a same-zid inbound reconnect couldn't
+        // find the outbound conn to close (reopening the collision this guards)
+        // and its later drop would never re-arm the supervisor.
+        let conn_id = conn.stable_id();
+        if let Some(old) = self.swap_zenoh_conn(peer_id, conn.clone()) {
+            tracing::debug!(
+                peer = %peer_id,
+                "ZEB-616/620: outbound dial superseded a registered connection; \
+                 closing it before opening the new stream"
+            );
+            old.close(0u32.into(), b"zeb616-reconnect");
+            if tokio::time::timeout(STALE_CONN_CLOSE_TIMEOUT, old.closed())
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    peer = %peer_id,
+                    "ZEB-616/620: stale connection close timed out; opening new \
+                     stream anyway"
+                );
+            }
+        }
+        self.mark_supervisor_connected(peer_id);
+        self.spawn_drop_watcher(peer_id, conn_id, conn.clone());
+
+        let (send, recv) = match conn.open_bi().await {
+            Ok(s) => s,
+            Err(e) => {
+                // ZEB-620 Task 3: the stream failed to open after we registered
+                // this connection. Close it (if still the active entry) so the
+                // drop-watcher evicts the registry entry and kicks `Dropped` —
+                // otherwise the peer would linger as phantom-connected with no
+                // zenoh link. Mirrors the inbound accept_bi-failure handling.
+                if self.is_active_zenoh_conn(peer_id, conn_id) {
+                    conn.close(0u32.into(), b"zeb620-open-bi-failed");
+                }
+                return Err(zerror!("iroh open_bi: {e}").into());
+            }
+        };
         let src = locator_from_endpoint_id(&self.endpoint.node_id());
         let dst = locator_from_endpoint_id(&peer_id);
         let link: Arc<dyn LinkUnicastTrait> = Arc::new(IrohZenohLink::new(send, recv, src, dst));
@@ -779,6 +890,7 @@ mod tests {
     use super::*;
     use crate::owner_state_types::{Hlc, OwnerAddr};
     use crate::reachability_record::ReachabilityAnnouncePayload;
+    use crate::reconnect_supervisor::PeerStateWire;
     use iroh::endpoint::{presets, Endpoint, RelayMode};
     use iroh::SecretKey;
     use rand::RngCore;
@@ -1002,6 +1114,332 @@ mod tests {
 
         alice_ep.shutdown().await;
         bob_ep.shutdown().await;
+    }
+
+    /// ZEB-620 Task 3: when a registered inbound connection closes, its
+    /// drop-watcher both evicts the registry entry AND kicks the installed
+    /// reconnect supervisor with `Dropped` (re-arming the peer's ladder); and a
+    /// successful accept marks the peer connected. Extends
+    /// `zenoh_conn_registry_evicts_on_drop` with the supervisor wiring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drop_watcher_kicks_supervisor() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            drop_watcher_kicks_supervisor_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn drop_watcher_kicks_supervisor_inner() {
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            ReachabilityResolver::new(),
+            new_link_tx,
+        ));
+        let handle = SupervisorHandle::new();
+        assert!(
+            alice_mgr.set_reconnect_handle(handle.clone()).is_ok(),
+            "install reconnect handle once"
+        );
+        let _accept = alice_mgr.spawn_accept_loop();
+
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+        let bob_id = bob_ep.node_id();
+
+        let alice_socket = *alice_ep
+            .bound_sockets()
+            .first()
+            .expect("alice has a bound socket");
+        let alice_addr = EndpointAddr::new(alice_ep.node_id()).with_ip_addr(alice_socket);
+
+        let conn = bob_ep
+            .inner()
+            .connect(alice_addr, alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("bob dial alice on zenoh ALPN");
+        for _ in 0..300 {
+            if alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "alice must register bob's connection"
+        );
+
+        // A successful inbound accept marks bob connected on the supervisor.
+        for _ in 0..300 {
+            if handle
+                .states_snapshot()
+                .iter()
+                .any(|(p, _)| *p == *bob_id.as_bytes())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(p, s)| *p == *bob_id.as_bytes()
+                    && matches!(s, PeerStateWire::Connected { .. })),
+            "inbound accept must mark bob connected on the supervisor"
+        );
+
+        // Bob closes → alice's watcher evicts the entry AND kicks Dropped.
+        conn.close(0u32.into(), b"test-drop");
+        for _ in 0..300 {
+            if !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "watcher must evict the registry entry on close"
+        );
+        for _ in 0..300 {
+            if handle.pending_trigger(*bob_id.as_bytes()).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            handle.pending_trigger(*bob_id.as_bytes()),
+            Some(ReconnectTrigger::Dropped),
+            "drop-watcher must kick the supervisor with Dropped after a guarded eviction"
+        );
+
+        alice_ep.shutdown().await;
+        bob_ep.shutdown().await;
+    }
+
+    /// ZEB-620 Task 3: the outbound `new_link` path registers its connection in
+    /// the per-peer zenoh registry (parity with the inbound accept path), marks
+    /// the peer connected on the supervisor, and installs a drop-watcher that
+    /// evicts + kicks `Dropped` when the peer goes away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn outbound_new_link_registers_and_watches() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            outbound_new_link_registers_and_watches_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn outbound_new_link_registers_and_watches_inner() {
+        // Alice: the dialer under test, with a supervisor handle installed.
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let alice_resolver = ReachabilityResolver::new();
+        let (alice_tx, _alice_rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            alice_resolver.clone(),
+            alice_tx,
+        ));
+        let handle = SupervisorHandle::new();
+        assert!(
+            alice_mgr.set_reconnect_handle(handle.clone()).is_ok(),
+            "install reconnect handle once"
+        );
+
+        // Bob: the accept side — a full manager + accept loop so alice's
+        // connect() completes the handshake and its open_bi() stream is
+        // serviced (otherwise open_bi could stall waiting for a peer).
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+        let (bob_tx, _bob_rx) = flume::unbounded::<LinkUnicast>();
+        let bob_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&bob_ep),
+            ReachabilityResolver::new(),
+            bob_tx,
+        ));
+        let _bob_accept = bob_mgr.spawn_accept_loop();
+
+        // Seed alice's resolver so new_link resolves bob's node-id → loopback.
+        let bob_id = bob_ep.node_id();
+        let bob_socket = *bob_ep
+            .bound_sockets()
+            .first()
+            .expect("bob has a bound socket");
+        alice_resolver.update(
+            OwnerAddr([0xBB; 16]),
+            ReachabilityAnnouncePayload {
+                iroh_node_id: *bob_id.as_bytes(),
+                home_relay_url: String::new(),
+                direct_addresses: vec![bob_socket],
+                announced_at_ms: 1,
+                identity_signature: [0u8; 64],
+                butler_set: vec![],
+                bs_at: 0,
+            },
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: String::new(),
+            },
+        );
+
+        // Outbound dial via new_link.
+        let link = alice_mgr
+            .new_link(locator_from_endpoint_id(&bob_id).to_endpoint())
+            .await
+            .expect("outbound new_link must succeed");
+
+        assert!(
+            alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "outbound new_link must register the connection in the zenoh registry"
+        );
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(p, s)| *p == *bob_id.as_bytes()
+                    && matches!(s, PeerStateWire::Connected { .. })),
+            "outbound swap success must mark the peer connected on the supervisor"
+        );
+
+        // Drop the accept side → alice's outbound connection closes → watcher
+        // evicts the entry + kicks Dropped. iroh 1.0 moved endpoint drain onto
+        // Drop, so merely dropping a handle may not promptly signal the remote;
+        // close bob's registered inbound connection explicitly (the accept-side
+        // drop) so alice's outbound `closed()` fires fast.
+        drop(link);
+        let bob_inbound = bob_mgr
+            .zenoh_conns
+            .lock()
+            .unwrap()
+            .get(&alice_ep.node_id())
+            .cloned();
+        if let Some(c) = bob_inbound {
+            c.close(0u32.into(), b"test-accept-side-drop");
+        }
+        bob_ep.shutdown().await;
+        for _ in 0..300 {
+            if !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "watcher must evict the outbound entry when the peer drops"
+        );
+        for _ in 0..300 {
+            if handle.pending_trigger(*bob_id.as_bytes()).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            handle.pending_trigger(*bob_id.as_bytes()),
+            Some(ReconnectTrigger::Dropped),
+            "outbound drop-watcher must kick the supervisor with Dropped"
+        );
+
+        alice_ep.shutdown().await;
+        // bob_ep already shut down above.
+    }
+
+    /// ZEB-620 Task 3: a superseded connection's drop-watcher must NOT kick the
+    /// supervisor. When a same-zid reconnect swaps conn2 in and closes conn1,
+    /// the identity guard suppresses conn1's eviction — so it must equally
+    /// suppress conn1's `Dropped` kick, otherwise the live, replaced peer would
+    /// be spuriously re-armed. The two bob endpoints share one secret → one
+    /// node-id → one deterministic zid, modelling a silent drop + rebind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn superseded_conn_drop_does_not_kick() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            superseded_conn_drop_does_not_kick_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn superseded_conn_drop_does_not_kick_inner() {
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            ReachabilityResolver::new(),
+            new_link_tx,
+        ));
+        let handle = SupervisorHandle::new();
+        assert!(
+            alice_mgr.set_reconnect_handle(handle.clone()).is_ok(),
+            "install reconnect handle once"
+        );
+        let _accept = alice_mgr.spawn_accept_loop();
+
+        // Bob's stable identity across two endpoints (same node-id → same zid).
+        let mut buf = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut buf);
+        let bob_id = SecretKey::from_bytes(&buf).public();
+        let bob_ep1 = build_hermetic_iroh_endpoint_with_secret(SecretKey::from_bytes(&buf)).await;
+        let bob_ep2 = build_hermetic_iroh_endpoint_with_secret(SecretKey::from_bytes(&buf)).await;
+
+        let alice_socket = *alice_ep
+            .bound_sockets()
+            .first()
+            .expect("alice has a bound socket");
+        let alice_addr = EndpointAddr::new(alice_ep.node_id()).with_ip_addr(alice_socket);
+
+        // First connection → alice registers bob under his node-id.
+        let conn1 = bob_ep1
+            .inner()
+            .connect(alice_addr.clone(), alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("bob1 dial alice on zenoh ALPN");
+        for _ in 0..300 {
+            if alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "alice must register bob's first connection"
+        );
+
+        // Reconnect: same node-id → alice closes conn1 (close-stale-first) and
+        // swaps conn2 in. conn1's watcher fires but the guard suppresses it.
+        let conn2 = bob_ep2
+            .inner()
+            .connect(alice_addr, alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("bob2 dial alice on zenoh ALPN (same node-id)");
+        tokio::time::timeout(Duration::from_secs(10), conn1.closed())
+            .await
+            .expect("alice must close the stale conn1 on reconnect");
+
+        // Let conn1's watcher run its (suppressed) eviction branch to the end.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The registry still holds exactly the reconnect (conn2), and NO
+        // Dropped kick was raised — the superseded conn1 close is silent.
+        assert!(
+            alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "the reconnect (conn2) must remain registered"
+        );
+        assert_eq!(
+            handle.pending_trigger(*bob_id.as_bytes()),
+            None,
+            "a superseded connection's close must NOT kick the supervisor"
+        );
+        assert!(conn2.close_reason().is_none(), "reconnect must stay open");
+
+        alice_ep.shutdown().await;
+        bob_ep1.shutdown().await;
+        bob_ep2.shutdown().await;
     }
 
     /// Resolver-miss → `new_link` returns an error. This is the only
@@ -1466,5 +1904,351 @@ mod tests {
         let parsed = IrohZenohLinkManager::parse_endpoint_id(&locator.to_endpoint())
             .expect("locator parses back into EndpointId");
         assert_eq!(parsed, id);
+    }
+
+    /// Poll `cond` every `step` until it returns `true` or `max` elapses.
+    /// Returns whether the condition became true within the budget. Each
+    /// invocation of `cond` is a synchronous lock-and-read (never held across
+    /// the sleep) — the same poll-with-interval idiom the ZEB-616 tests above
+    /// spell out inline, factored out for the multi-phase acceptance test.
+    async fn poll_until<F: FnMut() -> bool>(mut cond: F, max: Duration, step: Duration) -> bool {
+        let deadline = Instant::now() + max;
+        loop {
+            if cond() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(step).await;
+        }
+    }
+
+    /// ZEB-620 Task 7: a hermetic [`PeerDialer`] that dials through a real
+    /// [`IrohZenohLinkManager`]'s outbound `new_link` — the same per-peer
+    /// registry-registration seam production's `RuntimePeerDialer` reaches via
+    /// zenoh's `connect_peer`. Returns whether the iroh link established
+    /// (registered + bi-stream open), the hermetic analogue of `connect_peer`'s
+    /// success bool. A literal second in-process zenoh `Runtime` (which
+    /// `connect_peer` + a real zenoh GET would require) is impossible here: the
+    /// iroh session ctx is a process-global singleton (see
+    /// `iroh_zenoh_registration` and `tests/zeb_373_dynamic_dial_integration.rs`),
+    /// so the dialer exercises the registry seam directly.
+    struct SupervisorLinkDialer {
+        mgr: Arc<IrohZenohLinkManager>,
+    }
+
+    #[async_trait]
+    impl crate::iroh_dial_driver::PeerDialer for SupervisorLinkDialer {
+        async fn dial(&self, node_id: [u8; 32], _locator: String) -> bool {
+            let id = match EndpointId::from_bytes(&node_id) {
+                Ok(id) => id,
+                Err(_) => return false,
+            };
+            self.mgr
+                .new_link(locator_from_endpoint_id(&id).to_endpoint())
+                .await
+                .is_ok()
+        }
+    }
+
+    /// ZEB-620 Task 7 (acceptance): a live zenoh-over-iroh link that is
+    /// hard-dropped on the acceptor side is recovered by the reconnect
+    /// supervisor WITHOUT any manual re-dial. The real `run_reconnect_supervisor`
+    /// task — driven only by the registry drop-watcher's `Dropped` kick —
+    /// re-dials the peer through the outbound registry seam (`new_link`, the
+    /// same seam production's `RuntimePeerDialer` reaches via `connect_peer`),
+    /// reinstalling the peer's connection (exactly one live conn, stale reaped)
+    /// and marking it `Connected`.
+    ///
+    /// Acceptance assertions (ZEB-620 amendment — the `reconnected` ring marker
+    /// is unwired, fires on first-connects too, so it is NOT asserted): after
+    /// recovery the supervisor telemetry shows ≥1 dial attempt and a `succeeded`
+    /// hit FOR THE PEER, and the supervisor's `states_snapshot` reports the peer
+    /// `Connected`. The registry holds exactly one live connection for the peer.
+    ///
+    /// Extends ZEB-616's `zenoh_reconnect_closes_stale_connection`: alice = the
+    /// dialer under test (manager + accept loop + real supervisor); bob = a bare
+    /// acceptor (manager + accept loop, no supervisor). A second in-process
+    /// zenoh `Runtime` for a literal zenoh GET is impossible (the iroh session
+    /// ctx is a process-global singleton — see [`SupervisorLinkDialer`]), so the
+    /// recovered link's usability is proven at the link layer: a reinstalled,
+    /// live connection (`close_reason().is_none()`) established end-to-end
+    /// through `new_link`'s `open_bi()` against bob's accept loop.
+    ///
+    /// Runtime is ~60-120s: two real iroh handshakes (establish + re-dial) under
+    /// the `iroh-endpoint` nextest-group throttle plus iroh 1.0's Drop-drain
+    /// teardown. Generous outer budget + fat per-phase poll windows per the
+    /// ZEB-616 idiom; no assertion is weakened to fit the clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_redials_after_drop_and_get_answers() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(180),
+            supervisor_redials_after_drop_and_get_answers_inner(),
+        )
+        .await
+        .expect("test must finish within 180s");
+    }
+
+    async fn supervisor_redials_after_drop_and_get_answers_inner() {
+        use crate::network_health::DialTelemetry;
+        use crate::reconnect_supervisor::{run_reconnect_supervisor, SupervisorConfig};
+
+        // ── Alice: the dialer under test — manager + accept loop + a real
+        // reconnect supervisor. ──
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let alice_id = alice_ep.node_id();
+        let alice_resolver = ReachabilityResolver::new();
+        let (alice_tx, _alice_rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            alice_resolver.clone(),
+            alice_tx,
+        ));
+        let handle = SupervisorHandle::new();
+        assert!(
+            alice_mgr.set_reconnect_handle(handle.clone()).is_ok(),
+            "install reconnect handle once"
+        );
+        let _alice_accept = alice_mgr.spawn_accept_loop();
+
+        // ── Bob: a bare acceptor — manager + accept loop, no supervisor. Alice
+        // dials bob; bob only accepts. ──
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+        let bob_id = bob_ep.node_id();
+        let (bob_tx, _bob_rx) = flume::unbounded::<LinkUnicast>();
+        let bob_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&bob_ep),
+            ReachabilityResolver::new(),
+            bob_tx,
+        ));
+        let _bob_accept = bob_mgr.spawn_accept_loop();
+
+        // Seed alice's resolver so BOTH the supervisor's dispatch gate and the
+        // dialer's `new_link` resolve bob's node-id → loopback socket. Left in
+        // place across the drop so the supervisor's autonomous re-dial resolves
+        // bob again (an evicted-from-resolver peer would soft-fail instead).
+        let bob_socket = *bob_ep
+            .bound_sockets()
+            .first()
+            .expect("bob has a bound socket");
+        alice_resolver.update(
+            OwnerAddr([0xBB; 16]),
+            ReachabilityAnnouncePayload {
+                iroh_node_id: *bob_id.as_bytes(),
+                home_relay_url: String::new(),
+                direct_addresses: vec![bob_socket],
+                announced_at_ms: 1,
+                identity_signature: [0u8; 64],
+                butler_set: vec![],
+                bs_at: 0,
+            },
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: String::new(),
+            },
+        );
+
+        // ── Real supervisor on alice, dialing through the registry seam. Fast
+        // config so both the first dial and the post-drop re-dial land in
+        // seconds regardless of the alice/bob NodeId dial-role ordering (base +
+        // fallback both 400ms). The 400ms base also keeps the post-eviction /
+        // pre-reinstall window comfortably observable by the 25ms poll below. ──
+        let telemetry = Arc::new(DialTelemetry::new());
+        let dialer = Arc::new(SupervisorLinkDialer {
+            mgr: Arc::clone(&alice_mgr),
+        });
+        let config = SupervisorConfig {
+            retry_base: Duration::from_millis(400),
+            retry_cap: Duration::from_secs(4),
+            dormant_after: Duration::from_secs(3600),
+            presence_sweep_cooldown: Duration::from_secs(30),
+            max_concurrent_dials: 4,
+            // Real-time test over live endpoints under the nextest iroh-endpoint
+            // throttle group: a slow-but-progressing `new_link` is NOT a hung
+            // dial. A tight bound here cancels it mid-`open_bi` — after the
+            // registry swap already marked the peer Connected — recording a
+            // spurious `failed` whose stale-epoch result is discarded, so no
+            // retry ever fires. Keep the bound far above worst contention.
+            dial_timeout: Duration::from_secs(300),
+            higher_id_fallback_delay: Duration::from_millis(400),
+            jitter_seed: Some(0x2E_B6_20),
+        };
+        let _supervisor = tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer,
+            Arc::new(alice_resolver.clone()),
+            Arc::clone(&telemetry),
+            *alice_id.as_bytes(),
+            config,
+        ));
+
+        // First-learn kick → supervisor dials bob → `new_link` registers bob in
+        // alice's registry + marks him Connected. Kicking directly keeps the
+        // establish deterministic; the recovery under test is driven by the REAL
+        // drop-watcher wiring, not this kick.
+        handle.kick(*bob_id.as_bytes(), ReconnectTrigger::NewPeer);
+
+        // ── Phase 1: establish. ──
+        let established = poll_until(
+            || alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            Duration::from_secs(60),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            established,
+            "supervisor's first dial must register bob in alice's registry"
+        );
+        let connected_1 = poll_until(
+            || {
+                handle.states_snapshot().iter().any(|(p, s)| {
+                    *p == *bob_id.as_bytes() && matches!(s, PeerStateWire::Connected { .. })
+                })
+            },
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            connected_1,
+            "supervisor must mark bob Connected after the first dial"
+        );
+        // `Connected` becomes visible at the registry swap INSIDE `new_link`,
+        // before the dial task's `record_succeeded` runs (the tail of `new_link`
+        // — `open_bi` — sits between them, and can take seconds under the
+        // throttle group). Poll for the telemetry instead of instant-asserting:
+        // the ring push is the LAST step of `record_succeeded`, so once it is
+        // visible the `succeeded` counter is too.
+        let bob_short = hex::encode(&bob_id.as_bytes()[..4]);
+        let succeeded_recorded = poll_until(
+            || {
+                telemetry
+                    .summary()
+                    .recent
+                    .iter()
+                    .any(|h| h.outcome == "succeeded" && h.node_id_short == bob_short)
+            },
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            succeeded_recorded,
+            "first dial must record a succeeded hit for bob"
+        );
+        let succeeded_before = telemetry.summary().succeeded;
+        assert!(
+            succeeded_before >= 1,
+            "succeeded counter must be visible with the ring hit, got {succeeded_before}"
+        );
+
+        // ── Phase 2: hard-drop on the acceptor side. iroh 1.0 drains on Drop, so
+        // a handle drop may not promptly signal the remote — close bob's
+        // registered inbound conn from alice EXPLICITLY. Alice's outbound conn's
+        // `closed()` then fires → drop-watcher evicts + kicks `Dropped`. ──
+        let bob_has_inbound = poll_until(
+            || bob_mgr.zenoh_conns.lock().unwrap().contains_key(&alice_id),
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            bob_has_inbound,
+            "bob's accept loop must have registered alice's inbound connection"
+        );
+        let inbound = bob_mgr
+            .zenoh_conns
+            .lock()
+            .unwrap()
+            .get(&alice_id)
+            .cloned()
+            .expect("bob's inbound conn from alice");
+        inbound.close(0u32.into(), b"zeb620-task7-hard-drop");
+
+        // Alice detects the drop and evicts bob (registry goes empty for him).
+        let evicted = poll_until(
+            || !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            Duration::from_secs(45),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            evicted,
+            "alice's drop-watcher must evict bob after the acceptor-side hard drop"
+        );
+
+        // ── Phase 3: recovery — WITHOUT manual intervention the supervisor
+        // re-dials (Dropped kick → re-armed ladder) and reinstalls bob. Recovery
+        // is a NEW succeeded hit AND bob back in the registry; `new_link`
+        // registers the conn strictly before `record_succeeded` fires, so the
+        // combined predicate never observes the success ahead of the conn. ──
+        let recovered = poll_until(
+            || {
+                alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id)
+                    && telemetry.summary().succeeded > succeeded_before
+            },
+            Duration::from_secs(60),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            recovered,
+            "supervisor must autonomously re-dial and reinstall bob after the drop"
+        );
+
+        // Same-zid reinstall: exactly one live connection for the peer.
+        {
+            let map = alice_mgr.zenoh_conns.lock().unwrap();
+            assert_eq!(
+                map.len(),
+                1,
+                "registry holds exactly one connection after recovery (stale reaped)"
+            );
+            let conn = map
+                .get(&bob_id)
+                .expect("bob present in registry after recovery");
+            assert!(
+                conn.close_reason().is_none(),
+                "the reinstalled connection must be live (open bi-stream, GET-ready)"
+            );
+        }
+
+        // Snapshot reports bob Connected post-recovery.
+        let connected_2 = poll_until(
+            || {
+                handle.states_snapshot().iter().any(|(p, s)| {
+                    *p == *bob_id.as_bytes() && matches!(s, PeerStateWire::Connected { .. })
+                })
+            },
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            connected_2,
+            "supervisor's states_snapshot must report bob Connected post-recovery"
+        );
+
+        // Telemetry: a re-dial attempt AND a re-connect success beyond the
+        // establish (bob is the only dialed peer, so the aggregate counts are
+        // his). Stronger than the amendment's ≥1 floor — proves the recovery
+        // dial specifically, not just the first connect.
+        let summary = telemetry.summary();
+        assert!(
+            summary.attempts >= 2,
+            "supervisor must record a re-dial attempt after the drop, got {}",
+            summary.attempts
+        );
+        assert!(
+            summary.succeeded >= 2,
+            "supervisor must record a re-connect success after the drop, got {}",
+            summary.succeeded
+        );
+
+        alice_ep.shutdown().await;
+        bob_ep.shutdown().await;
     }
 }

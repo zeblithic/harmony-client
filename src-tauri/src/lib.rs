@@ -267,9 +267,14 @@ pub mod zenoh_iroh_transport;
 // ZEB-368: registers harmony's IrohZenohLinkManager with the vendored
 // zenoh-link factory and forwards accepted inbound links into Zenoh.
 pub mod iroh_zenoh_registration;
-// ZEB-373: dynamic mid-session iroh dial driver — consumes DialHints, dedups,
-// dials via PeerDialer with bounded backoff.
+// ZEB-373/ZEB-620: iroh dial primitives — the `PeerDialer` trait,
+// `RuntimePeerDialer` (over a live zenoh Runtime), and `deterministic_zid_hex`.
+// The dial-once `run_dial_driver` was retired for the reconnect supervisor.
 pub mod iroh_dial_driver;
+// ZEB-620: reconnect supervisor — per-peer retry state machine, jittered
+// exponential ladder, coalescing dirty-set kicks, lower-NodeId dial-role gate,
+// bounded dial concurrency. Pure logic; producers are wired in later tasks.
+pub mod reconnect_supervisor;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
 /// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets
@@ -9540,6 +9545,16 @@ pub async fn start_node_inner(
                                 prod_dial,
                                 prod_relay,
                             );
+                            // ZEB-620 Task 6: dial-state telemetry source. Reads
+                            // the reconnect supervisor's `states_snapshot` lazily
+                            // via the resolver's installed handle (event_loop wires
+                            // it at boot) — feeds the panel's retrying/dormant/
+                            // connected counts + the PeerHealth last-seen fallback.
+                            nh.set_supervisor_source(std::sync::Arc::new(
+                                crate::network_health::ProdSupervisorSnapshot::new(
+                                    reachability_resolver.clone(),
+                                ),
+                            ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
