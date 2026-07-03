@@ -171,8 +171,40 @@
 
   function peerStatusIcon(p: PeerHealth): string {
     if (p.connectionMode === 'direct') return '✓';
+    // ZEB-622: relay and degraded both warn (⚠) but carry distinct titles
+    // (see peerStatusTitle) — relay is a working relay-mediated path, degraded
+    // is a live link with no selected path yet.
     if (p.connectionMode === 'relay') return '⚠';
+    if (p.connectionMode === 'degraded') return '⚠';
     return '✗';
+  }
+
+  // ZEB-622: hover text that disambiguates the shared ⚠ icon (relay vs
+  // degraded) and names each state for accessibility.
+  function peerStatusTitle(p: PeerHealth): string {
+    if (p.connectionMode === 'direct') return 'Direct connection';
+    if (p.connectionMode === 'relay') return 'Relay-mediated connection';
+    if (p.connectionMode === 'degraded')
+      return 'Link up — no selected path yet (degraded)';
+    return 'No connection';
+  }
+
+  // ZEB-622: recent dial-ring markers. Dial outcomes succeeded/failed plus the
+  // reconnect-supervisor transitions reconnected/retrying/dormant.
+  function dialHitIcon(outcome: string): string {
+    switch (outcome) {
+      case 'succeeded':
+        return '✓';
+      case 'reconnected':
+        return '↻';
+      case 'retrying':
+        return '…';
+      case 'dormant':
+        return 'zzz';
+      case 'failed':
+      default:
+        return '✗';
+    }
   }
 </script>
 
@@ -235,7 +267,11 @@
           <ul>
             {#each snap.peers as p (p.ownerAddr)}
               <li data-testid="nh-peer">
-                {peerStatusIcon(p)}
+                <span
+                  class="peer-status-icon"
+                  title={peerStatusTitle(p)}
+                  data-testid="nh-peer-icon">{peerStatusIcon(p)}</span
+                >
                 <strong>{redactAddr(p.ownerAddr, false)}</strong>
                 <span>{p.connectionMode}</span>
                 {#if p.rttMs !== null}<span>{p.rttMs}ms</span>{/if}
@@ -275,6 +311,13 @@
             <li class="muted" data-testid="nh-dial-skipped">
               Skipped (dup): <strong>{dial.skippedDuplicate}</strong>
             </li>
+            <!-- ZEB-620/622: live per-peer transport-state tally from the
+                 reconnect supervisor (folded into the dial summary). -->
+            <li class="dial-peer-states" data-testid="nh-dial-peer-states">
+              Peers: <strong>{dial.connected}</strong> connected ·
+              <strong>{dial.retrying}</strong> retrying ·
+              <strong>{dial.dormant}</strong> dormant
+            </li>
           </ul>
           {#if recentHits.length === 0}
             <p class="muted" data-testid="nh-dial-empty">No dynamic dials yet.</p>
@@ -282,7 +325,7 @@
             <ul class="dial-recent">
               {#each recentHits as hit (`${hit.capturedAtMs}-${hit.nodeIdShort}-${hit.ownerShort}`)}
                 <li data-testid="nh-dial-hit">
-                  {hit.outcome === 'succeeded' ? '✓' : '✗'}
+                  {dialHitIcon(hit.outcome)}
                   <code>{hit.nodeIdShort}</code>
                   <span class="muted">owner {hit.ownerShort}</span>
                   <span class="muted"

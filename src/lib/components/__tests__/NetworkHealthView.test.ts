@@ -61,12 +61,24 @@ function readySnapWithDials(): NetworkHealthSnapshot {
       succeeded: 2,
       failed: 1,
       skippedDuplicate: 0,
+      // ZEB-620/622: live per-peer-state counts (distinct values so the
+      // summary-row assertions below can pin each field).
+      connected: 5,
+      retrying: 2,
+      dormant: 1,
       recent: [
         {
           nodeIdShort: 'dead5678',
           ownerShort: 'cc22dd33',
           outcome: 'failed',
           capturedAtMs: now - 41000,
+        },
+        // ZEB-622: a reconnect-supervisor transition marker in the ring.
+        {
+          nodeIdShort: 'beef9012',
+          ownerShort: 'aa11bb22',
+          outcome: 'reconnected',
+          capturedAtMs: now - 20000,
         },
         {
           nodeIdShort: 'a3f9e1c2',
@@ -89,8 +101,30 @@ function readySnapIdleDials(): NetworkHealthSnapshot {
       succeeded: 0,
       failed: 0,
       skippedDuplicate: 0,
+      connected: 0,
+      retrying: 0,
+      dormant: 0,
       recent: [],
     },
+  };
+}
+
+// ZEB-622: a snapshot with a `degraded` peer (link up, no selected path yet)
+// so the panel's shared-⚠ / distinct-title handling is exercised.
+function readySnapWithDegradedPeer(): NetworkHealthSnapshot {
+  return {
+    ...readySnap(),
+    peers: [
+      {
+        ownerAddr: 'f00dbabe'.repeat(8),
+        displayName: null,
+        sharedCommunities: ['c0ffee'],
+        connectionMode: 'degraded',
+        rttMs: null,
+        lastSeenMs: null,
+        reachabilityRecordAgeMs: null,
+      },
+    ],
   };
 }
 
@@ -161,10 +195,34 @@ describe('NetworkHealthView', () => {
     expect(screen.getByTestId('nh-dial-attempts').textContent).toContain('3');
     expect(screen.getByTestId('nh-dial-succeeded').textContent).toContain('2');
     expect(screen.getByTestId('nh-dial-failed').textContent).toContain('1');
+    // ZEB-620/622: the per-peer-state summary row surfaces the supervisor tally.
+    const states = screen.getByTestId('nh-dial-peer-states');
+    expect(states.textContent).toContain('5');
+    expect(states.textContent).toContain('connected');
+    expect(states.textContent).toContain('2');
+    expect(states.textContent).toContain('retrying');
+    expect(states.textContent).toContain('1');
+    expect(states.textContent).toContain('dormant');
     const hits = screen.getAllByTestId('nh-dial-hit');
-    expect(hits.length).toBe(2);
-    // Newest-first: the 8s-ago succeeded hit must sort above the 41s-ago one.
+    expect(hits.length).toBe(3);
+    // Newest-first: the 8s-ago succeeded hit sorts above the 20s reconnected
+    // and 41s failed hits.
     expect(hits[0].textContent).toContain('a3f9e1c2');
+    // ZEB-622: the reconnected marker renders its ↻ icon (not the ✓/✗ pair).
+    const reconnected = hits.find((h) => h.textContent?.includes('beef9012'));
+    expect(reconnected?.textContent).toContain('↻');
+  });
+
+  it('renders a degraded peer with the ⚠ icon and its own title (ZEB-622)', async () => {
+    mockInvoke.mockResolvedValue(readySnapWithDegradedPeer());
+    render(NetworkHealthView);
+    await waitFor(() => screen.getByTestId('nh-peer'));
+    const icon = screen.getByTestId('nh-peer-icon');
+    // Shares the warn glyph with relay, but its title disambiguates the state.
+    expect(icon.textContent).toContain('⚠');
+    expect(icon.getAttribute('title')).toContain('degraded');
+    // The mode label still reads "degraded" in the row body.
+    expect(screen.getByTestId('nh-peer').textContent).toContain('degraded');
   });
 
   it('renders idle dial state when there are no recent hits', async () => {

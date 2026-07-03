@@ -1403,6 +1403,23 @@ pub async fn ping_peer(
     node_id: iroh::EndpointId,
     timeout: std::time::Duration,
 ) -> Result<std::time::Duration, String> {
+    // Discard the live connection — callers that want the selected-path mode
+    // (ZEB-622) use `ping_peer_conn` directly and inspect it via
+    // `mode_from_conn`.
+    ping_peer_conn(endpoint, node_id, timeout)
+        .await
+        .map(|(rtt, _conn)| rtt)
+}
+
+/// Connect + echo core of [`ping_peer`], returning the measured RTT AND the
+/// live [`iroh::endpoint::Connection`] so the caller can read its selected path
+/// (ZEB-622: honest Direct-vs-Relay mode via [`mode_from_conn`]). The
+/// connection stays open until the returned value is dropped.
+async fn ping_peer_conn(
+    endpoint: &crate::iroh_endpoint::IrohEndpoint,
+    node_id: iroh::EndpointId,
+    timeout: std::time::Duration,
+) -> Result<(std::time::Duration, iroh::endpoint::Connection), String> {
     // PR #161 R1 (CodeRabbit): spec §6.2 requires bounded canonical
     // reason strings on user-facing self-test output. Raw transport
     // error chains (`{e}`) leak internal addresses / cert details /
@@ -1431,11 +1448,12 @@ pub async fn ping_peer(
         if buf[0] != 0x42 {
             return Err("unexpected echo byte".to_string());
         }
-        Ok::<(), String>(())
+        // Hand the connection back so the caller can inspect its paths.
+        Ok::<iroh::endpoint::Connection, String>(conn)
     })
     .await;
     match result {
-        Ok(Ok(())) => Ok(start.elapsed()),
+        Ok(Ok(conn)) => Ok((start.elapsed(), conn)),
         Ok(Err(e)) => Err(e),
         Err(_) => Err("timeout".to_string()),
     }
@@ -1689,8 +1707,29 @@ impl PingDispatcher for NullDispatcher {
     }
 }
 
+/// ZEB-622: derive the honest [`ConnectionMode`] from a live connection's
+/// selected path, mirroring `peer_liveness::run_conn_path_watcher`'s idiom
+/// (`is_selected()` → the active path; `is_relay()` → `Relay`, else `Direct`).
+/// If no path is marked selected yet, keep `Direct` as the documented
+/// fallback: the echo just succeeded so a path exists — the `paths()` snapshot
+/// merely raced its selection flag.
+fn mode_from_conn(conn: &iroh::endpoint::Connection) -> ConnectionMode {
+    conn.paths()
+        .iter()
+        .find(|p| p.is_selected())
+        .map(|p| {
+            if p.is_relay() {
+                ConnectionMode::Relay
+            } else {
+                ConnectionMode::Direct
+            }
+        })
+        .unwrap_or(ConnectionMode::Direct)
+}
+
 /// Production [`PingDispatcher`]: dials each peer's iroh node id on the
-/// `harmony/ping/v1` ALPN via [`ping_peer`] and reports the measured RTT.
+/// `harmony/ping/v1` ALPN via [`ping_peer_conn`], reports the measured RTT,
+/// and derives the real [`ConnectionMode`] from the connection's selected path.
 pub struct ProdPingDispatcher {
     endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
 }
@@ -1714,14 +1753,12 @@ impl PingDispatcher for ProdPingDispatcher {
         Box::pin(async move {
             let node_id = iroh::EndpointId::from_bytes(&peer_node_id_bytes)
                 .map_err(|_| "invalid node id".to_string())?;
-            let rtt = ping_peer(&endpoint, node_id, timeout).await?;
-            // Phase-1 mode approximation: `ping_peer` returns RTT only (no
-            // ConnectionMode). A successful HARMONY_PING round-trip is
-            // reported Direct — consistent with the other Phase-1
-            // placeholders (ProdReachabilitySnapshot's NoConnection,
-            // nat_classification's Unknown). Distinguishing Direct vs Relay
-            // via the iroh conn-type is a documented follow-up.
-            Ok((rtt, ConnectionMode::Direct))
+            let (rtt, conn) = ping_peer_conn(&endpoint, node_id, timeout).await?;
+            // ZEB-622: report the REAL transport mode. The echo just succeeded
+            // over `conn`, so its selected path tells us Direct vs Relay
+            // honestly (with a documented Direct fallback if the snapshot
+            // raced the selection flag — see `mode_from_conn`).
+            Ok((rtt, mode_from_conn(&conn)))
         })
     }
 }
