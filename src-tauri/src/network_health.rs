@@ -1299,7 +1299,7 @@ pub fn format_export_markdown(
         // Redact loopback/private/link-local relay hosts — public relays are
         // fine verbatim, but a shared export shouldn't leak a user's LAN relay.
         let display_url = match url::Url::parse(&relay.url) {
-            Ok(u) if crate::pkarr_settings::is_local_host(u.host_str().unwrap_or("")) => {
+            Ok(u) if crate::connectivity_settings::is_local_host(u.host_str().unwrap_or("")) => {
                 format!("{}://<local-relay>", u.scheme())
             }
             _ => relay.url.clone(),

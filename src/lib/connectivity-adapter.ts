@@ -389,7 +389,7 @@ export async function setPkarrRelays(relays: string[]): Promise<RelayHealth[]> {
 
 /**
  * Resets the pkarr relay pool to the backend's recommended default set
- * (`default_relays()`), persisted + hot-swapped live. Server-authoritative —
+ * (`default_pkarr_relays()`), persisted + hot-swapped live. Server-authoritative —
  * the frontend does not need to know the default URL list.
  */
 export async function resetPkarrRelays(): Promise<RelayHealth[]> {

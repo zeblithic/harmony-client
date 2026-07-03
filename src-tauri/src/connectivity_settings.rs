@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PkarrSettings {
+pub struct ConnectivitySettings {
     /// Case B (identity-keyed discoverability) — opt-in, default OFF.
     #[serde(default)]
     pub identity_discoverable: bool,
@@ -22,7 +22,7 @@ pub struct PkarrSettings {
     /// default fills a vetted >=2 set for old settings files (forward-compat),
     /// guaranteeing relay redundancy on upgrade. Applied live via
     /// `set_pkarr_relays` (no restart).
-    #[serde(default = "default_relays")]
+    #[serde(default = "default_pkarr_relays")]
     pub relays: Vec<String>,
     /// ZEB-600: user "appear offline" toggle. When true, the node suppresses
     /// its community-presence beacons (others see it offline; it still receives
@@ -31,12 +31,12 @@ pub struct PkarrSettings {
     pub presence_invisible: bool,
 }
 
-/// Default for [`PkarrSettings::friend_auto_accept_known`]: ON (spec §7.1).
+/// Default for [`ConnectivitySettings::friend_auto_accept_known`]: ON (spec §7.1).
 fn default_friend_auto_accept_known() -> bool {
     true
 }
 
-/// Default for [`PkarrSettings::relays`]: the Zeblithic-operated
+/// Default for [`ConnectivitySettings::relays`]: the Zeblithic-operated
 /// `pkarr.q8.fyi` (primary) followed by the vetted public fallbacks
 /// `relay.pkarr.org` (n0-operated) + `pkarr.pubky.app` (Pubky).
 ///
@@ -46,7 +46,7 @@ fn default_friend_auto_accept_known() -> bool {
 /// each other (ZEB-513). The public relays are retained behind it so one
 /// host-level relay hiccup is never terminal for first-contact (ZEB-330,
 /// ZEB-380 redundancy).
-pub fn default_relays() -> Vec<String> {
+pub fn default_pkarr_relays() -> Vec<String> {
     vec![
         "https://pkarr.q8.fyi".to_string(),
         "https://relay.pkarr.org".to_string(),
@@ -54,12 +54,12 @@ pub fn default_relays() -> Vec<String> {
     ]
 }
 
-impl Default for PkarrSettings {
+impl Default for ConnectivitySettings {
     fn default() -> Self {
         Self {
             identity_discoverable: false,
             friend_auto_accept_known: default_friend_auto_accept_known(),
-            relays: default_relays(),
+            relays: default_pkarr_relays(),
             presence_invisible: false,
         }
     }
@@ -143,7 +143,7 @@ fn validate_single_relay(trimmed: &str) -> Result<String, String> {
 /// otherwise-good custom pool. Dedups (trailing-slash-normalized, first wins)
 /// and truncates to [`MAX_RELAYS`]. May return an empty vec (input empty or all
 /// entries invalid); the caller decides the empty fallback (callers use
-/// [`default_relays`]).
+/// [`default_pkarr_relays`]).
 pub fn sanitize_relay_urls(input: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -195,7 +195,7 @@ pub(crate) fn is_local_host(host: &str) -> bool {
     }
 }
 
-impl PkarrSettings {
+impl ConnectivitySettings {
     /// Most-restrictive settings for when persisted state is present but
     /// untrustworthy (corrupt or unreadable). Distinct from [`Default`], which
     /// is the genuine first-run profile: `Default` leaves `friend_auto_accept_known`
@@ -209,7 +209,7 @@ impl PkarrSettings {
         Self {
             identity_discoverable: false,
             friend_auto_accept_known: false,
-            relays: default_relays(),
+            relays: default_pkarr_relays(),
             // ZEB-600: fail closed = INVISIBLE. A corrupt/unreadable file must
             // never silently re-broadcast a user who had opted to appear offline.
             // This is the INVERSE of identity_discoverable's closed value (false):
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn defaults_to_not_discoverable() {
-        let settings = PkarrSettings::default();
+        let settings = ConnectivitySettings::default();
         assert!(!settings.identity_discoverable);
     }
 
@@ -282,7 +282,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("connectivity-settings.json");
         std::fs::write(&path, b"{ this is not valid json").unwrap();
-        let settings = PkarrSettings::load_or_default(&path);
+        let settings = ConnectivitySettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
         assert!(!settings.friend_auto_accept_known);
     }
@@ -295,7 +295,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("connectivity-settings.json");
         std::fs::create_dir(&path).unwrap();
-        let settings = PkarrSettings::load_or_default(&path);
+        let settings = ConnectivitySettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
         assert!(!settings.friend_auto_accept_known);
     }
@@ -306,7 +306,7 @@ mod tests {
         // (auto-accept ON) applies, distinct from the fail-closed paths above.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does-not-exist.json");
-        let settings = PkarrSettings::load_or_default(&path);
+        let settings = ConnectivitySettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
         assert!(settings.friend_auto_accept_known);
     }
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn defaults_to_auto_accept_known_on() {
         // ZEB-371 spec §7.1: auto-accept KNOWN requesters defaults ON.
-        let settings = PkarrSettings::default();
+        let settings = ConnectivitySettings::default();
         assert!(settings.friend_auto_accept_known);
     }
 
@@ -326,7 +326,7 @@ mod tests {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("legacy.json");
         std::fs::write(&path, r#"{"identity_discoverable":true}"#).expect("write");
-        let loaded = PkarrSettings::load_or_default(&path);
+        let loaded = ConnectivitySettings::load_or_default(&path);
         assert!(loaded.identity_discoverable);
         assert!(loaded.friend_auto_accept_known);
     }
@@ -335,7 +335,7 @@ mod tests {
     fn load_missing_file_returns_default() {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("nonexistent.json");
-        let settings = PkarrSettings::load_or_default(&path);
+        let settings = ConnectivitySettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
     }
 
@@ -343,7 +343,7 @@ mod tests {
     fn round_trip_save_then_load() {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
-        let settings = PkarrSettings {
+        let settings = ConnectivitySettings {
             identity_discoverable: true,
             friend_auto_accept_known: false,
             relays: vec!["https://relay.pkarr.org".to_string()],
@@ -351,14 +351,14 @@ mod tests {
         };
         settings.save(&path).expect("save");
 
-        let loaded = PkarrSettings::load_or_default(&path);
+        let loaded = ConnectivitySettings::load_or_default(&path);
         assert_eq!(loaded, settings);
     }
 
     #[test]
     fn defaults_to_recommended_relays() {
-        let settings = PkarrSettings::default();
-        assert_eq!(settings.relays, default_relays());
+        let settings = ConnectivitySettings::default();
+        assert_eq!(settings.relays, default_pkarr_relays());
         assert!(settings.relays.len() >= 2, "must ship a >=2 relay default");
     }
 
@@ -367,7 +367,7 @@ mod tests {
         // The Zeblithic-operated relay leads the pool so the fleet shares one
         // deterministic rendezvous (ZEB-513); the public relays stay behind it
         // as redundancy fallbacks (ZEB-330/380).
-        let relays = default_relays();
+        let relays = default_pkarr_relays();
         assert_eq!(
             relays.first().map(String::as_str),
             Some("https://pkarr.q8.fyi"),
@@ -385,15 +385,15 @@ mod tests {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("legacy.json");
         std::fs::write(&path, r#"{"identity_discoverable":true}"#).expect("write");
-        let loaded = PkarrSettings::load_or_default(&path);
-        assert_eq!(loaded.relays, default_relays());
+        let loaded = ConnectivitySettings::load_or_default(&path);
+        assert_eq!(loaded.relays, default_pkarr_relays());
     }
 
     #[test]
     fn round_trips_custom_relays() {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
-        let settings = PkarrSettings {
+        let settings = ConnectivitySettings {
             identity_discoverable: false,
             friend_auto_accept_known: true,
             relays: vec!["https://relay.pkarr.org".to_string()],
@@ -401,7 +401,7 @@ mod tests {
         };
         settings.save(&path).expect("save");
         assert_eq!(
-            PkarrSettings::load_or_default(&path).relays,
+            ConnectivitySettings::load_or_default(&path).relays,
             settings.relays
         );
     }
@@ -489,7 +489,7 @@ mod tests {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("bad.json");
         std::fs::write(&path, "not json {{").expect("write");
-        let settings = PkarrSettings::load_or_default(&path);
+        let settings = ConnectivitySettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
     }
 
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn sanitize_all_invalid_or_empty_returns_empty() {
-        // The caller (effective_pkarr_relays) maps empty → default_relays().
+        // The caller (effective_pkarr_relays) maps empty → default_pkarr_relays().
         assert!(sanitize_relay_urls(vec![]).is_empty());
         assert!(
             sanitize_relay_urls(vec!["garbage".into(), "ftp://x".into(), "".into()]).is_empty()
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn presence_invisible_defaults_visible() {
         // First-run product default: presence broadcasts (invisible = false).
-        assert!(!PkarrSettings::default().presence_invisible);
+        assert!(!ConnectivitySettings::default().presence_invisible);
     }
 
     #[test]
@@ -549,7 +549,7 @@ mod tests {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("legacy.json");
         std::fs::write(&path, r#"{"identity_discoverable":true}"#).expect("write");
-        assert!(!PkarrSettings::load_or_default(&path).presence_invisible);
+        assert!(!ConnectivitySettings::load_or_default(&path).presence_invisible);
     }
 
     #[test]
@@ -560,18 +560,18 @@ mod tests {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
         std::fs::write(&path, b"{ not valid json").expect("write");
-        assert!(PkarrSettings::load_or_default(&path).presence_invisible);
+        assert!(ConnectivitySettings::load_or_default(&path).presence_invisible);
     }
 
     #[test]
     fn presence_invisible_round_trips() {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
-        let s = PkarrSettings {
+        let s = ConnectivitySettings {
             presence_invisible: true,
             ..Default::default()
         };
         s.save(&path).expect("save");
-        assert!(PkarrSettings::load_or_default(&path).presence_invisible);
+        assert!(ConnectivitySettings::load_or_default(&path).presence_invisible);
     }
 }

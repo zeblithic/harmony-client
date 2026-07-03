@@ -157,6 +157,7 @@ pub mod community_voting_tick;
 pub mod community_voting_tier3;
 pub mod community_voting_tier3_crypto;
 pub mod community_voting_tier3_nizk;
+pub mod connectivity_settings;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
@@ -224,7 +225,6 @@ pub mod pkarr_friend_publisher;
 pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
-pub mod pkarr_settings;
 pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
@@ -1426,7 +1426,7 @@ pub struct NodeState {
     /// Cached here so `connectivity_set_identity_discoverable` and
     /// `connectivity_get_identity_discoverable` can reach it without
     /// re-resolving via the Tauri path API (which requires `AppHandle`).
-    pub pkarr_settings_path: Option<std::path::PathBuf>,
+    pub connectivity_settings_path: Option<std::path::PathBuf>,
 
     /// JoinHandle of the pkarr publisher's background task. Held so
     /// `stop_inner` can `abort()` it — without abort the loop keeps
@@ -1539,7 +1539,7 @@ impl NodeState {
         self.pkarr_invite_publisher = None;
         self.pkarr_identity_publisher = None;
         self.pkarr_community_publisher = None;
-        self.pkarr_settings_path = None;
+        self.connectivity_settings_path = None;
         // ZEB-329: drop the synthesis-only service so a restart
         // rebuilds against the fresh iroh / resolver. The service's
         // spawned rate-limiter task winds down when its sender (held
@@ -1764,7 +1764,7 @@ impl Default for NodeState {
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
             pkarr_community_publisher: None,
-            pkarr_settings_path: None,
+            connectivity_settings_path: None,
             pkarr_publisher_handle: None,
             // ZEB-329: stays None until start_node wires it.
             network_health: None,
@@ -3818,7 +3818,7 @@ pub async fn start_node_inner(
         let pending_friend_requests_for_state =
             std::sync::Arc::new(crate::friend_requests::PendingFriendRequests::new());
         // ZEB-371 Task 12 (spec §7.1): "auto-accept known requesters" toggle.
-        // Assigned from persisted `PkarrSettings` in the pkarr setup block
+        // Assigned from persisted `ConnectivitySettings` in the pkarr setup block
         // (default ON when the setting is absent). The variable is declared
         // here without an initializer because the pkarr block always runs
         // before the acceptor constructor below; the compiler enforces this via
@@ -7180,11 +7180,14 @@ pub async fn start_node_inner(
                     // Resolve settings path and load settings here (hoisted from below
                     // by ZEB-380) so the relay pool can be built from the persisted relay
                     // list before constructing the RelayClient. The downstream readers
-                    // (identity_discoverable, friend_auto_accept_known, pkarr_settings_path
+                    // (identity_discoverable, friend_auto_accept_known, connectivity_settings_path
                     // stash) all reference the same hoisted bindings.
-                    let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
-                    let pkarr_settings =
-                        pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
+                    let connectivity_settings_path =
+                        app_data_dir.join("connectivity-settings.json");
+                    let connectivity_settings =
+                        connectivity_settings::ConnectivitySettings::load_or_default(
+                            &connectivity_settings_path,
+                        );
                     // ZEB-600: apply the persisted appear-offline setting to the
                     // presence map's node-global visibility gate BEFORE the event
                     // loop can publish, so an invisible user emits no launch beacon.
@@ -7192,14 +7195,14 @@ pub async fn start_node_inner(
                     community_presence_map
                         .lock()
                         .await
-                        .set_visible(!pkarr_settings.presence_invisible);
+                        .set_visible(!connectivity_settings.presence_invisible);
                     // ZEB-380: build the pool from the persisted user-configurable
                     // relay list via the SAME lenient reader the IPCs + boot
                     // reconcile use — drops only malformed entries (a single bad
                     // hand-edited URL must not nuke an otherwise-good custom pool)
                     // and falls back to the recommended set only when nothing
                     // valid remains, rather than booting a broken/empty pool.
-                    let pool_relays = effective_pkarr_relays(pkarr_settings.relays.clone());
+                    let pool_relays = effective_pkarr_relays(connectivity_settings.relays.clone());
                     let pkarr_relay_pool = harmony_pkarr::RelayPool::new(pool_relays);
                     // ZEB-387: a valid pkarr PUT triggers a synchronous mainline-DHT
                     // write on the relay that routinely exceeds the 5s default
@@ -7497,13 +7500,14 @@ pub async fn start_node_inner(
                         }
                     }
 
-                    // Restore case-B if enabled (pkarr_settings loaded above, hoisted by ZEB-380).
-                    if pkarr_settings.identity_discoverable {
+                    // Restore case-B if enabled (connectivity_settings loaded above, hoisted by ZEB-380).
+                    if connectivity_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
                     }
                     // ZEB-371 Task 12: lift the persisted Path-A auto-accept
                     // toggle so the friend acceptor (constructed below) reads it.
-                    friend_auto_accept_known_for_state = pkarr_settings.friend_auto_accept_known;
+                    friend_auto_accept_known_for_state =
+                        connectivity_settings.friend_auto_accept_known;
 
                     // Bootstrap case-C: register per-community publications for
                     // every community the device is currently a member of.
@@ -7553,7 +7557,7 @@ pub async fn start_node_inner(
                     //     re-stamps it" promise above).
                     //   * identity (case B) — ONLY when the publication is
                     //     currently active. Initial enable keys off
-                    //     `pkarr_settings.identity_discoverable`, but the
+                    //     `connectivity_settings.identity_discoverable`, but the
                     //     toggle flips at runtime via
                     //     `connectivity_set_identity_discoverable`; the
                     //     single source of truth for "active now" is the
@@ -7590,7 +7594,7 @@ pub async fn start_node_inner(
                         let ep_opt = iroh_endpoint_arc.clone();
                         // ZEB-516: captured so the periodic identity (case-B)
                         // republish reads the persisted discoverable setting.
-                        let pkarr_settings_path = pkarr_settings_path.clone();
+                        let connectivity_settings_path = connectivity_settings_path.clone();
                         std::sync::Arc::new(move || {
                             // Per-invocation clones — the closure is `Fn`.
                             let identity_pub = std::sync::Arc::clone(&identity_pub);
@@ -7605,7 +7609,7 @@ pub async fn start_node_inner(
                             let hlc_tracker = std::sync::Arc::clone(&hlc_tracker);
                             let device_id = republish_device_id.clone();
                             let ep_opt = ep_opt.clone();
-                            let pkarr_settings_path = pkarr_settings_path.clone();
+                            let connectivity_settings_path = connectivity_settings_path.clone();
                             tokio::spawn(async move {
                                 // 1. Fleet-net self-row re-stamp (fresh
                                 //    seen_at + current relay), mirroring the
@@ -7661,7 +7665,7 @@ pub async fn start_node_inner(
                                 // disk-read pattern (PR #207/#280).
                                 let identity_discoverable =
                                     tokio::task::spawn_blocking(move || {
-                                        identity_republish_enabled(&pkarr_settings_path)
+                                        identity_republish_enabled(&connectivity_settings_path)
                                     })
                                     .await
                                     .unwrap_or(false);
@@ -7847,7 +7851,7 @@ pub async fn start_node_inner(
                     pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
                     pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
                     pkarr_community_publisher_for_state = Some(pkarr_community_pub);
-                    pkarr_settings_path_for_state = Some(pkarr_settings_path);
+                    pkarr_settings_path_for_state = Some(connectivity_settings_path);
                     pkarr_publisher_handle_for_state = Some(pkarr_publisher_join);
 
                     // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher spawn ──
@@ -9658,7 +9662,7 @@ pub async fn start_node_inner(
                         guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
                         guard.pkarr_community_publisher =
                             pkarr_community_publisher_for_state.take();
-                        guard.pkarr_settings_path = pkarr_settings_path_for_state.take();
+                        guard.connectivity_settings_path = pkarr_settings_path_for_state.take();
                         guard.pkarr_publisher_handle = pkarr_publisher_handle_for_state.take();
 
                         // ── ZEB-329: NetworkHealthService boot wiring ──
@@ -9736,9 +9740,10 @@ pub async fn start_node_inner(
                                 // persisted relays Settings shows (Healthy
                                 // placeholders), resolving the path exactly as
                                 // get_pkarr_relays does so the two surfaces agree.
-                                let settings_path =
-                                    connectivity_settings_path(guard.pkarr_settings_path.clone())
-                                        .ok();
+                                let settings_path = connectivity_settings_path(
+                                    guard.connectivity_settings_path.clone(),
+                                )
+                                .ok();
                                 std::sync::Arc::new(PersistedRelaySnapshot { settings_path })
                             };
                             let mut nh = crate::network_health::NetworkHealthService::new(
@@ -10238,7 +10243,7 @@ pub async fn start_node_inner(
                     } else {
                         match (
                             guard.pkarr_relay_client.as_ref(),
-                            guard.pkarr_settings_path.as_ref(),
+                            guard.connectivity_settings_path.as_ref(),
                         ) {
                             (Some(rc), Some(path)) => {
                                 Some((std::sync::Arc::clone(rc), path.clone()))
@@ -10249,7 +10254,7 @@ pub async fn start_node_inner(
                 };
                 if let Some((rc, path)) = target {
                     let effective = effective_pkarr_relays(
-                        pkarr_settings::PkarrSettings::load_or_default(&path).relays,
+                        connectivity_settings::ConnectivitySettings::load_or_default(&path).relays,
                     );
                     let mut live: Vec<String> =
                         rc.relay_health().into_iter().map(|h| h.url).collect();
@@ -22854,14 +22859,14 @@ pub(crate) fn ensure_public_cid(cid: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve the `emoji_names.json` path from `NodeState.pkarr_settings_path`,
-/// mirroring how the nickname store co-locates beside `pkarr_settings.json`.
+/// Resolve the `emoji_names.json` path from `NodeState.connectivity_settings_path`,
+/// mirroring how the nickname store co-locates beside `connectivity_settings.json`.
 fn emoji_names_path(state: &std::sync::Mutex<NodeState>) -> Result<std::path::PathBuf, String> {
     let g = state
         .lock()
         .map_err(|e| format!("NodeState poisoned: {e}"))?;
     let p = g
-        .pkarr_settings_path
+        .connectivity_settings_path
         .clone()
         .ok_or_else(|| OWNER_NOT_LOADED_MSG.to_string())?;
     Ok(p.with_file_name("emoji_names.json"))
@@ -26165,9 +26170,9 @@ mod create_community_inner_tests {
     #[tokio::test]
     async fn set_emoji_name_impl_writes_and_clears_public_only() {
         let dir = tempfile::tempdir().unwrap();
-        let settings = dir.path().join("pkarr_settings.json");
+        let settings = dir.path().join("connectivity_settings.json");
         let state = std::sync::Mutex::new(NodeState {
-            pkarr_settings_path: Some(settings.clone()),
+            connectivity_settings_path: Some(settings.clone()),
             ..NodeState::default()
         });
         let public_hex = hex::encode([0x42u8; 32]);
@@ -26200,7 +26205,7 @@ mod create_community_inner_tests {
     async fn set_emoji_name_impl_rejects_encrypted_and_bad_name() {
         let dir = tempfile::tempdir().unwrap();
         let state = std::sync::Mutex::new(NodeState {
-            pkarr_settings_path: Some(dir.path().join("pkarr_settings.json")),
+            connectivity_settings_path: Some(dir.path().join("connectivity_settings.json")),
             ..NodeState::default()
         });
         let encrypted_hex = hex::encode([0xB2u8; 32]);
@@ -31921,7 +31926,7 @@ pub(crate) async fn unsubscribe_community_presence_impl(
 /// pattern as `apply_pkarr_relays`.
 fn persist_presence_visibility(path: &std::path::Path, visible: bool) -> Result<(), String> {
     let path_buf = path.to_path_buf();
-    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path_buf);
+    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path_buf);
     settings.presence_invisible = !visible;
     settings
         .save(&path_buf)
@@ -31945,7 +31950,7 @@ async fn set_presence_visibility(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.community_presence_map.clone(),
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
         )
     };
     // Live: flip the shared gate if a node is running. If not, the persisted
@@ -31988,7 +31993,7 @@ async fn get_presence_visibility(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.community_presence_map.clone(),
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
         )
     };
     if let Some(m) = map {
@@ -31998,7 +32003,7 @@ async fn get_presence_visibility(
     // Offload the sync std::fs read off the Tokio worker (same rationale as the
     // setter — this seam is reachable over the async IPC/headless surface).
     let invisible = tokio::task::spawn_blocking(move || {
-        pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).presence_invisible
     })
     .await
     .map_err(|e| format!("load presence visibility task: {e}"))?;
@@ -46683,7 +46688,7 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             guard.pkarr_identity_publisher.clone(),
-            guard.pkarr_settings_path.clone(),
+            guard.connectivity_settings_path.clone(),
         )
     };
 
@@ -46694,13 +46699,13 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
     let Some(path) = settings_path else {
-        return Err("pkarr_settings_path missing".into());
+        return Err("connectivity_settings_path missing".into());
     };
 
     // Persist the preference. Offload the sync std::fs load+save off the Tokio
     // worker — this seam is reachable over the async headless API surface.
     tokio::task::spawn_blocking(move || {
-        let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.identity_discoverable = enabled;
         settings
             .save(&path)
@@ -46748,7 +46753,7 @@ pub(crate) async fn connectivity_get_identity_discoverable_impl(
         state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pkarr_settings_path
+            .connectivity_settings_path
             .clone()
     };
     let Some(path) = path else {
@@ -46758,7 +46763,7 @@ pub(crate) async fn connectivity_get_identity_discoverable_impl(
     // Offload the sync std::fs read off the Tokio worker — this seam is reachable
     // over the async headless API surface.
     tokio::task::spawn_blocking(move || {
-        pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).identity_discoverable
     })
     .await
     .map_err(|e| format!("load connectivity-settings task: {e}"))
@@ -46772,7 +46777,7 @@ async fn connectivity_get_identity_discoverable(
 }
 
 /// ZEB-380: resolve `connectivity-settings.json` even when the node is stopped.
-/// `NodeState.pkarr_settings_path` is cleared on stop, but the relay manager
+/// `NodeState.connectivity_settings_path` is cleared on stop, but the relay manager
 /// must still read/write the user's persisted relays pre-start / post-stop —
 /// fall back to the app-data-dir-derived path.
 fn connectivity_settings_path(
@@ -46836,12 +46841,12 @@ fn apply_pkarr_relays<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            guard.pkarr_settings_path.clone(),
+            guard.connectivity_settings_path.clone(),
             guard.pkarr_relay_client.clone(),
         )
     };
     let path = connectivity_settings_path(settings_path)?;
-    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
     settings.relays = validated.clone();
     settings
         .save(&path)
@@ -46863,13 +46868,13 @@ fn apply_pkarr_relays<R: tauri::Runtime>(
 /// apply, so every reader/mutator agrees on the live pool. Drops only the
 /// malformed entries (a single bad URL in a hand-edited file must not discard an
 /// otherwise-good custom pool — see `sanitize_relay_urls`); resolves to
-/// `default_relays()` only when NOTHING valid remains (empty or all-invalid),
+/// `default_pkarr_relays()` only when NOTHING valid remains (empty or all-invalid),
 /// which is the pool that is actually live and shown in the UI, so add/remove
 /// mutate the live set rather than a raw possibly-empty file value.
 fn effective_pkarr_relays(persisted: Vec<String>) -> Vec<String> {
-    let sanitized = crate::pkarr_settings::sanitize_relay_urls(persisted);
+    let sanitized = crate::connectivity_settings::sanitize_relay_urls(persisted);
     if sanitized.is_empty() {
-        crate::pkarr_settings::default_relays()
+        crate::connectivity_settings::default_pkarr_relays()
     } else {
         sanitized
     }
@@ -46882,7 +46887,9 @@ fn effective_pkarr_relays(persisted: Vec<String>) -> Vec<String> {
 fn effective_persisted_relays(settings_path: Option<&std::path::Path>) -> Vec<String> {
     let persisted = settings_path
         // load_or_default takes &PathBuf; cheap to_path_buf on this cold path.
-        .map(|p| pkarr_settings::PkarrSettings::load_or_default(&p.to_path_buf()).relays)
+        .map(|p| {
+            connectivity_settings::ConnectivitySettings::load_or_default(&p.to_path_buf()).relays
+        })
         .unwrap_or_default();
     effective_pkarr_relays(persisted)
 }
@@ -46990,7 +46997,7 @@ mod epoch_republish_trigger_tests {
 /// boot publish froze the identity record permanently. Returns false when the
 /// setting is off or the file is missing/unreadable (matches `load_or_default`).
 fn identity_republish_enabled(settings_path: &std::path::Path) -> bool {
-    pkarr_settings::PkarrSettings::load_or_default(&settings_path.to_path_buf())
+    connectivity_settings::ConnectivitySettings::load_or_default(&settings_path.to_path_buf())
         .identity_discoverable
 }
 
@@ -47044,12 +47051,12 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
     relays: Vec<String>,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let _relay_write_guard = pkarr_relay_write_lock().lock().await;
-    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    let validated = crate::connectivity_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
 }
 
 /// ZEB-380: reset the pkarr relay pool to the recommended default set
-/// (`default_relays()`), persisted + hot-swapped live. Server-authoritative so
+/// (`default_pkarr_relays()`), persisted + hot-swapped live. Server-authoritative so
 /// the frontend never hardcodes the default list ("Restore recommended").
 #[tauri::command]
 async fn reset_pkarr_relays<R: tauri::Runtime>(
@@ -47057,16 +47064,17 @@ async fn reset_pkarr_relays<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let _relay_write_guard = pkarr_relay_write_lock().lock().await;
-    // default_relays() is always valid; run it through the validator anyway so
+    // default_pkarr_relays() is always valid; run it through the validator anyway so
     // any future change to the defaults is held to the same contract.
-    let validated =
-        crate::pkarr_settings::validate_relay_urls(crate::pkarr_settings::default_relays())?;
+    let validated = crate::connectivity_settings::validate_relay_urls(
+        crate::connectivity_settings::default_pkarr_relays(),
+    )?;
     apply_pkarr_relays(&app, &state, validated)
 }
 
 /// ZEB-380: add a single relay to the persisted pool (server-authoritative
 /// read-modify-write). The client sends only the URL — the backend appends it
-/// to the EFFECTIVE relay pool (defaulting to `default_relays()` when the
+/// to the EFFECTIVE relay pool (defaulting to `default_pkarr_relays()` when the
 /// persisted list is empty/invalid) and re-validates, so adding to a fresh
 /// install preserves the live defaults rather than replacing them with just
 /// the new URL.
@@ -47081,21 +47089,22 @@ async fn add_pkarr_relay<R: tauri::Runtime>(
         let guard = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        guard.pkarr_settings_path.clone()
+        guard.connectivity_settings_path.clone()
     };
     let path = connectivity_settings_path(settings_path)?;
-    let mut relays =
-        effective_pkarr_relays(pkarr_settings::PkarrSettings::load_or_default(&path).relays);
+    let mut relays = effective_pkarr_relays(
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).relays,
+    );
     relays.push(url);
     // validate_relay_urls dedups (so re-adding an existing relay is a no-op),
     // caps at 8, and rejects invalid input — returning a clear Err to the UI.
-    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    let validated = crate::connectivity_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
 }
 
 /// ZEB-380: remove a single relay from the persisted pool (server-authoritative
 /// read-modify-write). Filters from the EFFECTIVE pool (defaulting to
-/// `default_relays()` when the persisted list is empty/invalid), so a fresh
+/// `default_pkarr_relays()` when the persisted list is empty/invalid), so a fresh
 /// install can remove an unwanted default. Removing the last relay fails
 /// (validate_relay_urls rejects an empty list), preserving the >=1 invariant
 /// server-side.
@@ -47110,18 +47119,19 @@ async fn remove_pkarr_relay<R: tauri::Runtime>(
         let guard = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        guard.pkarr_settings_path.clone()
+        guard.connectivity_settings_path.clone()
     };
     let path = connectivity_settings_path(settings_path)?;
     let target = url.trim().trim_end_matches('/');
-    let relays: Vec<String> =
-        effective_pkarr_relays(pkarr_settings::PkarrSettings::load_or_default(&path).relays)
-            .into_iter()
-            .filter(|r| r.trim_end_matches('/') != target)
-            .collect();
+    let relays: Vec<String> = effective_pkarr_relays(
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).relays,
+    )
+    .into_iter()
+    .filter(|r| r.trim_end_matches('/') != target)
+    .collect();
     // Empty → validate_relay_urls errors ("at least one relay is required"),
     // which guards against removing the final relay.
-    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    let validated = crate::connectivity_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
 }
 
@@ -47137,7 +47147,7 @@ async fn get_pkarr_relays(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            guard.pkarr_settings_path.clone(),
+            guard.connectivity_settings_path.clone(),
             guard.pkarr_relay_client.clone(),
         )
     };
@@ -47752,13 +47762,13 @@ async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<F
 pub(crate) async fn list_friends_impl(
     state: &std::sync::Mutex<NodeState>,
 ) -> Result<Vec<FriendDto>, String> {
-    let (crdt_state, pkarr_settings_path) = {
+    let (crdt_state, connectivity_settings_path) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
         )
     };
     let dtos = {
@@ -47767,7 +47777,7 @@ pub(crate) async fn list_friends_impl(
     };
     // ZEB-419: join purely-local nicknames from their own file (outside the
     // published CRDT). A missing/unset path → no nicknames.
-    let nicknames = match &pkarr_settings_path {
+    let nicknames = match &connectivity_settings_path {
         Some(p) => crate::friend_nicknames::FriendNicknames::load_or_default(
             &p.with_file_name("friend_nicknames.json"),
         ),
@@ -48457,14 +48467,14 @@ async fn set_friend_auto_accept(
         state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pkarr_settings_path
+            .connectivity_settings_path
             .clone()
     };
     let Some(path) = path else {
-        return Err("pkarr_settings_path missing".into());
+        return Err("connectivity_settings_path missing".into());
     };
 
-    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
     settings.friend_auto_accept_known = enabled;
     settings
         .save(&path)
@@ -48490,14 +48500,17 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
         state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pkarr_settings_path
+            .connectivity_settings_path
             .clone()
     };
     let Some(path) = path else {
         // Node not running / pkarr not initialized — return the spec default (ON).
         return Ok(true);
     };
-    Ok(pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known)
+    Ok(
+        connectivity_settings::ConnectivitySettings::load_or_default(&path)
+            .friend_auto_accept_known,
+    )
 }
 
 /// ZEB-419: serializes the nickname-file read-modify-write so two concurrent
@@ -48548,7 +48561,7 @@ async fn set_friend_nickname(
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (g.crdt_state.clone(), g.pkarr_settings_path.clone())
+        (g.crdt_state.clone(), g.connectivity_settings_path.clone())
     };
     let (Some(crdt_state), Some(path)) = (crdt_state, path) else {
         return Err(OWNER_NOT_LOADED_MSG.into());
@@ -49881,7 +49894,7 @@ mod friend_ipc_tests {
     #[test]
     fn set_friend_auto_accept_persists_round_trips() {
         // The IPC's persistence half (independent of NodeState): flipping the
-        // toggle writes through `PkarrSettings::save` and reads back via
+        // toggle writes through `ConnectivitySettings::save` and reads back via
         // `load_or_default`, exactly as `set_/get_friend_auto_accept` do.
         let td = tempfile::TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
@@ -49889,22 +49902,27 @@ mod friend_ipc_tests {
         // Default (no file) is ON (spec §7.1) — what `get_friend_auto_accept`
         // returns when the file is absent.
         assert!(
-            crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .friend_auto_accept_known
         );
 
-        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.friend_auto_accept_known = false;
         settings.save(&path).expect("save");
         assert!(
-            !crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known,
+            !crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .friend_auto_accept_known,
             "toggle OFF persists"
         );
 
-        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.friend_auto_accept_known = true;
         settings.save(&path).expect("save");
         assert!(
-            crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known,
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .friend_auto_accept_known,
             "toggle back ON persists"
         );
     }
@@ -49912,25 +49930,27 @@ mod friend_ipc_tests {
     #[test]
     fn set_pkarr_relays_validation_and_persist_round_trip() {
         // Mirrors the friend-auto-accept persistence test: the IPC's pure pieces
-        // (validate + PkarrSettings load/save) round-trip through a temp file.
+        // (validate + ConnectivitySettings load/save) round-trip through a temp file.
         let td = tempfile::TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
 
         // Invalid input is rejected by the validator (no persist).
-        assert!(
-            crate::pkarr_settings::validate_relay_urls(vec!["http://relay.pkarr.org".into()])
-                .is_err()
-        );
+        assert!(crate::connectivity_settings::validate_relay_urls(vec![
+            "http://relay.pkarr.org".into()
+        ])
+        .is_err());
 
         // Valid input persists + reloads.
-        let validated =
-            crate::pkarr_settings::validate_relay_urls(vec!["https://relay.pkarr.org".into()])
-                .expect("valid");
-        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let validated = crate::connectivity_settings::validate_relay_urls(vec![
+            "https://relay.pkarr.org".into(),
+        ])
+        .expect("valid");
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.relays = validated.clone();
         settings.save(&path).expect("save");
         assert_eq!(
-            crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays,
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays,
             validated
         );
     }
@@ -49949,19 +49969,22 @@ mod friend_ipc_tests {
         ];
 
         // Seed the file.
-        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.relays = initial.clone();
         settings.save(&path).expect("save initial");
 
         // --- Simulate add ---
-        let mut relays = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let mut relays =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         relays.push("https://new.relay.example".to_string());
         let validated =
-            crate::pkarr_settings::validate_relay_urls(relays).expect("valid after add");
-        let mut s = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+            crate::connectivity_settings::validate_relay_urls(relays).expect("valid after add");
+        let mut s = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         s.relays = validated.clone();
         s.save(&path).expect("save after add");
-        let reloaded = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let reloaded =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         assert_eq!(reloaded.len(), 3, "add: three relays persisted");
         assert!(
             reloaded.contains(&"https://new.relay.example".to_string()),
@@ -49969,9 +49992,11 @@ mod friend_ipc_tests {
         );
 
         // Re-adding the same URL is a no-op (validate_relay_urls dedups).
-        let mut relays2 = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let mut relays2 =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         relays2.push("https://new.relay.example".to_string());
-        let validated2 = crate::pkarr_settings::validate_relay_urls(relays2).expect("valid dedup");
+        let validated2 =
+            crate::connectivity_settings::validate_relay_urls(relays2).expect("valid dedup");
         assert_eq!(
             validated2.len(),
             3,
@@ -49981,17 +50006,18 @@ mod friend_ipc_tests {
         // --- Simulate remove of one relay ---
         let target = "https://new.relay.example";
         let relays_after_remove: Vec<String> =
-            crate::pkarr_settings::PkarrSettings::load_or_default(&path)
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
                 .relays
                 .into_iter()
                 .filter(|r| r.trim_end_matches('/') != target.trim_end_matches('/'))
                 .collect();
-        let validated3 = crate::pkarr_settings::validate_relay_urls(relays_after_remove)
+        let validated3 = crate::connectivity_settings::validate_relay_urls(relays_after_remove)
             .expect("valid after remove");
-        let mut s3 = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut s3 = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         s3.relays = validated3;
         s3.save(&path).expect("save after remove");
-        let reloaded3 = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let reloaded3 =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         assert_eq!(reloaded3.len(), 2, "remove: back to two relays");
         assert!(
             !reloaded3.contains(&"https://new.relay.example".to_string()),
@@ -50000,22 +50026,23 @@ mod friend_ipc_tests {
 
         // --- Simulate remove of a relay down to one ---
         let target2 = "https://pkarr.pubky.app";
-        let relays_one: Vec<String> = crate::pkarr_settings::PkarrSettings::load_or_default(&path)
-            .relays
-            .into_iter()
-            .filter(|r| r.trim_end_matches('/') != target2.trim_end_matches('/'))
-            .collect();
+        let relays_one: Vec<String> =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .relays
+                .into_iter()
+                .filter(|r| r.trim_end_matches('/') != target2.trim_end_matches('/'))
+                .collect();
         assert_eq!(
             relays_one.len(),
             1,
             "one relay remaining before final remove attempt"
         );
-        let validated_one =
-            crate::pkarr_settings::validate_relay_urls(relays_one).expect("one relay is valid");
+        let validated_one = crate::connectivity_settings::validate_relay_urls(relays_one)
+            .expect("one relay is valid");
         assert_eq!(validated_one.len(), 1);
 
         // --- Simulate remove of the LAST relay → validate_relay_urls must error ---
-        let result = crate::pkarr_settings::validate_relay_urls(vec![]);
+        let result = crate::connectivity_settings::validate_relay_urls(vec![]);
         assert!(
             result.is_err(),
             "remove-last: empty list is rejected by validator"
@@ -50025,20 +50052,20 @@ mod friend_ipc_tests {
     #[test]
     fn effective_pkarr_relays_empty_persisted_resolves_to_defaults() {
         // FIX 1 (ZEB-380): effective_pkarr_relays() on an empty persisted list
-        // must return default_relays(), not [].  Simulates a fresh install where
+        // must return default_pkarr_relays(), not [].  Simulates a fresh install where
         // the settings file has no relays written yet — the live pool is the
         // defaults, so add/remove must operate on that set, not [].
-        let defaults = crate::pkarr_settings::default_relays();
+        let defaults = crate::connectivity_settings::default_pkarr_relays();
         assert!(
             !defaults.is_empty(),
-            "precondition: default_relays() is non-empty"
+            "precondition: default_pkarr_relays() is non-empty"
         );
 
         // Empty persisted list → defaults.
         let effective = effective_pkarr_relays(vec![]);
         assert_eq!(
             effective, defaults,
-            "empty persisted resolves to default_relays()"
+            "empty persisted resolves to default_pkarr_relays()"
         );
 
         // Simulate add on a fresh install (empty file) — result must be
@@ -50047,7 +50074,7 @@ mod friend_ipc_tests {
         let mut relays = effective_pkarr_relays(vec![]);
         relays.push(new_url.clone());
         let validated =
-            crate::pkarr_settings::validate_relay_urls(relays).expect("valid after add");
+            crate::connectivity_settings::validate_relay_urls(relays).expect("valid after add");
         assert!(
             validated.contains(&new_url),
             "add on fresh install: new URL present"
@@ -50067,13 +50094,14 @@ mod friend_ipc_tests {
         // Persist + reload: a settings file with an empty relays array (e.g.
         // produced by a bug or hand-editing) should also resolve to defaults.
         // `load_or_default` on a MISSING file returns the struct Default (which
-        // itself contains default_relays()), so to get an empty list we must
+        // itself contains default_pkarr_relays()), so to get an empty list we must
         // explicitly write `{"relays":[]}` — the serde field default only fills
         // in ABSENT keys, not empty arrays.
         let td = tempfile::TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
         std::fs::write(&path, r#"{"relays":[]}"#).expect("write empty relays file");
-        let from_file = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let from_file =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         assert!(
             from_file.is_empty(),
             "explicitly-written empty relays parses as []"
@@ -50081,7 +50109,7 @@ mod friend_ipc_tests {
         let effective_from_file = effective_pkarr_relays(from_file);
         assert_eq!(
             effective_from_file, defaults,
-            "effective from empty-relays file == default_relays()"
+            "effective from empty-relays file == default_pkarr_relays()"
         );
     }
 
@@ -50109,8 +50137,8 @@ mod friend_ipc_tests {
         let all_bad = effective_pkarr_relays(vec!["garbage".into(), "ftp://x".into()]);
         assert_eq!(
             all_bad,
-            crate::pkarr_settings::default_relays(),
-            "all-invalid persisted list resolves to default_relays()"
+            crate::connectivity_settings::default_pkarr_relays(),
+            "all-invalid persisted list resolves to default_pkarr_relays()"
         );
     }
 
@@ -50158,7 +50186,10 @@ mod friend_ipc_tests {
             .into_iter()
             .map(|h| h.url)
             .collect();
-        assert_eq!(urls_empty, crate::pkarr_settings::default_relays());
+        assert_eq!(
+            urls_empty,
+            crate::connectivity_settings::default_pkarr_relays()
+        );
 
         // No resolvable path (degraded) → defaults, not an empty panel.
         let snap_none = PersistedRelaySnapshot {
@@ -50169,7 +50200,10 @@ mod friend_ipc_tests {
             .into_iter()
             .map(|h| h.url)
             .collect();
-        assert_eq!(urls_none, crate::pkarr_settings::default_relays());
+        assert_eq!(
+            urls_none,
+            crate::connectivity_settings::default_pkarr_relays()
+        );
     }
 
     #[test]
@@ -50227,14 +50261,20 @@ mod friend_ipc_tests {
             .into_iter()
             .map(|w| w.url)
             .collect();
-        assert_eq!(urls_empty, crate::pkarr_settings::default_relays());
+        assert_eq!(
+            urls_empty,
+            crate::connectivity_settings::default_pkarr_relays()
+        );
 
         // No client + no resolvable path → defaults.
         let urls_none: Vec<String> = relay_health_wires(None, None)
             .into_iter()
             .map(|w| w.url)
             .collect();
-        assert_eq!(urls_none, crate::pkarr_settings::default_relays());
+        assert_eq!(
+            urls_none,
+            crate::connectivity_settings::default_pkarr_relays()
+        );
     }
 
     #[test]
@@ -50574,7 +50614,7 @@ pub(crate) async fn network_health_snapshot_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.network_health.clone(),
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
             g.pkarr_relay_client.clone(),
             // ZEB-450: surface a boot-time transport failure to the UI.
             g.transport_disabled_reason.clone(),
@@ -50658,7 +50698,7 @@ pub(crate) async fn network_health_run_self_test_impl(
             g.pkarr_relay_client.clone(),
             g.dm_identity_pub_64,
             g.pkarr_publisher.clone(),
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
         )
     };
 
@@ -50687,7 +50727,7 @@ pub(crate) async fn network_health_run_self_test_impl(
     // runtime worker during a user-triggered self-test.
     let discoverable = match settings_path {
         Some(p) => tokio::task::spawn_blocking(move || {
-            pkarr_settings::PkarrSettings::load_or_default(&p).identity_discoverable
+            connectivity_settings::ConnectivitySettings::load_or_default(&p).identity_discoverable
         })
         .await
         .unwrap_or(false),
@@ -54068,12 +54108,12 @@ mod channel_message_ipc_tests {
         let path = td.path().join("connectivity-settings.json");
         persist_presence_visibility(&path, false).expect("persist invisible");
         assert!(
-            pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible,
+            connectivity_settings::ConnectivitySettings::load_or_default(&path).presence_invisible,
             "visible=false must persist presence_invisible=true"
         );
         persist_presence_visibility(&path, true).expect("persist visible");
         assert!(
-            !pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible,
+            !connectivity_settings::ConnectivitySettings::load_or_default(&path).presence_invisible,
             "visible=true must persist presence_invisible=false"
         );
     }
@@ -56474,7 +56514,7 @@ mod start_node_race_tests {
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
             pkarr_community_publisher: None,
-            pkarr_settings_path: None,
+            connectivity_settings_path: None,
             pkarr_publisher_handle: None,
             // ZEB-329: race-test NodeStates never wire the network
             // health service — set to None.
