@@ -236,6 +236,16 @@ pub struct IrohZenohLinkManager {
     /// until the zenoh lease reaps it. `Arc`-wrapped for the same
     /// spawn-from-either-path reason as `zenoh_conns`.
     reconnect: Arc<std::sync::OnceLock<SupervisorHandle>>,
+    /// ZEB-622 Task 2: optional per-peer liveness handle. When installed via
+    /// [`Self::set_liveness_handle`], every registry install — inbound accept and
+    /// outbound `new_link`, both funneling through [`Self::swap_zenoh_conn`] —
+    /// reports an `on_transport_up` edge and spawns exactly one
+    /// [`crate::peer_liveness::run_conn_path_watcher`] for the new conn, and every
+    /// identity-guarded eviction in [`Self::spawn_drop_watcher`] reports the
+    /// `on_transport_down` edge. Optional (`OnceLock`) so the manager boots before
+    /// liveness is wired: pre-install, no liveness edges are raised. `Arc`-wrapped
+    /// for the same spawn-from-either-path reason as `zenoh_conns` / `reconnect`.
+    liveness: Arc<std::sync::OnceLock<crate::peer_liveness::LivenessHandle>>,
 }
 
 /// ZEB-616 identity guard for the drop-watcher: only evict a peer's registry
@@ -268,6 +278,7 @@ impl IrohZenohLinkManager {
             tunnel_acceptor: std::sync::OnceLock::new(),
             zenoh_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             reconnect: Arc::new(std::sync::OnceLock::new()),
+            liveness: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -276,7 +287,26 @@ impl IrohZenohLinkManager {
     /// close. Pure synchronous map op — the lock is not held across any await;
     /// the async close + await happens on the returned connection.
     fn swap_zenoh_conn(&self, peer_id: EndpointId, conn: Connection) -> Option<Connection> {
-        self.zenoh_conns.lock().unwrap().insert(peer_id, conn)
+        let prev = self
+            .zenoh_conns
+            .lock()
+            .unwrap()
+            .insert(peer_id, conn.clone());
+        // ZEB-622 Task 2: this is the single choke point BOTH the inbound accept
+        // and outbound `new_link` paths pass through with the `Connection` in
+        // hand, so raise the liveness up-edge and spawn exactly one path watcher
+        // for the new conn here. `on_transport_up` keys off `stable_id`, so a
+        // superseding swap (same peer, new conn) re-arms as a fresh up-edge; the
+        // superseded conn's watcher is silenced by the slot's conn-id guard.
+        if let Some(lh) = self.liveness.get() {
+            lh.on_transport_up(*peer_id.as_bytes(), conn.stable_id());
+            tokio::spawn(crate::peer_liveness::run_conn_path_watcher(
+                lh.clone(),
+                *peer_id.as_bytes(),
+                conn,
+            ));
+        }
+        prev
     }
 
     /// ZEB-616: is `conn_id` still the registered live connection for
@@ -305,6 +335,20 @@ impl IrohZenohLinkManager {
         self.reconnect.set(handle)
     }
 
+    /// ZEB-622 Task 2: install the per-peer liveness handle. Install-once
+    /// (`OnceLock`, mirroring [`Self::set_reconnect_handle`]); a second install
+    /// returns the supplied handle back as `Err`. Once installed,
+    /// [`Self::swap_zenoh_conn`] raises an `on_transport_up` edge + spawns the
+    /// iroh path watcher on every registry install, and
+    /// [`Self::spawn_drop_watcher`]'s identity-guarded eviction raises the
+    /// matching `on_transport_down` edge.
+    pub fn set_liveness_handle(
+        &self,
+        handle: crate::peer_liveness::LivenessHandle,
+    ) -> Result<(), crate::peer_liveness::LivenessHandle> {
+        self.liveness.set(handle)
+    }
+
     /// ZEB-620 Task 3: mark `peer_id` connected on the reconnect supervisor (if
     /// one is installed), cancelling further dialing until the peer drops.
     /// Called on a successful inbound-accept / outbound-dial registry swap.
@@ -329,6 +373,7 @@ impl IrohZenohLinkManager {
     fn spawn_drop_watcher(&self, peer_id: EndpointId, conn_id: usize, conn: Connection) {
         let conns = Arc::clone(&self.zenoh_conns);
         let reconnect = Arc::clone(&self.reconnect);
+        let liveness = Arc::clone(&self.liveness);
         tokio::spawn(async move {
             conn.closed().await;
             let evicted = {
@@ -346,6 +391,14 @@ impl IrohZenohLinkManager {
             if evicted {
                 if let Some(handle) = reconnect.get() {
                     handle.kick(*peer_id.as_bytes(), ReconnectTrigger::Dropped);
+                }
+                // ZEB-622 Task 2: same identity guard, same edge — a genuinely-
+                // gone conn raises the liveness down-edge (the watcher spawned in
+                // `swap_zenoh_conn` for THIS conn also exits on its own when the
+                // event stream ends, but the Disconnected transition is owned
+                // here so a superseded conn can't clobber the live slot).
+                if let Some(lh) = liveness.get() {
+                    lh.on_transport_down(*peer_id.as_bytes(), conn_id);
                 }
             }
         });
@@ -2246,6 +2299,224 @@ mod tests {
             summary.succeeded >= 2,
             "supervisor must record a re-connect success after the drop, got {}",
             summary.succeeded
+        );
+
+        alice_ep.shutdown().await;
+        bob_ep.shutdown().await;
+    }
+
+    /// ZEB-622 acceptance (transport half): a real link registers Connected with
+    /// a live mode + RTT in the liveness map; an explicit remote close lands
+    /// Disconnected; a re-link (same zid) re-registers Connected — and every
+    /// up-edge bumps the registered transport-epoch watch (the same-zid flap the
+    /// seen-zid gate could never re-arm).
+    ///
+    /// Modeled on `supervisor_redials_after_drop_and_get_answers` for endpoint /
+    /// manager construction and `poll_until`, but drives `new_link` DIRECTLY —
+    /// no supervisor — so the assertions isolate the liveness wiring added to
+    /// `swap_zenoh_conn` (up-edge + path watcher) and `spawn_drop_watcher`
+    /// (down-edge). alice = the dialer with the liveness handle installed; bob =
+    /// a bare acceptor. Runtime is ~60-120s: two real iroh handshakes (establish
+    /// + re-link) under the `iroh-endpoint` nextest-group throttle plus iroh
+    /// 1.0's Drop-drain teardown. Generous outer budget + fat per-phase poll
+    /// windows per the ZEB-616/620 idiom.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn liveness_tracks_link_lifecycle_and_flap_bumps_epoch() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(180),
+            liveness_tracks_link_lifecycle_and_flap_bumps_epoch_inner(),
+        )
+        .await
+        .expect("test must finish within 180s");
+    }
+
+    async fn liveness_tracks_link_lifecycle_and_flap_bumps_epoch_inner() {
+        use crate::peer_liveness::{LivenessHandle, LivenessMode, LivenessStateWire};
+
+        // ── Alice: the dialer under test — manager + accept loop + a liveness
+        // handle whose transport-epoch sink is wired. ──
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let alice_id = alice_ep.node_id();
+        let alice_resolver = ReachabilityResolver::new();
+        let (alice_tx, _alice_rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            alice_resolver.clone(),
+            alice_tx,
+        ));
+        let _alice_accept = alice_mgr.spawn_accept_loop();
+
+        let liveness = LivenessHandle::new();
+        let (etx, erx) = tokio::sync::watch::channel(0u64);
+        liveness.set_transport_epoch_tx(etx);
+        assert!(
+            alice_mgr.set_liveness_handle(liveness.clone()).is_ok(),
+            "install the liveness handle once"
+        );
+
+        // ── Bob: a bare acceptor — manager + accept loop, no liveness. Alice
+        // dials bob; bob only accepts. ──
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+        let bob_id = bob_ep.node_id();
+        let (bob_tx, _bob_rx) = flume::unbounded::<LinkUnicast>();
+        let bob_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&bob_ep),
+            ReachabilityResolver::new(),
+            bob_tx,
+        ));
+        let _bob_accept = bob_mgr.spawn_accept_loop();
+
+        // Seed alice's resolver so `new_link` resolves bob's node-id → loopback
+        // socket. Left in place across the close so the re-link resolves bob
+        // again.
+        let bob_socket = *bob_ep
+            .bound_sockets()
+            .first()
+            .expect("bob has a bound socket");
+        alice_resolver.update(
+            OwnerAddr([0xBB; 16]),
+            ReachabilityAnnouncePayload {
+                iroh_node_id: *bob_id.as_bytes(),
+                home_relay_url: String::new(),
+                direct_addresses: vec![bob_socket],
+                announced_at_ms: 1,
+                identity_signature: [0u8; 64],
+                butler_set: vec![],
+                bs_at: 0,
+            },
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: String::new(),
+            },
+        );
+
+        let bob_peer = *bob_id.as_bytes();
+        let is_connected_direct = |liveness: &LivenessHandle| {
+            liveness.states_snapshot().iter().any(|(p, s)| {
+                *p == bob_peer
+                    && matches!(
+                        s,
+                        LivenessStateWire::Connected {
+                            mode: LivenessMode::Direct,
+                            rtt_ms: Some(_),
+                            ..
+                        }
+                    )
+            })
+        };
+
+        // ── Phase 1: establish. Alice dials bob directly through `new_link`; the
+        // swap's up-edge + spawned path watcher land bob in the liveness map. The
+        // watcher promotes Degraded → Connected once a path is selected — a
+        // hermetic loopback link with RelayMode::Disabled selects a direct Ip
+        // path (mode Direct). ──
+        alice_mgr
+            .new_link(locator_from_endpoint_id(&bob_id).to_endpoint())
+            .await
+            .expect("alice's first new_link to bob establishes");
+        let connected_1 = poll_until(
+            || is_connected_direct(&liveness),
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            connected_1,
+            "first link must register bob Connected(Direct, rtt) in the liveness map"
+        );
+        assert_eq!(
+            *erx.borrow(),
+            1,
+            "the establish up-edge bumps the transport epoch exactly once"
+        );
+
+        // ── Phase 2: explicit remote close (same pattern as the ZEB-620 test's
+        // Phase 2). Closing bob's registered inbound conn makes alice's outbound
+        // conn's `closed()` fire → the drop-watcher evicts + raises the liveness
+        // down-edge. ──
+        let bob_has_inbound = poll_until(
+            || bob_mgr.zenoh_conns.lock().unwrap().contains_key(&alice_id),
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            bob_has_inbound,
+            "bob's accept loop must have registered alice's inbound connection"
+        );
+        let inbound = bob_mgr
+            .zenoh_conns
+            .lock()
+            .unwrap()
+            .get(&alice_id)
+            .cloned()
+            .expect("bob's inbound conn from alice");
+        inbound.close(0u32.into(), b"zeb622-liveness-close");
+
+        let disconnected = poll_until(
+            || {
+                liveness.states_snapshot().iter().any(|(p, s)| {
+                    *p == bob_peer && matches!(s, LivenessStateWire::Disconnected { .. })
+                })
+            },
+            Duration::from_secs(45),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            disconnected,
+            "an explicit remote close must land bob Disconnected in the liveness map"
+        );
+        assert_eq!(
+            *erx.borrow(),
+            1,
+            "a down-edge is not an up-edge — the transport epoch stays at 1"
+        );
+
+        // ── Phase 3: re-link (same zid). The flap re-arms as a FRESH up-edge —
+        // the exact same-zid case the accumulating seen-zid gate could never
+        // re-fire. Wait for alice's registry to go empty for bob first so the
+        // re-dial is a genuine fresh install (a stale entry would make the swap a
+        // same-conn no-op). ──
+        let evicted = poll_until(
+            || !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            evicted,
+            "alice's registry must be empty for bob before the re-link"
+        );
+        alice_mgr
+            .new_link(locator_from_endpoint_id(&bob_id).to_endpoint())
+            .await
+            .expect("alice's re-link to bob establishes");
+        let connected_2 = poll_until(
+            || is_connected_direct(&liveness),
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            connected_2,
+            "the re-link must re-register bob Connected(Direct, rtt)"
+        );
+        // The re-link's up-edge bumps the epoch 1 → 2 (the transport-level flap
+        // re-arm proof). The bump fires synchronously in `swap_zenoh_conn`, so it
+        // is visible once `new_link` returns; poll defensively for scheduling.
+        let epoch_re_armed = poll_until(
+            || *erx.borrow() == 2,
+            Duration::from_secs(15),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            epoch_re_armed,
+            "the same-zid flap re-arms the transport epoch (1 → 2), got {}",
+            *erx.borrow()
         );
 
         alice_ep.shutdown().await;

@@ -10,14 +10,16 @@
 //! the reconnect supervisor's Retrying/Dormant for the fused PeerHealth view.
 //! `Dormant` deliberately stays supervisor-owned (single source of truth).
 //!
-//! The module is pure logic and endpoint-free: the iroh path watcher
-//! (`run_conn_path_watcher`) lands in Task 2, so nothing here imports iroh yet.
 //! Every producer feeds one of the non-async `on_*` / `report_path` seams; the
 //! handle is cheap to clone (shared `Arc`) and safe to call from sync contexts.
+//! The one endpoint-touching item is the iroh path watcher
+//! (`run_conn_path_watcher`, ZEB-622 Task 2): it owns a `Connection` clone,
+//! translates iroh 1.0 path snapshots/events into `report_path` calls, and is
+//! the sole reason this module imports iroh.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -352,6 +354,58 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Refresh cadence for RTT while a connection is quiet (path events fire on
+/// open/close/selection change, not on RTT drift).
+const RTT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Watch one connection's paths and feed `handle`. Owns a `Connection` clone:
+/// `Path<'_>` borrows the connection and cannot cross tasks, so each event
+/// re-reads `conn.paths()`. Exits when the event stream ends (conn closed) —
+/// the registry drop watcher owns the Disconnected edge.
+///
+/// (`n0_future::StreamExt` — iroh's own stream-ext — is a re-export of
+/// `futures_lite::StreamExt`; iroh's `PathEventStream` is a plain
+/// `futures_core::Stream`, so the crate-local `futures::StreamExt` drives
+/// `.next()` identically without pulling `n0_future` in as a direct dep.)
+pub async fn run_conn_path_watcher(
+    handle: LivenessHandle,
+    peer: [u8; 32],
+    conn: iroh::endpoint::Connection,
+) {
+    use futures::StreamExt;
+    let conn_id = conn.stable_id();
+    let report = |h: &LivenessHandle| {
+        let paths = conn.paths();
+        let selected = paths.iter().find(|p| p.is_selected()).map(|p| {
+            let mode = if p.is_relay() {
+                LivenessMode::Relay
+            } else {
+                LivenessMode::Direct
+            };
+            (mode, p.rtt().as_millis().min(u32::MAX as u128) as u32)
+        });
+        let min_relay = paths
+            .iter()
+            .filter(|p| p.is_relay())
+            .map(|p| p.rtt().as_millis().min(u32::MAX as u128) as u32)
+            .min();
+        h.report_path(peer, conn_id, selected, min_relay);
+    };
+    report(&handle);
+    let mut events = conn.path_events();
+    let mut tick = tokio::time::interval(RTT_REFRESH_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            ev = events.next() => match ev {
+                Some(_) => report(&handle),   // any event → re-read snapshot (incl. Lagged)
+                None => break,
+            },
+            _ = tick.tick() => report(&handle),
+        }
+    }
 }
 
 #[cfg(test)]
