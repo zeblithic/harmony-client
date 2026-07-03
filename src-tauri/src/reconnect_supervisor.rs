@@ -28,9 +28,12 @@
 //!   the ladder, so an evicted peer eventually falls dormant rather than
 //!   dialing into the void.
 //!
-//! This module intentionally wires *no* producers (resolver notify, drop
-//! watchers, registry eviction) — later ZEB-620 tasks connect those to the
-//! `kick*` / `mark_connected` seams exposed here.
+//! The module itself stays pure logic; the producers feed the `kick*` /
+//! `mark_connected` seams from outside — `event_loop.rs` wires the resolver
+//! (`set_supervisor`: first-learn + changed-record kicks), the transport
+//! (`set_reconnect_handle`: registry drop-watchers both directions +
+//! `mark_connected`), the zenoh transport-events listener (`Delete` →
+//! `Dropped`), boot seeding, and the presence roster-edge sweeps.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,6 +72,12 @@ pub enum ReconnectTrigger {
     /// Registry eviction or a zenoh transport `Delete` — the transport is gone.
     Dropped,
     /// Identity-free roster edge: re-arm ALL known non-connected peers.
+    ///
+    /// Reserved for identity-AWARE per-peer sweeps: v1 roster edges carry no
+    /// peer id, so every sweep goes through [`SupervisorHandle::kick_sweep`] →
+    /// `do_sweep` and nothing `kick()`s this variant today. It participates in
+    /// the merge ordering so per-peer sweep kicks slot in without a wire
+    /// change when the liveness slice adds them.
     PresenceSweep,
 }
 
@@ -1197,6 +1206,57 @@ mod tests {
             dialer.count_for(p),
             2,
             "re-dial after Dropped despite the stale dial still parked"
+        );
+        dialer.release();
+    }
+
+    /// Greptile (PR #392): `Dropped` while a dial is in-flight WITHOUT a prior
+    /// `mark_connected` re-arms the schedule but keeps dispatch suppressed
+    /// until the stale dial resolves — bounded by `dial_timeout`, after which
+    /// the re-armed rung dispatches promptly. Pins the deliberate asymmetry
+    /// with `mark_connected` (which clears the flag itself) so a future
+    /// tightening of `dial_timeout` can't silently turn this into an unbounded
+    /// stall.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_mid_dial_suppression_is_bounded_by_dial_timeout() {
+        let dialer = RecordingDialer::parking();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let handle = SupervisorHandle::new();
+        let mut config = cfg(1_000, 64_000, 3_600_000, 30_000, 4, 3_000);
+        config.dial_timeout = ms(8_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(rung_hi(1_000)).await;
+        assert_eq!(dialer.count_for(p), 1, "first dial dispatched and parked");
+
+        // Dropped arrives while the dial is still genuinely in flight — no
+        // mark_connected ever ran for this peer.
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(rung_hi(1_000) + ms(500)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            1,
+            "re-armed schedule stays suppressed while the stale dial is in flight"
+        );
+
+        // The stale dial times out → in-flight clears, its stale-epoch result
+        // is discarded, and the re-armed (long overdue) rung dispatches.
+        tokio::time::sleep(ms(10_000)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            2,
+            "re-dial dispatches once the stale dial resolves via dial_timeout"
         );
         dialer.release();
     }
