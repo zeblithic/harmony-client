@@ -81,6 +81,7 @@ async fn build_server_endpoint() -> Arc<IrohEndpoint> {
             alpn::HARMONY_FRIEND_PEX_V1.to_vec(),
         ])
         .relay_mode(RelayMode::Disabled)
+        .dns_resolver(harmony_app::iroh_endpoint::hermetic_dns_resolver())
         .clear_ip_transports()
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .expect("bind_addr loopback")
@@ -100,6 +101,7 @@ async fn build_client_endpoint() -> Endpoint {
         .secret_key(secret)
         .alpns(vec![alpn::HARMONY_FRIEND_PEX_V1.to_vec()])
         .relay_mode(RelayMode::Disabled)
+        .dns_resolver(harmony_app::iroh_endpoint::hermetic_dns_resolver())
         .clear_ip_transports()
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .expect("bind_addr loopback")

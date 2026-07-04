@@ -164,6 +164,33 @@ impl IrohEndpoint {
         secret_key: SecretKey,
         custom_relays: Option<Vec<RelayUrl>>,
     ) -> Result<Self, IrohEndpointError> {
+        Self::new_with_secret_and_relays_inner(secret_key, custom_relays, None).await
+    }
+
+    /// ZEB-626: test seam. Same as [`Self::new_with_secret_and_relays`] but with
+    /// [`hermetic_dns_resolver`] injected, so N0-path unit tests (relay-map
+    /// logic) skip iroh's eager system-DNS-config read at bind — a synchronous
+    /// SystemConfiguration XPC that stalls ~22s/process on macOS for
+    /// unentitled processes (test binaries). Production uses the plain
+    /// constructor and iroh's default system resolver.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn new_with_secret_and_relays_hermetic_dns(
+        secret_key: SecretKey,
+        custom_relays: Option<Vec<RelayUrl>>,
+    ) -> Result<Self, IrohEndpointError> {
+        Self::new_with_secret_and_relays_inner(
+            secret_key,
+            custom_relays,
+            Some(hermetic_dns_resolver()),
+        )
+        .await
+    }
+
+    async fn new_with_secret_and_relays_inner(
+        secret_key: SecretKey,
+        custom_relays: Option<Vec<RelayUrl>>,
+        dns_resolver: Option<iroh::dns::DnsResolver>,
+    ) -> Result<Self, IrohEndpointError> {
         let builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![
@@ -196,6 +223,10 @@ impl IrohEndpoint {
                     .collect();
                 (builder, set)
             }
+        };
+        let builder = match dns_resolver {
+            Some(resolver) => builder.dns_resolver(resolver),
+            None => builder,
         };
         let inner = builder
             .bind()
@@ -507,6 +538,7 @@ fn load_or_create_secret_key_inner(
 pub async fn warm_up_iroh_global_init() {
     let builder = Endpoint::builder(presets::Minimal)
         .relay_mode(iroh::endpoint::RelayMode::Disabled)
+        .dns_resolver(hermetic_dns_resolver())
         .clear_ip_transports()
         .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("warm-up bind_addr loopback");
@@ -519,6 +551,19 @@ pub async fn warm_up_iroh_global_init() {
         )
         .expect("warm-up iroh bind");
     ep.close().await;
+}
+
+/// ZEB-626: a DNS resolver for hermetic test endpoints that never reads the
+/// system DNS configuration. iroh's `Builder::bind` eagerly constructs the
+/// system resolver when none is supplied, and hickory's macOS
+/// `read_system_conf` blocks in `SCDynamicStoreCreateWithOptions` — a
+/// synchronous SystemConfiguration XPC that stalls ~22s/process for
+/// unentitled callers (every test binary). Hermetic tests dial loopback by
+/// address with relays disabled and never resolve a name, so the nameserver
+/// below (loopback port 1) is intentionally unanswering.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn hermetic_dns_resolver() -> iroh::dns::DnsResolver {
+    iroh::dns::DnsResolver::with_nameserver(std::net::SocketAddr::from(([127, 0, 0, 1], 1)))
 }
 
 #[cfg(test)]
@@ -552,6 +597,7 @@ mod tests {
                 alpn::HARMONY_TUNNEL_V2.to_vec(),
             ])
             .relay_mode(RelayMode::Disabled)
+            .dns_resolver(hermetic_dns_resolver())
             .bind()
             .await
             .expect("bind ephemeral endpoint");
@@ -619,9 +665,12 @@ mod tests {
         let custom: RelayUrl = "https://relay.example.com"
             .parse()
             .expect("parse custom relay url");
-        let ep = IrohEndpoint::new_with_secret_and_relays(secret, Some(vec![custom.clone()]))
-            .await
-            .expect("bind endpoint with custom relay");
+        let ep = IrohEndpoint::new_with_secret_and_relays_hermetic_dns(
+            secret,
+            Some(vec![custom.clone()]),
+        )
+        .await
+        .expect("bind endpoint with custom relay");
         assert_eq!(
             relay_url_set(&ep),
             std::collections::BTreeSet::from([custom.clone()])
@@ -638,9 +687,10 @@ mod tests {
         let secret = SecretKey::generate();
         let a: RelayUrl = "https://relay-a.example.com".parse().expect("parse A");
         let b: RelayUrl = "https://relay-b.example.com".parse().expect("parse B");
-        let ep = IrohEndpoint::new_with_secret_and_relays(secret, Some(vec![a.clone()]))
-            .await
-            .expect("bind endpoint with [A]");
+        let ep =
+            IrohEndpoint::new_with_secret_and_relays_hermetic_dns(secret, Some(vec![a.clone()]))
+                .await
+                .expect("bind endpoint with [A]");
         assert_eq!(
             relay_url_set(&ep),
             std::collections::BTreeSet::from([a.clone()])
@@ -676,5 +726,25 @@ mod tests {
             b"harmony/butler-deposit/v1"
         );
         assert_eq!(alpn::HARMONY_TUNNEL_V1, b"harmony/tunnel/v1");
+    }
+
+    /// ZEB-626 patch-presence tripwire. The vendored netdev
+    /// (vendor/netdev/README.zeblithic.md) must never compute
+    /// transmit_speed on macOS: the upstream implementation stalls
+    /// ~60s/process in a synchronous CoreWLAN->wifid XPC call, paid inside
+    /// the first Endpoint::bind() of every process via netwatch. If this
+    /// fails, an unpatched netdev re-entered the graph (likely a
+    /// netwatch/iroh bump) — refresh vendor/netdev per its README.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn vendored_netdev_never_computes_transmit_speed_on_macos() {
+        for iface in netdev::interface::get_interfaces() {
+            assert!(
+                iface.transmit_speed.is_none(),
+                "interface {} has transmit_speed {:?} — unpatched netdev in the graph (ZEB-626)",
+                iface.name,
+                iface.transmit_speed
+            );
+        }
     }
 }

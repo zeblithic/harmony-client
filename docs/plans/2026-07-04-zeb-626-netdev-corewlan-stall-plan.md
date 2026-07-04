@@ -224,6 +224,51 @@ Nothing consumes transmit_speed; the vendored copy sets it to None.
 [patch.crates-io] substitution graph-wide + macOS guard test."
 ```
 
+### Task 1b: hermetic DNS resolver (second stall, discovered by Task 1's probe)
+
+Task 1's probe left a fixed ~22s/process residue (66s → 22.1s, identical for Minimal and N0
+shapes). Sample: `Builder::bind` → `iroh_dns::dns::DnsResolver::new` → `HickoryResolver::
+system_config` → `hickory_resolver::system_conf::apple::read_system_conf` →
+`SCDynamicStoreCreateWithOptions` — a second synchronous SystemConfiguration XPC (configd this
+time), stalled for unentitled processes. iroh builds the system resolver eagerly at bind unless
+`Builder::dns_resolver(DnsResolver)` is supplied; `DnsResolver::with_nameserver(SocketAddr)`
+(iroh-dns 1.0.1 dns.rs:351) builds without reading system conf. Hermetic tests never resolve
+names (loopback dials by addr, relays disabled), so they get a resolver pointed at an
+unanswering loopback port.
+
+**Files:** `src-tauri/src/iroh_endpoint.rs` (helper + `*_inner` seam + warm_up + 3 N0 unit
+tests), the 5 other src hermetic builder sites (`tunnel_task.rs`, `zenoh_iroh_transport.rs`,
+`reachability_publisher.rs`, `lib.rs`, `zenoh_iroh_link.rs` ×2), the 10 integration builder
+sites (`pkarr_iroh_redeem_full`, `zeb_373_dynamic_dial`, `referral_catalog_roundtrip` ×2,
+`network_health_two_endpoint` ×2, `friend_token_roundtrip`, `iroh_zenoh_registration`,
+`community_open_join_cross_wan`, `community_misc/community_reachability_two_engine`).
+
+- [ ] **Step 1:** Add to `iroh_endpoint.rs` (near `warm_up_iroh_global_init`, pub under
+  `#[cfg(any(test, feature = "test-fixtures"))]`):
+
+```rust
+pub fn hermetic_dns_resolver() -> iroh::dns::DnsResolver {
+    iroh::dns::DnsResolver::with_nameserver(std::net::SocketAddr::from(([127, 0, 0, 1], 1)))
+}
+```
+
+- [ ] **Step 2:** Split `new_with_secret_and_relays` into an `*_inner(secret, relays,
+  dns_resolver: Option<DnsResolver>)` (prod wrapper passes `None`; builder chains
+  `.dns_resolver(r)` when `Some`) + a `#[cfg(any(test, feature = "test-fixtures"))]`
+  `new_with_secret_and_relays_hermetic_dns` passing `Some(hermetic_dns_resolver())`. Switch the
+  3 N0-path unit tests (`iroh_endpoint_inits_with_ephemeral_secret`,
+  `custom_relay_list_overrides_default_map`, `apply_relay_urls_diffs_insert_and_remove`) to the
+  hermetic-dns variant (they test relay-map logic, not DNS). Production behavior unchanged.
+- [ ] **Step 3:** Add `.dns_resolver(hermetic_dns_resolver())` (or the
+  `harmony_app::iroh_endpoint::hermetic_dns_resolver()` path from integration tests) to the
+  warm_up builder and every hermetic `Endpoint::builder(presets::Minimal)` site listed above.
+- [ ] **Step 4:** Re-run the Task 1 Step 9 probe pair + the referral direct-run. Expected: both
+  drop from ~22s to low single digits; that measured value becomes **T1_SECS**.
+- [ ] **Step 5:** Commit (`ZEB-626: hermetic DNS resolver — skip eager system-conf read at test bind`).
+- [ ] **Step 6:** Append the iroh_dns eager-`read_system_conf` finding to the ZEB-632 dossier
+  (second would-be-upstream ask: build the system resolver lazily / skip when unused; prod macOS
+  boot keeps this ~22s until upstream changes it — only tests are fixed by this task).
+
 ### Task 2: De-containment + timeout revert + warm_up doc correction
 
 **Files:**
