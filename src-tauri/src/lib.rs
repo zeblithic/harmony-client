@@ -48862,6 +48862,268 @@ pub(crate) async fn decline_friend_request_impl(
     Ok(())
 }
 
+// ── ZEB-236 Task 4: staged non-friend DM-invite consent trio ─────────
+//
+// Three commands surfacing the process-local pending DM-invite inbox to the
+// frontend (mirrors the Path-A friend trio above):
+//
+//   * `list_pending_dm_invites` — project the process-local pending store.
+//   * `accept_dm_invite` — run the SHARED accept tail the friend-tier
+//     auto-accept runs (`dm_outbox::run_invite_accept_tail`): write the DM
+//     Space and, when the ingest route entitled it, refresh the inviter's
+//     OwnerDeviceCache; then arm the owner-state debounced publish+persist so
+//     the Space survives a clean shutdown and replicates to the user's other
+//     devices, and surface it on the nav tree.
+//   * `decline_dm_invite` — DROP the staged invite. Spec §"DmInvite rejection /
+//     decline semantics (v1)": write NOTHING durable and notify no one — a
+//     decline is indistinguishable from the receiver being offline.
+
+/// ZEB-236: one staged inbound DM invite surfaced to the frontend. Deliberately
+/// projects ONLY routing/display fields — never `content_key` or
+/// `inviter_identity_pub` (trust-secret material stays backend-side).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingDmInviteDto {
+    /// The invited Space's 16-byte `SpaceId`, hex-encoded.
+    pub space_id_hex: String,
+    /// The inviter's 16-byte master `owner_id`, hex-encoded.
+    pub inviter_owner_id_hex: String,
+    /// Dm vs GroupDm (serde: "d" / "g").
+    pub kind: crate::owner_state_types::SpaceKind,
+    /// All member `owner_id`s (incl. inviter + self), each hex-encoded.
+    pub member_owner_ids_hex: Vec<String>,
+    /// The invite's claimed creation HLC wall-clock (epoch-ms).
+    pub created_at_ms: u64,
+    /// Epoch-ms this invite was first staged locally.
+    pub received_at_ms: u64,
+}
+
+/// Project the process-local staged-invite store into the frontend DTO list.
+/// Pure over the store so it's unit-testable without a NodeState harness.
+pub fn list_pending_dm_invites_inner(
+    store: &crate::pending_dm_invites::PendingDmInvites,
+) -> Vec<PendingDmInviteDto> {
+    let mut rows: Vec<PendingDmInviteDto> = store
+        .list()
+        .into_iter()
+        .map(|s| PendingDmInviteDto {
+            space_id_hex: hex::encode(s.signed.space_id.0),
+            inviter_owner_id_hex: hex::encode(s.signed.inviter.0),
+            kind: s.signed.kind,
+            member_owner_ids_hex: s.signed.members.iter().map(|m| hex::encode(m.0)).collect(),
+            created_at_ms: s.signed.created_at.wall_ms,
+            received_at_ms: s.received_at_ms,
+        })
+        .collect();
+    rows.sort_by_key(|r| r.received_at_ms); // deterministic list order
+    rows
+}
+
+/// Decode a 16-byte `SpaceId` from hex, shared by the accept/decline IPCs
+/// (mirrors `decode_owner_id_16`).
+fn decode_space_id_16(space_id_hex: &str) -> Result<crate::owner_state_types::SpaceId, String> {
+    let bytes: [u8; 16] = hex::decode(space_id_hex)
+        .map_err(|e| format!("invalid space_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
+    Ok(crate::owner_state_types::SpaceId(bytes))
+}
+
+/// List the process-local staged inbound DM invites (ZEB-236) for the frontend
+/// inbox. Returns an empty list when the store isn't wired (pre-`start_node` /
+/// owner not loaded) rather than erroring — mirrors
+/// `list_pending_friend_requests`.
+#[tauri::command]
+async fn list_pending_dm_invites(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<PendingDmInviteDto>, String> {
+    list_pending_dm_invites_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_pending_dm_invites_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Vec<PendingDmInviteDto>, String> {
+    let store = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pending_dm_invites
+            .clone()
+    };
+    let Some(store) = store else {
+        return Ok(Vec::new());
+    };
+    Ok(list_pending_dm_invites_inner(&store))
+}
+
+/// Accept a staged inbound DM invite (ZEB-236): run the SAME accept tail the
+/// friend-tier auto-accept runs (`dm_outbox::run_invite_accept_tail`) — write
+/// the DM Space and, when the ingest route entitled it, refresh the inviter's
+/// OwnerDeviceCache — then arm the owner-state debounced publish+persist so the
+/// accepted Space both persists (clean shutdown) and replicates to the user's
+/// other devices, and surface it on the nav tree. The invite was
+/// signature-verified at staging time; accept does NOT re-verify.
+#[tauri::command]
+async fn accept_dm_invite(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    space_id: String,
+) -> Result<(), String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    accept_dm_invite_impl(state.inner(), sink, space_id).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn accept_dm_invite_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    space_id_hex: String,
+) -> Result<(), String> {
+    let space_id = decode_space_id_16(&space_id_hex)?;
+    // Snapshot the handles under the std Mutex, then DROP the lock before any
+    // `.await` (mirrors `unfriend` / `set_friend_referrable` — NodeState's sync
+    // mutex must never span an `.await`).
+    let (store, crdt_state, device_id, sync_engine) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pending_dm_invites.clone(),
+            g.crdt_state.clone(),
+            g.dm_device_id.clone(),
+            g.sync_engine.clone(),
+        )
+    };
+    let (Some(store), Some(crdt_state), Some(device_id)) = (store, crdt_state, device_id) else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+    let Some(staged) = store.take(&space_id) else {
+        return Err("no pending DM invite for space".into());
+    };
+    // RE-STAGE guard: keep a clone BEFORE we consume `staged.signed` into the
+    // accept tail, so a transient apply failure re-stages the invite rather than
+    // silently swallowing it (a lost accept is otherwise indistinguishable from
+    // a decline — spec: decline writes no state).
+    let restage_copy = staged.clone();
+    // ACCEPT-TIME wall clock — NOT the staged `received_at_ms`. The tail records
+    // this as the OwnerDeviceCache `learned_at` HLC; using the invite-claimed
+    // time would let a forged far-future HLC pin the local cache (see the tail's
+    // SECURITY comment on anti-HLC-pinning). Same rationale applies here at the
+    // deferred-accept call site.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Capture the Space's display shape for the nav emit BEFORE `signed` moves
+    // into the tail.
+    let kind = staged.signed.kind;
+    let inviter_hex = hex::encode(staged.signed.inviter.0);
+    let members_hex: Vec<String> = staged
+        .signed
+        .members
+        .iter()
+        .map(|m| hex::encode(m.0))
+        .collect();
+
+    // Run the accept tail under the owner-state lock, then DROP the guard before
+    // touching the store / sink (the store `Mutex` + event sink must not nest
+    // inside the held `crdt_state` lock — ZEB-236 T3 caller contract).
+    let apply_result = {
+        let mut g = crdt_state.lock().await;
+        crate::dm_outbox::run_invite_accept_tail(
+            &mut g,
+            &device_id,
+            staged.signed,
+            now_ms,
+            staged.refresh_owner_device_cache,
+        )
+    };
+    if let Err(e) = apply_result {
+        // Transient failure — re-stage so it isn't a silent decline.
+        store.stage(restage_copy);
+        return Err(format!("accept failed: {e:?}"));
+    }
+
+    // Owner-state mutated (new DM Space, maybe OwnerDeviceCache) → arm the
+    // debounced publish-root + persist on the owner-state SyncEngine so the
+    // accepted Space survives a clean shutdown and reaches the user's other
+    // devices. Mirrors `unfriend` / `set_friend_referrable`. (NOTE: `add_space`
+    // — the brief's named exemplar — omits this arming; see the task report's
+    // "deviation" note for why the notify_dirty sibling pattern governs here.)
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
+    }
+
+    // Refresh the DM-invite inbox (the row is gone) and surface the new Space on
+    // the nav tree so it appears without a manual reload.
+    crate::node_event_sink::emit_ser(sink.as_ref(), "dm-invite-list-changed", &());
+    let nav_kind = match kind {
+        crate::owner_state_types::SpaceKind::GroupDm => "group-dm",
+        _ => "dm",
+    };
+    crate::node_event_sink::emit_ser(
+        sink.as_ref(),
+        "nav-updated",
+        &NavUpdatedPayload {
+            action: "added",
+            space_id: space_id_hex,
+            kind: nav_kind,
+            // Mirror the Space name `run_invite_accept_tail` builds; the
+            // frontend replaces it with the resolved peer profile name.
+            name: format!("DM with {inviter_hex}"),
+            members: Some(members_hex),
+            parent_id: None,
+            pending: None,
+        },
+    );
+    Ok(())
+}
+
+/// Decline a staged inbound DM invite (ZEB-236). Spec §"DmInvite rejection /
+/// decline semantics (v1)": DROP the staged invite and write NOTHING durable —
+/// no Space, no cache, no tombstone — and send NO notification to the inviter.
+/// A decline is therefore indistinguishable from the receiver being offline
+/// (the process-local store is the only place the invite ever lived; a later
+/// ZEB-483 redelivery re-prompts). Emits ONLY `dm-invite-list-changed` so the
+/// inbox row disappears.
+#[tauri::command]
+async fn decline_dm_invite(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    space_id: String,
+) -> Result<(), String> {
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    decline_dm_invite_impl(state.inner(), sink, space_id).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn decline_dm_invite_impl(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    space_id_hex: String,
+) -> Result<(), String> {
+    let space_id = decode_space_id_16(&space_id_hex)?;
+    let store = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pending_dm_invites
+            .clone()
+    };
+    let Some(store) = store else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+    if store.take(&space_id).is_none() {
+        return Err("no pending DM invite for space".into());
+    }
+    // `take()` already dropped the staged invite — decline writes no durable
+    // state and notifies no one (spec).
+    crate::node_event_sink::emit_ser(sink.as_ref(), "dm-invite-list-changed", &());
+    Ok(())
+}
+
 /// Set the per-user "auto-accept known requesters" toggle (spec §7.1) and
 /// persist it to `connectivity-settings.json` (mirroring
 /// `connectivity_set_identity_discoverable`).
@@ -50239,6 +50501,76 @@ mod friend_ipc_tests {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
         assert!(list_pending_friend_requests_inner(&store).is_empty());
+    }
+
+    // ── ZEB-236 Task 4: DM-invite projector ──────────────────────────────
+
+    #[test]
+    fn list_pending_dm_invites_inner_projects_and_hides_secret_material() {
+        use crate::pending_dm_invites::{PendingDmInvites, StagedDmInvite};
+        let store = PendingDmInvites::new();
+        let signed = crate::dm_envelope::test_fixtures::minimal_invite_for_space(0x11);
+        assert!(store.stage(StagedDmInvite {
+            signed: signed.clone(),
+            received_at_ms: 4_242,
+            refresh_owner_device_cache: true,
+        }));
+
+        let rows = list_pending_dm_invites_inner(&store);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.space_id_hex, hex::encode(signed.space_id.0));
+        assert_eq!(row.inviter_owner_id_hex, hex::encode(signed.inviter.0));
+        assert_eq!(row.kind, signed.kind);
+        assert_eq!(
+            row.member_owner_ids_hex,
+            signed
+                .members
+                .iter()
+                .map(|m| hex::encode(m.0))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(row.created_at_ms, signed.created_at.wall_ms);
+        assert_eq!(row.received_at_ms, 4_242);
+
+        // Pin the no-secret-material property: EXACTLY the six camelCase keys —
+        // never `contentKey` / `inviterIdentityPub`.
+        let json = serde_json::to_value(row).expect("serialize DTO");
+        let obj = json.as_object().expect("DTO serializes to a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "createdAtMs",
+                "inviterOwnerIdHex",
+                "kind",
+                "memberOwnerIdsHex",
+                "receivedAtMs",
+                "spaceIdHex",
+            ],
+            "DTO must expose exactly the six routing/display keys (no trust-secret material)"
+        );
+    }
+
+    #[test]
+    fn list_pending_dm_invites_inner_sorts_by_received_at_and_empty_is_empty() {
+        use crate::pending_dm_invites::{PendingDmInvites, StagedDmInvite};
+        let store = PendingDmInvites::new();
+        assert!(list_pending_dm_invites_inner(&store).is_empty());
+        // Stage out of order — the projector must return them by received_at_ms.
+        for (space, ms) in [(0x22u8, 3_000u64), (0x21, 1_000), (0x23, 2_000)] {
+            assert!(store.stage(StagedDmInvite {
+                signed: crate::dm_envelope::test_fixtures::minimal_invite_for_space(space),
+                received_at_ms: ms,
+                refresh_owner_device_cache: false,
+            }));
+        }
+        let order: Vec<u64> = list_pending_dm_invites_inner(&store)
+            .iter()
+            .map(|r| r.received_at_ms)
+            .collect();
+        assert_eq!(order, vec![1_000, 2_000, 3_000], "sorted by received_at_ms");
     }
 
     #[test]
@@ -52208,6 +52540,10 @@ pub fn run() {
             list_pending_friend_requests,
             accept_friend_request,
             decline_friend_request,
+            // ZEB-236 Task 4: staged non-friend DM-invite consent trio.
+            list_pending_dm_invites,
+            accept_dm_invite,
+            decline_dm_invite,
             set_friend_auto_accept,
             get_friend_auto_accept,
             set_friend_nickname,

@@ -277,6 +277,13 @@ struct OwnerIdHexArgs {
     owner_id_hex: String,
 }
 
+/// ZEB-236: accept/decline a staged DM invite, keyed by hex `SpaceId`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpaceIdHexArgs {
+    space_id: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AddSpaceArgs {
@@ -751,6 +758,26 @@ pub fn build_registry() -> RpcRegistry {
         |state, sink, a| async move {
             crate::decline_friend_request_impl(state, sink, a.owner_id_hex).await
         }
+    );
+
+    // DM invites (ZEB-236): the staged non-friend invite consent trio.
+    rpc!(
+        m,
+        "list_pending_dm_invites",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_pending_dm_invites_impl(state).await }
+    );
+    rpc!(
+        m,
+        "accept_dm_invite",
+        SpaceIdHexArgs,
+        |state, sink, a| async move { crate::accept_dm_invite_impl(state, sink, a.space_id).await }
+    );
+    rpc!(
+        m,
+        "decline_dm_invite",
+        SpaceIdHexArgs,
+        |state, sink, a| async move { crate::decline_dm_invite_impl(state, sink, a.space_id).await }
     );
 
     // Spaces / DMs.
@@ -1462,6 +1489,10 @@ mod tests {
             "list_pending_friend_requests",
             "accept_friend_request",
             "decline_friend_request",
+            // DM invites (ZEB-236)
+            "list_pending_dm_invites",
+            "accept_dm_invite",
+            "decline_dm_invite",
             // spaces / DMs
             "add_space",
             "send_dm",
