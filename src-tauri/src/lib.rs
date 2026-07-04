@@ -5903,8 +5903,28 @@ pub async fn start_node_inner(
                                                 // remove_owner below).
                                                 community_relay_resolver
                                                     .remove_advertiser(&community_id, &event.actor);
+                                                // ZEB-627: capture the leaver's
+                                                // device node-ids BEFORE the
+                                                // resolver forgets them (read
+                                                // precedes the destructive
+                                                // write), to evict their
+                                                // reconnect-supervisor slots.
+                                                let departed_nodes: Vec<[u8; 32]> = resolver
+                                                    .resolve(&event.actor)
+                                                    .into_iter()
+                                                    .map(|p| p.iroh_node_id)
+                                                    .collect();
                                                 let n = resolver.remove_owner(&event.actor);
                                                 if n > 0 {
+                                                    // ZEB-627: a departed peer
+                                                    // must not stay scheduled
+                                                    // (or parked Dormant) for
+                                                    // process life.
+                                                    if let Some(sup) = resolver.supervisor() {
+                                                        for node in &departed_nodes {
+                                                            sup.evict_peer(*node);
+                                                        }
+                                                    }
                                                     // ZEB-329: see comment above.
                                                     if let Some(nh) = network_health_cell
                                                         .read()
@@ -5922,8 +5942,20 @@ pub async fn start_node_inner(
                                                 // (mirrors remove_owner below).
                                                 community_relay_resolver
                                                     .remove_advertiser(&community_id, target);
+                                                // ZEB-627: capture-then-evict,
+                                                // as in the Leave arm above.
+                                                let departed_nodes: Vec<[u8; 32]> = resolver
+                                                    .resolve(target)
+                                                    .into_iter()
+                                                    .map(|p| p.iroh_node_id)
+                                                    .collect();
                                                 let n = resolver.remove_owner(target);
                                                 if n > 0 {
+                                                    if let Some(sup) = resolver.supervisor() {
+                                                        for node in &departed_nodes {
+                                                            sup.evict_peer(*node);
+                                                        }
+                                                    }
                                                     // ZEB-329: see comment above.
                                                     if let Some(nh) = network_health_cell
                                                         .read()
@@ -10246,7 +10278,7 @@ pub async fn start_node_inner(
             // `pkarr_relay_client` was still `None`, so that IPC's hot-swap
             // was skipped and the live pool would otherwise lag
             // connectivity-settings.json until the next mutation or restart.
-            // Hold the same relay write lock the mutators take so a
+            // Hold the same connectivity-settings write lock the mutators take so a
             // concurrent mutation can't interleave between the disk read and
             // `set_relays`; the generation guard skips a pool a newer
             // start_node now owns. The `relay_health()` vs effective compare
@@ -10254,7 +10286,7 @@ pub async fn start_node_inner(
             // already hot-swapped) — `set_relays` only fires on a genuinely
             // stale boot pool, so the common path resets no per-relay health.
             {
-                let _relay_boot_guard = pkarr_relay_write_lock().lock().await;
+                let _relay_boot_guard = connectivity_settings_write_lock().lock().await;
                 let target = {
                     let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                     if guard.generation != our_gen {
@@ -10302,13 +10334,14 @@ pub async fn start_node_inner(
             // which point `iroh_endpoint` was still None on NodeState, so that
             // IPC's live diff-apply was skipped) — without this the endpoint's
             // relay map would lag connectivity-settings.json until the next
-            // mutation or restart. Hold the same write lock the mutators take;
+            // mutation or restart. Hold the same connectivity-settings write
+            // lock the mutators take;
             // the generation guard skips an endpoint a newer start_node owns. The
             // diff is `RelayUrl`-valued (`apply_relay_urls`), so it's a genuine
             // no-op when the relay set already matches — the common path applies
             // nothing.
             {
-                let _relay_boot_guard = iroh_relay_write_lock().lock().await;
+                let _relay_boot_guard = connectivity_settings_write_lock().lock().await;
                 let target = {
                     let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                     if guard.generation != our_gen {
@@ -32035,9 +32068,13 @@ async fn set_presence_visibility(
     // over the async IPC/headless surface (matches connectivity_set_identity_
     // discoverable; PR #207/#305).
     let path = connectivity_settings_path(settings_path)?;
-    tokio::task::spawn_blocking(move || persist_presence_visibility(&path, visible))
-        .await
-        .map_err(|e| format!("persist presence visibility task: {e}"))??;
+    {
+        // ZEB-629: file RMW under the process-global settings write lock.
+        let _settings_guard = connectivity_settings_write_lock().lock().await;
+        tokio::task::spawn_blocking(move || persist_presence_visibility(&path, visible))
+            .await
+            .map_err(|e| format!("persist presence visibility task: {e}"))??;
+    }
 
     // Notify the frontend so any panel showing self-presence (e.g. the member
     // list self-dot) re-renders without polling. Mirrors the identity-
@@ -46776,15 +46813,19 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
 
     // Persist the preference. Offload the sync std::fs load+save off the Tokio
     // worker — this seam is reachable over the async headless API surface.
-    tokio::task::spawn_blocking(move || {
-        let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
-        settings.identity_discoverable = enabled;
-        settings
-            .save(&path)
-            .map_err(|e| format!("save connectivity-settings: {e}"))
-    })
-    .await
-    .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    {
+        // ZEB-629: file RMW under the process-global settings write lock.
+        let _settings_guard = connectivity_settings_write_lock().lock().await;
+        tokio::task::spawn_blocking(move || {
+            let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+            settings.identity_discoverable = enabled;
+            settings
+                .save(&path)
+                .map_err(|e| format!("save connectivity-settings: {e}"))
+        })
+        .await
+        .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    }
 
     // Toggle the publication.
     if enabled {
@@ -47102,16 +47143,23 @@ mod identity_republish_gate_tests {
     }
 }
 
-/// ZEB-380: serializes all pkarr-relay settings mutations (add/remove/set/reset)
-/// so a concurrent read-modify-write from another window can't lose an update.
-/// Process-global because connectivity-settings.json is a single per-process
-/// file. Separate from the NodeState mutex (which `apply_pkarr_relays` takes),
-/// so there is no lock-ordering/deadlock concern.
-static PKARR_RELAY_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+/// ZEB-629: serializes EVERY read-modify-write of `connectivity-settings.json`
+/// — pkarr relays, iroh relays, presence visibility, identity
+/// discoverability, friend auto-accept, and the two boot reconciles. The file
+/// is a single per-process whole-file save target, so writers under different
+/// locks (the former PKARR/IROH pair) — or under none (the three toggles) —
+/// could interleave load/load/save/save and silently drop each other's field
+/// (ZEB-623/624 final-review findings (j)/(m)). One process-global lock
+/// closes every pairing. LOCK ORDER: always acquired BEFORE the NodeState
+/// mutex, never while holding it (matches the pre-unification relay-lock
+/// convention — see `get_iroh_relays`' round-2 note). Readers other than
+/// `get_iroh_relays` (which pairs the custom flag with the live list) stay
+/// lock-free: `save` renames atomically, so they always see a complete file.
+static CONNECTIVITY_SETTINGS_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
-fn pkarr_relay_write_lock() -> &'static tokio::sync::Mutex<()> {
-    PKARR_RELAY_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+fn connectivity_settings_write_lock() -> &'static tokio::sync::Mutex<()> {
+    CONNECTIVITY_SETTINGS_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// ZEB-380: replace the user-configurable pkarr relay list. Validates, persists
@@ -47122,7 +47170,7 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
     relays: Vec<String>,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
-    let _relay_write_guard = pkarr_relay_write_lock().lock().await;
+    let _relay_write_guard = connectivity_settings_write_lock().lock().await;
     let validated = crate::connectivity_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
 }
@@ -47135,7 +47183,7 @@ async fn reset_pkarr_relays<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
-    let _relay_write_guard = pkarr_relay_write_lock().lock().await;
+    let _relay_write_guard = connectivity_settings_write_lock().lock().await;
     // default_pkarr_relays() is always valid; run it through the validator anyway so
     // any future change to the defaults is held to the same contract.
     let validated = crate::connectivity_settings::validate_relay_urls(
@@ -47156,7 +47204,7 @@ async fn add_pkarr_relay<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
-    let _relay_write_guard = pkarr_relay_write_lock().lock().await;
+    let _relay_write_guard = connectivity_settings_write_lock().lock().await;
     let settings_path = {
         let guard = state
             .lock()
@@ -47186,7 +47234,7 @@ async fn remove_pkarr_relay<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
-    let _relay_write_guard = pkarr_relay_write_lock().lock().await;
+    let _relay_write_guard = connectivity_settings_write_lock().lock().await;
     let settings_path = {
         let guard = state
             .lock()
@@ -47245,9 +47293,10 @@ async fn get_pkarr_relays(
 // SAME `connectivity-settings.json`; an EMPTY list is the sentinel for "follow
 // the iroh preset's default relay map" (n0 stable), so `reset` writes `[]` and
 // `set` requires >=1 (`validate_iroh_relay_urls` rejects empty). Mutations are
-// serialized by `iroh_relay_write_lock()` (separate from the NodeState mutex, so
-// no lock-ordering concern), persisted, then live-diff-applied to the running
-// endpoint (no restart) and announced via `iroh-relays-changed`.
+// serialized by `connectivity_settings_write_lock()` (ZEB-629: the process-
+// global settings-file lock, always taken BEFORE the NodeState mutex),
+// persisted, then live-diff-applied to the running endpoint (no restart) and
+// announced via `iroh-relays-changed`.
 
 /// ZEB-624: the wire shape every iroh-relay verb returns. `relays` is the
 /// EFFECTIVE relay URL list (the custom list, or the materialized preset
@@ -47304,21 +47353,45 @@ fn iroh_target_relay_urls(settings: &connectivity_settings::ConnectivitySettings
     connectivity_settings::effective_iroh_relays(settings).unwrap_or_else(iroh_default_relay_urls)
 }
 
-/// ZEB-624: serializes all iroh-relay settings mutations (add/remove/set/reset)
-/// so a concurrent read-modify-write from another window can't lose an update.
-/// Process-global (single per-process settings file); separate from both the
-/// NodeState mutex and `PKARR_RELAY_WRITE_LOCK`, so no lock-ordering concern.
-static IROH_RELAY_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
+/// ZEB-630: pure RMW core of `add_iroh_relay` — materialize the EFFECTIVE
+/// list (preset defaults on a defaults-following node), append, validate
+/// (dedups, caps at `MAX_IROH_RELAYS`). Extracted from the IPC so the
+/// materialization behavior is unit-testable without a Tauri runtime.
+fn add_iroh_relay_target(
+    settings: &connectivity_settings::ConnectivitySettings,
+    url: &str,
+) -> Result<Vec<String>, String> {
+    let mut relays = iroh_target_relay_urls(settings);
+    relays.push(url.to_string());
+    connectivity_settings::validate_iroh_relay_urls(relays)
+}
 
-fn iroh_relay_write_lock() -> &'static tokio::sync::Mutex<()> {
-    IROH_RELAY_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+/// ZEB-630: pure RMW core of `remove_iroh_relay` — filter the EFFECTIVE list
+/// (trailing-slash-normalized match), reject removing the last relay (use
+/// reset to follow defaults), validate. Extracted so the last-relay guard is
+/// covered by a unit test rather than a simulation.
+fn remove_iroh_relay_target(
+    settings: &connectivity_settings::ConnectivitySettings,
+    url: &str,
+) -> Result<Vec<String>, String> {
+    let target = url.trim().trim_end_matches('/');
+    let remaining: Vec<String> = iroh_target_relay_urls(settings)
+        .into_iter()
+        .filter(|r| r.trim_end_matches('/') != target)
+        .collect();
+    if remaining.is_empty() {
+        return Err(
+            "cannot remove the last iroh relay; use reset to follow the built-in defaults instead"
+                .to_string(),
+        );
+    }
+    connectivity_settings::validate_iroh_relay_urls(remaining)
 }
 
 /// ZEB-624: persist an ALREADY-VALIDATED iroh relay list (empty = reset =
 /// follow-defaults sentinel), live-diff-apply the effective target to the
 /// running endpoint if any, emit `iroh-relays-changed`, and return the wire.
-/// The iroh mirror of `apply_pkarr_relays`. Callers hold `iroh_relay_write_lock()`.
+/// The iroh mirror of `apply_pkarr_relays`. Callers hold `connectivity_settings_write_lock()`.
 async fn apply_iroh_relays<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &tauri::State<'_, Mutex<NodeState>>,
@@ -47377,7 +47450,7 @@ async fn get_iroh_relays(
     // `custom` flag with the OLD live relay list. Taken at the TOP, BEFORE the
     // NodeState mutex — matching the mutators' lock order (`add`/`remove` acquire
     // the write lock first, then the NodeState mutex) so we never invert it.
-    let _relay_read_guard = iroh_relay_write_lock().lock().await;
+    let _relay_read_guard = connectivity_settings_write_lock().lock().await;
     let (settings_path, endpoint) = {
         let guard = state
             .lock()
@@ -47407,7 +47480,7 @@ async fn set_iroh_relays<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
     relays: Vec<String>,
 ) -> Result<IrohRelayWire, String> {
-    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let _relay_write_guard = connectivity_settings_write_lock().lock().await;
     let validated = connectivity_settings::validate_iroh_relay_urls(relays)?;
     apply_iroh_relays(&app, &state, validated).await
 }
@@ -47419,7 +47492,7 @@ async fn reset_iroh_relays<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<IrohRelayWire, String> {
-    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let _relay_write_guard = connectivity_settings_write_lock().lock().await;
     apply_iroh_relays(&app, &state, Vec::new()).await
 }
 
@@ -47434,7 +47507,7 @@ async fn add_iroh_relay<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
 ) -> Result<IrohRelayWire, String> {
-    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let _relay_write_guard = connectivity_settings_write_lock().lock().await;
     let settings_path = {
         let guard = state
             .lock()
@@ -47443,9 +47516,7 @@ async fn add_iroh_relay<R: tauri::Runtime>(
     };
     let path = connectivity_settings_path(settings_path)?;
     let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
-    let mut relays = iroh_target_relay_urls(&settings);
-    relays.push(url);
-    let validated = connectivity_settings::validate_iroh_relay_urls(relays)?;
+    let validated = add_iroh_relay_target(&settings, &url)?;
     apply_iroh_relays(&app, &state, validated).await
 }
 
@@ -47461,7 +47532,7 @@ async fn remove_iroh_relay<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
 ) -> Result<IrohRelayWire, String> {
-    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let _relay_write_guard = connectivity_settings_write_lock().lock().await;
     let settings_path = {
         let guard = state
             .lock()
@@ -47470,18 +47541,7 @@ async fn remove_iroh_relay<R: tauri::Runtime>(
     };
     let path = connectivity_settings_path(settings_path)?;
     let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
-    let target = url.trim().trim_end_matches('/');
-    let remaining: Vec<String> = iroh_target_relay_urls(&settings)
-        .into_iter()
-        .filter(|r| r.trim_end_matches('/') != target)
-        .collect();
-    if remaining.is_empty() {
-        return Err(
-            "cannot remove the last iroh relay; use reset to follow the built-in defaults instead"
-                .to_string(),
-        );
-    }
-    let validated = connectivity_settings::validate_iroh_relay_urls(remaining)?;
+    let validated = remove_iroh_relay_target(&settings, &url)?;
     apply_iroh_relays(&app, &state, validated).await
 }
 
@@ -48794,11 +48854,24 @@ async fn set_friend_auto_accept(
         return Err("connectivity_settings_path missing".into());
     };
 
-    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
-    settings.friend_auto_accept_known = enabled;
-    settings
-        .save(&path)
-        .map_err(|e| format!("save connectivity-settings: {e}"))?;
+    {
+        // ZEB-629: file RMW under the process-global settings write lock.
+        // CodeRabbit PR #397 R1: offload the sync load+save to spawn_blocking
+        // (mirrors connectivity_set_identity_discoverable_impl) so a Tokio
+        // worker isn't parked on disk I/O while the lock is held.
+        let _settings_guard = connectivity_settings_write_lock().lock().await;
+        let rmw_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut settings =
+                connectivity_settings::ConnectivitySettings::load_or_default(&rmw_path);
+            settings.friend_auto_accept_known = enabled;
+            settings
+                .save(&rmw_path)
+                .map_err(|e| format!("save connectivity-settings: {e}"))
+        })
+        .await
+        .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    }
 
     // Emit so the UI reflects the toggle (and can surface the "applies on next
     // start" hint).
@@ -50425,6 +50498,59 @@ mod friend_ipc_tests {
         assert!(
             result.is_err(),
             "remove-last: empty list is rejected by validator"
+        );
+    }
+
+    #[test]
+    fn add_remove_iroh_relay_read_modify_write() {
+        // ZEB-630: iroh mirror of add_remove_pkarr_relay_read_modify_write,
+        // driving the REAL RMW cores (add/remove_iroh_relay_target) that the
+        // IPCs delegate to — including the defaults-materialization on a
+        // defaults-following node and the inline last-relay rejection (which,
+        // unlike pkarr, is NOT in the validator).
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Defaults-following node: no custom iroh relays persisted.
+        let settings = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        assert!(
+            crate::connectivity_settings::effective_iroh_relays(&settings).is_none(),
+            "fresh settings follow defaults"
+        );
+        let defaults = crate::iroh_default_relay_urls();
+        assert!(!defaults.is_empty(), "preset defaults are non-empty");
+
+        // --- Add on a defaults-following node materializes defaults + new ---
+        let added = crate::add_iroh_relay_target(&settings, "https://relay.zeblithic.example")
+            .expect("valid add");
+        assert_eq!(added.len(), defaults.len() + 1, "defaults materialized + 1");
+        assert!(added.contains(&"https://relay.zeblithic.example".to_string()));
+        let mut s = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        s.iroh_relays = added.clone();
+        s.save(&path).expect("persist add");
+
+        // --- Re-add dedups (validator) ---
+        let s2 = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        let readded = crate::add_iroh_relay_target(&s2, "https://relay.zeblithic.example")
+            .expect("dedup add");
+        assert_eq!(readded.len(), added.len(), "re-add is a no-op");
+
+        // --- Remove one (trailing-slash-normalized) ---
+        let removed = crate::remove_iroh_relay_target(&s2, "https://relay.zeblithic.example/")
+            .expect("valid remove");
+        assert_eq!(removed.len(), added.len() - 1);
+        assert!(!removed.contains(&"https://relay.zeblithic.example".to_string()));
+
+        // --- Remove down to one, then the LAST one → inline guard fires ---
+        let mut one = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        one.iroh_relays = vec![removed[0].clone()];
+        one.save(&path).expect("persist single");
+        let s3 = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        let err = crate::remove_iroh_relay_target(&s3, &removed[0])
+            .expect_err("last-relay removal must be rejected");
+        assert_eq!(
+            err,
+            "cannot remove the last iroh relay; use reset to follow the built-in defaults instead"
         );
     }
 

@@ -2690,9 +2690,14 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
     // ZEB-501: the redeem oneshot now fires ONLY on a real JoinCountersign, so an
     // unreachable inviter (no countersign) genuinely reaches the step-7d timeout.
     // Both tests drive that timeout with a short `redeem_timeout` passed via
-    // `RedeemInviteOverrides` (50ms) — NOT the process-global
+    // `RedeemInviteOverrides` — NOT the process-global
     // HARMONY_REDEEM_INVITE_TIMEOUT_MS env var, so there is no cross-test env
-    // race (the one Qodo/CodeAnt flagged on #293).
+    // race (the one Qodo/CodeAnt flagged on #293). ZEB-633: 2s, not 50ms — the
+    // 50ms budget flaked once under a full-parallelism sweep (budget ≈ scheduler
+    // starvation window); the duration is semantically irrelevant (the inviter
+    // is unreachable, nothing can ever arrive), so a load-proof budget costs
+    // only wall-clock. If it EVER flakes at 2s, capture full output (no tail
+    // pipes).
 
     // ZEB-497/ZEB-500: Alice (the inviter/admin) is a consistent ENROLLED-DEVICE
     // owner so the redeem path's `verify_inviter_enrollment` gate PASSES — her
@@ -2998,7 +3003,7 @@ async fn redeem_invite_only_commits_pending_join_when_inviter_unreachable() {
         || Ok(()),
         None, // identity_dir
         harmony_app::RedeemInviteOverrides {
-            redeem_timeout: Some(std::time::Duration::from_millis(50)),
+            redeem_timeout: Some(std::time::Duration::from_secs(2)),
             ..Default::default()
         },
     )
@@ -3077,7 +3082,7 @@ async fn redeem_invite_only_rolls_back_owner_state_on_fence_failure() {
         || Err("simulated node-stopped fence rejection".to_string()),
         None, // identity_dir
         harmony_app::RedeemInviteOverrides {
-            redeem_timeout: Some(std::time::Duration::from_millis(50)),
+            redeem_timeout: Some(std::time::Duration::from_secs(2)),
             ..Default::default()
         },
     )

@@ -493,11 +493,13 @@ pub(crate) fn stamp_transport_status(
 
 // ── Pure synthesis functions (no iroh, no network) ──────────────────
 
-/// Spec §4.1: derive top-level reachability from my own state +
-/// peer set. Reachable: my_network present + at least one peer is
-/// Direct-connected. Degraded: my_network present but all peer
-/// connections are Relay or NoConnection. Unreachable: my_network
-/// absent OR all peers NoConnection AND none Direct/Relay.
+/// Spec §4.1 + ZEB-628: derive top-level reachability from my own state +
+/// peer set. Reachable: at least one peer is Direct-connected (or no peers
+/// yet — our own endpoint works; others' reachability is unknown, not
+/// failing). Degraded: best peer signal is Relay OR liveness-Degraded (a
+/// live link without a selected path is degraded-reachable, not down).
+/// Unreachable: peers exist and every one is NoConnection. (`_my` presence
+/// is enforced by the caller — this only runs inside `my_network.map(..)`.)
 pub fn derive_reachability_status(
     _my: &MyNetworkSummary,
     peers: &[PeerHealth],
@@ -507,10 +509,12 @@ pub fn derive_reachability_status(
         .any(|p| p.connection_mode == ConnectionMode::Direct)
     {
         ReachabilityStatus::Reachable
-    } else if peers
-        .iter()
-        .any(|p| p.connection_mode == ConnectionMode::Relay)
-    {
+    } else if peers.iter().any(|p| {
+        matches!(
+            p.connection_mode,
+            ConnectionMode::Relay | ConnectionMode::Degraded
+        )
+    }) {
         ReachabilityStatus::Degraded
     } else if peers.is_empty() {
         // No peers yet ≠ unreachable. Report Reachable because *we* have
@@ -2443,6 +2447,34 @@ mod tests {
     }
 
     #[test]
+    fn derive_reachability_status_degraded_when_only_peer_signal_degraded() {
+        // ZEB-628: a peer whose only signal is liveness `Degraded` (live link,
+        // no selected path yet) is degraded-reachable, NOT unreachable.
+        let my = MyNetworkSummary {
+            iroh_node_id: "deadbeef".into(),
+            reachability: ReachabilityStatus::Unreachable, // ignored
+            nat_classification: NatClass::Unknown,
+            home_relay_url: None,
+            relay_rtt_ms: None,
+            direct_addresses: vec![],
+        };
+        let peers = vec![PeerHealth {
+            owner_addr: "abcd".into(),
+            display_name: None,
+            shared_communities: vec![],
+            connection_mode: ConnectionMode::Degraded,
+            rtt_ms: None,
+            last_seen_ms: None,
+            reachability_record_age_ms: None,
+            protocol_incompat_reason: None,
+        }];
+        assert_eq!(
+            derive_reachability_status(&my, &peers),
+            ReachabilityStatus::Degraded
+        );
+    }
+
+    #[test]
     fn derive_reachability_status_unreachable_when_all_no_connection() {
         let my = MyNetworkSummary {
             iroh_node_id: "deadbeef".into(),
@@ -3494,6 +3526,11 @@ mod tests {
         assert_eq!(
             snap.peers[0].rtt_ms, None,
             "liveness Degraded clears the stale self-test rtt (Degraded carries no RTT)"
+        );
+        assert_eq!(
+            snap.my_network.expect("my_network present").reachability,
+            ReachabilityStatus::Degraded,
+            "ZEB-628: peer-signal-only Degraded rolls up Degraded, not Unreachable"
         );
     }
 

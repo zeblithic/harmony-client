@@ -317,6 +317,42 @@ impl SupervisorHandle {
         self.inner.notify.notify_one();
     }
 
+    /// ZEB-627: forget a departed peer (membership Leave/Kick). Removes the
+    /// slot in ANY state — a departed peer must never be dialed again, and
+    /// Dormant slots otherwise persist for process life (unbounded over
+    /// long-session peer churn). Also drops the peer's pending dirty entry so
+    /// a pre-eviction kick can't immediately resurrect the slot.
+    ///
+    /// KNOWN RESIDUAL (final review 2026-07-04): a LATER kick — in particular
+    /// the departing conn's drop-watcher `Dropped`, which fires whenever the
+    /// peer was still connected at departure (the common case: a member must
+    /// be online to publish Leave) — recreates a fresh slot that resolve-
+    /// misses ladder to Dormant, where it parks for process life. Eviction
+    /// therefore bounds churn growth to the departed-while-connected subset
+    /// rather than eliminating it. Closing it fully needs a membership
+    /// consult at slot-creation or a periodic record-less-Dormant sweep —
+    /// tracked as ZEB-634. Non-async and sync-context-safe, like every other
+    /// handle method.
+    pub fn evict_peer(&self, peer: [u8; 32]) {
+        // Qodo PR #397 R1: hold BOTH locks across the removal so a concurrent
+        // `kick()` cannot land between the dirty-remove and the states-remove
+        // and resurrect the slot on the loop's next drain. This is the only
+        // nested dirty+states acquisition in the module (the loop drains
+        // `dirty` and RELEASES it before taking `states`, and every other
+        // path takes exactly one of the two), so the dirty→states order here
+        // cannot deadlock. Kicks that arrive AFTER eviction completes remain
+        // the documented ZEB-634 residual.
+        let removed = {
+            let mut dirty = self.inner.dirty.lock().expect("dirty lock");
+            let mut states = self.inner.states.lock().expect("states lock");
+            dirty.remove(&peer);
+            states.remove(&peer).is_some()
+        };
+        if removed {
+            self.inner.notify.notify_one();
+        }
+    }
+
     /// Telemetry snapshot of every known peer's current state.
     pub fn states_snapshot(&self) -> Vec<([u8; 32], PeerStateWire)> {
         let now = Instant::now();
@@ -1652,6 +1688,50 @@ mod tests {
             "inbound reconnect emits reconnected via the loop drain"
         );
         dialer.release();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn evict_peer_removes_slot_in_any_state() {
+        let handle = SupervisorHandle::new();
+        let peer = [7u8; 32];
+        handle.mark_connected(peer);
+        assert_eq!(handle.states_snapshot().len(), 1, "slot exists pre-evict");
+        handle.evict_peer(peer);
+        assert!(
+            handle.states_snapshot().is_empty(),
+            "ZEB-627: eviction removes the slot outright"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn evict_peer_unknown_is_noop() {
+        let handle = SupervisorHandle::new();
+        handle.evict_peer([9u8; 32]);
+        assert!(handle.states_snapshot().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn evict_peer_clears_pending_kick_but_not_future_ones() {
+        // ZEB-627: eviction drops the peer's PENDING dirty entry (so the loop
+        // doesn't immediately resurrect the slot from a pre-eviction kick),
+        // but a LATER kick (e.g. the departing conn's final drop-watcher
+        // `Dropped`) still lands — pinning the documented bounded residual:
+        // post-eviction kicks recreate a slot that ladders to Dormant.
+        let handle = SupervisorHandle::new();
+        let peer = [3u8; 32];
+        handle.kick(peer, ReconnectTrigger::Dropped);
+        assert!(handle.pending_trigger(peer).is_some(), "kick pending");
+        handle.evict_peer(peer);
+        assert!(
+            handle.pending_trigger(peer).is_none(),
+            "eviction clears the pending kick"
+        );
+        handle.kick(peer, ReconnectTrigger::Dropped);
+        assert_eq!(
+            handle.pending_trigger(peer),
+            Some(ReconnectTrigger::Dropped),
+            "a post-eviction kick still lands (documented residual)"
+        );
     }
 
     /// ZEB-621: the dispatch pass calls `maybe_refresh_stale` for every peer it

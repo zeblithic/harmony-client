@@ -715,6 +715,161 @@ fn build_connect_endpoints(endpoint: Option<&str>) -> Result<Vec<String>, String
     Ok(connect_eps)
 }
 
+/// ZEB-627: generation-keyed zid→node cache for the zenoh transport-events
+/// listener. Values are `Option<[u8; 32]>` — `None` tombstones a zid unknown
+/// at this generation, so repeated events from a non-peer session don't pay an
+/// O(active_peers) rebuild each (the pre-ZEB-627 behavior). Any resolver
+/// change (generation bump) clears the cache wholesale, covering BOTH stale
+/// directions: a hit for an evicted/reassigned peer (stale-positive kicks for
+/// departed nodes) and a tombstone hiding a newly learned peer.
+struct ZidNodeCache {
+    map: std::collections::HashMap<String, Option<[u8; 32]>>,
+    seen_gen: Option<u64>,
+}
+
+impl ZidNodeCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            seen_gen: None,
+        }
+    }
+
+    /// Resolve `zid`. `current_gen` must be read from the resolver BEFORE the
+    /// rebuild closure would run — a concurrent mutation mid-rebuild then
+    /// forces another clear on the next event (conservative, never stale).
+    fn lookup(
+        &mut self,
+        zid: &str,
+        current_gen: u64,
+        rebuild: impl FnOnce() -> std::collections::HashMap<String, [u8; 32]>,
+    ) -> Option<[u8; 32]> {
+        if self.seen_gen != Some(current_gen) {
+            self.map.clear();
+            self.seen_gen = Some(current_gen);
+        }
+        if let Some(cached) = self.map.get(zid) {
+            return *cached;
+        }
+        // EXTEND, don't replace: at a stable generation the resolver view is
+        // immutable (any add/remove bumps the generation), so previously
+        // cached entries AND tombstones for OTHER zids are still valid —
+        // replacing the map would discard those tombstones and re-pay the
+        // O(active_peers) rebuild for every interleaved non-peer session
+        // (final-review finding, 2026-07-04).
+        self.map
+            .extend(rebuild().into_iter().map(|(k, v)| (k, Some(v))));
+        let hit = self.map.get(zid).copied().flatten();
+        if hit.is_none() {
+            self.map.insert(zid.to_string(), None); // tombstone
+        }
+        hit
+    }
+}
+
+#[cfg(test)]
+mod zid_node_cache_tests {
+    use super::ZidNodeCache;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    fn view(entries: &[(&str, [u8; 32])]) -> HashMap<String, [u8; 32]> {
+        entries.iter().map(|(z, n)| (z.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn hit_does_not_rebuild() {
+        let mut c = ZidNodeCache::new();
+        let rebuilds = Cell::new(0);
+        let a = [1u8; 32];
+        assert_eq!(
+            c.lookup("z1", 0, || {
+                rebuilds.set(rebuilds.get() + 1);
+                view(&[("z1", a)])
+            }),
+            Some(a)
+        );
+        assert_eq!(
+            c.lookup("z1", 0, || {
+                rebuilds.set(rebuilds.get() + 1);
+                view(&[("z1", a)])
+            }),
+            Some(a)
+        );
+        assert_eq!(rebuilds.get(), 1, "same-generation hit skips the rebuild");
+    }
+
+    #[test]
+    fn tombstone_prevents_rebuild_per_event() {
+        let mut c = ZidNodeCache::new();
+        let rebuilds = Cell::new(0);
+        for _ in 0..3 {
+            assert_eq!(
+                c.lookup("ghost", 7, || {
+                    rebuilds.set(rebuilds.get() + 1);
+                    view(&[])
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            rebuilds.get(),
+            1,
+            "unknown zid rebuilds once per generation, then tombstones"
+        );
+    }
+
+    #[test]
+    fn interleaved_ghosts_keep_each_others_tombstones() {
+        // Final-review finding (2026-07-04): a rebuild must EXTEND the map,
+        // not replace it — replacement dropped same-generation tombstones for
+        // other zids, so two interleaved non-peer sessions re-paid the full
+        // rebuild on every event.
+        let mut c = ZidNodeCache::new();
+        let rebuilds = Cell::new(0);
+        let mut probe = |zid: &str| {
+            c.lookup(zid, 7, || {
+                rebuilds.set(rebuilds.get() + 1);
+                view(&[])
+            })
+        };
+        for _ in 0..3 {
+            assert_eq!(probe("ghost-a"), None);
+            assert_eq!(probe("ghost-b"), None);
+        }
+        assert_eq!(
+            rebuilds.get(),
+            2,
+            "one rebuild per distinct ghost per generation, not per event"
+        );
+    }
+
+    #[test]
+    fn generation_bump_clears_stale_positive() {
+        let mut c = ZidNodeCache::new();
+        let a = [1u8; 32];
+        assert_eq!(c.lookup("z1", 0, || view(&[("z1", a)])), Some(a));
+        // Resolver evicted z1's peer → generation bumped, view empty.
+        assert_eq!(
+            c.lookup("z1", 1, || view(&[])),
+            None,
+            "stale-positive entry does not survive a generation bump"
+        );
+    }
+
+    #[test]
+    fn generation_bump_reveals_new_peer_behind_tombstone() {
+        let mut c = ZidNodeCache::new();
+        let b = [2u8; 32];
+        assert_eq!(c.lookup("z2", 0, || view(&[])), None); // tombstoned
+        assert_eq!(
+            c.lookup("z2", 1, || view(&[("z2", b)])),
+            Some(b),
+            "stale-negative tombstone does not survive a generation bump"
+        );
+    }
+}
+
 /// Run the NodeRuntime event loop as a background task.
 ///
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
@@ -1202,35 +1357,31 @@ pub async fn run(
                         return;
                     }
                 };
-                // zid (canonical hex) -> node-id, rebuilt from the resolver on a miss
-                // (a peer learned after the last refresh is picked up on its Delete).
-                let mut zid_to_node: std::collections::HashMap<String, [u8; 32]> =
-                    std::collections::HashMap::new();
+                // ZEB-627: generation-keyed zid→node cache (see ZidNodeCache).
+                // Replaces the former miss-only rebuild map, whose hits were
+                // never revalidated (stale-positive kicks for departed peers)
+                // and whose unknown-zid misses rebuilt O(active_peers) on
+                // every event (no negative cache).
+                let mut zid_cache = ZidNodeCache::new();
                 while let Ok(event) = listener.recv_async().await {
-                    // Resolve the peer's zid → iroh node-id ONCE via the shared
-                    // `zid_to_node` cache (rebuilt from the resolver on a miss),
+                    // Resolve the peer's zid → iroh node-id ONCE via the cache,
                     // then dispatch on the event kind. `SampleKind` is a closed
                     // two-variant enum, so Put/Delete are exhaustive (no `_` arm
                     // — one would be an unreachable-pattern error under -D warnings).
                     let zid = event.transport().zid().to_string();
-                    let node_id = match zid_to_node.get(&zid).copied() {
-                        Some(n) => Some(n),
-                        None => {
-                            zid_to_node = listener_resolver
-                                .list_active_peers()
-                                .into_iter()
-                                .map(|(_owner, p)| {
-                                    (
-                                        crate::iroh_dial_driver::deterministic_zid_hex(
-                                            &p.iroh_node_id,
-                                        ),
-                                        p.iroh_node_id,
-                                    )
-                                })
-                                .collect();
-                            zid_to_node.get(&zid).copied()
-                        }
-                    };
+                    let current_gen = listener_resolver.generation();
+                    let node_id = zid_cache.lookup(&zid, current_gen, || {
+                        listener_resolver
+                            .list_active_peers()
+                            .into_iter()
+                            .map(|(_owner, p)| {
+                                (
+                                    crate::iroh_dial_driver::deterministic_zid_hex(&p.iroh_node_id),
+                                    p.iroh_node_id,
+                                )
+                            })
+                            .collect()
+                    });
                     match event.kind() {
                         // Down-edge: kick the reconnect supervisor (ZEB-620) AND
                         // raise an external liveness down-edge (ZEB-622) so a
