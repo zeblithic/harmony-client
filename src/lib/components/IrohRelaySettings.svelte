@@ -123,6 +123,11 @@
   }
 
   async function handleRestoreRecommended(): Promise<void> {
+    // Guard: never submit a Restore before the initial fetch succeeds (matches
+    // Add's `!relayLoaded` gate; defense-in-depth — the button is also disabled
+    // until then). A reset before the base config is known could clobber a
+    // config the client hasn't observed yet.
+    if (!relayLoaded) return;
     if (relayPending) return;
     relayPending = true;
     relayError = null;
@@ -222,7 +227,7 @@
   <button
     class="relay-restore-btn"
     onclick={handleRestoreRecommended}
-    disabled={relayPending}
+    disabled={!relayLoaded || relayPending}
     data-testid="iroh-relay-restore-button"
   >
     Restore recommended

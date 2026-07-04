@@ -647,7 +647,7 @@ mod tests {
         );
 
         // Swap to [B]: B inserted, A removed.
-        let (inserted, removed) = ep.apply_relay_urls(&[b.clone()]).await;
+        let (inserted, removed) = ep.apply_relay_urls(std::slice::from_ref(&b)).await;
         assert_eq!((inserted, removed), (1, 1));
         assert_eq!(
             relay_url_set(&ep),
@@ -655,7 +655,7 @@ mod tests {
         );
 
         // Re-applying the same target is a no-op.
-        let (inserted2, removed2) = ep.apply_relay_urls(&[b.clone()]).await;
+        let (inserted2, removed2) = ep.apply_relay_urls(std::slice::from_ref(&b)).await;
         assert_eq!((inserted2, removed2), (0, 0));
         assert_eq!(
             relay_url_set(&ep),

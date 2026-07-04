@@ -235,6 +235,6 @@ mod tests {
             crate::iroh_endpoint::alpn::HARMONY_TUNNEL_V2,
             b"harmony/tunnel/v2"
         );
-        assert!(MIN_SUPPORTED_TUNNEL_ALPN_GENERATION <= TUNNEL_ALPN_GENERATION);
+        const { assert!(MIN_SUPPORTED_TUNNEL_ALPN_GENERATION <= TUNNEL_ALPN_GENERATION) };
     }
 }

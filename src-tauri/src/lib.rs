@@ -10339,7 +10339,10 @@ pub async fn start_node_inner(
                         );
                         // Mirror the mutators: a relay-map change must emit so the
                         // Settings listener refetches rather than showing the
-                        // pre-reconcile list until the next manual refresh.
+                        // pre-reconcile list until the next manual refresh. `app`
+                        // here is the NodeEventSink abstraction (GUI or headless),
+                        // whose `emit` is ()-returning by trait contract — each
+                        // sink impl handles its own delivery internally.
                         app.emit("iroh-relays-changed", serde_json::Value::Null);
                     }
                 }

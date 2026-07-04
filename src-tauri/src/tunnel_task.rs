@@ -69,9 +69,13 @@ const KEEPALIVE_TICK: Duration = Duration::from_secs(10);
 /// always-deposit rung covers durability).
 pub(crate) enum HandshakeFailure {
     /// The peer's tunnel hello advertised a `protocol_version` below our
-    /// minimum. The initiator (which knows the peer NodeId up front) records
-    /// `reason` in the compat registry; the responder can only log it (the peer
-    /// NodeId is unauthenticated until the PQ handshake completes).
+    /// minimum. BOTH sides record `reason` in the compat registry, keyed by the
+    /// peer's authenticated iroh EndpointId (the key Network Health joins on):
+    /// the initiator knows it up front (`addr.id`); the responder reads it from
+    /// `conn.remote_id()`. iroh authenticates the remote endpoint key in its TLS
+    /// handshake, so this id is trustworthy even before the PQ tunnel handshake
+    /// completes — unlike the tunnel NodeId (`blake3(ML-DSA pubkey)`), which is
+    /// not authenticated until then.
     Incompatible { reason: String },
     /// Any other handshake failure (connect, stream, decode, crypto, timeout).
     Other(String),
@@ -105,16 +109,31 @@ pub async fn run_tunnel_responder(
     let (session, send_stream, recv_stream, peer_node_id) = match handshake {
         Ok(Ok(v)) => v,
         Ok(Err(failure)) => {
-            // ZEB-623: an incompatible inbound hello was already logged loudly
-            // (with the peer's iroh remote id) inside `responder_handshake`; the
-            // responder can't key the compat registry because the peer NodeId is
-            // unauthenticated until the PQ handshake completes. Both Incompatible
-            // and Other just drop the inbound connection here.
+            // ZEB-623: record a *protocol-incompatible* inbound peer in the compat
+            // registry (surfaced in Network Health) keyed by the peer's iroh
+            // EndpointId. iroh authenticates the remote endpoint key in its TLS
+            // handshake, so `conn.remote_id()` is trustworthy even though the PQ
+            // tunnel handshake never completed — and it is the SAME key the reader
+            // in `network_health.rs` joins on (`record.iroh_node_id`). ONLY the
+            // Incompatible arm records: `Other` covers transient dial/stream/
+            // decode/crypto/timeout failures, which are NOT protocol
+            // incompatibility, and a v1-generation inbound carries no hello so it
+            // can never produce Incompatible (keeping the N-1 window unflagged).
+            if let HandshakeFailure::Incompatible { reason } = &failure {
+                let remote_id = conn.remote_id();
+                mgr.compat_registry()
+                    .note_incompatible(*remote_id.as_bytes(), reason.clone());
+            }
             tracing::debug!(%failure, "ZEB-473: inbound tunnel handshake failed");
+            // Explicitly close before dropping (mirrors the accept loop's
+            // pre-install close) so the peer sees a prompt application close
+            // rather than waiting out an idle timeout.
+            conn.close(0u32.into(), b"tunnel-handshake-failed");
             return;
         }
         Err(_) => {
             tracing::debug!("ZEB-473: inbound tunnel handshake timed out");
+            conn.close(0u32.into(), b"tunnel-handshake-failed");
             return;
         }
     };
@@ -169,11 +188,14 @@ async fn responder_handshake(
         let peer_hello = crate::protocol_versioning::decode_hello(&peer_hello_bytes)
             .map_err(|e| HandshakeFailure::Other(format!("decode hello: {e}")))?;
         if let Err(reason) = crate::protocol_versioning::check_hello_compatible(&peer_hello) {
-            // The peer NodeId isn't authenticated until the PQ handshake
-            // completes, so we can't key the compat registry here. Log LOUDLY
-            // with the iroh remote endpoint id for diagnostics; the initiator
-            // side (which knows the peer NodeId up front) records the
-            // authoritative registry entry. Reject the connection.
+            // The peer's *tunnel* NodeId (`blake3(ML-DSA pubkey)`) isn't
+            // authenticated until the PQ handshake completes — but iroh HAS
+            // authenticated the remote *endpoint* key in its TLS handshake, so the
+            // caller (`run_tunnel_responder`) DOES record this incompatibility in
+            // the compat registry, keyed by `conn.remote_id()` (the same iroh
+            // EndpointId Network Health joins on). Here we just log LOUDLY with
+            // that id and reject; the registry write happens on the returned
+            // Incompatible.
             tracing::warn!(
                 remote = %conn.remote_id(),
                 %reason,
@@ -443,8 +465,14 @@ async fn initiator_handshake(
         .map_err(|e| HandshakeFailure::Other(format!("read hello: {e}")))?;
         let peer_hello = crate::protocol_versioning::decode_hello(&peer_hello_bytes)
             .map_err(|e| HandshakeFailure::Other(format!("decode hello: {e}")))?;
-        crate::protocol_versioning::check_hello_compatible(&peer_hello)
-            .map_err(|reason| HandshakeFailure::Incompatible { reason })?;
+        if let Err(reason) = crate::protocol_versioning::check_hello_compatible(&peer_hello) {
+            // ZEB-623: explicitly close before returning so the peer sees a prompt
+            // application close instead of an idle timeout. The caller
+            // (`run_tunnel_initiator_inner`) records the incompatibility in the
+            // compat registry keyed by the peer's iroh EndpointId.
+            conn.close(0u32.into(), b"tunnel-protocol-incompatible");
+            return Err(HandshakeFailure::Incompatible { reason });
+        }
     }
 
     let accept_bytes = read_length_prefixed(&mut recv_stream, HANDSHAKE_MAX_MESSAGE)
@@ -1263,6 +1291,91 @@ mod tests {
         );
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fake_responder).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incompatible_hello_inbound_is_recorded_by_responder() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            incompatible_hello_inbound_inner(),
+        )
+        .await
+        .expect("responder incompatible-hello recording must complete within 30s");
+    }
+
+    /// ZEB-623 (PR #395 review): mirror of `incompatible_hello_inner` for the
+    /// RESPONDER path. A scripted dialer connects `/v2`, opens the bi-stream, and
+    /// sends a hello advertising protocol_version 0 (below MIN). The real
+    /// `run_tunnel_responder` must reject it AND record the incompatibility under
+    /// the DIALER's authenticated iroh EndpointId (`conn.remote_id()`) — the key
+    /// Network Health joins on. Pins the new responder-side registry write.
+    async fn incompatible_hello_inbound_inner() {
+        use iroh::{EndpointAddr, TransportAddr};
+
+        let responder_pq = Arc::new(harmony_identity::PqPrivateIdentity::generate(
+            &mut rand::rngs::OsRng,
+        ));
+
+        let ep_dialer = loopback_endpoint([0x71; 32]).await;
+        let ep_resp = loopback_endpoint([0x72; 32]).await;
+        let ep_resp_addr = EndpointAddr::from_parts(
+            ep_resp.id(),
+            ep_resp.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+
+        // Real responder driver on the accepted connection, sharing a compat
+        // registry we can assert on.
+        let compat = Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default());
+        let (resp_ingest_tx, _resp_ingest_rx) = mpsc::channel::<InboundDm>(8);
+        let resp_mgr = tunnel_manager_with_compat(
+            ep_resp.clone(),
+            Arc::clone(&responder_pq),
+            resp_ingest_tx.clone(),
+            Arc::clone(&compat),
+        );
+        let ep_resp_accept = ep_resp.clone();
+        let responder = tokio::spawn(async move {
+            let incoming = ep_resp_accept.accept().await.expect("incoming");
+            let conn = incoming.await.expect("connection established");
+            run_tunnel_responder(conn, responder_pq, resp_mgr, resp_ingest_tx).await;
+        });
+
+        // Scripted dialer: connect `/v2`, open_bi, send a low hello. The responder
+        // reads + gates the hello FIRST, so it rejects before ever reading a
+        // TunnelInit — the dialer never needs to send one.
+        let dialer_iroh_id = *ep_dialer.id().as_bytes();
+        let conn = ep_dialer
+            .connect(ep_resp_addr, crate::iroh_endpoint::alpn::HARMONY_TUNNEL_V2)
+            .await
+            .expect("dialer connect v2");
+        let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+        let low_hello =
+            crate::protocol_versioning::encode_hello(&crate::protocol_versioning::TunnelHello {
+                protocol_version: 0,
+                capabilities: 0,
+            })
+            .expect("encode low hello");
+        write_length_prefixed(&mut send, &low_hello)
+            .await
+            .expect("write low hello");
+
+        // The responder must record the incompat under the DIALER's iroh
+        // EndpointId within a few seconds (poll; the responder runs concurrently).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if compat.incompat_reason(&dialer_iroh_id).is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "responder must record an incompatible inbound peer under its \
+                 authenticated iroh EndpointId (the Network Health join key)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), responder).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

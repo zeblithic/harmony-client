@@ -149,7 +149,12 @@ describe('IrohRelaySettings', () => {
     setupDefaultMocks(info(['https://mine.relay.example'], true), info(DEFAULT_RELAYS, false));
     render(IrohRelaySettings);
 
-    await waitFor(() => screen.getByTestId('iroh-relay-restore-button'));
+    // Restore is gated on relayLoaded (like Add): wait for the initial fetch to
+    // resolve and the button to become enabled before clicking.
+    await waitFor(() => {
+      const btn = screen.getByTestId('iroh-relay-restore-button') as HTMLButtonElement;
+      expect(btn.disabled).toBe(false);
+    });
     await fireEvent.click(screen.getByTestId('iroh-relay-restore-button'));
 
     await waitFor(() => {

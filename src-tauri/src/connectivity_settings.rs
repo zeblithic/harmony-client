@@ -351,21 +351,42 @@ impl ConnectivitySettings {
         }
     }
 
+    /// Atomically persist the settings to `path`. Serializes to a *uniquely*
+    /// named sibling tempfile (`tempfile::NamedTempFile`), fsyncs it, then
+    /// renames it into place; on Unix the parent directory is fsynced afterwards
+    /// so the rename itself is durable. A same-directory rename is atomic on
+    /// macOS/Linux (POSIX `rename(2)`), so a concurrent reader never observes a
+    /// half-written settings file and a crash mid-write leaves the prior file
+    /// intact.
+    ///
+    /// This mirrors `owner_state_persist::save_atomically`. Two reasons it beats
+    /// the previous fixed `<name>.json.tmp` + `std::fs::rename`: (1) the random
+    /// temp name can't collide with a concurrent writer's temp (the fixed name
+    /// was racy); (2) on Windows the fixed-name `std::fs::rename` is best-effort
+    /// and fails when the destination already exists, whereas `NamedTempFile::
+    /// persist` uses `MoveFileEx`/`ReplaceFile`, which atomically *replaces* an
+    /// existing destination.
     pub fn save(&self, path: &PathBuf) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        use std::io::Write as _;
+        // `NamedTempFile` must be created in the destination directory so the
+        // final `persist` is a same-volume atomic rename. Fall back to `.` for a
+        // bare filename with no directory component (no real caller does this).
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        // ZEB-624: atomic write — serialize to a sibling temp file, then rename
-        // it into place. A same-directory rename is atomic on macOS/Linux (POSIX
-        // `rename(2)`), so a concurrent reader never observes a half-written
-        // settings file and a crash mid-write leaves the prior file intact. On
-        // Windows `rename` is best-effort (it can fail if the destination exists
-        // or is open), acceptable here: the settings file is written rarely and
-        // by a single writer.
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, path)
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(json.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map_err(std::io::Error::other)?;
+        // Unix-only dir fsync (matches owner_state_persist): `File::open(dir)`
+        // fails on Windows, whose journaled `MoveFileEx`/`ReplaceFile` already
+        // durably records the rename.
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
 }
 
@@ -463,19 +484,28 @@ mod tests {
     }
 
     #[test]
-    fn save_is_atomic_tmp_rename() {
-        // save() writes <name>.tmp then renames: after a successful save, no .tmp
-        // sibling remains and the persisted file parses back to an equal value.
+    fn save_is_atomic_no_stray_temp_files() {
+        // save() writes to a uniquely-named NamedTempFile sibling then renames it
+        // into place. After a successful save: (1) the persisted file round-trips
+        // to an equal value, and (2) the parent dir holds ONLY the settings file
+        // — the temp file was renamed away, not left behind (glob the dir).
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
         let s = ConnectivitySettings::default();
         s.save(&path).expect("save");
-        let tmp = path.with_extension("json.tmp");
-        assert!(
-            !tmp.exists(),
-            "atomic-write temp sibling must be renamed away, not left behind"
-        );
+        // (1) Round-trips.
         assert_eq!(ConnectivitySettings::load_or_default(&path), s);
+        // (2) No stray temp files: the fresh tempdir contains exactly one entry,
+        // the settings file itself.
+        let entries: Vec<_> = std::fs::read_dir(td.path())
+            .expect("read tempdir")
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![path.clone()],
+            "only the settings file should remain in the parent dir (no temp leftovers)"
+        );
     }
 
     #[test]
