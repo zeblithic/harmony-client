@@ -183,21 +183,31 @@ Expected first line: `netdev v0.45.0 (/Users/zeblith/work/zeblithic/harmony-clie
 
 Inside the existing `#[cfg(test)] mod tests` block (near the other endpoint tests, after `alpn_constants_are_correct`):
 
+> **Superseded during review (see final-review I-1 + Qodo round 1):** the shipped guard has two
+> layers — a non-cfg'd `const` block asserting the vendored crate's `ZEBLITHIC_ZEB_626_PATCH`
+> marker (an unpatched netdev fails to COMPILE the test target, all platforms), plus the macOS
+> behavioral test below scoped to `Wireless80211` interfaces only (wired links legitimately get a
+> `transmit_speed` from netdev's unix SIOCGIFXMEDIA path — an all-interfaces assertion false-fails
+> on docked Macs).
+
 ```rust
-    /// ZEB-626 patch-presence tripwire. The vendored netdev
-    /// (vendor/netdev/README.zeblithic.md) must never compute
-    /// transmit_speed on macOS: the upstream implementation stalls
-    /// ~60s/process in a synchronous CoreWLAN->wifid XPC call, paid inside
-    /// the first Endpoint::bind() of every process via netwatch. If this
-    /// fails, an unpatched netdev re-entered the graph (likely a
-    /// netwatch/iroh bump) — refresh vendor/netdev per its README.
+    const _: () = assert!(
+        netdev::ZEBLITHIC_ZEB_626_PATCH,
+        "unpatched netdev in the graph (ZEB-626) — refresh vendor/netdev per its README"
+    );
+
     #[test]
     #[cfg(target_os = "macos")]
     fn vendored_netdev_never_computes_transmit_speed_on_macos() {
+        use netdev::prelude::InterfaceType;
         for iface in netdev::interface::get_interfaces() {
+            if iface.if_type != InterfaceType::Wireless80211 {
+                continue;
+            }
             assert!(
                 iface.transmit_speed.is_none(),
-                "interface {} has transmit_speed {:?} — unpatched netdev in the graph (ZEB-626)",
+                "wireless interface {} has transmit_speed {:?} — unpatched netdev \
+                 (CoreWLAN query) back in the graph (ZEB-626)",
                 iface.name,
                 iface.transmit_speed
             );

@@ -15,14 +15,18 @@ netwatch→iroh, every first `Endpoint::bind()` in every process paid it —
 `transmit_speed` is set to `None`; `src/os/macos/wifi.rs` and the three
 wifi-only deps (`objc2`, `objc2-core-wlan`, `objc2-foundation`) are removed.
 The `[[example]]` targets are stripped from `Cargo.toml` because `examples/`
-is not vendored. Nothing else is modified; non-macOS code is untouched.
+is not vendored, and `src/lib.rs` gains the marker
+`pub const ZEBLITHIC_ZEB_626_PATCH: bool = true;` (see Guard below). Nothing
+else is modified; non-macOS behavior is untouched.
 
-Guard: `vendored_netdev_never_computes_transmit_speed_on_macos` in
-`src-tauri/src/iroh_endpoint.rs` fails on a macOS machine with a WiFi
-interface if an unpatched netdev re-enters the graph. (The assertion is
-scoped to `Wireless80211` interfaces: wired links legitimately get a
-`transmit_speed` from netdev's shared unix SIOCGIFXMEDIA path, which this
-patch deliberately leaves untouched.)
+Guard (two layers, `src-tauri/src/iroh_endpoint.rs` tests): a `const` block
+asserts `netdev::ZEBLITHIC_ZEB_626_PATCH` — an unpatched netdev lacks the
+const, so the test target fails to COMPILE on every platform; and
+`vendored_netdev_never_computes_transmit_speed_on_macos` behaviorally checks
+that no `Wireless80211` interface carries a `transmit_speed` on macOS.
+(Scoped to wireless: wired links legitimately get a `transmit_speed` from
+netdev's shared unix SIOCGIFXMEDIA path, which this patch deliberately
+leaves untouched.)
 
 **Exit condition:** drop this vendored copy when an upstream netdev/netwatch
 release makes the WiFi query lazy/optional (the asks we would file are

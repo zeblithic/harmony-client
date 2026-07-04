@@ -571,6 +571,12 @@ pub async fn warm_up_iroh_global_init() {
 /// unentitled callers (every test binary). Hermetic tests dial loopback by
 /// address with relays disabled and never resolve a name, so the nameserver
 /// below (loopback port 1) is intentionally unanswering.
+///
+/// Symptom if a future hermetic test DOES resolve a name: a fast
+/// connection-refused / timed-out DNS error mentioning `127.0.0.1:1`. If you
+/// hit that, the test is no longer hermetic — either dial by address or give
+/// that one test a real resolver; do NOT point this helper at a live
+/// nameserver (it would re-couple every hermetic test to the host network).
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn hermetic_dns_resolver() -> iroh::dns::DnsResolver {
     iroh::dns::DnsResolver::with_nameserver(std::net::SocketAddr::from(([127, 0, 0, 1], 1)))
@@ -738,19 +744,30 @@ mod tests {
         assert_eq!(alpn::HARMONY_TUNNEL_V1, b"harmony/tunnel/v1");
     }
 
-    /// ZEB-626 patch-presence tripwire. The vendored netdev
-    /// (vendor/netdev/README.zeblithic.md) must never compute
-    /// transmit_speed for WIRELESS interfaces on macOS: the upstream
-    /// implementation fills it via a synchronous CoreWLAN->wifid XPC call
-    /// (~44s/process for unentitled callers), paid inside the first
-    /// Endpoint::bind() of every process via netwatch. Wired interfaces
-    /// legitimately get a link speed from the shared unix SIOCGIFXMEDIA
-    /// path (vendor/netdev/src/os/unix/link_speed.rs) — the patch leaves
-    /// that untouched, so the assertion is scoped to Wireless80211. If this
-    /// fails, an unpatched netdev re-entered the graph (likely a
-    /// netwatch/iroh bump) — refresh vendor/netdev per its README. (On a
-    /// Mac with no WiFi interface this passes vacuously; real dev machines
-    /// have one.)
+    /// ZEB-626 patch-presence tripwire, part 1 (deterministic, all
+    /// platforms): referencing the vendored crate's marker const in a
+    /// `const` block means an UNPATCHED netdev (which lacks the const)
+    /// fails to COMPILE this test target — no reliance on host hardware.
+    /// (Qodo round-1 finding: the behavioral test below passes vacuously
+    /// on a Mac with no WiFi interface.)
+    const _: () = assert!(
+        netdev::ZEBLITHIC_ZEB_626_PATCH,
+        "unpatched netdev in the graph (ZEB-626) — refresh vendor/netdev per its README"
+    );
+
+    /// ZEB-626 patch-presence tripwire, part 2 (behavioral, macOS). The
+    /// vendored netdev (vendor/netdev/README.zeblithic.md) must never
+    /// compute transmit_speed for WIRELESS interfaces on macOS: the
+    /// upstream implementation fills it via a synchronous CoreWLAN->wifid
+    /// XPC call (~44s/process for unentitled callers), paid inside the
+    /// first Endpoint::bind() of every process via netwatch. Wired
+    /// interfaces legitimately get a link speed from the shared unix
+    /// SIOCGIFXMEDIA path (vendor/netdev/src/os/unix/link_speed.rs) — the
+    /// patch leaves that untouched, so the assertion is scoped to
+    /// Wireless80211. If this fails, an unpatched netdev re-entered the
+    /// graph — refresh vendor/netdev per its README. (Vacuous on a Mac
+    /// with no WiFi interface; the const assertion above is the
+    /// deterministic net.)
     #[test]
     #[cfg(target_os = "macos")]
     fn vendored_netdev_never_computes_transmit_speed_on_macos() {
