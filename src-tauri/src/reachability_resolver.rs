@@ -203,6 +203,13 @@ pub struct ReachabilityResolver {
     // semaphore bounds the total number of refresh network calls in flight across
     // all owners. Shared across clones (`Arc`) so the bound is global.
     refresh_permits: Arc<tokio::sync::Semaphore>,
+    // ZEB-627: monotonic change counter for the peer-record map — bumped on
+    // every MATERIALIZED update (LWW-accepted slot write) and on any
+    // non-empty `remove_owner`. Generation-keyed caches over derived views
+    // (event_loop's zid→node map) compare it to decide when to rebuild; a
+    // bump covers both stale directions (evicted/reassigned AND newly added).
+    // Shared across clones (`Arc`) like every other field.
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -224,6 +231,7 @@ impl Default for ReachabilityResolver {
             refresh_cooldowns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             clock: Arc::new(RwLock::new(default_clock())),
             refresh_permits: Arc::new(tokio::sync::Semaphore::new(PKARR_REFRESH_MAX_CONCURRENT)),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -241,6 +249,7 @@ impl Clone for ReachabilityResolver {
             refresh_cooldowns: Arc::clone(&self.refresh_cooldowns),
             clock: Arc::clone(&self.clock),
             refresh_permits: Arc::clone(&self.refresh_permits),
+            generation: Arc::clone(&self.generation),
         }
     }
 }
@@ -282,6 +291,12 @@ impl ReachabilityResolver {
     /// a cheap `Arc`-backed clone).
     pub fn supervisor(&self) -> Option<SupervisorHandle> {
         self.supervisor.read().expect("supervisor lock").clone()
+    }
+
+    /// ZEB-627: current map generation (see the field doc). `Acquire` pairs
+    /// with the mutators' `Release` bumps.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// ZEB-622: install the peer-liveness handle. Called once at boot
@@ -372,6 +387,9 @@ impl ReachabilityResolver {
         };
         if do_replace {
             *target = Some(next);
+            // ZEB-627: the derived zid→node view may have changed.
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         // When `do_replace` is false the freshest view is unchanged, so the after
         // snapshot equals the before one — skip re-reading it.
@@ -581,6 +599,11 @@ impl ReachabilityResolver {
         let n = to_remove.len();
         for k in to_remove {
             map.remove(&k);
+        }
+        if n > 0 {
+            // ZEB-627: departed devices left the derived views.
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         drop(map);
         // Full per-owner eviction (ZEB-621): drop the stale-refresh cooldown too,
@@ -874,6 +897,32 @@ mod tests {
         let records = r.resolve(&actor);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].announced_at_ms, 2000);
+    }
+
+    /// ZEB-627: the generation counter bumps only when the map materially
+    /// changes — accepted (LWW-winning) writes and non-empty removals — so
+    /// generation-keyed caches (event_loop's zid→node map) rebuild exactly
+    /// when the derived view could have changed.
+    #[test]
+    fn generation_bumps_only_on_materialized_change() {
+        let r = ReachabilityResolver::new();
+        let actor = OwnerAddr([0xAA; 16]);
+        let g0 = r.generation();
+        // First learn: materialized → bump.
+        r.update(actor, make_payload(1, 1000), make_hlc(1000, 0, "a"));
+        let g1 = r.generation();
+        assert!(g1 > g0, "accepted write bumps");
+        // LWW-rejected (older HLC, same device slot): no bump.
+        r.update(actor, make_payload(1, 500), make_hlc(500, 0, "a"));
+        assert_eq!(r.generation(), g1, "rejected write does not bump");
+        // Eviction: bump.
+        let n = r.remove_owner(&actor);
+        assert_eq!(n, 1);
+        assert!(r.generation() > g1, "remove_owner bumps");
+        // Removing an absent owner: no bump.
+        let g2 = r.generation();
+        assert_eq!(r.remove_owner(&OwnerAddr([0xBB; 16])), 0);
+        assert_eq!(r.generation(), g2, "empty removal does not bump");
     }
 
     #[test]
