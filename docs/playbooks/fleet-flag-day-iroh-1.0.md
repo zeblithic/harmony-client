@@ -67,7 +67,11 @@ tree**, logging to a stable path, with its exact start command recorded here.
    named profiles). Check directly:
 
    ```bash
-   ls ~/.harmony/profiles/<fleet-profile>/*.enc   # the ZEB-449 vault set
+   # The ZEB-449 vault set — expect identity.enc, iroh_sk.enc, device_sk.enc,
+   # master_seed.enc (the verified layout on all 2026-07-04 fleet nodes). A
+   # legacy identity.key may show up in old boot-log lines as the resolved
+   # identity path; it is NOT required on disk and its absence is normal.
+   ls ~/.harmony/profiles/<fleet-profile>/*.enc
    ls ~/.harmony-<fleet-profile>-pass             # its passphrase, minted alongside
    ```
 
@@ -108,14 +112,17 @@ API_DIR="$HOME/Library/Application Support/net.zeblith.harmony/profiles/fleet-ko
 PID=$(cat "$API_DIR/serve.lock")   # serve mode writes its PID lockfile here
 curl -fsS -X POST -H "Authorization: Bearer $(cat "$API_DIR/token")" \
   "http://127.0.0.1:$(cat "$API_DIR/port")/v1/shutdown" || kill "$PID"
-while kill -0 "$PID" 2>/dev/null; do sleep 1; done
-#    Wedge case (seen live on Ildwyn, 2026-07-04): a 0.98-era process can
-#    accept /v1/shutdown then hang forever in iroh endpoint teardown
-#    (MaxPathIdReached retry loop — the very bug 1.0 fixes). If the PID
-#    won't exit and the log shows the shutdown signal was received: confirm
-#    the last state persist in the log, then force-kill (`kill -9` /
-#    `taskkill //F` — Windows refuses a graceful taskkill on console
-#    daemons anyway). State on disk is safe once the flush logged.
+for _ in $(seq 1 120); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+#    Bounded wait (120 s) — do NOT wait unboundedly. Wedge case (seen live
+#    on Ildwyn, 2026-07-04): a 0.98-era process can accept /v1/shutdown then
+#    hang forever in iroh endpoint teardown (MaxPathIdReached retry loop —
+#    the very bug 1.0 fixes). If the PID is still alive after the bounded
+#    wait and the log shows the shutdown signal was received: confirm the
+#    last state persist in the log, then force-kill — `kill -9 "$PID"` on
+#    macOS/Linux, `taskkill /F /PID <pid>` on Windows (from Git Bash escape
+#    the flags: `taskkill //F //PID <pid>`; Windows refuses a graceful
+#    taskkill on console daemons anyway). State on disk is safe once the
+#    flush logged.
 
 # 2. Start the staged binary — same profile, same port, stable log path,
 #    and the profile's vault passphrase (ZEB-446 — mandatory for named
@@ -130,7 +137,7 @@ $BIN --profile fleet-koya api get_owner_state | jq -r .ownerId
 #    → MUST equal the Phase 0 value. If it changed: STOP THE WINDOW, post to
 #      ZEB-636, do NOT mint_owner_identity (ZEB-477 stale-ghost-key lesson).
 $BIN --profile fleet-koya api network_health_snapshot \
-  | jq '{schemaVersion, pub: .pkarrStatus.communityPublishCount, relays: [.pkarrStatus.relays[] | {url, lastSuccessMs}]}'
+  | jq '{schemaVersion, communityPublishCount: .pkarrStatus.communityPublishCount, relays: [.pkarrStatus.relays[] | {url, lastSuccessMs}]}'
 #    → schemaVersion 4 (proves the new build);
 #    → poll until some relays[].lastSuccessMs >= your restart timestamp AND
 #      communityPublishCount >= 1. Boot publish lands in ≈15–90 s; don't
