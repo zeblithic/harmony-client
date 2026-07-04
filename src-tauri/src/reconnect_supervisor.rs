@@ -334,12 +334,18 @@ impl SupervisorHandle {
     /// tracked as ZEB-634. Non-async and sync-context-safe, like every other
     /// handle method.
     pub fn evict_peer(&self, peer: [u8; 32]) {
-        {
-            let mut dirty = self.inner.dirty.lock().expect("dirty lock");
-            dirty.remove(&peer);
-        }
+        // Qodo PR #397 R1: hold BOTH locks across the removal so a concurrent
+        // `kick()` cannot land between the dirty-remove and the states-remove
+        // and resurrect the slot on the loop's next drain. This is the only
+        // nested dirty+states acquisition in the module (the loop drains
+        // `dirty` and RELEASES it before taking `states`, and every other
+        // path takes exactly one of the two), so the dirty→states order here
+        // cannot deadlock. Kicks that arrive AFTER eviction completes remain
+        // the documented ZEB-634 residual.
         let removed = {
+            let mut dirty = self.inner.dirty.lock().expect("dirty lock");
             let mut states = self.inner.states.lock().expect("states lock");
+            dirty.remove(&peer);
             states.remove(&peer).is_some()
         };
         if removed {

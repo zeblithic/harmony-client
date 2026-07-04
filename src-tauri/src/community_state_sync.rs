@@ -3824,7 +3824,12 @@ fn shutdown_flush_lost_race_to_dir_removal(
     match result {
         Err(CommunitySyncError::PersistDirMissing(_)) => true,
         Err(CommunitySyncError::Persist(_)) => {
-            matches!(community_dir, Some(dir) if !dir.exists())
+            // `try_exists`, not `exists` (Qodo + CodeRabbit, PR #397 R1):
+            // downgrade ONLY on a CONFIRMED absence — `Ok(false)`. A probe
+            // error (`Err`: permission, transient FS fault) or a present dir
+            // (`Ok(true)`) propagates the persist failure, so an unreadable
+            // dir can never masquerade as the intentional-discard race.
+            matches!(community_dir.map(|dir| dir.try_exists()), Some(Ok(false)))
         }
         _ => false,
     }

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the five approved post-review hardening fixes as one PR: outbound link supersession recheck, membership-driven supervisor eviction, generation-keyed zid→node cache, Degraded rollup tier, unified settings write lock, iroh relay RMW tests, and the redeem-timeout flake fix.
+**Goal:** Ship five approved post-review hardening tickets (ZEB-627/628/629/630/633) as one PR, as seven code changes: outbound link supersession recheck, membership-driven supervisor eviction, generation-keyed zid→node cache, Degraded rollup tier, unified settings write lock, iroh relay RMW tests, and the redeem-timeout flake fix.
 
-**Architecture:** Six independent surgical changes in existing modules (no new files); each lands with its own tests and commit. Spec: `docs/specs/2026-07-04-hardening-bundle-design.md` (commit `9c7ac481`).
+**Architecture:** Seven independent surgical changes in existing modules (no new files), delivered as Tasks 1–7 below (Task 3 carries both ZEB-627b sub-changes; Task 8 is gates/PR only); each lands with its own tests and commit. Spec: `docs/specs/2026-07-04-hardening-bundle-design.md` (commit `9c7ac481`).
 
 **Tech Stack:** Rust (tokio, zenoh, iroh), nextest, existing test harnesses (`start_paused` supervisor tests, tempdir settings tests).
 

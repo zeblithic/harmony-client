@@ -48856,12 +48856,21 @@ async fn set_friend_auto_accept(
 
     {
         // ZEB-629: file RMW under the process-global settings write lock.
+        // CodeRabbit PR #397 R1: offload the sync load+save to spawn_blocking
+        // (mirrors connectivity_set_identity_discoverable_impl) so a Tokio
+        // worker isn't parked on disk I/O while the lock is held.
         let _settings_guard = connectivity_settings_write_lock().lock().await;
-        let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
-        settings.friend_auto_accept_known = enabled;
-        settings
-            .save(&path)
-            .map_err(|e| format!("save connectivity-settings: {e}"))?;
+        let rmw_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut settings =
+                connectivity_settings::ConnectivitySettings::load_or_default(&rmw_path);
+            settings.friend_auto_accept_known = enabled;
+            settings
+                .save(&rmw_path)
+                .map_err(|e| format!("save connectivity-settings: {e}"))
+        })
+        .await
+        .map_err(|e| format!("save connectivity-settings task: {e}"))??;
     }
 
     // Emit so the UI reflects the toggle (and can surface the "applies on next
