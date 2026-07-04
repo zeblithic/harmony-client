@@ -509,26 +509,34 @@ fn load_or_create_secret_key_inner(
     Ok((SecretKey::from_bytes(&key_bytes), freshly_created))
 }
 
-/// ZEB-347: prime the one-time, process-global initialization that the
-/// FIRST `iroh::Endpoint::bind()` in a process pays (~10s on CI, ~30s on
-/// some macOS hosts); every subsequent bind in the same process is ~3ms.
+/// ZEB-347/ZEB-626: serialize residual first-`bind()` initialization in this
+/// process ahead of tests that assert tight timeouts.
 ///
-/// `cargo nextest` runs each test in its own process, so every test that
-/// binds a hermetic iroh endpoint pays this init once. Call this ONCE at
-/// the top of such a test, OUTSIDE any `tokio::time::timeout` that guards
-/// the behavior under test. That timeout exists to catch a *hung
-/// behavior* (a lost wakeup, a deadlocked roundtrip), not slow hermetic
-/// setup; folding the one-time init into it makes the test flaky under CI
-/// parallelism (the init balloons past the budget) for zero real signal.
-/// After this returns, the test's own `bind()` is the fast cached path.
+/// History: the first `iroh::Endpoint::bind()` in a process used to stall
+/// ~10s on CI and ~30-66s on macOS (~76s under heavy local parallelism).
+/// ZEB-626's diagnosis (2026-07-04) showed that was never a process-global
+/// iroh init OR teardown: netwatch's interface enumeration (the `netdev`
+/// crate) queried each wireless interface's transmit rate via CoreWLAN
+/// (sync XPC into `wifid`, ~44s), and iroh's eagerly-built system DNS
+/// resolver read macOS DNS config via `SCDynamicStoreCreateWithOptions`
+/// (sync XPC into `configd`, ~22s) — both stalled for unentitled processes
+/// (every test binary). Both are gone: the vendored netdev patch
+/// (vendor/netdev) removes the CoreWLAN query, and hermetic tests inject
+/// [`hermetic_dns_resolver`] to skip the system-conf read. Post-fix, a
+/// single-endpoint bind+close test measures ~0.06s (was 66.0s).
 ///
-/// A generous 120s kill-switch still bounds the warm-up itself: the init is
-/// normally ~10s (CI) / ~30s (macOS) (~76s under heavy local parallelism), so
-/// 120s never fires under legitimate load, but a future iroh regression that
-/// makes the bind truly *hang* fails the test in ~2 min instead of stalling
-/// until the 30-min job timeout. This keeps a wall-clock bound on the warm-up
-/// even though it lives outside the per-test asserted timeout (Qodo + CodeAnt
-/// review).
+/// `cargo nextest` runs each test in its own process, so any residual
+/// per-process first-bind cost (crypto-provider init, netmon route-socket
+/// setup) is paid per test. Call this ONCE at the top of an endpoint-binding
+/// test, OUTSIDE any `tokio::time::timeout` that guards the behavior under
+/// test — that timeout exists to catch a *hung behavior*, not setup. If
+/// first-bind cost ever regresses, sample the process mid-stall (ZEB-626
+/// diagnosis method; see docs/specs/2026-07-04-zeb-626-netdev-corewlan-stall-design.md
+/// §3) before widening any timeout.
+///
+/// A generous 120s kill-switch still bounds the warm-up itself: a future
+/// regression that makes the bind truly *hang* fails the test in ~2 min
+/// instead of stalling until the job timeout.
 ///
 /// Marked `pub` + feature-gated so integration tests (which see only the
 /// `--features test-fixtures` public surface) can call it too;
@@ -545,9 +553,9 @@ pub async fn warm_up_iroh_global_init() {
     let ep = tokio::time::timeout(std::time::Duration::from_secs(120), builder.bind())
         .await
         .expect(
-            "warm-up iroh bind exceeded its 120s kill-switch — the one-time bind \
-             init is normally ~10s (CI) / ~30s (macOS); a stall this long means an \
-             iroh bind regression, not normal slowness",
+            "warm-up iroh bind exceeded its 120s kill-switch — post-ZEB-626 a \
+             hermetic bind is ~0.06s; a stall this long means an iroh bind \
+             regression (sample the process mid-stall before widening timeouts)",
         )
         .expect("warm-up iroh bind");
     ep.close().await;
