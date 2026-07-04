@@ -378,8 +378,13 @@ pub struct ProdRelayIngestCtx {
     /// The shared CAS handle (`RuntimeContentStore` in production) — the storage
     /// blob is put here so the message body is fetchable like a direct arrival.
     pub content_store: Arc<dyn crate::content_store::ContentStore>,
-    /// Event sink for the `dm-received` emit (ZEB-445).
+    /// Event sink for the `dm-received` emit (ZEB-445) and the ZEB-236
+    /// `dm-invite-received` / `dm-invite-list-changed` emits.
     pub sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
+    /// ZEB-236 (T3): the process-local staged-invite store (from `NodeState`).
+    /// A relay-recovered non-friend invite (invite-only or co-deposited) is
+    /// staged here + surfaced via `sink`. `None` only in unit tests.
+    pub pending_dm_invites: Option<Arc<crate::pending_dm_invites::PendingDmInvites>>,
 }
 
 #[async_trait]
@@ -423,26 +428,31 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     "ZEB-505: invite inviter does not match authenticated relay sender".into(),
                 );
             }
-            let mut state = self.crdt_state.lock().await;
-            match crate::dm_outbox::apply_invite(
-                &mut state,
-                self.self_owner,
-                &self.device_id,
-                signed,
-                signature,
-                &signed_bytes,
-                now_epoch_ms(),
-                Some(crate::owner_state_types::OwnerAddr(sender_owner)),
-                false,
-            )
-            .map_err(|e| format!("apply_invite: {e:?}"))?
-            {
-                // ZEB-236 (T2 interim): real staging lands in T3; until then a
-                // non-friend invite is logged and dropped.
+            // Scope the lock to `apply_invite`, then DROP the guard before
+            // staging + emitting (store `Mutex` + sink must not nest inside the
+            // held `crdt_state` lock — ZEB-236 T3).
+            let outcome = {
+                let mut state = self.crdt_state.lock().await;
+                crate::dm_outbox::apply_invite(
+                    &mut state,
+                    self.self_owner,
+                    &self.device_id,
+                    signed,
+                    signature,
+                    &signed_bytes,
+                    now_epoch_ms(),
+                    Some(crate::owner_state_types::OwnerAddr(sender_owner)),
+                    false,
+                )
+                .map_err(|e| format!("apply_invite: {e:?}"))?
+            };
+            match outcome {
+                // ZEB-236 (T3): stage the non-friend invite + surface it to the UI.
                 crate::dm_outbox::ApplyInviteOutcome::Staged(staged) => {
-                    tracing::info!(
-                        space_id = ?staged.signed.space_id,
-                        "ZEB-236: non-friend DM invite staged pending store wiring (T3)"
+                    crate::pending_dm_invites::stage_and_emit_staged_invite(
+                        self.pending_dm_invites.as_ref(),
+                        self.sink.as_ref(),
+                        staged,
                     );
                 }
                 crate::dm_outbox::ApplyInviteOutcome::Accepted => {}
@@ -503,7 +513,9 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                 &signed_bytes,
             )
             .map_err(|e| format!("verify_cidnotify_sender_binding: {e:?}"))?;
-            if let Some(inv) = payload.invite_packet.as_ref() {
+            // ZEB-236 (T3): a co-deposited invite from a non-friend is STAGED
+            // (writes no Space); `apply_deposited_invite` hands it back here.
+            let staged_invite = if let Some(inv) = payload.invite_packet.as_ref() {
                 crate::dm_outbox::apply_deposited_invite(
                     &mut state,
                     self.self_owner,
@@ -514,10 +526,31 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     signed.signing_device_hash,
                     identity_pub,
                     now_epoch_ms(),
-                )?;
-            }
-            let space = crate::dm_outbox::verify_cidnotify_space(&state, &signed, resolved_owner)
-                .map_err(|e| format!("verify_cidnotify_space: {e:?}"))?;
+                )?
+            } else {
+                None
+            };
+            // A staged (non-friend) invite bootstrapped no Space, so this lookup
+            // fails UNLESS the Space already exists from a prior accept. On that
+            // space-absent branch, drop the lock, stage + emit the invite so the
+            // user is prompted, and leave the message unacked (Err) for a
+            // post-accept redelivery. When the Space DOES exist the invite is
+            // redundant — admit the message and do NOT re-prompt.
+            let space =
+                match crate::dm_outbox::verify_cidnotify_space(&state, &signed, resolved_owner) {
+                    Ok(space) => space,
+                    Err(e) => {
+                        drop(state);
+                        if let Some(staged) = staged_invite {
+                            crate::pending_dm_invites::stage_and_emit_staged_invite(
+                                self.pending_dm_invites.as_ref(),
+                                self.sink.as_ref(),
+                                staged,
+                            );
+                        }
+                        return Err(format!("verify_cidnotify_space: {e:?}"));
+                    }
+                };
 
             // 4. Blob ↔ packet binding: the recovered storage blob must hash to
             //    the packet's message_cid under the DM send path's flags.
@@ -2748,6 +2781,13 @@ mod tests {
                     device_id: "bob-device-64hex".into(),
                 },
             );
+            // ZEB-236: the legitimate offline-DM sender is an ACTIVE friend, so a
+            // recovered invite AUTO-ACCEPTS (bootstraps the Space). Without an
+            // active friendship the tier fork would STAGE it instead of applying.
+            bob_state
+                .friend_graph
+                .friends
+                .insert(alice, crate::friend_graph::active_friend_entry_for_test(1));
         }
         let crdt_state = Arc::new(tokio::sync::Mutex::new(bob_state));
         let content_store: Arc<dyn crate::content_store::ContentStore> =
@@ -2763,6 +2803,7 @@ mod tests {
             crdt_state: Arc::clone(&crdt_state),
             content_store,
             sink,
+            pending_dm_invites: None,
         };
 
         RelayRecoverInviteFixture {

@@ -2480,7 +2480,7 @@ pub(crate) fn apply_deposited_invite(
     expected_signing_device_hash: DeviceIdentityHash,
     expected_identity_pub: [u8; 64],
     wall_now_ms: u64,
-) -> Result<(), String> {
+) -> Result<Option<crate::pending_dm_invites::StagedDmInvite>, String> {
     if invite_packet.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
         return Err(format!(
             "deposited invite too large: {} bytes",
@@ -2532,17 +2532,13 @@ pub(crate) fn apply_deposited_invite(
     )
     .map_err(|e| format!("apply_invite: {e:?}"))?
     {
-        // ZEB-236 (T2 interim): the store wiring lands in T3. Until then a
-        // non-friend deposited invite is logged and dropped (same interim
-        // behavior as the tunnel ingest path).
-        ApplyInviteOutcome::Staged(staged) => {
-            tracing::info!(
-                space_id = ?staged.signed.space_id,
-                "ZEB-236: non-friend DM invite staged pending store wiring (T3)"
-            );
-            Ok(())
-        }
-        ApplyInviteOutcome::Accepted => Ok(()),
+        // ZEB-236 (T3): a non-friend deposited invite bootstraps NO Space; the
+        // verified invite is handed back to the caller to stage + emit AFTER it
+        // releases the owner-state lock (this fn holds only `&mut state` and has
+        // no store/sink handle — the ingest ctx owns those). `Accepted` (active
+        // friend) already wrote the Space, so there is nothing to stage.
+        ApplyInviteOutcome::Staged(staged) => Ok(Some(staged)),
+        ApplyInviteOutcome::Accepted => Ok(None),
     }
 }
 

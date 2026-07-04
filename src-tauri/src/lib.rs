@@ -4617,6 +4617,10 @@ pub async fn start_node_inner(
                         crdt_state: std::sync::Arc::clone(&crdt_state),
                         content_store: std::sync::Arc::clone(&content_store),
                         sink: app.clone(),
+                        // ZEB-236: stage non-friend deposited invites + emit.
+                        pending_dm_invites: Some(std::sync::Arc::clone(
+                            &pending_dm_invites_for_state,
+                        )),
                         enrolled: dm_inbox_enrolled,
                     });
                     // The ingest sweeper: one startup sweep (entries
@@ -8284,6 +8288,9 @@ pub async fn start_node_inner(
                             let drain_crdt_state = std::sync::Arc::clone(&crdt_state);
                             let drain_content_store = std::sync::Arc::clone(&content_store);
                             let drain_sink = app.clone();
+                            // ZEB-236: the tunnel drain stages non-friend invites.
+                            let drain_pending_invites =
+                                std::sync::Arc::clone(&pending_dm_invites_for_state);
                             let drain_device_id = device_id.clone();
                             // ZEB-482: the same self OwnerAddr `dm_self_owner`
                             // carries — needed so the invite-ingest arm can run
@@ -8295,6 +8302,7 @@ pub async fn start_node_inner(
                                         &drain_crdt_state,
                                         &drain_content_store,
                                         &drain_sink,
+                                        Some(std::sync::Arc::clone(&drain_pending_invites)),
                                         drain_self_owner,
                                         &drain_device_id,
                                         // ZEB-482 (CodeRabbit F1): bind a tunnel
@@ -8543,6 +8551,11 @@ pub async fn start_node_inner(
                                             crdt_state: std::sync::Arc::clone(&crdt_state),
                                             content_store: std::sync::Arc::clone(&content_store),
                                             sink: app.clone(),
+                                            // ZEB-236: stage non-friend
+                                            // relay-recovered invites + emit.
+                                            pending_dm_invites: Some(std::sync::Arc::clone(
+                                                &pending_dm_invites_for_state,
+                                            )),
                                         },
                                     );
                                     let relay_pull_transport: std::sync::Arc<

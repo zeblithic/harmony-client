@@ -77,6 +77,38 @@ impl PendingDmInvites {
     }
 }
 
+/// ZEB-236 (T3): stage a verified non-friend invite into the process-local
+/// store and fire the UI events, shared by every live ingest route so all
+/// paths emit identically. CANONICAL semantics: emit `dm-invite-received` ONLY
+/// when `stage()` reports a NEWLY-staged invite (a keep-first redelivery of an
+/// already-pending invite must NOT re-prompt); ALWAYS emit
+/// `dm-invite-list-changed` after a successful stage so the list view refreshes.
+/// Both payloads are `&()` — the frontend re-fetches via `list_pending_dm_invites`
+/// (mirrors `friend-list-changed`).
+///
+/// `pending == None` means the store was not wired on this path (defensive; the
+/// live routes always pass `Some`) — the invite is warn-logged and dropped
+/// rather than silently swallowed.
+///
+/// CALLER CONTRACT: the `crdt_state` async lock guard MUST already be dropped
+/// before calling this — `stage()` takes the store `Mutex` and this fires the
+/// event sink, neither of which may nest inside the held owner-state lock.
+pub(crate) fn stage_and_emit_staged_invite(
+    pending: Option<&std::sync::Arc<PendingDmInvites>>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    staged: StagedDmInvite,
+) {
+    let Some(pending) = pending else {
+        tracing::warn!("ZEB-236: staged DM invite dropped (pending store not wired on this path)");
+        return;
+    };
+    let newly = pending.stage(staged);
+    if newly {
+        crate::node_event_sink::emit_ser(sink, "dm-invite-received", &());
+    }
+    crate::node_event_sink::emit_ser(sink, "dm-invite-list-changed", &());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
