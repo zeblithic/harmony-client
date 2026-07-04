@@ -183,6 +183,7 @@ pub mod friend_graph;
 pub mod friend_nicknames;
 pub mod friend_rendezvous;
 pub mod friend_requests;
+pub mod pending_dm_invites;
 pub mod friend_token;
 pub mod identity;
 pub mod identity_commands;
@@ -1397,6 +1398,11 @@ pub struct NodeState {
     pub pending_friend_requests:
         Option<std::sync::Arc<crate::friend_requests::PendingFriendRequests>>,
 
+    /// ZEB-236: process-local staged DM invites awaiting user accept/decline.
+    /// Same lifecycle as `pending_friend_requests`.
+    pub(crate) pending_dm_invites:
+        Option<std::sync::Arc<crate::pending_dm_invites::PendingDmInvites>>,
+
     /// Shared pkarr resolver. Used by `connectivity_discover_identity` IPC
     /// and wired into the `ReachabilityResolver` as the case-C fallback.
     pub pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
@@ -1534,6 +1540,10 @@ impl NodeState {
         // rebuilds a fresh one (process-local + ephemeral — pending requests are
         // re-sent by the requester's next dial after a restart).
         self.pending_friend_requests = None;
+        // ZEB-236: drop the staged DM-invite store so a restart rebuilds a
+        // fresh one (process-local + ephemeral — ZEB-483 re-stages pending
+        // invites from the next inbound message after a restart).
+        self.pending_dm_invites = None;
         self.pkarr_resolver = None;
         self.pkarr_relay_client = None;
         self.pkarr_invite_publisher = None;
@@ -1759,6 +1769,7 @@ impl Default for NodeState {
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
             pending_friend_requests: None,
+            pending_dm_invites: None,
             pkarr_resolver: None,
             pkarr_relay_client: None,
             pkarr_invite_publisher: None,
@@ -3817,6 +3828,11 @@ pub async fn start_node_inner(
         // into the friend acceptor at its construction below.
         let pending_friend_requests_for_state =
             std::sync::Arc::new(crate::friend_requests::PendingFriendRequests::new());
+        // ZEB-236: process-local staged DM-invite store. Built unconditionally
+        // so the accept/decline/list IPCs (later tasks) can reach it via
+        // NodeState even when pkarr is disabled. Cloned into the guard below.
+        let pending_dm_invites_for_state =
+            std::sync::Arc::new(crate::pending_dm_invites::PendingDmInvites::new());
         // ZEB-371 Task 12 (spec §7.1): "auto-accept known requesters" toggle.
         // Assigned from persisted `ConnectivitySettings` in the pkarr setup block
         // (default ON when the setting is absent). The variable is declared
@@ -9707,6 +9723,11 @@ pub async fn start_node_inner(
                         // acceptor (built above) holds the other strong ref.
                         guard.pending_friend_requests =
                             Some(std::sync::Arc::clone(&pending_friend_requests_for_state));
+                        // ZEB-236: stash the staged DM-invite store so the
+                        // accept/decline/list IPCs (later tasks) reach the SAME
+                        // store the invite-ingest path will stage into.
+                        guard.pending_dm_invites =
+                            Some(std::sync::Arc::clone(&pending_dm_invites_for_state));
                         guard.pkarr_resolver = pkarr_resolver_for_state.take();
                         guard.pkarr_relay_client = pkarr_relay_client_for_state.take();
                         guard.pkarr_invite_publisher = pkarr_invite_publisher_for_state.take();
@@ -57026,6 +57047,7 @@ mod start_node_race_tests {
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
             pending_friend_requests: None,
+            pending_dm_invites: None,
             pkarr_resolver: None,
             pkarr_relay_client: None,
             pkarr_invite_publisher: None,
