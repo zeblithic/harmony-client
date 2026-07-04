@@ -169,7 +169,18 @@ setup_nodes() {
   # key over pkarr, so case-B publish must be on before the invite is minted.
   local_api  connectivity_set_identity_discoverable '{"enabled": true}' > /dev/null
   remote_api connectivity_set_identity_discoverable '{"enabled": true}' > /dev/null
-  log "identity_discoverable=true on both; pkarr propagation needs ~75-90s (polls below absorb it)"
+  # GATE on the inviter's identity record actually landing: a RUNTIME
+  # discoverable-enable waits for the publisher's ~7.5min tick (measured live:
+  # first publish 4m49s after enable, 2026-07-04) — redeem retries alone
+  # cannot absorb that. identityPublished + identityLastPublishMs are real
+  # (post-ZEB-511) and flip only when the identity record publish succeeded.
+  identity_published() {
+    api_of "$1" network_health_snapshot | \
+      jq -e '.pkarrStatus | select(.identityPublished == true and .identityLastPublishMs != null)' > /dev/null
+  }
+  log "waiting for local identity pkarr publish (first runtime-enabled publish can wait for the ~7.5min tick)…"
+  poll 600 15 "local identity pkarr publish" identity_published local || die "local identity record never published"
+  log "local identity record published — inviter is resolvable"
 }
 
 # ---- T1: first-contact + community ----------------------------------------
