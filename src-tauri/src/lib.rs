@@ -47336,6 +47336,41 @@ fn iroh_target_relay_urls(settings: &connectivity_settings::ConnectivitySettings
     connectivity_settings::effective_iroh_relays(settings).unwrap_or_else(iroh_default_relay_urls)
 }
 
+/// ZEB-630: pure RMW core of `add_iroh_relay` — materialize the EFFECTIVE
+/// list (preset defaults on a defaults-following node), append, validate
+/// (dedups, caps at `MAX_IROH_RELAYS`). Extracted from the IPC so the
+/// materialization behavior is unit-testable without a Tauri runtime.
+fn add_iroh_relay_target(
+    settings: &connectivity_settings::ConnectivitySettings,
+    url: &str,
+) -> Result<Vec<String>, String> {
+    let mut relays = iroh_target_relay_urls(settings);
+    relays.push(url.to_string());
+    connectivity_settings::validate_iroh_relay_urls(relays)
+}
+
+/// ZEB-630: pure RMW core of `remove_iroh_relay` — filter the EFFECTIVE list
+/// (trailing-slash-normalized match), reject removing the last relay (use
+/// reset to follow defaults), validate. Extracted so the last-relay guard is
+/// covered by a unit test rather than a simulation.
+fn remove_iroh_relay_target(
+    settings: &connectivity_settings::ConnectivitySettings,
+    url: &str,
+) -> Result<Vec<String>, String> {
+    let target = url.trim().trim_end_matches('/');
+    let remaining: Vec<String> = iroh_target_relay_urls(settings)
+        .into_iter()
+        .filter(|r| r.trim_end_matches('/') != target)
+        .collect();
+    if remaining.is_empty() {
+        return Err(
+            "cannot remove the last iroh relay; use reset to follow the built-in defaults instead"
+                .to_string(),
+        );
+    }
+    connectivity_settings::validate_iroh_relay_urls(remaining)
+}
+
 /// ZEB-624: serializes all iroh-relay settings mutations (add/remove/set/reset)
 /// so a concurrent read-modify-write from another window can't lose an update.
 /// Process-global (single per-process settings file); separate from both the
@@ -47475,9 +47510,7 @@ async fn add_iroh_relay<R: tauri::Runtime>(
     };
     let path = connectivity_settings_path(settings_path)?;
     let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
-    let mut relays = iroh_target_relay_urls(&settings);
-    relays.push(url);
-    let validated = connectivity_settings::validate_iroh_relay_urls(relays)?;
+    let validated = add_iroh_relay_target(&settings, &url)?;
     apply_iroh_relays(&app, &state, validated).await
 }
 
@@ -47502,18 +47535,7 @@ async fn remove_iroh_relay<R: tauri::Runtime>(
     };
     let path = connectivity_settings_path(settings_path)?;
     let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
-    let target = url.trim().trim_end_matches('/');
-    let remaining: Vec<String> = iroh_target_relay_urls(&settings)
-        .into_iter()
-        .filter(|r| r.trim_end_matches('/') != target)
-        .collect();
-    if remaining.is_empty() {
-        return Err(
-            "cannot remove the last iroh relay; use reset to follow the built-in defaults instead"
-                .to_string(),
-        );
-    }
-    let validated = connectivity_settings::validate_iroh_relay_urls(remaining)?;
+    let validated = remove_iroh_relay_target(&settings, &url)?;
     apply_iroh_relays(&app, &state, validated).await
 }
 
@@ -50457,6 +50479,59 @@ mod friend_ipc_tests {
         assert!(
             result.is_err(),
             "remove-last: empty list is rejected by validator"
+        );
+    }
+
+    #[test]
+    fn add_remove_iroh_relay_read_modify_write() {
+        // ZEB-630: iroh mirror of add_remove_pkarr_relay_read_modify_write,
+        // driving the REAL RMW cores (add/remove_iroh_relay_target) that the
+        // IPCs delegate to — including the defaults-materialization on a
+        // defaults-following node and the inline last-relay rejection (which,
+        // unlike pkarr, is NOT in the validator).
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Defaults-following node: no custom iroh relays persisted.
+        let settings = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        assert!(
+            crate::connectivity_settings::effective_iroh_relays(&settings).is_none(),
+            "fresh settings follow defaults"
+        );
+        let defaults = crate::iroh_default_relay_urls();
+        assert!(!defaults.is_empty(), "preset defaults are non-empty");
+
+        // --- Add on a defaults-following node materializes defaults + new ---
+        let added = crate::add_iroh_relay_target(&settings, "https://relay.zeblithic.example")
+            .expect("valid add");
+        assert_eq!(added.len(), defaults.len() + 1, "defaults materialized + 1");
+        assert!(added.contains(&"https://relay.zeblithic.example".to_string()));
+        let mut s = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        s.iroh_relays = added.clone();
+        s.save(&path).expect("persist add");
+
+        // --- Re-add dedups (validator) ---
+        let s2 = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        let readded = crate::add_iroh_relay_target(&s2, "https://relay.zeblithic.example")
+            .expect("dedup add");
+        assert_eq!(readded.len(), added.len(), "re-add is a no-op");
+
+        // --- Remove one (trailing-slash-normalized) ---
+        let removed = crate::remove_iroh_relay_target(&s2, "https://relay.zeblithic.example/")
+            .expect("valid remove");
+        assert_eq!(removed.len(), added.len() - 1);
+        assert!(!removed.contains(&"https://relay.zeblithic.example".to_string()));
+
+        // --- Remove down to one, then the LAST one → inline guard fires ---
+        let mut one = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        one.iroh_relays = vec![removed[0].clone()];
+        one.save(&path).expect("persist single");
+        let s3 = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        let err = crate::remove_iroh_relay_target(&s3, &removed[0])
+            .expect_err("last-relay removal must be rejected");
+        assert_eq!(
+            err,
+            "cannot remove the last iroh relay; use reset to follow the built-in defaults instead"
         );
     }
 
