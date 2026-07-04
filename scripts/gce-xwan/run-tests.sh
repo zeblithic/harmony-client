@@ -74,7 +74,12 @@ start_local() {
 
 start_remote() {
   log "starting remote node (profile $REMOTE_PROFILE)…"
-  gssh "source ${REMOTE_ENV} && nohup ${REMOTE_BIN} serve > ~/serve.log 2>&1 & disown"
+  # Both halves are load-bearing (found live, first open-mode sessions
+  # 2026-07-04): the ';' keeps '&' bound to the nohup command alone — with
+  # '&&' the whole list backgrounds as a subshell that runs serve in ITS
+  # foreground while holding the ssh channel fds, and ssh blocks until the
+  # node exits. The </dev/null keeps stdin off the channel for the same reason.
+  gssh "source ${REMOTE_ENV}; nohup ${REMOTE_BIN} serve > ~/serve.log 2>&1 < /dev/null & disown; exit 0"
   wait_api remote
 }
 
