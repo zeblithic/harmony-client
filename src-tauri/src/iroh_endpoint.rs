@@ -164,6 +164,33 @@ impl IrohEndpoint {
         secret_key: SecretKey,
         custom_relays: Option<Vec<RelayUrl>>,
     ) -> Result<Self, IrohEndpointError> {
+        Self::new_with_secret_and_relays_inner(secret_key, custom_relays, None).await
+    }
+
+    /// ZEB-626: test seam. Same as [`Self::new_with_secret_and_relays`] but with
+    /// [`hermetic_dns_resolver`] injected, so N0-path unit tests (relay-map
+    /// logic) skip iroh's eager system-DNS-config read at bind — a synchronous
+    /// SystemConfiguration XPC that stalls ~22s/process on macOS for
+    /// unentitled processes (test binaries). Production uses the plain
+    /// constructor and iroh's default system resolver.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn new_with_secret_and_relays_hermetic_dns(
+        secret_key: SecretKey,
+        custom_relays: Option<Vec<RelayUrl>>,
+    ) -> Result<Self, IrohEndpointError> {
+        Self::new_with_secret_and_relays_inner(
+            secret_key,
+            custom_relays,
+            Some(hermetic_dns_resolver()),
+        )
+        .await
+    }
+
+    async fn new_with_secret_and_relays_inner(
+        secret_key: SecretKey,
+        custom_relays: Option<Vec<RelayUrl>>,
+        dns_resolver: Option<iroh::dns::DnsResolver>,
+    ) -> Result<Self, IrohEndpointError> {
         let builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![
@@ -196,6 +223,10 @@ impl IrohEndpoint {
                     .collect();
                 (builder, set)
             }
+        };
+        let builder = match dns_resolver {
+            Some(resolver) => builder.dns_resolver(resolver),
+            None => builder,
         };
         let inner = builder
             .bind()
@@ -478,26 +509,36 @@ fn load_or_create_secret_key_inner(
     Ok((SecretKey::from_bytes(&key_bytes), freshly_created))
 }
 
-/// ZEB-347: prime the one-time, process-global initialization that the
-/// FIRST `iroh::Endpoint::bind()` in a process pays (~10s on CI, ~30s on
-/// some macOS hosts); every subsequent bind in the same process is ~3ms.
+/// ZEB-347/ZEB-626: serialize residual first-`bind()` initialization in this
+/// process ahead of tests that assert tight timeouts.
 ///
-/// `cargo nextest` runs each test in its own process, so every test that
-/// binds a hermetic iroh endpoint pays this init once. Call this ONCE at
-/// the top of such a test, OUTSIDE any `tokio::time::timeout` that guards
-/// the behavior under test. That timeout exists to catch a *hung
-/// behavior* (a lost wakeup, a deadlocked roundtrip), not slow hermetic
-/// setup; folding the one-time init into it makes the test flaky under CI
-/// parallelism (the init balloons past the budget) for zero real signal.
-/// After this returns, the test's own `bind()` is the fast cached path.
+/// History: the first `iroh::Endpoint::bind()` in a process used to stall
+/// ~30-66s on macOS (~76s under heavy local parallelism; a separate ~10s
+/// was once observed on ubuntu CI with a different, never-pinned cause).
+/// ZEB-626's diagnosis (2026-07-04) showed the macOS stall was never a
+/// process-global iroh init OR teardown: netwatch's interface enumeration
+/// (the `netdev` crate) queried each wireless interface's transmit rate via
+/// CoreWLAN (sync XPC into `wifid`, ~44s), and iroh's eagerly-built system
+/// DNS resolver read macOS DNS config via `SCDynamicStoreCreateWithOptions`
+/// (sync XPC into `configd`, ~22s) — both stalled for unentitled processes
+/// (every test binary). Both are gone from the test suite: the vendored
+/// netdev patch (vendor/netdev) removes the CoreWLAN query, and every
+/// endpoint-binding test path injects [`hermetic_dns_resolver`] to skip
+/// the system-conf read. Post-fix, a single-endpoint bind+close test
+/// measures ~0.06s (was 66.0s).
 ///
-/// A generous 120s kill-switch still bounds the warm-up itself: the init is
-/// normally ~10s (CI) / ~30s (macOS) (~76s under heavy local parallelism), so
-/// 120s never fires under legitimate load, but a future iroh regression that
-/// makes the bind truly *hang* fails the test in ~2 min instead of stalling
-/// until the 30-min job timeout. This keeps a wall-clock bound on the warm-up
-/// even though it lives outside the per-test asserted timeout (Qodo + CodeAnt
-/// review).
+/// `cargo nextest` runs each test in its own process, so any residual
+/// per-process first-bind cost (crypto-provider init, netmon route-socket
+/// setup) is paid per test. Call this ONCE at the top of an endpoint-binding
+/// test, OUTSIDE any `tokio::time::timeout` that guards the behavior under
+/// test — that timeout exists to catch a *hung behavior*, not setup. If
+/// first-bind cost ever regresses, sample the process mid-stall (ZEB-626
+/// diagnosis method; see docs/specs/2026-07-04-zeb-626-netdev-corewlan-stall-design.md
+/// §3) before widening any timeout.
+///
+/// A generous 120s kill-switch still bounds the warm-up itself: a future
+/// regression that makes the bind truly *hang* fails the test in ~2 min
+/// instead of stalling until the job timeout.
 ///
 /// Marked `pub` + feature-gated so integration tests (which see only the
 /// `--features test-fixtures` public surface) can call it too;
@@ -507,18 +548,38 @@ fn load_or_create_secret_key_inner(
 pub async fn warm_up_iroh_global_init() {
     let builder = Endpoint::builder(presets::Minimal)
         .relay_mode(iroh::endpoint::RelayMode::Disabled)
+        .dns_resolver(hermetic_dns_resolver())
         .clear_ip_transports()
         .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("warm-up bind_addr loopback");
     let ep = tokio::time::timeout(std::time::Duration::from_secs(120), builder.bind())
         .await
         .expect(
-            "warm-up iroh bind exceeded its 120s kill-switch — the one-time bind \
-             init is normally ~10s (CI) / ~30s (macOS); a stall this long means an \
-             iroh bind regression, not normal slowness",
+            "warm-up iroh bind exceeded its 120s kill-switch — post-ZEB-626 a \
+             hermetic bind is ~0.06s; a stall this long means an iroh bind \
+             regression (sample the process mid-stall before widening timeouts)",
         )
         .expect("warm-up iroh bind");
     ep.close().await;
+}
+
+/// ZEB-626: a DNS resolver for hermetic test endpoints that never reads the
+/// system DNS configuration. iroh's `Builder::bind` eagerly constructs the
+/// system resolver when none is supplied, and hickory's macOS
+/// `read_system_conf` blocks in `SCDynamicStoreCreateWithOptions` — a
+/// synchronous SystemConfiguration XPC that stalls ~22s/process for
+/// unentitled callers (every test binary). Hermetic tests dial loopback by
+/// address with relays disabled and never resolve a name, so the nameserver
+/// below (loopback port 1) is intentionally unanswering.
+///
+/// Symptom if a future hermetic test DOES resolve a name: a fast
+/// connection-refused / timed-out DNS error mentioning `127.0.0.1:1`. If you
+/// hit that, the test is no longer hermetic — either dial by address or give
+/// that one test a real resolver; do NOT point this helper at a live
+/// nameserver (it would re-couple every hermetic test to the host network).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn hermetic_dns_resolver() -> iroh::dns::DnsResolver {
+    iroh::dns::DnsResolver::with_nameserver(std::net::SocketAddr::from(([127, 0, 0, 1], 1)))
 }
 
 #[cfg(test)]
@@ -552,6 +613,7 @@ mod tests {
                 alpn::HARMONY_TUNNEL_V2.to_vec(),
             ])
             .relay_mode(RelayMode::Disabled)
+            .dns_resolver(hermetic_dns_resolver())
             .bind()
             .await
             .expect("bind ephemeral endpoint");
@@ -619,9 +681,12 @@ mod tests {
         let custom: RelayUrl = "https://relay.example.com"
             .parse()
             .expect("parse custom relay url");
-        let ep = IrohEndpoint::new_with_secret_and_relays(secret, Some(vec![custom.clone()]))
-            .await
-            .expect("bind endpoint with custom relay");
+        let ep = IrohEndpoint::new_with_secret_and_relays_hermetic_dns(
+            secret,
+            Some(vec![custom.clone()]),
+        )
+        .await
+        .expect("bind endpoint with custom relay");
         assert_eq!(
             relay_url_set(&ep),
             std::collections::BTreeSet::from([custom.clone()])
@@ -638,9 +703,10 @@ mod tests {
         let secret = SecretKey::generate();
         let a: RelayUrl = "https://relay-a.example.com".parse().expect("parse A");
         let b: RelayUrl = "https://relay-b.example.com".parse().expect("parse B");
-        let ep = IrohEndpoint::new_with_secret_and_relays(secret, Some(vec![a.clone()]))
-            .await
-            .expect("bind endpoint with [A]");
+        let ep =
+            IrohEndpoint::new_with_secret_and_relays_hermetic_dns(secret, Some(vec![a.clone()]))
+                .await
+                .expect("bind endpoint with [A]");
         assert_eq!(
             relay_url_set(&ep),
             std::collections::BTreeSet::from([a.clone()])
@@ -676,5 +742,47 @@ mod tests {
             b"harmony/butler-deposit/v1"
         );
         assert_eq!(alpn::HARMONY_TUNNEL_V1, b"harmony/tunnel/v1");
+    }
+
+    /// ZEB-626 patch-presence tripwire, part 1 (deterministic, all
+    /// platforms): referencing the vendored crate's marker const in a
+    /// `const` block means an UNPATCHED netdev (which lacks the const)
+    /// fails to COMPILE this test target — no reliance on host hardware.
+    /// (Qodo round-1 finding: the behavioral test below passes vacuously
+    /// on a Mac with no WiFi interface.)
+    const _: () = assert!(
+        netdev::ZEBLITHIC_ZEB_626_PATCH,
+        "unpatched netdev in the graph (ZEB-626) — refresh vendor/netdev per its README"
+    );
+
+    /// ZEB-626 patch-presence tripwire, part 2 (behavioral, macOS). The
+    /// vendored netdev (vendor/netdev/README.zeblithic.md) must never
+    /// compute transmit_speed for WIRELESS interfaces on macOS: the
+    /// upstream implementation fills it via a synchronous CoreWLAN->wifid
+    /// XPC call (~44s/process for unentitled callers), paid inside the
+    /// first Endpoint::bind() of every process via netwatch. Wired
+    /// interfaces legitimately get a link speed from the shared unix
+    /// SIOCGIFXMEDIA path (vendor/netdev/src/os/unix/link_speed.rs) — the
+    /// patch leaves that untouched, so the assertion is scoped to
+    /// Wireless80211. If this fails, an unpatched netdev re-entered the
+    /// graph — refresh vendor/netdev per its README. (Vacuous on a Mac
+    /// with no WiFi interface; the const assertion above is the
+    /// deterministic net.)
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn vendored_netdev_never_computes_transmit_speed_on_macos() {
+        use netdev::prelude::InterfaceType;
+        for iface in netdev::interface::get_interfaces() {
+            if iface.if_type != InterfaceType::Wireless80211 {
+                continue;
+            }
+            assert!(
+                iface.transmit_speed.is_none(),
+                "wireless interface {} has transmit_speed {:?} — unpatched netdev \
+                 (CoreWLAN query) back in the graph (ZEB-626)",
+                iface.name,
+                iface.transmit_speed
+            );
+        }
     }
 }

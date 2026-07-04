@@ -12384,7 +12384,7 @@ mod add_space_tunnel_routing_tests {
     async fn test_manager() -> StdArc<TunnelManager> {
         let endpoint = {
             let sk = iroh::SecretKey::generate();
-            crate::iroh_endpoint::IrohEndpoint::new_with_secret(sk)
+            crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
                 .await
                 .expect("bind loopback iroh endpoint")
         };
@@ -58666,6 +58666,7 @@ mod zeb_321_connectivity_ipc_tests {
             .secret_key(secret)
             .alpns(vec![alpn::HARMONY_ZENOH_V1.to_vec()])
             .relay_mode(RelayMode::Disabled)
+            .dns_resolver(crate::iroh_endpoint::hermetic_dns_resolver())
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
             .expect("bind_addr loopback")

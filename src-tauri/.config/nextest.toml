@@ -23,19 +23,13 @@
 #
 # No profile config is needed today; this file is kept as the home for any
 # future nextest configuration.
-
-# ZEB-619 (iroh 0.98.2 -> 1.0.1): iroh 1.0 moved endpoint drain off the
-# awaited close() path onto Drop, so every hermetic test process pays a
-# ~57s background teardown (netwatch blocking socket-close + per-endpoint
-# netmon monitor) AFTER its test body finishes. Under nextest's default
-# full-CPU parallelism those drains contend and serialize into a
-# ~330-360s-per-test plateau (54min suite, one outer-timeout failure).
-# Capping concurrency for endpoint-heavy tests keeps the drains from
-# stampeding; the ~57s/process floor itself is upstream behavior — a
-# follow-up ticket tracks cutting it (endpoint pool or an iroh knob).
-[test-groups]
-iroh-endpoint = { max-threads = 4 }
-
-[[profile.default.overrides]]
-filter = 'test(iroh) | test(zenoh) | test(tunnel) | test(reachability) | test(dial) | test(liveness) | binary(~iroh) | binary(~zenoh) | binary(~referral) | binary(~network_health) | binary(~friend_token) | binary(~open_join) | binary(~api_server) | binary(~profile_isolation)'
-test-group = 'iroh-endpoint'
+#
+# (Historical) ZEB-619 added an `iroh-endpoint` test-group (max-threads 4)
+# here to contain what looked like iroh 1.0 Drop-drain teardown contention
+# (~330-360s/test plateau). ZEB-626's diagnosis showed the real cause was
+# two synchronous macOS XPC stalls at first bind (netdev's CoreWLAN->wifid
+# wifi-rate query + iroh's eager SystemConfiguration/configd DNS-config
+# read), both fixed at the source (vendor/netdev + hermetic_dns_resolver),
+# so the cap was removed. If endpoint-heavy tests ever plateau again,
+# sample a test process mid-run BEFORE re-adding concurrency caps
+# (ZEB-626 method).

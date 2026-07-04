@@ -58,12 +58,13 @@ use zenoh_link::LinkUnicast;
 /// under contention; these are deliberately fat so a wedged dial fails the test
 /// rather than masking a real wiring bug behind a too-tight deadline.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-// ZEB-619: 90s -> 180s. iroh 1.0's Drop-based endpoint drain adds ~57s of
-// per-process teardown that contends across parallel test processes; under
-// a full-suite run this test's real-QUIC body exceeded 90s (it passes in
-// isolation at ~57s total). 180s keeps ~3x headroom over the isolated cost
-// without weakening any assertion, per this file's header rule.
-const OUTER_TIMEOUT: Duration = Duration::from_secs(180);
+// ZEB-626: back to the pre-ZEB-619 90s. The "drain teardown" that forced
+// 180s was actually two synchronous macOS XPC stalls at first bind
+// (netdev's CoreWLAN->wifid query + iroh's eager SystemConfiguration/
+// configd DNS read), removed at the source (vendor/netdev +
+// hermetic_dns_resolver); this test now runs in ~0.06s isolated, so 90s
+// is >1000x headroom without weakening any assertion.
+const OUTER_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Build a hermetic SERVER iroh endpoint (the `IrohEndpoint` wrapper the link
 /// manager + accept loop need) on loopback with no address-lookup, no pkarr, no
@@ -81,6 +82,7 @@ async fn build_server_endpoint() -> Arc<IrohEndpoint> {
             alpn::HARMONY_FRIEND_PEX_V1.to_vec(),
         ])
         .relay_mode(RelayMode::Disabled)
+        .dns_resolver(harmony_app::iroh_endpoint::hermetic_dns_resolver())
         .clear_ip_transports()
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .expect("bind_addr loopback")
@@ -100,6 +102,7 @@ async fn build_client_endpoint() -> Endpoint {
         .secret_key(secret)
         .alpns(vec![alpn::HARMONY_FRIEND_PEX_V1.to_vec()])
         .relay_mode(RelayMode::Disabled)
+        .dns_resolver(harmony_app::iroh_endpoint::hermetic_dns_resolver())
         .clear_ip_transports()
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .expect("bind_addr loopback")

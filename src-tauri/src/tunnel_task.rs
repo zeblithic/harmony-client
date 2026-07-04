@@ -935,6 +935,7 @@ mod tests {
             .secret_key(SecretKey::from_bytes(&secret))
             .alpns(alpns)
             .relay_mode(RelayMode::Disabled)
+            .dns_resolver(crate::iroh_endpoint::hermetic_dns_resolver())
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
             .expect("bind_addr")
