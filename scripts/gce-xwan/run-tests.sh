@@ -186,28 +186,38 @@ setup_nodes() {
   log "waiting for a fresh local identity pkarr publish (boot publish ≈70s; runtime-enable can wait for the ~7.5min tick)…"
   poll 600 10 "fresh local identity pkarr publish" identity_published_since local "$gate_start_ms" \
     || die "local identity record never published after script start"
-  log "local identity record freshly published — inviter is resolvable"
+  # Settle before ANY redeem attempt. Measured live (3 manual probes vs 3
+  # scripted runs, 2026-07-04): a publish-gated + ~90s-settled FIRST attempt
+  # joins instantly, while an attempt fired seconds after publish fails AND
+  # poisons subsequent same-peer attempts for minutes (remote-side dial
+  # backoff) — a 300s retry loop cannot recover from one early attempt.
+  log "local identity record freshly published — settling 90s before first contact…"
+  sleep 90
 }
 
 # ---- T1: first-contact + community ----------------------------------------
 
 t1_first_contact() {
   log "T1: create community + invite (local) → redeem over iroh (remote) → roster convergence"
-  local cname cid url out status
+  local cname cid url out status attempt
   cname="xwan-t1-$(date +%s)"
   cid="$(local_api create_community "{\"name\": \"$cname\", \"isInviteOnly\": true}" | id_of)"
   [ -n "$cid" ] || die "T1: create_community returned no id"
-  url="$(local_api generate_invite "{\"communityId\": \"$cid\"}" | id_of)"
-  [ -n "$url" ] || die "T1: generate_invite returned no url"
-  log "T1: communityId=$cid — redeeming from GCE node (retries absorb pkarr warm-up)…"
 
-  local deadline=$(( $(date +%s) + 300 ))
+  # A FRESH invite per attempt: hammering one URL after a failed attempt never
+  # recovered in three scripted runs (remote-side backoff outlives the retry
+  # budget), while a fresh mint against a settled inviter joined first-try in
+  # all three manual probes.
   status=""
-  while [ "$(date +%s)" -lt "$deadline" ]; do
+  for attempt in 1 2 3 4; do
+    url="$(local_api generate_invite "{\"communityId\": \"$cid\"}" | id_of)"
+    [ -n "$url" ] || die "T1: generate_invite returned no url"
+    log "T1: attempt $attempt (fresh invite) — redeeming from GCE node…"
     out="$(remote_api connectivity_redeem_invite_iroh "{\"url\": \"$url\"}" 2>&1 || true)"
     status="$(echo "$out" | jq -r '.status // empty' 2>/dev/null || true)"
     [ "$status" = "joined" ] && break
-    sleep 10
+    log "T1: attempt $attempt: ${out}"
+    sleep 45
   done
   echo "$out" > "$ARTIFACTS/t1-redeem-final.json"
   [ "$status" = "joined" ] || { echo "FAIL T1 (mode=$MODE_WANT): redeem never reached joined — last: $out"; return 1; }
