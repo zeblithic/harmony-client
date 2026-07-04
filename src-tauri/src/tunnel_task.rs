@@ -138,6 +138,19 @@ pub async fn run_tunnel_responder(
         }
     };
 
+    // ZEB-623 round-2: clear any stale incompatibility record for this peer — a
+    // successful INBOUND handshake (over v1 or v2) proves we can now speak a
+    // compatible protocol (e.g. the peer has since upgraded, or this is a v1
+    // N-1 inbound that carries no hello). This mirrors the initiator, which
+    // clears on ANY successful handshake. The record is keyed by the peer's
+    // IROH EndpointId (`conn.remote_id()` — the Network Health join key), the
+    // SAME key the failure arm above records under, so we clear symmetrically;
+    // otherwise a previously-flagged peer that reconnects INBOUND stays flagged
+    // until we happen to dial it outbound. `conn` is still in scope here (the
+    // handshake fns borrow it via `&conn`, so ownership stayed with us).
+    mgr.compat_registry()
+        .note_compatible(*conn.remote_id().as_bytes());
+
     // Register the live responder session so our outbound DMs to this peer
     // reuse the bidirectional tunnel. The manager applies lower-NodeId collision
     // dedup: if it already holds a session for this peer, the loser is closed
@@ -976,12 +989,19 @@ mod tests {
         );
 
         // Responder side: production responder driver on the accepted connection.
+        // ZEB-623 round-2: pre-seed the ACCEPTOR-side registry with a STALE
+        // incompatibility keyed by the dialer's iroh EndpointId (what the acceptor
+        // sees as `conn.remote_id()`), simulating a peer that was previously
+        // flagged and has since upgraded. A successful INBOUND handshake must
+        // clear it symmetrically (mirrors the initiator path).
+        let resp_compat = Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default());
+        resp_compat.note_incompatible(*ep_a.id().as_bytes(), "stale".into());
         let (resp_ingest_tx, mut resp_ingest_rx) = mpsc::channel::<InboundDm>(8);
         let resp_mgr = tunnel_manager_with_compat(
             ep_b.clone(),
             Arc::clone(&responder_pq),
             resp_ingest_tx.clone(),
-            Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+            Arc::clone(&resp_compat),
         );
         let resp_pq = Arc::clone(&responder_pq);
         let ep_b_accept = ep_b.clone();
@@ -1050,6 +1070,17 @@ mod tests {
                 .incompat_reason(&peer_node_id)
                 .is_none(),
             "a compatible v2 handshake must leave the compat registry clean"
+        );
+
+        // ZEB-623 round-2: the successful INBOUND handshake must have CLEARED the
+        // stale incompatibility pre-seeded above, keyed by the dialer's iroh
+        // EndpointId (the acceptor's `conn.remote_id()`). Without the responder's
+        // symmetric `note_compatible`, a previously-flagged peer that reconnects
+        // inbound would stay flagged in Network Health.
+        assert!(
+            resp_compat.incompat_reason(ep_a.id().as_bytes()).is_none(),
+            "a successful inbound handshake must clear a stale incompatibility \
+             for the peer's iroh EndpointId on the acceptor side"
         );
 
         drop(init_cmd_tx);

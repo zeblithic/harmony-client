@@ -47369,6 +47369,15 @@ async fn apply_iroh_relays<R: tauri::Runtime>(
 async fn get_iroh_relays(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<IrohRelayWire, String> {
+    // ZEB-624 round-2: serialize this read against mutations under the SAME lock
+    // the mutators hold (set/reset/add/remove → apply_iroh_relays), so the
+    // persisted `custom` flag and the live relay list form ONE consistent
+    // snapshot. Without it, a read racing `apply_iroh_relays` (which saves the new
+    // settings FIRST, then awaits the live endpoint diff) could pair the NEW
+    // `custom` flag with the OLD live relay list. Taken at the TOP, BEFORE the
+    // NodeState mutex — matching the mutators' lock order (`add`/`remove` acquire
+    // the write lock first, then the NodeState mutex) so we never invert it.
+    let _relay_read_guard = iroh_relay_write_lock().lock().await;
     let (settings_path, endpoint) = {
         let guard = state
             .lock()
