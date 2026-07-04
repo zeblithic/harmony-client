@@ -47,11 +47,12 @@ tree**, logging to a stable path, with its exact start command recorded here.
 
    ```bash
    cd <repo>/src-tauri
+   REV=$(git rev-parse --short HEAD)        # must be at/past 1fb35b72
    cargo build --locked --release --bin harmony-app
    mkdir -p ~/work/fleet-bin ~/work/fleet-logs
-   cp target/release/harmony-app ~/work/fleet-bin/harmony-app-1fb35b72
-   shasum -a 256 ~/work/fleet-bin/harmony-app-1fb35b72   # record in ZEB-636
-   ~/work/fleet-bin/harmony-app-1fb35b72 --help > /dev/null && echo staged-OK
+   cp -f target/release/harmony-app ~/work/fleet-bin/harmony-app-"$REV"
+   shasum -a 256 ~/work/fleet-bin/harmony-app-"$REV"   # record REV + sha256 in ZEB-636
+   ~/work/fleet-bin/harmony-app-"$REV" --help > /dev/null && echo staged-OK
    ```
 
    (Windows: same shape under `/c/zeblith/work/fleet-bin/`, `certutil -hashfile
@@ -67,7 +68,7 @@ tree**, logging to a stable path, with its exact start command recorded here.
    the value that must SURVIVE the restart:
 
    ```bash
-   <current-binary> --profile <fleet-profile> api get_owner_state | jq .ownerId
+   <current-binary> --profile <fleet-profile> api get_owner_state | jq -r .ownerId
    ```
 
 5. Do **not** stop anything. Preflight done = post "Phase 0 complete: <machine>,
@@ -93,22 +94,25 @@ Per-node recipe (Koya's concrete version; Windows nodes substitute paths):
 #    suite uses). Fallback: SIGTERM the PID and wait for exit. Never
 #    SIGKILL (shutdown flush guard).
 API_DIR="$HOME/Library/Application Support/net.zeblith.harmony/profiles/fleet-koya/api"
+PID=$(cat "$API_DIR/serve.lock")   # serve mode writes its PID lockfile here
 curl -fsS -X POST -H "Authorization: Bearer $(cat "$API_DIR/token")" \
-  "http://127.0.0.1:$(cat "$API_DIR/port")/v1/shutdown" || kill <PID>
-while ps -p <PID> > /dev/null; do sleep 1; done
+  "http://127.0.0.1:$(cat "$API_DIR/port")/v1/shutdown" || kill "$PID"
+while kill -0 "$PID" 2>/dev/null; do sleep 1; done
 
-# 2. Start the staged binary — same profile, same port, stable log path:
-nohup ~/work/fleet-bin/harmony-app-1fb35b72 --profile fleet-koya serve --api-port 7421 \
+# 2. Start the staged binary — same profile, same port, stable log path.
+#    BIN = the exact staged file you recorded in ZEB-636.
+BIN=~/work/fleet-bin/harmony-app-1fb35b72
+nohup "$BIN" --profile fleet-koya serve --api-port 7421 \
   > ~/work/fleet-logs/fleet-koya-serve.log 2>&1 < /dev/null & disown
 
 # 3. Verify, in order:
-BIN=~/work/fleet-bin/harmony-app-1fb35b72
-$BIN --profile fleet-koya api get_owner_state | jq .ownerId
+$BIN --profile fleet-koya api get_owner_state | jq -r .ownerId
 #    → MUST equal the Phase 0 value. If it changed: STOP THE WINDOW, post to
 #      ZEB-636, do NOT mint_owner_identity (ZEB-477 stale-ghost-key lesson).
-$BIN --profile fleet-koya api network_health_snapshot | jq '{schemaVersion, identityLastPublishMs}'
+$BIN --profile fleet-koya api network_health_snapshot \
+  | jq '{schemaVersion, publish: .pkarrStatus.identityLastPublishMs}'
 #    → schemaVersion 4 (proves the new build);
-#    → poll until identityLastPublishMs >= your restart timestamp. The field
+#    → poll until publish >= your restart timestamp. The field
 #      PERSISTS across restarts (ZEB-635 trap) — a non-null stale value is NOT
 #      a fresh publish. Boot publish lands in ≈15–90 s; don't panic-restart
 #      inside that window.
