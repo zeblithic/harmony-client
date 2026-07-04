@@ -1344,9 +1344,7 @@ pub async fn run(
                             .into_iter()
                             .map(|(_owner, p)| {
                                 (
-                                    crate::iroh_dial_driver::deterministic_zid_hex(
-                                        &p.iroh_node_id,
-                                    ),
+                                    crate::iroh_dial_driver::deterministic_zid_hex(&p.iroh_node_id),
                                     p.iroh_node_id,
                                 )
                             })
