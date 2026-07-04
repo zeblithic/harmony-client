@@ -99,7 +99,14 @@ _Filled from live sessions; each row names the commit driven and the firewall mo
 
 | Date (UTC) | Commit | Cold build | T1 | T2 open | T2 filtered | T3 | Session cost |
 |---|---|---|---|---|---|---|---|
-| _pending first session_ | | | | | | | |
+| 2026-07-04 | `9d12a9a4` (main) | **24m20s** (e2-standard-4, peak RSS 7.1 GB) | **PASS** both modes, attempt 1 each | **PASS + `direct` both sides** | **PASS + `direct` both sides** | **PASS** (catch-up ≈60s post-restart) | ≈$0.40 (VM up ~2.5 h) |
+
+The 2026-07-04 session is the **first proven cross-WAN direct-path NAT traversal**
+for Harmony: `connectionMode: "direct"` on both a home-NAT node and the GCE node,
+in open mode AND in filtered mode (relay-coordinated hole-punch with zero ingress
+rules). It also proved distinct-WAN first-contact (T1, the ZEB-330 evidence) and
+restart backfill over a real WAN (T3). Node snapshots:
+`~/.cache/gce-xwan-logs/20260704-{102353,102710,104929}/` on Koya.
 
 ## Troubleshooting
 
@@ -118,3 +125,30 @@ _Filled from live sessions; each row names the commit driven and the firewall mo
 - **VM ssh works but `gssh` hangs** → BatchMode is set everywhere; a hang usually
   means gcloud is re-generating ssh keys — run any `gcloud compute ssh` command
   interactively once, then retry.
+
+### Hard-won timing/shape rules (all found live, 2026-07-04 — the scripts encode them)
+
+- **Never fire the first redeem early.** One attempt before the inviter's
+  current-process record is on the relay triggers a remote-side dial backoff
+  that outlives a 300 s same-URL retry loop. The script gates on a **fresh**
+  identity publish (`identityLastPublishMs >= script start` — the value
+  PERSISTS across restarts, so a null-check passes on stale data), settles
+  90 s, then mints a fresh invite per attempt. Settled first attempts joined
+  instantly, every time (5/5 across manual probes + scripted runs).
+- **Publish timing:** boot publish ≈15–90 s; a RUNTIME `discoverable` enable
+  waits for the publisher tick — 4m49s observed. Prefer booting with
+  discoverable already persisted.
+- **gcloud ssh stderr blinds jq.** `2>&1` capture interleaves "Existing host
+  keys…" chatter with the JSON — a JOINED result was invisible to a bare
+  `jq` parse. Extract the JSON line (`grep -E '^\{' | tail -1`) first.
+- **Payload shapes** (verified against `e2e-harness/src/driver.rs`): minting
+  verbs return **bare JSON strings**; DM/channel payloads go up as **byte
+  arrays**; DM reads come back **hex** (`body`), channel reads come back as
+  **byte-number arrays** — hex-matching a channel body "would silently never
+  match" (the harness's own words).
+- **Remote process control over ssh:** `source env; nohup <bin> serve >log
+  2>&1 </dev/null & disown; exit 0` — with `&&` instead of `;` the `&`
+  backgrounds the whole list and ssh blocks on the serve process; without
+  `</dev/null` stdin pins the channel. And never `pkill -f "harmony-app
+  serve"` over ssh — the pattern matches the invoking shell's own cmdline;
+  use `pkill -f "[h]armony-app serve"`.
