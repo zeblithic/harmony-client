@@ -1803,7 +1803,7 @@ impl DmOutbox {
         // holds the owner-state lock but has no outbox handle) applies the
         // identical trust gates. This method stays the (dormant) outbox entry
         // point, delegating to the single source of truth.
-        apply_invite(
+        match apply_invite(
             state,
             self.self_owner,
             &self.device_id,
@@ -1819,7 +1819,19 @@ impl DmOutbox {
             None,
             // ZEB-483: dormant authenticated path — refresh the cache as before.
             true,
-        )
+        )? {
+            // ZEB-236: this dormant path has no pending-invite store wired, so a
+            // non-friend invite is staged-and-dropped here (the live ingest
+            // paths own real staging). Warn so it is not silently swallowed.
+            ApplyInviteOutcome::Staged(staged) => {
+                tracing::warn!(
+                    space_id = ?staged.signed.space_id,
+                    "dormant handle_invite: non-friend invite staged-and-dropped (no store on this path)"
+                );
+                Ok(DrainOutcome::default())
+            }
+            ApplyInviteOutcome::Accepted => Ok(DrainOutcome::default()),
+        }
     }
 
     /// ZEB-241: lock-lifted CidNotify handler. Manages its
@@ -2201,6 +2213,28 @@ impl DmOutbox {
     }
 }
 
+/// ZEB-236: outcome of `apply_invite`. An invite from an ACTIVE friend is
+/// auto-accepted (the friendship approval was the consent gate) → `Accepted`.
+/// Anything else is `Staged` for an explicit user decision — carrying the
+/// verified invite (plus its ingest-route entitlements) so the deferred
+/// accept path can run the identical accept tail without re-verifying.
+// `ApplyInviteOutcome` is a transient, immediately-matched return value (never
+// stored in a collection or sent over a channel), so the `Accepted`-vs-`Staged`
+// size asymmetry the lint flags has no memory cost worth boxing for — and the
+// deferred-accept caller (`accept_dm_invite_impl`, Task 4) reads `s.signed`
+// directly, which an unboxed payload keeps ergonomic.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub(crate) enum ApplyInviteOutcome {
+    /// The inviter was an active friend; the DM Space (and, when entitled, the
+    /// OwnerDeviceCache) was written via `run_invite_accept_tail`.
+    Accepted,
+    /// The inviter was NOT an active friend; NOTHING was written. The verified
+    /// invite is returned for the caller to stage (spec: staging is
+    /// process-local only, so decline is indistinguishable from offline).
+    Staged(crate::pending_dm_invites::StagedDmInvite),
+}
+
 /// ZEB-482: auto-accept a received DmInvite — write the DM Space + cache the
 /// inviter's devices/identity-pub. Idempotent on `space_id`. Shared by the
 /// (dormant) outbox `handle_invite` method and the tunnel ingest path so both
@@ -2241,7 +2275,7 @@ pub(crate) fn apply_invite(
     // NOT let a sender-claimed device list regress that verified state — it
     // bootstraps ONLY the Space.
     refresh_owner_device_cache: bool,
-) -> Result<DrainOutcome, DmReceiveError> {
+) -> Result<ApplyInviteOutcome, DmReceiveError> {
     // SECURITY (CodeRabbit F1): bind the payload-controlled `signed.inviter` to
     // the authenticated tunnel peer BEFORE touching any trust state (cache or
     // Space). When the caller cannot supply an expected owner (`None`), behavior
@@ -2276,6 +2310,46 @@ pub(crate) fn apply_invite(
         signed.signing_device_hash,
     )?;
 
+    // ZEB-236 tier fork: invites from ACTIVE friends keep Phase 3b's
+    // auto-accept (the friendship approval was the consent gate). Anything
+    // else is STAGED for an explicit user decision — no Space, no cache
+    // write, nothing persistent (spec: decline must be indistinguishable
+    // from offline, so staging itself is process-local only).
+    let inviter_is_active_friend = state
+        .friend_graph
+        .friends
+        .get(&signed.inviter)
+        .is_some_and(|e| e.status == crate::friend_graph::FriendStatus::Active);
+    if !inviter_is_active_friend {
+        return Ok(ApplyInviteOutcome::Staged(
+            crate::pending_dm_invites::StagedDmInvite {
+                signed,
+                received_at_ms: wall_now_ms,
+                refresh_owner_device_cache,
+            },
+        ));
+    }
+    run_invite_accept_tail(
+        state,
+        device_id,
+        signed,
+        wall_now_ms,
+        refresh_owner_device_cache,
+    )?;
+    Ok(ApplyInviteOutcome::Accepted)
+}
+
+/// ZEB-236: the invite ACCEPT tail — exactly the Phase 3b auto-accept body,
+/// extracted so the deferred user-accept path (`accept_dm_invite_impl`) and
+/// the friend-tier auto-accept run the same code. Callers guarantee `signed`
+/// already passed `apply_invite`'s gates + signature verification.
+pub(crate) fn run_invite_accept_tail(
+    state: &mut OwnerState,
+    device_id: &str,
+    signed: crate::dm_envelope::DmInviteSigned,
+    wall_now_ms: u64,
+    refresh_owner_device_cache: bool,
+) -> Result<(), DmReceiveError> {
     // Phase 3b auto-accept: write the Space, and — on the authenticated
     // tunnel/dormant path only — refresh the OwnerDeviceCache.
     // (Phase 4 will replace this with a stage-pending-invite + UI prompt
@@ -2376,7 +2450,7 @@ pub(crate) fn apply_invite(
         }
     }
 
-    Ok(DrainOutcome::default())
+    Ok(())
 }
 
 /// ZEB-483: apply a deposited DmInvite (if present) to bootstrap ONLY the DM
@@ -2442,7 +2516,7 @@ pub(crate) fn apply_deposited_invite(
             "deposited invite identity_pub does not match verified CidNotify signer".into(),
         );
     }
-    apply_invite(
+    match apply_invite(
         state,
         self_owner,
         device_id,
@@ -2456,8 +2530,20 @@ pub(crate) fn apply_deposited_invite(
         // must NOT mutate authenticated device-cache state.
         false,
     )
-    .map(|_| ())
-    .map_err(|e| format!("apply_invite: {e:?}"))
+    .map_err(|e| format!("apply_invite: {e:?}"))?
+    {
+        // ZEB-236 (T2 interim): the store wiring lands in T3. Until then a
+        // non-friend deposited invite is logged and dropped (same interim
+        // behavior as the tunnel ingest path).
+        ApplyInviteOutcome::Staged(staged) => {
+            tracing::info!(
+                space_id = ?staged.signed.space_id,
+                "ZEB-236: non-friend DM invite staged pending store wiring (T3)"
+            );
+            Ok(())
+        }
+        ApplyInviteOutcome::Accepted => Ok(()),
+    }
 }
 
 /// ZEB-233: lock-lifted drain entrypoint for production.
@@ -3198,6 +3284,66 @@ mod tests {
             community_signing_key,
             enrollment_cert,
         )
+    }
+
+    /// ZEB-236 test helper: mark `inviter` an ACTIVE friend so `apply_invite`'s
+    /// tier fork takes the auto-accept branch. Uses a DIRECT map insert (not the
+    /// validated `apply_friend_update` route): that route re-derives `owner_id`
+    /// from `master_ed25519` and rejects any entry whose map key ≠ that
+    /// derivation, and these synthetic fixture inviters are arbitrary
+    /// `OwnerAddr`s not derived from a real master key. The tier fork reads only
+    /// `friend_graph.friends[inviter].status`, which a direct insert satisfies.
+    fn insert_active_friend(state: &mut OwnerState, inviter: OwnerAddr) {
+        state.friend_graph.friends.insert(
+            inviter,
+            crate::friend_graph::FriendEntry {
+                master_ed25519: [0u8; 32],
+                display: None,
+                status: crate::friend_graph::FriendStatus::Active,
+                established_via: crate::friend_graph::FriendOrigin::Token,
+                referrable: false,
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "test-friend".into(),
+                },
+                sealed_secret: None,
+            },
+        );
+    }
+
+    /// ZEB-236 test helper: a signature-valid 2-member `Dm` invite whose inviter
+    /// is `OwnerAddr([1; 16])` and whose other member is `self_owner`. Mirrors
+    /// the inline builder in `handle_invite_writes_space_and_cache_with_signing_pub`
+    /// (same fixed `[0x42; 32]` identity seed), so the invite verifies and two
+    /// calls produce byte-identical invites — a precondition for the golden
+    /// parity test. Returns `(signed, signature, signed_bytes)`.
+    fn build_valid_dm_invite(
+        self_owner: OwnerAddr,
+    ) -> (crate::dm_envelope::DmInviteSigned, [u8; 64], Vec<u8>) {
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members: vec![OwnerAddr([1; 16]), self_owner],
+            inviter: OwnerAddr([1; 16]),
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+        (signed, signature, body_bytes)
     }
 
     /// ZEB-262 Phase 4 Task 2: assert that `DmOutbox.signing_key` and
@@ -4209,6 +4355,9 @@ mod tests {
 
         // And a FRESH recipient state applies it (signature + admission gates pass).
         let mut rx = OwnerState::default();
+        // ZEB-236: the recipient auto-accepts only from an ACTIVE friend (tier
+        // fork); the inviter here is `o.self_owner`, so befriend them.
+        insert_active_friend(&mut rx, o.self_owner);
         let outcome = crate::dm_outbox::apply_invite(
             &mut rx,
             bob,       // recipient self
@@ -5619,6 +5768,11 @@ mod tests {
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
 
+        // ZEB-236: the accept path now requires the inviter to be an ACTIVE
+        // friend (the tier fork). This test's intent is the auto-accept body, so
+        // establish the friendship the fork gates on.
+        insert_active_friend(&mut state, OwnerAddr([1; 16]));
+
         outbox
             .handle_invite(&mut state, signed.clone(), signature, &body_bytes, 200)
             .await
@@ -5639,6 +5793,174 @@ mod tests {
         assert_eq!(entry.devices, vec![device_hash]);
         // Cached pub is at index 0 (the only device, also the signer).
         assert_eq!(entry.device_identity_pubs[0], Some(identity_pub));
+    }
+
+    // ── ZEB-236 Task 2: tier fork (auto-accept ⟂ stage) + golden parity ─────────
+
+    /// An invite from an ACTIVE friend keeps Phase 3b's auto-accept: the Space
+    /// is written and (refresh=true) the OwnerDeviceCache is seeded.
+    #[test]
+    fn apply_invite_from_active_friend_auto_accepts() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default();
+        insert_active_friend(&mut state, OwnerAddr([1; 16]));
+
+        let (signed, signature, body_bytes) = build_valid_dm_invite(self_owner);
+        let device_hash = signed.signing_device_hash;
+        let identity_pub = signed.inviter_identity_pub;
+
+        let outcome = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            200,
+            None,
+            true, // refresh=true variant: cache row must be seeded
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, ApplyInviteOutcome::Accepted));
+        assert!(state.spaces.contains_key(&SpaceId([7; 16])));
+        let entry = state
+            .owner_device_cache
+            .devices
+            .get(&OwnerAddr([1; 16]))
+            .expect("cache row present on refresh=true auto-accept");
+        assert_eq!(entry.devices, vec![device_hash]);
+        assert_eq!(entry.device_identity_pubs[0], Some(identity_pub));
+    }
+
+    /// An invite from a NON-friend is staged and writes NOTHING to owner state
+    /// (spec: staging is process-local only; decline == offline).
+    #[test]
+    fn apply_invite_from_non_friend_stages_and_writes_nothing() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default(); // friend_graph EMPTY
+        let before = crate::owner_state_persist::canonicalize(&state).unwrap();
+
+        let (signed, signature, body_bytes) = build_valid_dm_invite(self_owner);
+        let outcome = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            4242,
+            None,
+            true,
+        )
+        .unwrap();
+
+        match outcome {
+            ApplyInviteOutcome::Staged(s) => {
+                assert_eq!(s.signed.space_id, SpaceId([7; 16]));
+                assert_eq!(s.received_at_ms, 4242, "staged at the passed wall clock");
+                assert!(
+                    s.refresh_owner_device_cache,
+                    "staged invite carries the ingest route's cache entitlement"
+                );
+            }
+            other => panic!("expected Staged for a non-friend inviter, got {other:?}"),
+        }
+
+        let after = crate::owner_state_persist::canonicalize(&state).unwrap();
+        assert_eq!(
+            before, after,
+            "staging a non-friend invite must write NOTHING"
+        );
+    }
+
+    /// Golden parity: the staged-then-accepted path (`apply_invite` → `Staged` →
+    /// `run_invite_accept_tail`) produces byte-identical owner state to the
+    /// inline auto-accept — for BOTH `refresh_owner_device_cache` variants. The
+    /// only intended divergence is the friendship that GATED auto-accept (A
+    /// carries it, the deferred path never befriends), so it is stripped from A
+    /// before comparison to isolate the accept TAIL's effect.
+    #[test]
+    fn staged_then_accept_tail_matches_direct_auto_accept_golden() {
+        for refresh in [true, false] {
+            let self_owner = OwnerAddr([0xaa; 16]);
+            let inviter = OwnerAddr([1; 16]);
+
+            // A: inviter is an ACTIVE friend → apply_invite auto-accepts inline.
+            let mut a = OwnerState::default();
+            insert_active_friend(&mut a, inviter);
+            let (signed_a, sig_a, bytes_a) = build_valid_dm_invite(self_owner);
+            let out_a = apply_invite(
+                &mut a, self_owner, "dev", signed_a, sig_a, &bytes_a, 777, None, refresh,
+            )
+            .unwrap();
+            assert!(matches!(out_a, ApplyInviteOutcome::Accepted));
+
+            // B: inviter NOT a friend → apply_invite stages; the deferred accept
+            // runs the extracted tail with EXACTLY the inputs Staged carries.
+            let mut b = OwnerState::default();
+            let (signed_b, sig_b, bytes_b) = build_valid_dm_invite(self_owner);
+            let staged = match apply_invite(
+                &mut b, self_owner, "dev", signed_b, sig_b, &bytes_b, 777, None, refresh,
+            )
+            .unwrap()
+            {
+                ApplyInviteOutcome::Staged(s) => s,
+                other => panic!("expected Staged, got {other:?}"),
+            };
+            run_invite_accept_tail(
+                &mut b,
+                "dev",
+                staged.signed,
+                777,
+                staged.refresh_owner_device_cache,
+            )
+            .unwrap();
+
+            // Neutralize the one intended difference (the consent-gate friendship).
+            a.friend_graph.friends.remove(&inviter);
+
+            assert_eq!(
+                crate::owner_state_persist::canonicalize(&a).unwrap(),
+                crate::owner_state_persist::canonicalize(&b).unwrap(),
+                "staged-then-accept tail must be byte-identical to inline \
+                 auto-accept (refresh_owner_device_cache = {refresh})"
+            );
+        }
+    }
+
+    /// The reinstated spec test: declining a staged invite writes no state.
+    /// Decline == drop the `StagedDmInvite` (all decline does at this layer).
+    #[test]
+    fn decline_writes_no_state() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default();
+        let before = crate::owner_state_persist::canonicalize(&state).unwrap();
+
+        let (signed, signature, body_bytes) = build_valid_dm_invite(self_owner);
+        let outcome = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            900,
+            None,
+            true,
+        )
+        .unwrap();
+        let staged = match outcome {
+            ApplyInviteOutcome::Staged(s) => s,
+            other => panic!("expected Staged, got {other:?}"),
+        };
+        drop(staged); // decline: the invite is simply dropped, never applied
+
+        let after = crate::owner_state_persist::canonicalize(&state).unwrap();
+        assert_eq!(
+            before, after,
+            "decline must leave owner state byte-identical"
+        );
     }
 
     #[tokio::test]
@@ -5689,6 +6011,9 @@ mod tests {
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
+
+        // ZEB-236: accept path requires an ACTIVE-friend inviter (tier fork).
+        insert_active_friend(&mut state, OwnerAddr([1; 16]));
 
         let local_wall_now_ms: u64 = 12345;
         outbox
@@ -5758,6 +6083,9 @@ mod tests {
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
+
+        // ZEB-236: accept path requires an ACTIVE-friend inviter (tier fork).
+        insert_active_friend(&mut state, inviter_addr);
 
         outbox
             .handle_invite(&mut state, signed, signature, &body_bytes, 200)
@@ -5991,6 +6319,14 @@ mod tests {
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
+
+        // ZEB-236: make the inviter an ACTIVE friend so the tier fork takes the
+        // accept path and reaches the Space apply — which is what this test
+        // asserts REJECTS (3-member Dm). Without the friendship the invite would
+        // Stage before ever reaching the Space invariant check, masking the F2
+        // guard this test pins. Friendship touches only `friend_graph`, so the
+        // "cache untouched" assertion below is unaffected.
+        insert_active_friend(&mut state, inviter);
 
         // `None` for expected_inviter isolates the F2 (cache-on-reject) concern
         // from the F1 inviter-bind gate. The Space apply is what rejects here.

@@ -469,7 +469,7 @@ pub(crate) async fn ingest_dm_packet(
                         hex::encode(peer_node_id)
                     )
                 })?;
-            crate::dm_outbox::apply_invite(
+            match crate::dm_outbox::apply_invite(
                 &mut state,
                 self_owner,
                 device_id,
@@ -481,7 +481,18 @@ pub(crate) async fn ingest_dm_packet(
                 // ZEB-483: authenticated tunnel path — refresh the cache.
                 true,
             )
-            .map_err(|e| format!("apply_invite: {e:?}"))?;
+            .map_err(|e| format!("apply_invite: {e:?}"))?
+            {
+                // ZEB-236 (T2 interim): real staging (store + IPC emit) lands in
+                // T3; until then a non-friend invite is logged and dropped.
+                crate::dm_outbox::ApplyInviteOutcome::Staged(staged) => {
+                    tracing::info!(
+                        space_id = ?staged.signed.space_id,
+                        "ZEB-236: non-friend DM invite staged pending store wiring (T3)"
+                    );
+                }
+                crate::dm_outbox::ApplyInviteOutcome::Accepted => {}
+            }
             return Ok(false);
         }
         crate::dm_envelope::DmPacket::CidNotify {
@@ -843,7 +854,7 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
             return Err("ZEB-505: invite inviter does not match deposit entry sender".into());
         }
         let mut state = self.crdt_state.lock().await;
-        crate::dm_outbox::apply_invite(
+        match crate::dm_outbox::apply_invite(
             &mut state,
             self.self_owner,
             &self.self_device_id(),
@@ -856,8 +867,19 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
             // deposited invite (it would let an untrusted invite seed cache rows).
             false,
         )
-        .map(|_| ())
-        .map_err(|e| format!("apply_invite: {e:?}"))
+        .map_err(|e| format!("apply_invite: {e:?}"))?
+        {
+            // ZEB-236 (T2 interim): real staging lands in T3; until then a
+            // non-friend invite is logged and dropped.
+            crate::dm_outbox::ApplyInviteOutcome::Staged(staged) => {
+                tracing::info!(
+                    space_id = ?staged.signed.space_id,
+                    "ZEB-236: non-friend DM invite staged pending store wiring (T3)"
+                );
+                Ok(())
+            }
+            crate::dm_outbox::ApplyInviteOutcome::Accepted => Ok(()),
+        }
     }
 
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {

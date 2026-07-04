@@ -424,7 +424,7 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                 );
             }
             let mut state = self.crdt_state.lock().await;
-            crate::dm_outbox::apply_invite(
+            match crate::dm_outbox::apply_invite(
                 &mut state,
                 self.self_owner,
                 &self.device_id,
@@ -435,7 +435,18 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                 Some(crate::owner_state_types::OwnerAddr(sender_owner)),
                 false,
             )
-            .map_err(|e| format!("apply_invite: {e:?}"))?;
+            .map_err(|e| format!("apply_invite: {e:?}"))?
+            {
+                // ZEB-236 (T2 interim): real staging lands in T3; until then a
+                // non-friend invite is logged and dropped.
+                crate::dm_outbox::ApplyInviteOutcome::Staged(staged) => {
+                    tracing::info!(
+                        space_id = ?staged.signed.space_id,
+                        "ZEB-236: non-friend DM invite staged pending store wiring (T3)"
+                    );
+                }
+                crate::dm_outbox::ApplyInviteOutcome::Accepted => {}
+            }
             return Ok(());
         };
         // 1. Decode the recovered packet — must be a signed CidNotify.
