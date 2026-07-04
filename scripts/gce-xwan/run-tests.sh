@@ -313,8 +313,12 @@ t3_restart_backfill() {
   start_remote
 
   caught_up() {
-    # Body may read back hex-encoded (DM-read convention) or raw — accept either.
-    remote_api list_channel_messages "{\"communityId\": \"$cid\", \"channelId\": \"$chan\", \"limit\": 100}" | grep -q -e "$(to_hex "$m2")" -e "$m2"
+    # ChannelMessageDto.body is a JSON ARRAY of byte numbers — NOT hex like the
+    # DM read (e2e_two_node.rs channel_msg_body_bytes documents exactly this
+    # trap: "matching it as hex would silently never match"). Decode via jq
+    # implode (bytes == codepoints for our ASCII probe messages).
+    remote_api list_channel_messages "{\"communityId\": \"$cid\", \"channelId\": \"$chan\", \"limit\": 100}" \
+      | grep -E '^\[' | tail -1 | jq -r '.[].body | implode' 2>/dev/null | grep -q "$m2"
   }
   poll 300 10 "T3 backfill catch-up" caught_up || { echo "FAIL T3 (mode=$MODE_WANT): remote never caught up"; return 1; }
   echo "PASS T3 (mode=$MODE_WANT): remote caught up on offline channel messages"
