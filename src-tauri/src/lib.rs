@@ -5903,8 +5903,28 @@ pub async fn start_node_inner(
                                                 // remove_owner below).
                                                 community_relay_resolver
                                                     .remove_advertiser(&community_id, &event.actor);
+                                                // ZEB-627: capture the leaver's
+                                                // device node-ids BEFORE the
+                                                // resolver forgets them (read
+                                                // precedes the destructive
+                                                // write), to evict their
+                                                // reconnect-supervisor slots.
+                                                let departed_nodes: Vec<[u8; 32]> = resolver
+                                                    .resolve(&event.actor)
+                                                    .into_iter()
+                                                    .map(|p| p.iroh_node_id)
+                                                    .collect();
                                                 let n = resolver.remove_owner(&event.actor);
                                                 if n > 0 {
+                                                    // ZEB-627: a departed peer
+                                                    // must not stay scheduled
+                                                    // (or parked Dormant) for
+                                                    // process life.
+                                                    if let Some(sup) = resolver.supervisor() {
+                                                        for node in &departed_nodes {
+                                                            sup.evict_peer(*node);
+                                                        }
+                                                    }
                                                     // ZEB-329: see comment above.
                                                     if let Some(nh) = network_health_cell
                                                         .read()
@@ -5922,8 +5942,20 @@ pub async fn start_node_inner(
                                                 // (mirrors remove_owner below).
                                                 community_relay_resolver
                                                     .remove_advertiser(&community_id, target);
+                                                // ZEB-627: capture-then-evict,
+                                                // as in the Leave arm above.
+                                                let departed_nodes: Vec<[u8; 32]> = resolver
+                                                    .resolve(target)
+                                                    .into_iter()
+                                                    .map(|p| p.iroh_node_id)
+                                                    .collect();
                                                 let n = resolver.remove_owner(target);
                                                 if n > 0 {
+                                                    if let Some(sup) = resolver.supervisor() {
+                                                        for node in &departed_nodes {
+                                                            sup.evict_peer(*node);
+                                                        }
+                                                    }
                                                     // ZEB-329: see comment above.
                                                     if let Some(nh) = network_health_cell
                                                         .read()
