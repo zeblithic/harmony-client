@@ -531,15 +531,20 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                 None
             };
             // A staged (non-friend) invite bootstrapped no Space, so this lookup
-            // fails UNLESS the Space already exists from a prior accept. On that
-            // space-absent branch, drop the lock, stage + emit the invite so the
-            // user is prompted, and leave the message unacked (Err) for a
-            // post-accept redelivery. When the Space DOES exist the invite is
-            // redundant — admit the message and do NOT re-prompt.
+            // fails UNLESS the Space already exists from a prior accept. On the
+            // space-absent (SpaceNotFound) branch, drop the lock, stage + emit
+            // the invite so the user is prompted, and leave the message unacked
+            // (Err) for a post-accept redelivery. Any OTHER error here means the
+            // Space DOES exist (e.g. a kicked co-member's device is still
+            // cached and passes sender binding, but fails
+            // SenderNotInSpaceMembers/SpaceKindMismatch) — do NOT stage, or a
+            // removed member's redelivery would re-prompt the user to re-admit
+            // them. When the Space exists and the sender IS a member, the
+            // invite is redundant — admit the message and do NOT re-prompt.
             let space =
                 match crate::dm_outbox::verify_cidnotify_space(&state, &signed, resolved_owner) {
                     Ok(space) => space,
-                    Err(e) => {
+                    Err(e @ crate::dm_outbox::DmReceiveError::SpaceNotFound) => {
                         drop(state);
                         if let Some(staged) = staged_invite {
                             crate::pending_dm_invites::stage_and_emit_staged_invite(
@@ -548,6 +553,9 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                                 staged,
                             );
                         }
+                        return Err(format!("verify_cidnotify_space: {e:?}"));
+                    }
+                    Err(e) => {
                         return Err(format!("verify_cidnotify_space: {e:?}"));
                     }
                 };

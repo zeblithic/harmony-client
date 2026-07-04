@@ -169,6 +169,14 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
         if entry.cidnotify_packet.is_none() {
             match ctx.apply_invite_only(entry).await {
                 Ok(()) => {
+                    // Deliberate asymmetry vs. the co-deposit path below: this
+                    // invite-only deposit is consumed here (marked ingested)
+                    // once staged — the prompt is process-local, so if the
+                    // process restarts before the user acts, the ONLY way it
+                    // re-surfaces is the sender's next message co-depositing
+                    // the invite again. The co-deposit path intentionally does
+                    // NOT mark itself ingested this way; it stays pending
+                    // (retried every sweep) until the invite is admitted.
                     entry.ingested_by.insert(self_id.clone());
                     changed = true;
                 }
@@ -830,15 +838,20 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                 None
             };
             // A staged (non-friend) invite bootstrapped no Space, so this lookup
-            // fails UNLESS the Space already exists from a prior accept. On that
-            // space-absent branch, drop the lock, stage + emit the invite so the
-            // user is prompted, and leave the message deferred (Err) for a
-            // post-accept redelivery. When the Space DOES exist the invite is
-            // redundant — admit the message and do NOT re-prompt.
+            // fails UNLESS the Space already exists from a prior accept. On the
+            // space-absent (SpaceNotFound) branch, drop the lock, stage + emit
+            // the invite so the user is prompted, and leave the message deferred
+            // (Err) for a post-accept redelivery. Any OTHER error here means the
+            // Space DOES exist (e.g. a kicked co-member's device is still
+            // cached and passes sender binding, but fails
+            // SenderNotInSpaceMembers/SpaceKindMismatch) — do NOT stage, or a
+            // removed member's redelivery would re-prompt the user to re-admit
+            // them. When the Space exists and the sender IS a member, the
+            // invite is redundant — admit the message and do NOT re-prompt.
             let space =
                 match crate::dm_outbox::verify_cidnotify_space(&state, &signed, resolved_owner) {
                     Ok(space) => space,
-                    Err(e) => {
+                    Err(e @ crate::dm_outbox::DmReceiveError::SpaceNotFound) => {
                         drop(state);
                         if let Some(staged) = staged_invite {
                             crate::pending_dm_invites::stage_and_emit_staged_invite(
@@ -847,6 +860,9 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                                 staged,
                             );
                         }
+                        return Err(format!("verify_cidnotify_space: {e:?}"));
+                    }
+                    Err(e) => {
                         return Err(format!("verify_cidnotify_space: {e:?}"));
                     }
                 };
@@ -2947,6 +2963,236 @@ mod tests {
         assert!(
             !st.spaces.contains_key(&fx.space_id),
             "no Space bootstrapped from a non-DM invite"
+        );
+    }
+
+    /// Task-3 review fix regression: the co-deposit staging arm must fire
+    /// ONLY on `DmReceiveError::SpaceNotFound` (the genuine space-absent
+    /// bootstrap case) — never on `SenderNotInSpaceMembers` /
+    /// `SpaceKindMismatch`, which mean the Space EXISTS. Models a kicked
+    /// group-DM co-member: Alice's signing device is still cached locally
+    /// (from when she was a member, so sender-binding resolves her), but the
+    /// local Space no longer lists her in `members` (she was removed) and she
+    /// is not an active friend, so her stale redelivered message still
+    /// carries a co-deposited invite claiming her as a member. Pre-fix this
+    /// would stage + emit the invite, prompting the user to effectively
+    /// re-admit a removed member.
+    #[tokio::test]
+    async fn co_deposit_membership_failure_does_not_stage_rejoin_prompt() {
+        let alice = OwnerAddr([0xA1; 16]);
+        let bob = OwnerAddr([0xB0; 16]);
+        let charlie = OwnerAddr([0xC3; 16]);
+        let dave = OwnerAddr([0xDA; 16]);
+        let space_id = SpaceId([0x5B; 16]);
+        let content_key = DmContentKey::new([0x42u8; 32]);
+
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+
+        // The invite Alice originally co-deposited still lists the full
+        // (pre-kick) 4-person group-DM roster — a stale redelivery from
+        // before she was removed. `SpaceKind::GroupDm` requires 3..=16
+        // members, so a 4-person roster keeps both this invite AND the
+        // post-kick 3-person local Space below independently valid.
+        let mut invite_members = vec![alice, bob, charlie, dave];
+        invite_members.sort();
+        let created_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+
+        // Encrypt the DM blob under the AAD the invite's member set implies.
+        // Irrelevant to the outcome (verification fails before decrypt is
+        // ever reached) but kept realistic.
+        let aad_space = Space {
+            id: space_id,
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "Alice + Bob + Charlie + Dave".into(),
+            transport: None,
+            members: invite_members.clone(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: created_at.clone(),
+            updated_at: created_at.clone(),
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"redelivered after being kicked".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&aad_space).unwrap();
+        let storage_blob =
+            crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let message_cid = ContentId::for_book(
+            &storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let cn_signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let cn_signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&cn_signed).unwrap();
+        let cn_signature = private_alice.sign(&cn_signed_bytes);
+        let cidnotify_packet =
+            crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::CidNotify {
+                signed: cn_signed,
+                signature: cn_signature,
+                signed_bytes: cn_signed_bytes,
+            })
+            .unwrap();
+
+        let inv_signed = crate::dm_envelope::DmInviteSigned {
+            space_id,
+            kind: SpaceKind::GroupDm,
+            members: invite_members,
+            inviter: alice,
+            content_key: content_key.clone(),
+            sender_devices: vec![alice_device_hash],
+            created_at: created_at.clone(),
+            signing_device_hash: alice_device_hash,
+            inviter_identity_pub: alice_identity_pub,
+        };
+        let inv_signed_bytes =
+            crate::owner_state_crypto::canonical_cbor_encode(&inv_signed).unwrap();
+        let inv_signature = private_alice.sign(&inv_signed_bytes);
+        let invite_wire =
+            crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+                signed: inv_signed,
+                signature: inv_signature,
+                signed_bytes: inv_signed_bytes,
+            })
+            .unwrap();
+
+        let entry = DmInboxEntry {
+            sender_owner: alice.0,
+            cidnotify_packet: Some(cidnotify_packet),
+            storage_blob,
+            invite_packet: Some(invite_wire),
+            deposited_at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "butler-device".into(),
+            },
+            deposited_by: "butler-device".into(),
+            ingested_by: BTreeSet::new(),
+        };
+
+        // Bob's local state: the Space EXISTS (Bob already had it) but Alice
+        // is no longer in `members` — she was kicked, leaving a valid
+        // 3-person GroupDm (bob, charlie, dave). Her device is still cached
+        // from when she WAS a member, so sender-binding resolves her. She is
+        // NOT an active friend (no friend_graph entry), matching a group-DM
+        // co-member rather than a 1:1 friend.
+        let mut bob_state = OwnerState::default();
+        bob_state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            vec![None],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "bob-device-64hex".into(),
+            },
+        );
+        let mut remaining_members = vec![bob, charlie, dave];
+        remaining_members.sort();
+        bob_state.spaces.insert(
+            space_id,
+            Space {
+                id: space_id,
+                kind: SpaceKind::GroupDm,
+                parent: None,
+                community_id: None,
+                name: "Group DM".into(),
+                transport: None,
+                members: remaining_members, // Alice already kicked
+                custom_name: None,
+                notification_pref: None,
+                left_at: None,
+                created_at: created_at.clone(),
+                updated_at: created_at.clone(),
+                content_key: Some(content_key.clone()),
+                prior_content_keys: vec![],
+                current_epoch: None,
+                current_epoch_key: None,
+                old_epoch_keys: std::collections::BTreeMap::new(),
+                admin_addr: None,
+                is_invite_only: None,
+                shared_in_profile: false,
+                pending_join_at: None,
+            },
+        );
+
+        let crdt_state = Arc::new(Mutex::new(bob_state));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(Arc::clone(&sink_handle));
+        let pending = Arc::new(crate::pending_dm_invites::PendingDmInvites::new());
+
+        let prod_ctx = ProdDmInboxIngestCtx {
+            device_id: "bob-device-64hex".into(),
+            self_owner: bob,
+            crdt_state,
+            content_store,
+            sink,
+            pending_dm_invites: Some(Arc::clone(&pending)),
+            enrolled: BTreeSet::new(),
+        };
+
+        let err = prod_ctx
+            .verify(&entry)
+            .await
+            .expect_err("a kicked co-member's redelivered message must fail-closed");
+        assert!(
+            err.contains("SenderNotInSpaceMembers"),
+            "must reject at the space-membership gate (Space exists, sender \
+             was removed from it), got {err}"
+        );
+
+        assert!(
+            pending.list().is_empty(),
+            "SenderNotInSpaceMembers must NOT stage an invite — the Space \
+             already exists and the sender was removed from it; staging here \
+             would prompt the user to re-admit a kicked co-member"
+        );
+        assert!(
+            sink_handle
+                .frames()
+                .iter()
+                .all(|(n, _)| n != "dm-invite-received"),
+            "no dm-invite-received emit on a membership-failure error"
         );
     }
 }
