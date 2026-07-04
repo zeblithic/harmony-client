@@ -934,6 +934,19 @@ impl LinkManagerUnicastTrait for IrohZenohLinkManager {
                 return Err(zerror!("iroh open_bi: {e}").into());
             }
         };
+        // ZEB-627: a same-zid reconnect may have superseded this connection
+        // while `open_bi()` was awaiting (its swap closed us and installed a
+        // newer conn). Do NOT hand zenoh a stale link — mirrors the inbound
+        // accept path's post-`accept_bi` recheck (ZEB-616). The supersessor's
+        // swap already closed this conn; the supervisor's normal kick/dial
+        // path owns recovery, so failing the link here is safe.
+        if !self.is_active_zenoh_conn(peer_id, conn_id) {
+            tracing::debug!(
+                peer = %peer_id,
+                "ZEB-627: connection superseded during open_bi; not admitting stale link"
+            );
+            return Err(zerror!("iroh connection superseded during open_bi").into());
+        }
         let src = locator_from_endpoint_id(&self.endpoint.node_id());
         let dst = locator_from_endpoint_id(&peer_id);
         let link: Arc<dyn LinkUnicastTrait> = Arc::new(IrohZenohLink::new(send, recv, src, dst));
