@@ -18,8 +18,8 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 ssh-add -l >/dev/null 2>&1 || die "ssh agent has no keys loaded — the agent-forwarded cargo build needs one (ssh-add)."
 
 log "1/6 System deps (apt; CI's tauri Linux list + build essentials)…"
-gssh "sudo DEBIAN_FRONTEND=noninteractive apt-get -qq update && \
-  sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y \
+gssh "timeout 900 sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -qq update && \
+  timeout 1200 sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -qq install -y \
   build-essential curl pkg-config rsync jq git time \
   libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
   librsvg2-dev libssl-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev"
@@ -28,7 +28,10 @@ log "2/6 Rust toolchain (rustup; repo pin 1.94.1 self-installs at first cargo ru
 gssh 'command -v "$HOME/.cargo/bin/cargo" >/dev/null 2>&1 || \
   (curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none)'
 gssh 'mkdir -p ~/.cargo && printf "[net]\ngit-fetch-with-cli = true\n" > ~/.cargo/config.toml'
-gssh 'grep -q github.com ~/.ssh/known_hosts 2>/dev/null || ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null'
+# TOFU keyscan is acceptable here: the cargo git deps are pinned to exact
+# revs + lockfile checksums (content-addressed), so a MITM'd fetch cannot
+# substitute code without failing the build.
+gssh 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && (grep -q github.com ~/.ssh/known_hosts 2>/dev/null || ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null)'
 
 log "3/6 Source sync (rsync via gcloud config-ssh; excludes target/, node_modules/, .git/)…"
 gcloud compute config-ssh --project "$GCP_PROJECT" --quiet >/dev/null
@@ -39,7 +42,11 @@ rsync -az --delete \
   "$REPO_ROOT/" "${SSH_HOST}:harmony-client/"
 
 log "4/6 Build (agent-forwarded; --locked release; timing recorded)…"
-gssh_agent "source \$HOME/.cargo/env && cd ${REMOTE_SRC}/src-tauri && \
+# set -o pipefail is load-bearing: the remote non-interactive shell doesn't
+# inherit ours, and without it a failed build exits 0 through `tail`, letting
+# later steps run against a STALE binary (CodeRabbit PR #399 R1 — the exact
+# pipe-exit-codes-lie trap this repo's conventions warn about).
+gssh_agent "set -o pipefail; source \$HOME/.cargo/env && cd ${REMOTE_SRC}/src-tauri && \
   /usr/bin/time -v cargo build --locked --release --bin harmony-app 2>&1 | tail -25"
 
 log "5/6 Profile + vault (named profile => file vault; passphrase mandatory, ZEB-449)…"

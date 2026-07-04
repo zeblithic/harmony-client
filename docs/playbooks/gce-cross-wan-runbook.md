@@ -25,7 +25,7 @@ the missing far end.
 
 ## Session flow
 
-```
+```bash
 scripts/gce-xwan/up.sh            # create-or-start harmony-xwan-1 (~40s start, ~1min create)
 scripts/gce-xwan/provision.sh     # idempotent: deps + rsync + build + profile (cold build = long pole)
 scripts/gce-xwan/mode.sh open     # firewall mode 1: public-host easy case

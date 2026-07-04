@@ -39,7 +39,14 @@ done
 
 [ -n "$MODE_WANT" ] || die "--mode open|filtered is required (results must be attributable)"
 command -v jq >/dev/null || die "jq is required locally"
+command -v xxd >/dev/null || die "xxd is required locally (to_hex for the DM assertions — a silent miss would masquerade as a poll timeout)"
 [ -x "$LOCAL_BIN" ] || die "local release binary missing — cd src-tauri && cargo build --locked --release --bin harmony-app"
+
+# Local vault passphrase: generated once, never hardcoded (Qodo PR #399 R1).
+# NOTE: changing/removing this file orphans an existing xwan-local vault —
+# the profile is disposable by design; wipe it and re-run.
+LOCAL_PASS_FILE="${XWAN_LOCAL_PASS_FILE:-$HOME/.harmony-xwan-local-pass}"
+[ -f "$LOCAL_PASS_FILE" ] || (umask 177 && openssl rand -hex 32 > "$LOCAL_PASS_FILE")
 [ "$(vm_status)" = "RUNNING" ] || die "$VM_NAME is not RUNNING — run up.sh"
 ACTUAL_MODE="$(firewall_mode)"
 [ "$ACTUAL_MODE" = "$MODE_WANT" ] || die "firewall mode is '$ACTUAL_MODE' but --mode $MODE_WANT was requested — run mode.sh $MODE_WANT first"
@@ -51,7 +58,7 @@ log "mode=$MODE_WANT tests=$TESTS artifacts=$ARTIFACTS"
 
 local_env() {
   HARMONY_PROFILE="$LOCAL_PROFILE" \
-  HARMONY_PASSPHRASE="xwan-local-test-passphrase" \
+  HARMONY_PASSPHRASE_FILE="$LOCAL_PASS_FILE" \
   HARMONY_DISABLE_KEYCHAIN=1 \
   "$@"
 }
@@ -276,13 +283,20 @@ t2_friend_dm_direct() {
   poll 240 10 "T2 DM remote→local" local_sees || { echo "FAIL T2 (mode=$MODE_WANT): DM remote→local never arrived"; return 1; }
   log "T2: DM remote→local delivered"
 
-  # The headline assert: a live peer at connectionMode "direct" (camelCase
-  # serde value is lowercase) on BOTH sides. Relay-only = traversal failed
-  # for this mode — delivery above still passing is expected and reported.
-  direct_on() { api_of "$1" network_health_snapshot | jq -e '.peers[] | select(.connectionMode == "direct")' > /dev/null; }
+  # The headline assert: THE peer under test at connectionMode "direct"
+  # (camelCase serde value is lowercase) on BOTH sides. Peer-scoped (Qodo
+  # PR #399 R1): snapshots include other rows (e.g. a self ownerAddr entry
+  # at noConnection), so an any-peer check could false-PASS/FAIL.
+  # PeerHealth.ownerAddr == the 32-hex ownerId (verified against the
+  # 2026-07-04 session snapshots). Relay-only = traversal failed for this
+  # mode — delivery above still passing is expected and reported.
+  is_direct_with() { # side peer_owner
+    api_of "$1" network_health_snapshot \
+      | jq -e --arg owner "$2" '.peers[] | select(.ownerAddr == $owner) | select(.connectionMode == "direct")' > /dev/null
+  }
   local direct_ok=1
-  poll 180 10 "T2 direct path (local view)"  direct_on local  || direct_ok=0
-  poll 60  10 "T2 direct path (remote view)" direct_on remote || direct_ok=0
+  poll 180 10 "T2 direct path (local view of remote peer)"  is_direct_with local  "$REMOTE_OWNER" || direct_ok=0
+  poll 60  10 "T2 direct path (remote view of local peer)"  is_direct_with remote "$LOCAL_OWNER"  || direct_ok=0
   local_api  network_health_snapshot > "$ARTIFACTS/t2-snapshot-local-$MODE_WANT.json"  || true
   remote_api network_health_snapshot > "$ARTIFACTS/t2-snapshot-remote-$MODE_WANT.json" || true
   if [ "$direct_ok" = 1 ]; then
