@@ -30,6 +30,7 @@
   import LibraryDirectoryBrowser from './lib/components/LibraryDirectoryBrowser.svelte';
   import ToastHost from './lib/components/ToastHost.svelte';
   import IncomingCallToast from './lib/components/IncomingCallToast.svelte';
+  import DmInviteToast from './lib/components/DmInviteToast.svelte';
   import CallInProgressBar from './lib/components/CallInProgressBar.svelte';
   import GroupCallBar from './lib/components/GroupCallBar.svelte';
   import GroupCallBanner from './lib/components/GroupCallBanner.svelte';
@@ -45,6 +46,7 @@
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
   import { FriendService, contactsFromFriends } from './lib/friend-service';
+  import { DmInviteService, type PendingDmInviteDto } from './lib/dm-invite-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
   import { NotificationService } from './lib/notification-service';
@@ -1328,6 +1330,40 @@
   // edits (those emit friend-list-changed too). Listener set is cleared
   // by friendService.destroy() on unmount.
   friendService.onFriendsChanged(() => void refreshDmContacts());
+  // ── ZEB-236: DM-invite corner toast ─────────────────────────────────
+  // Same eager-construct / adapter-wired-in-IIFE / destroy-on-unmount
+  // pattern as FriendService. `dmInviteQueue` holds pending inbound DM
+  // invites (oldest-first) not yet "Later"-dismissed this session; the
+  // toast (mounted beside IncomingCallToast, below) shows only the head
+  // of the queue. Accept/Decline call the service directly and do NOT
+  // optimistically remove the row — the service's `dm-invite-list-changed`
+  // event is the single source of truth, and it drives the same refresh
+  // that hydrates the queue in the first place.
+  const dmInviteService = new DmInviteService();
+  $effect(() => () => dmInviteService.destroy());
+  let dmInviteQueue: PendingDmInviteDto[] = $state([]);
+  // Session-local dismissals from the toast's "Later" button. Deliberately
+  // a plain (non-reactive) Set: it's never read by the template directly,
+  // only consulted when filtering `dmInviteQueue` (which IS reactive), and
+  // it resets on reload since it's not persisted anywhere.
+  const laterDismissed = new Set<string>();
+  async function refreshDmInviteQueue(): Promise<void> {
+    try {
+      const pending = await dmInviteService.listPending();
+      dmInviteQueue = pending
+        .filter((invite) => !laterDismissed.has(invite.spaceIdHex))
+        .sort((a, b) => a.receivedAtMs - b.receivedAtMs);
+    } catch (e) {
+      // Expected pre-owner-load and in mock mode (no adapter), same as
+      // refreshDmContacts above. Keep the last known-good queue.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[harmony-client] refreshDmInviteQueue skipped:', msg);
+    }
+  }
+  // Fires on both new-invite-received and list-mutated (accept/decline,
+  // possibly from another device). Listener set is cleared by
+  // dmInviteService.destroy() on unmount.
+  dmInviteService.onPendingChanged(() => void refreshDmInviteQueue());
   // ZEB-419: a SECOND MemberCardService dedicated to the Friends panel. It must
   // NOT share the roster instance: subscribeVisible(ids) reconciles to EXACTLY
   // the passed set, so friends + roster would unsubscribe each other. The panel
@@ -1804,6 +1840,11 @@
       // Fire-and-forget: pre-owner-load failure is recovered by the
       // friend-list-changed listener and the dialog-open refresh.
       void refreshDmContacts();
+      await tryConnect('dmInvite', dmInviteService.connectAdapter(adapter));
+      // ZEB-236: hydrate the pending DM-invite queue. Fire-and-forget:
+      // pre-owner-load failure is recovered by the onPendingChanged
+      // listener once a real event fires.
+      void refreshDmInviteQueue();
       await tryConnect('channelMessage', channelMessageService.connectAdapter(adapter));
       avatarResolver.connectAdapter(adapter);
       // ZEB-345 Task 10: wire the lazy profile-page resolver so panel opens can
@@ -2905,6 +2946,25 @@
   <GroupCallBar
     session={groupCall}
     groupName={navService.nodes.find((n) => n.id === $groupCallState?.spaceId)?.name}
+  />
+{/if}
+
+<!--
+  ZEB-236: DM-invite corner toast, mirroring the IncomingCallToast pair
+  above — lives at the app root so a pending invite is reachable regardless
+  of which view is active. Shows only the oldest not-yet-"Later"-dismissed
+  pending invite; App owns the queue (dmInviteQueue), the component is pure
+  presentational.
+-->
+{#if dmInviteQueue.length > 0}
+  <DmInviteToast
+    invite={dmInviteQueue[0]}
+    onAccept={() => dmInviteService.accept(dmInviteQueue[0].spaceIdHex)}
+    onDecline={() => dmInviteService.decline(dmInviteQueue[0].spaceIdHex)}
+    onLater={() => {
+      laterDismissed.add(dmInviteQueue[0].spaceIdHex);
+      dmInviteQueue = dmInviteQueue.filter((i) => !laterDismissed.has(i.spaceIdHex));
+    }}
   />
 {/if}
 
