@@ -214,7 +214,10 @@ t1_first_contact() {
     [ -n "$url" ] || die "T1: generate_invite returned no url"
     log "T1: attempt $attempt (fresh invite) — redeeming from GCE node…"
     out="$(remote_api connectivity_redeem_invite_iroh "{\"url\": \"$url\"}" 2>&1 || true)"
-    status="$(echo "$out" | jq -r '.status // empty' 2>/dev/null || true)"
+    # gcloud ssh interleaves its own stderr chatter ("Existing host keys…")
+    # into 2>&1 — jq must only ever see the JSON line (found live: a JOINED
+    # attempt was invisible to a bare jq parse and the loop kept going).
+    status="$(echo "$out" | grep -E '^\{' | tail -1 | jq -r '.status // empty' 2>/dev/null || true)"
     [ "$status" = "joined" ] && break
     log "T1: attempt $attempt: ${out}"
     sleep 45
