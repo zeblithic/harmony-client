@@ -8,6 +8,9 @@ validation so far has missed: real separate-WAN NAT traversal.
 runbook) is a follow-up ticket once this is reviewed. Provenance: ZEB-522 (Jake's 2026-06-21
 call: a few hours of GCE spend is a reasonable trade for a self-driven cross-WAN node).
 
+**Validated against:** `main` @ `b89c765c` (2026-07-04). The `path:line` citations below are
+secondary hints anchored to that commit; symbol names are the stable reference.
+
 **Why:** Ildwyn + AVALON share one egress IP (165.162.82.51), so every "cross-WAN" run to date
 is NAT-hairpin — direct-path hole-punch reflects through the same NAT and `ValidationFailed`s,
 and the relay path masks it. Signed-TTL freshness and store-and-forward durability are proven;
@@ -95,16 +98,19 @@ plan fixes the shape:
 3. **Toolchain:** rustup with default toolchain none; the repo's `rust-toolchain.toml` pins
    1.94.1 and auto-installs on first cargo invocation. `cargo-nextest` not required (we run
    the node, not the test suite).
-4. **Source transfer — no repo credentials at rest on the VM.** Rsync the working tree from
+4. **Source transfer — no long-lived repo credentials on the VM.** Rsync the working tree from
    Koya over `gcloud compute ssh` (excluding `target/`, `node_modules/`; the vendored
    `vendor/zenoh-link` + `vendor/netdev` patches ride along — the netdev patch is
    macOS-cfg'd, inert on Linux). The **private git deps** (`zeblithic/harmony.git`, nine
    pinned-rev crates in `src-tauri/Cargo.toml:103-120`) are fetched by cargo at build time:
-   run the build inside `gcloud compute ssh --ssh-flag=-A` (agent forwarding) with cargo's
-   `net.git-fetch-with-cli = true`, so GitHub credentials never touch the VM disk. Fallback if
-   forwarding misbehaves: a fine-grained read-only PAT scoped to `zeblithic/harmony` only,
-   stored 0600, deleted at teardown.
-5. **Build:** `cd src-tauri && cargo build --release --bin harmony-app`. First cold build is
+   run the build inside `gcloud compute ssh --ssh-flag="-A -o BatchMode=yes"` (agent
+   forwarding) with cargo's `net.git-fetch-with-cli = true`. Precisely stated: keys never
+   touch VM disk, but the forwarded agent socket IS usable by the VM for signing while a
+   session is live — acceptable for a short-lived single-purpose VM we own, and gone the
+   moment the session closes. Fallback if forwarding misbehaves: a fine-grained **read-only**
+   PAT scoped to `zeblithic/harmony` only — a deliberate credential-at-rest deviation from
+   the above: stored 0600, revoked *and* deleted at teardown (the down-checklist owns this).
+5. **Build:** `cd src-tauri && cargo build --locked --release --bin harmony-app`. First cold build is
    the big unknown (est. 30–60 min on 4 vCPU — measure on first bring-up; if painful, do the
    one-time build on a temporary e2-standard-8 and keep the disk). Incremental rebuilds after
    a source rsync are minutes — this is why the disk survives between sessions.
@@ -114,7 +120,10 @@ plan fixes the shape:
    - `HARMONY_PASSPHRASE_FILE=/home/<user>/.harmony-xwan-pass` (0600, random, generated at
      provision; disposable with the node). Server Ubuntu has no secret-service daemon, so
      without this the node hard-fails at boot (`identity.rs:2789`). Set
-     `HARMONY_DISABLE_KEYCHAIN=1` for belt-and-braces determinism.
+     `HARMONY_DISABLE_KEYCHAIN=1` for belt-and-braces determinism — safe *only because* the
+     passphrase is mandatory here: the encrypted-file vault covers the iroh transport key too
+     (ZEB-449, `docs/headless-install.md` "Keychain-backed vault" caveat), whereas disabling
+     the keychain **without** a passphrase boots a node that can't network.
    - Pre-seed `<data-dir>/connectivity-settings.json` with
      `{"identity_discoverable": true}` before first boot **or** call
      `connectivity_set_identity_discoverable` after boot (ZEB-512 verb). If pre-seeding:
@@ -173,11 +182,13 @@ fails the test's purpose and must be reported as such, per mode.
   (`api/cli.rs:21,64`) — it cannot target a remote host, and the control server is
   loopback-only. So the driver executes verbs **on** each node:
   - local node: `harmony-app --profile xwan-local api <verb> '<json>'`
-  - GCE node: `gcloud compute ssh harmony-xwan-1 -- <path>/harmony-app --profile xwan api <verb> '<json>'`
-  - event stream: `gcloud compute ssh harmony-xwan-1 -- … api --events` piped to a local log
-    (the fleet-playbook watcher idiom). For programmatic use an `-L` tunnel + `curl` with the
-    bearer token against `/v1/rpc/{command}` works identically.
-  No new client code required; the driver is a shell script of ssh-exec'd verbs.
+  - GCE node: `gcloud compute ssh harmony-xwan-1 --ssh-flag="-o BatchMode=yes" -- <path>/harmony-app --profile xwan api <verb> '<json>'`
+  - event stream: `gcloud compute ssh harmony-xwan-1 --ssh-flag="-o BatchMode=yes" -- … api --events`
+    piped to a local log (the fleet-playbook watcher idiom). For programmatic use an `-L`
+    tunnel + `curl` with the bearer token against `/v1/rpc/{command}` works identically.
+  No new client code required; the driver is a shell script of ssh-exec'd verbs. Every
+  unattended ssh invocation carries `-o BatchMode=yes` (compliance rule: automation must
+  fail fast, never hang on an interactive prompt).
 - **Fully unattended is now real** (§0.1): every step below is an allowlisted v1 verb — no GUI,
   no file-dance, no human at either end.
 - **Choreography** — retarget the `docs/playbooks/e2e-two-agent-suite.md` scenarios to the pair
