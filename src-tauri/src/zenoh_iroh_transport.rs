@@ -788,6 +788,25 @@ impl IrohZenohLinkManager {
                             );
                             conn.close(0u32.into(), b"");
                         }
+                    } else if alpn_used == alpn::HARMONY_TUNNEL_V2 {
+                        // ZEB-623: inbound PQ DM tunnel, generation 2 (versioned
+                        // `TunnelHello` capabilities frame precedes the
+                        // TunnelInit). Same acceptor + spawn-so-a-slow-peer-can't-
+                        // block rationale as the `/v1` branch above; the responder
+                        // driver reads `conn.alpn()` to learn the generation and
+                        // runs the hello exchange. Deliberate duplication of the
+                        // `/v1` dispatch body over premature factoring of the
+                        // per-ALPN branch chain (ZEB-623 plan scope note).
+                        if let Some(acceptor) = mgr.tunnel_acceptor.get().cloned() {
+                            tokio::spawn(async move {
+                                acceptor.handle_connection(conn).await;
+                            });
+                        } else {
+                            tracing::debug!(
+                                "ZEB-623: tunnel v2 dial before acceptor installed; closing"
+                            );
+                            conn.close(0u32.into(), b"");
+                        }
                     } else if alpn_used == alpn::HARMONY_PING_V1 {
                         // ZEB-329 Task 5 (option B): fold HARMONY_PING_V1
                         // dispatch into the single accept loop. iroh 0.98's

@@ -1,5 +1,5 @@
 //! Case B publisher — publishes alice's iroh routing under HKDF(owner_pub, epoch)
-//! when user opts in via "Make me discoverable" toggle. Persisted via PkarrSettings.
+//! when user opts in via "Make me discoverable" toggle. Persisted via ConnectivitySettings.
 
 use harmony_pkarr::{
     current_epoch_id, derive_ephemeral_key, EphemeralKeyBuilder, PkarrCase, PkarrPublisher,

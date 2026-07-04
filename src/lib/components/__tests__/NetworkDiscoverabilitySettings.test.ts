@@ -17,7 +17,7 @@ import type { RelayHealth } from '../../types/network-health';
 
 const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
-// Default relay list matching Rust default_relays() — must stay in sync.
+// Default relay list matching Rust default_pkarr_relays() — must stay in sync.
 const DEFAULT_RELAYS = [
   'https://pkarr.q8.fyi',
   'https://relay.pkarr.org',

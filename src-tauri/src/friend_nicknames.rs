@@ -7,7 +7,7 @@
 //! CRDT). Entries carry a monotonic `updated_ms` LWW key so the ZEB-417
 //! fleet-sync substrate can later adopt the whole map as a replicated dataset.
 //!
-//! Persistence mirrors `pkarr_settings.rs`: `load_or_default` tolerates a
+//! Persistence mirrors `connectivity_settings.rs`: `load_or_default` tolerates a
 //! missing/corrupt file (→ empty), `save` writes atomically (temp + rename).
 
 use std::collections::BTreeMap;

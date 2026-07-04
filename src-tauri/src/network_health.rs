@@ -82,6 +82,14 @@ pub struct PeerHealth {
     pub rtt_ms: Option<u32>,
     pub last_seen_ms: Option<u64>,
     pub reachability_record_age_ms: Option<u64>,
+    /// ZEB-623: set when the tunnel-v2 hello negotiation recorded this peer as
+    /// protocol-incompatible (its `protocol_version` below our
+    /// `MIN_SUPPORTED_TUNNEL_PROTOCOL_VERSION`); carries the human reason the
+    /// panel shows in a loud badge. `None` when the peer is compatible. Additive
+    /// wire field — `#[serde(default)]`, always serialized (present as `null`
+    /// when `None`), so a pre-field cached snapshot still deserializes.
+    #[serde(default)]
+    pub protocol_incompat_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -557,6 +565,7 @@ pub fn filter_peers_by_shared_membership(
             rtt_ms: r.rtt_ms,
             last_seen_ms: r.last_seen_ms,
             reachability_record_age_ms: r.last_seen_ms.map(|ls| now_ms.saturating_sub(ls)),
+            protocol_incompat_reason: r.protocol_incompat_reason,
         });
     }
     // Sort by last_seen_ms desc; None values last.
@@ -585,6 +594,11 @@ pub struct ResolverPeerRecord {
     pub connection_mode: ConnectionMode,
     pub rtt_ms: Option<u32>,
     pub last_seen_ms: Option<u64>,
+    /// ZEB-623: the protocol-incompatibility reason recorded for this peer's
+    /// iroh node id, joined from the `ProtocolCompatRegistry` by
+    /// `NetworkHealthService::snapshot`. `None` for a compatible (or
+    /// never-dialed) peer. Copied straight onto the emitted `PeerHealth`.
+    pub protocol_incompat_reason: Option<String>,
 }
 
 impl ResolverPeerRecord {
@@ -826,6 +840,13 @@ pub struct NetworkHealthService {
     /// presence freshness. Installed at boot via
     /// [`set_presence_source`](Self::set_presence_source).
     presence: Option<std::sync::Arc<PresenceLastSeenCache>>,
+    /// ZEB-623: per-peer protocol-compatibility registry, shared with the
+    /// TunnelManager that writes it from the tunnel-v2 hello negotiation. Reads
+    /// only; defaults to an empty registry (inert — every lookup is `None`) so
+    /// unit tests and pre-boot construction need no wiring. Installed at boot via
+    /// [`set_protocol_compat_source`](Self::set_protocol_compat_source),
+    /// mirroring the liveness/presence handles.
+    protocol_compat: std::sync::Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
     last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
     /// Channel into the rate-limiter task. `None` until `spawn_rate_limiter`
     /// is called at boot; `notify()` is a no-op while None so unit tests
@@ -852,6 +873,9 @@ impl NetworkHealthService {
             supervisor: None,
             liveness: None,
             presence: None,
+            protocol_compat: std::sync::Arc::new(
+                crate::protocol_versioning::ProtocolCompatRegistry::default(),
+            ),
             last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             notify_tx: None,
         }
@@ -877,6 +901,16 @@ impl NetworkHealthService {
     /// unset, the presence contribution to `last_seen_ms` is inert.
     pub fn set_presence_source(&mut self, src: std::sync::Arc<PresenceLastSeenCache>) {
         self.presence = Some(src);
+    }
+
+    /// ZEB-623: install the per-peer protocol-compat registry (the SAME Arc the
+    /// TunnelManager writes from the hello negotiation). Called once at boot;
+    /// until then the default empty registry keeps the compat join inert.
+    pub fn set_protocol_compat_source(
+        &mut self,
+        src: std::sync::Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
+    ) {
+        self.protocol_compat = src;
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -1033,6 +1067,17 @@ impl NetworkHealthService {
                 }
             }
             record.last_seen_ms = best;
+        }
+
+        // ZEB-623: join the per-peer protocol-compat registry onto each record
+        // by iroh node id. An entry means the tunnel-v2 hello negotiation could
+        // not agree a compatible protocol with this peer; the reason rides
+        // through the filter onto PeerHealth so the panel shows it loudly
+        // instead of the failure being a silent connect drop. Inert when the
+        // registry is empty (unit tests, deposit-only node with no manager).
+        for record in &mut records {
+            record.protocol_incompat_reason =
+                self.protocol_compat.incompat_reason(&record.iroh_node_id);
         }
 
         let peers = filter_peers_by_shared_membership(records, &*self.membership, now);
@@ -1254,7 +1299,7 @@ pub fn format_export_markdown(
         // Redact loopback/private/link-local relay hosts — public relays are
         // fine verbatim, but a shared export shouldn't leak a user's LAN relay.
         let display_url = match url::Url::parse(&relay.url) {
-            Ok(u) if crate::pkarr_settings::is_local_host(u.host_str().unwrap_or("")) => {
+            Ok(u) if crate::connectivity_settings::is_local_host(u.host_str().unwrap_or("")) => {
                 format!("{}://<local-relay>", u.scheme())
             }
             _ => relay.url.clone(),
@@ -1987,6 +2032,9 @@ impl ReachabilitySnapshot for ProdReachabilitySnapshot {
                 connection_mode: ConnectionMode::NoConnection,
                 rtt_ms: None,
                 last_seen_ms: Some(payload.announced_at_ms),
+                // ZEB-623: filled by `NetworkHealthService::snapshot`'s compat
+                // join (the resolver has no view of the registry).
+                protocol_incompat_reason: None,
             })
             .collect()
     }
@@ -2212,6 +2260,7 @@ mod tests {
             connection_mode: mode,
             rtt_ms: None,
             last_seen_ms: last_seen,
+            protocol_incompat_reason: None,
         }
     }
 
@@ -2286,6 +2335,53 @@ mod tests {
         assert_eq!(kept[0].shared_communities, vec![hex::encode([0xC1u8; 16])]);
     }
 
+    // ── ZEB-623 Task 3: per-peer protocol incompatibility surfacing ──────
+
+    #[test]
+    fn incompatible_peer_reason_flows_to_peer_health() {
+        // A resolver record flagged incompatible (as the tunnel-v2 hello
+        // negotiation records via ProtocolCompatRegistry) carries its reason
+        // through the membership filter onto the PeerHealth the panel renders.
+        let mut record = make_record(0xAA, ConnectionMode::NoConnection, Some(1_000));
+        record.protocol_incompat_reason = Some("tunnel hello v0 < min 1".to_string());
+        let out =
+            filter_peers_by_shared_membership(vec![record], &*membership_sharing(&[0xAA]), 2_000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].protocol_incompat_reason.as_deref(),
+            Some("tunnel hello v0 < min 1")
+        );
+    }
+
+    #[test]
+    fn peer_health_serializes_protocol_incompat_reason_camel_case() {
+        let ph = PeerHealth {
+            owner_addr: "abcd".into(),
+            display_name: None,
+            shared_communities: vec![],
+            connection_mode: ConnectionMode::NoConnection,
+            rtt_ms: None,
+            last_seen_ms: None,
+            reachability_record_age_ms: None,
+            protocol_incompat_reason: Some("tunnel hello v0 < min 1".into()),
+        };
+        let v = serde_json::to_value(&ph).expect("serialize");
+        assert_eq!(v["protocolIncompatReason"], "tunnel hello v0 < min 1");
+
+        // A `None` still serializes as an explicit null with the field PRESENT
+        // (additive-with-default: `#[serde(default)]`, never skip_serializing_if).
+        let none = PeerHealth {
+            protocol_incompat_reason: None,
+            ..ph
+        };
+        let v2 = serde_json::to_value(&none).expect("serialize");
+        assert!(
+            v2.get("protocolIncompatReason").is_some(),
+            "field must be present even when None"
+        );
+        assert!(v2["protocolIncompatReason"].is_null());
+    }
+
     #[test]
     fn classify_nat_returns_unknown_for_any_input() {
         // Phase 1: classify_nat always returns Unknown until iroh
@@ -2312,6 +2408,7 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: None,
             reachability_record_age_ms: None,
+            protocol_incompat_reason: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -2337,6 +2434,7 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: None,
             reachability_record_age_ms: None,
+            protocol_incompat_reason: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -2362,6 +2460,7 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: None,
             reachability_record_age_ms: None,
+            protocol_incompat_reason: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -2546,6 +2645,7 @@ mod tests {
                 rtt_ms: Some(18),
                 last_seen_ms: Some(1_700_000_000_000 - 3_000),
                 reachability_record_age_ms: Some(3_000),
+                protocol_incompat_reason: None,
             }],
             pkarr_status: PkarrHealthSummary {
                 identity_published: true,
@@ -3223,6 +3323,43 @@ mod tests {
         let p33 = get(0x33);
         assert_eq!(p33.connection_mode, ConnectionMode::NoConnection);
         assert_eq!(p33.rtt_ms, None);
+    }
+
+    /// ZEB-623 Task 3: the snapshot joins the ProtocolCompatRegistry onto each
+    /// peer by iroh node id, so a peer the tunnel handshake flagged
+    /// incompatible surfaces the reason in its PeerHealth; a compatible peer
+    /// carries `None`. `make_record(byte)` uses `[byte; 32]` as the node id.
+    #[tokio::test]
+    async fn snapshot_surfaces_protocol_incompat_reason_from_registry() {
+        let registry =
+            std::sync::Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default());
+        registry.note_incompatible([0xAA; 32], "tunnel hello v0 < min 1".to_string());
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![
+                    make_record(0xAA, ConnectionMode::NoConnection, Some(1_000)),
+                    make_record(0xBB, ConnectionMode::NoConnection, Some(1_000)),
+                ],
+            }),
+            membership_sharing(&[0xAA, 0xBB]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_protocol_compat_source(std::sync::Arc::clone(&registry));
+        let snap = svc.snapshot().await;
+        let get = |b: u8| {
+            snap.peers
+                .iter()
+                .find(|p| p.owner_addr == hex::encode([b; 16]))
+                .expect("peer present")
+        };
+        assert_eq!(
+            get(0xAA).protocol_incompat_reason.as_deref(),
+            Some("tunnel hello v0 < min 1")
+        );
+        assert_eq!(get(0xBB).protocol_incompat_reason, None);
     }
 
     /// (b) Live liveness data wins over a stale cached self-test for the same

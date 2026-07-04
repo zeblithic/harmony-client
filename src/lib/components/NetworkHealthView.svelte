@@ -181,12 +181,21 @@
 
   // ZEB-622: hover text that disambiguates the shared ⚠ icon (relay vs
   // degraded) and names each state for accessibility.
+  // ZEB-623: when the peer is protocol-incompatible, prepend the reason so the
+  // status hover explains the more severe failure first.
   function peerStatusTitle(p: PeerHealth): string {
-    if (p.connectionMode === 'direct') return 'Direct connection';
-    if (p.connectionMode === 'relay') return 'Relay-mediated connection';
-    if (p.connectionMode === 'degraded')
-      return 'Link up — no selected path yet (degraded)';
-    return 'No connection';
+    const base =
+      p.connectionMode === 'direct'
+        ? 'Direct connection'
+        : p.connectionMode === 'relay'
+          ? 'Relay-mediated connection'
+          : p.connectionMode === 'degraded'
+            ? 'Link up — no selected path yet (degraded)'
+            : 'No connection';
+    if (p.protocolIncompatReason) {
+      return `Incompatible protocol: ${p.protocolIncompatReason} — ${base}`;
+    }
+    return base;
   }
 
   // ZEB-622: recent dial-ring markers. Dial outcomes succeeded/failed plus the
@@ -274,6 +283,17 @@
                 >
                 <strong>{redactAddr(p.ownerAddr, false)}</strong>
                 <span>{p.connectionMode}</span>
+                {#if p.protocolIncompatReason}
+                  <!-- ZEB-623: loud per-peer signal that the tunnel-v2 hello
+                       negotiation could not agree a compatible protocol. Scaled-
+                       down sibling of the transport-disabled role="alert" banner. -->
+                  <span
+                    class="peer-incompat"
+                    role="alert"
+                    title={p.protocolIncompatReason}
+                    data-testid="nh-peer-incompat">⚠ incompatible</span
+                  >
+                {/if}
                 {#if p.rttMs !== null}<span>{p.rttMs}ms</span>{/if}
                 {#if p.lastSeenMs !== null}
                   <span class="muted"
@@ -454,6 +474,20 @@
   .transport-disabled .reason {
     font-family: monospace;
     word-break: break-word;
+  }
+  /* ZEB-623: inline per-peer protocol-incompatibility badge. Same crimson
+     alarm palette as the transport-disabled banner, scaled to a row badge. */
+  .peer-incompat {
+    display: inline-block;
+    padding: 1px 6px;
+    border: 1px solid var(--net-danger-fg);
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--net-danger-fg);
+    background: var(--net-danger-bg);
+    margin-left: 4px;
+    cursor: help;
   }
   .info-hover {
     cursor: help;

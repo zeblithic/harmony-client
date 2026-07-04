@@ -32,6 +32,11 @@ export interface PeerHealth {
   rttMs: number | null;
   lastSeenMs: number | null;
   reachabilityRecordAgeMs: number | null;
+  // ZEB-623: set when the tunnel-v2 hello negotiation recorded this peer as
+  // protocol-incompatible; carries the reason the panel shows in a loud badge.
+  // `null` when compatible. Rust serializes it unconditionally (present as
+  // `null` when None), so it is always on the wire for a schema-v4 snapshot.
+  protocolIncompatReason: string | null;
 }
 
 // ZEB-595: three-state so the panel can distinguish a clean "not published
@@ -63,6 +68,16 @@ export interface RelayHealth {
   state: RelayState;
   lastOutcome: RelayOutcome | null;
   lastSuccessMs: number | null;
+}
+
+// ZEB-624: iroh transport relay configuration. Distinct from the pkarr relay
+// pool (per-relay RelayHealth) — the iroh wire carries no per-relay health.
+// `custom === false` means the node is following iroh's recommended defaults
+// (the returned `relays` list shows them); `true` means a materialized custom
+// list. Mirrors the Rust `IrohRelayInfo` DTO (serde rename_all = "camelCase").
+export interface IrohRelayInfo {
+  relays: string[];
+  custom: boolean;
 }
 
 export interface PkarrHealthSummary {

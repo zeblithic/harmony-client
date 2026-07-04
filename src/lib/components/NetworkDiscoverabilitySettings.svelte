@@ -7,7 +7,7 @@
    * key. When enabled, anyone who has the user's identity address can reach
    * this device cross-WAN without a shared community or pending invite.
    *
-   * Default is OFF — matches the backend `PkarrSettings` default.
+   * Default is OFF — matches the backend `ConnectivitySettings` default.
    *
    * Uses Svelte 5 runes (`$state`, `$effect`) consistent with other
    * IPC-driven components in this codebase (e.g. DiagnosticsPanel.svelte).

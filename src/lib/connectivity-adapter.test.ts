@@ -24,13 +24,18 @@ import {
   setPkarrRelays,
   addPkarrRelay,
   removePkarrRelay,
+  getIrohRelays,
+  setIrohRelays,
+  addIrohRelay,
+  removeIrohRelay,
+  resetIrohRelays,
 } from './connectivity-adapter';
 import type {
   ReachabilityRecord,
   PeerReachability,
   ConnectivityReachabilityChangedPayload,
 } from './types/connectivity';
-import type { RelayHealth } from './types/network-health';
+import type { RelayHealth, IrohRelayInfo } from './types/network-health';
 
 const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 const mockListen = listen as unknown as ReturnType<typeof vi.fn>;
@@ -292,6 +297,132 @@ describe('connectivity-adapter', () => {
       await expect(removePkarrRelay('https://relay.pkarr.org')).rejects.toThrow(
         'remove_pkarr_relay: NodeState poisoned',
       );
+    });
+  });
+
+  // ZEB-624: iroh transport relay config IPCs. Unlike the pkarr relay pool
+  // (per-relay RelayHealth), these return an IrohRelayInfo `{ relays, custom }`:
+  // `custom === false` means the node is following iroh's recommended defaults
+  // (the returned `relays` shows them), `true` means a materialized custom list.
+  describe('getIrohRelays', () => {
+    it('returns the mocked relay info and invokes with no args', async () => {
+      const fixture: IrohRelayInfo = {
+        relays: ['https://use1.relay.example', 'https://euw1.relay.example'],
+        custom: false,
+      };
+      mockInvoke.mockResolvedValueOnce(fixture);
+      const result = await getIrohRelays();
+      expect(result).toEqual(fixture);
+      expect(mockInvoke).toHaveBeenCalledWith('get_iroh_relays');
+    });
+
+    it('wraps Error rejections with the IPC-name prefix', async () => {
+      mockInvoke.mockRejectedValueOnce(new Error('config poisoned'));
+      await expect(getIrohRelays()).rejects.toThrow('get_iroh_relays: config poisoned');
+    });
+
+    it('wraps plain-string rejections (production Tauri shape)', async () => {
+      mockInvoke.mockRejectedValueOnce('config poisoned');
+      await expect(getIrohRelays()).rejects.toThrow('get_iroh_relays: config poisoned');
+    });
+  });
+
+  describe('setIrohRelays', () => {
+    it('passes the relays array as { relays } and returns the authoritative info', async () => {
+      const fixture: IrohRelayInfo = { relays: ['https://a.example'], custom: true };
+      mockInvoke.mockResolvedValueOnce(fixture);
+      const result = await setIrohRelays(['https://a.example']);
+      expect(mockInvoke).toHaveBeenCalledWith('set_iroh_relays', {
+        relays: ['https://a.example'],
+      });
+      expect(result).toEqual(fixture);
+    });
+
+    it('wraps a rejected set_iroh_relays and surfaces the error string', async () => {
+      mockInvoke.mockRejectedValueOnce('invalid URL: missing scheme');
+      await expect(setIrohRelays(['not-a-url'])).rejects.toThrow(
+        'set_iroh_relays: invalid URL: missing scheme',
+      );
+    });
+
+    it('wraps Error-object rejections as well', async () => {
+      mockInvoke.mockRejectedValueOnce(new Error('cap exceeded'));
+      await expect(setIrohRelays(Array(9).fill('https://a.example'))).rejects.toThrow(
+        'set_iroh_relays: cap exceeded',
+      );
+    });
+  });
+
+  describe('addIrohRelay', () => {
+    it('passes the url as { url } and returns the materialized custom list', async () => {
+      const fixture: IrohRelayInfo = {
+        relays: ['https://a.example', 'https://new.relay.example'],
+        custom: true,
+      };
+      mockInvoke.mockResolvedValueOnce(fixture);
+      const result = await addIrohRelay('https://new.relay.example');
+      expect(mockInvoke).toHaveBeenCalledWith('add_iroh_relay', {
+        url: 'https://new.relay.example',
+      });
+      expect(result).toEqual(fixture);
+    });
+
+    it('wraps a rejected add_iroh_relay and surfaces the error string', async () => {
+      mockInvoke.mockRejectedValueOnce('invalid URL: missing scheme');
+      await expect(addIrohRelay('not-a-url')).rejects.toThrow(
+        'add_iroh_relay: invalid URL: missing scheme',
+      );
+    });
+
+    it('wraps Error-object rejections as well', async () => {
+      mockInvoke.mockRejectedValueOnce(new Error('cap exceeded'));
+      await expect(addIrohRelay('https://a.example')).rejects.toThrow(
+        'add_iroh_relay: cap exceeded',
+      );
+    });
+  });
+
+  describe('removeIrohRelay', () => {
+    it('passes the url as { url } and returns the authoritative info', async () => {
+      const fixture: IrohRelayInfo = { relays: ['https://a.example'], custom: true };
+      mockInvoke.mockResolvedValueOnce(fixture);
+      const result = await removeIrohRelay('https://b.example');
+      expect(mockInvoke).toHaveBeenCalledWith('remove_iroh_relay', {
+        url: 'https://b.example',
+      });
+      expect(result).toEqual(fixture);
+    });
+
+    it('wraps a rejected remove_iroh_relay (last-relay reject) and surfaces the error', async () => {
+      mockInvoke.mockRejectedValueOnce('cannot remove the last relay; reset to recommended instead');
+      await expect(removeIrohRelay('https://a.example')).rejects.toThrow(
+        'remove_iroh_relay: cannot remove the last relay; reset to recommended instead',
+      );
+    });
+
+    it('wraps Error-object rejections as well', async () => {
+      mockInvoke.mockRejectedValueOnce(new Error('config poisoned'));
+      await expect(removeIrohRelay('https://a.example')).rejects.toThrow(
+        'remove_iroh_relay: config poisoned',
+      );
+    });
+  });
+
+  describe('resetIrohRelays', () => {
+    it('invokes reset_iroh_relays and returns the recommended defaults info', async () => {
+      const fixture: IrohRelayInfo = {
+        relays: ['https://use1.relay.example', 'https://euw1.relay.example'],
+        custom: false,
+      };
+      mockInvoke.mockResolvedValueOnce(fixture);
+      const result = await resetIrohRelays();
+      expect(mockInvoke).toHaveBeenCalledWith('reset_iroh_relays');
+      expect(result).toEqual(fixture);
+    });
+
+    it('wraps rejections with the IPC-name prefix', async () => {
+      mockInvoke.mockRejectedValueOnce(new Error('config poisoned'));
+      await expect(resetIrohRelays()).rejects.toThrow('reset_iroh_relays: config poisoned');
     });
   });
 

@@ -157,6 +157,7 @@ pub mod community_voting_tick;
 pub mod community_voting_tier3;
 pub mod community_voting_tier3_crypto;
 pub mod community_voting_tier3_nizk;
+pub mod connectivity_settings;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
@@ -224,11 +225,11 @@ pub mod pkarr_friend_publisher;
 pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
-pub mod pkarr_settings;
 pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
+pub mod protocol_versioning;
 pub mod referral_catalog;
 pub mod relay_hold_persist;
 pub mod relay_optin_persist;
@@ -883,6 +884,14 @@ pub struct NodeState {
     /// failed (no tunnel transport — DMs stay deposit-only). Cleared on stop_node
     /// so a stale identity's live tunnels never outlive an identity switch.
     tunnel_manager: Option<std::sync::Arc<crate::tunnel_manager::TunnelManager>>,
+    /// ZEB-623: per-peer protocol-compatibility registry. Built once per node
+    /// start (alongside the `TunnelManager`, sharing the SAME `Arc`) and stored
+    /// here so Network Health (Task 3) can surface peers we couldn't speak a
+    /// compatible tunnel protocol with. Deliberately NOT a connection handle:
+    /// `clear_iroh_handles` does not clear it (peer incompatibility is knowledge,
+    /// not a live resource), though an identity switch rebuilds `NodeState`
+    /// anyway. Defaults to an empty registry on a deposit-only node (no iroh).
+    protocol_compat: std::sync::Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
     /// ZEB-217 Sub-C Phase 3 Task 9: sender used by IPC handlers
     /// (`create_community`, `redeem_invite`) to dispatch a
     /// `CommunityAdapterRequest` into the event loop, where it's
@@ -1417,7 +1426,7 @@ pub struct NodeState {
     /// Cached here so `connectivity_set_identity_discoverable` and
     /// `connectivity_get_identity_discoverable` can reach it without
     /// re-resolving via the Tauri path API (which requires `AppHandle`).
-    pub pkarr_settings_path: Option<std::path::PathBuf>,
+    pub connectivity_settings_path: Option<std::path::PathBuf>,
 
     /// JoinHandle of the pkarr publisher's background task. Held so
     /// `stop_inner` can `abort()` it — without abort the loop keeps
@@ -1530,7 +1539,7 @@ impl NodeState {
         self.pkarr_invite_publisher = None;
         self.pkarr_identity_publisher = None;
         self.pkarr_community_publisher = None;
-        self.pkarr_settings_path = None;
+        self.connectivity_settings_path = None;
         // ZEB-329: drop the synthesis-only service so a restart
         // rebuilds against the fresh iroh / resolver. The service's
         // spawned rate-limiter task winds down when its sender (held
@@ -1610,6 +1619,9 @@ impl Default for NodeState {
             dm_local_kem_pubkey: None,
             dm_pq_identity: None,
             tunnel_manager: None,
+            protocol_compat: std::sync::Arc::new(
+                crate::protocol_versioning::ProtocolCompatRegistry::default(),
+            ),
             community_adapter_request_tx: None,
             // ZEB-434 D6: stays None until start_node wires the
             // transport-epoch watch.
@@ -1752,7 +1764,7 @@ impl Default for NodeState {
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
             pkarr_community_publisher: None,
-            pkarr_settings_path: None,
+            connectivity_settings_path: None,
             pkarr_publisher_handle: None,
             // ZEB-329: stays None until start_node wires it.
             network_health: None,
@@ -3806,7 +3818,7 @@ pub async fn start_node_inner(
         let pending_friend_requests_for_state =
             std::sync::Arc::new(crate::friend_requests::PendingFriendRequests::new());
         // ZEB-371 Task 12 (spec §7.1): "auto-accept known requesters" toggle.
-        // Assigned from persisted `PkarrSettings` in the pkarr setup block
+        // Assigned from persisted `ConnectivitySettings` in the pkarr setup block
         // (default ON when the setting is absent). The variable is declared
         // here without an initializer because the pkarr block always runs
         // before the acceptor constructor below; the compiler enforces this via
@@ -3896,6 +3908,15 @@ pub async fn start_node_inner(
         let mut tunnel_manager_for_state: Option<
             std::sync::Arc<crate::tunnel_manager::TunnelManager>,
         > = None;
+        // ZEB-623: the per-peer protocol-compatibility registry, built alongside
+        // the `TunnelManager` below (sharing the SAME `Arc`) and published onto
+        // NodeState only when the tunnel acceptor actually installs — so the
+        // registry NodeState holds always matches the manager driving outbound
+        // dials. Stays `None` (NodeState keeps its default empty registry) on a
+        // deposit-only node.
+        let mut protocol_compat_for_state: Option<
+            std::sync::Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
+        > = None;
         // ZEB-321 Phase 1 PR #157 round 4 (Greptile P1): JoinHandle of
         // the iroh accept loop. Captured here (not dropped via
         // `inspect()` inside event_loop as before) so `clear_iroh_handles`
@@ -3930,7 +3951,26 @@ pub async fn start_node_inner(
             match crate::iroh_endpoint::load_or_create_secret_key() {
                 Ok((secret, fc)) => {
                     freshly_created = fc;
-                    match crate::iroh_endpoint::IrohEndpoint::new_with_secret(secret).await {
+                    // ZEB-624: apply the persisted custom iroh relay list at
+                    // endpoint build. Empty persisted list → None = follow the
+                    // preset defaults (n0 stable); a custom list is parsed to
+                    // `RelayUrl`s (sanitize already dropped malformed entries, so
+                    // any parse failure here is unexpected — `parse_iroh_relay_urls`
+                    // warns + skips it). A concurrent `set_iroh_relays` IPC that
+                    // lands after this read is reconciled by the boot pass below.
+                    let iroh_settings =
+                        connectivity_settings::ConnectivitySettings::load_or_default(
+                            &app_data_dir.join("connectivity-settings.json"),
+                        );
+                    let custom_iroh_relays =
+                        connectivity_settings::effective_iroh_relays(&iroh_settings)
+                            .map(|urls| parse_iroh_relay_urls(&urls));
+                    match crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays(
+                        secret,
+                        custom_iroh_relays,
+                    )
+                    .await
+                    {
                         Ok(ep) => {
                             let ep_arc = std::sync::Arc::new(ep);
                             let (new_link_tx, new_link_rx) =
@@ -7159,11 +7199,14 @@ pub async fn start_node_inner(
                     // Resolve settings path and load settings here (hoisted from below
                     // by ZEB-380) so the relay pool can be built from the persisted relay
                     // list before constructing the RelayClient. The downstream readers
-                    // (identity_discoverable, friend_auto_accept_known, pkarr_settings_path
+                    // (identity_discoverable, friend_auto_accept_known, connectivity_settings_path
                     // stash) all reference the same hoisted bindings.
-                    let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
-                    let pkarr_settings =
-                        pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
+                    let connectivity_settings_path =
+                        app_data_dir.join("connectivity-settings.json");
+                    let connectivity_settings =
+                        connectivity_settings::ConnectivitySettings::load_or_default(
+                            &connectivity_settings_path,
+                        );
                     // ZEB-600: apply the persisted appear-offline setting to the
                     // presence map's node-global visibility gate BEFORE the event
                     // loop can publish, so an invisible user emits no launch beacon.
@@ -7171,14 +7214,14 @@ pub async fn start_node_inner(
                     community_presence_map
                         .lock()
                         .await
-                        .set_visible(!pkarr_settings.presence_invisible);
+                        .set_visible(!connectivity_settings.presence_invisible);
                     // ZEB-380: build the pool from the persisted user-configurable
                     // relay list via the SAME lenient reader the IPCs + boot
                     // reconcile use — drops only malformed entries (a single bad
                     // hand-edited URL must not nuke an otherwise-good custom pool)
                     // and falls back to the recommended set only when nothing
                     // valid remains, rather than booting a broken/empty pool.
-                    let pool_relays = effective_pkarr_relays(pkarr_settings.relays.clone());
+                    let pool_relays = effective_pkarr_relays(connectivity_settings.relays.clone());
                     let pkarr_relay_pool = harmony_pkarr::RelayPool::new(pool_relays);
                     // ZEB-387: a valid pkarr PUT triggers a synchronous mainline-DHT
                     // write on the relay that routinely exceeds the 5s default
@@ -7476,13 +7519,14 @@ pub async fn start_node_inner(
                         }
                     }
 
-                    // Restore case-B if enabled (pkarr_settings loaded above, hoisted by ZEB-380).
-                    if pkarr_settings.identity_discoverable {
+                    // Restore case-B if enabled (connectivity_settings loaded above, hoisted by ZEB-380).
+                    if connectivity_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
                     }
                     // ZEB-371 Task 12: lift the persisted Path-A auto-accept
                     // toggle so the friend acceptor (constructed below) reads it.
-                    friend_auto_accept_known_for_state = pkarr_settings.friend_auto_accept_known;
+                    friend_auto_accept_known_for_state =
+                        connectivity_settings.friend_auto_accept_known;
 
                     // Bootstrap case-C: register per-community publications for
                     // every community the device is currently a member of.
@@ -7532,7 +7576,7 @@ pub async fn start_node_inner(
                     //     re-stamps it" promise above).
                     //   * identity (case B) — ONLY when the publication is
                     //     currently active. Initial enable keys off
-                    //     `pkarr_settings.identity_discoverable`, but the
+                    //     `connectivity_settings.identity_discoverable`, but the
                     //     toggle flips at runtime via
                     //     `connectivity_set_identity_discoverable`; the
                     //     single source of truth for "active now" is the
@@ -7569,7 +7613,7 @@ pub async fn start_node_inner(
                         let ep_opt = iroh_endpoint_arc.clone();
                         // ZEB-516: captured so the periodic identity (case-B)
                         // republish reads the persisted discoverable setting.
-                        let pkarr_settings_path = pkarr_settings_path.clone();
+                        let connectivity_settings_path = connectivity_settings_path.clone();
                         std::sync::Arc::new(move || {
                             // Per-invocation clones — the closure is `Fn`.
                             let identity_pub = std::sync::Arc::clone(&identity_pub);
@@ -7584,7 +7628,7 @@ pub async fn start_node_inner(
                             let hlc_tracker = std::sync::Arc::clone(&hlc_tracker);
                             let device_id = republish_device_id.clone();
                             let ep_opt = ep_opt.clone();
-                            let pkarr_settings_path = pkarr_settings_path.clone();
+                            let connectivity_settings_path = connectivity_settings_path.clone();
                             tokio::spawn(async move {
                                 // 1. Fleet-net self-row re-stamp (fresh
                                 //    seen_at + current relay), mirroring the
@@ -7640,7 +7684,7 @@ pub async fn start_node_inner(
                                 // disk-read pattern (PR #207/#280).
                                 let identity_discoverable =
                                     tokio::task::spawn_blocking(move || {
-                                        identity_republish_enabled(&pkarr_settings_path)
+                                        identity_republish_enabled(&connectivity_settings_path)
                                     })
                                     .await
                                     .unwrap_or(false);
@@ -7826,7 +7870,7 @@ pub async fn start_node_inner(
                     pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
                     pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
                     pkarr_community_publisher_for_state = Some(pkarr_community_pub);
-                    pkarr_settings_path_for_state = Some(pkarr_settings_path);
+                    pkarr_settings_path_for_state = Some(connectivity_settings_path);
                     pkarr_publisher_handle_for_state = Some(pkarr_publisher_join);
 
                     // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher spawn ──
@@ -8229,11 +8273,19 @@ pub async fn start_node_inner(
                                 }
                             });
 
+                            // ZEB-623: build the per-peer compat registry ONCE
+                            // here and share the SAME Arc between the manager
+                            // (which writes it from the initiator loop) and
+                            // NodeState (which Task 3 reads for Network Health).
+                            let protocol_compat = std::sync::Arc::new(
+                                crate::protocol_versioning::ProtocolCompatRegistry::default(),
+                            );
                             let tunnel_manager =
                                 std::sync::Arc::new(crate::tunnel_manager::TunnelManager::new(
                                     (**ep_arc).clone(),
                                     std::sync::Arc::clone(&pq_identity),
                                     tunnel_ingest_tx.clone(),
+                                    std::sync::Arc::clone(&protocol_compat),
                                 ));
                             let tunnel_acceptor: std::sync::Arc<
                                 dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
@@ -8259,6 +8311,10 @@ pub async fn start_node_inner(
                                     // Task 8 DmTransport can route outbound DMs
                                     // through it (wired to the installed acceptor).
                                     tunnel_manager_for_state = Some(tunnel_manager);
+                                    // ZEB-623: publish the SAME compat registry so
+                                    // NodeState's view matches the manager that
+                                    // drives outbound dials.
+                                    protocol_compat_for_state = Some(protocol_compat);
                                 }
                                 Err(_) => {
                                     tracing::warn!(
@@ -9408,6 +9464,12 @@ pub async fn start_node_inner(
                         // `None` if iroh bind failed) so the Task 8 DmTransport
                         // can route outbound DMs through it.
                         guard.tunnel_manager = tunnel_manager_for_state;
+                        // ZEB-623: publish the compat registry shared with the
+                        // installed TunnelManager (kept as an empty default on a
+                        // deposit-only node where no manager installed).
+                        if let Some(pc) = protocol_compat_for_state {
+                            guard.protocol_compat = pc;
+                        }
                         // ZEB-217 Sub-C Phase 3 Task 9: store the adapter-
                         // request sender so create_community / Phase 4
                         // redeem_invite can dispatch on-demand
@@ -9619,7 +9681,7 @@ pub async fn start_node_inner(
                         guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
                         guard.pkarr_community_publisher =
                             pkarr_community_publisher_for_state.take();
-                        guard.pkarr_settings_path = pkarr_settings_path_for_state.take();
+                        guard.connectivity_settings_path = pkarr_settings_path_for_state.take();
                         guard.pkarr_publisher_handle = pkarr_publisher_handle_for_state.take();
 
                         // ── ZEB-329: NetworkHealthService boot wiring ──
@@ -9697,9 +9759,10 @@ pub async fn start_node_inner(
                                 // persisted relays Settings shows (Healthy
                                 // placeholders), resolving the path exactly as
                                 // get_pkarr_relays does so the two surfaces agree.
-                                let settings_path =
-                                    connectivity_settings_path(guard.pkarr_settings_path.clone())
-                                        .ok();
+                                let settings_path = connectivity_settings_path(
+                                    guard.connectivity_settings_path.clone(),
+                                )
+                                .ok();
                                 std::sync::Arc::new(PersistedRelaySnapshot { settings_path })
                             };
                             let mut nh = crate::network_health::NetworkHealthService::new(
@@ -9735,6 +9798,15 @@ pub async fn start_node_inner(
                             // community-presence subscriber's `apply`).
                             nh.set_presence_source(std::sync::Arc::clone(
                                 &network_health_presence_cache,
+                            ));
+                            // ZEB-623: per-peer protocol-compat registry. Share
+                            // the SAME Arc NodeState holds (published just above
+                            // from the tunnel-acceptor install block, or the
+                            // empty default on a deposit-only node) so the panel
+                            // surfaces exactly what the TunnelManager recorded
+                            // during hello negotiation.
+                            nh.set_protocol_compat_source(std::sync::Arc::clone(
+                                &guard.protocol_compat,
                             ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
@@ -10190,7 +10262,7 @@ pub async fn start_node_inner(
                     } else {
                         match (
                             guard.pkarr_relay_client.as_ref(),
-                            guard.pkarr_settings_path.as_ref(),
+                            guard.connectivity_settings_path.as_ref(),
                         ) {
                             (Some(rc), Some(path)) => {
                                 Some((std::sync::Arc::clone(rc), path.clone()))
@@ -10201,7 +10273,7 @@ pub async fn start_node_inner(
                 };
                 if let Some((rc, path)) = target {
                     let effective = effective_pkarr_relays(
-                        pkarr_settings::PkarrSettings::load_or_default(&path).relays,
+                        connectivity_settings::ConnectivitySettings::load_or_default(&path).relays,
                     );
                     let mut live: Vec<String> =
                         rc.relay_health().into_iter().map(|h| h.url).collect();
@@ -10219,6 +10291,59 @@ pub async fn start_node_inner(
                         // listeners refetch, otherwise they'd show the
                         // pre-reconcile list until the next manual refresh.
                         app.emit("connectivity-relays-changed", serde_json::Value::Null);
+                    }
+                }
+            }
+
+            // ZEB-624: reconcile the live iroh relay map against persisted
+            // settings now that the endpoint handle is stashed and visible. A
+            // set/add/remove/reset_iroh_relays IPC may have persisted a newer
+            // `iroh_relays` list while boot was still building the endpoint (at
+            // which point `iroh_endpoint` was still None on NodeState, so that
+            // IPC's live diff-apply was skipped) — without this the endpoint's
+            // relay map would lag connectivity-settings.json until the next
+            // mutation or restart. Hold the same write lock the mutators take;
+            // the generation guard skips an endpoint a newer start_node owns. The
+            // diff is `RelayUrl`-valued (`apply_relay_urls`), so it's a genuine
+            // no-op when the relay set already matches — the common path applies
+            // nothing.
+            {
+                let _relay_boot_guard = iroh_relay_write_lock().lock().await;
+                let target = {
+                    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                    if guard.generation != our_gen {
+                        None
+                    } else {
+                        match (
+                            guard.iroh_endpoint.as_ref(),
+                            guard.connectivity_settings_path.as_ref(),
+                        ) {
+                            (Some(ep), Some(path)) => {
+                                Some((std::sync::Arc::clone(ep), path.clone()))
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some((ep, path)) = target {
+                    let settings =
+                        connectivity_settings::ConnectivitySettings::load_or_default(&path);
+                    let want = parse_iroh_relay_urls(&iroh_target_relay_urls(&settings));
+                    let (inserted, removed) = ep.apply_relay_urls(&want).await;
+                    if inserted > 0 || removed > 0 {
+                        tracing::info!(
+                            inserted,
+                            removed,
+                            "ZEB-624: iroh relay settings changed during boot; \
+                             reconciled live relay map to persisted set"
+                        );
+                        // Mirror the mutators: a relay-map change must emit so the
+                        // Settings listener refetches rather than showing the
+                        // pre-reconcile list until the next manual refresh. `app`
+                        // here is the NodeEventSink abstraction (GUI or headless),
+                        // whose `emit` is ()-returning by trait contract — each
+                        // sink impl handles its own delivery internally.
+                        app.emit("iroh-relays-changed", serde_json::Value::Null);
                     }
                 }
             }
@@ -12267,7 +12392,12 @@ mod add_space_tunnel_routing_tests {
             &mut rand::rngs::OsRng,
         ));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
-        StdArc::new(TunnelManager::new(endpoint, local_pq, ingest_tx))
+        StdArc::new(TunnelManager::new(
+            endpoint,
+            local_pq,
+            ingest_tx,
+            StdArc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+        ))
     }
 
     /// Build a `NodeState` wired with the DM handles `add_space_impl` snapshots
@@ -22801,14 +22931,14 @@ pub(crate) fn ensure_public_cid(cid: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve the `emoji_names.json` path from `NodeState.pkarr_settings_path`,
-/// mirroring how the nickname store co-locates beside `pkarr_settings.json`.
+/// Resolve the `emoji_names.json` path from `NodeState.connectivity_settings_path`,
+/// mirroring how the nickname store co-locates beside `connectivity_settings.json`.
 fn emoji_names_path(state: &std::sync::Mutex<NodeState>) -> Result<std::path::PathBuf, String> {
     let g = state
         .lock()
         .map_err(|e| format!("NodeState poisoned: {e}"))?;
     let p = g
-        .pkarr_settings_path
+        .connectivity_settings_path
         .clone()
         .ok_or_else(|| OWNER_NOT_LOADED_MSG.to_string())?;
     Ok(p.with_file_name("emoji_names.json"))
@@ -26112,9 +26242,9 @@ mod create_community_inner_tests {
     #[tokio::test]
     async fn set_emoji_name_impl_writes_and_clears_public_only() {
         let dir = tempfile::tempdir().unwrap();
-        let settings = dir.path().join("pkarr_settings.json");
+        let settings = dir.path().join("connectivity_settings.json");
         let state = std::sync::Mutex::new(NodeState {
-            pkarr_settings_path: Some(settings.clone()),
+            connectivity_settings_path: Some(settings.clone()),
             ..NodeState::default()
         });
         let public_hex = hex::encode([0x42u8; 32]);
@@ -26147,7 +26277,7 @@ mod create_community_inner_tests {
     async fn set_emoji_name_impl_rejects_encrypted_and_bad_name() {
         let dir = tempfile::tempdir().unwrap();
         let state = std::sync::Mutex::new(NodeState {
-            pkarr_settings_path: Some(dir.path().join("pkarr_settings.json")),
+            connectivity_settings_path: Some(dir.path().join("connectivity_settings.json")),
             ..NodeState::default()
         });
         let encrypted_hex = hex::encode([0xB2u8; 32]);
@@ -31868,7 +31998,7 @@ pub(crate) async fn unsubscribe_community_presence_impl(
 /// pattern as `apply_pkarr_relays`.
 fn persist_presence_visibility(path: &std::path::Path, visible: bool) -> Result<(), String> {
     let path_buf = path.to_path_buf();
-    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path_buf);
+    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path_buf);
     settings.presence_invisible = !visible;
     settings
         .save(&path_buf)
@@ -31892,7 +32022,7 @@ async fn set_presence_visibility(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.community_presence_map.clone(),
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
         )
     };
     // Live: flip the shared gate if a node is running. If not, the persisted
@@ -31935,7 +32065,7 @@ async fn get_presence_visibility(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.community_presence_map.clone(),
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
         )
     };
     if let Some(m) = map {
@@ -31945,7 +32075,7 @@ async fn get_presence_visibility(
     // Offload the sync std::fs read off the Tokio worker (same rationale as the
     // setter — this seam is reachable over the async IPC/headless surface).
     let invisible = tokio::task::spawn_blocking(move || {
-        pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).presence_invisible
     })
     .await
     .map_err(|e| format!("load presence visibility task: {e}"))?;
@@ -46630,7 +46760,7 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             guard.pkarr_identity_publisher.clone(),
-            guard.pkarr_settings_path.clone(),
+            guard.connectivity_settings_path.clone(),
         )
     };
 
@@ -46641,13 +46771,13 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
     let Some(path) = settings_path else {
-        return Err("pkarr_settings_path missing".into());
+        return Err("connectivity_settings_path missing".into());
     };
 
     // Persist the preference. Offload the sync std::fs load+save off the Tokio
     // worker — this seam is reachable over the async headless API surface.
     tokio::task::spawn_blocking(move || {
-        let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.identity_discoverable = enabled;
         settings
             .save(&path)
@@ -46695,7 +46825,7 @@ pub(crate) async fn connectivity_get_identity_discoverable_impl(
         state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pkarr_settings_path
+            .connectivity_settings_path
             .clone()
     };
     let Some(path) = path else {
@@ -46705,7 +46835,7 @@ pub(crate) async fn connectivity_get_identity_discoverable_impl(
     // Offload the sync std::fs read off the Tokio worker — this seam is reachable
     // over the async headless API surface.
     tokio::task::spawn_blocking(move || {
-        pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).identity_discoverable
     })
     .await
     .map_err(|e| format!("load connectivity-settings task: {e}"))
@@ -46719,7 +46849,7 @@ async fn connectivity_get_identity_discoverable(
 }
 
 /// ZEB-380: resolve `connectivity-settings.json` even when the node is stopped.
-/// `NodeState.pkarr_settings_path` is cleared on stop, but the relay manager
+/// `NodeState.connectivity_settings_path` is cleared on stop, but the relay manager
 /// must still read/write the user's persisted relays pre-start / post-stop —
 /// fall back to the app-data-dir-derived path.
 fn connectivity_settings_path(
@@ -46783,12 +46913,12 @@ fn apply_pkarr_relays<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            guard.pkarr_settings_path.clone(),
+            guard.connectivity_settings_path.clone(),
             guard.pkarr_relay_client.clone(),
         )
     };
     let path = connectivity_settings_path(settings_path)?;
-    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
     settings.relays = validated.clone();
     settings
         .save(&path)
@@ -46810,13 +46940,13 @@ fn apply_pkarr_relays<R: tauri::Runtime>(
 /// apply, so every reader/mutator agrees on the live pool. Drops only the
 /// malformed entries (a single bad URL in a hand-edited file must not discard an
 /// otherwise-good custom pool — see `sanitize_relay_urls`); resolves to
-/// `default_relays()` only when NOTHING valid remains (empty or all-invalid),
+/// `default_pkarr_relays()` only when NOTHING valid remains (empty or all-invalid),
 /// which is the pool that is actually live and shown in the UI, so add/remove
 /// mutate the live set rather than a raw possibly-empty file value.
 fn effective_pkarr_relays(persisted: Vec<String>) -> Vec<String> {
-    let sanitized = crate::pkarr_settings::sanitize_relay_urls(persisted);
+    let sanitized = crate::connectivity_settings::sanitize_relay_urls(persisted);
     if sanitized.is_empty() {
-        crate::pkarr_settings::default_relays()
+        crate::connectivity_settings::default_pkarr_relays()
     } else {
         sanitized
     }
@@ -46829,7 +46959,9 @@ fn effective_pkarr_relays(persisted: Vec<String>) -> Vec<String> {
 fn effective_persisted_relays(settings_path: Option<&std::path::Path>) -> Vec<String> {
     let persisted = settings_path
         // load_or_default takes &PathBuf; cheap to_path_buf on this cold path.
-        .map(|p| pkarr_settings::PkarrSettings::load_or_default(&p.to_path_buf()).relays)
+        .map(|p| {
+            connectivity_settings::ConnectivitySettings::load_or_default(&p.to_path_buf()).relays
+        })
         .unwrap_or_default();
     effective_pkarr_relays(persisted)
 }
@@ -46937,7 +47069,7 @@ mod epoch_republish_trigger_tests {
 /// boot publish froze the identity record permanently. Returns false when the
 /// setting is off or the file is missing/unreadable (matches `load_or_default`).
 fn identity_republish_enabled(settings_path: &std::path::Path) -> bool {
-    pkarr_settings::PkarrSettings::load_or_default(&settings_path.to_path_buf())
+    connectivity_settings::ConnectivitySettings::load_or_default(&settings_path.to_path_buf())
         .identity_discoverable
 }
 
@@ -46991,12 +47123,12 @@ async fn set_pkarr_relays<R: tauri::Runtime>(
     relays: Vec<String>,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let _relay_write_guard = pkarr_relay_write_lock().lock().await;
-    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    let validated = crate::connectivity_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
 }
 
 /// ZEB-380: reset the pkarr relay pool to the recommended default set
-/// (`default_relays()`), persisted + hot-swapped live. Server-authoritative so
+/// (`default_pkarr_relays()`), persisted + hot-swapped live. Server-authoritative so
 /// the frontend never hardcodes the default list ("Restore recommended").
 #[tauri::command]
 async fn reset_pkarr_relays<R: tauri::Runtime>(
@@ -47004,16 +47136,17 @@ async fn reset_pkarr_relays<R: tauri::Runtime>(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<crate::network_health::RelayHealthWire>, String> {
     let _relay_write_guard = pkarr_relay_write_lock().lock().await;
-    // default_relays() is always valid; run it through the validator anyway so
+    // default_pkarr_relays() is always valid; run it through the validator anyway so
     // any future change to the defaults is held to the same contract.
-    let validated =
-        crate::pkarr_settings::validate_relay_urls(crate::pkarr_settings::default_relays())?;
+    let validated = crate::connectivity_settings::validate_relay_urls(
+        crate::connectivity_settings::default_pkarr_relays(),
+    )?;
     apply_pkarr_relays(&app, &state, validated)
 }
 
 /// ZEB-380: add a single relay to the persisted pool (server-authoritative
 /// read-modify-write). The client sends only the URL — the backend appends it
-/// to the EFFECTIVE relay pool (defaulting to `default_relays()` when the
+/// to the EFFECTIVE relay pool (defaulting to `default_pkarr_relays()` when the
 /// persisted list is empty/invalid) and re-validates, so adding to a fresh
 /// install preserves the live defaults rather than replacing them with just
 /// the new URL.
@@ -47028,21 +47161,22 @@ async fn add_pkarr_relay<R: tauri::Runtime>(
         let guard = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        guard.pkarr_settings_path.clone()
+        guard.connectivity_settings_path.clone()
     };
     let path = connectivity_settings_path(settings_path)?;
-    let mut relays =
-        effective_pkarr_relays(pkarr_settings::PkarrSettings::load_or_default(&path).relays);
+    let mut relays = effective_pkarr_relays(
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).relays,
+    );
     relays.push(url);
     // validate_relay_urls dedups (so re-adding an existing relay is a no-op),
     // caps at 8, and rejects invalid input — returning a clear Err to the UI.
-    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    let validated = crate::connectivity_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
 }
 
 /// ZEB-380: remove a single relay from the persisted pool (server-authoritative
 /// read-modify-write). Filters from the EFFECTIVE pool (defaulting to
-/// `default_relays()` when the persisted list is empty/invalid), so a fresh
+/// `default_pkarr_relays()` when the persisted list is empty/invalid), so a fresh
 /// install can remove an unwanted default. Removing the last relay fails
 /// (validate_relay_urls rejects an empty list), preserving the >=1 invariant
 /// server-side.
@@ -47057,18 +47191,19 @@ async fn remove_pkarr_relay<R: tauri::Runtime>(
         let guard = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        guard.pkarr_settings_path.clone()
+        guard.connectivity_settings_path.clone()
     };
     let path = connectivity_settings_path(settings_path)?;
     let target = url.trim().trim_end_matches('/');
-    let relays: Vec<String> =
-        effective_pkarr_relays(pkarr_settings::PkarrSettings::load_or_default(&path).relays)
-            .into_iter()
-            .filter(|r| r.trim_end_matches('/') != target)
-            .collect();
+    let relays: Vec<String> = effective_pkarr_relays(
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).relays,
+    )
+    .into_iter()
+    .filter(|r| r.trim_end_matches('/') != target)
+    .collect();
     // Empty → validate_relay_urls errors ("at least one relay is required"),
     // which guards against removing the final relay.
-    let validated = crate::pkarr_settings::validate_relay_urls(relays)?;
+    let validated = crate::connectivity_settings::validate_relay_urls(relays)?;
     apply_pkarr_relays(&app, &state, validated)
 }
 
@@ -47084,7 +47219,7 @@ async fn get_pkarr_relays(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            guard.pkarr_settings_path.clone(),
+            guard.connectivity_settings_path.clone(),
             guard.pkarr_relay_client.clone(),
         )
     };
@@ -47100,6 +47235,254 @@ async fn get_pkarr_relays(
         }
     };
     Ok(relays)
+}
+
+// ─── ZEB-624: user-configurable iroh transport relay list ───────────────────
+//
+// The iroh mirror of the pkarr relay verbs above. Distinct from the pkarr pool
+// (`relays`): the pkarr pool steers identity publish/resolve, whereas
+// `iroh_relays` steers iroh's transport home-relay selection. Persisted in the
+// SAME `connectivity-settings.json`; an EMPTY list is the sentinel for "follow
+// the iroh preset's default relay map" (n0 stable), so `reset` writes `[]` and
+// `set` requires >=1 (`validate_iroh_relay_urls` rejects empty). Mutations are
+// serialized by `iroh_relay_write_lock()` (separate from the NodeState mutex, so
+// no lock-ordering concern), persisted, then live-diff-applied to the running
+// endpoint (no restart) and announced via `iroh-relays-changed`.
+
+/// ZEB-624: the wire shape every iroh-relay verb returns. `relays` is the
+/// EFFECTIVE relay URL list (the custom list, or the materialized preset
+/// defaults); `custom` is whether a user override is persisted (empty = follow
+/// defaults). `#[serde(rename_all = "camelCase")]` so the JS side reads
+/// `{ relays, custom }`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IrohRelayWire {
+    pub relays: Vec<String>,
+    pub custom: bool,
+}
+
+/// ZEB-624: parse persisted iroh relay URL strings into `RelayUrl`s, dropping
+/// (with a `warn!`) any that fail to parse. `sanitize_iroh_relay_urls` /
+/// `validate_iroh_relay_urls` already reject unparseable entries, so a failure
+/// here is unexpected — we skip rather than abort so one bad entry can't strand
+/// the whole transport. Shared by the boot builder and the live diff-apply.
+fn parse_iroh_relay_urls(urls: &[String]) -> Vec<iroh::RelayUrl> {
+    urls.iter()
+        .filter_map(|s| match s.parse::<iroh::RelayUrl>() {
+            Ok(u) => Some(u),
+            Err(e) => {
+                tracing::warn!(url = %s, error = %e, "ZEB-624: dropping unparseable iroh relay URL");
+                None
+            }
+        })
+        .collect()
+}
+
+/// ZEB-624: the iroh preset's default relay map URLs (n0 stable), normalized +
+/// sorted. The materialized form of the "follow defaults" sentinel — used when
+/// no custom list is persisted, and as the base that `add`/`remove` mutate on a
+/// defaults-following node.
+fn iroh_default_relay_urls() -> Vec<String> {
+    // Strip the trailing slash `RelayUrl`'s `Display` adds so this matches the
+    // persisted/validated wire form (and `IrohEndpoint::relay_map_urls`), keeping
+    // `get_iroh_relays` consistent across its live and defaults branches.
+    let mut urls: Vec<String> = iroh::endpoint::default_relay_mode()
+        .relay_map()
+        .urls::<Vec<iroh::RelayUrl>>()
+        .into_iter()
+        .map(|u| u.to_string().trim_end_matches('/').to_string())
+        .collect();
+    urls.sort();
+    urls
+}
+
+/// ZEB-624: the EFFECTIVE iroh relay URL list for a persisted settings value —
+/// the custom list when one is configured (non-empty after sanitize), else the
+/// preset defaults. The single source both `get_iroh_relays` and the live
+/// diff-apply compute their target from, so they can't disagree.
+fn iroh_target_relay_urls(settings: &connectivity_settings::ConnectivitySettings) -> Vec<String> {
+    connectivity_settings::effective_iroh_relays(settings).unwrap_or_else(iroh_default_relay_urls)
+}
+
+/// ZEB-624: serializes all iroh-relay settings mutations (add/remove/set/reset)
+/// so a concurrent read-modify-write from another window can't lose an update.
+/// Process-global (single per-process settings file); separate from both the
+/// NodeState mutex and `PKARR_RELAY_WRITE_LOCK`, so no lock-ordering concern.
+static IROH_RELAY_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn iroh_relay_write_lock() -> &'static tokio::sync::Mutex<()> {
+    IROH_RELAY_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// ZEB-624: persist an ALREADY-VALIDATED iroh relay list (empty = reset =
+/// follow-defaults sentinel), live-diff-apply the effective target to the
+/// running endpoint if any, emit `iroh-relays-changed`, and return the wire.
+/// The iroh mirror of `apply_pkarr_relays`. Callers hold `iroh_relay_write_lock()`.
+async fn apply_iroh_relays<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &tauri::State<'_, Mutex<NodeState>>,
+    validated: Vec<String>,
+) -> Result<IrohRelayWire, String> {
+    let (settings_path, endpoint) = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            guard.connectivity_settings_path.clone(),
+            guard.iroh_endpoint.clone(),
+        )
+    };
+    let path = connectivity_settings_path(settings_path)?;
+    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+    settings.iroh_relays = validated.clone();
+    settings
+        .save(&path)
+        .map_err(|e| format!("save connectivity-settings: {e}"))?;
+    let custom = !validated.is_empty();
+    // The effective target the endpoint must hold (custom list, or defaults).
+    let target = iroh_target_relay_urls(&settings);
+    if let Some(ep) = endpoint {
+        let (inserted, removed) = ep.apply_relay_urls(&parse_iroh_relay_urls(&target)).await;
+        if inserted > 0 || removed > 0 {
+            tracing::info!(
+                inserted,
+                removed,
+                "ZEB-624: iroh relay map diff-applied live"
+            );
+        }
+    }
+    if let Err(e) = app.emit("iroh-relays-changed", ()) {
+        tracing::warn!(error = %e, "apply_iroh_relays: emit failed");
+    }
+    Ok(IrohRelayWire {
+        relays: target,
+        custom,
+    })
+}
+
+/// ZEB-624: current iroh relay list + whether it's a user override. Prefers the
+/// live endpoint's configured map (so a just-applied edit is reflected); falls
+/// back to the effective persisted target pre-wiring. `custom` is always read
+/// from the persisted setting (empty = follow defaults).
+#[tauri::command]
+async fn get_iroh_relays(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<IrohRelayWire, String> {
+    // ZEB-624 round-2: serialize this read against mutations under the SAME lock
+    // the mutators hold (set/reset/add/remove → apply_iroh_relays), so the
+    // persisted `custom` flag and the live relay list form ONE consistent
+    // snapshot. Without it, a read racing `apply_iroh_relays` (which saves the new
+    // settings FIRST, then awaits the live endpoint diff) could pair the NEW
+    // `custom` flag with the OLD live relay list. Taken at the TOP, BEFORE the
+    // NodeState mutex — matching the mutators' lock order (`add`/`remove` acquire
+    // the write lock first, then the NodeState mutex) so we never invert it.
+    let _relay_read_guard = iroh_relay_write_lock().lock().await;
+    let (settings_path, endpoint) = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            guard.connectivity_settings_path.clone(),
+            guard.iroh_endpoint.clone(),
+        )
+    };
+    let path = connectivity_settings_path(settings_path)?;
+    let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+    let custom = connectivity_settings::effective_iroh_relays(&settings).is_some();
+    let relays = match endpoint {
+        Some(ep) => ep.relay_map_urls(),
+        None => iroh_target_relay_urls(&settings),
+    };
+    Ok(IrohRelayWire { relays, custom })
+}
+
+/// ZEB-624: replace the custom iroh relay list. Validates (>=1, https/loopback,
+/// parses as `RelayUrl`, dedups, caps), persists, then hot-swaps the live
+/// endpoint's relay map (no restart). Empty input is rejected — use
+/// `reset_iroh_relays` to follow the preset defaults.
+#[tauri::command]
+async fn set_iroh_relays<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    relays: Vec<String>,
+) -> Result<IrohRelayWire, String> {
+    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let validated = connectivity_settings::validate_iroh_relay_urls(relays)?;
+    apply_iroh_relays(&app, &state, validated).await
+}
+
+/// ZEB-624: clear the custom iroh relay list (persist `[]`) so the endpoint
+/// follows the iroh preset's default relay map (n0 stable), live-applied.
+#[tauri::command]
+async fn reset_iroh_relays<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<IrohRelayWire, String> {
+    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    apply_iroh_relays(&app, &state, Vec::new()).await
+}
+
+/// ZEB-624: add a single relay to the custom iroh list (server-authoritative
+/// read-modify-write). On a defaults-following node the current EFFECTIVE list
+/// is the materialized preset defaults, so the added relay turns the node into a
+/// custom list of defaults+new; `validate_iroh_relay_urls` dedups (re-adding is a
+/// no-op) and caps at `MAX_IROH_RELAYS`.
+#[tauri::command]
+async fn add_iroh_relay<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<IrohRelayWire, String> {
+    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let settings_path = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard.connectivity_settings_path.clone()
+    };
+    let path = connectivity_settings_path(settings_path)?;
+    let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+    let mut relays = iroh_target_relay_urls(&settings);
+    relays.push(url);
+    let validated = connectivity_settings::validate_iroh_relay_urls(relays)?;
+    apply_iroh_relays(&app, &state, validated).await
+}
+
+/// ZEB-624: remove a single relay from the custom iroh list (server-authoritative
+/// read-modify-write). Operates on the EFFECTIVE list (materialized defaults on a
+/// defaults-following node, so an unwanted default can be dropped). Removing the
+/// LAST relay of a custom list is rejected — the user should `reset_iroh_relays`
+/// to follow the preset defaults rather than persist an empty custom list (which
+/// would strand the endpoint with no relays).
+#[tauri::command]
+async fn remove_iroh_relay<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    url: String,
+) -> Result<IrohRelayWire, String> {
+    let _relay_write_guard = iroh_relay_write_lock().lock().await;
+    let settings_path = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard.connectivity_settings_path.clone()
+    };
+    let path = connectivity_settings_path(settings_path)?;
+    let settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+    let target = url.trim().trim_end_matches('/');
+    let remaining: Vec<String> = iroh_target_relay_urls(&settings)
+        .into_iter()
+        .filter(|r| r.trim_end_matches('/') != target)
+        .collect();
+    if remaining.is_empty() {
+        return Err(
+            "cannot remove the last iroh relay; use reset to follow the built-in defaults instead"
+                .to_string(),
+        );
+    }
+    let validated = connectivity_settings::validate_iroh_relay_urls(remaining)?;
+    apply_iroh_relays(&app, &state, validated).await
 }
 
 /// Look up a peer's current iroh routing via case-B (identity-keyed) pkarr
@@ -47699,13 +48082,13 @@ async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<F
 pub(crate) async fn list_friends_impl(
     state: &std::sync::Mutex<NodeState>,
 ) -> Result<Vec<FriendDto>, String> {
-    let (crdt_state, pkarr_settings_path) = {
+    let (crdt_state, connectivity_settings_path) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
         )
     };
     let dtos = {
@@ -47714,7 +48097,7 @@ pub(crate) async fn list_friends_impl(
     };
     // ZEB-419: join purely-local nicknames from their own file (outside the
     // published CRDT). A missing/unset path → no nicknames.
-    let nicknames = match &pkarr_settings_path {
+    let nicknames = match &connectivity_settings_path {
         Some(p) => crate::friend_nicknames::FriendNicknames::load_or_default(
             &p.with_file_name("friend_nicknames.json"),
         ),
@@ -48404,14 +48787,14 @@ async fn set_friend_auto_accept(
         state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pkarr_settings_path
+            .connectivity_settings_path
             .clone()
     };
     let Some(path) = path else {
-        return Err("pkarr_settings_path missing".into());
+        return Err("connectivity_settings_path missing".into());
     };
 
-    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+    let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
     settings.friend_auto_accept_known = enabled;
     settings
         .save(&path)
@@ -48437,14 +48820,17 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
         state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pkarr_settings_path
+            .connectivity_settings_path
             .clone()
     };
     let Some(path) = path else {
         // Node not running / pkarr not initialized — return the spec default (ON).
         return Ok(true);
     };
-    Ok(pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known)
+    Ok(
+        connectivity_settings::ConnectivitySettings::load_or_default(&path)
+            .friend_auto_accept_known,
+    )
 }
 
 /// ZEB-419: serializes the nickname-file read-modify-write so two concurrent
@@ -48495,7 +48881,7 @@ async fn set_friend_nickname(
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (g.crdt_state.clone(), g.pkarr_settings_path.clone())
+        (g.crdt_state.clone(), g.connectivity_settings_path.clone())
     };
     let (Some(crdt_state), Some(path)) = (crdt_state, path) else {
         return Err(OWNER_NOT_LOADED_MSG.into());
@@ -49828,7 +50214,7 @@ mod friend_ipc_tests {
     #[test]
     fn set_friend_auto_accept_persists_round_trips() {
         // The IPC's persistence half (independent of NodeState): flipping the
-        // toggle writes through `PkarrSettings::save` and reads back via
+        // toggle writes through `ConnectivitySettings::save` and reads back via
         // `load_or_default`, exactly as `set_/get_friend_auto_accept` do.
         let td = tempfile::TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
@@ -49836,22 +50222,27 @@ mod friend_ipc_tests {
         // Default (no file) is ON (spec §7.1) — what `get_friend_auto_accept`
         // returns when the file is absent.
         assert!(
-            crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .friend_auto_accept_known
         );
 
-        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.friend_auto_accept_known = false;
         settings.save(&path).expect("save");
         assert!(
-            !crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known,
+            !crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .friend_auto_accept_known,
             "toggle OFF persists"
         );
 
-        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.friend_auto_accept_known = true;
         settings.save(&path).expect("save");
         assert!(
-            crate::pkarr_settings::PkarrSettings::load_or_default(&path).friend_auto_accept_known,
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .friend_auto_accept_known,
             "toggle back ON persists"
         );
     }
@@ -49859,27 +50250,88 @@ mod friend_ipc_tests {
     #[test]
     fn set_pkarr_relays_validation_and_persist_round_trip() {
         // Mirrors the friend-auto-accept persistence test: the IPC's pure pieces
-        // (validate + PkarrSettings load/save) round-trip through a temp file.
+        // (validate + ConnectivitySettings load/save) round-trip through a temp file.
         let td = tempfile::TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
 
         // Invalid input is rejected by the validator (no persist).
-        assert!(
-            crate::pkarr_settings::validate_relay_urls(vec!["http://relay.pkarr.org".into()])
-                .is_err()
-        );
+        assert!(crate::connectivity_settings::validate_relay_urls(vec![
+            "http://relay.pkarr.org".into()
+        ])
+        .is_err());
 
         // Valid input persists + reloads.
-        let validated =
-            crate::pkarr_settings::validate_relay_urls(vec!["https://relay.pkarr.org".into()])
-                .expect("valid");
-        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let validated = crate::connectivity_settings::validate_relay_urls(vec![
+            "https://relay.pkarr.org".into(),
+        ])
+        .expect("valid");
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.relays = validated.clone();
         settings.save(&path).expect("save");
         assert_eq!(
-            crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays,
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays,
             validated
         );
+    }
+
+    #[test]
+    fn iroh_relay_set_persist_roundtrip() {
+        // ZEB-624: the iroh-relay `set` verb's pure pieces (validate + persist +
+        // effective) round-trip through a temp settings file, mirroring
+        // `set_pkarr_relays_validation_and_persist_round_trip`.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Invalid input is rejected (http for a remote host); no persist.
+        assert!(crate::connectivity_settings::validate_iroh_relay_urls(vec![
+            "http://relay.evil.example".into()
+        ])
+        .is_err());
+
+        // Valid input persists + reloads, and `effective_iroh_relays` returns it.
+        let validated = crate::connectivity_settings::validate_iroh_relay_urls(vec![
+            "https://use1-1.relay.n0.iroh.link".into(),
+        ])
+        .expect("valid");
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.iroh_relays = validated.clone();
+        settings.save(&path).expect("save");
+        let reloaded = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        assert_eq!(reloaded.iroh_relays, validated);
+        assert_eq!(
+            crate::connectivity_settings::effective_iroh_relays(&reloaded),
+            Some(validated)
+        );
+    }
+
+    #[test]
+    fn iroh_relay_reset_clears_to_defaults_sentinel() {
+        // ZEB-624: `reset_iroh_relays` persists `[]` — the sentinel for "follow
+        // the iroh preset defaults" — so `effective_iroh_relays` reloads as None.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Seed a custom list first.
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.iroh_relays = vec!["https://use1-1.relay.n0.iroh.link".into()];
+        settings.save(&path).expect("save custom");
+        assert!(crate::connectivity_settings::effective_iroh_relays(
+            &crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+        )
+        .is_some());
+
+        // Reset writes the empty sentinel.
+        let mut cleared =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        cleared.iroh_relays = Vec::new();
+        cleared.save(&path).expect("save reset");
+
+        let reloaded = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        assert!(reloaded.iroh_relays.is_empty());
+        assert!(crate::connectivity_settings::effective_iroh_relays(&reloaded).is_none());
     }
 
     #[test]
@@ -49896,19 +50348,22 @@ mod friend_ipc_tests {
         ];
 
         // Seed the file.
-        let mut settings = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.relays = initial.clone();
         settings.save(&path).expect("save initial");
 
         // --- Simulate add ---
-        let mut relays = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let mut relays =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         relays.push("https://new.relay.example".to_string());
         let validated =
-            crate::pkarr_settings::validate_relay_urls(relays).expect("valid after add");
-        let mut s = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+            crate::connectivity_settings::validate_relay_urls(relays).expect("valid after add");
+        let mut s = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         s.relays = validated.clone();
         s.save(&path).expect("save after add");
-        let reloaded = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let reloaded =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         assert_eq!(reloaded.len(), 3, "add: three relays persisted");
         assert!(
             reloaded.contains(&"https://new.relay.example".to_string()),
@@ -49916,9 +50371,11 @@ mod friend_ipc_tests {
         );
 
         // Re-adding the same URL is a no-op (validate_relay_urls dedups).
-        let mut relays2 = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let mut relays2 =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         relays2.push("https://new.relay.example".to_string());
-        let validated2 = crate::pkarr_settings::validate_relay_urls(relays2).expect("valid dedup");
+        let validated2 =
+            crate::connectivity_settings::validate_relay_urls(relays2).expect("valid dedup");
         assert_eq!(
             validated2.len(),
             3,
@@ -49928,17 +50385,18 @@ mod friend_ipc_tests {
         // --- Simulate remove of one relay ---
         let target = "https://new.relay.example";
         let relays_after_remove: Vec<String> =
-            crate::pkarr_settings::PkarrSettings::load_or_default(&path)
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
                 .relays
                 .into_iter()
                 .filter(|r| r.trim_end_matches('/') != target.trim_end_matches('/'))
                 .collect();
-        let validated3 = crate::pkarr_settings::validate_relay_urls(relays_after_remove)
+        let validated3 = crate::connectivity_settings::validate_relay_urls(relays_after_remove)
             .expect("valid after remove");
-        let mut s3 = crate::pkarr_settings::PkarrSettings::load_or_default(&path);
+        let mut s3 = crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
         s3.relays = validated3;
         s3.save(&path).expect("save after remove");
-        let reloaded3 = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let reloaded3 =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         assert_eq!(reloaded3.len(), 2, "remove: back to two relays");
         assert!(
             !reloaded3.contains(&"https://new.relay.example".to_string()),
@@ -49947,22 +50405,23 @@ mod friend_ipc_tests {
 
         // --- Simulate remove of a relay down to one ---
         let target2 = "https://pkarr.pubky.app";
-        let relays_one: Vec<String> = crate::pkarr_settings::PkarrSettings::load_or_default(&path)
-            .relays
-            .into_iter()
-            .filter(|r| r.trim_end_matches('/') != target2.trim_end_matches('/'))
-            .collect();
+        let relays_one: Vec<String> =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .relays
+                .into_iter()
+                .filter(|r| r.trim_end_matches('/') != target2.trim_end_matches('/'))
+                .collect();
         assert_eq!(
             relays_one.len(),
             1,
             "one relay remaining before final remove attempt"
         );
-        let validated_one =
-            crate::pkarr_settings::validate_relay_urls(relays_one).expect("one relay is valid");
+        let validated_one = crate::connectivity_settings::validate_relay_urls(relays_one)
+            .expect("one relay is valid");
         assert_eq!(validated_one.len(), 1);
 
         // --- Simulate remove of the LAST relay → validate_relay_urls must error ---
-        let result = crate::pkarr_settings::validate_relay_urls(vec![]);
+        let result = crate::connectivity_settings::validate_relay_urls(vec![]);
         assert!(
             result.is_err(),
             "remove-last: empty list is rejected by validator"
@@ -49972,20 +50431,20 @@ mod friend_ipc_tests {
     #[test]
     fn effective_pkarr_relays_empty_persisted_resolves_to_defaults() {
         // FIX 1 (ZEB-380): effective_pkarr_relays() on an empty persisted list
-        // must return default_relays(), not [].  Simulates a fresh install where
+        // must return default_pkarr_relays(), not [].  Simulates a fresh install where
         // the settings file has no relays written yet — the live pool is the
         // defaults, so add/remove must operate on that set, not [].
-        let defaults = crate::pkarr_settings::default_relays();
+        let defaults = crate::connectivity_settings::default_pkarr_relays();
         assert!(
             !defaults.is_empty(),
-            "precondition: default_relays() is non-empty"
+            "precondition: default_pkarr_relays() is non-empty"
         );
 
         // Empty persisted list → defaults.
         let effective = effective_pkarr_relays(vec![]);
         assert_eq!(
             effective, defaults,
-            "empty persisted resolves to default_relays()"
+            "empty persisted resolves to default_pkarr_relays()"
         );
 
         // Simulate add on a fresh install (empty file) — result must be
@@ -49994,7 +50453,7 @@ mod friend_ipc_tests {
         let mut relays = effective_pkarr_relays(vec![]);
         relays.push(new_url.clone());
         let validated =
-            crate::pkarr_settings::validate_relay_urls(relays).expect("valid after add");
+            crate::connectivity_settings::validate_relay_urls(relays).expect("valid after add");
         assert!(
             validated.contains(&new_url),
             "add on fresh install: new URL present"
@@ -50014,13 +50473,14 @@ mod friend_ipc_tests {
         // Persist + reload: a settings file with an empty relays array (e.g.
         // produced by a bug or hand-editing) should also resolve to defaults.
         // `load_or_default` on a MISSING file returns the struct Default (which
-        // itself contains default_relays()), so to get an empty list we must
+        // itself contains default_pkarr_relays()), so to get an empty list we must
         // explicitly write `{"relays":[]}` — the serde field default only fills
         // in ABSENT keys, not empty arrays.
         let td = tempfile::TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
         std::fs::write(&path, r#"{"relays":[]}"#).expect("write empty relays file");
-        let from_file = crate::pkarr_settings::PkarrSettings::load_or_default(&path).relays;
+        let from_file =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path).relays;
         assert!(
             from_file.is_empty(),
             "explicitly-written empty relays parses as []"
@@ -50028,7 +50488,7 @@ mod friend_ipc_tests {
         let effective_from_file = effective_pkarr_relays(from_file);
         assert_eq!(
             effective_from_file, defaults,
-            "effective from empty-relays file == default_relays()"
+            "effective from empty-relays file == default_pkarr_relays()"
         );
     }
 
@@ -50056,8 +50516,8 @@ mod friend_ipc_tests {
         let all_bad = effective_pkarr_relays(vec!["garbage".into(), "ftp://x".into()]);
         assert_eq!(
             all_bad,
-            crate::pkarr_settings::default_relays(),
-            "all-invalid persisted list resolves to default_relays()"
+            crate::connectivity_settings::default_pkarr_relays(),
+            "all-invalid persisted list resolves to default_pkarr_relays()"
         );
     }
 
@@ -50105,7 +50565,10 @@ mod friend_ipc_tests {
             .into_iter()
             .map(|h| h.url)
             .collect();
-        assert_eq!(urls_empty, crate::pkarr_settings::default_relays());
+        assert_eq!(
+            urls_empty,
+            crate::connectivity_settings::default_pkarr_relays()
+        );
 
         // No resolvable path (degraded) → defaults, not an empty panel.
         let snap_none = PersistedRelaySnapshot {
@@ -50116,7 +50579,10 @@ mod friend_ipc_tests {
             .into_iter()
             .map(|h| h.url)
             .collect();
-        assert_eq!(urls_none, crate::pkarr_settings::default_relays());
+        assert_eq!(
+            urls_none,
+            crate::connectivity_settings::default_pkarr_relays()
+        );
     }
 
     #[test]
@@ -50174,14 +50640,20 @@ mod friend_ipc_tests {
             .into_iter()
             .map(|w| w.url)
             .collect();
-        assert_eq!(urls_empty, crate::pkarr_settings::default_relays());
+        assert_eq!(
+            urls_empty,
+            crate::connectivity_settings::default_pkarr_relays()
+        );
 
         // No client + no resolvable path → defaults.
         let urls_none: Vec<String> = relay_health_wires(None, None)
             .into_iter()
             .map(|w| w.url)
             .collect();
-        assert_eq!(urls_none, crate::pkarr_settings::default_relays());
+        assert_eq!(
+            urls_none,
+            crate::connectivity_settings::default_pkarr_relays()
+        );
     }
 
     #[test]
@@ -50521,7 +50993,7 @@ pub(crate) async fn network_health_snapshot_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.network_health.clone(),
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
             g.pkarr_relay_client.clone(),
             // ZEB-450: surface a boot-time transport failure to the UI.
             g.transport_disabled_reason.clone(),
@@ -50605,7 +51077,7 @@ pub(crate) async fn network_health_run_self_test_impl(
             g.pkarr_relay_client.clone(),
             g.dm_identity_pub_64,
             g.pkarr_publisher.clone(),
-            g.pkarr_settings_path.clone(),
+            g.connectivity_settings_path.clone(),
         )
     };
 
@@ -50634,7 +51106,7 @@ pub(crate) async fn network_health_run_self_test_impl(
     // runtime worker during a user-triggered self-test.
     let discoverable = match settings_path {
         Some(p) => tokio::task::spawn_blocking(move || {
-            pkarr_settings::PkarrSettings::load_or_default(&p).identity_discoverable
+            connectivity_settings::ConnectivitySettings::load_or_default(&p).identity_discoverable
         })
         .await
         .unwrap_or(false),
@@ -51589,6 +52061,12 @@ pub fn run() {
             reset_pkarr_relays,
             add_pkarr_relay,
             remove_pkarr_relay,
+            // ZEB-624: iroh transport relay configuration IPCs.
+            get_iroh_relays,
+            set_iroh_relays,
+            add_iroh_relay,
+            remove_iroh_relay,
+            reset_iroh_relays,
             // ZEB-417 SP1: owner-private Notes IPCs.
             notes_commands::notes_list,
             notes_commands::notes_upsert,
@@ -51685,6 +52163,12 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         reset_pkarr_relays,
         add_pkarr_relay,
         remove_pkarr_relay,
+        // ZEB-624: iroh transport relay configuration IPCs.
+        get_iroh_relays,
+        set_iroh_relays,
+        add_iroh_relay,
+        remove_iroh_relay,
+        reset_iroh_relays,
     ])
 }
 
@@ -54015,12 +54499,12 @@ mod channel_message_ipc_tests {
         let path = td.path().join("connectivity-settings.json");
         persist_presence_visibility(&path, false).expect("persist invisible");
         assert!(
-            pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible,
+            connectivity_settings::ConnectivitySettings::load_or_default(&path).presence_invisible,
             "visible=false must persist presence_invisible=true"
         );
         persist_presence_visibility(&path, true).expect("persist visible");
         assert!(
-            !pkarr_settings::PkarrSettings::load_or_default(&path).presence_invisible,
+            !connectivity_settings::ConnectivitySettings::load_or_default(&path).presence_invisible,
             "visible=true must persist presence_invisible=false"
         );
     }
@@ -56315,6 +56799,9 @@ mod start_node_race_tests {
             dm_local_kem_pubkey: None,
             dm_pq_identity: None,
             tunnel_manager: None,
+            protocol_compat: std::sync::Arc::new(
+                crate::protocol_versioning::ProtocolCompatRegistry::default(),
+            ),
             community_adapter_request_tx: None,
             transport_epoch_rx: None,
             voting_log_adapter_request_tx: None,
@@ -56418,7 +56905,7 @@ mod start_node_race_tests {
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
             pkarr_community_publisher: None,
-            pkarr_settings_path: None,
+            connectivity_settings_path: None,
             pkarr_publisher_handle: None,
             // ZEB-329: race-test NodeStates never wire the network
             // health service — set to None.
