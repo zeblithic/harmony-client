@@ -321,11 +321,18 @@ impl SupervisorHandle {
     /// slot in ANY state — a departed peer must never be dialed again, and
     /// Dormant slots otherwise persist for process life (unbounded over
     /// long-session peer churn). Also drops the peer's pending dirty entry so
-    /// a pre-eviction kick can't immediately resurrect the slot. A LATER kick
-    /// (e.g. the departing conn's final drop-watcher `Dropped`) recreates a
-    /// fresh slot that resolve-misses ladder to Dormant — a bounded, transient
-    /// tail, accepted by design (spec §2). Non-async and sync-context-safe,
-    /// like every other handle method.
+    /// a pre-eviction kick can't immediately resurrect the slot.
+    ///
+    /// KNOWN RESIDUAL (final review 2026-07-04): a LATER kick — in particular
+    /// the departing conn's drop-watcher `Dropped`, which fires whenever the
+    /// peer was still connected at departure (the common case: a member must
+    /// be online to publish Leave) — recreates a fresh slot that resolve-
+    /// misses ladder to Dormant, where it parks for process life. Eviction
+    /// therefore bounds churn growth to the departed-while-connected subset
+    /// rather than eliminating it. Closing it fully needs a membership
+    /// consult at slot-creation or a periodic record-less-Dormant sweep —
+    /// tracked as ZEB-634. Non-async and sync-context-safe, like every other
+    /// handle method.
     pub fn evict_peer(&self, peer: [u8; 32]) {
         {
             let mut dirty = self.inner.dirty.lock().expect("dirty lock");

@@ -85,6 +85,20 @@ resolve-misses ladder to Dormant. That is today's steady-state behavior for
 teardown, not a permanent leak. Not worth suppressing (would require kick-time
 resolver consultation on a hot path).
 
+**Correction (final review, 2026-07-04):** the "not a permanent leak" phrasing
+above is wrong for the COMMON departure mode. A member must be online to
+publish Leave, so the drop-watcher `Dropped` kick fires for most departures,
+and the recreated slot parks in Dormant for process life (nothing removes
+Dormant slots). Eviction therefore bounds churn growth to roughly one parked
+slot per departed-while-connected peer — a real reduction, not elimination.
+Full closure (membership consult at slot-creation, or a periodic sweep of
+record-less Dormant slots) is tracked as **ZEB-634**, together with two
+adjacent edges from the same review: `remove_owner`'s community-blindness now
+extends to eviction (leaving community A evicts a peer still shared via B —
+self-heals via `NewPeer` on B's next announce at the cost of one redundant
+dial and a lost `ever_connected` bit), and the `n > 0` gate means a peer with
+a supervisor slot but zero resolver records is never evicted by this path.
+
 **Tests** (unit style: `#[tokio::test(start_paused = true)]` + `RecordingDialer` +
 `seed`, per the existing module): evict removes the slot (counts before/after);
 evicting an unknown peer is a no-op; a post-eviction `Dropped` kick recreates a

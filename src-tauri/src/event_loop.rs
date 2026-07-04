@@ -751,7 +751,14 @@ impl ZidNodeCache {
         if let Some(cached) = self.map.get(zid) {
             return *cached;
         }
-        self.map = rebuild().into_iter().map(|(k, v)| (k, Some(v))).collect();
+        // EXTEND, don't replace: at a stable generation the resolver view is
+        // immutable (any add/remove bumps the generation), so previously
+        // cached entries AND tombstones for OTHER zids are still valid —
+        // replacing the map would discard those tombstones and re-pay the
+        // O(active_peers) rebuild for every interleaved non-peer session
+        // (final-review finding, 2026-07-04).
+        self.map
+            .extend(rebuild().into_iter().map(|(k, v)| (k, Some(v))));
         let hit = self.map.get(zid).copied().flatten();
         if hit.is_none() {
             self.map.insert(zid.to_string(), None); // tombstone
@@ -809,6 +816,31 @@ mod zid_node_cache_tests {
             rebuilds.get(),
             1,
             "unknown zid rebuilds once per generation, then tombstones"
+        );
+    }
+
+    #[test]
+    fn interleaved_ghosts_keep_each_others_tombstones() {
+        // Final-review finding (2026-07-04): a rebuild must EXTEND the map,
+        // not replace it — replacement dropped same-generation tombstones for
+        // other zids, so two interleaved non-peer sessions re-paid the full
+        // rebuild on every event.
+        let mut c = ZidNodeCache::new();
+        let rebuilds = Cell::new(0);
+        let mut probe = |zid: &str| {
+            c.lookup(zid, 7, || {
+                rebuilds.set(rebuilds.get() + 1);
+                view(&[])
+            })
+        };
+        for _ in 0..3 {
+            assert_eq!(probe("ghost-a"), None);
+            assert_eq!(probe("ghost-b"), None);
+        }
+        assert_eq!(
+            rebuilds.get(),
+            2,
+            "one rebuild per distinct ghost per generation, not per event"
         );
     }
 
