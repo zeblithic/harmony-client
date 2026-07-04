@@ -81,9 +81,9 @@ impl PendingDmInvites {
 mod tests {
     use super::*;
 
-    // Build a minimal DmInviteSigned fixture. Reuse the field layout from
-    // dm_envelope.rs:67-115; values are arbitrary but self-consistent
-    // (inviter ∈ members not required here — store logic is gate-agnostic).
+    // Build a minimal StagedDmInvite around the shared test fixture
+    // (dm_envelope::test_fixtures::minimal_invite_for_space — store logic
+    // is gate-agnostic; the fixture's field consistency is its own concern).
     fn staged(space: u8, ms: u64) -> StagedDmInvite {
         StagedDmInvite {
             signed: crate::dm_envelope::test_fixtures::minimal_invite_for_space(space),
@@ -121,7 +121,7 @@ mod tests {
         assert!(store.stage(staged(3, 100)));
         let sid = store.list()[0].signed.space_id;
         store.take(&sid); // decline consumes
-        // The next ZEB-483 redelivery re-stages (spec: repeat invites re-prompt).
+                          // The next ZEB-483 redelivery re-stages (spec: repeat invites re-prompt).
         assert!(store.stage(staged(3, 200)));
         assert_eq!(store.list()[0].received_at_ms, 200);
     }
