@@ -169,18 +169,24 @@ setup_nodes() {
   # key over pkarr, so case-B publish must be on before the invite is minted.
   local_api  connectivity_set_identity_discoverable '{"enabled": true}' > /dev/null
   remote_api connectivity_set_identity_discoverable '{"enabled": true}' > /dev/null
-  # GATE on the inviter's identity record actually landing: a RUNTIME
-  # discoverable-enable waits for the publisher's ~7.5min tick (measured live:
-  # first publish 4m49s after enable, 2026-07-04) — redeem retries alone
-  # cannot absorb that. identityPublished + identityLastPublishMs are real
-  # (post-ZEB-511) and flip only when the identity record publish succeeded.
-  identity_published() {
+  # GATE on a FRESH identity publish from THIS local process before anything
+  # mints an invite. Two live-measured traps (2026-07-04) make this load-bearing:
+  #   1. identityLastPublishMs PERSISTS across restarts — a stale value passes a
+  #      null-check gate ~5s after boot while the real boot publish lands ~70s in
+  #      (runtime-enable is worse: up to the ~7.5min publisher tick, 4m49s seen).
+  #   2. A redeem attempted BEFORE the current process's record is on the relay
+  #      poisons the remote's retry loop for minutes (resolver-side caching/
+  #      cooldown) — whereas publish-first joined on the FIRST attempt, twice.
+  identity_published_since() { # side floor_ms
     api_of "$1" network_health_snapshot | \
-      jq -e '.pkarrStatus | select(.identityPublished == true and .identityLastPublishMs != null)' > /dev/null
+      jq -e --argjson floor "$2" \
+        '.pkarrStatus | select(.identityPublished == true and (.identityLastPublishMs // 0) >= $floor)' > /dev/null
   }
-  log "waiting for local identity pkarr publish (first runtime-enabled publish can wait for the ~7.5min tick)…"
-  poll 600 15 "local identity pkarr publish" identity_published local || die "local identity record never published"
-  log "local identity record published — inviter is resolvable"
+  local gate_start_ms=$(( $(date +%s) * 1000 ))
+  log "waiting for a fresh local identity pkarr publish (boot publish ≈70s; runtime-enable can wait for the ~7.5min tick)…"
+  poll 600 10 "fresh local identity pkarr publish" identity_published_since local "$gate_start_ms" \
+    || die "local identity record never published after script start"
+  log "local identity record freshly published — inviter is resolvable"
 }
 
 # ---- T1: first-contact + community ----------------------------------------
