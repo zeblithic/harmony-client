@@ -12384,7 +12384,7 @@ mod add_space_tunnel_routing_tests {
     async fn test_manager() -> StdArc<TunnelManager> {
         let endpoint = {
             let sk = iroh::SecretKey::generate();
-            crate::iroh_endpoint::IrohEndpoint::new_with_secret(sk)
+            crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
                 .await
                 .expect("bind loopback iroh endpoint")
         };

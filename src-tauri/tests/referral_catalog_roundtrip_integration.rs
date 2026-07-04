@@ -59,10 +59,11 @@ use zenoh_link::LinkUnicast;
 /// rather than masking a real wiring bug behind a too-tight deadline.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 // ZEB-626: back to the pre-ZEB-619 90s. The "drain teardown" that forced
-// 180s was actually two SystemConfiguration XPC stalls at first bind
-// (netdev CoreWLAN + eager system-DNS read), removed at the source
-// (vendor/netdev + hermetic_dns_resolver); this test now runs in ~0.06s
-// isolated, so 90s is >1000x headroom without weakening any assertion.
+// 180s was actually two synchronous macOS XPC stalls at first bind
+// (netdev's CoreWLAN->wifid query + iroh's eager SystemConfiguration/
+// configd DNS read), removed at the source (vendor/netdev +
+// hermetic_dns_resolver); this test now runs in ~0.06s isolated, so 90s
+// is >1000x headroom without weakening any assertion.
 const OUTER_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Build a hermetic SERVER iroh endpoint (the `IrohEndpoint` wrapper the link

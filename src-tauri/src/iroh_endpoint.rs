@@ -513,17 +513,19 @@ fn load_or_create_secret_key_inner(
 /// process ahead of tests that assert tight timeouts.
 ///
 /// History: the first `iroh::Endpoint::bind()` in a process used to stall
-/// ~10s on CI and ~30-66s on macOS (~76s under heavy local parallelism).
-/// ZEB-626's diagnosis (2026-07-04) showed that was never a process-global
-/// iroh init OR teardown: netwatch's interface enumeration (the `netdev`
-/// crate) queried each wireless interface's transmit rate via CoreWLAN
-/// (sync XPC into `wifid`, ~44s), and iroh's eagerly-built system DNS
-/// resolver read macOS DNS config via `SCDynamicStoreCreateWithOptions`
+/// ~30-66s on macOS (~76s under heavy local parallelism; a separate ~10s
+/// was once observed on ubuntu CI with a different, never-pinned cause).
+/// ZEB-626's diagnosis (2026-07-04) showed the macOS stall was never a
+/// process-global iroh init OR teardown: netwatch's interface enumeration
+/// (the `netdev` crate) queried each wireless interface's transmit rate via
+/// CoreWLAN (sync XPC into `wifid`, ~44s), and iroh's eagerly-built system
+/// DNS resolver read macOS DNS config via `SCDynamicStoreCreateWithOptions`
 /// (sync XPC into `configd`, ~22s) — both stalled for unentitled processes
-/// (every test binary). Both are gone: the vendored netdev patch
-/// (vendor/netdev) removes the CoreWLAN query, and hermetic tests inject
-/// [`hermetic_dns_resolver`] to skip the system-conf read. Post-fix, a
-/// single-endpoint bind+close test measures ~0.06s (was 66.0s).
+/// (every test binary). Both are gone from the test suite: the vendored
+/// netdev patch (vendor/netdev) removes the CoreWLAN query, and every
+/// endpoint-binding test path injects [`hermetic_dns_resolver`] to skip
+/// the system-conf read. Post-fix, a single-endpoint bind+close test
+/// measures ~0.06s (was 66.0s).
 ///
 /// `cargo nextest` runs each test in its own process, so any residual
 /// per-process first-bind cost (crypto-provider init, netmon route-socket
@@ -738,18 +740,29 @@ mod tests {
 
     /// ZEB-626 patch-presence tripwire. The vendored netdev
     /// (vendor/netdev/README.zeblithic.md) must never compute
-    /// transmit_speed on macOS: the upstream implementation stalls
-    /// ~60s/process in a synchronous CoreWLAN->wifid XPC call, paid inside
-    /// the first Endpoint::bind() of every process via netwatch. If this
+    /// transmit_speed for WIRELESS interfaces on macOS: the upstream
+    /// implementation fills it via a synchronous CoreWLAN->wifid XPC call
+    /// (~44s/process for unentitled callers), paid inside the first
+    /// Endpoint::bind() of every process via netwatch. Wired interfaces
+    /// legitimately get a link speed from the shared unix SIOCGIFXMEDIA
+    /// path (vendor/netdev/src/os/unix/link_speed.rs) — the patch leaves
+    /// that untouched, so the assertion is scoped to Wireless80211. If this
     /// fails, an unpatched netdev re-entered the graph (likely a
-    /// netwatch/iroh bump) — refresh vendor/netdev per its README.
+    /// netwatch/iroh bump) — refresh vendor/netdev per its README. (On a
+    /// Mac with no WiFi interface this passes vacuously; real dev machines
+    /// have one.)
     #[test]
     #[cfg(target_os = "macos")]
     fn vendored_netdev_never_computes_transmit_speed_on_macos() {
+        use netdev::prelude::InterfaceType;
         for iface in netdev::interface::get_interfaces() {
+            if iface.if_type != InterfaceType::Wireless80211 {
+                continue;
+            }
             assert!(
                 iface.transmit_speed.is_none(),
-                "interface {} has transmit_speed {:?} — unpatched netdev in the graph (ZEB-626)",
+                "wireless interface {} has transmit_speed {:?} — unpatched netdev \
+                 (CoreWLAN query) back in the graph (ZEB-626)",
                 iface.name,
                 iface.transmit_speed
             );

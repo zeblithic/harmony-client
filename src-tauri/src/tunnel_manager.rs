@@ -725,7 +725,7 @@ mod tests {
     fn test_endpoint_and_pq() -> (IrohEndpoint, Arc<PqPrivateIdentity>) {
         let endpoint = futures::executor::block_on(async {
             let sk = iroh::SecretKey::generate();
-            crate::iroh_endpoint::IrohEndpoint::new_with_secret(sk)
+            crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
                 .await
                 .expect("bind loopback iroh endpoint")
         });

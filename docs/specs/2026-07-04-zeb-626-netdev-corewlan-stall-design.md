@@ -86,9 +86,12 @@ copy by the patch) so the guard test in 2.4 can call it directly.
 ### 2.4 Guard test (patch-presence tripwire)
 
 A `#[cfg(target_os = "macos")]` unit test in `src-tauri/src/iroh_endpoint.rs`'s test module:
-enumerate interfaces via `netdev::get_interfaces()` and assert every interface has
-`transmit_speed.is_none()`. Deterministic (no wall-clock assertion): if a future dependency bump
-silently swaps in an unpatched netdev, this fails on any macOS dev machine instead of the suite
+enumerate interfaces via `netdev::interface::get_interfaces()` and assert every **Wireless80211**
+interface has `transmit_speed.is_none()`. (Scoped to wireless — final review correction: wired
+links legitimately get a `transmit_speed` from netdev's shared unix SIOCGIFXMEDIA path, which the
+patch deliberately leaves untouched; an all-interfaces assertion would false-fail on any docked
+Mac.) Deterministic (no wall-clock assertion): if a future dependency bump silently swaps in an
+unpatched netdev, this fails on any macOS machine with a WiFi interface instead of the suite
 re-bloating quietly. On Linux/CI the test does not exist (cfg-gated); CI's guard is the rust-test
 job duration itself.
 

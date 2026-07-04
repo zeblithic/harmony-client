@@ -27,8 +27,9 @@
 # (Historical) ZEB-619 added an `iroh-endpoint` test-group (max-threads 4)
 # here to contain what looked like iroh 1.0 Drop-drain teardown contention
 # (~330-360s/test plateau). ZEB-626's diagnosis showed the real cause was
-# two synchronous SystemConfiguration XPC stalls at first bind (netdev's
-# CoreWLAN wifi-rate query + iroh's eager system-DNS-config read), both
-# fixed at the source (vendor/netdev + hermetic_dns_resolver), so the cap
-# was removed. If endpoint-heavy tests ever plateau again, sample a test
-# process mid-run BEFORE re-adding concurrency caps (ZEB-626 method).
+# two synchronous macOS XPC stalls at first bind (netdev's CoreWLAN->wifid
+# wifi-rate query + iroh's eager SystemConfiguration/configd DNS-config
+# read), both fixed at the source (vendor/netdev + hermetic_dns_resolver),
+# so the cap was removed. If endpoint-heavy tests ever plateau again,
+# sample a test process mid-run BEFORE re-adding concurrency caps
+# (ZEB-626 method).
