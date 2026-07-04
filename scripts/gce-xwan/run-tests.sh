@@ -130,6 +130,18 @@ poll() { # seconds interval description command...
   return 1
 }
 
+# Verbs that mint things return a BARE JSON string (see e2e-harness driver.rs
+# `as_str`); tolerate both shapes.
+id_of() { jq -r 'if type == "string" then . else (.communityId // .channelId // .spaceId // .id // .url // empty) end'; }
+
+# DM/channel payloads travel as BYTE ARRAYS (`Vec<u8>` DTOs) and read back as
+# HEX-encoded `body` strings (driver.rs read_dm_plaintext) — a plain-string
+# send is a 400, and a plain grep on the read is a silent timeout.
+payload_json() { # key1 val1 msg → {"key1":"val1","content":bytes,"mimeType":"text/plain"}
+  jq -nc --arg k "$1" --arg v "$2" --arg s "$3" '{($k): $v, "content": ($s | explode), "mimeType": "text/plain"}'
+}
+to_hex() { printf '%s' "$1" | xxd -p -c 9999; }
+
 # ---- identity + discoverability -------------------------------------------
 
 ensure_identity() { # local|remote → echoes ownerId
@@ -166,9 +178,9 @@ t1_first_contact() {
   log "T1: create community + invite (local) → redeem over iroh (remote) → roster convergence"
   local cname cid url out status
   cname="xwan-t1-$(date +%s)"
-  cid="$(local_api create_community "{\"name\": \"$cname\", \"isInviteOnly\": true}" | jq -r '.communityId // .id // empty')"
+  cid="$(local_api create_community "{\"name\": \"$cname\", \"isInviteOnly\": true}" | id_of)"
   [ -n "$cid" ] || die "T1: create_community returned no id"
-  url="$(local_api generate_invite "{\"communityId\": \"$cid\"}" | jq -r 'if type == "string" then . else (.url // empty) end')"
+  url="$(local_api generate_invite "{\"communityId\": \"$cid\"}" | id_of)"
   [ -n "$url" ] || die "T1: generate_invite returned no url"
   log "T1: communityId=$cid — redeeming from GCE node (retries absorb pkarr warm-up)…"
 
@@ -198,7 +210,7 @@ t1_first_contact() {
 t2_friend_dm_direct() {
   log "T2: friend-token (remote→local) → DM both directions → direct-path assert"
   local url space msg_a msg_b
-  url="$(remote_api generate_friend_token | jq -r 'if type == "string" then . else (.url // empty) end')"
+  url="$(remote_api generate_friend_token | id_of)"
   [ -n "$url" ] || die "T2: generate_friend_token returned no url"
   local_api redeem_friend_token "{\"url\": \"$url\"}" > "$ARTIFACTS/t2-redeem-token.json"
 
@@ -219,18 +231,18 @@ t2_friend_dm_direct() {
   }
   log "T2: friendship active"
 
-  space="$(local_api add_space "{\"kind\": \"dm\", \"name\": \"xwan-dm\", \"members\": [\"$REMOTE_OWNER\"]}" | jq -r '.spaceId // .id // empty')"
+  space="$(local_api add_space "{\"kind\": \"dm\", \"name\": \"xwan-dm\", \"members\": [\"$REMOTE_OWNER\"]}" | id_of)"
   [ -n "$space" ] || die "T2: add_space returned no spaceId"
   msg_a="ping-from-koya-$(date +%s)"
-  local_api send_dm "{\"spaceId\": \"$space\", \"content\": \"$msg_a\", \"mimeType\": \"text/plain\"}" > /dev/null
+  local_api send_dm "$(payload_json spaceId "$space" "$msg_a")" > /dev/null
 
-  remote_sees() { remote_api read_dm_thread "{\"spaceId\": \"$space\", \"limit\": 100}" | grep -q "$msg_a"; }
+  remote_sees() { remote_api read_dm_thread "{\"spaceId\": \"$space\", \"limit\": 100}" | grep -q "$(to_hex "$msg_a")"; }
   poll 240 10 "T2 DM local→remote" remote_sees || { echo "FAIL T2 (mode=$MODE_WANT): DM local→remote never arrived"; return 1; }
   log "T2: DM local→remote delivered"
 
   msg_b="pong-from-gce-$(date +%s)"
-  remote_api send_dm "{\"spaceId\": \"$space\", \"content\": \"$msg_b\", \"mimeType\": \"text/plain\"}" > /dev/null
-  local_sees() { local_api read_dm_thread "{\"spaceId\": \"$space\", \"limit\": 100}" | grep -q "$msg_b"; }
+  remote_api send_dm "$(payload_json spaceId "$space" "$msg_b")" > /dev/null
+  local_sees() { local_api read_dm_thread "{\"spaceId\": \"$space\", \"limit\": 100}" | grep -q "$(to_hex "$msg_b")"; }
   poll 240 10 "T2 DM remote→local" local_sees || { echo "FAIL T2 (mode=$MODE_WANT): DM remote→local never arrived"; return 1; }
   log "T2: DM remote→local delivered"
 
@@ -257,17 +269,22 @@ t3_restart_backfill() {
   [ -n "${T1_COMMUNITY_ID:-}" ] || die "T3 needs T1's community — run --test all"
   log "T3: channel + offline messages → remote restart → catch-up"
   local cid="$T1_COMMUNITY_ID" chan m1 m2
-  chan="$(local_api create_channel "{\"communityId\": \"$cid\", \"name\": \"xwan-t3\", \"writePower\": 0}" | jq -r '.channelId // .id // empty')"
+  chan="$(local_api create_channel "{\"communityId\": \"$cid\", \"name\": \"xwan-t3\", \"writePower\": 0}" | id_of)"
   [ -n "$chan" ] || die "T3: create_channel returned no channelId"
 
+  post_body() { # msg
+    jq -nc --arg cid "$cid" --arg ch "$chan" --arg s "$1" \
+      '{"communityId": $cid, "channelId": $ch, "body": ($s | explode)}'
+  }
   stop_remote
   m1="offline-msg-1-$(date +%s)"; m2="offline-msg-2-$(date +%s)"
-  local_api post_channel_message "{\"communityId\": \"$cid\", \"channelId\": \"$chan\", \"body\": \"$m1\"}" > /dev/null
-  local_api post_channel_message "{\"communityId\": \"$cid\", \"channelId\": \"$chan\", \"body\": \"$m2\"}" > /dev/null
+  local_api post_channel_message "$(post_body "$m1")" > /dev/null
+  local_api post_channel_message "$(post_body "$m2")" > /dev/null
   start_remote
 
   caught_up() {
-    remote_api list_channel_messages "{\"communityId\": \"$cid\", \"channelId\": \"$chan\", \"limit\": 100}" | grep -q "$m2"
+    # Body may read back hex-encoded (DM-read convention) or raw — accept either.
+    remote_api list_channel_messages "{\"communityId\": \"$cid\", \"channelId\": \"$chan\", \"limit\": 100}" | grep -q -e "$(to_hex "$m2")" -e "$m2"
   }
   poll 300 10 "T3 backfill catch-up" caught_up || { echo "FAIL T3 (mode=$MODE_WANT): remote never caught up"; return 1; }
   echo "PASS T3 (mode=$MODE_WANT): remote caught up on offline channel messages"
