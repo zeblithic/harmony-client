@@ -16,7 +16,7 @@ both firewall modes, restart backfill) against the GCE node. The fleet is the
 last thing running the old wire, and it is one accidental restart away from an
 *uncoordinated* flag-day (see below).
 
-## Current fleet state (Koya verified live 2026-07-04; others self-report in Phase 0)
+## Fleet state going INTO the 2026-07-04 window (historical; outcome below)
 
 | Machine | Profile | Owner ID | Node today |
 |---|---|---|---|
@@ -57,13 +57,28 @@ tree**, logging to a stable path, with its exact start command recorded here.
 
    (Windows: same shape under `/c/zeblith/work/fleet-bin/`, `certutil -hashfile
    … SHA256` or `sha256sum` in Git Bash.)
-3. Record the **current** node's full command line and its env/secret source
-   (`ps aux | grep [h]armony` / `Get-Process`), and post it to ZEB-636. Koya's
-   keys are macOS-keychain-backed (no file vault in the profile dir ⇒ no
-   passphrase env needed at restart; the GUI session must be logged in).
-   Windows nodes: confirm whether the profile uses keychain or the ZEB-449
-   file vault — if file vault, the restart command MUST carry the same
-   `HARMONY_PASSPHRASE_FILE`.
+3. Record the **current** node's full command line (`ps aux | grep [h]armony`
+   / `Get-Process`), and post it to ZEB-636. Then verify the secret source
+   **from the vault layout, not from process inspection** — `ps` and
+   `Win32_Process` do not show environment variables, and on 2026-07-04 both
+   machines that inferred "keychain-backed, no env needed" from them were
+   wrong. Every named profile REQUIRES a vault passphrase at start (ZEB-446
+   fail-fast: `serve` exits 1 without one; the OS keychain is refused for
+   named profiles). Check directly:
+
+   ```bash
+   # The ZEB-449 vault set — expect identity.enc, iroh_sk.enc, device_sk.enc,
+   # master_seed.enc (the verified layout on all 2026-07-04 fleet nodes). A
+   # legacy identity.key may show up in old boot-log lines as the resolved
+   # identity path; it is NOT required on disk and its absence is normal.
+   ls ~/.harmony/profiles/<fleet-profile>/*.enc
+   ls ~/.harmony-<fleet-profile>-pass             # its passphrase, minted alongside
+   ```
+
+   The restart command must carry `HARMONY_PASSPHRASE_FILE=<that file>`
+   (plus `HARMONY_DISABLE_KEYCHAIN=1`). If the passphrase source cannot be
+   located, HALT before the window — a wrong/missing passphrase cannot boot
+   the existing identity, and minting a fresh one is forbidden (ZEB-477).
 4. Read-only sanity against the running node and record the owner ID — this is
    the value that must SURVIVE the restart:
 
@@ -97,11 +112,23 @@ API_DIR="$HOME/Library/Application Support/net.zeblith.harmony/profiles/fleet-ko
 PID=$(cat "$API_DIR/serve.lock")   # serve mode writes its PID lockfile here
 curl -fsS -X POST -H "Authorization: Bearer $(cat "$API_DIR/token")" \
   "http://127.0.0.1:$(cat "$API_DIR/port")/v1/shutdown" || kill "$PID"
-while kill -0 "$PID" 2>/dev/null; do sleep 1; done
+for _ in $(seq 1 120); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+#    Bounded wait (120 s) — do NOT wait unboundedly. Wedge case (seen live
+#    on Ildwyn, 2026-07-04): a 0.98-era process can accept /v1/shutdown then
+#    hang forever in iroh endpoint teardown (MaxPathIdReached retry loop —
+#    the very bug 1.0 fixes). If the PID is still alive after the bounded
+#    wait and the log shows the shutdown signal was received: confirm the
+#    last state persist in the log, then force-kill — `kill -9 "$PID"` on
+#    macOS/Linux, `taskkill /F /PID <pid>` on Windows (from Git Bash escape
+#    the flags: `taskkill //F //PID <pid>`; Windows refuses a graceful
+#    taskkill on console daemons anyway). State on disk is safe once the
+#    flush logged.
 
-# 2. Start the staged binary — same profile, same port, stable log path.
-#    BIN = the exact staged file you recorded in ZEB-636.
+# 2. Start the staged binary — same profile, same port, stable log path,
+#    and the profile's vault passphrase (ZEB-446 — mandatory for named
+#    profiles). BIN = the exact staged file you recorded in ZEB-636.
 BIN=~/work/fleet-bin/harmony-app-1fb35b72
+export HARMONY_PASSPHRASE_FILE=$HOME/.harmony-fleet-koya-pass HARMONY_DISABLE_KEYCHAIN=1
 nohup "$BIN" --profile fleet-koya serve --api-port 7421 \
   > ~/work/fleet-logs/fleet-koya-serve.log 2>&1 < /dev/null & disown
 
@@ -110,12 +137,15 @@ $BIN --profile fleet-koya api get_owner_state | jq -r .ownerId
 #    → MUST equal the Phase 0 value. If it changed: STOP THE WINDOW, post to
 #      ZEB-636, do NOT mint_owner_identity (ZEB-477 stale-ghost-key lesson).
 $BIN --profile fleet-koya api network_health_snapshot \
-  | jq '{schemaVersion, publish: .pkarrStatus.identityLastPublishMs}'
+  | jq '{schemaVersion, communityPublishCount: .pkarrStatus.communityPublishCount, relays: [.pkarrStatus.relays[] | {url, lastSuccessMs}]}'
 #    → schemaVersion 4 (proves the new build);
-#    → poll until publish >= your restart timestamp. The field
-#      PERSISTS across restarts (ZEB-635 trap) — a non-null stale value is NOT
-#      a fresh publish. Boot publish lands in ≈15–90 s; don't panic-restart
-#      inside that window.
+#    → poll until some relays[].lastSuccessMs >= your restart timestamp AND
+#      communityPublishCount >= 1. Boot publish lands in ≈15–90 s; don't
+#      panic-restart inside that window.
+#    → .pkarrStatus.identityLastPublishMs is PROFILE-DEPENDENT: it only
+#      populates for discoverable identities (fleet-ildwyn yes; fleet-koya
+#      and fleet-avalon stay null). Where it does populate it also PERSISTS
+#      across restarts (ZEB-635 trap) — never treat non-null as fresh.
 ```
 
 Post "up: <machine>, owner unchanged, publish fresh" to ZEB-636 after each
@@ -147,6 +177,30 @@ above, and why the window order matters less than everyone finishing.
 4. Pushover Jake "flag-day complete"; post the closing summary (per-machine
    sha256, owner IDs, validation results) to ZEB-636.
 
+## What the 2026-07-04 window measured (the 0.98 → 1.0 execution)
+
+| Node | Flip (UTC) | API downtime | Notes |
+|---|---|---|---|
+| Koya | 19:24 | ~3 min | ZEB-446 passphrase refusal on first start (harmless, exits pre-state); resolved via `~/.harmony-fleet-koya-pass` |
+| Ildwyn | 19:46 | ~7.5 min | old 0.98 process wedged in endpoint teardown (`MaxPathIdReached`) after accepting `/v1/shutdown`; force-killed after clean-persist check |
+| AVALON | 19:48 | 21 s | textbook |
+
+All three owner IDs and iroh node keys survived; all landed on the stable
+relay cluster with fresh publishes; `protocolIncompatReason: null` fleet-wide.
+
+Two structural findings for future windows:
+
+- **The same-LAN fleet bus does not partition during a mixed-wire window.**
+  Zenoh's plain `tcp/` LAN links are iroh-version-agnostic and kept channel
+  traffic flowing throughout. Corollary: a peer-table `connectionMode:
+  "direct"` on the LAN is NOT evidence a peer is on the new wire.
+- **iroh-wire validation needs an iroh-carried probe.** The 2026-07-04 proof
+  was a friend-token redeem + DM exchange, confirmed by
+  `iroh_friend_acceptor: friend handshake completed` and
+  `iroh_butler_acceptor: butler deposit accepted` lines in the serve log
+  (and a `zenoh … iroh/<node-id>` locator scout for the fork-carried links).
+  The GCE node (`gce-cross-wan-runbook.md`) remains the off-LAN variant.
+
 ## Failure handling — there is no rollback
 
 Crossing the wire boundary is one-way in practice: nothing rebuilds a 0.98
@@ -162,6 +216,10 @@ than improvising identity recovery mid-flight.
 - Fleet nodes run **staged release binaries** from `~/work/fleet-bin/`
   (`/c/zeblith/work/fleet-bin/` on Windows), never from a repo `target/` dir.
 - Logs under `~/work/fleet-logs/`, never `/tmp`.
+- Each fleet profile's vault passphrase file (`~/.harmony-<profile>-pass`,
+  0600, minted alongside the vault) is part of the node's identity — losing
+  it means losing the identity (no recovery path). Ildwyn's inline-env
+  variant is a tracked hygiene follow-up.
 - The start command for each node is recorded in this file and in ZEB-636;
   update both when it changes.
 - `harmony-relay` (production pkarr rendezvous VM) and `harmony-xwan-1` (GCE
