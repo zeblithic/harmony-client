@@ -250,6 +250,24 @@ scheduler starvation; the #396 flake fired at 0.095s). Cost: +4s suite wall-cloc
 If the flake ever recurs at 2s, capture full output (no `tail` pipes) — noted on
 the ticket.
 
+**Addendum (implementation-time diagnosis correction, 2026-07-04):** with full
+output finally captured (25-iteration hunt, reproduced on iteration 6), the
+flake is NOT the redeem timeout at all — both redeem asserts pass; the panic is
+the test's final `registry.shutdown_all().expect("shutdown")` failing with
+`Persist("io: Invalid argument (os error 22)")`. Root cause: the **ZEB-463
+race** (fence-failure rollback's detached `shutdown_engine_and_cleanup_persistence`
+removing the community persistence dir while `shutdown_all` flushes the same
+engine) surfacing with an errno other than ENOENT — macOS/APFS returns EINVAL
+when `write_atomic`'s rename runs against the dying directory, and ZEB-463's
+causal downgrade keys on `NotFound` only. Fix shipped in this bundle:
+`shutdown_flush_lost_race_to_dir_removal` gains a second layer — a plain
+`Persist` failure downgrades iff the community dir is GONE at check time (the
+only removers are intentional discards, so the flush is moot whatever the
+errno); a persist fault with the dir present still propagates (ZEB-460), as
+does everything else. Unit-tested. Validated with a 25-iteration paired-test
+hunt post-fix. The 50ms→2s timeout raise is kept as hygiene (it makes the
+budget≈starvation anti-pattern moot) but was never the mechanism.
+
 ## 8. Verification & delivery
 
 - Gates: `cargo fmt --all -- --check`; clippy CI form

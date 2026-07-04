@@ -2567,12 +2567,16 @@ async fn internal_task(mut ctx: InternalCtx) {
                 // freshly-spawned engine rolled back via
                 // shutdown_engine_and_cleanup_persistence (detached task)
                 // while shutdown_all flushes the SAME engine. The final flush
-                // then fails with Persist(ENOENT) against a directory that is
-                // being intentionally discarded, which is not a durability
-                // failure. Downgrade that one case to Ok; ANY other persist
-                // failure — the dir still exists — still propagates loudly per
-                // ZEB-460.
-                let final_result = if shutdown_flush_lost_race_to_dir_removal(&final_result) {
+                // then fails against a directory that is being intentionally
+                // discarded — ENOENT usually, but other errnos too (ZEB-633
+                // observed EINVAL from a rename against the dying dir). Not a
+                // durability failure either way. Downgrade when the dir is
+                // being discarded; a persist failure with the dir still
+                // present propagates loudly per ZEB-460.
+                let final_result = if shutdown_flush_lost_race_to_dir_removal(
+                    &final_result,
+                    ctx.paths.crdt.parent(),
+                ) {
                         tracing::debug!(
                             community_id = ?ctx.community_id,
                             "community persistence dir removed during shutdown \
@@ -3793,18 +3797,37 @@ fn map_persist_err(e: crate::community_state_persist::PersistError) -> Community
     }
 }
 
-/// ZEB-463: decide whether a graceful-shutdown final-flush failure is the
-/// benign "lost the race with a concurrent rollback that removed this
+/// ZEB-463 + ZEB-633: decide whether a graceful-shutdown final-flush failure
+/// is the benign "lost the race with a concurrent rollback that removed this
 /// community's persistence directory" case.
 ///
-/// CAUSAL: keys on `PersistDirMissing` — the variant `map_persist_err`
-/// produces ONLY when the underlying io error was `NotFound` — rather than a
-/// post-hoc dir-existence heuristic (which Qodo, PR #267, flagged as able to
-/// suppress an unrelated IO fault if the dir happened to vanish after the
-/// error). Every other outcome — `Ok`, a non-persist error, or a real
-/// `Persist` disk fault — returns `false` so it still propagates (ZEB-460).
-fn shutdown_flush_lost_race_to_dir_removal(result: &Result<(), CommunitySyncError>) -> bool {
-    matches!(result, Err(CommunitySyncError::PersistDirMissing(_)))
+/// Two-layer decision:
+///
+/// 1. CAUSAL (ZEB-463): `PersistDirMissing` — the variant `map_persist_err`
+///    produces ONLY when the underlying io error was `NotFound` — is the race
+///    by construction. Always downgraded, no dir check needed.
+/// 2. DIR-GONE (ZEB-633): the same race surfaces as OTHER errnos too —
+///    observed live: `Persist("io: Invalid argument (os error 22)")` when
+///    `write_atomic`'s rename ran against a directory `remove_dir_all` was
+///    concurrently tearing down (macOS/APFS). For a `Persist` failure, if the
+///    community dir is GONE at check time the flush is moot whatever the
+///    errno: the ONLY removers of that dir are intentional discards (rollback
+///    / leave-cleanup), so there is nothing left to be durable into. This is
+///    deliberately narrower than the post-hoc heuristic Qodo flagged on
+///    PR #267 — a `Persist` fault with the dir STILL PRESENT (the real-disk-
+///    fault case ZEB-460 protects) still propagates, as does every non-persist
+///    error and `Ok`.
+fn shutdown_flush_lost_race_to_dir_removal(
+    result: &Result<(), CommunitySyncError>,
+    community_dir: Option<&std::path::Path>,
+) -> bool {
+    match result {
+        Err(CommunitySyncError::PersistDirMissing(_)) => true,
+        Err(CommunitySyncError::Persist(_)) => {
+            matches!(community_dir, Some(dir) if !dir.exists())
+        }
+        _ => false,
+    }
 }
 
 async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
@@ -5584,31 +5607,63 @@ mod tests {
         );
     }
 
-    /// ZEB-463 regression: a graceful-shutdown final flush that fails
-    /// because a concurrent rollback removed the community's persistence
-    /// directory must be treated as a benign no-op (the data is being
-    /// discarded on purpose), while EVERY other failure still propagates.
+    /// ZEB-463 + ZEB-633 regression: a graceful-shutdown final flush that
+    /// fails because a concurrent rollback removed the community's
+    /// persistence directory must be treated as a benign no-op (the data is
+    /// being discarded on purpose), while EVERY other failure still
+    /// propagates.
     ///
     /// The race itself (a `remove_dir_all` interleaving inside
     /// `write_atomic`, which `create_dir_all`s its parent first) is a true
     /// TOCTOU and not deterministically reproducible, so we test the exact
-    /// decision predicate the shutdown arm applies — keyed CAUSALLY on the
-    /// `PersistDirMissing` variant (Qodo PR #267), not a dir-exists heuristic.
+    /// decision predicate the shutdown arm applies: (1) the causal
+    /// `PersistDirMissing` variant (Qodo PR #267) downgrades unconditionally;
+    /// (2) ZEB-633: a plain `Persist` fault downgrades ONLY when the
+    /// community dir is gone at check time (the race surfaced live as EINVAL,
+    /// not ENOENT, on macOS) — with the dir present it still propagates.
     #[test]
-    fn shutdown_flush_dir_removal_predicate_only_downgrades_persist_dir_missing() {
-        // The predicate downgrades ONLY the causal PersistDirMissing variant.
-        assert!(shutdown_flush_lost_race_to_dir_removal(&Err(
-            CommunitySyncError::PersistDirMissing("io: No such file or directory".into())
-        )));
-        // A real persist disk fault (e.g. ENOSPC) must still propagate.
-        assert!(!shutdown_flush_lost_race_to_dir_removal(&Err(
-            CommunitySyncError::Persist("io: disk full".into())
-        )));
+    fn shutdown_flush_dir_removal_predicate_downgrades_race_only() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let existing = td.path().to_path_buf();
+        let missing = td.path().join("removed-by-rollback");
+
+        // (1) The causal PersistDirMissing variant downgrades regardless of
+        // the dir's current state (it may have been racily recreated).
+        assert!(shutdown_flush_lost_race_to_dir_removal(
+            &Err(CommunitySyncError::PersistDirMissing(
+                "io: No such file or directory".into()
+            )),
+            Some(&existing),
+        ));
+        // (2) ZEB-633: a Persist fault with the dir GONE is the same race
+        // wearing a different errno (observed: EINVAL from a rename against
+        // the dying dir) — downgrade.
+        assert!(shutdown_flush_lost_race_to_dir_removal(
+            &Err(CommunitySyncError::Persist(
+                "io: Invalid argument (os error 22)".into()
+            )),
+            Some(&missing),
+        ));
+        // A real persist disk fault (e.g. ENOSPC) with the dir still present
+        // must still propagate (ZEB-460).
+        assert!(!shutdown_flush_lost_race_to_dir_removal(
+            &Err(CommunitySyncError::Persist("io: disk full".into())),
+            Some(&existing),
+        ));
+        // Unknown dir (no parent) is conservative: propagate.
+        assert!(!shutdown_flush_lost_race_to_dir_removal(
+            &Err(CommunitySyncError::Persist("io: disk full".into())),
+            None,
+        ));
         // Success and unrelated errors are never downgraded.
-        assert!(!shutdown_flush_lost_race_to_dir_removal(&Ok(())));
-        assert!(!shutdown_flush_lost_race_to_dir_removal(&Err(
-            CommunitySyncError::TransportClosed
-        )));
+        assert!(!shutdown_flush_lost_race_to_dir_removal(
+            &Ok(()),
+            Some(&missing)
+        ));
+        assert!(!shutdown_flush_lost_race_to_dir_removal(
+            &Err(CommunitySyncError::TransportClosed),
+            Some(&missing),
+        ));
     }
 
     /// ZEB-463 (Qodo PR #267): `map_persist_err` routes ONLY io `NotFound` to
