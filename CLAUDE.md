@@ -177,7 +177,7 @@ a hard bound, not a probability.
 scripts/test-select --context task    # k=4 — per-task gates during iterative dev
 scripts/test-select --context round   # k=2 — PR converge-round re-runs
 scripts/test-select --dry-run         # print selection + commands; no cargo, no counter bump
-scripts/test-select --full            # bypass selection (standard full local command)
+scripts/test-select --full            # bypass selection: CI-parity full sweep (--workspace --all-targets)
 ```
 
 **Use it for:** iterative development gates — per-task test cycles, review-fix

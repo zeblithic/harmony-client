@@ -23,16 +23,21 @@ no expression-length limits.
 
 ## `scripts/test-select` (bash, executable, repo root)
 
-```
+```text
 scripts/test-select [--context task|round] [-k N] [--dry-run] [--full] [--force] [-- extra nextest args]
 ```
 
 - **Contexts → k presets:** `task` → k=4 (SDD per-task gates), `round` → k=2
   (PR converge-round re-runs). `-k N` overrides. `--full` bypasses selection
-  entirely (runs the standard full command) — the escape hatch when a gate
-  MUST be comprehensive.
+  entirely and runs the **CI-parity sweep** (`--workspace --all-targets`) —
+  the escape hatch when a gate MUST be comprehensive, so it must match what
+  CI enforces (a narrower "full" would silently miss bin-target tests).
 - **Round counter:** `.testselect/round` — a git-ignored, per-machine plain
-  integer file. Read → use → increment. Missing file = round 0. Counter is
+  integer file. Read → use → increment, with the WRITE deferred past the
+  deps gate (bot round 1): an invocation that aborts before running any
+  tests must not consume a rotation slot, or the k-round coverage bound
+  erodes across aborted runs. A run that executes and FAILS still consumes
+  its round (any counter value works). Missing file = round 0. Counter is
   shared across contexts deliberately: alternating task/round invocations
   still advance coverage; the k used per invocation only picks the bucket
   count for THAT run (`bucket = (round mod k) + 1`).
@@ -55,8 +60,12 @@ scripts/test-select [--context task|round] [-k N] [--dry-run] [--full] [--force]
   2. sampled pass: `--partition hash:<bucket>/<k>`, with
      `-E 'not (<always-expr>)'` when the always-run set is non-empty (no
      double-running).
-  Script exits non-zero if EITHER pass fails; `set -o pipefail` throughout
-  (pipe exit codes lie).
+  BOTH passes run even when the first fails (a failing always-run pass must
+  not hide the sampled bucket's status — bot round 1); the script exits
+  non-zero if EITHER pass failed. `set -o pipefail` throughout (pipe exit
+  codes lie). When `origin/main` is unavailable, the merge-base falls back
+  to HEAD with a LOUD stderr warning that always-run is degraded to
+  uncommitted changes only (never silently).
 - **Auditability:** before running, print one summary line —
   `round=<r> k=<k> bucket=<b>/<k> always-run=[<terms>|none]` — so task
   reports and converge notes record exactly what was selected. `--dry-run`
