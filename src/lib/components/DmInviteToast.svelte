@@ -80,10 +80,12 @@
 
 <style>
   .dm-invite-toast {
+    /* Positioning constraint: incoming-call toasts own bottom-center
+       (IncomingCallToast.svelte); DM invites own bottom-right so the two
+       surfaces never overlap when both are visible at once. */
     position: fixed;
     bottom: 1rem;
-    left: 50%;
-    transform: translateX(-50%);
+    right: 1rem;
     display: flex;
     align-items: center;
     gap: 0.75rem;

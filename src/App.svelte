@@ -1364,6 +1364,27 @@
   // possibly from another device). Listener set is cleared by
   // dmInviteService.destroy() on unmount.
   dmInviteService.onPendingChanged(() => void refreshDmInviteQueue());
+  // T6 review fix: accept/decline can reject (backend error, stale invite
+  // already actioned on another device, etc.) — surface it via the shared
+  // toast store instead of letting it become an unhandled rejection with no
+  // user feedback. The queue itself is refreshed via onPendingChanged above,
+  // regardless of success/failure, so no optimistic-state cleanup is needed here.
+  async function handleDmInviteAccept(spaceIdHex: string): Promise<void> {
+    try {
+      await dmInviteService.accept(spaceIdHex);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toastStore.show(`DM invite accept failed: ${msg}`);
+    }
+  }
+  async function handleDmInviteDecline(spaceIdHex: string): Promise<void> {
+    try {
+      await dmInviteService.decline(spaceIdHex);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toastStore.show(`DM invite decline failed: ${msg}`);
+    }
+  }
   // ZEB-419: a SECOND MemberCardService dedicated to the Friends panel. It must
   // NOT share the roster instance: subscribeVisible(ids) reconciles to EXACTLY
   // the passed set, so friends + roster would unsubscribe each other. The panel
@@ -2959,8 +2980,8 @@
 {#if dmInviteQueue.length > 0}
   <DmInviteToast
     invite={dmInviteQueue[0]}
-    onAccept={() => dmInviteService.accept(dmInviteQueue[0].spaceIdHex)}
-    onDecline={() => dmInviteService.decline(dmInviteQueue[0].spaceIdHex)}
+    onAccept={() => handleDmInviteAccept(dmInviteQueue[0].spaceIdHex)}
+    onDecline={() => handleDmInviteDecline(dmInviteQueue[0].spaceIdHex)}
     onLater={() => {
       laterDismissed.add(dmInviteQueue[0].spaceIdHex);
       dmInviteQueue = dmInviteQueue.filter((i) => !laterDismissed.has(i.spaceIdHex));
