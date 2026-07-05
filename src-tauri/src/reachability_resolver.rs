@@ -582,14 +582,13 @@ impl ReachabilityResolver {
         });
     }
 
-    /// Evict every device record for `actor`. Called from the membership-
-    /// delta consumer on Leave / Kick events (PR #157 round 5 Cursor
-    /// finding) so departed members don't linger in
-    /// `connectivity_list_peer_reachability` or `resolve_by_node_id`
-    /// until restart bootstrap re-filters them.
-    ///
     /// Remove ALL device records for `actor`, returning the iroh node-ids
-    /// of the removed records. ZEB-643: the decide-and-remove pair executes
+    /// of the removed records. Called from the membership-delta consumer on
+    /// Leave / Kick events (PR #157 round 5 Cursor finding) so departed
+    /// members don't linger in `connectivity_list_peer_reachability` or
+    /// `resolve_by_node_id` until restart bootstrap re-filters them.
+    ///
+    /// ZEB-643: the decide-and-remove pair executes
     /// under a single write-lock hold, so the returned set is the
     /// authoritative deleted set — a concurrent `update` for the same owner
     /// cannot slip a record between a caller's separate capture read and

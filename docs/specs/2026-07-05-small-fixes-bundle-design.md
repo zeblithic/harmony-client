@@ -242,9 +242,19 @@ consumer of `peers[]`.
 - No resolver-level self-skip (see Decision).
 - NAT/relay-RTT enrichment remains iroh-blocked, untouched.
 
----
+### Implementation amendments (task-3 review + final whole-branch review)
 
-## 4. ZEB-625 — kick-vs-floor invariant test pins (test-only)
+- **Third call site (reviewer-adjudicated, Important):** the self-test ping
+  path builds its candidate list through the same filter, so it also
+  threads the self owner — otherwise the node iroh-dials ITSELF during a
+  self-test (the all-zero-node-id guard doesn't catch self; its id is
+  real). Pinned by `self_test_omits_self_owner_from_ping_candidates`.
+- **Documented behavior change (final review):** `derive_reachability_status`
+  derives purely from `peers[]`. Pre-fix, a lone node (joined communities,
+  no other reachable members) always saw `peers = [self@noConnection]` and
+  rendered **Unreachable**; post-filter it sees `peers = []` and renders
+  **Reachable** — the function's documented intent, previously masked by
+  the self row. Correctness-positive; no test pinned the old value.
 
 ### Invariant under pin
 
