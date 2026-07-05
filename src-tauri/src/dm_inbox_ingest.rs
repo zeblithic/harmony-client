@@ -3688,6 +3688,84 @@ mod tests {
             "a new-cid message fires list-changed: {new_frames:?}"
         );
     }
+
+    /// ZEB-641 (1): staging wiring pin for the PROD-INGEST invite-only site
+    /// (`ProdDmInboxIngestCtx::apply_invite_only`, the deposit sweeper's
+    /// ZEB-505 route — the second `ApplyInviteOutcome` match in this file).
+    /// A non-friend invite-only deposit through the real site wiring lands in
+    /// a REAL `PendingDmInvites` and emits both UI events exactly once; an
+    /// identical redelivery (the sweeper re-runs every ~7.5 min while the
+    /// entry stays pending) emits NOTHING further (keep-first at site level).
+    #[tokio::test]
+    async fn apply_invite_only_stages_non_friend_deposited_invite() {
+        let (ctx, pending, sink_handle) = build_non_friend_staging_ctx();
+        // ZEB-505 invite-only deposit: strip the co-deposit down to the bare
+        // invite (mirrors the relay fixture's `invite_only_payload`).
+        let (mut entry, space_id, _cid) = build_staging_co_deposit(b"invite only");
+        entry.cidnotify_packet = None;
+        entry.storage_blob = Vec::new();
+
+        ctx.apply_invite_only(&entry)
+            .await
+            .expect("a staged non-friend invite-only deposit is Ok, not an error");
+
+        // Staging writes nothing to owner-state (Space appears only on accept).
+        {
+            let st = ctx.crdt_state.lock().await;
+            assert!(
+                !st.spaces.contains_key(&space_id),
+                "a staged (non-friend) invite must NOT write the DM Space"
+            );
+        }
+        let staged = pending.list();
+        assert_eq!(staged.len(), 1, "exactly one invite staged");
+        assert_eq!(staged[0].signed.space_id, space_id);
+        assert_eq!(
+            staged[0].source_cid, None,
+            "an invite-only deposit has no notifying message — apply_invite \
+             leaves source_cid None and this site never overwrites it"
+        );
+        assert!(
+            !staged[0].refresh_owner_device_cache,
+            "deposit-recover route is never cache-refresh entitled (ZEB-483)"
+        );
+
+        let frames = sink_handle.frames();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-received")
+                .count(),
+            1,
+            "newly-staged invite prompts exactly once"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-list-changed")
+                .count(),
+            1,
+            "list-changed fires once after staging"
+        );
+
+        // Second identical delivery (sweep re-run): keep-first — no re-stage,
+        // no re-emit.
+        let frames_before = sink_handle.frames().len();
+        ctx.apply_invite_only(&entry)
+            .await
+            .expect("an already-pending redelivery is still Ok");
+        assert_eq!(
+            pending.list().len(),
+            1,
+            "keep-first: the redelivery must not re-stage or duplicate"
+        );
+        assert_eq!(
+            sink_handle.frames().len(),
+            frames_before,
+            "an already-pending redelivery emits neither dm-invite-received \
+             nor dm-invite-list-changed"
+        );
+    }
 }
 
 /// ZEB-473 Task 9: receive-side test fixture for the inbound-tunnel-DM ingest,
