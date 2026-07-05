@@ -471,6 +471,8 @@ pub(crate) async fn ingest_dm_packet(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
+            // Capture for the ZEB-639 ignore log (`signed` moves into apply_invite).
+            let invite_space_id = signed.space_id;
             // Scope the owner-state lock to the `apply_invite` call: the outcome
             // is owned, so we take it out and DROP the guard before staging +
             // emitting (the store `Mutex` + event sink must not nest inside the
@@ -517,6 +519,13 @@ pub(crate) async fn ingest_dm_packet(
                     );
                 }
                 crate::dm_outbox::ApplyInviteOutcome::Accepted => {}
+                // ZEB-639: non-friend invite for a space we already hold — no-op.
+                crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
+                    tracing::debug!(
+                        space_id = ?invite_space_id,
+                        "tunnel invite ignored: space already exists locally (non-friend inviter)"
+                    );
+                }
             }
             return Ok(false);
         }
@@ -920,6 +929,8 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         if signed.inviter.0 != entry.sender_owner {
             return Err("ZEB-505: invite inviter does not match deposit entry sender".into());
         }
+        // Capture for the ZEB-639 ignore log (`signed` moves into apply_invite).
+        let invite_space_id = signed.space_id;
         // Scope the lock to `apply_invite`, then DROP the guard before staging +
         // emitting (store `Mutex` + sink must not nest inside the held lock).
         let outcome = {
@@ -950,6 +961,14 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                 Ok(())
             }
             crate::dm_outbox::ApplyInviteOutcome::Accepted => Ok(()),
+            // ZEB-639: non-friend invite for a space we already hold — no-op.
+            crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
+                tracing::debug!(
+                    space_id = ?invite_space_id,
+                    "deposited invite ignored: space already exists locally (non-friend inviter)"
+                );
+                Ok(())
+            }
         }
     }
 

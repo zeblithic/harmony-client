@@ -428,6 +428,8 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     "ZEB-505: invite inviter does not match authenticated relay sender".into(),
                 );
             }
+            // Capture for the ZEB-639 ignore log (`signed` moves into apply_invite).
+            let invite_space_id = signed.space_id;
             // Scope the lock to `apply_invite`, then DROP the guard before
             // staging + emitting (store `Mutex` + sink must not nest inside the
             // held `crdt_state` lock — ZEB-236 T3).
@@ -456,6 +458,13 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     );
                 }
                 crate::dm_outbox::ApplyInviteOutcome::Accepted => {}
+                // ZEB-639: non-friend invite for a space we already hold — no-op.
+                crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
+                    tracing::debug!(
+                        space_id = ?invite_space_id,
+                        "relay invite ignored: space already exists locally (non-friend inviter)"
+                    );
+                }
             }
             return Ok(());
         };

@@ -1803,6 +1803,7 @@ impl DmOutbox {
         // holds the owner-state lock but has no outbox handle) applies the
         // identical trust gates. This method stays the (dormant) outbox entry
         // point, delegating to the single source of truth.
+        let invite_space_id = signed.space_id; // for the ZEB-639 ignore log
         match apply_invite(
             state,
             self.self_owner,
@@ -1831,6 +1832,14 @@ impl DmOutbox {
                 Ok(DrainOutcome::default())
             }
             ApplyInviteOutcome::Accepted => Ok(DrainOutcome::default()),
+            // ZEB-639: non-friend invite for a space we already hold — no-op.
+            ApplyInviteOutcome::IgnoredExistingSpace => {
+                tracing::debug!(
+                    space_id = ?invite_space_id,
+                    "dormant handle_invite: non-friend invite ignored (space already exists locally)"
+                );
+                Ok(DrainOutcome::default())
+            }
         }
     }
 
@@ -2233,6 +2242,14 @@ pub(crate) enum ApplyInviteOutcome {
     /// invite is returned for the caller to stage (spec: staging is
     /// process-local only, so decline is indistinguishable from offline).
     Staged(crate::pending_dm_invites::StagedDmInvite),
+    /// ZEB-639: a structurally-valid NON-FRIEND invite for a space that already
+    /// exists locally. Never staged: we are already a member, so there is no
+    /// consent to ask for — and a consent prompt here is exactly the kicked
+    /// GroupDm co-member re-admit vector (forged fresh invite for the existing
+    /// space_id). Legit roster changes arrive via Space CRDT sync, not invites.
+    /// Matches the co-deposit path's semantics (it only stages on SpaceNotFound).
+    /// Friend-tier invites are NOT gated — idempotent redelivery merge contract.
+    IgnoredExistingSpace,
 }
 
 /// ZEB-482: auto-accept a received DmInvite — write the DM Space + cache the
@@ -2321,6 +2338,15 @@ pub(crate) fn apply_invite(
         .get(&signed.inviter)
         .is_some_and(|e| e.status == crate::friend_graph::FriendStatus::Active);
     if !inviter_is_active_friend {
+        // ZEB-639 (1): never stage a non-friend invite for a space we already
+        // hold — there is no consent to ask for, and prompting is the kicked
+        // GroupDm co-member re-admit vector. Friend-tier invites bypass this
+        // (idempotent redelivery merge). Tombstoned spaces are NOT in
+        // `state.spaces`, so they still stage (accept later surfaces the
+        // permanent rejection).
+        if state.spaces.contains_key(&signed.space_id) {
+            return Ok(ApplyInviteOutcome::IgnoredExistingSpace);
+        }
         return Ok(ApplyInviteOutcome::Staged(
             crate::pending_dm_invites::StagedDmInvite {
                 signed,
@@ -2545,6 +2571,9 @@ pub(crate) fn apply_deposited_invite(
         // friend) already wrote the Space, so there is nothing to stage.
         ApplyInviteOutcome::Staged(staged) => Ok(Some(staged)),
         ApplyInviteOutcome::Accepted => Ok(None),
+        // ZEB-639: non-friend invite for a space we already hold — nothing to
+        // stage, nothing written (same caller contract as `Accepted`).
+        ApplyInviteOutcome::IgnoredExistingSpace => Ok(None),
     }
 }
 
@@ -3346,6 +3375,46 @@ mod tests {
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
         (signed, signature, body_bytes)
+    }
+
+    /// ZEB-639 test helper: pre-populate `state` with the Space `signed`
+    /// targets — the exact shape `run_invite_accept_tail` builds, so the
+    /// "space already exists locally" arrangement matches what a genuine
+    /// prior accept would have written.
+    fn insert_space_from_invite(
+        state: &mut OwnerState,
+        signed: &crate::dm_envelope::DmInviteSigned,
+    ) {
+        let space = crate::owner_state_types::Space {
+            id: signed.space_id,
+            kind: signed.kind,
+            parent: None,
+            community_id: None,
+            name: format!("DM with {}", hex::encode(signed.inviter.0)),
+            transport: None,
+            members: signed.members.clone(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: signed.created_at.clone(),
+            updated_at: signed.created_at.clone(),
+            content_key: Some(signed.content_key.clone()),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        assert!(
+            matches!(
+                state.apply_space_with_canonicalization(space),
+                crate::owner_state_crdt::ApplyOutcome::Inserted
+            ),
+            "fixture Space must insert cleanly"
+        );
     }
 
     /// ZEB-262 Phase 4 Task 2: assert that `DmOutbox.signing_key` and
@@ -5874,6 +5943,84 @@ mod tests {
             before, after,
             "staging a non-friend invite must write NOTHING"
         );
+    }
+
+    /// ZEB-639 (1): a NON-friend invite for a space that ALREADY EXISTS
+    /// locally is IGNORED — never staged, never prompted. Staging it is the
+    /// kicked-GroupDm co-member re-admit vector (forged fresh invite for the
+    /// existing space_id). The call must also write nothing.
+    #[test]
+    fn non_friend_invite_for_existing_space_is_ignored_not_staged() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default(); // friend_graph EMPTY → non-friend tier
+
+        // Arrange: the invite's target Space already exists locally.
+        let (signed, _sig, _bytes) = build_valid_dm_invite(self_owner);
+        insert_space_from_invite(&mut state, &signed);
+        let before = crate::owner_state_persist::canonicalize(&state).unwrap();
+
+        // Act: apply the (byte-identical, deterministic) invite from a
+        // NON-friend inviter for that same space_id.
+        let (signed, signature, body_bytes) = build_valid_dm_invite(self_owner);
+        let outcome = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            4242,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(outcome, ApplyInviteOutcome::IgnoredExistingSpace),
+            "non-friend invite for an existing space must be ignored, got {outcome:?}"
+        );
+        let after = crate::owner_state_persist::canonicalize(&state).unwrap();
+        assert_eq!(
+            before, after,
+            "ignoring an existing-space invite must write NOTHING"
+        );
+    }
+
+    /// ZEB-639 (1): the friend tier is NOT gated on space existence — an
+    /// ACTIVE-friend invite for an existing space still runs the accept tail
+    /// (the established idempotent redelivery-merge contract; ZEB-483
+    /// co-deposits the invite with every message).
+    #[test]
+    fn friend_invite_for_existing_space_still_accepts_redelivery_merge() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let inviter = OwnerAddr([1; 16]);
+        let mut state = OwnerState::default();
+        insert_active_friend(&mut state, inviter);
+
+        // Arrange: the invite's target Space already exists locally
+        // (redelivery: a prior accept already wrote it).
+        let (signed, _sig, _bytes) = build_valid_dm_invite(self_owner);
+        insert_space_from_invite(&mut state, &signed);
+
+        let (signed, signature, body_bytes) = build_valid_dm_invite(self_owner);
+        let outcome = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            200,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(outcome, ApplyInviteOutcome::Accepted),
+            "active-friend redelivery for an existing space must still accept, got {outcome:?}"
+        );
+        assert!(state.spaces.contains_key(&SpaceId([7; 16])));
     }
 
     /// Golden parity: the staged-then-accepted path (`apply_invite` → `Staged` →
