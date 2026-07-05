@@ -1807,6 +1807,62 @@ mod tests {
         );
     }
 
+    /// ZEB-643: the eviction pair evicts EXACTLY the node-ids
+    /// `remove_owner` deleted. Interleave under pin: a second device (n2)
+    /// announces after the arm's would-be capture point but before
+    /// `remove_owner`; evicting the RETURNED set clears n2's pending
+    /// NewPeer kick (pre-fix, evicting only a stale pre-captured set left
+    /// that kick to drain record-less into a process-lifetime Dormant).
+    #[tokio::test(start_paused = true)]
+    async fn eviction_from_removed_set_clears_interleaved_newpeer_kick() {
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let n1 = peer(1);
+        let n2 = peer(2);
+        seed(&resolver, n1);
+        let handle = SupervisorHandle::new();
+        let config = cfg(1_000, 64_000, 3_600_000, 30_000, 4, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // n1 is a live, connected peer with a slot.
+        handle.kick(n1, ReconnectTrigger::NewPeer);
+        handle.mark_connected(n1);
+        tokio::time::sleep(ms(500)).await;
+        assert_eq!(handle.states_snapshot().len(), 1, "connected slot exists");
+
+        // The interleave: a NEW device (n2) lands its record + NewPeer kick
+        // after the would-be capture point. No awaits until the eviction
+        // pair below, so the kick is still pending when we evict.
+        seed(&resolver, n2);
+        handle.kick(n2, ReconnectTrigger::NewPeer);
+        assert!(handle.pending_trigger(n2).is_some(), "n2 kick queued");
+
+        // The lib.rs arm shape (ZEB-643): evict the RETURNED set.
+        let removed = resolver.remove_owner(&OwnerAddr([0xAA; 16]));
+        assert_eq!(removed.len(), 2, "both devices deleted");
+        for node in &removed {
+            handle.evict_peer(*node);
+        }
+        assert!(
+            handle.pending_trigger(n2).is_none(),
+            "ZEB-643: the interleaved NewPeer kick is cleared by eviction"
+        );
+
+        tokio::time::sleep(ms(500)).await;
+        assert!(
+            handle.states_snapshot().is_empty(),
+            "no slot survives or resurrects after the eviction pair"
+        );
+    }
+
     /// Non-regression pin for the gate's scope: a `Dropped` for an unknown
     /// peer that DOES have a live record arms a Retrying slot as before.
     #[tokio::test(start_paused = true)]

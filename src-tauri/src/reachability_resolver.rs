@@ -588,32 +588,38 @@ impl ReachabilityResolver {
     /// `connectivity_list_peer_reachability` or `resolve_by_node_id`
     /// until restart bootstrap re-filters them.
     ///
-    /// Returns the number of entries removed (across all the owner's
-    /// devices) so callers can log / decide whether to emit a UI hint.
-    pub fn remove_owner(&self, actor: &OwnerAddr) -> usize {
+    /// Remove ALL device records for `actor`, returning the iroh node-ids
+    /// of the removed records. ZEB-643: the decide-and-remove pair executes
+    /// under a single write-lock hold, so the returned set is the
+    /// authoritative deleted set — a concurrent `update` for the same owner
+    /// cannot slip a record between a caller's separate capture read and
+    /// this removal (the old resolve→remove_owner two-step raced exactly
+    /// that way, leaking a record-less supervisor slot via the pending
+    /// NewPeer kick of the uncaptured device). Callers evict supervisor
+    /// slots from the returned set.
+    pub fn remove_owner(&self, actor: &OwnerAddr) -> Vec<[u8; 32]> {
         let mut map = self.inner.write().expect("resolver write lock");
         let to_remove: Vec<ResolverKey> = map
             .range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
             .map(|(k, _)| *k)
             .collect();
-        let n = to_remove.len();
-        for k in to_remove {
-            map.remove(&k);
+        for k in &to_remove {
+            map.remove(k);
         }
-        if n > 0 {
+        if !to_remove.is_empty() {
             // ZEB-627: departed devices left the derived views.
             self.generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         drop(map);
-        // Full per-owner eviction (ZEB-621): drop the stale-refresh cooldown too,
-        // else the map grows monotonically with every stale-dispatched owner over
-        // process lifetime.
+        // Full per-owner eviction (ZEB-621): drop the stale-refresh cooldown
+        // too, else the map grows monotonically with every stale-dispatched
+        // owner over process lifetime.
         self.refresh_cooldowns
             .lock()
             .expect("refresh_cooldowns lock")
             .remove(actor);
-        n
+        to_remove.into_iter().map(|(_, node_id)| node_id).collect()
     }
 
     /// Register a pkarr-backed fallback source. Called once at boot by
@@ -916,12 +922,11 @@ mod tests {
         r.update(actor, make_payload(1, 500), make_hlc(500, 0, "a"));
         assert_eq!(r.generation(), g1, "rejected write does not bump");
         // Eviction: bump.
-        let n = r.remove_owner(&actor);
-        assert_eq!(n, 1);
+        assert_eq!(r.remove_owner(&actor).len(), 1);
         assert!(r.generation() > g1, "remove_owner bumps");
         // Removing an absent owner: no bump.
         let g2 = r.generation();
-        assert_eq!(r.remove_owner(&OwnerAddr([0xBB; 16])), 0);
+        assert_eq!(r.remove_owner(&OwnerAddr([0xBB; 16])).len(), 0);
         assert_eq!(r.generation(), g2, "empty removal does not bump");
     }
 
@@ -1197,7 +1202,7 @@ mod tests {
         r.update(other, make_payload(0xCC, 1000), make_hlc(1000, 0, "d"));
 
         let removed = r.remove_owner(&actor);
-        assert_eq!(removed, 3, "all three of actor's devices evicted");
+        assert_eq!(removed.len(), 3, "all three of actor's devices evicted");
 
         assert!(r.resolve(&actor).is_empty());
         assert_eq!(r.resolve(&other).len(), 1, "other owner untouched");
@@ -1211,12 +1216,38 @@ mod tests {
         let r = ReachabilityResolver::new();
         let actor = OwnerAddr([0x11; 16]);
         // No entries → returns 0, doesn't panic.
-        assert_eq!(r.remove_owner(&actor), 0);
+        assert_eq!(r.remove_owner(&actor).len(), 0);
 
         r.update(actor, make_payload(0x01, 1000), make_hlc(1000, 0, "a"));
-        assert_eq!(r.remove_owner(&actor), 1);
+        assert_eq!(r.remove_owner(&actor).len(), 1);
         // Second remove is a no-op — also 0.
-        assert_eq!(r.remove_owner(&actor), 0);
+        assert_eq!(r.remove_owner(&actor).len(), 0);
+    }
+
+    /// ZEB-643: `remove_owner` returns the node-ids of the records it
+    /// deleted — the authoritative set, captured under the same write-lock
+    /// hold as the removal (callers evict supervisor slots from it).
+    #[test]
+    fn remove_owner_returns_removed_node_ids() {
+        let r = ReachabilityResolver::new();
+        let actor = OwnerAddr([0x11; 16]);
+        let other = OwnerAddr([0x22; 16]);
+        r.update(actor, make_payload(0x01, 1000), make_hlc(1000, 0, "a"));
+        r.update(actor, make_payload(0x02, 1000), make_hlc(1000, 0, "b"));
+        r.update(other, make_payload(0xCC, 1000), make_hlc(1000, 0, "c"));
+
+        let mut removed = r.remove_owner(&actor);
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![[0x01; 32], [0x02; 32]],
+            "returns exactly the deleted node-ids"
+        );
+        assert_eq!(r.resolve(&other).len(), 1, "other owner untouched");
+        assert!(
+            r.remove_owner(&actor).is_empty(),
+            "second remove returns the empty set"
+        );
     }
 
     // ---- ZEB-620 Task 4: reconnect-supervisor triggers -------------------
@@ -1472,7 +1503,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(owner, tokio::time::Instant::now());
-        assert_eq!(r.remove_owner(&owner), 1); // one composite entry (both slots)
+        assert_eq!(r.remove_owner(&owner).len(), 1); // one composite entry (both slots)
         assert!(r.resolve_by_node_id(&node_id_bytes(7)).is_none());
         assert!(r.resolve(&owner).is_empty());
         assert!(

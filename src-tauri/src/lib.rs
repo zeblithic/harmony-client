@@ -5950,19 +5950,16 @@ pub async fn start_node_inner(
                                                 if !membership_projection
                                                     .is_joined_elsewhere(&event.actor.0, &community_id)
                                                 {
-                                                    // ZEB-627: capture the leaver's
-                                                    // device node-ids BEFORE the
-                                                    // resolver forgets them (read
-                                                    // precedes the destructive
-                                                    // write), to evict their
-                                                    // reconnect-supervisor slots.
-                                                    let departed_nodes: Vec<[u8; 32]> = resolver
-                                                        .resolve(&event.actor)
-                                                        .into_iter()
-                                                        .map(|p| p.iroh_node_id)
-                                                        .collect();
-                                                    let n = resolver.remove_owner(&event.actor);
-                                                    if n > 0 {
+                                                    // ZEB-643: `remove_owner` returns the node-ids it
+                                                    // deleted, captured atomically under the same
+                                                    // write-lock hold as the removal — a concurrent
+                                                    // device announce can no longer slip a record
+                                                    // between a separate capture read and the
+                                                    // destructive write (the old resolve→remove_owner
+                                                    // two-step). Evicting exactly the returned set
+                                                    // also clears each node's pending supervisor kick.
+                                                    let departed_nodes = resolver.remove_owner(&event.actor);
+                                                    if !departed_nodes.is_empty() {
                                                         // ZEB-627: a departed peer
                                                         // must not stay scheduled
                                                         // (or parked Dormant) for
@@ -6002,15 +5999,9 @@ pub async fn start_node_inner(
                                                 if !membership_projection
                                                     .is_joined_elsewhere(&target.0, &community_id)
                                                 {
-                                                    // ZEB-627: capture-then-evict,
-                                                    // as in the Leave arm above.
-                                                    let departed_nodes: Vec<[u8; 32]> = resolver
-                                                        .resolve(target)
-                                                        .into_iter()
-                                                        .map(|p| p.iroh_node_id)
-                                                        .collect();
-                                                    let n = resolver.remove_owner(target);
-                                                    if n > 0 {
+                                                    // ZEB-643: as in the Leave arm above.
+                                                    let departed_nodes = resolver.remove_owner(target);
+                                                    if !departed_nodes.is_empty() {
                                                         if let Some(sup) = resolver.supervisor() {
                                                             for node in &departed_nodes {
                                                                 sup.evict_peer(*node);
@@ -59231,7 +59222,7 @@ mod zeb_321_event_loop_wiring_tests {
         };
         if let MembershipEventKind::Leave = &delta.event.kind {
             let n = resolver.remove_owner(&delta.event.actor);
-            assert_eq!(n, 2, "both of actor's devices evicted");
+            assert_eq!(n.len(), 2, "both of actor's devices evicted");
         } else {
             panic!("expected Leave");
         }
@@ -59318,7 +59309,7 @@ mod zeb_321_event_loop_wiring_tests {
 
         if !projection.is_joined_elsewhere(&actor.0, &community_a) {
             let n = resolver.remove_owner(&actor);
-            assert_eq!(n, 1, "eviction ran");
+            assert_eq!(n.len(), 1, "eviction ran");
         }
         assert!(
             resolver.resolve(&actor).is_empty(),
@@ -59387,7 +59378,7 @@ mod zeb_321_event_loop_wiring_tests {
         };
         if let MembershipEventKind::Kick { target: t, .. } = &delta.event.kind {
             let n = resolver.remove_owner(t);
-            assert_eq!(n, 1);
+            assert_eq!(n.len(), 1);
         } else {
             panic!("expected Kick");
         }
