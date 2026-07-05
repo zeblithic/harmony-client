@@ -49054,6 +49054,12 @@ pub(crate) async fn accept_dm_invite_impl(
             // would wedge the row: every Accept re-errors forever and only
             // Decline clears it. Drop the row and tell both surfaces.
             crate::dm_outbox::DmReceiveError::CrdtRejected(reason) => {
+                // Mirror the success path's phantom-row cleanup (PR #403
+                // round 1): a co-deposit redelivery during the accept window
+                // can re-stage this invite (a tombstoned space is NOT in
+                // `spaces`, so the ZEB-639 gate passes) — "drop the row" must
+                // hold under that race too, or the emit below lies.
+                let _ = store.take(&space_id);
                 crate::node_event_sink::emit_ser(sink.as_ref(), "dm-invite-list-changed", &());
                 Err(format!("invite no longer applicable: {reason}"))
             }

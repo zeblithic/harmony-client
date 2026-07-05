@@ -100,16 +100,22 @@ entry survives: a pending toast/row for a DM that already exists in nav.
 **Fix:** helper in `pending_dm_invites.rs`:
 
 ```rust
-pub fn purge_stale_staged_on_accept(
-    store: &PendingDmInvites,
+pub(crate) fn purge_stale_staged_on_accept(
+    pending: Option<&std::sync::Arc<PendingDmInvites>>,
     sink: &dyn NodeEventSink,
     space_id: &SpaceId,
 ) {
+    let Some(store) = pending else {
+        return; // store not wired on this path (defensive; silent — purge is best-effort)
+    };
     if store.take(space_id).is_some() {
         crate::node_event_sink::emit_ser(sink, "dm-invite-list-changed", &());
     }
 }
 ```
+
+(Signature mirrors `stage_and_emit_staged_invite`'s optional-store seam so the
+dormant/no-store path needs no dummy store.)
 
 Called at every live arm that observes a friend-tier accept AND holds
 store+sink: the `Accepted` match arms (`dm_inbox_ingest.rs:~519`, `:~952`,
