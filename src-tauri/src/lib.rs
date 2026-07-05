@@ -5829,6 +5829,16 @@ pub async fn start_node_inner(
                                         // was kicked. All three emit the same Tauri
                                         // event so the DiagnosticsPanel re-fetches.
                                         let mut emit_changed: Option<crate::owner_state_types::OwnerAddr> = None;
+                                        // ZEB-634 (Qodo PR #405 R1): set by the
+                                        // Leave/Kick arms when the co-membership
+                                        // consult SKIPS eviction. The projection
+                                        // refresh below still shrinks the peer's
+                                        // shared_communities (the network-health
+                                        // snapshot derives from it), so the
+                                        // notify must fire AFTER that refresh —
+                                        // notifying inside the arm would race the
+                                        // panel's re-fetch against the stale set.
+                                        let mut nh_notify_after_projection = false;
                                         match &event.kind {
                                             crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
                                                 resolver.update(
@@ -5972,6 +5982,13 @@ pub async fn start_node_inner(
                                                         }
                                                         emit_changed = Some(event.actor);
                                                     }
+                                                } else {
+                                                    // ZEB-634 (Qodo PR #405 R1):
+                                                    // eviction skipped, but the
+                                                    // leaver's shared_communities
+                                                    // still shrinks — notify after
+                                                    // the projection refresh below.
+                                                    nh_notify_after_projection = true;
                                                 }
                                             }
                                             crate::community_membership::MembershipEventKind::Kick { target, .. } => {
@@ -6009,6 +6026,10 @@ pub async fn start_node_inner(
                                                         }
                                                         emit_changed = Some(*target);
                                                     }
+                                                } else {
+                                                    // ZEB-634 (Qodo PR #405 R1): as
+                                                    // in the Leave arm above.
+                                                    nh_notify_after_projection = true;
                                                 }
                                             }
                                             _ => {}
@@ -6108,6 +6129,26 @@ pub async fn start_node_inner(
                                             }
                                         } else {
                                             membership_projection.remove_community(&community_id);
+                                        }
+
+                                        // ── ZEB-634 (Qodo PR #405 R1): deferred
+                                        // network-health notify for a Leave/Kick
+                                        // whose eviction was skipped (co-member
+                                        // elsewhere). The projection refresh just
+                                        // above shrank the peer's
+                                        // shared_communities; the snapshot the
+                                        // panel re-fetches on this notify now
+                                        // reflects it. Firing inside the arm
+                                        // instead would race the re-fetch against
+                                        // the pre-refresh projection.
+                                        if nh_notify_after_projection {
+                                            if let Some(nh) = network_health_cell
+                                                .read()
+                                                .ok()
+                                                .and_then(|g| g.as_ref().cloned())
+                                            {
+                                                nh.notify();
+                                            }
                                         }
 
                                         // ── ZEB-495 (ZEB-340 Part 2):

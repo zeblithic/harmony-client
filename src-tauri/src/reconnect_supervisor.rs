@@ -688,12 +688,20 @@ fn apply_trigger(
     // `RecordChanged` fire only AFTER the resolver write, so a record-add
     // always re-creates the slot; a live inbound accept re-enters via
     // `mark_connected`. `remove` on an absent key is the decline-to-create
-    // no-op.
-    if matches!(trigger, ReconnectTrigger::Dropped) && resolver.resolve_by_node_id(&peer).is_none()
-    {
-        states.remove(&peer);
-        return;
-    }
+    // no-op. Single lookup (Qodo PR #405 R1): `resolve_by_node_id` is an
+    // O(N) scan, and the Connected→Retrying marker below needs the same
+    // owner — resolve once per `Dropped` and thread the result through.
+    let dropped_owner = if matches!(trigger, ReconnectTrigger::Dropped) {
+        match resolver.resolve_by_node_id(&peer) {
+            Some((owner, _)) => Some(owner.0),
+            None => {
+                states.remove(&peer);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let role = dial_role(self_node_id, &peer);
     match states.get_mut(&peer) {
         None => {
@@ -724,10 +732,12 @@ fn apply_trigger(
                 // branch via `Dropped`; record-only triggers took the branch
                 // above) — the SINGLE edge that emits `retrying`. Re-arming an
                 // already-Retrying/Dormant peer (every other ladder rung, and
-                // dormant revival) emits none. No live routing record ⇒ skip the
-                // marker (no invented owner).
+                // dormant revival) emits none. `dropped_owner` is the gate's
+                // lookup: `Some` by construction on this edge (a record-less
+                // `Dropped` returned early above), reused so the marker costs
+                // no second resolver scan.
                 if connected {
-                    if let Some(owner) = resolver.resolve_by_node_id(&peer).map(|(o, _)| o.0) {
+                    if let Some(owner) = dropped_owner {
                         telemetry.record_retrying(peer, owner);
                     }
                 }
