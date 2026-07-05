@@ -553,10 +553,20 @@ pub fn classify_nat<T>(_connection_info: &T) -> NatClass {
 pub fn filter_peers_by_shared_membership(
     resolver_records: Vec<ResolverPeerRecord>,
     my_memberships: &dyn MyMembershipSet,
+    self_owner: Option<&[u8; 16]>,
     now_ms: u64,
 ) -> Vec<PeerHealth> {
     let mut out: Vec<PeerHealth> = Vec::new();
     for r in resolver_records {
+        // ZEB-637: the node's own announce lands in its own resolver (the
+        // membership consumer is self-blind by design) and the projection
+        // "shares" every community with self — so without this skip the
+        // snapshot grows a permanent self row at noConnection (no
+        // connection source ever keys on self). Filter it here so every
+        // peers[] consumer (panel, e2e asserts, GCE suite) sees peers only.
+        if self_owner.is_some_and(|s| r.owner_addr == *s) {
+            continue;
+        }
         let shared = my_memberships.communities_shared_with(&r.owner_addr);
         if shared.is_empty() {
             continue;
@@ -856,6 +866,11 @@ pub struct NetworkHealthService {
     /// is called at boot; `notify()` is a no-op while None so unit tests
     /// that don't exercise event emission can construct the service freely.
     notify_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// ZEB-637: the local node's own OwnerAddr, installed at boot when an
+    /// identity is loaded. `None` in unit tests and pre-identity boot — then
+    /// no self-row filtering happens (additive like the other `set_*`
+    /// sources). Consumed by `snapshot` to drop the self row from `peers[]`.
+    self_owner: Option<[u8; 16]>,
 }
 
 impl NetworkHealthService {
@@ -882,6 +897,7 @@ impl NetworkHealthService {
             ),
             last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             notify_tx: None,
+            self_owner: None,
         }
     }
 
@@ -915,6 +931,14 @@ impl NetworkHealthService {
         src: std::sync::Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
     ) {
         self.protocol_compat = src;
+    }
+
+    /// ZEB-637: install the local node's own OwnerAddr so `snapshot` can
+    /// filter the self row out of `peers[]`. Called once at boot when an
+    /// identity is loaded; when unset (no identity yet) no filtering
+    /// happens — additive like the other `set_*` sources.
+    pub fn set_self_owner(&mut self, owner: [u8; 16]) {
+        self.self_owner = Some(owner);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -1084,7 +1108,12 @@ impl NetworkHealthService {
                 self.protocol_compat.incompat_reason(&record.iroh_node_id);
         }
 
-        let peers = filter_peers_by_shared_membership(records, &*self.membership, now);
+        let peers = filter_peers_by_shared_membership(
+            records,
+            &*self.membership,
+            self.self_owner.as_ref(),
+            now,
+        );
 
         // Patch reachability status now that we have peers.
         let my_network = my_network.map(|mut my| {
@@ -1652,7 +1681,13 @@ impl NetworkHealthService {
             .filter(|r| r.iroh_node_id != [0u8; 32])
             .map(|r| (r.owner_addr_hex(), r.iroh_node_id))
             .collect();
-        let scoped = filter_peers_by_shared_membership(records, &*self.membership, now);
+        // ZEB-637: keep self out of the ping-candidate list too (same root cause as the snapshot peers[] row).
+        let scoped = filter_peers_by_shared_membership(
+            records,
+            &*self.membership,
+            self.self_owner.as_ref(),
+            now,
+        );
         if endpoint_ok {
             // Semaphore-bounded parallel ping. The ping dispatcher itself
             // is the production wiring extension point — for Phase 1 the
@@ -2395,7 +2430,7 @@ mod tests {
             make_record(0xAA, ConnectionMode::NoConnection, Some(1_000)),
             make_record(0xBB, ConnectionMode::NoConnection, Some(1_000)),
         ];
-        let kept = filter_peers_by_shared_membership(records, &membership, 2_000);
+        let kept = filter_peers_by_shared_membership(records, &membership, None, 2_000);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].owner_addr, hex::encode([0xAA; 16]));
         assert_eq!(kept[0].shared_communities, vec![hex::encode([0xC1u8; 16])]);
@@ -2410,8 +2445,12 @@ mod tests {
         // through the membership filter onto the PeerHealth the panel renders.
         let mut record = make_record(0xAA, ConnectionMode::NoConnection, Some(1_000));
         record.protocol_incompat_reason = Some("tunnel hello v0 < min 1".to_string());
-        let out =
-            filter_peers_by_shared_membership(vec![record], &*membership_sharing(&[0xAA]), 2_000);
+        let out = filter_peers_by_shared_membership(
+            vec![record],
+            &*membership_sharing(&[0xAA]),
+            None,
+            2_000,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].protocol_incompat_reason.as_deref(),
@@ -2590,7 +2629,7 @@ mod tests {
         let memb = FakeMembership {
             table: std::collections::HashMap::new(),
         };
-        let out = filter_peers_by_shared_membership(records, &memb, 5000);
+        let out = filter_peers_by_shared_membership(records, &memb, None, 5000);
         assert!(out.is_empty());
     }
 
@@ -2604,9 +2643,32 @@ mod tests {
         table.insert([0x11u8; 16], vec!["comm-a".to_string()]);
         // 0x22 has NO entry → excluded
         let memb = FakeMembership { table };
-        let out = filter_peers_by_shared_membership(records, &memb, 5000);
+        let out = filter_peers_by_shared_membership(records, &memb, None, 5000);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].owner_addr, hex::encode([0x11u8; 16]));
+    }
+
+    /// ZEB-637: the self owner's record is dropped from peers[]; `None`
+    /// (no identity loaded) keeps the unfiltered behavior.
+    #[test]
+    fn filter_peers_drops_self_owner_row() {
+        let records = vec![
+            make_record(0x11, ConnectionMode::NoConnection, Some(1000)),
+            make_record(0x22, ConnectionMode::Direct, Some(2000)),
+        ];
+        let mut table = std::collections::HashMap::new();
+        table.insert([0x11u8; 16], vec!["comm-a".to_string()]);
+        table.insert([0x22u8; 16], vec!["comm-a".to_string()]);
+        let memb = FakeMembership { table };
+
+        let self_owner = [0x11u8; 16];
+        let out =
+            filter_peers_by_shared_membership(records.clone(), &memb, Some(&self_owner), 5000);
+        assert_eq!(out.len(), 1, "self row dropped");
+        assert_eq!(out[0].owner_addr, hex::encode([0x22u8; 16]));
+
+        let out = filter_peers_by_shared_membership(records, &memb, None, 5000);
+        assert_eq!(out.len(), 2, "no identity → no filtering");
     }
 
     #[test]
@@ -2618,7 +2680,7 @@ mod tests {
             vec!["comm-a".to_string(), "comm-b".to_string()],
         );
         let memb = FakeMembership { table };
-        let out = filter_peers_by_shared_membership(records, &memb, 5000);
+        let out = filter_peers_by_shared_membership(records, &memb, None, 5000);
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].shared_communities,
@@ -2639,7 +2701,7 @@ mod tests {
             table.insert([b as u8; 16], vec!["c".to_string()]);
         }
         let memb = FakeMembership { table };
-        let out = filter_peers_by_shared_membership(records, &memb, 10_000);
+        let out = filter_peers_by_shared_membership(records, &memb, None, 10_000);
         assert_eq!(out.len(), 4);
         // Order: 3000, 2000, 1000, None
         assert_eq!(out[0].last_seen_ms, Some(3000));
@@ -2654,7 +2716,7 @@ mod tests {
         let mut table = std::collections::HashMap::new();
         table.insert([0x11u8; 16], vec!["c".to_string()]);
         let memb = FakeMembership { table };
-        let out = filter_peers_by_shared_membership(records, &memb, 5000);
+        let out = filter_peers_by_shared_membership(records, &memb, None, 5000);
         assert_eq!(out[0].reachability_record_age_ms, Some(4000));
     }
 
@@ -3044,6 +3106,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn snapshot_filters_self_owner_from_peers() {
+        // ZEB-637: with a self owner installed, snapshot() drops the self row
+        // from peers[]. Same three-peer fixture as the sort test above; the
+        // pin is peer count (one fewer) + absence of the self owner_addr.
+        let mut table = std::collections::HashMap::new();
+        for b in [0x11u8, 0x22, 0x33] {
+            table.insert([b; 16], vec!["c1".to_string()]);
+        }
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![
+                    make_record(0x11, ConnectionMode::Direct, Some(1000)),
+                    make_record(0x22, ConnectionMode::Direct, Some(3000)),
+                    make_record(0x33, ConnectionMode::Direct, Some(2000)),
+                ],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_self_owner([0x22u8; 16]);
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 2, "self row filtered out");
+        let self_hex = hex::encode([0x22u8; 16]);
+        assert!(
+            snap.peers.iter().all(|p| p.owner_addr != self_hex),
+            "no remaining row is the self owner"
+        );
+    }
+
     // ── Rate-limiter tests (Task 4) ──────────────────────────────────
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3272,6 +3367,56 @@ mod tests {
             "cc should Skip (no node id)"
         );
         assert_eq!(cc.mode, None);
+    }
+
+    #[tokio::test]
+    async fn self_test_omits_self_owner_from_ping_candidates() {
+        // ZEB-637: with a self owner wired, the self record (0xAA) is dropped
+        // from the ping-candidate list — only the real peer (0xBB) is dialed
+        // and reported. Without the filter, self would surface an "unscripted
+        // peer" Fail row in the user-visible self-test peer_results.
+        let records = vec![
+            make_record(0xAA, ConnectionMode::NoConnection, Some(2_000)),
+            make_record(0xBB, ConnectionMode::NoConnection, Some(1_000)),
+        ];
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records }),
+            membership_sharing(&[0xAA, 0xBB]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_self_owner([0xAAu8; 16]);
+
+        let mut scripted = std::collections::HashMap::new();
+        scripted.insert(
+            [0xBBu8; 32],
+            Ok((std::time::Duration::from_millis(7), ConnectionMode::Direct)),
+        );
+        let dispatcher = ScriptedPingDispatcher { results: scripted };
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: StepOutcome::Pass { duration_ms: 1 },
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: StepOutcome::Pass { duration_ms: 1 },
+            resolve: StepOutcome::Pass { duration_ms: 1 },
+        };
+
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &dispatcher).await;
+
+        assert_eq!(
+            report.peer_results.len(),
+            1,
+            "only the non-self peer is pinged"
+        );
+        assert_eq!(report.peer_results[0].owner_addr, hex::encode([0xBBu8; 16]));
+        let self_hex = hex::encode([0xAAu8; 16]);
+        assert!(
+            report.peer_results.iter().all(|p| p.owner_addr != self_hex),
+            "self owner absent from ping results"
+        );
     }
 
     #[tokio::test]

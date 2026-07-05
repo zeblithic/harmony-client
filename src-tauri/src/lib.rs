@@ -9895,6 +9895,12 @@ pub async fn start_node_inner(
                                 prod_dial,
                                 prod_relay,
                             );
+                            // ZEB-637: the panel's peers[] must not list the
+                            // node's own owner (a permanent noConnection row
+                            // — bit the GCE suite and both flag-day agents).
+                            if let Some(self_owner) = guard.dm_self_owner {
+                                nh.set_self_owner(self_owner.0);
+                            }
                             // ZEB-620 Task 6: dial-state telemetry source. Reads
                             // the reconnect supervisor's `states_snapshot` lazily
                             // via the resolver's installed handle (event_loop wires
