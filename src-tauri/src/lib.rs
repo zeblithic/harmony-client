@@ -5829,6 +5829,16 @@ pub async fn start_node_inner(
                                         // was kicked. All three emit the same Tauri
                                         // event so the DiagnosticsPanel re-fetches.
                                         let mut emit_changed: Option<crate::owner_state_types::OwnerAddr> = None;
+                                        // ZEB-634 (Qodo PR #405 R1): set by the
+                                        // Leave/Kick arms when the co-membership
+                                        // consult SKIPS eviction. The projection
+                                        // refresh below still shrinks the peer's
+                                        // shared_communities (the network-health
+                                        // snapshot derives from it), so the
+                                        // notify must fire AFTER that refresh —
+                                        // notifying inside the arm would race the
+                                        // panel's re-fetch against the stale set.
+                                        let mut nh_notify_after_projection = false;
                                         match &event.kind {
                                             crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
                                                 resolver.update(
@@ -5923,37 +5933,62 @@ pub async fn start_node_inner(
                                                 // remove_owner below).
                                                 community_relay_resolver
                                                     .remove_advertiser(&community_id, &event.actor);
-                                                // ZEB-627: capture the leaver's
-                                                // device node-ids BEFORE the
-                                                // resolver forgets them (read
-                                                // precedes the destructive
-                                                // write), to evict their
-                                                // reconnect-supervisor slots.
-                                                let departed_nodes: Vec<[u8; 32]> = resolver
-                                                    .resolve(&event.actor)
-                                                    .into_iter()
-                                                    .map(|p| p.iroh_node_id)
-                                                    .collect();
-                                                let n = resolver.remove_owner(&event.actor);
-                                                if n > 0 {
-                                                    // ZEB-627: a departed peer
-                                                    // must not stay scheduled
-                                                    // (or parked Dormant) for
-                                                    // process life.
-                                                    if let Some(sup) = resolver.supervisor() {
-                                                        for node in &departed_nodes {
-                                                            sup.evict_peer(*node);
+                                                // ZEB-634 item 2: a Leave from THIS
+                                                // community must not evict a peer who
+                                                // is still a Joined co-member of
+                                                // another shared community —
+                                                // `remove_owner` is owner-global, so
+                                                // pre-consult the projection. The
+                                                // departing community is excluded
+                                                // explicitly (its projected set is
+                                                // still pre-Leave: the consumer
+                                                // refreshes the projection AFTER this
+                                                // arm). Skipping leaves records, slot,
+                                                // and the live conn untouched — there
+                                                // is no reachability change to notify
+                                                // or emit.
+                                                if !membership_projection
+                                                    .is_joined_elsewhere(&event.actor.0, &community_id)
+                                                {
+                                                    // ZEB-627: capture the leaver's
+                                                    // device node-ids BEFORE the
+                                                    // resolver forgets them (read
+                                                    // precedes the destructive
+                                                    // write), to evict their
+                                                    // reconnect-supervisor slots.
+                                                    let departed_nodes: Vec<[u8; 32]> = resolver
+                                                        .resolve(&event.actor)
+                                                        .into_iter()
+                                                        .map(|p| p.iroh_node_id)
+                                                        .collect();
+                                                    let n = resolver.remove_owner(&event.actor);
+                                                    if n > 0 {
+                                                        // ZEB-627: a departed peer
+                                                        // must not stay scheduled
+                                                        // (or parked Dormant) for
+                                                        // process life.
+                                                        if let Some(sup) = resolver.supervisor() {
+                                                            for node in &departed_nodes {
+                                                                sup.evict_peer(*node);
+                                                            }
                                                         }
+                                                        // ZEB-329: see comment above.
+                                                        if let Some(nh) = network_health_cell
+                                                            .read()
+                                                            .ok()
+                                                            .and_then(|g| g.as_ref().cloned())
+                                                        {
+                                                            nh.notify();
+                                                        }
+                                                        emit_changed = Some(event.actor);
                                                     }
-                                                    // ZEB-329: see comment above.
-                                                    if let Some(nh) = network_health_cell
-                                                        .read()
-                                                        .ok()
-                                                        .and_then(|g| g.as_ref().cloned())
-                                                    {
-                                                        nh.notify();
-                                                    }
-                                                    emit_changed = Some(event.actor);
+                                                } else {
+                                                    // ZEB-634 (Qodo PR #405 R1):
+                                                    // eviction skipped, but the
+                                                    // leaver's shared_communities
+                                                    // still shrinks — notify after
+                                                    // the projection refresh below.
+                                                    nh_notify_after_projection = true;
                                                 }
                                             }
                                             crate::community_membership::MembershipEventKind::Kick { target, .. } => {
@@ -5962,29 +5997,39 @@ pub async fn start_node_inner(
                                                 // (mirrors remove_owner below).
                                                 community_relay_resolver
                                                     .remove_advertiser(&community_id, target);
-                                                // ZEB-627: capture-then-evict,
-                                                // as in the Leave arm above.
-                                                let departed_nodes: Vec<[u8; 32]> = resolver
-                                                    .resolve(target)
-                                                    .into_iter()
-                                                    .map(|p| p.iroh_node_id)
-                                                    .collect();
-                                                let n = resolver.remove_owner(target);
-                                                if n > 0 {
-                                                    if let Some(sup) = resolver.supervisor() {
-                                                        for node in &departed_nodes {
-                                                            sup.evict_peer(*node);
+                                                // ZEB-634 item 2: as in the Leave arm
+                                                // above, for the kicked target.
+                                                if !membership_projection
+                                                    .is_joined_elsewhere(&target.0, &community_id)
+                                                {
+                                                    // ZEB-627: capture-then-evict,
+                                                    // as in the Leave arm above.
+                                                    let departed_nodes: Vec<[u8; 32]> = resolver
+                                                        .resolve(target)
+                                                        .into_iter()
+                                                        .map(|p| p.iroh_node_id)
+                                                        .collect();
+                                                    let n = resolver.remove_owner(target);
+                                                    if n > 0 {
+                                                        if let Some(sup) = resolver.supervisor() {
+                                                            for node in &departed_nodes {
+                                                                sup.evict_peer(*node);
+                                                            }
                                                         }
+                                                        // ZEB-329: see comment above.
+                                                        if let Some(nh) = network_health_cell
+                                                            .read()
+                                                            .ok()
+                                                            .and_then(|g| g.as_ref().cloned())
+                                                        {
+                                                            nh.notify();
+                                                        }
+                                                        emit_changed = Some(*target);
                                                     }
-                                                    // ZEB-329: see comment above.
-                                                    if let Some(nh) = network_health_cell
-                                                        .read()
-                                                        .ok()
-                                                        .and_then(|g| g.as_ref().cloned())
-                                                    {
-                                                        nh.notify();
-                                                    }
-                                                    emit_changed = Some(*target);
+                                                } else {
+                                                    // ZEB-634 (Qodo PR #405 R1): as
+                                                    // in the Leave arm above.
+                                                    nh_notify_after_projection = true;
                                                 }
                                             }
                                             _ => {}
@@ -6084,6 +6129,26 @@ pub async fn start_node_inner(
                                             }
                                         } else {
                                             membership_projection.remove_community(&community_id);
+                                        }
+
+                                        // ── ZEB-634 (Qodo PR #405 R1): deferred
+                                        // network-health notify for a Leave/Kick
+                                        // whose eviction was skipped (co-member
+                                        // elsewhere). The projection refresh just
+                                        // above shrank the peer's
+                                        // shared_communities; the snapshot the
+                                        // panel re-fetches on this notify now
+                                        // reflects it. Firing inside the arm
+                                        // instead would race the re-fetch against
+                                        // the pre-refresh projection.
+                                        if nh_notify_after_projection {
+                                            if let Some(nh) = network_health_cell
+                                                .read()
+                                                .ok()
+                                                .and_then(|g| g.as_ref().cloned())
+                                            {
+                                                nh.notify();
+                                            }
                                         }
 
                                         // ── ZEB-495 (ZEB-340 Part 2):
@@ -59173,6 +59238,92 @@ mod zeb_321_event_loop_wiring_tests {
 
         assert!(resolver.resolve(&actor).is_empty(), "actor evicted");
         assert_eq!(resolver.resolve(&other).len(), 1, "other untouched");
+    }
+
+    /// ZEB-634 item 2: the Leave-arm consult. A peer still Joined in another
+    /// shared community must survive a Leave-driven eviction — mirrors the
+    /// consumer-closure hook logic (consult BEFORE remove_owner).
+    #[test]
+    fn leave_from_one_shared_community_skips_eviction() {
+        let actor = OwnerAddr([0x77; 16]);
+        let community_a = SpaceId([0xA1; 16]);
+        let community_b = SpaceId([0xB2; 16]);
+        let resolver = ReachabilityResolver::new();
+        resolver.update(
+            actor,
+            crate::reachability_record::ReachabilityAnnouncePayload {
+                iroh_node_id: [0x01; 32],
+                home_relay_url: "https://derp.example/".into(),
+                direct_addresses: vec![],
+                announced_at_ms: 1000,
+                identity_signature: [0; 64],
+                butler_set: Vec::new(),
+                bs_at: 0,
+            },
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "a".into(),
+            },
+        );
+
+        // Projection: actor Joined in BOTH A and B (pre-Leave state, as the
+        // consumer sees it — the projection refreshes after the arm).
+        let projection = crate::network_health::MembershipProjection::new();
+        let mut members = std::collections::BTreeSet::new();
+        members.insert(actor);
+        projection.set_community_members(community_a, members.clone());
+        projection.set_community_members(community_b, members);
+
+        // Hook logic for Leave from A: consult, then (conditionally) evict.
+        if !projection.is_joined_elsewhere(&actor.0, &community_a) {
+            resolver.remove_owner(&actor);
+        }
+        assert_eq!(
+            resolver.resolve(&actor).len(),
+            1,
+            "co-member elsewhere: records survive the Leave"
+        );
+    }
+
+    /// ZEB-634 item 2 counterpart: the consult must not over-protect — a
+    /// Leave from the peer's LAST shared community still evicts.
+    #[test]
+    fn leave_from_last_shared_community_still_evicts() {
+        let actor = OwnerAddr([0x77; 16]);
+        let community_a = SpaceId([0xA1; 16]);
+        let resolver = ReachabilityResolver::new();
+        resolver.update(
+            actor,
+            crate::reachability_record::ReachabilityAnnouncePayload {
+                iroh_node_id: [0x01; 32],
+                home_relay_url: "https://derp.example/".into(),
+                direct_addresses: vec![],
+                announced_at_ms: 1000,
+                identity_signature: [0; 64],
+                butler_set: Vec::new(),
+                bs_at: 0,
+            },
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "a".into(),
+            },
+        );
+
+        let projection = crate::network_health::MembershipProjection::new();
+        let mut members = std::collections::BTreeSet::new();
+        members.insert(actor);
+        projection.set_community_members(community_a, members);
+
+        if !projection.is_joined_elsewhere(&actor.0, &community_a) {
+            let n = resolver.remove_owner(&actor);
+            assert_eq!(n, 1, "eviction ran");
+        }
+        assert!(
+            resolver.resolve(&actor).is_empty(),
+            "last shared community: eviction proceeds as before"
+        );
     }
 
     /// PR #157 round 5 (Cursor): Kick delta must evict the TARGET's

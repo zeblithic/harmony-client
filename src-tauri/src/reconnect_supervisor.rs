@@ -323,16 +323,15 @@ impl SupervisorHandle {
     /// long-session peer churn). Also drops the peer's pending dirty entry so
     /// a pre-eviction kick can't immediately resurrect the slot.
     ///
-    /// KNOWN RESIDUAL (final review 2026-07-04): a LATER kick — in particular
-    /// the departing conn's drop-watcher `Dropped`, which fires whenever the
-    /// peer was still connected at departure (the common case: a member must
-    /// be online to publish Leave) — recreates a fresh slot that resolve-
-    /// misses ladder to Dormant, where it parks for process life. Eviction
-    /// therefore bounds churn growth to the departed-while-connected subset
-    /// rather than eliminating it. Closing it fully needs a membership
-    /// consult at slot-creation or a periodic record-less-Dormant sweep —
-    /// tracked as ZEB-634. Non-async and sync-context-safe, like every other
-    /// handle method.
+    /// ZEB-634 closed the former residual here: a LATER kick — in
+    /// particular the departing conn's drop-watcher `Dropped` — used to
+    /// recreate a fresh slot that resolve-misses laddered to a
+    /// process-lifetime Dormant. `apply_trigger` now declines to arm (and
+    /// removes any existing slot for) a `Dropped` whose peer has no live
+    /// resolver record, so the eviction is final unless the peer
+    /// legitimately re-announces (record-add ⇒ `NewPeer`/`RecordChanged`)
+    /// or connects inbound (`mark_connected`).
+    /// Non-async and sync-context-safe, like every other handle method.
     pub fn evict_peer(&self, peer: [u8; 32]) {
         // Qodo PR #397 R1: hold BOTH locks across the removal so a concurrent
         // `kick()` cannot land between the dirty-remove and the states-remove
@@ -340,8 +339,9 @@ impl SupervisorHandle {
         // nested dirty+states acquisition in the module (the loop drains
         // `dirty` and RELEASES it before taking `states`, and every other
         // path takes exactly one of the two), so the dirty→states order here
-        // cannot deadlock. Kicks that arrive AFTER eviction completes remain
-        // the documented ZEB-634 residual.
+        // cannot deadlock. Kicks that arrive AFTER eviction completes are
+        // declined at drain time by `apply_trigger`'s record-less-`Dropped`
+        // gate (ZEB-634).
         let removed = {
             let mut dirty = self.inner.dirty.lock().expect("dirty lock");
             let mut states = self.inner.states.lock().expect("states lock");
@@ -675,6 +675,33 @@ fn apply_trigger(
     telemetry: &DialTelemetry,
     resolver: &ReachabilityResolver,
 ) {
+    // ZEB-634 (items 1+3): a `Dropped` kick for a peer with NO live resolver
+    // record is a departure echo, not a reconnect signal — the canonical
+    // source is the departing conn's drop-watcher firing after membership
+    // eviction already removed both the records and the slot. Arming it
+    // would recreate a slot that resolve-misses ladder to a Dormant that
+    // parks for process life (the ZEB-627 residual). Removing instead of
+    // re-arming also cleans inbound-conn-only peers (slot via
+    // `mark_connected`, zero records — the membership-eviction path can
+    // never name their node-id) at conn-drop, the only causally-available
+    // moment. Record-backed kicks are exempt by construction: `NewPeer`/
+    // `RecordChanged` fire only AFTER the resolver write, so a record-add
+    // always re-creates the slot; a live inbound accept re-enters via
+    // `mark_connected`. `remove` on an absent key is the decline-to-create
+    // no-op. Single lookup (Qodo PR #405 R1): `resolve_by_node_id` is an
+    // O(N) scan, and the Connected→Retrying marker below needs the same
+    // owner — resolve once per `Dropped` and thread the result through.
+    let dropped_owner = if matches!(trigger, ReconnectTrigger::Dropped) {
+        match resolver.resolve_by_node_id(&peer) {
+            Some((owner, _)) => Some(owner.0),
+            None => {
+                states.remove(&peer);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let role = dial_role(self_node_id, &peer);
     match states.get_mut(&peer) {
         None => {
@@ -705,10 +732,12 @@ fn apply_trigger(
                 // branch via `Dropped`; record-only triggers took the branch
                 // above) — the SINGLE edge that emits `retrying`. Re-arming an
                 // already-Retrying/Dormant peer (every other ladder rung, and
-                // dormant revival) emits none. No live routing record ⇒ skip the
-                // marker (no invented owner).
+                // dormant revival) emits none. `dropped_owner` is the gate's
+                // lookup: `Some` by construction on this edge (a record-less
+                // `Dropped` returned early above), reused so the marker costs
+                // no second resolver scan.
                 if connected {
-                    if let Some(owner) = resolver.resolve_by_node_id(&peer).map(|(o, _)| o.0) {
+                    if let Some(owner) = dropped_owner {
                         telemetry.record_retrying(peer, owner);
                     }
                 }
@@ -1713,10 +1742,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn evict_peer_clears_pending_kick_but_not_future_ones() {
         // ZEB-627: eviction drops the peer's PENDING dirty entry (so the loop
-        // doesn't immediately resurrect the slot from a pre-eviction kick),
-        // but a LATER kick (e.g. the departing conn's final drop-watcher
-        // `Dropped`) still lands — pinning the documented bounded residual:
-        // post-eviction kicks recreate a slot that ladders to Dormant.
+        // doesn't immediately resurrect the slot from a pre-eviction kick).
+        // A LATER kick still lands in the dirty set — the handle can't know
+        // the peer is gone — but since ZEB-634 the loop's `apply_trigger`
+        // declines to arm a record-less `Dropped` at drain time (see
+        // `dropped_kick_recordless_unknown_creates_no_slot`), so a landed
+        // post-eviction kick no longer recreates a slot.
         let handle = SupervisorHandle::new();
         let peer = [3u8; 32];
         handle.kick(peer, ReconnectTrigger::Dropped);
@@ -1730,7 +1761,125 @@ mod tests {
         assert_eq!(
             handle.pending_trigger(peer),
             Some(ReconnectTrigger::Dropped),
-            "a post-eviction kick still lands (documented residual)"
+            "a post-eviction kick still lands in the dirty set (drain-time gate declines it)"
+        );
+    }
+
+    /// ZEB-634 item 1 (the headline leak): after a membership eviction
+    /// (records removed + slot evicted), the departing conn's drop-watcher
+    /// `Dropped` must NOT recreate a slot — pre-fix it armed a Retrying slot
+    /// that resolve-misses laddered to a process-lifetime Dormant.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_kick_recordless_unknown_creates_no_slot() {
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let handle = SupervisorHandle::new();
+        let config = cfg(1_000, 64_000, 3_600_000, 30_000, 4, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // Live peer: inbound connect, then the membership eviction pair
+        // (resolver first, slot second — the lib.rs arm order).
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        handle.mark_connected(p);
+        tokio::time::sleep(ms(500)).await;
+        assert_eq!(handle.states_snapshot().len(), 1, "connected slot exists");
+
+        resolver.remove_owner(&OwnerAddr([0xAA; 16]));
+        handle.evict_peer(p);
+        assert!(handle.states_snapshot().is_empty(), "evicted");
+
+        // The departing conn's drop-watcher fires AFTER eviction.
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(ms(500)).await;
+        assert!(
+            handle.states_snapshot().is_empty(),
+            "ZEB-634: a record-less Dropped must not recreate a slot"
+        );
+    }
+
+    /// Non-regression pin for the gate's scope: a `Dropped` for an unknown
+    /// peer that DOES have a live record arms a Retrying slot as before.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_kick_with_record_still_creates_slot() {
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let handle = SupervisorHandle::new();
+        let config = cfg(1_000, 64_000, 3_600_000, 30_000, 4, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(ms(500)).await;
+        let snap = handle.states_snapshot();
+        assert_eq!(snap.len(), 1, "record-backed Dropped still arms the peer");
+        assert!(
+            matches!(snap[0].1, PeerStateWire::Retrying { .. }),
+            "armed at the ladder, got {:?}",
+            snap[0].1
+        );
+    }
+
+    /// ZEB-634 item 3: an inbound-conn-only peer (slot via `mark_connected`,
+    /// zero resolver records — the membership-eviction path can never name
+    /// its node-id) is cleaned at conn-drop instead of laddering to a parked
+    /// Dormant; a later record-add (⇒ `NewPeer` kick) re-creates the slot.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_kick_recordless_removes_existing_slot() {
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        // NO seed: inbound-conn-only peer.
+        let handle = SupervisorHandle::new();
+        let config = cfg(1_000, 64_000, 3_600_000, 30_000, 4, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        handle.mark_connected(p);
+        tokio::time::sleep(ms(500)).await;
+        assert_eq!(handle.states_snapshot().len(), 1, "inbound slot exists");
+
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(ms(500)).await;
+        assert!(
+            handle.states_snapshot().is_empty(),
+            "ZEB-634: record-less Dropped removes the slot (not Dormant-park)"
+        );
+
+        // Revival path: a record-add kicks NewPeer (in production via the
+        // resolver's installed supervisor handle; manual here) and re-creates.
+        seed(&resolver, p);
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(500)).await;
+        assert_eq!(
+            handle.states_snapshot().len(),
+            1,
+            "record-add revives the peer at the base rung"
         );
     }
 
