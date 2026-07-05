@@ -2211,6 +2211,27 @@ impl MembershipProjection {
             .map(|(cid, _)| hex::encode(cid.0))
             .collect()
     }
+
+    /// True if `peer` is a Joined member of any community OTHER than
+    /// `excluding` that the local node is Joined in. The lib.rs Leave/Kick
+    /// eviction arms consult this (ZEB-634 item 2) so a departure from ONE
+    /// shared community doesn't evict the reachability records and
+    /// reconnect slot of a peer who is still a co-member elsewhere.
+    /// `excluding` must be passed explicitly: for the SAME delta the
+    /// consumer updates this projection AFTER the eviction arm runs, so the
+    /// departing community's stored set is still pre-Leave (it would
+    /// otherwise always match). Synchronous, poisoned lock recovered (see
+    /// `set_community_members`).
+    pub fn is_joined_elsewhere(
+        &self,
+        peer: &[u8; 16],
+        excluding: &crate::owner_state_types::SpaceId,
+    ) -> bool {
+        let needle = crate::owner_state_types::OwnerAddr(*peer);
+        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        g.iter()
+            .any(|(cid, members)| cid != excluding && members.contains(&needle))
+    }
 }
 
 /// Production membership lookup backed by [`MembershipProjection`].
@@ -2306,6 +2327,47 @@ mod tests {
         assert!(!proj.communities_shared_with(&[0xAA; 16]).is_empty());
         proj.remove_community(&community);
         assert!(proj.communities_shared_with(&[0xAA; 16]).is_empty());
+    }
+
+    /// ZEB-634 item 2: the Leave/Kick consult. Peer in A+B excluding A →
+    /// true (skip eviction); only-A excluding A → false (last shared
+    /// community: evict); unknown peer / empty projection → false.
+    #[test]
+    fn is_joined_elsewhere_matrix() {
+        use crate::owner_state_types::{OwnerAddr, SpaceId};
+        let proj = MembershipProjection::new();
+        let a = SpaceId([0xA1; 16]);
+        let b = SpaceId([0xB2; 16]);
+        let peer = [0x77u8; 16];
+        let loner = [0x88u8; 16];
+
+        // Empty projection: nobody is joined anywhere.
+        assert!(!proj.is_joined_elsewhere(&peer, &a), "empty projection");
+
+        let mut a_members = std::collections::BTreeSet::new();
+        a_members.insert(OwnerAddr(peer));
+        a_members.insert(OwnerAddr(loner));
+        proj.set_community_members(a, a_members);
+        let mut b_members = std::collections::BTreeSet::new();
+        b_members.insert(OwnerAddr(peer));
+        proj.set_community_members(b, b_members);
+
+        assert!(
+            proj.is_joined_elsewhere(&peer, &a),
+            "peer shares B: leaving A must not evict"
+        );
+        assert!(
+            proj.is_joined_elsewhere(&peer, &b),
+            "symmetric: leaving B, still in A"
+        );
+        assert!(
+            !proj.is_joined_elsewhere(&loner, &a),
+            "A is loner's LAST shared community: evict"
+        );
+        assert!(
+            !proj.is_joined_elsewhere(&[0x99u8; 16], &a),
+            "unknown peer matches nothing"
+        );
     }
 
     #[test]
