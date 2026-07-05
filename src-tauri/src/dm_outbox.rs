@@ -2394,6 +2394,24 @@ pub(crate) fn run_invite_accept_tail(
     // ZEB-474: DM/GroupDm Spaces carry transport=None (deposit-only;
     // the Reticulum carrier was removed). Delivery uses OwnerDeviceCache,
     // not Space.transport.
+    // SECURITY (ZEB-639): clamp the Space's LWW driver to a local-clock
+    // ceiling. `lww_merge_space` is LWW-by-`updated_at` and GroupDm dedupe_key
+    // is id-derived (members ARE mutable on the same SpaceId), so echoing the
+    // invite-controlled `created_at` would let one forged far-future HLC pin
+    // this Space against every future legitimate update — the same
+    // denial-of-updates attack the cache `learned_at` rule below already
+    // defeats. Legit invites have past created_at → clamp is a no-op (golden
+    // parity tests pin this). `created_at` keeps the claimed value: it is
+    // provenance/display and does not drive LWW.
+    let updated_at = if signed.created_at.wall_ms > wall_now_ms {
+        Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        }
+    } else {
+        signed.created_at.clone()
+    };
     let space = crate::owner_state_types::Space {
         id: signed.space_id,
         kind: signed.kind,
@@ -2406,7 +2424,7 @@ pub(crate) fn run_invite_accept_tail(
         notification_pref: None,
         left_at: None,
         created_at: signed.created_at.clone(),
-        updated_at: signed.created_at,
+        updated_at,
         content_key: Some(signed.content_key),
         prior_content_keys: vec![],
         current_epoch: None,
@@ -3415,6 +3433,26 @@ mod tests {
             ),
             "fixture Space must insert cleanly"
         );
+    }
+
+    /// ZEB-639 (2) test helper: `build_valid_dm_invite` with the `created_at`
+    /// HLC forged to a far-future wall clock (`u64::MAX / 2`), re-signed with
+    /// the same deterministic `[0x42; 32]` identity so the invite still passes
+    /// `apply_invite`'s signature gate — `created_at` is inside the signed
+    /// body, so the attack is a fully valid-looking invite, not a corrupt one.
+    fn build_far_future_dm_invite(
+        self_owner: OwnerAddr,
+    ) -> (crate::dm_envelope::DmInviteSigned, [u8; 64], Vec<u8>) {
+        let (mut signed, _sig, _bytes) = build_valid_dm_invite(self_owner);
+        signed.created_at = Hlc {
+            wall_ms: u64::MAX / 2,
+            logical: 0,
+            device_id: "alice".into(),
+        };
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+        (signed, signature, body_bytes)
     }
 
     /// ZEB-262 Phase 4 Task 2: assert that `DmOutbox.signing_key` and
@@ -6076,6 +6114,136 @@ mod tests {
                  auto-accept (refresh_owner_device_cache = {refresh})"
             );
         }
+    }
+
+    /// ZEB-639 (2): a forged far-future `created_at` on an accepted invite
+    /// must NOT become the Space's LWW driver. `lww_merge_space` is
+    /// LWW-by-`updated_at` and GroupDm dedupe_key is id-derived, so echoing
+    /// the invite-controlled HLC would pin the Space against every future
+    /// legitimate update — the same denial-of-updates attack the cache
+    /// `learned_at` rule already defeats. The tail must clamp `updated_at`
+    /// to the local clock; `created_at` keeps the claimed value (provenance
+    /// and display only, never LWW).
+    #[test]
+    fn forged_far_future_created_at_is_clamped_on_accept() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default(); // friend_graph EMPTY → non-friend tier
+
+        let (signed, signature, body_bytes) = build_far_future_dm_invite(self_owner);
+        let forged_created_at = signed.created_at.clone();
+        let wall_now_ms = 5_000u64;
+
+        // Non-friend invite → Staged; the deferred user-accept then runs the
+        // tail with EXACTLY the inputs Staged carries (mirrors the golden-
+        // parity test's deferred leg).
+        let staged = match apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            wall_now_ms,
+            None,
+            true,
+        )
+        .unwrap()
+        {
+            ApplyInviteOutcome::Staged(s) => s,
+            other => panic!("expected Staged, got {other:?}"),
+        };
+        run_invite_accept_tail(
+            &mut state,
+            "dev",
+            staged.signed,
+            wall_now_ms,
+            staged.refresh_owner_device_cache,
+        )
+        .unwrap();
+
+        let space = state
+            .spaces
+            .get(&SpaceId([7; 16]))
+            .expect("accepted invite must write the Space");
+        assert_eq!(
+            space.updated_at.wall_ms, wall_now_ms,
+            "updated_at must be clamped to the local wall clock, not echo the forged HLC"
+        );
+        assert_eq!(
+            space.updated_at.device_id, "dev",
+            "clamped updated_at must carry the LOCAL device_id, not the invite's"
+        );
+        assert_eq!(
+            space.created_at, forged_created_at,
+            "created_at keeps the claimed value — provenance/display, not LWW"
+        );
+    }
+
+    /// ZEB-639 (2): after the clamped accept, a later legitimate Space update
+    /// (`updated_at.wall_ms = wall_now_ms + 1`) must WIN the LWW merge and be
+    /// visible — the point of the clamp. Pre-clamp, the forged `u64::MAX / 2`
+    /// HLC silently kept the old state (a `Merged` outcome whose field change
+    /// never lands).
+    #[test]
+    fn legit_update_wins_lww_after_clamped_accept() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default(); // friend_graph EMPTY → non-friend tier
+
+        let (signed, signature, body_bytes) = build_far_future_dm_invite(self_owner);
+        let wall_now_ms = 5_000u64;
+        let staged = match apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            wall_now_ms,
+            None,
+            true,
+        )
+        .unwrap()
+        {
+            ApplyInviteOutcome::Staged(s) => s,
+            other => panic!("expected Staged, got {other:?}"),
+        };
+        run_invite_accept_tail(
+            &mut state,
+            "dev",
+            staged.signed,
+            wall_now_ms,
+            staged.refresh_owner_device_cache,
+        )
+        .unwrap();
+
+        // A later legitimate update: newer local HLC + a visible field change.
+        let mut update = state
+            .spaces
+            .get(&SpaceId([7; 16]))
+            .expect("accepted invite must write the Space")
+            .clone();
+        update.updated_at = Hlc {
+            wall_ms: wall_now_ms + 1,
+            logical: 0,
+            device_id: "dev".into(),
+        };
+        update.custom_name = Some("renamed".into());
+
+        let outcome = state.apply_space_with_canonicalization(update);
+        assert!(
+            !matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)),
+            "later legit update must not be rejected, got {outcome:?}"
+        );
+        assert_eq!(
+            state
+                .spaces
+                .get(&SpaceId([7; 16]))
+                .unwrap()
+                .custom_name
+                .as_deref(),
+            Some("renamed"),
+            "the legit update's field change must be visible after LWW merge"
+        );
     }
 
     /// The reinstated spec test: declining a staged invite writes no state.
