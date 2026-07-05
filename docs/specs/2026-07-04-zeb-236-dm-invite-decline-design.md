@@ -48,12 +48,24 @@ the friend graph), evaluated under the `OwnerState` lock already held.
   message CidNotify, so a restart-lost pending invite re-stages on the next
   inbound message. Ephemerality is also what keeps the decline contract pure.
 - `StagedDmInvite` keeps everything accept needs later: the verified
-  `DmInviteSigned`, `received_at_ms`, and the ingest route's
+  `DmInviteSigned`, `received_at_ms`, the ingest route's
   `refresh_owner_device_cache` flag (tunnel=true / deposit=false — accept must
-  honor the same trust distinction the auto-accept path does today).
+  honor the same trust distinction the auto-accept path does today), and
+  `source_cid: Option<ContentId>` (the co-deposited message's cid at deposit
+  ingest sites; `None` on tunnel/invite-only routes) — the key for the
+  declined ledger below.
 - API: `stage()` (idempotent by `space_id`; returns `bool` newly-staged —
   redundant ZEB-483 redeliveries of an already-pending invite must NOT re-emit
-  the event), `list()`, `take(space_id)`.
+  the event; also refuses a `(space_id, source_cid)` pair already in the
+  declined ledger), `list()`, `take(space_id)` (accept path ONLY), and
+  `decline(space_id)`. Decline must go through `decline()` — NEVER `take()` —
+  because it additionally records `(space_id, source_cid)` in a
+  **session-local declined ledger** (hardening from the final whole-branch
+  review): the deposit sweeper redelivers the SAME message every few minutes
+  for up to 30 days, and without the ledger a declined co-deposited invite
+  would re-prompt on every sweep. A genuinely NEW message (new cid) still
+  re-prompts per the contract. The ledger is in-memory only and clears on
+  restart, so decline still writes nothing durable.
 - Parked on `NodeState` as `Option<Arc<PendingDmInvites>>` (the
   `PendingFriendRequests` slot pattern).
 - Decline-then-change-mind falls out for free: decline removes the entry; the
@@ -66,7 +78,7 @@ the friend graph), evaluated under the `OwnerState` lock already held.
 |---|---|---|
 | `list_pending_dm_invites` | — | `Vec<PendingDmInviteDto>` |
 | `accept_dm_invite` | `{spaceId}` | `take()` from store; run the accept tail (Space apply + cache refresh per the stored flag) under the `NodeState` lock; emit `dm-invite-list-changed` + `nav-updated` (the new Space must appear in nav) |
-| `decline_dm_invite` | `{spaceId}` | `take()` and drop; emit `dm-invite-list-changed`. Nothing else — the contract. |
+| `decline_dm_invite` | `{spaceId}` | `decline()` (drop + session-local declined-ledger entry when `source_cid` is present — see store API above); emit `dm-invite-list-changed`. Nothing durable, no notification — the contract. |
 
 - `PendingDmInviteDto` (`camelCase`): `spaceId`, `inviterOwnerIdHex`, `kind`,
   `members[]`, `createdAtMs`, `receivedAtMs`. **Never** `content_key` or

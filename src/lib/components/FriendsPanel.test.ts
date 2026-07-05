@@ -501,10 +501,12 @@ describe('FriendsPanel — DM invites pending section (ZEB-236 T7)', () => {
   });
 
   it('declines a DM invite and refreshes', async () => {
-    const listPending = vi.fn().mockResolvedValue([INVITE]);
+    // Second listPending resolves [] so the test proves the UI actually
+    // re-renders without the declined row, not just that a refresh ran.
+    const listPending = vi.fn().mockResolvedValueOnce([INVITE]).mockResolvedValueOnce([]);
     const decline = vi.fn().mockResolvedValue(undefined);
     const dmInviteService = mockDmInviteService({ listPending, decline });
-    const { findByTestId, getByTestId } = render(FriendsPanel, {
+    const { findByTestId, getByTestId, queryByTestId } = render(FriendsPanel, {
       props: { service: mockService(), dmInviteService },
     });
 
@@ -512,6 +514,7 @@ describe('FriendsPanel — DM invites pending section (ZEB-236 T7)', () => {
     await fireEvent.click(getByTestId('dm-invite-decline-btn'));
     expect(decline).toHaveBeenCalledWith(INVITE.spaceIdHex);
     await vi.waitFor(() => expect(listPending).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(queryByTestId('dm-invites-section')).toBeNull());
   });
 
   it('renders no DM-invites section when the service prop is absent', async () => {

@@ -54,17 +54,28 @@ export class DmInviteService {
     if (this.adapter) return;
     this.adapter = adapter;
 
-    const unlistenReceived = await adapter.listen('dm-invite-received', () => {
-      // Snapshot before iterating so a listener that unsubscribes itself
-      // during notification doesn't mutate the live set mid-loop.
-      for (const cb of [...this.pendingChangedListeners]) cb();
-    });
-    this.unlisteners.push(unlistenReceived);
+    try {
+      const unlistenReceived = await adapter.listen('dm-invite-received', () => {
+        // Snapshot before iterating so a listener that unsubscribes itself
+        // during notification doesn't mutate the live set mid-loop.
+        for (const cb of [...this.pendingChangedListeners]) cb();
+      });
+      this.unlisteners.push(unlistenReceived);
 
-    const unlistenListChanged = await adapter.listen('dm-invite-list-changed', () => {
-      for (const cb of [...this.pendingChangedListeners]) cb();
-    });
-    this.unlisteners.push(unlistenListChanged);
+      const unlistenListChanged = await adapter.listen('dm-invite-list-changed', () => {
+        for (const cb of [...this.pendingChangedListeners]) cb();
+      });
+      this.unlisteners.push(unlistenListChanged);
+    } catch (e) {
+      // Roll back the half-wired state (adapter was assigned before the guard
+      // above could see a failure) so a later connectAdapter can retry cleanly.
+      // Deliberately NOT destroy(): that would also wipe pendingChangedListeners
+      // registered before connect, silencing subscribers across the retry.
+      for (const fn of this.unlisteners) fn();
+      this.unlisteners = [];
+      this.adapter = null;
+      throw e;
+    }
   }
 
   /**

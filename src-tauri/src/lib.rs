@@ -48915,7 +48915,14 @@ pub fn list_pending_dm_invites_inner(
             received_at_ms: s.received_at_ms,
         })
         .collect();
-    rows.sort_by_key(|r| r.received_at_ms); // deterministic list order
+    // Deterministic list order: received_at_ms, then space_id_hex as a stable
+    // tie-breaker (two invites staged in the same millisecond must not flip
+    // order across calls — the store's HashMap iteration order varies).
+    rows.sort_by(|a, b| {
+        a.received_at_ms
+            .cmp(&b.received_at_ms)
+            .then_with(|| a.space_id_hex.cmp(&b.space_id_hex))
+    });
     rows
 }
 
@@ -49045,6 +49052,13 @@ pub(crate) async fn accept_dm_invite_impl(
         store.stage(restage_copy);
         return Err(format!("accept failed: {e:?}"));
     }
+
+    // A ZEB-483 co-deposit redelivery can re-stage this invite in the window
+    // between the `take()` above and the Space write (the sweeper still sees
+    // SpaceNotFound until the accept tail commits). Now that the Space exists,
+    // clear any such phantom row so accept leaves nothing pending — future
+    // redeliveries hit the existing Space and never reach the staging path.
+    let _ = store.take(&space_id);
 
     // Owner-state mutated (new DM Space, maybe OwnerDeviceCache) → arm the
     // debounced publish-root + persist on the owner-state SyncEngine so the
@@ -50564,7 +50578,14 @@ mod friend_ipc_tests {
         let store = PendingDmInvites::new();
         assert!(list_pending_dm_invites_inner(&store).is_empty());
         // Stage out of order — the projector must return them by received_at_ms.
-        for (space, ms) in [(0x22u8, 3_000u64), (0x21, 1_000), (0x23, 2_000)] {
+        // 0x24/0x22 share a millisecond: the space_id_hex tie-breaker must keep
+        // their relative order deterministic regardless of HashMap iteration.
+        for (space, ms) in [
+            (0x24u8, 3_000u64),
+            (0x22, 3_000),
+            (0x21, 1_000),
+            (0x23, 2_000),
+        ] {
             assert!(store.stage(StagedDmInvite {
                 signed: crate::dm_envelope::test_fixtures::minimal_invite_for_space(space),
                 received_at_ms: ms,
@@ -50572,11 +50593,21 @@ mod friend_ipc_tests {
                 source_cid: None,
             }));
         }
-        let order: Vec<u64> = list_pending_dm_invites_inner(&store)
+        let order: Vec<(u64, String)> = list_pending_dm_invites_inner(&store)
             .iter()
-            .map(|r| r.received_at_ms)
+            .map(|r| (r.received_at_ms, r.space_id_hex.clone()))
             .collect();
-        assert_eq!(order, vec![1_000, 2_000, 3_000], "sorted by received_at_ms");
+        assert_eq!(
+            order.iter().map(|(ms, _)| *ms).collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000, 3_000],
+            "sorted by received_at_ms"
+        );
+        assert!(
+            order[2].1 < order[3].1,
+            "same-ms invites tie-break on space_id_hex ({} !< {})",
+            order[2].1,
+            order[3].1
+        );
     }
 
     #[test]

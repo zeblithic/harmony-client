@@ -1350,6 +1350,14 @@
   async function refreshDmInviteQueue(): Promise<void> {
     try {
       const pending = await dmInviteService.listPending();
+      // Prune dismissals whose invite is no longer pending (accepted, declined,
+      // or store restart): "Later" suppresses the CURRENT staged invite only —
+      // a genuinely new invite for the same Space later in the session must
+      // toast again (spec: repeat invites re-prompt).
+      const pendingIds = new Set(pending.map((invite) => invite.spaceIdHex));
+      for (const id of laterDismissed) {
+        if (!pendingIds.has(id)) laterDismissed.delete(id);
+      }
       dmInviteQueue = pending
         .filter((invite) => !laterDismissed.has(invite.spaceIdHex))
         .sort((a, b) => a.receivedAtMs - b.receivedAtMs);
@@ -2978,15 +2986,21 @@
   presentational.
 -->
 {#if dmInviteQueue.length > 0}
-  <DmInviteToast
-    invite={dmInviteQueue[0]}
-    onAccept={() => handleDmInviteAccept(dmInviteQueue[0].spaceIdHex)}
-    onDecline={() => handleDmInviteDecline(dmInviteQueue[0].spaceIdHex)}
-    onLater={() => {
-      laterDismissed.add(dmInviteQueue[0].spaceIdHex);
-      dmInviteQueue = dmInviteQueue.filter((i) => !laterDismissed.has(i.spaceIdHex));
-    }}
-  />
+  {#key dmInviteQueue[0].spaceIdHex}
+    <!-- Keyed remount per invite: a fresh component instance resets the
+         internal `busy` flag (so "Later" during an in-flight accept/decline
+         can't disable the NEXT invite's buttons) and replays the entrance
+         transition when the queue head changes. -->
+    <DmInviteToast
+      invite={dmInviteQueue[0]}
+      onAccept={() => handleDmInviteAccept(dmInviteQueue[0].spaceIdHex)}
+      onDecline={() => handleDmInviteDecline(dmInviteQueue[0].spaceIdHex)}
+      onLater={() => {
+        laterDismissed.add(dmInviteQueue[0].spaceIdHex);
+        dmInviteQueue = dmInviteQueue.filter((i) => !laterDismissed.has(i.spaceIdHex));
+      }}
+    />
+  {/key}
 {/if}
 
 <BackupStalenessWarning ownerId={selfOwnerId} onExportRequested={handleExportRequested} />

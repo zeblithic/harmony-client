@@ -50,7 +50,15 @@
 </script>
 
 {#if invite}
-  <div class="dm-invite-toast" data-testid="dm-invite-toast" transition:fly={{ y: 20, duration: 200 }}>
+  <!-- role="status" = polite ARIA live region: announce the arriving invite
+       to assistive tech without interrupting (parity with other async
+       user-facing notifications). -->
+  <div
+    class="dm-invite-toast"
+    data-testid="dm-invite-toast"
+    role="status"
+    transition:fly={{ y: 20, duration: 200 }}
+  >
     <div class="invite-info">
       <span class="invite-title">DM invite</span>
       <span class="invite-body">From {invite.inviterOwnerIdHex.slice(0, 8)}… ({kindLabel(invite.kind)})</span>
