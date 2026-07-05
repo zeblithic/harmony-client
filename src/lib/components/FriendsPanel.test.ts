@@ -549,4 +549,25 @@ describe('FriendsPanel — DM invites pending section (ZEB-236 T7)', () => {
     const err = await findByTestId('dm-invite-error');
     expect(err.textContent).toContain('no pending DM invite for space');
   });
+
+  it('guards against double-invoke while accept is in flight', async () => {
+    let resolveAccept!: () => void;
+    const accept = vi.fn().mockImplementation(
+      () => new Promise<void>((r) => { resolveAccept = r; }),
+    );
+    const listPending = vi.fn().mockResolvedValue([INVITE]);
+    const dmInviteService = mockDmInviteService({ listPending, accept });
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service: mockService(), dmInviteService },
+    });
+
+    await findByTestId('dm-invite-list');
+    await fireEvent.click(getByTestId('dm-invite-accept-btn'));
+    // The in-flight state disables the button (belt)…
+    expect((getByTestId('dm-invite-accept-btn') as HTMLButtonElement).disabled).toBe(true);
+    // …and the handler's re-entry check drops the call regardless (suspenders).
+    await fireEvent.click(getByTestId('dm-invite-accept-btn')); // in-flight
+    expect(accept).toHaveBeenCalledTimes(1);
+    resolveAccept();
+  });
 });
