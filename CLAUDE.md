@@ -133,7 +133,9 @@ Wire-format pinning tests (`tests/wire_format_*_fixtures.rs`) use deterministic 
 
 ### `--all-targets` is load-bearing
 
-Always include `--all-targets` in clippy and test commands. Without it, integration test compile errors slip through the lib-only `cargo test` invocation. ZEB-164's SidecarId migration proved this: main stayed "green" for two days while contributors only ran `cargo test --lib` locally; the breakage was in `tests/content_index_integration.rs` and `tests/folder_primitive_integration.rs`.
+Always include `--all-targets` in clippy and full-gate test commands (the
+ZEB-631 iterative selection below is the one documented exception — and it is
+backstopped by full runs). Without it, integration test compile errors slip through the lib-only `cargo test` invocation. ZEB-164's SidecarId migration proved this: main stayed "green" for two days while contributors only ran `cargo test --lib` locally; the breakage was in `tests/content_index_integration.rs` and `tests/folder_primitive_integration.rs`.
 
 ### `--locked` is load-bearing
 
@@ -190,6 +192,8 @@ untouched by design; full runs are the scheme's backstop).
 `src-tauri/vendor/`) make module mapping unreliable — the script exits and
 tells you to use `--full` (or `--force` to proceed anyway). `git add` new test
 files before gating: untracked files are invisible to the always-run set.
+
+### sccache (optional, larger speedup)
 
 [`sccache`](https://github.com/mozilla/sccache) caches cargo's compile artifacts across `cargo` invocations and across projects that share dep trees. Worth installing if you switch between `harmony-client` and other Rust projects often:
 

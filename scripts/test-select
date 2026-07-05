@@ -79,11 +79,15 @@ terms="" warn_deps=0
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   case "$f" in
-    src-tauri/Cargo.toml|src-tauri/Cargo.lock|src-tauri/.cargo/*|src-tauri/vendor/*)
+    src-tauri/Cargo.toml|src-tauri/Cargo.lock|src-tauri/.cargo/*|.cargo/*|src-tauri/vendor/*)
       warn_deps=1 ;;
     src-tauri/src/*.rs)
+      # lib/main would match half the suite; mod (case globs cross '/', so
+      # src/api/mod.rs lands here) would produce a garbage test(mod) term.
+      # All three fall back to the sampled pass + full backstops — honest
+      # coarseness over a wrong always-run claim.
       m="$(basename "$f" .rs)"
-      [ "$m" = "lib" ] || [ "$m" = "main" ] || terms="$terms test($m)" ;;
+      [ "$m" = "lib" ] || [ "$m" = "main" ] || [ "$m" = "mod" ] || terms="$terms test($m)" ;;
     src-tauri/tests/*.rs)
       terms="$terms binary($(basename "$f" .rs))" ;;
   esac
