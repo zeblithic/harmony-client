@@ -471,6 +471,8 @@ pub(crate) async fn ingest_dm_packet(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
+            // Capture for the ZEB-639 ignore log (`signed` moves into apply_invite).
+            let invite_space_id = signed.space_id;
             // Scope the owner-state lock to the `apply_invite` call: the outcome
             // is owned, so we take it out and DROP the guard before staging +
             // emitting (the store `Mutex` + event sink must not nest inside the
@@ -516,7 +518,23 @@ pub(crate) async fn ingest_dm_packet(
                         staged,
                     );
                 }
-                crate::dm_outbox::ApplyInviteOutcome::Accepted => {}
+                crate::dm_outbox::ApplyInviteOutcome::Accepted => {
+                    // ZEB-640 (1): a friend-tier auto-accept makes any EARLIER
+                    // staged (pre-befriend) entry for this space stale — the
+                    // Space now exists in nav, so purge the pending row.
+                    crate::pending_dm_invites::purge_stale_staged_on_accept(
+                        pending_invites.as_ref(),
+                        sink.as_ref(),
+                        &invite_space_id,
+                    );
+                }
+                // ZEB-639: non-friend invite for a space we already hold — no-op.
+                crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
+                    tracing::debug!(
+                        space_id = ?invite_space_id,
+                        "tunnel invite ignored: space already exists locally (non-friend inviter)"
+                    );
+                }
             }
             return Ok(false);
         }
@@ -800,6 +818,12 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         // 3. The NORMAL receive-path admission pipeline, under the
         //    owner-state lock (signature, owner resolution, Space lookup,
         //    SpaceKind gate, membership).
+        // ZEB-640 (1): set inside the lock scope when `apply_deposited_invite`
+        // consumed a co-deposited invite WITHOUT staging (`Ok(None)`:
+        // friend-tier auto-accept, or the Space already exists) — any EARLIER
+        // staged (pre-befriend) entry for this space is stale. The purge itself
+        // runs AFTER the lock scope (helper caller contract).
+        let mut purge_stale_staged = false;
         let (space, resolved_owner) = {
             let mut state = self.crdt_state.lock().await;
             // ZEB-483 (CodeRabbit Critical): verify the CidNotify's signer
@@ -823,7 +847,7 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
             // ZEB-236 (T3): a co-deposited invite from a non-friend is STAGED
             // (writes no Space); `apply_deposited_invite` hands it back here.
             let staged_invite = if let Some(inv) = entry.invite_packet.as_ref() {
-                crate::dm_outbox::apply_deposited_invite(
+                match crate::dm_outbox::apply_deposited_invite(
                     &mut state,
                     self.self_owner,
                     &self.self_device_id(),
@@ -833,7 +857,15 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                     signed.signing_device_hash,
                     identity_pub,
                     self.now_ms(),
-                )?
+                )? {
+                    Some(staged) => Some(staged),
+                    // ZEB-640 (1): invite consumed without staging (friend-tier
+                    // accept / space exists) → flag the post-lock purge.
+                    None => {
+                        purge_stale_staged = true;
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -874,6 +906,16 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                 };
             (space, resolved_owner)
         };
+        // ZEB-640 (1): the co-deposited invite auto-accepted (or the Space
+        // already existed) — the lock is dropped now, so purge any stale
+        // staged (pre-befriend) entry for this space.
+        if purge_stale_staged {
+            crate::pending_dm_invites::purge_stale_staged_on_accept(
+                self.pending_dm_invites.as_ref(),
+                self.sink.as_ref(),
+                &signed.space_id,
+            );
+        }
         // 4. Blob ↔ packet binding: the deposited storage blob must hash to
         //    the packet's message_cid under the DM send path's flags.
         let computed_cid = harmony_content::cid::ContentId::for_book(
@@ -920,6 +962,8 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         if signed.inviter.0 != entry.sender_owner {
             return Err("ZEB-505: invite inviter does not match deposit entry sender".into());
         }
+        // Capture for the ZEB-639 ignore log (`signed` moves into apply_invite).
+        let invite_space_id = signed.space_id;
         // Scope the lock to `apply_invite`, then DROP the guard before staging +
         // emitting (store `Mutex` + sink must not nest inside the held lock).
         let outcome = {
@@ -949,7 +993,25 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                 );
                 Ok(())
             }
-            crate::dm_outbox::ApplyInviteOutcome::Accepted => Ok(()),
+            crate::dm_outbox::ApplyInviteOutcome::Accepted => {
+                // ZEB-640 (1): a friend-tier auto-accept makes any EARLIER
+                // staged (pre-befriend) entry for this space stale — the Space
+                // now exists in nav, so purge the pending row.
+                crate::pending_dm_invites::purge_stale_staged_on_accept(
+                    self.pending_dm_invites.as_ref(),
+                    self.sink.as_ref(),
+                    &invite_space_id,
+                );
+                Ok(())
+            }
+            // ZEB-639: non-friend invite for a space we already hold — no-op.
+            crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
+                tracing::debug!(
+                    space_id = ?invite_space_id,
+                    "deposited invite ignored: space already exists locally (non-friend inviter)"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -1896,6 +1958,153 @@ mod tests {
                 .all(|(n, _)| n != crate::dm_outbox::DM_RECEIVED_EVENT),
             "an invite must not emit dm-received"
         );
+    }
+
+    /// ZEB-640 (1): befriend-then-redeliver. A non-friend tunnel invite is
+    /// STAGED; the user then befriends the inviter; a redelivery of the same
+    /// invite now auto-accepts (friend tier) and writes the Space. The
+    /// `Accepted` arm must PURGE the stale staged entry — otherwise a pending
+    /// toast/row survives for a DM Space that already exists in nav. The purge
+    /// leg emits exactly one `dm-invite-list-changed` and NO
+    /// `dm-invite-received` (nothing to prompt).
+    #[tokio::test]
+    async fn ingest_dm_packet_purges_staged_invite_on_friend_tier_accept() {
+        let bob = OwnerAddr([0xB0; 16]);
+        let space_id = SpaceId([0x77; 16]);
+        let state = std::sync::Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(std::sync::Arc::clone(&sink_handle));
+        let pending = std::sync::Arc::new(crate::pending_dm_invites::PendingDmInvites::new());
+
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice = OwnerAddr([0xA1; 16]);
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+
+        let mut members = vec![alice, bob];
+        members.sort();
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id,
+            kind: crate::owner_state_types::SpaceKind::Dm,
+            members,
+            inviter: alice,
+            content_key: crate::owner_state_types::DmContentKey::new([0x42; 32]),
+            sender_devices: vec![alice_device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            signing_device_hash: alice_device_hash,
+            inviter_identity_pub: alice_identity_pub,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+        let packet = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+            signed,
+            signature,
+            signed_bytes,
+        })
+        .unwrap();
+
+        // Alice's device is cached (so `resolve_owner_for_peer` binds the peer),
+        // but she is NOT (yet) an active friend — the first delivery stages.
+        let alice_dsa_pubkey = vec![0x07u8; 1952];
+        let peer_node_id = crate::tunnel_manager::node_id_from_dsa_pubkey(&alice_dsa_pubkey);
+        {
+            let mut st = state.lock().await;
+            st.apply_owner_device_update(
+                alice,
+                vec![alice_device_hash],
+                vec![None],
+                vec![Some(crate::owner_state_types::DeviceTunnelContact {
+                    iroh_node_id: [0x09; 32],
+                    home_relay_url: None,
+                    pq_dsa_pubkey: alice_dsa_pubkey.clone(),
+                    pq_kem_pubkey: vec![0x08u8; 1184],
+                })],
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "handshake".into(),
+                },
+            );
+        }
+
+        // Leg 1: non-friend delivery → staged (Space NOT written).
+        ingest_dm_packet(
+            &state,
+            &content_store,
+            &sink,
+            Some(std::sync::Arc::clone(&pending)),
+            bob,
+            "bob-device-64hex",
+            peer_node_id,
+            &packet,
+        )
+        .await
+        .expect("a non-friend invite stages (not an error)");
+        assert_eq!(pending.list().len(), 1, "precondition: invite staged");
+        let frames_after_staging = sink_handle.frames().len();
+
+        // Befriend Alice AFTER staging — the redelivery below now takes the
+        // friend-tier auto-accept fork.
+        {
+            let mut st = state.lock().await;
+            st.friend_graph
+                .friends
+                .insert(alice, crate::friend_graph::active_friend_entry_for_test(2));
+        }
+
+        // Leg 2: redeliver the SAME invite → friend-tier auto-accept writes
+        // the Space AND purges the now-stale staged entry.
+        ingest_dm_packet(
+            &state,
+            &content_store,
+            &sink,
+            Some(std::sync::Arc::clone(&pending)),
+            bob,
+            "bob-device-64hex",
+            peer_node_id,
+            &packet,
+        )
+        .await
+        .expect("a friend-tier invite redelivery must apply");
+
+        {
+            let st = state.lock().await;
+            assert!(
+                st.spaces.contains_key(&space_id),
+                "friend-tier auto-accept must write the DM Space"
+            );
+        }
+        assert!(
+            pending.list().is_empty(),
+            "the stale staged entry must be purged on friend-tier accept"
+        );
+
+        // The purge leg emits EXACTLY one dm-invite-list-changed and nothing
+        // else — no dm-invite-received (nothing to prompt), no dm-received
+        // (invites carry no message).
+        let purge_frames = sink_handle.frames().split_off(frames_after_staging);
+        assert_eq!(
+            purge_frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-list-changed")
+                .count(),
+            1,
+            "purge emits list-changed exactly once"
+        );
+        assert!(
+            purge_frames.iter().all(|(n, _)| n != "dm-invite-received"),
+            "purge must never re-prompt"
+        );
+        assert_eq!(purge_frames.len(), 1, "no other events from the purge leg");
     }
 
     /// ZEB-484: a `CidNotifyWithBlob` delivers the DM live — the inline blob is
@@ -3477,6 +3686,84 @@ mod tests {
         assert!(
             new_frames.iter().any(|n| n == "dm-invite-list-changed"),
             "a new-cid message fires list-changed: {new_frames:?}"
+        );
+    }
+
+    /// ZEB-641 (1): staging wiring pin for the PROD-INGEST invite-only site
+    /// (`ProdDmInboxIngestCtx::apply_invite_only`, the deposit sweeper's
+    /// ZEB-505 route — the second `ApplyInviteOutcome` match in this file).
+    /// A non-friend invite-only deposit through the real site wiring lands in
+    /// a REAL `PendingDmInvites` and emits both UI events exactly once; an
+    /// identical redelivery (the sweeper re-runs every ~7.5 min while the
+    /// entry stays pending) emits NOTHING further (keep-first at site level).
+    #[tokio::test]
+    async fn apply_invite_only_stages_non_friend_deposited_invite() {
+        let (ctx, pending, sink_handle) = build_non_friend_staging_ctx();
+        // ZEB-505 invite-only deposit: strip the co-deposit down to the bare
+        // invite (mirrors the relay fixture's `invite_only_payload`).
+        let (mut entry, space_id, _cid) = build_staging_co_deposit(b"invite only");
+        entry.cidnotify_packet = None;
+        entry.storage_blob = Vec::new();
+
+        ctx.apply_invite_only(&entry)
+            .await
+            .expect("a staged non-friend invite-only deposit is Ok, not an error");
+
+        // Staging writes nothing to owner-state (Space appears only on accept).
+        {
+            let st = ctx.crdt_state.lock().await;
+            assert!(
+                !st.spaces.contains_key(&space_id),
+                "a staged (non-friend) invite must NOT write the DM Space"
+            );
+        }
+        let staged = pending.list();
+        assert_eq!(staged.len(), 1, "exactly one invite staged");
+        assert_eq!(staged[0].signed.space_id, space_id);
+        assert_eq!(
+            staged[0].source_cid, None,
+            "an invite-only deposit has no notifying message — apply_invite \
+             leaves source_cid None and this site never overwrites it"
+        );
+        assert!(
+            !staged[0].refresh_owner_device_cache,
+            "deposit-recover route is never cache-refresh entitled (ZEB-483)"
+        );
+
+        let frames = sink_handle.frames();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-received")
+                .count(),
+            1,
+            "newly-staged invite prompts exactly once"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-list-changed")
+                .count(),
+            1,
+            "list-changed fires once after staging"
+        );
+
+        // Second identical delivery (sweep re-run): keep-first — no re-stage,
+        // no re-emit.
+        let frames_before = sink_handle.frames().len();
+        ctx.apply_invite_only(&entry)
+            .await
+            .expect("an already-pending redelivery is still Ok");
+        assert_eq!(
+            pending.list().len(),
+            1,
+            "keep-first: the redelivery must not re-stage or duplicate"
+        );
+        assert_eq!(
+            sink_handle.frames().len(),
+            frames_before,
+            "an already-pending redelivery emits neither dm-invite-received \
+             nor dm-invite-list-changed"
         );
     }
 }

@@ -49048,9 +49048,29 @@ pub(crate) async fn accept_dm_invite_impl(
         )
     };
     if let Err(e) = apply_result {
-        // Transient failure — re-stage so it isn't a silent decline.
-        store.stage(restage_copy);
-        return Err(format!("accept failed: {e:?}"));
+        return match e {
+            // ZEB-640: CRDT rejects are deterministic-permanent (pure function
+            // of state + input — Tombstoned, invariant violations). Re-staging
+            // would wedge the row: every Accept re-errors forever and only
+            // Decline clears it. Drop the row and tell both surfaces.
+            crate::dm_outbox::DmReceiveError::CrdtRejected(reason) => {
+                // Mirror the success path's phantom-row cleanup (PR #403
+                // round 1): a co-deposit redelivery during the accept window
+                // can re-stage this invite (a tombstoned space is NOT in
+                // `spaces`, so the ZEB-639 gate passes) — "drop the row" must
+                // hold under that race too, or the emit below lies.
+                let _ = store.take(&space_id);
+                crate::node_event_sink::emit_ser(sink.as_ref(), "dm-invite-list-changed", &());
+                Err(format!("invite no longer applicable: {reason}"))
+            }
+            // Defensive arm: the tail's only current Err is CrdtRejected, but a
+            // future genuinely-transient failure must re-stage — a silently
+            // lost accept is indistinguishable from a decline (spec).
+            other => {
+                store.stage(restage_copy);
+                Err(format!("accept failed: {other:?}"))
+            }
+        };
     }
 
     // A ZEB-483 co-deposit redelivery can re-stage this invite in the window
@@ -50607,6 +50627,88 @@ mod friend_ipc_tests {
             "same-ms invites tie-break on space_id_hex ({} !< {})",
             order[2].1,
             order[3].1
+        );
+    }
+
+    // ── ZEB-640 (2): permanent accept failures drop the pending row ──────
+
+    /// A space tombstoned between staging and the user's Accept click is a
+    /// deterministic-permanent CRDT reject (same input, same reject — pure
+    /// function of state + input). Re-staging it would wedge the row: every
+    /// Accept re-errors forever and only Decline clears it. The impl must
+    /// DROP the row, refresh both UI surfaces, and return a distinct
+    /// user-explainable error instead of the generic "accept failed".
+    #[tokio::test]
+    async fn accept_of_tombstoned_space_drops_pending_row_with_distinct_error() {
+        use crate::pending_dm_invites::{PendingDmInvites, StagedDmInvite};
+
+        let mut signed = crate::dm_envelope::test_fixtures::minimal_invite_for_space(0x2F);
+        // The fixture carries a single member; a Dm Space must have exactly 2
+        // distinct members and `apply_space` checks invariants BEFORE the
+        // tombstone gate. Add the local side so the TOMBSTONE is what rejects
+        // (accept does not re-verify signatures, so mutating here is sound).
+        signed.members.push(OwnerAddr([0x30; 16]));
+        let space_id = signed.space_id;
+        let space_id_hex = hex::encode(space_id.0);
+
+        let store = Arc::new(PendingDmInvites::new());
+        assert!(store.stage(StagedDmInvite {
+            signed,
+            received_at_ms: 1_000,
+            refresh_owner_device_cache: false,
+            source_cid: None,
+        }));
+
+        // Tombstone AFTER staging — the ZEB-640 wedge window: the space died
+        // between the invite being staged and the user clicking Accept.
+        let mut owner_state = OwnerState::default();
+        owner_state.tombstone_space(space_id);
+
+        let state = std::sync::Mutex::new(NodeState {
+            pending_dm_invites: Some(Arc::clone(&store)),
+            crdt_state: Some(Arc::new(TokioMutex::new(owner_state))),
+            dm_device_id: Some("dev".into()),
+            ..NodeState::default()
+        });
+        let rec = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> = Arc::new(Arc::clone(&rec));
+
+        // (a) Distinct, user-explainable error — not the generic
+        // "accept failed" used by the (defensive) transient arm.
+        let err = accept_dm_invite_impl(&state, Arc::clone(&sink), space_id_hex.clone())
+            .await
+            .expect_err("accept of a tombstoned space must error");
+        assert!(
+            err.starts_with("invite no longer applicable"),
+            "permanent CRDT reject must return the distinct message, got: {err}"
+        );
+
+        // (b) The row is DROPPED, not re-staged — no wedge.
+        assert!(
+            list_pending_dm_invites_inner(&store).is_empty(),
+            "a permanent reject must drop the pending row, not re-stage it"
+        );
+
+        // (c) Exactly one dm-invite-list-changed so both UI surfaces (inbox
+        // panel + badge) drop the dead row.
+        let changed = rec
+            .frames()
+            .iter()
+            .filter(|(event, _)| event == "dm-invite-list-changed")
+            .count();
+        assert_eq!(
+            changed, 1,
+            "exactly one dm-invite-list-changed must be emitted on drop"
+        );
+
+        // (d) The row is really gone: a second Accept hits the standard
+        // missing-row guard, not another CRDT reject.
+        let err2 = accept_dm_invite_impl(&state, sink, space_id_hex)
+            .await
+            .expect_err("second accept must fail: the row is gone");
+        assert!(
+            err2.contains("no pending DM invite for space"),
+            "second accept must hit the no-row guard, got: {err2}"
         );
     }
 

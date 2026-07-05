@@ -428,6 +428,8 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     "ZEB-505: invite inviter does not match authenticated relay sender".into(),
                 );
             }
+            // Capture for the ZEB-639 ignore log (`signed` moves into apply_invite).
+            let invite_space_id = signed.space_id;
             // Scope the lock to `apply_invite`, then DROP the guard before
             // staging + emitting (store `Mutex` + sink must not nest inside the
             // held `crdt_state` lock — ZEB-236 T3).
@@ -455,7 +457,23 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                         staged,
                     );
                 }
-                crate::dm_outbox::ApplyInviteOutcome::Accepted => {}
+                crate::dm_outbox::ApplyInviteOutcome::Accepted => {
+                    // ZEB-640 (1): a friend-tier auto-accept makes any EARLIER
+                    // staged (pre-befriend) entry for this space stale — the
+                    // Space now exists in nav, so purge the pending row.
+                    crate::pending_dm_invites::purge_stale_staged_on_accept(
+                        self.pending_dm_invites.as_ref(),
+                        self.sink.as_ref(),
+                        &invite_space_id,
+                    );
+                }
+                // ZEB-639: non-friend invite for a space we already hold — no-op.
+                crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
+                    tracing::debug!(
+                        space_id = ?invite_space_id,
+                        "relay invite ignored: space already exists locally (non-friend inviter)"
+                    );
+                }
             }
             return Ok(());
         };
@@ -493,6 +511,12 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
         //    here from the packet — there is no separate sender claim to bind.
         //    `apply_inbox` runs under the SAME lock acquisition so admission and
         //    the durable insert are atomic, matching the direct path.
+        // ZEB-640 (1): set inside the lock scope when `apply_deposited_invite`
+        // consumed a co-deposited invite WITHOUT staging (`Ok(None)`:
+        // friend-tier auto-accept, or the Space already exists) — any EARLIER
+        // staged (pre-befriend) entry for this space is stale. The purge itself
+        // runs AFTER the lock scope (helper caller contract).
+        let mut purge_stale_staged = false;
         let (resolved_owner, payload_msg, newly_inserted, received_at, space_id, message_cid) = {
             let mut state = self.crdt_state.lock().await;
             // ZEB-483 (CodeRabbit Critical): verify the CidNotify's signer
@@ -516,7 +540,7 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
             // ZEB-236 (T3): a co-deposited invite from a non-friend is STAGED
             // (writes no Space); `apply_deposited_invite` hands it back here.
             let staged_invite = if let Some(inv) = payload.invite_packet.as_ref() {
-                crate::dm_outbox::apply_deposited_invite(
+                match crate::dm_outbox::apply_deposited_invite(
                     &mut state,
                     self.self_owner,
                     &self.device_id,
@@ -526,7 +550,15 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     signed.signing_device_hash,
                     identity_pub,
                     now_epoch_ms(),
-                )?
+                )? {
+                    Some(staged) => Some(staged),
+                    // ZEB-640 (1): invite consumed without staging (friend-tier
+                    // accept / space exists) → flag the post-lock purge.
+                    None => {
+                        purge_stale_staged = true;
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -611,6 +643,17 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                 signed.message_cid,
             )
         };
+
+        // ZEB-640 (1): the co-deposited invite auto-accepted (or the Space
+        // already existed) — the lock is dropped now, so purge any stale
+        // staged (pre-befriend) entry for this space.
+        if purge_stale_staged {
+            crate::pending_dm_invites::purge_stale_staged_on_accept(
+                self.pending_dm_invites.as_ref(),
+                self.sink.as_ref(),
+                &space_id,
+            );
+        }
 
         // 7. Emit the SAME dm-received event the normal path emits, gated on
         //    Inserted (a duplicate — direct arrival or an earlier ingest — never
@@ -2977,6 +3020,196 @@ mod tests {
             fx2.emitted_dm_received(),
             0,
             "invite-only recover delivers no message"
+        );
+    }
+
+    /// ZEB-641 (1): fixture variant for the relay STAGING arms — Alice is
+    /// pre-cached (sender-binding resolves) but NOT an active friend (the
+    /// ZEB-236 tier fork stages instead of auto-accepting), and the ctx is
+    /// wired to a REAL `PendingDmInvites` (the base fixture wires `None`).
+    async fn relay_non_friend_staging_fixture() -> (
+        RelayRecoverInviteFixture,
+        Arc<crate::pending_dm_invites::PendingDmInvites>,
+    ) {
+        let mut fx = relay_ingest_fixture_without_space_with_invite(true);
+        {
+            let mut st = fx.crdt_state.lock().await;
+            st.friend_graph.friends.remove(&OwnerAddr([0xA1; 16]));
+        }
+        let pending = Arc::new(crate::pending_dm_invites::PendingDmInvites::new());
+        fx.prod_ctx.pending_dm_invites = Some(Arc::clone(&pending));
+        (fx, pending)
+    }
+
+    /// ZEB-641 (1): staging wiring pin for the relay DIRECT (invite-only)
+    /// arm of `ProdRelayIngestCtx::ingest_recovered`. A non-friend
+    /// invite-only recover through the real site wiring lands in a REAL
+    /// `PendingDmInvites` and emits both UI events exactly once; an identical
+    /// redelivery (the relay re-delivers while the invite stays unacked)
+    /// emits NOTHING further (keep-first at site level).
+    #[tokio::test]
+    async fn ingest_recovered_invite_only_stages_non_friend_invite() {
+        let (fx, pending) = relay_non_friend_staging_fixture().await;
+
+        fx.prod_ctx
+            .ingest_recovered([0xA1; 16], fx.invite_only_payload())
+            .await
+            .expect("a staged non-friend invite-only recover is Ok, not an error");
+
+        // Staging writes nothing to owner-state (Space appears only on accept).
+        {
+            let st = fx.crdt_state.lock().await;
+            assert!(
+                !st.spaces.contains_key(&fx.space_id),
+                "a staged (non-friend) invite must NOT write the DM Space"
+            );
+        }
+        let staged = pending.list();
+        assert_eq!(staged.len(), 1, "exactly one invite staged");
+        assert_eq!(staged[0].signed.space_id, fx.space_id);
+        assert_eq!(
+            staged[0].source_cid, None,
+            "the direct invite-only arm has no notifying message — \
+             apply_invite leaves source_cid None and this site never \
+             overwrites it"
+        );
+        assert!(
+            !staged[0].refresh_owner_device_cache,
+            "relay-recover route is never cache-refresh entitled (ZEB-483)"
+        );
+
+        let frames = fx.sink.frames();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-received")
+                .count(),
+            1,
+            "newly-staged invite prompts exactly once"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-list-changed")
+                .count(),
+            1,
+            "list-changed fires once after staging"
+        );
+        assert_eq!(fx.emitted_dm_received(), 0, "no message to deliver");
+
+        // Second identical delivery: keep-first — no re-stage, no re-emit.
+        let frames_before = fx.sink.frames().len();
+        fx.prod_ctx
+            .ingest_recovered([0xA1; 16], fx.invite_only_payload())
+            .await
+            .expect("an already-pending redelivery is still Ok");
+        assert_eq!(
+            pending.list().len(),
+            1,
+            "keep-first: the redelivery must not re-stage or duplicate"
+        );
+        assert_eq!(
+            fx.sink.frames().len(),
+            frames_before,
+            "an already-pending redelivery emits neither dm-invite-received \
+             nor dm-invite-list-changed"
+        );
+    }
+
+    /// ZEB-641 (1): staging wiring pin for the relay CO-DEPOSIT arm of
+    /// `ProdRelayIngestCtx::ingest_recovered` (the `Ok(Some(staged))` branch:
+    /// non-friend co-deposited invite + SpaceNotFound on the message). The
+    /// invite is staged in a REAL `PendingDmInvites` tagged with the
+    /// notifying message's cid, both UI events fire exactly once, and the
+    /// message itself is deferred (Err → unacked for post-accept redelivery).
+    /// An identical redelivery emits NOTHING further (keep-first at site
+    /// level).
+    #[tokio::test]
+    async fn ingest_recovered_co_deposit_stages_non_friend_invite() {
+        use crate::owner_state_types::ContentId;
+        let (fx, pending) = relay_non_friend_staging_fixture().await;
+        // The site tags the staged invite with the verified CidNotify's
+        // message_cid — recompute it from the payload blob the same way.
+        let expected_cid = ContentId::for_book(
+            &fx.payload.storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = fx
+            .prod_ctx
+            .ingest_recovered([0xA1; 16], fx.payload.clone())
+            .await
+            .expect_err("the staging arm defers the message (unacked for post-accept redelivery)");
+        assert!(err.contains("SpaceNotFound"), "got {err}");
+
+        // Staging writes nothing to owner-state (Space appears only on accept).
+        {
+            let st = fx.crdt_state.lock().await;
+            assert!(
+                !st.spaces.contains_key(&fx.space_id),
+                "a staged (non-friend) invite must NOT write the DM Space"
+            );
+        }
+        let staged = pending.list();
+        assert_eq!(staged.len(), 1, "exactly one invite staged");
+        assert_eq!(staged[0].signed.space_id, fx.space_id);
+        assert_eq!(
+            staged[0].source_cid,
+            Some(expected_cid),
+            "the co-deposit arm overwrites source_cid with the notifying \
+             message's cid (decline-ledger key for sweep redeliveries)"
+        );
+        assert!(
+            !staged[0].refresh_owner_device_cache,
+            "relay-recover route is never cache-refresh entitled (ZEB-483)"
+        );
+
+        let frames = fx.sink.frames();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-received")
+                .count(),
+            1,
+            "newly-staged invite prompts exactly once"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-list-changed")
+                .count(),
+            1,
+            "list-changed fires once after staging"
+        );
+        assert_eq!(
+            fx.emitted_dm_received(),
+            0,
+            "deferred message never delivers"
+        );
+
+        // Second identical delivery (relay drain re-run while unacked):
+        // keep-first — still defers, no re-stage, no re-emit.
+        let frames_before = fx.sink.frames().len();
+        let err2 = fx
+            .prod_ctx
+            .ingest_recovered([0xA1; 16], fx.payload.clone())
+            .await
+            .expect_err("redelivery still defers");
+        assert!(err2.contains("SpaceNotFound"), "got {err2}");
+        assert_eq!(
+            pending.list().len(),
+            1,
+            "keep-first: the redelivery must not re-stage or duplicate"
+        );
+        assert_eq!(
+            fx.sink.frames().len(),
+            frames_before,
+            "an already-pending redelivery emits neither dm-invite-received \
+             nor dm-invite-list-changed"
         );
     }
 }
