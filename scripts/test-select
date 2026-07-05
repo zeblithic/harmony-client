@@ -79,7 +79,7 @@ terms="" warn_deps=0
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   case "$f" in
-    src-tauri/Cargo.toml|src-tauri/Cargo.lock|src-tauri/.cargo/*|vendor/*)
+    src-tauri/Cargo.toml|src-tauri/Cargo.lock|src-tauri/.cargo/*|src-tauri/vendor/*)
       warn_deps=1 ;;
     src-tauri/src/*.rs)
       m="$(basename "$f" .rs)"
@@ -91,10 +91,13 @@ done <<EOF
 $changed
 EOF
 
-if [ "$warn_deps" -eq 1 ] && [ "$force" -eq 0 ]; then
+if [ "$warn_deps" -eq 1 ]; then
   echo "test-select: dependency-graph files changed (Cargo.toml/lock/.cargo/vendor)." >&2
-  echo "test-select: module mapping is unreliable — use --full (or --force to proceed)." >&2
-  exit 2
+  if [ "$force" -eq 0 ]; then
+    echo "test-select: module mapping is unreliable — use --full (or --force to proceed)." >&2
+    exit 2
+  fi
+  echo "test-select: --force given — proceeding with selection anyway." >&2
 fi
 
 always_expr=""
@@ -106,7 +109,10 @@ fi
 echo "test-select: round=$round k=$k bucket=$bucket/$k always-run=[${always_expr:-none}]"
 
 if [ -n "$always_expr" ]; then
-  run_cmd "${base_cmd[@]}" -E "$always_expr" ${extra[@]+"${extra[@]}"}
+  # --no-tests=warn: a changed module whose tests live under other names (or a
+  # tests/common helper mapping to binary(mod)) legitimately matches zero
+  # tests — that must not fail the gate. The sampled pass keeps the default.
+  run_cmd "${base_cmd[@]}" --no-tests=warn -E "$always_expr" ${extra[@]+"${extra[@]}"}
   run_cmd "${base_cmd[@]}" -E "not ($always_expr)" --partition "hash:$bucket/$k" ${extra[@]+"${extra[@]}"}
 else
   run_cmd "${base_cmd[@]}" --partition "hash:$bucket/$k" ${extra[@]+"${extra[@]}"}
