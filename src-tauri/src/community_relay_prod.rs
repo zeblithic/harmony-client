@@ -457,7 +457,16 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                         staged,
                     );
                 }
-                crate::dm_outbox::ApplyInviteOutcome::Accepted => {}
+                crate::dm_outbox::ApplyInviteOutcome::Accepted => {
+                    // ZEB-640 (1): a friend-tier auto-accept makes any EARLIER
+                    // staged (pre-befriend) entry for this space stale — the
+                    // Space now exists in nav, so purge the pending row.
+                    crate::pending_dm_invites::purge_stale_staged_on_accept(
+                        self.pending_dm_invites.as_ref(),
+                        self.sink.as_ref(),
+                        &invite_space_id,
+                    );
+                }
                 // ZEB-639: non-friend invite for a space we already hold — no-op.
                 crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
                     tracing::debug!(
@@ -502,6 +511,12 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
         //    here from the packet — there is no separate sender claim to bind.
         //    `apply_inbox` runs under the SAME lock acquisition so admission and
         //    the durable insert are atomic, matching the direct path.
+        // ZEB-640 (1): set inside the lock scope when `apply_deposited_invite`
+        // consumed a co-deposited invite WITHOUT staging (`Ok(None)`:
+        // friend-tier auto-accept, or the Space already exists) — any EARLIER
+        // staged (pre-befriend) entry for this space is stale. The purge itself
+        // runs AFTER the lock scope (helper caller contract).
+        let mut purge_stale_staged = false;
         let (resolved_owner, payload_msg, newly_inserted, received_at, space_id, message_cid) = {
             let mut state = self.crdt_state.lock().await;
             // ZEB-483 (CodeRabbit Critical): verify the CidNotify's signer
@@ -525,7 +540,7 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
             // ZEB-236 (T3): a co-deposited invite from a non-friend is STAGED
             // (writes no Space); `apply_deposited_invite` hands it back here.
             let staged_invite = if let Some(inv) = payload.invite_packet.as_ref() {
-                crate::dm_outbox::apply_deposited_invite(
+                match crate::dm_outbox::apply_deposited_invite(
                     &mut state,
                     self.self_owner,
                     &self.device_id,
@@ -535,7 +550,15 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     signed.signing_device_hash,
                     identity_pub,
                     now_epoch_ms(),
-                )?
+                )? {
+                    Some(staged) => Some(staged),
+                    // ZEB-640 (1): invite consumed without staging (friend-tier
+                    // accept / space exists) → flag the post-lock purge.
+                    None => {
+                        purge_stale_staged = true;
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -620,6 +643,17 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                 signed.message_cid,
             )
         };
+
+        // ZEB-640 (1): the co-deposited invite auto-accepted (or the Space
+        // already existed) — the lock is dropped now, so purge any stale
+        // staged (pre-befriend) entry for this space.
+        if purge_stale_staged {
+            crate::pending_dm_invites::purge_stale_staged_on_accept(
+                self.pending_dm_invites.as_ref(),
+                self.sink.as_ref(),
+                &space_id,
+            );
+        }
 
         // 7. Emit the SAME dm-received event the normal path emits, gated on
         //    Inserted (a duplicate — direct arrival or an earlier ingest — never

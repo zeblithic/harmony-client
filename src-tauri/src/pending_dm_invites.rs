@@ -182,6 +182,43 @@ pub(crate) fn stage_and_emit_staged_invite(
     }
 }
 
+/// ZEB-640 (1): purge a stale staged invite after a friend-tier auto-accept
+/// for the same `space_id`, shared by every live arm that observes an accept
+/// and holds store+sink. Befriend-then-redeliver: a non-friend invite is
+/// staged, the user then befriends the inviter, and a later redelivery
+/// auto-accepts (friend tier) — without this purge the staged entry survives
+/// as a pending toast/row for a DM Space that already exists in nav.
+///
+/// Emits `dm-invite-list-changed` ONLY when an entry was actually removed —
+/// every friend-tier DM redelivery hits the accept arms, so an unconditional
+/// emit would churn the list view on the hot path. NEVER emits
+/// `dm-invite-received` (nothing to prompt: the Space exists). Consumes via
+/// `take()`, not `decline()`: the Space now exists, so a later redelivery is
+/// admitted by the normal receive path and never re-stages — no declined-ledger
+/// entry is needed (mirrors the user-accept contract on [`PendingDmInvites::take`]).
+///
+/// `pending == None` means the store was not wired on this path (defensive; the
+/// live routes always pass `Some`) — returns silently: purge is best-effort
+/// cleanup, and a path with no store has nothing staged to go stale (unlike a
+/// dropped staging, which loses a user prompt and warrants the stage helper's
+/// warn).
+///
+/// CALLER CONTRACT: the `crdt_state` async lock guard MUST already be dropped
+/// before calling this — `take()` takes the store `Mutex` and this fires the
+/// event sink, neither of which may nest inside the held owner-state lock.
+pub(crate) fn purge_stale_staged_on_accept(
+    pending: Option<&std::sync::Arc<PendingDmInvites>>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    space_id: &crate::owner_state_types::SpaceId,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    if pending.take(space_id).is_some() {
+        crate::node_event_sink::emit_ser(sink, "dm-invite-list-changed", &());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +274,55 @@ mod tests {
         assert!(store.decline(&sid).is_some()); // decline consumes; no cid → no ledger
         assert!(store.stage(staged(3, 200)));
         assert_eq!(store.list()[0].received_at_ms, 200);
+    }
+
+    #[test]
+    fn purge_on_accept_removes_and_emits_once() {
+        // ZEB-640 (1): a staged entry made stale by a friend-tier auto-accept
+        // is purged, and the UI is told the list changed EXACTLY once — with
+        // no re-prompt (`dm-invite-received` is for NEW pending invites only;
+        // the Space now exists in nav, so there is nothing to ask).
+        let store = std::sync::Arc::new(PendingDmInvites::new());
+        let rec = crate::node_event_sink::RecordingSink::new();
+        assert!(store.stage(staged(5, 100)));
+        let sid = store.list()[0].signed.space_id;
+
+        purge_stale_staged_on_accept(Some(&store), &rec, &sid);
+
+        assert!(store.list().is_empty(), "purge consumes the staged entry");
+        let frames = rec.frames();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-list-changed")
+                .count(),
+            1,
+            "purge emits list-changed exactly once"
+        );
+        assert!(
+            frames.iter().all(|(n, _)| n != "dm-invite-received"),
+            "purge must never re-prompt"
+        );
+        assert_eq!(frames.len(), 1, "no other events from the purge");
+    }
+
+    #[test]
+    fn purge_on_accept_is_silent_when_nothing_staged() {
+        // Hot-path noise guard: EVERY friend-tier DM redelivery hits the
+        // Accepted arms, so a purge that finds nothing staged must emit
+        // NOTHING (an unconditional list-changed would churn the list view
+        // on every ~7.5-min sweep).
+        let store = std::sync::Arc::new(PendingDmInvites::new());
+        let rec = crate::node_event_sink::RecordingSink::new();
+        let sid = staged(6, 100).signed.space_id;
+
+        purge_stale_staged_on_accept(Some(&store), &rec, &sid);
+        assert!(rec.frames().is_empty(), "empty store → no events");
+
+        // The defensive None-store arm is silent too (best-effort cleanup —
+        // a path with no store has nothing staged to go stale).
+        purge_stale_staged_on_accept(None, &rec, &sid);
+        assert!(rec.frames().is_empty(), "no store → no events");
     }
 
     #[test]
