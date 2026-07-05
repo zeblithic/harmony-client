@@ -528,11 +528,21 @@ pub(crate) async fn ingest_dm_packet(
                         &invite_space_id,
                     );
                 }
-                // ZEB-639: non-friend invite for a space we already hold — no-op.
+                // ZEB-639: non-friend invite for a space we already hold.
+                // ZEB-642 (1): a staged row for this space is stale by
+                // definition once the space exists (the same argument that
+                // blessed the co-deposit Ok(None) conflation) — purge it.
+                // The helper emits dm-invite-list-changed only on actual
+                // removal, so redeliveries stay event-quiet.
                 crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
                     tracing::debug!(
                         space_id = ?invite_space_id,
                         "tunnel invite ignored: space already exists locally (non-friend inviter)"
+                    );
+                    crate::pending_dm_invites::purge_stale_staged_on_accept(
+                        pending_invites.as_ref(),
+                        sink.as_ref(),
+                        &invite_space_id,
                     );
                 }
             }
@@ -823,6 +833,7 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         // friend-tier auto-accept, or the Space already exists) — any EARLIER
         // staged (pre-befriend) entry for this space is stale. The purge itself
         // runs AFTER the lock scope (helper caller contract).
+        // ZEB-642 (2): dm_inbox's skip-window CLOSES BEFORE blob↔packet binding — the purge at lock-drop precedes step 4, so a binding Err cannot skip it.
         let mut purge_stale_staged = false;
         let (space, resolved_owner) = {
             let mut state = self.crdt_state.lock().await;
@@ -1004,11 +1015,17 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                 );
                 Ok(())
             }
-            // ZEB-639: non-friend invite for a space we already hold — no-op.
+            // ZEB-639: non-friend invite for a space we already hold.
+            // ZEB-642 (1): purge the stale staged row (see tunnel arm).
             crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
                 tracing::debug!(
                     space_id = ?invite_space_id,
                     "deposited invite ignored: space already exists locally (non-friend inviter)"
+                );
+                crate::pending_dm_invites::purge_stale_staged_on_accept(
+                    self.pending_dm_invites.as_ref(),
+                    self.sink.as_ref(),
+                    &invite_space_id,
                 );
                 Ok(())
             }

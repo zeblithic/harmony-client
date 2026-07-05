@@ -467,11 +467,18 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                         &invite_space_id,
                     );
                 }
-                // ZEB-639: non-friend invite for a space we already hold — no-op.
+                // ZEB-639: non-friend invite for a space we already hold.
+                // ZEB-642 (1): purge the stale staged row (see the
+                // dm_inbox_ingest tunnel arm).
                 crate::dm_outbox::ApplyInviteOutcome::IgnoredExistingSpace => {
                     tracing::debug!(
                         space_id = ?invite_space_id,
                         "relay invite ignored: space already exists locally (non-friend inviter)"
+                    );
+                    crate::pending_dm_invites::purge_stale_staged_on_accept(
+                        self.pending_dm_invites.as_ref(),
+                        self.sink.as_ref(),
+                        &invite_space_id,
                     );
                 }
             }
@@ -516,6 +523,7 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
         // friend-tier auto-accept, or the Space already exists) — any EARLIER
         // staged (pre-befriend) entry for this space is stale. The purge itself
         // runs AFTER the lock scope (helper caller contract).
+        // ZEB-642 (2): relay's skip-window EXTENDS THROUGH apply_inbox — the lock scope encloses blob-binding/decrypt/apply_inbox, any of whose Err returns skips the purge until the next delivery.
         let mut purge_stale_staged = false;
         let (resolved_owner, payload_msg, newly_inserted, received_at, space_id, message_cid) = {
             let mut state = self.crdt_state.lock().await;

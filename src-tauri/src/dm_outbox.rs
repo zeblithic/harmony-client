@@ -6024,6 +6024,42 @@ mod tests {
         );
     }
 
+    /// ZEB-642 (3): a TOMBSTONED space is NOT in `state.spaces`, so a
+    /// non-friend invite for it still STAGES (consent re-asked; accept
+    /// later surfaces the permanent tombstone rejection). Pins the
+    /// `spaces.contains_key` gate comment in `apply_invite`.
+    #[test]
+    fn non_friend_invite_for_tombstoned_space_still_stages() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default(); // friend_graph EMPTY → non-friend tier
+
+        // Arrange: the invite's target space is tombstoned (removed from
+        // `spaces`, held only in `tombstones`).
+        state.tombstone_space(SpaceId([7; 16]));
+        let before = crate::owner_state_persist::canonicalize(&state).unwrap();
+
+        let (signed, signature, body_bytes) = build_valid_dm_invite(self_owner);
+        let outcome = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            4242,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(outcome, ApplyInviteOutcome::Staged(_)),
+            "tombstoned space must still stage, got {outcome:?}"
+        );
+        let after = crate::owner_state_persist::canonicalize(&state).unwrap();
+        assert_eq!(before, after, "staging must write NOTHING");
+    }
+
     /// ZEB-639 (1): the friend tier is NOT gated on space existence — an
     /// ACTIVE-friend invite for an existing space still runs the accept tail
     /// (the established idempotent redelivery-merge contract; ZEB-483
