@@ -14,6 +14,14 @@
     onLater: () => void;
   } = $props();
 
+  // Map the SpaceKind wire tag ('d'/'g') to a human label; fall back to the
+  // raw tag for any unexpected value (owner_state_types.rs SpaceKind).
+  function kindLabel(kind: string): string {
+    if (kind === 'd') return 'DM';
+    if (kind === 'g') return 'Group DM';
+    return kind;
+  }
+
   // Accept/Decline call the backend and can be slow (or racy if double-
   // clicked); disable both buttons while either is in flight. "Later" is
   // purely local/session-side (App just filters it out of the queue) so it
@@ -45,7 +53,7 @@
   <div class="dm-invite-toast" data-testid="dm-invite-toast" transition:fly={{ y: 20, duration: 200 }}>
     <div class="invite-info">
       <span class="invite-title">DM invite</span>
-      <span class="invite-body">From {invite.inviterOwnerIdHex.slice(0, 8)}… ({invite.kind})</span>
+      <span class="invite-body">From {invite.inviterOwnerIdHex.slice(0, 8)}… ({kindLabel(invite.kind)})</span>
     </div>
     <div class="invite-actions">
       <button

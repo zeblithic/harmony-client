@@ -49115,11 +49115,15 @@ pub(crate) async fn decline_dm_invite_impl(
     let Some(store) = store else {
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
-    if store.take(&space_id).is_none() {
+    if store.decline(&space_id).is_none() {
         return Err("no pending DM invite for space".into());
     }
-    // `take()` already dropped the staged invite — decline writes no durable
-    // state and notifies no one (spec).
+    // `decline()` dropped the staged invite and, for a co-deposited invite,
+    // recorded its `(space_id, source_cid)` in the session-local declined ledger
+    // so the deposit sweeper's re-delivery of the SAME message does not
+    // re-prompt (ZEB-236 final review). Decline still writes NOTHING durable and
+    // notifies no one (spec §"DmInvite rejection / decline semantics (v1)"): the
+    // ledger is process-local and cleared on restart.
     crate::node_event_sink::emit_ser(sink.as_ref(), "dm-invite-list-changed", &());
     Ok(())
 }
@@ -50514,6 +50518,7 @@ mod friend_ipc_tests {
             signed: signed.clone(),
             received_at_ms: 4_242,
             refresh_owner_device_cache: true,
+            source_cid: None,
         }));
 
         let rows = list_pending_dm_invites_inner(&store);
@@ -50564,6 +50569,7 @@ mod friend_ipc_tests {
                 signed: crate::dm_envelope::test_fixtures::minimal_invite_for_space(space),
                 received_at_ms: ms,
                 refresh_owner_device_cache: false,
+                source_cid: None,
             }));
         }
         let order: Vec<u64> = list_pending_dm_invites_inner(&store)

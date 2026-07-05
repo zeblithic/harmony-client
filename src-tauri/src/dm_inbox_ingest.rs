@@ -853,7 +853,13 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                     Ok(space) => space,
                     Err(e @ crate::dm_outbox::DmReceiveError::SpaceNotFound) => {
                         drop(state);
-                        if let Some(staged) = staged_invite {
+                        if let Some(mut staged) = staged_invite {
+                            // ZEB-236 (final review): tag with the verified
+                            // CidNotify's `message_cid` so a decline suppresses
+                            // re-prompts on THIS SAME message's sweep
+                            // redeliveries (this invite stays unacked while
+                            // pending, so the deposit sweeper re-delivers it).
+                            staged.source_cid = Some(signed.message_cid);
                             crate::pending_dm_invites::stage_and_emit_staged_invite(
                                 self.pending_dm_invites.as_ref(),
                                 self.sink.as_ref(),
@@ -3193,6 +3199,284 @@ mod tests {
                 .iter()
                 .all(|(n, _)| n != "dm-invite-received"),
             "no dm-invite-received emit on a membership-failure error"
+        );
+    }
+
+    // ── ZEB-236 (final review): cid-keyed declined ledger (sweep re-prompt kill) ──
+
+    /// Build a CO-DEPOSIT entry (signed CidNotify + co-deposited invite) from
+    /// Alice that STAGES a non-friend invite on Bob. `body` drives the encrypted
+    /// blob → `message_cid`, so two bodies model the SAME message (a mechanical
+    /// re-run) vs a genuinely NEW message (a new cid). The co-deposited invite is
+    /// identical across bodies — it carries no `message_cid`.
+    fn build_staging_co_deposit(body: &[u8]) -> (DmInboxEntry, SpaceId, ContentId) {
+        let alice = OwnerAddr([0xA1; 16]);
+        let bob = OwnerAddr([0xB0; 16]);
+        let space_id = SpaceId([0x5A; 16]);
+        let content_key = DmContentKey::new([0x42u8; 32]);
+
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+
+        let mut members = vec![alice, bob];
+        members.sort();
+        let created_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+
+        // AAD is keyed on the sorted member set only, so the transient encrypt
+        // Space and the invite-bootstrapped Space share it (mirrors
+        // `build_dm_ingest_fixture_without_space_with_invite`).
+        let aad_space = Space {
+            id: space_id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Alice".into(),
+            transport: None,
+            members: members.clone(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: created_at.clone(),
+            updated_at: created_at.clone(),
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        let payload = crate::dm_envelope::MessagePayload {
+            body: body.to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&aad_space).unwrap();
+        let storage_blob =
+            crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let message_cid = ContentId::for_book(
+            &storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let cn_signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let cn_signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&cn_signed).unwrap();
+        let cn_signature = private_alice.sign(&cn_signed_bytes);
+        let cidnotify_packet =
+            crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::CidNotify {
+                signed: cn_signed,
+                signature: cn_signature,
+                signed_bytes: cn_signed_bytes,
+            })
+            .unwrap();
+
+        let inv_signed = crate::dm_envelope::DmInviteSigned {
+            space_id,
+            kind: SpaceKind::Dm,
+            members,
+            inviter: alice,
+            content_key,
+            sender_devices: vec![alice_device_hash],
+            created_at: created_at.clone(),
+            signing_device_hash: alice_device_hash,
+            inviter_identity_pub: alice_identity_pub,
+        };
+        let inv_signed_bytes =
+            crate::owner_state_crypto::canonical_cbor_encode(&inv_signed).unwrap();
+        let inv_signature = private_alice.sign(&inv_signed_bytes);
+        let invite_wire =
+            crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Invite {
+                signed: inv_signed,
+                signature: inv_signature,
+                signed_bytes: inv_signed_bytes,
+            })
+            .unwrap();
+
+        let entry = DmInboxEntry {
+            sender_owner: alice.0,
+            cidnotify_packet: Some(cidnotify_packet),
+            storage_blob,
+            invite_packet: Some(invite_wire),
+            deposited_at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "butler-device".into(),
+            },
+            deposited_by: "butler-device".into(),
+            ingested_by: BTreeSet::new(),
+        };
+        (entry, space_id, message_cid)
+    }
+
+    /// Bob's ingest ctx for the staging path: Alice's signing device pre-cached
+    /// (sender-binding resolves) but she is NOT an active friend and Bob has NO
+    /// Space, wired to a REAL pending store + a `RecordingSink`.
+    fn build_non_friend_staging_ctx() -> (
+        ProdDmInboxIngestCtx,
+        Arc<crate::pending_dm_invites::PendingDmInvites>,
+        Arc<crate::node_event_sink::RecordingSink>,
+    ) {
+        let alice = OwnerAddr([0xA1; 16]);
+        let bob = OwnerAddr([0xB0; 16]);
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice_device_hash =
+            crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+
+        // Alice cached (sender-binding resolves) but NO friendship (→ stage, not
+        // auto-accept) and NO Space (→ SpaceNotFound defers the message).
+        let mut bob_state = OwnerState::default();
+        bob_state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            vec![None],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "bob-device-64hex".into(),
+            },
+        );
+
+        let crdt_state = Arc::new(Mutex::new(bob_state));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(Arc::clone(&sink_handle));
+        let pending = Arc::new(crate::pending_dm_invites::PendingDmInvites::new());
+
+        let prod_ctx = ProdDmInboxIngestCtx {
+            device_id: "bob-device-64hex".into(),
+            self_owner: bob,
+            crdt_state,
+            content_store,
+            sink,
+            pending_dm_invites: Some(Arc::clone(&pending)),
+            enrolled: BTreeSet::new(),
+        };
+        (prod_ctx, pending, sink_handle)
+    }
+
+    /// FIX 1 test (1): a declined co-deposit invite whose SAME message is
+    /// re-delivered by the deposit sweeper must NOT re-stage and must emit ZERO
+    /// events (kills both the re-prompt AND the every-sweep list-changed churn).
+    #[tokio::test]
+    async fn declined_co_deposit_same_cid_redelivery_is_suppressed() {
+        let (ctx, pending, sink_handle) = build_non_friend_staging_ctx();
+        let (entry, space_id, _cid) = build_staging_co_deposit(b"hello there");
+
+        // First delivery: the co-deposited non-friend invite stages; the message
+        // defers with SpaceNotFound (Space absent until an accept).
+        let err = ctx
+            .verify(&entry)
+            .await
+            .expect_err("staging path defers the message");
+        assert!(err.contains("SpaceNotFound"), "got {err}");
+        assert_eq!(pending.list().len(), 1, "invite staged on first delivery");
+        assert_eq!(
+            sink_handle
+                .frames()
+                .iter()
+                .filter(|(n, _)| n == "dm-invite-received")
+                .count(),
+            1,
+            "newly-staged invite prompts once"
+        );
+
+        // User declines → (space_id, source_cid) is recorded in the ledger.
+        assert!(
+            pending.decline(&space_id).is_some(),
+            "decline consumes the staged invite"
+        );
+        assert!(pending.list().is_empty(), "declined invite removed");
+
+        // The deposit sweeper re-delivers the SAME message (same entry → same
+        // cid). It must NOT re-stage and must emit nothing new.
+        let frames_before = sink_handle.frames().len();
+        let err2 = ctx
+            .verify(&entry)
+            .await
+            .expect_err("redelivery still defers");
+        assert!(err2.contains("SpaceNotFound"), "got {err2}");
+        assert!(
+            pending.list().is_empty(),
+            "the declined message's redelivery must NOT re-stage"
+        );
+        assert_eq!(
+            sink_handle.frames().len(),
+            frames_before,
+            "a suppressed redelivery emits neither dm-invite-received nor \
+             dm-invite-list-changed (sweep churn killed)"
+        );
+    }
+
+    /// FIX 1 test (2): after declining, a genuinely NEW message from the same
+    /// inviter (different `message_cid`) re-stages and re-emits both events.
+    #[tokio::test]
+    async fn declined_then_new_message_different_cid_restages() {
+        let (ctx, pending, sink_handle) = build_non_friend_staging_ctx();
+        let (entry_a, space_id, cid_a) = build_staging_co_deposit(b"first message");
+
+        ctx.verify(&entry_a)
+            .await
+            .expect_err("first staging defers");
+        assert_eq!(pending.list().len(), 1);
+        assert!(pending.decline(&space_id).is_some());
+
+        // Different body → different message_cid → NOT in the declined ledger.
+        let (entry_b, _space_id_b, cid_b) = build_staging_co_deposit(b"second message");
+        assert_ne!(
+            cid_a, cid_b,
+            "different body yields a different message_cid"
+        );
+
+        let frames_before = sink_handle.frames().len();
+        ctx.verify(&entry_b)
+            .await
+            .expect_err("new message also defers (Space still absent)");
+        assert_eq!(
+            pending.list().len(),
+            1,
+            "a genuinely new message re-stages after decline"
+        );
+
+        let new_frames: Vec<String> = sink_handle.frames()[frames_before..]
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert!(
+            new_frames.iter().any(|n| n == "dm-invite-received"),
+            "a new-cid message re-prompts: {new_frames:?}"
+        );
+        assert!(
+            new_frames.iter().any(|n| n == "dm-invite-list-changed"),
+            "a new-cid message fires list-changed: {new_frames:?}"
         );
     }
 }

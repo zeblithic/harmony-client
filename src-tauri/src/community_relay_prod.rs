@@ -546,7 +546,13 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     Ok(space) => space,
                     Err(e @ crate::dm_outbox::DmReceiveError::SpaceNotFound) => {
                         drop(state);
-                        if let Some(staged) = staged_invite {
+                        if let Some(mut staged) = staged_invite {
+                            // ZEB-236 (final review): tag with the verified
+                            // CidNotify's `message_cid` so a decline suppresses
+                            // re-prompts on THIS SAME message's relay-drain
+                            // redeliveries (the invite stays unacked while
+                            // pending, so the relay re-delivers it).
+                            staged.source_cid = Some(signed.message_cid);
                             crate::pending_dm_invites::stage_and_emit_staged_invite(
                                 self.pending_dm_invites.as_ref(),
                                 self.sink.as_ref(),

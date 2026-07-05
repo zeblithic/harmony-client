@@ -58,7 +58,7 @@ function mockDmInviteService(overrides: Partial<DmInviteService> = {}): DmInvite
 const INVITE: PendingDmInviteDto = {
   spaceIdHex: 'deadbeef'.repeat(8),
   inviterOwnerIdHex: 'aabbccdd11223344aabbccdd11223344',
-  kind: 'dm',
+  kind: 'd',
   memberOwnerIdsHex: ['aabbccdd11223344aabbccdd11223344'],
   createdAtMs: 1_700_000_000_000,
   receivedAtMs: 1_700_000_000_000,
@@ -490,8 +490,9 @@ describe('FriendsPanel — DM invites pending section (ZEB-236 T7)', () => {
     const list = await findByTestId('dm-invite-list');
     // Non-friends have no nickname — the short inviter hex (first 8 chars) shows.
     expect(getByTestId(`dm-invite-inviter-${INVITE.spaceIdHex}`).textContent).toContain('aabbccdd');
-    // …alongside the invite kind.
-    expect(list.textContent).toContain('dm');
+    // …alongside the invite kind, rendered as the human label (the 'd' wire
+    // tag maps to "DM"), never the raw serde tag.
+    expect(list.textContent).toContain('DM');
 
     await fireEvent.click(getByTestId('dm-invite-accept-btn'));
     expect(accept).toHaveBeenCalledWith(INVITE.spaceIdHex);

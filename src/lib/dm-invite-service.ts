@@ -29,7 +29,12 @@ export interface PendingDmInviteDto {
   spaceIdHex: string;
   /** The inviter's 16-byte master owner_id, hex-encoded. */
   inviterOwnerIdHex: string;
-  kind: string;
+  /**
+   * SpaceKind wire tag: `'d'` (Dm) or `'g'` (GroupDm) — the raw serde
+   * discriminant from `SpaceKind` in owner_state_types.rs. Surfaces map it to a
+   * human label (see `DmInviteToast.svelte` / `FriendsPanel.svelte`).
+   */
+  kind: 'd' | 'g';
   memberOwnerIdsHex: string[];
   createdAtMs: number;
   receivedAtMs: number;

@@ -532,6 +532,14 @@
     }
   }
 
+  // Map the SpaceKind wire tag ('d'/'g') to a human label; fall back to the
+  // raw tag for any unexpected value (owner_state_types.rs SpaceKind).
+  function dmInviteKindLabel(kind: string): string {
+    if (kind === 'd') return 'DM';
+    if (kind === 'g') return 'Group DM';
+    return kind;
+  }
+
   // ── ZEB-236 T7: DM-invite accept/decline (mirror handleAccept/handleDecline,
   //    keyed by spaceIdHex; failures surface in the section's dmInviteError) ──
   async function handleDmInviteAccept(spaceIdHex: string): Promise<void> {
@@ -1029,7 +1037,7 @@
                 class="friend-name"
                 data-testid="dm-invite-inviter-{invite.spaceIdHex}"
               >{invite.inviterOwnerIdHex.slice(0, 8)}…</span>
-              <span class="friend-addr">{invite.kind} · {relativeTime(invite.receivedAtMs)}</span>
+              <span class="friend-addr">{dmInviteKindLabel(invite.kind)} · {relativeTime(invite.receivedAtMs)}</span>
             </div>
             <div class="request-actions">
               <button

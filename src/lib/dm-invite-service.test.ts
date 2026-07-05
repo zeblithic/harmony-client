@@ -17,7 +17,7 @@ describe('DmInviteService', () => {
   it('listPending invokes the verb and returns rows', async () => {
     const { adapter } = createMockAdapter();
     (adapter.invoke as any) = vi.fn().mockResolvedValue([
-      { spaceIdHex: 'aa', inviterOwnerIdHex: 'bb', kind: 'dm',
+      { spaceIdHex: 'aa', inviterOwnerIdHex: 'bb', kind: 'd',
         memberOwnerIdsHex: ['bb', 'cc'], createdAtMs: 1, receivedAtMs: 2 },
     ]);
     const svc = new DmInviteService();

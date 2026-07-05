@@ -2326,6 +2326,12 @@ pub(crate) fn apply_invite(
                 signed,
                 received_at_ms: wall_now_ms,
                 refresh_owner_device_cache,
+                // ZEB-236 (final review): the CO-DEPOSIT ingest sites tag this
+                // with the notifying message's `message_cid` AFTER this returns
+                // (they hold the verified CidNotify); the tunnel / dormant path
+                // leaves it None — it never sweep-redelivers, so a genuine
+                // re-send is a new sender action that SHOULD re-prompt.
+                source_cid: None,
             },
         ));
     }
