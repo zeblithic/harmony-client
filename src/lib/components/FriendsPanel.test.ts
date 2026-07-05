@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
 import FriendsPanel from './FriendsPanel.svelte';
 import type { FriendService } from '../friend-service';
+import type { DmInviteService, PendingDmInviteDto } from '../dm-invite-service';
 import * as connectivity from '../connectivity-adapter';
 
 // FriendsPanel reads + toggles "Allow discovery by identity address" directly
@@ -40,6 +41,28 @@ function mockCardService(
     unsubscribeAll: vi.fn().mockResolvedValue(undefined),
   };
 }
+
+// ZEB-236 T7: a stand-in for the optional DmInviteService the panel consumes.
+// Only the surface the panel touches (listPending / accept / decline /
+// onPendingChanged) is implemented.
+function mockDmInviteService(overrides: Partial<DmInviteService> = {}): DmInviteService {
+  return {
+    listPending: vi.fn().mockResolvedValue([]),
+    accept: vi.fn().mockResolvedValue(undefined),
+    decline: vi.fn().mockResolvedValue(undefined),
+    onPendingChanged: vi.fn().mockReturnValue(() => {}),
+    ...overrides,
+  } as unknown as DmInviteService;
+}
+
+const INVITE: PendingDmInviteDto = {
+  spaceIdHex: 'deadbeef'.repeat(8),
+  inviterOwnerIdHex: 'aabbccdd11223344aabbccdd11223344',
+  kind: 'dm',
+  memberOwnerIdsHex: ['aabbccdd11223344aabbccdd11223344'],
+  createdAtMs: 1_700_000_000_000,
+  receivedAtMs: 1_700_000_000_000,
+};
 
 const writeText = vi.fn().mockResolvedValue(undefined);
 
@@ -452,5 +475,74 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
     const payload = onOpenCard.mock.calls[0][0];
     expect(payload.ownerIdHex).toBe(id); // FULL hex, not short
     expect(payload.displayName).toBe('RealCardName'); // the signed card name, NOT 'Nick'
+  });
+});
+
+describe('FriendsPanel — DM invites pending section (ZEB-236 T7)', () => {
+  it('renders a DM-invite row (short inviter hex + kind) and accepts it', async () => {
+    const listPending = vi.fn().mockResolvedValue([INVITE]);
+    const accept = vi.fn().mockResolvedValue(undefined);
+    const dmInviteService = mockDmInviteService({ listPending, accept });
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service: mockService(), dmInviteService },
+    });
+
+    const list = await findByTestId('dm-invite-list');
+    // Non-friends have no nickname — the short inviter hex (first 8 chars) shows.
+    expect(getByTestId(`dm-invite-inviter-${INVITE.spaceIdHex}`).textContent).toContain('aabbccdd');
+    // …alongside the invite kind.
+    expect(list.textContent).toContain('dm');
+
+    await fireEvent.click(getByTestId('dm-invite-accept-btn'));
+    expect(accept).toHaveBeenCalledWith(INVITE.spaceIdHex);
+    // Accepting refreshes the pending list (initial mount + post-accept).
+    await vi.waitFor(() => expect(listPending).toHaveBeenCalledTimes(2));
+  });
+
+  it('declines a DM invite and refreshes', async () => {
+    const listPending = vi.fn().mockResolvedValue([INVITE]);
+    const decline = vi.fn().mockResolvedValue(undefined);
+    const dmInviteService = mockDmInviteService({ listPending, decline });
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service: mockService(), dmInviteService },
+    });
+
+    await findByTestId('dm-invite-list');
+    await fireEvent.click(getByTestId('dm-invite-decline-btn'));
+    expect(decline).toHaveBeenCalledWith(INVITE.spaceIdHex);
+    await vi.waitFor(() => expect(listPending).toHaveBeenCalledTimes(2));
+  });
+
+  it('renders no DM-invites section when the service prop is absent', async () => {
+    const { findByTestId, queryByTestId } = render(FriendsPanel, {
+      props: { service: mockService() },
+    });
+    await findByTestId('friends-panel');
+    expect(queryByTestId('dm-invites-section')).toBeNull();
+  });
+
+  it('renders no DM-invites section when there are no pending invites', async () => {
+    const dmInviteService = mockDmInviteService({
+      listPending: vi.fn().mockResolvedValue([]),
+    });
+    const { findByTestId, queryByTestId } = render(FriendsPanel, {
+      props: { service: mockService(), dmInviteService },
+    });
+    await findByTestId('friends-panel');
+    expect(queryByTestId('dm-invites-section')).toBeNull();
+  });
+
+  it('surfaces an accept failure in the section error', async () => {
+    const listPending = vi.fn().mockResolvedValue([INVITE]);
+    const accept = vi.fn().mockRejectedValue(new Error('no pending DM invite for space'));
+    const dmInviteService = mockDmInviteService({ listPending, accept });
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service: mockService(), dmInviteService },
+    });
+
+    await findByTestId('dm-invite-list');
+    await fireEvent.click(getByTestId('dm-invite-accept-btn'));
+    const err = await findByTestId('dm-invite-error');
+    expect(err.textContent).toContain('no pending DM invite for space');
   });
 });

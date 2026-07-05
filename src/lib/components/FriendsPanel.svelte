@@ -26,11 +26,13 @@
     PendingFriendRequestDto,
     ReferralView,
   } from '../friend-service';
+  import type { DmInviteService, PendingDmInviteDto } from '../dm-invite-service';
   import {
     getIdentityDiscoverable,
     setIdentityDiscoverable,
     onIdentityDiscoverableChanged,
   } from '../connectivity-adapter';
+  import { relativeTime } from '../file-utils';
   import Avatar from './Avatar.svelte';
   import type { MemberCardService } from '../member-card-service';
   import type { OpenCardPayload } from './MemberRow.svelte';
@@ -39,6 +41,7 @@
     service,
     cardService,
     onOpenCard,
+    dmInviteService,
   }: {
     service: FriendService;
     /** ZEB-419: dedicated MemberCardService for live friend/request names +
@@ -47,6 +50,11 @@
     cardService?: MemberCardService;
     /** ZEB-419: open the owner-card drill-down popover (App's openMemberCard). */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
+    /** ZEB-236 T7: shared DM-invite service (App injects its single instance).
+     *  Optional so existing instantiations/tests stay valid; the "DM invites"
+     *  section renders only when this is provided AND the pending list is
+     *  non-empty. */
+    dmInviteService?: DmInviteService;
   } = $props();
 
   let friends = $state<FriendDto[]>([]);
@@ -96,6 +104,15 @@
 
   // Per-row in-flight accept/decline guard.
   let requestInFlight = $state<Set<string>>(new Set());
+
+  // ── ZEB-236 T7: pending DM invites (from the injected DmInviteService) ─────
+  // Only populated/subscribed when `dmInviteService` is provided. The section
+  // renders only when this list is non-empty. Per-row accept/decline guard is
+  // keyed by `spaceIdHex` (mirrors requestInFlight for friend requests).
+  let dmInvites = $state<PendingDmInviteDto[]>([]);
+  let dmInviteError = $state<string | null>(null);
+  let dmInviteInFlight = $state<Set<string>>(new Set());
+  let unsubscribeDmInviteChanged: (() => void) | null = null;
 
   // Add-by-key state.
   let addByKeyInput = $state('');
@@ -189,6 +206,20 @@
     }
   }
 
+  // ZEB-236 T7: re-fetch the pending DM-invite list. No-op when the service
+  // wasn't injected. Guards post-teardown writes like refresh()/refreshPending().
+  async function refreshDmInvites(): Promise<void> {
+    if (!dmInviteService) return;
+    try {
+      const next = await dmInviteService.listPending();
+      if (destroyed) return; // see refresh(): no post-teardown state writes
+      dmInvites = next;
+      dmInviteError = null;
+    } catch (e) {
+      dmInviteError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   async function loadAutoAccept(): Promise<void> {
     try {
       autoAccept = await service.getAutoAccept();
@@ -272,6 +303,14 @@
     unsubscribePendingChanged = service.onPendingRequestsChanged(() => {
       void refreshPending();
     });
+    // ZEB-236 T7: re-fetch pending DM invites on new-invite / list-mutated
+    // (accept/decline, possibly from another device). Only when injected.
+    if (dmInviteService) {
+      unsubscribeDmInviteChanged = dmInviteService.onPendingChanged(() => {
+        void refreshDmInvites();
+      });
+      void refreshDmInvites();
+    }
     void refresh();
     void refreshPending();
     void loadAutoAccept();
@@ -290,6 +329,8 @@
     unsubscribeChanged = null;
     unsubscribePendingChanged?.();
     unsubscribePendingChanged = null;
+    unsubscribeDmInviteChanged?.();
+    unsubscribeDmInviteChanged = null;
     unsubscribeDiscoverable?.();
     unsubscribeDiscoverable = null;
     // Block any async path that resumes after teardown (initial add / retry).
@@ -488,6 +529,38 @@
       const next = new Set(requestInFlight);
       next.delete(ownerIdHex);
       requestInFlight = next;
+    }
+  }
+
+  // ── ZEB-236 T7: DM-invite accept/decline (mirror handleAccept/handleDecline,
+  //    keyed by spaceIdHex; failures surface in the section's dmInviteError) ──
+  async function handleDmInviteAccept(spaceIdHex: string): Promise<void> {
+    if (!dmInviteService || dmInviteInFlight.has(spaceIdHex)) return;
+    dmInviteInFlight = new Set(dmInviteInFlight).add(spaceIdHex);
+    try {
+      await dmInviteService.accept(spaceIdHex);
+      await refreshDmInvites();
+    } catch (e) {
+      dmInviteError = e instanceof Error ? e.message : String(e);
+    } finally {
+      const next = new Set(dmInviteInFlight);
+      next.delete(spaceIdHex);
+      dmInviteInFlight = next;
+    }
+  }
+
+  async function handleDmInviteDecline(spaceIdHex: string): Promise<void> {
+    if (!dmInviteService || dmInviteInFlight.has(spaceIdHex)) return;
+    dmInviteInFlight = new Set(dmInviteInFlight).add(spaceIdHex);
+    try {
+      await dmInviteService.decline(spaceIdHex);
+      await refreshDmInvites();
+    } catch (e) {
+      dmInviteError = e instanceof Error ? e.message : String(e);
+    } finally {
+      const next = new Set(dmInviteInFlight);
+      next.delete(spaceIdHex);
+      dmInviteInFlight = next;
     }
   }
 
@@ -935,6 +1008,54 @@
       </ul>
     {/if}
   </div>
+
+  <!-- ── ZEB-236 T7: DM invites inbox ───────────────────────────────────── -->
+  <!-- Rendered only when the service is injected AND there are pending invites.
+       Inviters are non-friends (no nickname / no card), so the row shows the
+       short inviter hex + invite kind + relative received time. -->
+  {#if dmInviteService && dmInvites.length > 0}
+    <div class="subsection" data-testid="dm-invites-section">
+      <h5 class="subsection-title">DM invites</h5>
+
+      {#if dmInviteError}
+        <p class="error-text" data-testid="dm-invite-error">{dmInviteError}</p>
+      {/if}
+
+      <ul class="friend-list" data-testid="dm-invite-list">
+        {#each dmInvites as invite (invite.spaceIdHex)}
+          <li class="friend-row">
+            <div class="friend-id">
+              <span
+                class="friend-name"
+                data-testid="dm-invite-inviter-{invite.spaceIdHex}"
+              >{invite.inviterOwnerIdHex.slice(0, 8)}…</span>
+              <span class="friend-addr">{invite.kind} · {relativeTime(invite.receivedAtMs)}</span>
+            </div>
+            <div class="request-actions">
+              <button
+                type="button"
+                class="accept-btn"
+                disabled={dmInviteInFlight.has(invite.spaceIdHex)}
+                onclick={() => handleDmInviteAccept(invite.spaceIdHex)}
+                data-testid="dm-invite-accept-btn"
+              >
+                {dmInviteInFlight.has(invite.spaceIdHex) ? '…' : 'Accept'}
+              </button>
+              <button
+                type="button"
+                class="unfriend-btn"
+                disabled={dmInviteInFlight.has(invite.spaceIdHex)}
+                onclick={() => handleDmInviteDecline(invite.spaceIdHex)}
+                data-testid="dm-invite-decline-btn"
+              >
+                {dmInviteInFlight.has(invite.spaceIdHex) ? '…' : 'Decline'}
+              </button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
 
   <!-- ── ZEB-388: My key (share so a peer can add you by key) ───────────── -->
   <div class="action-block" data-testid="my-key-section">

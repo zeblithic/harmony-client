@@ -3240,6 +3240,7 @@
       onTrustChange={handleTrustChange}
       {friendService}
       {friendCardService}
+      {dmInviteService}
       onOpenCard={openMemberCard}
       bind:activeTab={settingsTab}
     />
