@@ -2930,6 +2930,226 @@ mod tests {
         driver.abort();
     }
 
+    /// ZEB-625 (1): a presence kick re-arms a FULL reconcile but must NOT
+    /// advance the persisted resync floor — `on_full_reconcile` stays
+    /// uncalled and the floor still fires at the ORIGINAL absolute
+    /// deadline. (Kick arms do `latch.reset` only; only the resync_tick
+    /// arm persists — the invariant was code-verified but never pinned.)
+    #[tokio::test(start_paused = true)]
+    async fn backfill_presence_kick_does_not_advance_persisted_floor() {
+        const DEADLINE_MS: u64 = 200_000;
+        const INTERVAL_MS: u64 = 500_000;
+        let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let since_log = Arc::clone(&sinces);
+        let request_page = move |since: Option<Hlc>| {
+            let since_log = Arc::clone(&since_log);
+            async move {
+                since_log.lock().unwrap().push(since);
+                PageFetch::Completed(0, 256) // short page → satisfied → park
+            }
+        };
+        let fired: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
+        let fired_cb = Arc::clone(&fired);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (presence_tx, presence_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(None),
+            request_page,
+            || async { None::<Hlc> },
+            shutdown_rx,
+            None,              // no transport-epoch watch — isolate presence vs floor
+            Some(presence_rx), // presence kick wired
+            Some(INTERVAL_MS),
+            move || start.elapsed().as_millis() as u64,
+            Some(ResyncPersist {
+                first_deadline_ms: DEADLINE_MS,
+                on_full_reconcile: Arc::new(move |ts| fired_cb.lock().unwrap().push(ts)),
+            }),
+        ));
+        // Req #1 at spawn satisfies → parks on Idle.
+        while sinces.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Presence kick past the re-arm cooldown → req #2 (full reconcile).
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
+        presence_tx.send(1).expect("presence bump");
+        for _ in 0..128 {
+            if sinces.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sinces.lock().unwrap().len(), 2, "kick re-armed a request");
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "ZEB-625: a presence kick must NOT invoke on_full_reconcile"
+        );
+        // The floor still fires at the ORIGINAL absolute deadline: just shy
+        // → nothing; cross it → exactly one persisted fire.
+        let now = start.elapsed().as_millis() as u64;
+        tokio::time::advance(Duration::from_millis(DEADLINE_MS - 1 - now)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "floor must not fire early — the kick moved nothing"
+        );
+        tokio::time::advance(Duration::from_millis(2)).await;
+        for _ in 0..128 {
+            if !fired.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let stamps = fired.lock().unwrap();
+        assert_eq!(stamps.len(), 1, "exactly one floor fire");
+        assert!(
+            stamps[0] >= DEADLINE_MS,
+            "fire at the original absolute deadline (kick did not advance it)"
+        );
+        driver.abort();
+    }
+
+    /// ZEB-625 (1): root-driver twin of
+    /// `backfill_presence_kick_does_not_advance_persisted_floor`.
+    #[tokio::test(start_paused = true)]
+    async fn root_presence_kick_does_not_advance_persisted_floor() {
+        const DEADLINE_MS: u64 = 200_000;
+        const INTERVAL_MS: u64 = 500_000;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::Answered // satisfied → parks
+            }
+        };
+        let fired: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
+        let fired_cb = Arc::clone(&fired);
+        let (kick_tx, kick_rx) = tokio::sync::watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            RootFetchLatch::new(),
+            request_root,
+            shutdown_rx,
+            None,          // no epoch watch
+            Some(kick_rx), // presence kick wired
+            Some(INTERVAL_MS),
+            move || start.elapsed().as_millis() as u64,
+            Some(ResyncPersist {
+                first_deadline_ms: DEADLINE_MS,
+                on_full_reconcile: Arc::new(move |ts| fired_cb.lock().unwrap().push(ts)),
+            }),
+        ));
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Presence kick past the cooldown → req #2; no persist.
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
+        kick_tx.send_modify(|e| *e = e.wrapping_add(1));
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "ZEB-625: a presence kick must NOT invoke on_full_reconcile"
+        );
+        // Floor fires at the ORIGINAL absolute deadline.
+        let now = start.elapsed().as_millis() as u64;
+        tokio::time::advance(Duration::from_millis(DEADLINE_MS - 1 - now)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "floor must not fire early — the kick moved nothing"
+        );
+        tokio::time::advance(Duration::from_millis(2)).await;
+        for _ in 0..128 {
+            if !fired.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let stamps = fired.lock().unwrap();
+        assert_eq!(stamps.len(), 1, "exactly one floor fire");
+        assert!(
+            stamps[0] >= DEADLINE_MS,
+            "fire at the original absolute deadline (kick did not advance it)"
+        );
+        driver.abort();
+    }
+
+    /// ZEB-625 (2): a presence kick arriving MID-BACKOFF (the root
+    /// driver's WaitUntil arm) re-arms the latch after the cooldown —
+    /// direct coverage for the arm previously validated only by
+    /// mirror-faithfulness with the backfill driver. The 600s backoff is
+    /// load-bearing: with the default 30s base, the ordinary backoff retry
+    /// fires inside the 60s cooldown advance and a page-less req #2 is
+    /// indistinguishable from the kick's — the test would pass with the
+    /// presence arm deleted (task-4 review, mutation-verified).
+    #[tokio::test(start_paused = true)]
+    async fn root_presence_kick_mid_backoff_rearms() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let request_root = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                RootFetch::NoReply // unanswered → the latch backs off (WaitUntil)
+            }
+        };
+        let (kick_tx, kick_rx) = tokio::sync::watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_root_fetch_driver(
+            // Backoff parked far past the cooldown window (see doc comment):
+            // the presence kick is the ONLY possible source of req #2.
+            RootFetchLatch::new_with_backoff(600_000, 600_000),
+            request_root,
+            shutdown_rx,
+            None,          // no epoch watch
+            Some(kick_rx), // presence kick wired
+            None,          // no floor — isolate the WaitUntil presence arm
+            move || start.elapsed().as_millis() as u64,
+            None,
+        ));
+        // Req #1 fires and goes unanswered → the driver parks in WaitUntil.
+        while requests.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "driver parks in WaitUntil (NoReply backoff), not exit"
+        );
+        // Mid-backoff presence kick; the cooldown defers the re-query
+        // until we advance past it.
+        kick_tx.send_modify(|e| *e = e.wrapping_add(1));
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "req #2 must come from the mid-backoff presence kick (backoff parked at 600s)"
+        );
+        driver.abort();
+    }
+
     /// ZEB-618: presence-kick sender drop degrades to None — the driver
     /// keeps running on the periodic floor (mirrors epoch-sender-drop).
     #[tokio::test(start_paused = true)]
