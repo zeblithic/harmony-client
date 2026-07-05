@@ -747,6 +747,52 @@ impl CanonicalPayload for DmCidNotifySigned {}
 impl CanonicalPayloadSealed for DmAckSigned {}
 impl CanonicalPayload for DmAckSigned {}
 
+/// Deterministic wire-type fixtures for in-crate tests. ZEB-236 Task 1
+/// extracted `minimal_invite_for_space` from the inline builder in
+/// `dm_outbox.rs`'s `handle_invite_writes_space_and_cache_with_signing_pub`
+/// so downstream stores (`pending_dm_invites`) and later tasks share one
+/// self-consistent invite. Plain `#[cfg(test)]`: every consumer is an
+/// in-crate unit test (no integration test needs it — see Task 1 brief).
+#[cfg(test)]
+pub mod test_fixtures {
+    use super::DmInviteSigned;
+    use crate::owner_state_types::{
+        DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, SpaceId, SpaceKind,
+    };
+
+    /// A minimal, signature-consistent `DmInviteSigned` seeded by `space`.
+    ///
+    /// The identity is derived from `PrivateIdentity::from_seed(&[space; 32])`
+    /// exactly as the `handle_invite_*` test does, so `signing_device_hash`,
+    /// `sender_devices[0]`, and `inviter_identity_pub` all agree (the invite
+    /// would verify). `space` seeds `space_id`/`inviter`/`members` so distinct
+    /// `space` values key distinct store entries. `inviter ∈ members` and
+    /// `signing_device_hash ∈ sender_devices` hold, so a later accept path can
+    /// reuse this without re-deriving.
+    pub fn minimal_invite_for_space(space: u8) -> DmInviteSigned {
+        let private = harmony_identity::PrivateIdentity::from_seed(&[space; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        DmInviteSigned {
+            space_id: SpaceId([space; 16]),
+            kind: SpaceKind::Dm,
+            inviter: OwnerAddr([space; 16]),
+            members: vec![OwnerAddr([space; 16])],
+            content_key: DmContentKey::new([space; 32]),
+            sender_devices: vec![device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "fixture".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

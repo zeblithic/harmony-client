@@ -16,6 +16,7 @@
   import type { NotificationService } from '../notification-service';
   import type { TrustService } from '../trust-service';
   import type { FriendService } from '../friend-service';
+  import type { DmInviteService } from '../dm-invite-service';
   import type { MemberCardService } from '../member-card-service';
   import type { OpenCardPayload } from './MemberRow.svelte';
 
@@ -41,6 +42,7 @@
     onTrustChange,
     friendService,
     friendCardService,
+    dmInviteService,
     onOpenCard,
     activeTab = $bindable('profile'),
   }: {
@@ -56,6 +58,9 @@
     onTrustChange?: () => void;
     friendService: FriendService;
     friendCardService?: MemberCardService;
+    /** ZEB-236 T7: shared DM-invite service, forwarded straight to FriendsPanel
+     *  for its "DM invites" pending section. Optional (existing mounts/tests). */
+    dmInviteService?: DmInviteService;
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
     /**
      * Active tab. Bindable so the app can route to a specific section — e.g. the
@@ -183,7 +188,7 @@
     aria-labelledby="settings-tab-friends"
     hidden={activeTab !== 'friends'}
   >
-    <FriendsPanel service={friendService} cardService={friendCardService} {onOpenCard} />
+    <FriendsPanel service={friendService} cardService={friendCardService} {dmInviteService} {onOpenCard} />
   </div>
 </div>
 

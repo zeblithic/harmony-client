@@ -194,6 +194,29 @@ impl FriendGraph {
     }
 }
 
+/// Test helper: a minimal ACTIVE [`FriendEntry`]. ZEB-236's tier fork
+/// auto-accepts DM invites only from active friends, so receive-path tests that
+/// exercise the auto-accept/bootstrap branch must seed a friendship. The
+/// `master_ed25519` is a placeholder — the tier check reads only `status`, and
+/// these tests insert directly into `friends` (bypassing `apply_friend_update`'s
+/// key↔master gate, since their `OwnerAddr`s are not master-derived).
+#[cfg(test)]
+pub(crate) fn active_friend_entry_for_test(learned_wall_ms: u64) -> FriendEntry {
+    FriendEntry {
+        master_ed25519: [0u8; 32],
+        display: None,
+        status: FriendStatus::Active,
+        established_via: FriendOrigin::Token,
+        referrable: false,
+        learned_at: crate::owner_state_types::Hlc {
+            wall_ms: learned_wall_ms,
+            logical: 0,
+            device_id: "friend-fixture".into(),
+        },
+        sealed_secret: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

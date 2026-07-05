@@ -277,6 +277,13 @@ struct OwnerIdHexArgs {
     owner_id_hex: String,
 }
 
+/// ZEB-236: accept/decline a staged DM invite, keyed by hex `SpaceId`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpaceIdHexArgs {
+    space_id: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AddSpaceArgs {
@@ -753,6 +760,26 @@ pub fn build_registry() -> RpcRegistry {
         }
     );
 
+    // DM invites (ZEB-236): the staged non-friend invite consent trio.
+    rpc!(
+        m,
+        "list_pending_dm_invites",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_pending_dm_invites_impl(state).await }
+    );
+    rpc!(
+        m,
+        "accept_dm_invite",
+        SpaceIdHexArgs,
+        |state, sink, a| async move { crate::accept_dm_invite_impl(state, sink, a.space_id).await }
+    );
+    rpc!(
+        m,
+        "decline_dm_invite",
+        SpaceIdHexArgs,
+        |state, sink, a| async move { crate::decline_dm_invite_impl(state, sink, a.space_id).await }
+    );
+
     // Spaces / DMs.
     rpc!(m, "add_space", AddSpaceArgs, |state, _sink, a| async move {
         crate::add_space_impl(state, a.kind, a.name, a.members).await
@@ -1216,6 +1243,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dm_invite_rpcs_dispatch_with_ipc_parity_pre_node() {
+        // ZEB-236: the DM-invite consent trio must dispatch through the SAME
+        // `*_impl` seams the Tauri IPC layer uses, observing identical pre-node
+        // behavior (list → empty, accept/decline → owner-not-loaded).
+        let reg = build_registry();
+
+        // Pre-node the staged-invite store isn't wired → empty list, not error
+        // (mirrors `list_pending_friend_requests`).
+        let out = reg
+            .dispatch(
+                "list_pending_dm_invites",
+                test_state(),
+                test_sink(),
+                serde_json::Value::Null,
+            )
+            .await
+            .expect("verb registered + dispatches");
+        assert_eq!(out, serde_json::json!([]));
+
+        // Accept/decline parse the camelCase `spaceId` (BadArgs would mean
+        // parsing broke), then fail pre-node with the shared IPC error string.
+        for cmd in ["accept_dm_invite", "decline_dm_invite"] {
+            let err = reg
+                .dispatch(
+                    cmd,
+                    test_state(),
+                    test_sink(),
+                    serde_json::json!({ "spaceId": "00112233445566778899aabbccddeeff" }),
+                )
+                .await
+                .unwrap_err();
+            match err {
+                RpcError::Command(msg) => assert_eq!(
+                    msg,
+                    crate::OWNER_NOT_LOADED_MSG,
+                    "{cmd} must share the IPC owner-not-loaded error string"
+                ),
+                other => panic!("{cmd}: expected Command, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn connectivity_get_my_identity_pub_hex_returns_null_pre_owner() {
         let reg = build_registry();
         let out = reg
@@ -1462,6 +1532,10 @@ mod tests {
             "list_pending_friend_requests",
             "accept_friend_request",
             "decline_friend_request",
+            // DM invites (ZEB-236)
+            "list_pending_dm_invites",
+            "accept_dm_invite",
+            "decline_dm_invite",
             // spaces / DMs
             "add_space",
             "send_dm",

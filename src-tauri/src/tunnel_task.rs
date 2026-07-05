@@ -1655,6 +1655,7 @@ mod tests {
                     &drain_state,
                     &drain_cas,
                     &drain_sink,
+                    None,
                     drain_self_owner,
                     &drain_device,
                     dm.peer_node_id,
