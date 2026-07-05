@@ -22,3 +22,6 @@ e2e/.playwright-artifacts/
 # macOS Finder metadata
 .DS_Store
 **/.DS_Store
+
+# ZEB-631 rotating test-selection round counter (per-machine)
+.testselect/

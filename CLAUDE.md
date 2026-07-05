@@ -133,7 +133,9 @@ Wire-format pinning tests (`tests/wire_format_*_fixtures.rs`) use deterministic 
 
 ### `--all-targets` is load-bearing
 
-Always include `--all-targets` in clippy and test commands. Without it, integration test compile errors slip through the lib-only `cargo test` invocation. ZEB-164's SidecarId migration proved this: main stayed "green" for two days while contributors only ran `cargo test --lib` locally; the breakage was in `tests/content_index_integration.rs` and `tests/folder_primitive_integration.rs`.
+Always include `--all-targets` in clippy and full-gate test commands (the
+ZEB-631 iterative selection below is the one documented exception — and it is
+backstopped by full runs). Without it, integration test compile errors slip through the lib-only `cargo test` invocation. ZEB-164's SidecarId migration proved this: main stayed "green" for two days while contributors only ran `cargo test --lib` locally; the breakage was in `tests/content_index_integration.rs` and `tests/folder_primitive_integration.rs`.
 
 ### `--locked` is load-bearing
 
@@ -160,6 +162,36 @@ cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(cha
 # Just the integration tests
 cd src-tauri && cargo nextest run --locked --features test-fixtures --test '*_integration'
 ```
+
+### Iterative test selection (ZEB-631)
+
+`scripts/test-select` amortizes regression detection across iterative runs
+instead of paying the full ~4,100-test suite on every local gate: it runs an
+**always-run set** (tests mapped from your branch's changed files) plus a
+**rotating partition** (nextest's stable `--partition hash:<bucket>/<k>`, with
+the bucket advanced by a per-machine round counter in git-ignored
+`.testselect/`). Every test is guaranteed to run at least once every k rounds —
+a hard bound, not a probability.
+
+```bash
+scripts/test-select --context task    # k=4 — per-task gates during iterative dev
+scripts/test-select --context round   # k=2 — PR converge-round re-runs
+scripts/test-select --dry-run         # print selection + commands; no cargo, no counter bump
+scripts/test-select --full            # bypass selection: CI-parity full sweep (--workspace --all-targets)
+```
+
+**Use it for:** iterative development gates — per-task test cycles, review-fix
+re-runs, PR converge rounds. Paste the printed `round=… bucket=…` summary line
+into task reports so the selection is auditable.
+
+**Do NOT use it for:** the final pre-PR sweep, anything CI-shaped, or release
+validation — those remain the full `--workspace --all-targets` commands (CI is
+untouched by design; full runs are the scheme's backstop).
+
+**Caveats:** dependency-graph changes (`Cargo.toml`/`Cargo.lock`/`.cargo/`/
+`src-tauri/vendor/`) make module mapping unreliable — the script exits and
+tells you to use `--full` (or `--force` to proceed anyway). `git add` new test
+files before gating: untracked files are invisible to the always-run set.
 
 ### sccache (optional, larger speedup)
 

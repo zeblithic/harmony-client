@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ZEB-631: rotating test selection for LOCAL iterative gates only.
+# Full runs remain the law for pre-PR sweeps, CI, and release validation.
+# Design: docs/specs/2026-07-05-zeb-631-rotating-test-selection-design.md
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: scripts/test-select [--context task|round] [-k N] [--dry-run] [--full] [--force] [-- extra nextest args]
+  --context task   k=4 preset (SDD per-task gates)   [default]
+  --context round  k=2 preset (PR converge-round re-runs)
+  -k N             explicit bucket count (overrides preset)
+  --dry-run        print selection summary + composed commands; no cargo, no counter bump
+  --full           bypass selection; run the CI-parity full sweep (--workspace --all-targets)
+  --force          proceed with selection despite dependency-graph changes
+EOF
+}
+
+k="" context="task" dry_run=0 full=0 force=0
+extra=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --context)
+      [ $# -ge 2 ] || { echo "test-select: --context requires a value" >&2; usage >&2; exit 2; }
+      context="$2"; shift 2 ;;
+    -k)
+      [ $# -ge 2 ] || { echo "test-select: -k requires a value" >&2; usage >&2; exit 2; }
+      k="$2"; shift 2 ;;
+    --dry-run) dry_run=1; shift ;;
+    --full) full=1; shift ;;
+    --force) force=1; shift ;;
+    --) shift; extra=("$@"); break ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "test-select: unknown arg: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root/src-tauri"
+base_cmd=(cargo nextest run --locked -p harmony-app --features test-fixtures)
+# --full = the CI-parity sweep, not just "selection off": CLAUDE.md's
+# "--all-targets is load-bearing" law — a bypass flag that silently ran a
+# narrower scope would miss bin-target tests CI catches.
+full_cmd=(cargo nextest run --locked --workspace --all-targets --features test-fixtures)
+
+emit_cmd() { printf 'test-select:'; printf ' %q' "$@"; printf '\n'; }
+run_cmd() {
+  emit_cmd "$@"
+  [ "$dry_run" -eq 1 ] && return 0
+  "$@"
+}
+
+if [ "$full" -eq 1 ]; then
+  echo "test-select: FULL run (selection bypassed; CI-parity sweep)"
+  run_cmd "${full_cmd[@]}" ${extra[@]+"${extra[@]}"}
+  exit $?
+fi
+
+case "$context" in
+  task)  [ -n "$k" ] || k=4 ;;
+  round) [ -n "$k" ] || k=2 ;;
+  *) echo "test-select: unknown --context: $context" >&2; exit 2 ;;
+esac
+case "$k" in (*[!0-9]*|'') echo "test-select: invalid k: $k" >&2; exit 2 ;; esac
+[ "$k" -ge 1 ] || { echo "test-select: invalid k: $k" >&2; exit 2; }
+
+# Counter READ happens here; the WRITE is deferred past the deps gate below so
+# an aborted invocation cannot consume a rotation slot (the k-round coverage
+# bound counts rounds that actually ran tests).
+counter_file="$repo_root/.testselect/round"
+round=0
+[ -f "$counter_file" ] && round="$(cat "$counter_file" 2>/dev/null || echo 0)"
+case "$round" in (*[!0-9]*|'') round=0 ;; esac
+bucket=$(( (round % k) + 1 ))
+
+# Always-run set: branch diff vs merge-base + staged + working tree.
+if merge_base="$(git merge-base origin/main HEAD 2>/dev/null)"; then
+  :
+else
+  merge_base="$(git rev-parse HEAD)"
+  echo "test-select: WARNING — origin/main unavailable; always-run covers only" >&2
+  echo "test-select: uncommitted changes (committed branch changes fall to the" >&2
+  echo "test-select: sampled pass + full backstops). Fetch origin to restore it." >&2
+fi
+changed="$( { git -C "$repo_root" diff --name-only "$merge_base" HEAD; \
+              git -C "$repo_root" diff --name-only; \
+              git -C "$repo_root" diff --name-only --cached; } | sort -u )"
+
+# lib.rs/main.rs are deliberately excluded from module terms: test(lib) would
+# match half the suite. A change there relies on the sampled pass plus the
+# full-run backstops (pre-PR sweep, CI) — acceptable v1 coarseness.
+terms="" warn_deps=0
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  case "$f" in
+    src-tauri/Cargo.toml|src-tauri/Cargo.lock|src-tauri/.cargo/*|.cargo/*|src-tauri/vendor/*)
+      warn_deps=1 ;;
+    src-tauri/src/*.rs)
+      # lib/main would match half the suite; mod (case globs cross '/', so
+      # src/api/mod.rs lands here) would produce a garbage test(mod) term.
+      # All three fall back to the sampled pass + full backstops — honest
+      # coarseness over a wrong always-run claim.
+      m="$(basename "$f" .rs)"
+      [ "$m" = "lib" ] || [ "$m" = "main" ] || [ "$m" = "mod" ] || terms="$terms test($m)" ;;
+    src-tauri/tests/*.rs)
+      # Only DEPTH-1 files are nextest binaries. Nested files
+      # (tests/common/mod.rs, tests/common/library_fixtures.rs, …) are
+      # helper modules compiled INTO the binaries — no honest term exists
+      # for them, so they fall to the sampled pass + full backstops
+      # (binary(mod) or binary(library_fixtures) would be garbage terms).
+      if [ "$(dirname "$f")" = "src-tauri/tests" ]; then
+        terms="$terms binary($(basename "$f" .rs))"
+      fi ;;
+  esac
+done <<EOF
+$changed
+EOF
+
+if [ "$warn_deps" -eq 1 ]; then
+  echo "test-select: dependency-graph files changed (Cargo.toml/lock/.cargo/vendor)." >&2
+  if [ "$force" -eq 0 ]; then
+    echo "test-select: module mapping is unreliable — use --full (or --force to proceed)." >&2
+    exit 2
+  fi
+  echo "test-select: --force given — proceeding with selection anyway." >&2
+fi
+
+# Counter WRITE: selection is committed to run from here on.
+if [ "$dry_run" -eq 0 ]; then
+  mkdir -p "$repo_root/.testselect"
+  echo $(( round + 1 )) > "$counter_file"
+fi
+
+always_expr=""
+if [ -n "$terms" ]; then
+  always_expr="$(printf '%s\n' $terms | sort -u | sed 's/$/ or/' | tr '\n' ' ')"
+  always_expr="${always_expr% or }"
+fi
+
+echo "test-select: round=$round k=$k bucket=$bucket/$k always-run=[${always_expr:-none}]"
+
+# Run BOTH passes even if the first fails (a failing always-run pass should
+# not hide the sampled bucket's status); exit non-zero if EITHER failed.
+rc_always=0 rc_sampled=0
+if [ -n "$always_expr" ]; then
+  # --no-tests=warn: a changed module whose tests live under other names
+  # legitimately matches zero tests — that must not fail the gate. The
+  # sampled pass keeps the default.
+  run_cmd "${base_cmd[@]}" --no-tests=warn -E "$always_expr" ${extra[@]+"${extra[@]}"} || rc_always=$?
+  run_cmd "${base_cmd[@]}" -E "not ($always_expr)" --partition "hash:$bucket/$k" ${extra[@]+"${extra[@]}"} || rc_sampled=$?
+else
+  run_cmd "${base_cmd[@]}" --partition "hash:$bucket/$k" ${extra[@]+"${extra[@]}"} || rc_sampled=$?
+fi
+
+if [ "$rc_always" -ne 0 ] || [ "$rc_sampled" -ne 0 ]; then
+  echo "test-select: FAILED (always-run rc=$rc_always, sampled rc=$rc_sampled)" >&2
+  exit 1
+fi
