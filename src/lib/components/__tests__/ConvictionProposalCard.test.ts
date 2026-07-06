@@ -140,8 +140,8 @@ describe('ConvictionProposalCard', () => {
     await waitFor(() => {
       expect(screen.getByRole('alert').textContent).toContain('voting_signal_tier2: not a member');
     });
-    // Roll-back: button should now be back to "Signal support" (the
-    // optimistic flip to "Withdraw signal" reverted).
+    // Roll-back: button should now be back to "▲ Support" (the
+    // optimistic flip to "Withdraw support" reverted).
     expect(screen.getByRole('button').textContent).toContain('▲ Support');
   });
 

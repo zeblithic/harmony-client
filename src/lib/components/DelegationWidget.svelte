@@ -208,6 +208,12 @@
     } catch (e) {
       if (genAtStart !== generation) return;
       error = e instanceof Error ? e.message : String(e);
+      // Close the confirm surface so the error renders in-flow in the
+      // widget body: while confirmState === 'typed', the GovConfirmModal
+      // is a position:fixed overlay that would hide the .dw-error line
+      // behind it, silently swallowing the failure. Matches the error
+      // sequencing of the other GovConfirmModal consumers.
+      confirmState = 'none';
     } finally {
       if (genAtStart === generation) busy = false;
     }

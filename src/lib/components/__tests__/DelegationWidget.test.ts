@@ -165,6 +165,35 @@ describe('DelegationWidget', () => {
     });
   });
 
+  it('surfaces a typed-revoke failure in-flow and closes the modal', async () => {
+    // Silent-failure regression guard: when undelegateTier2 rejects from
+    // the typed-confirm path, the modal (a position:fixed overlay) must
+    // close so the .dw-error line is visible in the widget body rather
+    // than rendering behind the overlay.
+    listProposalsMock.mockResolvedValueOnce([
+      makeProposal({ lifecycle: 'Open', total_supply: 10, voter_count: 3 }),
+    ]);
+    undelegateMock.mockRejectedValueOnce(new Error('revoke failed'));
+    render(DelegationWidget, {
+      props: {
+        communityId: COMMUNITY_ID,
+        adapter,
+        myAddr: ME,
+        communityMembers: members,
+        currentDelegate: BOB,
+      },
+    });
+    await fireEvent.click(screen.getByText(/revoke delegation/i));
+    await screen.findByRole('dialog', { name: /type-to-confirm revoke/i });
+    const input = screen.getByPlaceholderText('revoke') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: 'revoke' } });
+    await fireEvent.click(screen.getByRole('button', { name: /confirm revoke/i }));
+    // Error text renders in the visible widget body...
+    expect(await screen.findByText(/revoke failed/)).toBeInTheDocument();
+    // ...and the modal overlay that would have hidden it is gone.
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
   it('resets busy on community switch so the widget recovers when IPC was in-flight', async () => {
     // Cursor R8 regression: an in-flight delegate IPC at the moment of
     // community switch must not leave `busy` stuck on `true` in the new
