@@ -17,8 +17,10 @@ dialogs. Functionality wins over mock: nothing rendered that isn't real or expli
    (`src-tauri/capabilities/default.json`) and transport ALPN — unrelated. The matrix must be
    **derived**: global `POWER_THRESHOLDS` (`src/lib/types.ts:381`, backend
    `community_membership.rs:3904` — the types.ts comment's `:1108` backend ref is stale) plus a
-   hand-authored action→threshold table matching the real consumer checks (invite ≥0; channel
-   manage/moderate/join-approval ≥50; set-roles/kick-admin/change-quorum ≥100). Thresholds are v1
+   hand-authored action→threshold table matching the real consumer checks (invite AND
+   join-vouch ≥0 — backend verify accepts any Joined member's Invite/JoinCountersign
+   (community_membership.rs:246, :3159); the PendingJoinsPanel UI merely *surfaces* requests at
+   ≥50; channel manage/moderate & kick ≥50; set-roles/kick-admin/change-quorum ≥100). Thresholds are v1
    GLOBAL constants (per-community customization deferred to ZEB-251) — the charter must not imply
    they're community-specific.
 2. **No admin-quorum getter exists, and the settings panel has a latent bug.**
@@ -111,10 +113,12 @@ semantics across forks are unresolved; the charter header does without it.
    RoleBadge + mono `power 0` / `power ≥ 50` / `power ≥ 100` from `POWER_THRESHOLDS` — real
    values), descriptions per design copy. Then the **capability matrix** (grid `1fr 92px 92px
    92px`; header row on `--bg-secondary`; ● = `--vote-for`, — = `--vote-abstain`) with the 6
-   derived rows exactly as the real checks gate them: Post/vote/propose ●●●; Delegate & recall
-   ●●●; Fork the community ●●●; Manage channels & invites —●●; Approve joins · remove members
-   —●●; Set roles · change decision rules ——●. A mono footnote: *"Thresholds are platform-wide
-   in v1."* (honesty per §0.1).
+   derived rows exactly as the real checks gate them: Post/vote/propose/invite ●●● (invite is
+   member-level, §0.1); Delegate & recall ●●●; Fork the community ●●●; Manage & moderate
+   channels —●●; Remove & ban members —●●; Set roles · change decision rules ——●. (Join-vouch
+   is deliberately absent: enforcement is member-level while the moderation UI surfaces it at
+   ≥50 — a row would mislead either way. T3-review correction 2026-07-06.) A mono footnote:
+   *"Thresholds are platform-wide in v1."* (honesty per §0.1).
 4. **Article II · How we decide** — lede *"Proposals move through three tiers. Higher stakes,
    higher bar."* 3 tier cards with REAL prose, no invented numbers: **Tier 1 · Poll** —
    *"Multi-option approval polls. Options, window and eligibility are set per poll. Non-binding
