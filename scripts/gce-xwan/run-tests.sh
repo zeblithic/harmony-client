@@ -285,8 +285,8 @@ t2_friend_dm_direct() {
 
   # The headline assert: THE peer under test at connectionMode "direct"
   # (camelCase serde value is lowercase) on BOTH sides. Peer-scoped (Qodo
-  # PR #399 R1): snapshots include other rows (e.g. a self ownerAddr entry
-  # at noConnection), so an any-peer check could false-PASS/FAIL.
+  # PR #399 R1): the self ownerAddr row is filtered as of ZEB-637;
+  # peer-scoping retained as belt-and-braces against future extra rows.
   # PeerHealth.ownerAddr == the 32-hex ownerId (verified against the
   # 2026-07-04 session snapshots). Relay-only = traversal failed for this
   # mode — delivery above still passing is expected and reported.
