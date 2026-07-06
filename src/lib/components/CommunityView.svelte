@@ -53,6 +53,7 @@
     onOpenCard,
     voiceSession,
     onBeforeVoiceJoin,
+    activeView = $bindable('channels'),
   }: {
     communityId: string;
     communityName: string;
@@ -121,15 +122,14 @@
     /** ZEB-352 D12: forwarded to VoiceChannelView — the app tears down any
      *  active DM call before this community channel's voice join proceeds. */
     onBeforeVoiceJoin?: () => Promise<void>;
+    /** ZEB-606: which middle-column view is active. Bindable so App can
+     *  deep-link (nav proposals row / Assembly rail "View all"). Default
+     *  'channels' preserves the ZEB-291 behavior for non-binding parents. */
+    activeView?: 'channels' | 'proposals' | 'tier3';
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
   let activeChannelId = $state<string | null>(null);
-  /** ZEB-291 Phase 2: which middle-column view is active. Default is
-   *  'channels' (chat-native, current behavior); 'proposals' switches
-   *  to the Tier 2 governance panel. Only togglable when a
-   *  votingAdapter is provided. */
-  let activeView = $state<'channels' | 'proposals' | 'tier3'>('channels');
   let settingsModalOpen = $state(false);
   let communityMembersPanelOpen = $state(false);
   let showCreateDialog = $state(false);

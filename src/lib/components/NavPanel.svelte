@@ -39,6 +39,9 @@
     onSubmitFeedback,
     onShowAbout,
     onOpenDocs,
+    proposalCount,
+    onSelectProposals,
+    proposalsActiveFor = null,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
@@ -78,6 +81,12 @@
     onSubmitFeedback?: () => void;
     onShowAbout?: () => void;
     onOpenDocs?: () => void;
+    /** ZEB-606: active Tier-2 proposal count resolver for community rows. */
+    proposalCount?: (node: NavNode) => number | undefined;
+    /** ZEB-606: open a community's Proposals view (nav proposals row). */
+    onSelectProposals?: (communityId: string) => void;
+    /** ZEB-606: community id whose Proposals view is open (row active state). */
+    proposalsActiveFor?: string | null;
   } = $props();
 
   // ZEB-544: resolve the nav-rail gate map once per mount (a single localStorage
@@ -320,6 +329,9 @@
             onSortOrderChange={changeSortOrder}
             {profileLookup}
             {presenceOnline}
+            {proposalCount}
+            {onSelectProposals}
+            {proposalsActiveFor}
           />
         {/if}
         {#if hasCommunitiesTop}
@@ -335,6 +347,9 @@
             onSortOrderChange={changeSortOrder}
             {profileLookup}
             {presenceOnline}
+            {proposalCount}
+            {onSelectProposals}
+            {proposalsActiveFor}
           />
         {/if}
         {#if hasDmsTop}
@@ -350,6 +365,9 @@
             onSortOrderChange={changeSortOrder}
             {profileLookup}
             {presenceOnline}
+            {proposalCount}
+            {onSelectProposals}
+            {proposalsActiveFor}
           />
         {/if}
         <!-- ZEB-553 item 13: zero-community empty-state CTA. Suppressed while a

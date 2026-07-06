@@ -440,6 +440,13 @@ describe('NavPanel', () => {
       expect(text.indexOf('Work')).toBeLessThan(text.indexOf('Communities'));
     });
 
+    it('renders the Communities header before the Direct messages header', () => {
+      const { container } = render(NavPanel, { props: { nodes: mixedNodes, collapsed: false } });
+      const text = container.querySelector('.nav-tree-container')?.textContent ?? '';
+      expect(text.indexOf('Communities')).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf('Communities')).toBeLessThan(text.indexOf('Direct messages'));
+    });
+
     it('group-chat nodes land under Direct messages', () => {
       const nodes: NavNode[] = [
         { id: 'g1', parentId: null, type: 'group-chat', name: 'weekend crew', ...base, lastActivity: 1 },
@@ -515,6 +522,78 @@ describe('NavPanel', () => {
     it('does not show the CTA when no onRedeemInvite handler is wired', () => {
       render(NavPanel, { props: { nodes: dmOnlyNodes, collapsed: false } });
       expect(screen.queryByText(/No communities yet/i)).toBeNull();
+    });
+  });
+
+  describe('Proposals nav row (ZEB-606)', () => {
+    const base = { unreadCount: 0, unreadLevel: 'none' as const };
+    const expandedCommunity: NavNode[] = [
+      { id: 'comm-1', parentId: null, type: 'community', name: 'IPFS Crew', expanded: true, ...base, lastActivity: 2 },
+      { id: 'chan-1', parentId: 'comm-1', type: 'channel', name: 'general', expanded: false, ...base, lastActivity: 1 },
+    ];
+
+    it('renders the row with a mono count badge inside an expanded community', () => {
+      const { container } = render(NavPanel, {
+        props: {
+          nodes: expandedCommunity,
+          collapsed: false,
+          proposalCount: () => 3,
+          onSelectProposals: vi.fn(),
+        },
+      });
+      const row = container.querySelector('[data-testid="proposals-row-comm-1"]');
+      expect(row).toBeTruthy();
+      expect(row?.textContent).toContain('proposals');
+      expect(row?.querySelector('.count-badge')?.textContent).toBe('3');
+    });
+
+    it('shows no badge for zero or unknown counts (row still renders)', () => {
+      const { container } = render(NavPanel, {
+        props: {
+          nodes: expandedCommunity,
+          collapsed: false,
+          proposalCount: () => 0,
+          onSelectProposals: vi.fn(),
+        },
+      });
+      const row = container.querySelector('[data-testid="proposals-row-comm-1"]');
+      expect(row).toBeTruthy();
+      expect(row?.querySelector('.count-badge')).toBeNull();
+    });
+
+    it('clicking the row fires onSelectProposals with the community id', async () => {
+      const onSelectProposals = vi.fn();
+      const { container } = render(NavPanel, {
+        props: { nodes: expandedCommunity, collapsed: false, proposalCount: () => 1, onSelectProposals },
+      });
+      await fireEvent.click(container.querySelector('[data-testid="proposals-row-comm-1"]')!);
+      expect(onSelectProposals).toHaveBeenCalledWith('comm-1');
+    });
+
+    it('is active when proposalsActiveFor matches the community', () => {
+      const { container } = render(NavPanel, {
+        props: {
+          nodes: expandedCommunity,
+          collapsed: false,
+          proposalCount: () => 1,
+          onSelectProposals: vi.fn(),
+          proposalsActiveFor: 'comm-1',
+        },
+      });
+      expect(container.querySelector('[data-testid="proposals-row-comm-1"]')?.classList.contains('active')).toBe(true);
+    });
+
+    it('renders no row without the resolver (no votingAdapter contexts)', () => {
+      const { container } = render(NavPanel, { props: { nodes: expandedCommunity, collapsed: false } });
+      expect(container.querySelector('[data-testid="proposals-row-comm-1"]')).toBeNull();
+    });
+
+    it('renders no row for a collapsed community', () => {
+      const collapsedNodes = [{ ...expandedCommunity[0], expanded: false }];
+      const { container } = render(NavPanel, {
+        props: { nodes: collapsedNodes, collapsed: false, proposalCount: () => 1, onSelectProposals: vi.fn() },
+      });
+      expect(container.querySelector('[data-testid="proposals-row-comm-1"]')).toBeNull();
     });
   });
 });
