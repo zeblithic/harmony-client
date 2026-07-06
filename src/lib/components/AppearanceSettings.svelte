@@ -35,6 +35,7 @@
 
   function onKeydown(e: KeyboardEvent, index: number): void {
     if (e.key === 'Enter') {
+      e.preventDefault();
       select(OPTIONS[index].value);
     } else if (e.key === ' ') {
       e.preventDefault();

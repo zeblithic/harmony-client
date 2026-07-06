@@ -18,6 +18,7 @@ export const COMMONS_FALLBACK: Record<string, string> = {
   '--text-muted': '#767a6c',
   '--text-faint': '#a39e8e',
   '--text-secondary': '#4b4f44',
+  '--text-primary': '#20241c',
   '--bg-primary': '#fbf9f4',
   '--paper': '#f4f1ea',
   '--flashcard-hint': '#b9742c',
