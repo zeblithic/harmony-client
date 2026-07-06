@@ -4,6 +4,8 @@ import StatusPill from '../StatusPill.svelte';
 import TallyBar from '../TallyBar.svelte';
 import CountChip from '../CountChip.svelte';
 import GovConfirmModal from '../GovConfirmModal.svelte';
+import RoleBadge from '../RoleBadge.svelte';
+import PipMeter from '../PipMeter.svelte';
 
 describe('StatusPill', () => {
   it('renders the default label per variant with the variant class', () => {
@@ -106,5 +108,43 @@ describe('GovConfirmModal', () => {
     });
     expect((screen.getByRole('button', { name: 'Confirm' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe('RoleBadge', () => {
+  it.each([
+    ['member', 'MEMBER'],
+    ['mod', 'MOD'],
+    ['admin', 'ADMIN'],
+  ] as const)('renders %s with its variant class and uppercase label', (role, expected) => {
+    const { container } = render(RoleBadge, { props: { role } });
+    const badge = container.querySelector(`.role-badge.${role}`);
+    expect(badge?.textContent).toBe(expected);
+  });
+});
+
+describe('PipMeter', () => {
+  it('renders total pips with the filled count marked and the label applied', () => {
+    const { container } = render(PipMeter, {
+      props: { filled: 2, total: 4, label: 'Admin quorum meter' },
+    });
+    expect(container.querySelectorAll('.pip').length).toBe(4);
+    expect(container.querySelectorAll('.pip.filled').length).toBe(2);
+    expect(screen.getByLabelText('Admin quorum meter')).toBeTruthy();
+  });
+
+  it('clamps filled above total and below zero', () => {
+    const { container } = render(PipMeter, { props: { filled: 9, total: 3 } });
+    expect(container.querySelectorAll('.pip.filled').length).toBe(3);
+    const { container: c2 } = render(PipMeter, { props: { filled: -1, total: 3 } });
+    expect(c2.querySelectorAll('.pip.filled').length).toBe(0);
+  });
+
+  it('collapses a degenerate total to a single empty pip and defaults the aria-label', () => {
+    const { container } = render(PipMeter, { props: { filled: 2, total: 0 } });
+    // total clamps to >= 1; filled then clamps to <= total.
+    expect(container.querySelectorAll('.pip').length).toBe(1);
+    render(PipMeter, { props: { filled: 1, total: 3 } });
+    expect(screen.getByLabelText('1 of 3')).toBeTruthy();
   });
 });
