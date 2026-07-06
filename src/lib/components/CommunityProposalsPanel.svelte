@@ -24,11 +24,14 @@
 
   import { onDestroy } from 'svelte';
   import type { CommunityMember } from '../types';
+  import { convictionPercent } from '../types/voting';
   import type { Tier2ProposalExport } from '../types/voting';
+  import { shortId } from '../short-addr';
   import type { VotingAdapter } from '../voting-adapter';
   import ConvictionProposalCard from './ConvictionProposalCard.svelte';
   import DelegationGraph from './DelegationGraph.svelte';
   import DelegationWidget from './DelegationWidget.svelte';
+  import StatusPill from './governance/StatusPill.svelte';
 
   let {
     communityId,
@@ -65,6 +68,24 @@
    *  regardless of open state — visibility-only via CSS — so the
    *  simulation would otherwise tick continuously while collapsed). */
   let graphOpen = $state(false);
+  /** ZEB-607: doc-column ballot detail (spec D5). Holds the open
+   *  proposal's id; the DTO itself is derived from the live list so
+   *  event-driven refetches keep the detail fresh for free. Falls back
+   *  to the hub if the proposal leaves the list. */
+  let selectedProposalId = $state<string | null>(null);
+  let selectedProposal = $derived(
+    selectedProposalId
+      ? (proposals?.find((p) => p.proposal_id === selectedProposalId) ?? null)
+      : null,
+  );
+  let selectedPct = $derived(
+    selectedProposal
+      ? convictionPercent(
+          selectedProposal.total_conviction_ms,
+          selectedProposal.threshold_conviction_ms,
+        )
+      : 0,
+  );
   /** ZEB-292 Phase 3: caller's current delegate hex (32 chars) or
    *  null. Loaded on mount and refreshed on every
    *  voting-delegation-changed event for the local user. Passed to
@@ -140,6 +161,7 @@
     proposals = null;
     loadError = null;
     myDelegate = null;
+    selectedProposalId = null;
 
     void (async () => {
       if (cancelled) return;
@@ -220,6 +242,57 @@
 </script>
 
 <section class="community-proposals" aria-label="Community proposals">
+  {#if selectedProposal}
+    <button type="button" class="detail-back" onclick={() => (selectedProposalId = null)}>
+      ← All proposals
+    </button>
+    <div class="detail-grid">
+      <article class="doc-col" aria-label="Proposal document">
+        <div class="doc-breadcrumb">
+          <span class="doc-id-pill">{shortId(selectedProposal.proposal_id)}</span>
+          <StatusPill
+            variant={selectedProposal.lifecycle === 'Open'
+              ? 'open'
+              : selectedProposal.lifecycle === 'ThresholdReached'
+                ? 'passing'
+                : selectedProposal.lifecycle === 'Finalized'
+                  ? 'passed'
+                  : 'archived'}
+            label={selectedProposal.lifecycle === 'ThresholdReached'
+              ? 'Threshold reached'
+              : undefined}
+          />
+        </div>
+        <p class="doc-text">{selectedProposal.proposal_text}</p>
+        <section class="on-record" aria-label="On the record">
+          <h5 class="or-heading">On the record</h5>
+          <dl class="or-rows">
+            <dt>Method</dt>
+            <dd>conviction · half-life {Math.round(selectedProposal.half_life_seconds / 86_400)}d</dd>
+            <dt>Threshold</dt>
+            <dd>{selectedPct.toFixed(1)}% reached</dd>
+            <dt>Signed by</dt>
+            <dd class="or-keys">✓ {selectedProposal.voter_count} keys</dd>
+          </dl>
+          <p class="or-note">
+            Every vote is signed by its caster's key and replicated peer-to-peer. No server can
+            alter the tally.
+          </p>
+        </section>
+      </article>
+      <aside class="vote-col" aria-label="Ballot">
+        <h5 class="vote-heading">Live tally</h5>
+        <ConvictionProposalCard
+          {communityId}
+          proposal={selectedProposal}
+          {adapter}
+          {myDelegate}
+          delegateName={myDelegateName}
+          hideText
+        />
+      </aside>
+    </div>
+  {:else}
   <DelegationWidget
     {communityId}
     {adapter}
@@ -284,16 +357,26 @@
       <p class="cp-empty">No active proposals. Create one to start.</p>
     {:else if proposals}
       {#each proposals as proposal (proposal.proposal_id)}
-        <ConvictionProposalCard
-          {communityId}
-          {proposal}
-          {adapter}
-          {myDelegate}
-          delegateName={myDelegateName}
-        />
+        <div class="hub-item">
+          <ConvictionProposalCard
+            {communityId}
+            {proposal}
+            {adapter}
+            {myDelegate}
+            delegateName={myDelegateName}
+          />
+          <button
+            type="button"
+            class="hub-open-link"
+            onclick={() => (selectedProposalId = proposal.proposal_id)}
+          >
+            Open ballot →
+          </button>
+        </div>
       {/each}
     {/if}
   </div>
+  {/if}
 </section>
 
 <style>
@@ -305,6 +388,7 @@
     overflow-y: auto;
     flex: 1;
     min-height: 0;
+    container-type: inline-size;
   }
   .new-proposal-form {
     display: flex;
@@ -394,5 +478,125 @@
   }
   .dg-section[open] > summary {
     border-bottom: 1px solid var(--border);
+  }
+  .detail-back {
+    align-self: flex-start;
+    border: none;
+    background: none;
+    color: var(--vote-for);
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+  }
+  .detail-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 28px;
+    align-items: start;
+    max-width: 860px;
+  }
+  @container (max-width: 719px) {
+    .detail-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+  .doc-col {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
+  }
+  .doc-breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .doc-id-pill {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 0.62rem;
+    color: var(--text-bright);
+    background: var(--gov-clay);
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  .doc-text {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 0.95rem;
+    line-height: 1.65;
+    white-space: pre-wrap;
+  }
+  .on-record {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .or-heading {
+    margin: 0;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
+  .or-rows {
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 12px;
+    font-size: 0.8rem;
+  }
+  .or-rows dt {
+    color: var(--text-muted);
+  }
+  .or-rows dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+  }
+  .or-keys {
+    color: var(--vote-for);
+  }
+  .or-note {
+    margin: 0;
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: var(--text-muted);
+  }
+  .vote-col {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+  .vote-heading {
+    margin: 0;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
+  .hub-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .hub-open-link {
+    align-self: flex-start;
+    border: none;
+    background: none;
+    padding: 0;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--gov-clay);
+    cursor: pointer;
   }
 </style>

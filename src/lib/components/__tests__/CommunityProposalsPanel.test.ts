@@ -166,4 +166,55 @@ describe('CommunityProposalsPanel', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(listMock).not.toHaveBeenCalled();
   });
+
+  describe('ballot detail (ZEB-607)', () => {
+    it('opens the doc-column detail from "Open ballot →" and returns via back link', async () => {
+      listMock.mockResolvedValue([
+        makeProposal('1', { voter_count: 3, total_supply: 10, half_life_seconds: 7 * 86400 }),
+      ]);
+      render(CommunityProposalsPanel, {
+        props: { communityId: COMMUNITY_ID, adapter, myPower: 50, myAddr: MY_ADDR, communityMembers: COMMUNITY_MEMBERS },
+      });
+      await waitFor(() => expect(screen.getByText(/open ballot/i)).toBeTruthy());
+      // Sanity: the delegation widget is part of the hub chrome, so the
+      // detail-view assertion below is only meaningful if it's present now.
+      expect(screen.queryByLabelText('Delegation')).toBeTruthy();
+
+      await fireEvent.click(screen.getByText(/open ballot/i));
+
+      // Doc column + on-record composed from real DTO fields.
+      expect(screen.getByText('On the record')).toBeTruthy();
+      expect(screen.getByText('✓ 3 keys')).toBeTruthy();
+      // Scoped to the doc column's Method row — the vote-column card also
+      // renders a bare "half-life 7d" chip, so match its fuller string.
+      expect(screen.getByText(/conviction · half-life 7d/)).toBeTruthy();
+      expect(screen.getByText(/No server can alter the tally/)).toBeTruthy();
+      // Hub chrome hidden in detail:
+      expect(screen.queryByLabelText('Delegation')).toBeNull();
+
+      // Back:
+      await fireEvent.click(screen.getByText('← All proposals'));
+      await waitFor(() => expect(screen.getByText(/open ballot/i)).toBeTruthy());
+      expect(screen.queryByText('On the record')).toBeNull();
+    });
+
+    it('falls back to the hub when the selected proposal leaves the list', async () => {
+      listMock.mockResolvedValue([makeProposal('gone', { voter_count: 3, total_supply: 10 })]);
+      render(CommunityProposalsPanel, {
+        props: { communityId: COMMUNITY_ID, adapter, myPower: 50, myAddr: MY_ADDR, communityMembers: COMMUNITY_MEMBERS },
+      });
+      await waitFor(() => expect(screen.getByText(/open ballot/i)).toBeTruthy());
+      await fireEvent.click(screen.getByText(/open ballot/i));
+      await waitFor(() => expect(screen.getByText('On the record')).toBeTruthy());
+
+      // The proposal leaves the list; the next event-driven refetch drops
+      // it and the derived detail must fall back to the hub rather than
+      // dangle on a stale DTO.
+      listMock.mockResolvedValue([]);
+      for (const h of [...createdHandlers]) {
+        h({ proposalId: 'aa'.repeat(32), communityId: COMMUNITY_ID });
+      }
+      await waitFor(() => expect(screen.queryByText('On the record')).toBeNull());
+    });
+  });
 });
