@@ -11,7 +11,6 @@
   "lib/components/MintLedger.svelte": 1,
   "lib/components/NetworkHealthView.svelte": 2,
   "lib/components/PendingJoinsPanel.svelte": 1,
-  "lib/components/StatementComposer.svelte": 1,
   "lib/components/VinePlayer.svelte": 3,
   "lib/components/VinePublishDialog.svelte": 1
 }

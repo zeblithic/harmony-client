@@ -224,11 +224,30 @@
 
 <style>
   .admin-proposals-panel { margin-block: 1rem; }
-  .proposal-card { border: 1px solid var(--border); padding: 0.75rem; margin-block: 0.5rem; }
+  .proposal-card {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--gov-clay);
+    border-radius: 8px;
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-e1);
+    padding: 0.75rem;
+    margin-block: 0.5rem;
+  }
   .summary { font-weight: 600; }
-  .meta { font-size: 0.9em; color: var(--muted); margin-block: 0.25rem; }
+  .meta { font-family: var(--font-mono); font-size: 0.75rem; color: var(--muted); margin-block: 0.25rem; }
   .reason { font-style: italic; margin-block: 0.25rem; }
   .error { color: var(--danger-deep); }
-  .effective { opacity: 0.7; }
-  .expired { opacity: 0.5; }
+  .effective { opacity: 0.7; border-left-color: var(--vote-for); }
+  .expired { opacity: 0.5; border-left-color: var(--vote-abstain); }
+  button {
+    padding: 6px 14px;
+    border: 1px solid var(--vote-for);
+    border-radius: 7px;
+    background: var(--vote-for);
+    color: var(--status-passed-fg);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { cursor: not-allowed; opacity: 0.6; background: var(--surface-raised); color: var(--text-muted); border-color: var(--border); }
 </style>
