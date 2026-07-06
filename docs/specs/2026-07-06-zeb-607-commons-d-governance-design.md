@@ -177,7 +177,7 @@ Anatomy shorthand: *pill* = StatusPill, *chip* = CountChip, *bar* = TallyBar, *m
    state, votingReady-gated hosts, and delegate-context props (PR #408 Greptile P1) preserved.
    Cast/withdraw success fires the D6 toast.
 2. **CommunityProposalsPanel.svelte** (398 L) — hub rows per D5; detail state = doc-column per D5
-   with **"On the record"** block on `--bg-secondary`: Method `conviction · half-life {h}h`,
+   with **"On the record"** block on `--bg-secondary`: Method `conviction · half-life {d}d`,
    Threshold `{pct}% reached`, Signed by `✓ {voter_count} keys` (value `--vote-for`), plus the
    design's replication note verbatim: *"Every vote is signed by its caster's key and replicated
    peer-to-peer. No server can alter the tally."* No "Why now" (§0.7).

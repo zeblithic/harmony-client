@@ -39,6 +39,12 @@ describe('TallyBar', () => {
     expect((fills[0] as HTMLElement).style.background).toContain('--vote-for');
     expect(screen.getByLabelText('Live tally')).toBeTruthy();
   });
+  it('collapses a NaN pct to an explicit 0% width', () => {
+    const { container } = render(TallyBar, {
+      props: { segments: [{ pct: Number.NaN, token: '--vote-for' }] },
+    });
+    expect((container.querySelector('.tally-fill') as HTMLElement).style.width).toBe('0%');
+  });
 });
 
 describe('CountChip', () => {

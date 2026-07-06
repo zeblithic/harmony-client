@@ -16,6 +16,9 @@
   } = $props();
 
   function clamp(pct: number): number {
+    // NaN (e.g. a 0/0 ratio upstream) would render `width: NaN%`, which
+    // browsers silently drop — collapse it to an explicit 0 instead.
+    if (!Number.isFinite(pct)) return 0;
     return Math.max(0, Math.min(100, pct));
   }
 </script>

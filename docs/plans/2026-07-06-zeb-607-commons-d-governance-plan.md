@@ -1247,8 +1247,8 @@ Script:
         communityMembers.find((m) => m.address === target)?.displayName ?? shortId(target);
       showDelegationToast(targetName); // ZEB-607 D6
 ```
-4. In `confirmRevoke`, after the success-path `confirmState = 'none'; typedInput = '';` lines, add `showRecallToast(); // ZEB-607 D6`.
-5. `typedInput` state stays (the modal manages its own input; widget keeps the variable only if still referenced — after Step 3 it is NOT: delete `let typedInput = $state('');`, its reset in the `$effect` (`typedInput = '';`), the `confirmState === 'typed' && typedInput…` guard line in `confirmRevoke` (the modal's disabled gate already enforces the match), and `typedInput = '';` in `cancelRevoke`).
+4. In `confirmRevoke`, after the success-path `confirmState = 'none';` line, add `showRecallToast(); // ZEB-607 D6`. (The adjacent `typedInput = '';` reset is deleted by item 5.)
+5. `typedInput` state stays (the modal manages its own input; widget keeps the variable only if still referenced — after Step 3 it is NOT: delete `let typedInput = $state('');`, its reset in the `$effect` (`typedInput = '';`), the `confirmState === 'typed' && typedInput…` guard line in `confirmRevoke`, the `typedInput = '';` reset on `confirmRevoke`'s success path (the modal's disabled gate already enforces the match), and `typedInput = '';` in `cancelRevoke`).
 
 Template:
 - Replace the `{:else if confirmState === 'typed'}` block with:
