@@ -28,8 +28,8 @@
   let role = $derived(powerToRole(power));
   // ZEB-608 D6: helper copy keyed to the PREVIEWED role (design frame C1).
   const ROLE_HELP: Record<ReturnType<typeof powerToRole>, string> = {
-    member: 'Member can post, vote, propose, delegate and fork.',
-    mod: 'Moderator can manage channels, invites & join requests.',
+    member: 'Member can post, vote, propose, invite, delegate and fork.',
+    mod: 'Moderator can manage channels & join requests.',
     admin: 'Admin can set roles and change decision rules — under quorum.',
   };
   let safeMax = $derived(Math.max(0, Math.min(POWER_THRESHOLDS.max, actorMaxPower)));

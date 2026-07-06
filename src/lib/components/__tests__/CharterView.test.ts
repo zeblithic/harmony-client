@@ -151,4 +151,41 @@ describe('CharterView', () => {
     expect(getByText('Ratified: Adopted with amendments')).toBeTruthy();
     expect(getByText('eeeeeeee…eeee')).toBeTruthy(); // shortAddr 8…4
   });
+
+  it('a status-quo win is NOT counted as a ratified amendment and never leaks the sentinel', async () => {
+    // A finalized poll whose runoff upheld the status quo: backend returns
+    // winnerText === '<status quo>'. It must not inflate the amendment count
+    // and must render as "Upheld: status quo", never "Ratified: <status quo>"
+    // (final-review I-1 — finalized ≠ adopted).
+    const adapter = makeAdapter([
+      poll({ pollId: 'adopted', proposalText: 'Rename #general', winnerText: 'Renamed to #square' }),
+      poll({ pollId: 'upheld', proposalText: 'Abolish moderation', winnerText: '<status quo>' }),
+    ]);
+    const { getByText, queryByText, container } = render(CharterView, {
+      props: { ...baseProps, adapter },
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.on-record')).toBeTruthy();
+    });
+    // Only the adopted poll counts toward the pill.
+    expect(getByText('✓ 1 ratified amendment')).toBeTruthy();
+    // The upheld deliberation still appears in the record, honestly labeled.
+    expect(getByText('Abolish moderation')).toBeTruthy();
+    expect(getByText('Upheld: status quo')).toBeTruthy();
+    // The raw backend sentinel must never surface as a ratified outcome.
+    expect(queryByText('Ratified: <status quo>')).toBeNull();
+    expect(container.textContent).not.toContain('Ratified: <status quo>');
+  });
+
+  it('a community whose only finalized poll upheld the status quo shows no ratified amendments', async () => {
+    const adapter = makeAdapter([
+      poll({ pollId: 'upheld-only', proposalText: 'Adopt term limits', winnerText: '<status quo>' }),
+    ]);
+    const { getByText, container } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(container.querySelector('.on-record')).toBeTruthy();
+    });
+    expect(getByText('✓ No amendments yet')).toBeTruthy();
+    expect(getByText('Upheld: status quo')).toBeTruthy();
+  });
 });

@@ -59,18 +59,32 @@
       });
   });
 
-  let ratified = $derived(
+  // A Tier-3 poll ALWAYS carries a synthetic "status quo" candidate that
+  // advances to the STAR runoff; when it wins, the poll still finalizes
+  // (stage 'fi') with winnerText === STATUS_QUO_TEXT — the mini-public
+  // considered an amendment and UPHELD the status quo (backend:
+  // synthesize_status_quo + the list-IPC winnerText fallback, lib.rs). Those
+  // are ratified DECISIONS but NOT adopted amendments: they must not inflate
+  // the "ratified amendments" count, and the raw sentinel must never leak
+  // into the constitution. (Final-review I-1; spec §0.4 finalized ≠ adopted.)
+  const STATUS_QUO_TEXT = '<status quo>';
+
+  let finalized = $derived(
     (polls ?? [])
       .filter((p) => p.stage === 'fi')
       .slice()
       .sort((a, b) => a.pollCreateHlcMs - b.pollCreateHlcMs),
   );
+  function isUpheld(p: Tier3PollSummary): boolean {
+    return p.winnerText === STATUS_QUO_TEXT;
+  }
+  let adoptedCount = $derived(finalized.filter((p) => !isUpheld(p)).length);
   let ratifiedPillText = $derived(
     polls === null
       ? '✓ …'
-      : ratified.length === 0
+      : adoptedCount === 0
         ? '✓ No amendments yet'
-        : `✓ ${ratified.length} ratified amendment${ratified.length === 1 ? '' : 's'}`,
+        : `✓ ${adoptedCount} ratified amendment${adoptedCount === 1 ? '' : 's'}`,
   );
 
   // pollCreateHlcMs is CREATION time — the finalization HLC is not in the
@@ -132,14 +146,14 @@
           <RoleBadge role="member" />
           <span class="power-req">power {POWER_THRESHOLDS.invite}</span>
           <p class="role-desc">
-            Full civic standing: posts, votes, proposes, delegates — and can fork.
+            Full civic standing: posts, votes, proposes, invites, delegates — and can fork.
           </p>
         </div>
         <div class="role-card">
           <RoleBadge role="mod" />
           <span class="power-req">power ≥ {POWER_THRESHOLDS.kick}</span>
           <p class="role-desc">
-            Stewards the day-to-day space: channels, invites and join requests.
+            Stewards the day-to-day space: channels and join requests.
           </p>
         </div>
         <div class="role-card">
@@ -219,15 +233,17 @@
           recorded. Every ratified decision stays on the record.
         </p>
       </div>
-      {#if ratified.length > 0}
+      {#if finalized.length > 0}
         <section class="on-record" aria-label="On the record">
           <h3 class="or-heading">On the record</h3>
           <ul class="amendment-list">
-            {#each ratified as p (p.pollId)}
+            {#each finalized as p (p.pollId)}
               <li class="amendment-row">
                 <span class="amendment-date">{proposedDate(p.pollCreateHlcMs)} · proposed</span>
                 <span class="amendment-title">{p.proposalText}</span>
-                {#if p.winnerText}
+                {#if isUpheld(p)}
+                  <span class="amendment-outcome upheld">Upheld: status quo</span>
+                {:else if p.winnerText}
                   <span class="amendment-outcome">Ratified: {p.winnerText}</span>
                 {/if}
                 <span class="amendment-proposer">{shortAddr(p.proposer)}</span>
@@ -502,6 +518,9 @@
   .amendment-outcome {
     font-size: 0.78rem;
     color: var(--vote-for);
+  }
+  .amendment-outcome.upheld {
+    color: var(--text-muted);
   }
   .amendment-proposer {
     font-family: var(--font-mono);

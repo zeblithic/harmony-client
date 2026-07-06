@@ -140,10 +140,12 @@ describe('PipMeter', () => {
     expect(c2.querySelectorAll('.pip.filled').length).toBe(0);
   });
 
-  it('collapses a degenerate total to a single empty pip and defaults the aria-label', () => {
+  it('collapses a degenerate total to a single pip and defaults the aria-label', () => {
     const { container } = render(PipMeter, { props: { filled: 2, total: 0 } });
-    // total clamps to >= 1; filled then clamps to <= total.
+    // total clamps to >= 1; filled then clamps to <= total, so the lone pip
+    // is filled (filled=2 → min(1, 2) = 1).
     expect(container.querySelectorAll('.pip').length).toBe(1);
+    expect(container.querySelectorAll('.pip.filled').length).toBe(1);
     render(PipMeter, { props: { filled: 1, total: 3 } });
     expect(screen.getByLabelText('1 of 3')).toBeTruthy();
   });

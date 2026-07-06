@@ -576,7 +576,12 @@ export class CommunityService {
    * always-shows-1 default, spec §0.2).
    */
   async getCommunityGovernance(communityId: string): Promise<{ adminQuorum: number }> {
-    return this.invoke<{ adminQuorum: number }>('get_community_governance', { communityId });
+    try {
+      return await this.invoke<{ adminQuorum: number }>('get_community_governance', { communityId });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`getCommunityGovernance: ${msg}`);
+    }
   }
 
   destroy(): void {

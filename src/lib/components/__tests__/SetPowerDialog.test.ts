@@ -85,7 +85,7 @@ describe('SetPowerDialog', () => {
     const slider = container.querySelector('input[type="range"]') as HTMLInputElement;
     await fireEvent.input(slider, { target: { value: '60' } });
     expect(container.querySelector('.role-help')?.textContent).toContain(
-      'Moderator can manage channels, invites & join requests.',
+      'Moderator can manage channels & join requests.',
     );
     await fireEvent.input(slider, { target: { value: '100' } });
     expect(container.querySelector('.role-help')?.textContent).toContain('Admin can');
