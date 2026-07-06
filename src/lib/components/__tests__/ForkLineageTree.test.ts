@@ -309,4 +309,37 @@ describe('ForkLineageTree', () => {
     expect(selfRow).toBeTruthy();
     expect(selfRow?.textContent).toMatch(/My Self/);
   });
+
+  it('shows the sage "You are here" badge on the self row', () => {
+    const { container } = render(ForkLineageTree, {
+      props: { lineage: emptyLineage('Root'), descendants: [], localNavIds: new Set() },
+    });
+    const selfRow = container.querySelector('[aria-current="page"]')!;
+    const badge = selfRow.querySelector('.lineage-badge.you-here');
+    expect(badge).toBeTruthy();
+    expect(badge!.textContent).toMatch(/You are here/);
+  });
+
+  it('badges a locally-known descendant "Member" and an unknown one "not joined"', () => {
+    const descendants: ForkDescendantDto[] = [
+      { forkSpaceId: '33'.repeat(16), forkerAddr: 'ab'.repeat(16), forkerDisplayName: 'Maya', forkedAtWallMs: 1_715_000_000_000, locallyKnown: true },
+      { forkSpaceId: '44'.repeat(16), forkerAddr: 'cd'.repeat(16), forkerDisplayName: null, forkedAtWallMs: 1_716_000_000_000, locallyKnown: false },
+    ];
+    const { container } = render(ForkLineageTree, {
+      props: {
+        lineage: emptyLineage('Root'),
+        descendants,
+        localNavIds: new Set(['33'.repeat(16)]),
+        resolveLocalName: (hex: string) => (hex === '33'.repeat(16) ? 'Maya Fork' : null),
+      },
+    });
+    const rows = container.querySelectorAll('.lineage-descendant');
+    expect(rows.length).toBe(2);
+    // Locally-known → sage Member badge, and it is a button.
+    expect(rows[0].querySelector('.lineage-badge.member')?.textContent).toMatch(/Member/);
+    expect(rows[0].querySelector('button')).toBeTruthy();
+    // Unknown → muted "not joined", and zero buttons.
+    expect(rows[1].querySelector('.lineage-badge.not-joined')?.textContent).toMatch(/not joined/);
+    expect(rows[1].querySelector('button')).toBeNull();
+  });
 });
