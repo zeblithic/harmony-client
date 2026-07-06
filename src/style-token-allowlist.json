@@ -1,7 +1,6 @@
 {
   "lib/components/BackupReminderBanner.svelte": 1,
   "lib/components/CommunitySettingsPanel.svelte": 1,
-  "lib/components/DelegationGraph.svelte": 1,
   "lib/components/DiagnosticExportModal.svelte": 1,
   "lib/components/DmCreateDialog.svelte": 1,
   "lib/components/FileActions.svelte": 1,

@@ -23,6 +23,9 @@
   import type { CommunityMember } from '../types';
   import type { VotingAdapter } from '../voting-adapter';
   import type { Tier2ProposalExport } from '../types/voting';
+  import GovConfirmModal from './governance/GovConfirmModal.svelte';
+  import { shortId } from '../short-addr';
+  import { showDelegationToast, showRecallToast } from '../voting-toast-wiring';
 
   // Threshold above which revoking the delegate requires typed-confirm.
   // Calibrated so revoking a delegate carrying ≥25% of the effective
@@ -59,7 +62,6 @@
   /** UI state machine: 'none' = show widget, 'click' = single-click
    *  confirm bar, 'typed' = type-the-word confirm modal. */
   let confirmState = $state<'none' | 'click' | 'typed'>('none');
-  let typedInput = $state('');
   /** Generation counter bumped every time the $effect re-runs (i.e.,
    *  on every `communityId` change). Async functions in the widget
    *  capture the current generation at entry and discard their
@@ -71,7 +73,7 @@
   let delegateName = $derived(
     currentDelegate
       ? (communityMembers.find((m) => m.address === currentDelegate)?.displayName ??
-        `${currentDelegate.slice(0, 8)}…`)
+        shortId(currentDelegate))
       : null,
   );
 
@@ -107,7 +109,6 @@
     // disabled until remount. Resetting here is safe because the
     // stale IPC's success-effects are already gated.
     confirmState = 'none';
-    typedInput = '';
     error = null;
     pendingDelegate = '';
     busy = false;
@@ -127,6 +128,9 @@
     try {
       await adapter.delegateTier2(cidAtStart, target);
       if (genAtStart !== generation) return;
+      const targetName =
+        communityMembers.find((m) => m.address === target)?.displayName ?? shortId(target);
+      showDelegationToast(targetName); // ZEB-607 D6
       pendingDelegate = '';
       // currentDelegate refreshes via voting-delegation-changed subscriber.
     } catch (e) {
@@ -192,7 +196,6 @@
 
   async function confirmRevoke() {
     if (busy) return;
-    if (confirmState === 'typed' && typedInput.trim().toLowerCase() !== 'revoke') return;
     const cidAtStart = communityId;
     const genAtStart = generation;
     busy = true;
@@ -201,7 +204,7 @@
       await adapter.undelegateTier2(cidAtStart);
       if (genAtStart !== generation) return;
       confirmState = 'none';
-      typedInput = '';
+      showRecallToast(); // ZEB-607 D6
     } catch (e) {
       if (genAtStart !== generation) return;
       error = e instanceof Error ? e.message : String(e);
@@ -212,7 +215,6 @@
 
   function cancelRevoke() {
     confirmState = 'none';
-    typedInput = '';
   }
 </script>
 
@@ -220,7 +222,7 @@
   {#if currentDelegate}
     <p class="dw-status">
       Delegated to <strong>{delegateName}</strong>
-      <span class="dw-addr-tail" aria-hidden="true">({currentDelegate.slice(0, 8)}…)</span>
+      <span class="dw-addr-tail" aria-hidden="true">({shortId(currentDelegate)})</span>
     </p>
 
     {#if confirmState === 'none'}
@@ -270,31 +272,20 @@
         </div>
       </div>
     {:else if confirmState === 'typed'}
-      <div class="dw-confirm-typed" role="alertdialog" aria-label="Type-to-confirm revoke">
-        <p>
+      <GovConfirmModal
+        title="Type-to-confirm revoke"
+        confirmLabel="Confirm revoke"
+        severity="typed"
+        typedMatch="revoke"
+        busy={busy}
+        onConfirm={() => void confirmRevoke()}
+        onCancel={cancelRevoke}
+      >
+        <p class="dw-typed-copy">
           Your delegate is carrying significant weight on at least one active proposal.
           Revoking now will change those tallies. Type <strong>revoke</strong> to confirm.
         </p>
-        <input
-          class="dw-typed-input"
-          type="text"
-          bind:value={typedInput}
-          placeholder="revoke"
-          aria-label="Type the word revoke to confirm"
-          disabled={busy}
-        />
-        <div class="dw-confirm-actions">
-          <button
-            type="button"
-            class="dw-confirm"
-            onclick={() => void confirmRevoke()}
-            disabled={busy || typedInput.trim().toLowerCase() !== 'revoke'}
-          >
-            Confirm revoke
-          </button>
-          <button type="button" class="dw-cancel" onclick={cancelRevoke}>Cancel</button>
-        </div>
-      </div>
+      </GovConfirmModal>
     {/if}
   {:else}
     <p class="dw-status">Voting directly (no delegate)</p>
@@ -334,7 +325,7 @@
     padding: 12px 14px;
     border: 1px solid var(--border);
     border-radius: 8px;
-    background: var(--bg-secondary);
+    background: var(--paper);
   }
   .dw-status {
     margin: 0;
@@ -369,9 +360,9 @@
   }
   .dw-revoke {
     padding: 4px 12px;
-    border: 1px solid var(--danger);
+    border: 1px solid var(--danger-border-muted);
     background: transparent;
-    color: var(--danger);
+    color: var(--vote-against);
     border-radius: 4px;
     cursor: pointer;
     font: inherit;
@@ -404,13 +395,12 @@
     cursor: pointer;
     font: inherit;
   }
-  .dw-confirm-bar,
-  .dw-confirm-typed {
+  .dw-confirm-bar {
     display: flex;
     flex-direction: column;
     gap: 8px;
     padding: 10px 12px;
-    border: 1px solid var(--danger);
+    border: 1px solid var(--danger-border-muted);
     border-radius: 4px;
     background: var(--bg-primary);
   }
@@ -418,18 +408,10 @@
     display: flex;
     gap: 8px;
   }
-  .dw-typed-input {
-    padding: 4px 8px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--bg-secondary);
+  .dw-typed-copy {
+    margin: 0;
+    font-size: 0.85rem;
     color: var(--text-primary);
-    font: inherit;
-    max-width: 160px;
-  }
-  .dw-typed-input:focus {
-    outline: 1px solid var(--accent);
-    outline-offset: 1px;
   }
   .dw-error {
     margin: 0;
