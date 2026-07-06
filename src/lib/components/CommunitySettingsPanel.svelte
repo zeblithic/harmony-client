@@ -7,6 +7,7 @@
     type CommunityMember,
     type ForkDescendantDto,
   } from '../types';
+  import { nonEmpty } from '../display-label';
   import ConfirmationModal from './ConfirmationModal.svelte';
   import SetPowerDialog from './SetPowerDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
@@ -544,7 +545,7 @@
           <span class="fork-of-avatar" aria-hidden="true">{(parent.name.trim().charAt(0) || '⑂').toUpperCase()}</span>
           <span class="fork-of-body">
             <span class="fork-of-label">This is a fork of</span>
-            <span class="fork-of-name">{parent.name}</span>
+            <span class="fork-of-name">{nonEmpty(parent.name) ?? ('0x' + parent.spaceId.slice(0, 8) + '…')}</span>
           </span>
           {#if localNavIds.has(parent.spaceId)}
             <button class="fork-of-open" onclick={() => onForkLineageNavigate?.(parent.spaceId)}>Open <span aria-hidden="true">↗</span></button>

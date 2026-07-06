@@ -48,6 +48,21 @@ describe('ForkLineageTree', () => {
     expect(getByText(/Leaf/)).toBeTruthy();
   });
 
+  it('falls back to the truncated space-id when a lineage name is blank (PR #411 Qodo)', () => {
+    // Legacy/corrupted snapshots can carry an empty frozen name; the card must
+    // show the real space-id, never a blank label (team nonEmpty() idiom).
+    const lineage: CommunityLineageDto = {
+      ...emptyLineage('Leaf'),
+      forkedFrom: 'ab'.repeat(16),
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [{ spaceId: 'ab'.repeat(16), name: '', forkedAtWallMs: null }],
+    };
+    const { getByText } = render(ForkLineageTree, {
+      props: { lineage, descendants: [], localNavIds: new Set() },
+    });
+    expect(getByText(/0xabababab…/)).toBeTruthy();
+  });
+
   it('renders_descendants_only_for_root_with_forks', () => {
     const descendants: ForkDescendantDto[] = [
       {

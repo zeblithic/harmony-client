@@ -3,6 +3,7 @@
     CommunityLineageDto,
     ForkDescendantDto,
   } from '../types';
+  import { nonEmpty } from '../display-label';
 
   let {
     lineage,
@@ -62,6 +63,13 @@
     return '0x' + hex.slice(0, 8) + '…';
   }
 
+  // Blank frozen names (legacy/corrupted snapshots) fall back to the real
+  // space-id rather than rendering an empty card — matches the descendant
+  // rows and the team nonEmpty() idiom (PR #270/#337).
+  function nameOrId(name: string, spaceId: string): string {
+    return nonEmpty(name) ?? truncSpaceId(spaceId);
+  }
+
   function initial(text: string): string {
     return (text.trim().charAt(0) || '⑂').toUpperCase();
   }
@@ -97,7 +105,7 @@
         <button class="lineage-card lineage-clickable" onclick={() => handleClick(entry.spaceId)}>
           <span class="node-avatar" aria-hidden="true">{initial(entry.name)}</span>
           <span class="node-body">
-            <span class="node-name">&#x21B3; {entry.name}</span>
+            <span class="node-name">&#x21B3; {nameOrId(entry.name, entry.spaceId)}</span>
             {#if entry.forkedAtWallMs != null}<span class="node-sub">forked {formatDate(entry.forkedAtWallMs)}</span>{/if}
           </span>
         </button>
@@ -105,7 +113,7 @@
         <span class="lineage-card lineage-unknown" title="You're not a member of this community.">
           <span class="node-avatar" aria-hidden="true">{initial(entry.name)}</span>
           <span class="node-body">
-            <span class="node-name">&#x21B3; {entry.name}</span>
+            <span class="node-name">&#x21B3; {nameOrId(entry.name, entry.spaceId)}</span>
             {#if entry.forkedAtWallMs != null}<span class="node-sub">forked {formatDate(entry.forkedAtWallMs)}</span>{/if}
           </span>
         </span>
@@ -124,7 +132,7 @@
     <span class="lineage-card self-card">
       <span class="node-avatar node-avatar-self" aria-hidden="true">{initial(lineage.selfName)}</span>
       <span class="node-body">
-        <span class="node-name">{lineage.selfName}</span>
+        <span class="node-name">{nameOrId(lineage.selfName, lineage.selfSpaceId)}</span>
         <span class="node-sub">{selfSub}</span>
       </span>
       <span class="lineage-badge you-here"><span aria-hidden="true">&#x25CF;</span> You are here</span>
