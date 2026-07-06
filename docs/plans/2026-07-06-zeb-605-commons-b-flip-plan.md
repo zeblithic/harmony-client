@@ -1122,6 +1122,10 @@ theme's values):
 | `#1e1f22` / `#1a1b1e` (canvas bg) | `--bg-primary` / `--paper` |
 | `#b5bac1` (canvas text) | `--text-secondary` |
 
+> **T4 review amendment:** `#5865f2 → --accent` is the default; the three sites where `#5865f2`
+> collided with a green sibling in both themes (trust ≥2.5, capability `inference`, heat `isLocal`)
+> use `--info` instead — see design spec §4 amendment.
+
 Example transform (graph-utils.ts node-type map):
 
 ```ts

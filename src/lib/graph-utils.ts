@@ -1,11 +1,17 @@
 import type { NodeStatus, NodeCapability, TransportType } from './network-types';
+import { tokenColor } from './theme-colors';
 
-export const CAPABILITY_COLORS: Record<NodeCapability, string> = {
-  inference: '#5865f2',
-  storage: '#57f287',
-  routing: '#fee75c',
-  compute: '#eb459e',
+const CAPABILITY_TOKENS: Record<NodeCapability, string> = {
+  inference: '--info',
+  storage: '--success-gov',
+  routing: '--flashcard-hint',
+  compute: '--cat-purple',
 };
+
+/** Resolved capability badge color. Resolved at call time so theme switches repaint. */
+export function capabilityColor(capability: NodeCapability): string {
+  return tokenColor(CAPABILITY_TOKENS[capability]);
+}
 
 const CAPABILITY_INDEX: Record<NodeCapability, number> = {
   inference: 0,
@@ -28,14 +34,14 @@ function lerpColor(a: string, b: string, t: number): string {
 }
 
 export function heatToColor(percent: number, status: NodeStatus, isLocal: boolean): string {
-  if (status === 'offline') return '#72767d';
-  if (status === 'degraded') return '#faa61a';
-  if (isLocal) return '#5865f2';
+  if (status === 'offline') return tokenColor('--text-muted');
+  if (status === 'degraded') return tokenColor('--warning');
+  if (isLocal) return tokenColor('--info');
   const p = Math.max(0, Math.min(100, percent));
   if (p <= 50) {
-    return lerpColor('#43b581', '#faa61a', p / 50);
+    return lerpColor(tokenColor('--presence-online'), tokenColor('--warning'), p / 50);
   }
-  return lerpColor('#faa61a', '#ed4245', (p - 50) / 50);
+  return lerpColor(tokenColor('--warning'), tokenColor('--danger'), (p - 50) / 50);
 }
 
 export function badgePosition(
@@ -72,10 +78,10 @@ export function linkDashPattern(transportType: TransportType): number[] {
 
 export function linkUtilizationColor(percent: number): string {
   const p = Math.max(0, Math.min(100, percent));
-  if (p < 20) return '#4f545c';
-  if (p < 60) return '#43b581';
-  if (p < 85) return '#faa61a';
-  return '#ed4245';
+  if (p < 20) return tokenColor('--text-faint');
+  if (p < 60) return tokenColor('--presence-online');
+  if (p < 85) return tokenColor('--warning');
+  return tokenColor('--danger');
 }
 
 export function linkWidth(percent: number): number {

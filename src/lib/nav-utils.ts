@@ -1,6 +1,13 @@
 import type { NavNode, DisplayMode, SortOrder } from './types';
+import { tokenColor } from './theme-colors';
 
-export const NAV_PALETTE = ['#43b581', '#5865f2', '#9b59b6', '#e67e22'];
+/** Token names (not resolved hex) — resolve via navPaletteColor at pick time. */
+export const NAV_PALETTE = ['--accent', '--cat-blue', '--cat-purple', '--cat-orange'];
+
+/** Resolved folder-band color for a palette index. Resolved at call time so theme switches repaint. */
+export function navPaletteColor(index: number): string {
+  return tokenColor(NAV_PALETTE[index]);
+}
 
 /** Return direct children of a given parent (null for top-level). */
 export function getChildNodes(nodes: NavNode[], parentId: string | null): NavNode[] {

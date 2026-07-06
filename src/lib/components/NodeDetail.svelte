@@ -3,6 +3,7 @@
   import type { NetworkNode, NetworkLink } from '../network-types';
   import { generateIdenticon } from '../identicon';
   import { heatToColor, linkUtilizationColor } from '../graph-utils';
+  import { tokenColor } from '../theme-colors';
   import Sparkline from './Sparkline.svelte';
   import { RingBuffer } from '../ring-buffer';
 
@@ -85,9 +86,9 @@
   );
 
   function sparklineColor(value: number): string {
-    if (value < 60) return '#43b581';
-    if (value <= 85) return '#faa61a';
-    return '#ed4245';
+    if (value < 60) return tokenColor('--presence-online');
+    if (value <= 85) return tokenColor('--warning');
+    return tokenColor('--danger');
   }
 
   function formatPercent(value: number): string {
@@ -160,7 +161,7 @@
   {/if}
 
   {#if node.status === 'offline'}
-    <p class="meta-line" style="color: var(--text-muted, #72767d)">No metrics available — node is offline</p>
+    <p class="meta-line" style="color: var(--text-muted)">No metrics available — node is offline</p>
   {:else}
     <div class="metrics-section">
       <div class="metric">

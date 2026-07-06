@@ -226,6 +226,15 @@ New `src/lib/theme-colors.ts`:
   (`#5865f2 #57f287 #43b581 #faa61a #ed4245 #72767d #1e1f22 #b5bac1`, any case) over `src/` must
   return zero hits outside `docs/`.
 
+**Implementation amendment (T4 review).** `--accent`, `--presence-online`, and `--success-gov`
+resolve to one shared value per theme (`#466b4c` light / sage in dark), so the three ex-blurple
+(`#5865f2`) sites where color was the *only* discriminator against a green sibling — trust tier
+≥2.5 (`trustScoreColor`), capability `inference` (`capabilityColor`), and the `heatToColor`
+`isLocal` branch — map to `--info` (navy `#4a6fa5` light / `#8ab0d8` dark) instead of `--accent`.
+`--info` is distinct from every green in both themes. Other `--accent` uses are unchanged;
+`NAV_PALETTE` slot 0 (`--accent`, the ex-`#43b581` green slot) sits beside slot 1 (`--cat-blue`,
+ex-`#5865f2`), which already differ, so no nav collision exists.
+
 ## §5 Harmony mark
 
 `src/lib/components/HarmonyMark.svelte`: the reference SVG verbatim (viewBox `0 0 92 92`, three

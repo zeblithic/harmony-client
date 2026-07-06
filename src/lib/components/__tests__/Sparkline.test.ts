@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/svelte';
 import { describe, it, expect } from 'vitest';
 import Sparkline from '../Sparkline.svelte';
 import { RingBuffer } from '../../ring-buffer';
+import { COMMONS_FALLBACK } from '../../theme-colors';
 
 function makeBuffer(values: number[]): RingBuffer<number> {
   const buf = new RingBuffer<number>(values.length + 10);
@@ -43,9 +44,10 @@ describe('Sparkline', () => {
 
   it('applies the provided color', () => {
     const data = makeBuffer([10, 20]);
-    render(Sparkline, { props: { data, label: 'test', color: '#ed4245' } });
+    const provided = COMMONS_FALLBACK['--danger'];
+    render(Sparkline, { props: { data, label: 'test', color: provided } });
     const svg = screen.getByRole('img');
     const polyline = svg.querySelector('polyline');
-    expect(polyline?.getAttribute('stroke')).toBe('#ed4245');
+    expect(polyline?.getAttribute('stroke')).toBe(provided);
   });
 });

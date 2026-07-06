@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { NetworkLink, NetworkNode, LinkSnapshot } from '../network-types';
   import { linkUtilizationColor } from '../graph-utils';
+  import { tokenColor } from '../theme-colors';
   import Sparkline from './Sparkline.svelte';
   import { RingBuffer } from '../ring-buffer';
 
@@ -84,7 +85,7 @@
         <span class="metric-label">Latency</span>
         <span class="metric-value">{Math.round(link.latencyMs)} ms</span>
       </div>
-      <Sparkline data={latencyData} label="Link latency history" color="#5865f2" />
+      <Sparkline data={latencyData} label="Link latency history" color={tokenColor('--accent')} />
     </div>
 
     {#if lastSnapshot}

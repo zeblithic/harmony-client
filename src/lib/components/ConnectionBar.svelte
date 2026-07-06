@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ConnectionStatus } from '../zenoh-service';
+  import { tokenColor } from '../theme-colors';
 
   let {
     connectionStatus,
@@ -51,13 +52,18 @@
     }
   }
 
-  const statusColors: Record<ConnectionStatus, string> = {
-    disconnected: '#72767d',
-    connecting: '#faa61a',
-    connected: '#43b581',
-    error: '#ed4245',
-    reconnecting: '#faa61a',
+  const STATUS_TOKENS: Record<ConnectionStatus, string> = {
+    disconnected: '--text-muted',
+    connecting: '--warning',
+    connected: '--presence-online',
+    error: '--danger',
+    reconnecting: '--warning',
   };
+
+  // Resolved at call time (in the template) so a theme switch repaints the dot.
+  function statusColor(status: ConnectionStatus): string {
+    return tokenColor(STATUS_TOKENS[status]);
+  }
 
   let statusLabel = $derived.by(() => {
     switch (connectionStatus) {
@@ -95,7 +101,7 @@
   {/if}
 
   <div class="status-indicator" role="status" aria-label={statusLabel}>
-    <span class="status-dot" style="background: {statusColors[connectionStatus]}"></span>
+    <span class="status-dot" style="background: {statusColor(connectionStatus)}"></span>
     <span class="status-text">{statusLabel}</span>
   </div>
 </div>

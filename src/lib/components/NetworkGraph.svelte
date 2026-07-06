@@ -23,8 +23,9 @@
     advanceParticle,
     badgePosition,
     linkDashPattern,
-    CAPABILITY_COLORS,
+    capabilityColor,
   } from '../graph-utils';
+  import { tokenColor } from '../theme-colors';
 
   interface SimNode extends SimulationNodeDatum {
     address: string;
@@ -200,8 +201,8 @@
 
   function drawBackground(ctx: CanvasRenderingContext2D, w: number, h: number) {
     const gradient = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.max(w, h) / 2);
-    gradient.addColorStop(0, '#1e1f22');
-    gradient.addColorStop(1, '#1a1b1e');
+    gradient.addColorStop(0, tokenColor('--bg-primary'));
+    gradient.addColorStop(1, tokenColor('--paper'));
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, w, h);
   }
@@ -291,7 +292,7 @@
       }
 
       // Label
-      ctx.fillStyle = '#b5bac1';
+      ctx.fillStyle = tokenColor('--text-secondary');
       ctx.font = '11px sans-serif';
       ctx.textAlign = 'center';
       const label =
@@ -305,9 +306,9 @@
           const { dx, dy } = badgePosition(cap, r);
           ctx.beginPath();
           ctx.arc(node.x + dx, node.y + dy, 4, 0, Math.PI * 2);
-          ctx.fillStyle = CAPABILITY_COLORS[cap];
+          ctx.fillStyle = capabilityColor(cap);
           ctx.fill();
-          ctx.strokeStyle = '#1e1f22';
+          ctx.strokeStyle = tokenColor('--bg-primary');
           ctx.lineWidth = 1;
           ctx.stroke();
         }

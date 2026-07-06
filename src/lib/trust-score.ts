@@ -1,3 +1,5 @@
+import { tokenColor } from './theme-colors';
+
 export type TrustScore = number & { readonly __brand: 'TrustScore' };
 
 export interface TrustEdge {
@@ -58,12 +60,12 @@ function dimensionAverage(score: TrustScore): number {
 }
 
 export function trustScoreColor(score: TrustScore | null): string {
-  if (score === null) return '#72767d';
+  if (score === null) return tokenColor('--text-muted');
   const avg = dimensionAverage(score);
-  if (avg < 1) return '#ed4245';
-  if (avg < 2) return '#faa61a';
-  if (avg < 2.5) return '#43b581';
-  return '#5865f2';
+  if (avg < 1) return tokenColor('--danger');
+  if (avg < 2) return tokenColor('--warning');
+  if (avg < 2.5) return tokenColor('--presence-online');
+  return tokenColor('--info');
 }
 
 export function trustScoreLabel(score: TrustScore | null): string {
