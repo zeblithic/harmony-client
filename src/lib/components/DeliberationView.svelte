@@ -104,6 +104,15 @@
 
 <style>
   .deliberation-view { margin: 1rem 0; }
+  h4 {
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--line-soft);
+    padding-bottom: 6px;
+  }
   .two-column {
     display: grid;
     grid-template-columns: 1.4fr 1fr;

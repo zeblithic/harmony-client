@@ -63,12 +63,12 @@
   .decline-affordance { margin: 0.75rem 0; }
   .decline-affordance button {
     background: transparent;
-    color: var(--danger-alt);
-    border: 1px solid var(--danger-alt);
+    color: var(--vote-against);
+    border: 1px solid var(--danger-border-muted);
     padding: 0.35rem 0.8rem;
     border-radius: 4px;
     cursor: pointer;
   }
   .already-declined { color: var(--text-faint); font-style: italic; }
-  .error { color: var(--danger-alt); }
+  .error { color: var(--danger); }
 </style>
