@@ -15,7 +15,7 @@
   import NavPanel from './lib/components/NavPanel.svelte';
   import TextFeed from './lib/components/TextFeed.svelte';
   import NotesView from './lib/components/NotesView.svelte';
-  import MediaFeed from './lib/components/MediaFeed.svelte';
+  import MessagesRail from './lib/components/MessagesRail.svelte';
   import VineFeed from './lib/components/VineFeed.svelte';
   import FileBrowser from './lib/components/FileBrowser.svelte';
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
@@ -3287,7 +3287,10 @@
     {/if}
   {/snippet}
   {#snippet mediaFeed()}
-    <MediaFeed
+    <MessagesRail
+      communityId={selectedCommunityNode?.id ?? null}
+      {votingAdapter}
+      onViewAllProposals={openCommunityProposals}
       messages={mediaMessages}
       {trustService}
       {trustVersion}
