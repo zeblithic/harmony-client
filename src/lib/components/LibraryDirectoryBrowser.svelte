@@ -469,7 +469,7 @@
   .close-btn { background: none; border: none; font-size: 1.1rem; cursor: pointer; }
   .empty { text-align: center; padding: 24px; }
   .libraries-bar { display: flex; flex-wrap: wrap; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
-  .lib-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; background: color-mix(in srgb, var(--library-accent) 20%, transparent); border-radius: 12px; font-size: 0.75rem; font-family: monospace; }
+  .lib-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; background: color-mix(in srgb, var(--library-accent) 20%, transparent); border-radius: 12px; font-size: 0.75rem; font-family: var(--font-mono); }
   .lib-remove { background: none; border: none; cursor: pointer; padding: 0 2px; }
   .add-lib-btn { padding: 2px 8px; font-size: 0.75rem; }
   .empty-catalog { color: var(--text-secondary); padding: 16px; text-align: center; }
@@ -565,7 +565,7 @@
   .discovered-addr {
     font-size: 0.75rem;
     color: var(--text-secondary);
-    font-family: monospace;
+    font-family: var(--font-mono);
   }
   .discovered-add {
     padding: 4px 10px;

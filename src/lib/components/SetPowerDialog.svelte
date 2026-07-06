@@ -79,7 +79,7 @@
 <style>
   .dialog-title { color: var(--text-primary); font-size: 1.05rem; margin: 0 0 4px; }
   .dialog-subtitle { color: var(--text-secondary); font-size: 0.8rem; margin: 0 0 16px; }
-  .dialog-subtitle code { font-family: monospace; }
+  .dialog-subtitle code { font-family: var(--font-mono); }
   .role-preview { text-align: center; margin-bottom: 12px; }
   .role-badge { padding: 3px 14px; border-radius: 12px; font-size: 0.75rem; font-weight: bold; }
   .role-badge[data-role="member"] { background: var(--bg-tertiary); color: var(--text-secondary); }
@@ -96,7 +96,7 @@
     color: var(--text-primary);
     font-size: 0.9rem;
     text-align: center;
-    font-family: monospace;
+    font-family: var(--font-mono);
   }
   .number-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .thresholds {

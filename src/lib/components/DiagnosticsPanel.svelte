@@ -225,7 +225,7 @@
     border: 1px dashed var(--color-text-secondary);
     padding: 1em;
     margin: 1em;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.85em;
   }
   .error {

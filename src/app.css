@@ -1,117 +1,149 @@
 :root {
-  --bg-primary: #1e1f22;
-  --bg-secondary: #2b2d31;
-  --bg-tertiary: #313338;
-  --text-primary: #f2f3f5;
-  --text-secondary: #b5bac1;
-  --text-muted: #949ba4;
-  --accent: #5865f2;
-  --accent-hover: #4752c4;
-  --danger: #f23f42;
-  --border: #3f4147;
+  /* =========================================================================
+     Commons LIGHT (ZEB-605 flip). Dark re-values every color token in
+     :root[data-theme="dark"] below; dimensions/radii/fonts are theme-invariant.
+     Reference colors via variables — src/style-token-guard.test.ts rejects
+     new raw color literals in Svelte <style> blocks.
+     Remap rationale: docs/specs/2026-07-06-zeb-605-commons-b-flip-design.md §1.
+     ========================================================================= */
+  --bg-primary: #fbf9f4;
+  --bg-secondary: #efeadf;
+  --bg-tertiary: #e9e3d6;
+  --text-primary: #20241c;
+  --text-secondary: #4b4f44;
+  --text-muted: #767a6c;
+  --accent: #466b4c;
+  --accent-hover: #2f4a35;
+  --danger: #b1402f;
+  --border: #e3ddcf;
 
-  /* Semantic color tokens (ZEB-604). Values match the app's CURRENT rendered
-     appearance; the Commons flip (ZEB-605) re-values them. Reference colors
-     via variables — src/style-token-guard.test.ts rejects new raw color
-     literals in Svelte <style> blocks. */
-  --bg-hover: rgba(255, 255, 255, 0.1); /* row/button hover fill */
-  --overlay: rgba(0, 0, 0, 0.5); /* modal/dialog scrim */
-  --info: #4a9eff; /* informational accents, links, focus rings */
-  --success: #4ade80; /* positive/confirmed states */
-  --warning: #d8a200; /* caution, staleness, pending-attention */
+  /* Semantic color tokens (ZEB-604) */
+  --bg-hover: #e9e3d6;
+  --overlay: rgba(32, 27, 15, 0.45);
+  --info: #4a6fa5;
+  --success: #466b4c;
+  --warning: #b9742c;
 
-  /* Adopted seams (ZEB-604 sweep 2): components already referenced these
-     names via var(--name, fallback) with the variable undefined — the
-     fallback was the de-facto value. Defined here at exactly those values;
-     the fallbacks are dropped component-side. Names kept as the components
-     chose them; the Commons flip / Track H may converge or rename. */
-  --bg-tertiary-hover: #35373c;
-  --border-default: #555;
-  --buddy-bg: rgba(35, 165, 90, 0.08);
-  --buddy-bg-hover: rgba(35, 165, 90, 0.14);
-  --chip-bg: #2a2c34;
-  --chip-fg: #c8c9d1;
-  --color-bg: #fff; /* mint namespace */
-  --color-bg-warning: #fff8e1;
-  --color-error: #c53030;
-  --color-text-secondary: #888;
-  --fg-error: #ff6b6b;
-  --hover-bg: rgba(255, 255, 255, 0.05);
-  --input-bg: #0e0f15;
-  --muted: #666;
-  --panel-bg: #1a1c24;
-  --share-bg: rgba(88, 101, 242, 0.08);
-  --share-bg-hover: rgba(88, 101, 242, 0.14);
-  --success-bg: rgba(74, 217, 122, 0.15);
-  --surface: #1a1a1a;
-  --surface-active: #2a2a2a;
-  --surface-highlight: rgba(255, 200, 0, 0.1);
-  --surface-hover: #1a1a1a;
-  --text-danger: #ed4245;
-  --text-link: #5c8fff;
-  --text-warning: #f0b232;
-  --toast-bg: rgba(20, 22, 30, 0.95);
-  --toast-fg: #fff;
-  --warn-border: #f0c870;
-  --warn-fg: #5c4400;
+  /* Commons core (new in ZEB-605) */
+  --paper: #f4f1ea; /* deepest backdrop behind the layout grid */
+  --surface-raised: #ffffff;
+  --line-soft: #ece7da;
+  --faint: #a39e8e;
+  --primary-deep: #2f4a35;
+  --primary-soft: #e4ece2;
+  --primary-border: #c9d6c6;
+  --gov-clay: #b9742c;
+  --gov-clay-soft: #f1e2cc;
+  --gov-clay-deep: #5a4321;
+  --vote-for: #466b4c;
+  --vote-against: #b1402f;
+  --vote-abstain: #cdc6b4;
+  --tally-track: #eadfc8;
+  --status-drafting-fg: #5a5345;
+  --status-drafting-bg: #e6e0d0;
+  --status-open-fg: #5a4321;
+  --status-open-bg: #f1e2cc;
+  --status-passed-fg: #ffffff;
+  --status-passed-bg: #466b4c;
+  --status-failed-fg: #ffffff;
+  --status-failed-bg: #b1402f;
+  --status-recalled-fg: #7d2a1e;
+  --status-recalled-bg: #f3ddd7;
 
-  /* Status/role families (ZEB-604 sweep 2) — distinct drifted values get
-     distinct tokens so this stays pixel-identical; convergence is a Commons
-     flip decision, not a sweep decision. */
-  --danger-muted: #d83c3e; /* de-facto form-error red (52 uses) */
-  --danger-alt: #d93838; /* governance-panel error red */
-  --danger-deep: #c00;
-  --danger-vivid: #e74c3c;
-  --danger-text-muted: #cc7a7a;
-  --danger-border-muted: #553333;
-  --mail-danger: #c83c3c; /* only used as tints in MailReader */
-  --mail-error-text: #c66;
-  --warning-bright: #fbbf24; /* conviction threshold */
-  --role-mod: #ffb84a;
-  --success-deep: #43b581;
-  --success-gov: #4ad97a;
-  --success-alt: #23a55a;
-  --presence-online: #3ba55d;
-  --gov-purple: #b29bff; /* sortition/Tier-3 accent */
-  --sortition-bg: rgba(170, 130, 255, 0.08);
-  --flashcard-correct: #57f287;
-  --flashcard-hint: #fee75c;
-  --library-accent: #788cc8; /* only used as tints in library browser */
-  --cat-orange: #e67e22; /* recommendation/sensitivity categories */
-  --cat-yellow: #f1c40f;
-  --cat-blue: #3498db;
-  --cat-purple: #9b59b6;
-  --net-ok-bg: #1a4a1a;
-  --net-ok-fg: #5cb85c;
-  --net-ok-deep: green;
-  --net-warn-bg: #4a3a00;
-  --net-warn-fg: #f0a020;
-  --net-danger-bg: rgba(220, 20, 60, 0.06); /* crimson tint, matches .transport-disabled */
-  --net-danger-fg: crimson;
+  /* Adopted seams (ZEB-604 sweep 2; Commons values per the ZEB-605 remap table) */
+  --bg-tertiary-hover: #e0d9c8;
+  --border-default: #d8d2c2;
+  --buddy-bg: rgba(70, 107, 76, 0.08);
+  --buddy-bg-hover: rgba(70, 107, 76, 0.14);
+  --chip-bg: #e6e0d0;
+  --chip-fg: #4b4f44;
+  --color-bg: #ffffff; /* mint namespace */
+  --color-bg-warning: #f1e2cc;
+  --color-error: #b1402f;
+  --color-text-secondary: #767a6c;
+  --fg-error: #b1402f;
+  --hover-bg: rgba(32, 36, 28, 0.04);
+  --input-bg: #ffffff;
+  --muted: #767a6c;
+  --panel-bg: #efeadf;
+  --share-bg: rgba(70, 107, 76, 0.08);
+  --share-bg-hover: rgba(70, 107, 76, 0.14);
+  --success-bg: rgba(70, 107, 76, 0.12);
+  --surface: #fbf9f4;
+  --surface-active: #e9e3d6;
+  --surface-highlight: rgba(185, 116, 44, 0.1);
+  --surface-hover: #efeadf;
+  --text-danger: #b1402f;
+  --text-link: #4a6fa5;
+  --text-warning: #b9742c;
+  --toast-bg: rgba(32, 36, 28, 0.95);
+  --toast-fg: #f0ece2;
+  --warn-border: #d9b982;
+  --warn-fg: #5a4321;
+
+  /* Status/role families (converged onto the Commons set per the flip decision) */
+  --danger-muted: #b1402f;
+  --danger-alt: #b1402f;
+  --danger-deep: #7d2a1e;
+  --danger-vivid: #b1402f;
+  --danger-text-muted: #a06055;
+  --danger-border-muted: #dcc0b8;
+  --mail-danger: #b1402f;
+  --mail-error-text: #a06055;
+  --warning-bright: #b9742c;
+  --role-mod: #b9742c;
+  --success-deep: #2f4a35;
+  --success-gov: #466b4c;
+  --success-alt: #466b4c;
+  --presence-online: #466b4c;
+  --gov-purple: #7d6ba0;
+  --sortition-bg: rgba(125, 107, 160, 0.08);
+  --flashcard-correct: #466b4c;
+  --flashcard-hint: #b9742c;
+  --library-accent: #4a6fa5;
+  --cat-orange: #c56a46;
+  --cat-yellow: #b9742c;
+  --cat-blue: #4a6fa5;
+  --cat-purple: #7d6ba0;
+  --net-ok-bg: #e4ece2;
+  --net-ok-fg: #2f4a35;
+  --net-ok-deep: #2f4a35;
+  --net-warn-bg: #f1e2cc;
+  --net-warn-fg: #5a4321;
+  --net-danger-bg: rgba(177, 64, 47, 0.06);
+  --net-danger-fg: #b1402f;
 
   /* Text extras */
-  --text-bright: #fff; /* white text on colored/dark fills */
-  --text-faint: #8a8c95;
-  --text-dim: #999;
-  --text-chip: #d6d6d6;
-  --text-doc: #ddd;
-  --text-inverse-dark: #1a1a1a; /* dark text on bright badges */
+  --text-bright: #ffffff;
+  --text-faint: #a39e8e;
+  --text-dim: #767a6c;
+  --text-chip: #4b4f44;
+  --text-doc: #4b4f44;
+  --text-inverse-dark: #20241c;
 
   /* Surface extras */
-  --panel-bg-deep: #0e1118;
-  --chip-bg-active: #3a3c44;
-  --color-border-soft: #eee; /* mint namespace */
+  --panel-bg-deep: #e6e0d0;
+  --chip-bg-active: #ddd5c2;
+  --color-border-soft: #ece7da; /* mint namespace */
 
-  /* Subtle fills & bright borders */
-  --bg-hover-subtle: rgba(255, 255, 255, 0.06);
-  --bg-highlight-faint: rgba(255, 255, 255, 0.03);
-  --border-bright: rgba(255, 255, 255, 0.3);
+  /* Subtle fills & borders */
+  --bg-hover-subtle: rgba(32, 36, 28, 0.05);
+  --bg-highlight-faint: rgba(32, 36, 28, 0.03);
+  --border-bright: rgba(32, 36, 28, 0.25);
 
-  /* Shadow tiers (Commons flip maps these to its elevation system) */
-  --shadow-soft: rgba(0, 0, 0, 0.2);
-  --shadow-mid: rgba(0, 0, 0, 0.3);
-  --shadow-strong: rgba(0, 0, 0, 0.4);
-  --shadow-heavy: rgba(0, 0, 0, 0.6);
+  /* Shadow color tiers (consumed inside component box-shadows) + Commons elevation */
+  --shadow-soft: rgba(40, 30, 10, 0.1);
+  --shadow-mid: rgba(40, 30, 10, 0.16);
+  --shadow-strong: rgba(40, 30, 10, 0.24);
+  --shadow-heavy: rgba(40, 30, 10, 0.38);
+  --shadow-e1: 0 1px 3px rgba(40, 30, 10, 0.07);
+  --shadow-e2: 0 2px 10px rgba(40, 30, 10, 0.1);
+  --shadow-e3: 0 8px 28px rgba(40, 30, 10, 0.16);
+
+  /* Type (families self-hosted via @fontsource, ZEB-605) */
+  --font-display: 'Newsreader Variable', 'Newsreader', Georgia, serif;
+  --font-ui: 'Public Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
 
   --avatar-size-micro: 24px;
   --avatar-size-mini: 20px;
@@ -119,12 +151,143 @@
   --nav-width-collapsed: 56px;
   --breakpoint-collapse: 768px;
 
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
-    Ubuntu, Cantarell, sans-serif;
+  font-family: var(--font-ui);
   font-size: 14px;
   line-height: 1.4;
   color: var(--text-primary);
-  background-color: var(--bg-primary);
+  background-color: var(--paper);
+}
+
+/* =============================================================================
+   Commons DARK — warm, brown-tinted near-black (never Discord graphite).
+   Applied by theme-service.ts setting document.documentElement.dataset.theme.
+   ============================================================================= */
+:root[data-theme='dark'] {
+  --bg-primary: #26231e;
+  --bg-secondary: #201e19;
+  --bg-tertiary: #322e27;
+  --text-primary: #f0ece2;
+  --text-secondary: #c4bdab;
+  --text-muted: #8f897a;
+  --accent: #7fa886;
+  --accent-hover: #97bd9d;
+  --danger: #d98377;
+  --border: #38342c;
+
+  --bg-hover: #322e27;
+  --overlay: rgba(0, 0, 0, 0.55);
+  --info: #8ab0d8;
+  --success: #7fa886;
+  --warning: #d39450;
+
+  --paper: #1c1a16;
+  --surface-raised: #2b2823;
+  --line-soft: #322e27;
+  --faint: #6f6a5c;
+  --primary-deep: #7fa886;
+  --primary-soft: #2a342a;
+  --primary-border: #3c4a3d;
+  --gov-clay: #d39450;
+  --gov-clay-soft: #3a2f1f;
+  --gov-clay-deep: #e2b888;
+  --vote-for: #7fa886;
+  --vote-against: #d98377;
+  --vote-abstain: #4a4639;
+  --tally-track: #322a1f;
+  --status-drafting-fg: #c4bdab;
+  --status-drafting-bg: #322e27;
+  --status-open-fg: #e2b888;
+  --status-open-bg: #3a2f1f;
+  --status-passed-fg: #14160f;
+  --status-passed-bg: #7fa886;
+  --status-failed-fg: #1c1a16;
+  --status-failed-bg: #d98377;
+  --status-recalled-fg: #e2b888;
+  --status-recalled-bg: #3a2f1f;
+
+  --bg-tertiary-hover: #3a352d;
+  --border-default: #453f35;
+  --buddy-bg: rgba(127, 168, 134, 0.1);
+  --buddy-bg-hover: rgba(127, 168, 134, 0.16);
+  --chip-bg: #322e27;
+  --chip-fg: #c4bdab;
+  --color-bg: #2b2823;
+  --color-bg-warning: #3a2f1f;
+  --color-error: #d98377;
+  --color-text-secondary: #8f897a;
+  --fg-error: #d98377;
+  --hover-bg: rgba(240, 236, 226, 0.05);
+  --input-bg: #191713;
+  --muted: #8f897a;
+  --panel-bg: #201e19;
+  --share-bg: rgba(127, 168, 134, 0.1);
+  --share-bg-hover: rgba(127, 168, 134, 0.16);
+  --success-bg: rgba(127, 168, 134, 0.15);
+  --surface: #26231e;
+  --surface-active: #322e27;
+  --surface-highlight: rgba(211, 148, 80, 0.12);
+  --surface-hover: #2b2823;
+  --text-danger: #d98377;
+  --text-link: #8ab0d8;
+  --text-warning: #d39450;
+  --toast-bg: rgba(20, 18, 14, 0.95);
+  --toast-fg: #f0ece2;
+  --warn-border: #6b5633;
+  --warn-fg: #e2b888;
+
+  --danger-muted: #d98377;
+  --danger-alt: #d98377;
+  --danger-deep: #e2a49a;
+  --danger-vivid: #d98377;
+  --danger-text-muted: #b98d84;
+  --danger-border-muted: #4a332e;
+  --mail-danger: #d98377;
+  --mail-error-text: #c99087;
+  --warning-bright: #e2b888;
+  --role-mod: #d39450;
+  --success-deep: #97bd9d;
+  --success-gov: #7fa886;
+  --success-alt: #7fa886;
+  --presence-online: #7fa886;
+  --gov-purple: #b3a3d1;
+  --sortition-bg: rgba(179, 163, 209, 0.1);
+  --flashcard-correct: #7fa886;
+  --flashcard-hint: #e2b888;
+  --library-accent: #8ab0d8;
+  --cat-orange: #e0946f;
+  --cat-yellow: #d39450;
+  --cat-blue: #8ab0d8;
+  --cat-purple: #b3a3d1;
+  --net-ok-bg: #2a342a;
+  --net-ok-fg: #97bd9d;
+  --net-ok-deep: #7fa886;
+  --net-warn-bg: #3a2f1f;
+  --net-warn-fg: #e2b888;
+  --net-danger-bg: rgba(217, 131, 119, 0.08);
+  --net-danger-fg: #d98377;
+
+  --text-bright: #f0ece2;
+  --text-faint: #6f6a5c;
+  --text-dim: #8f897a;
+  --text-chip: #c4bdab;
+  --text-doc: #c4bdab;
+  --text-inverse-dark: #1c1a16;
+
+  --panel-bg-deep: #191713;
+  --chip-bg-active: #3a352d;
+  --color-border-soft: #322e27;
+
+  --bg-hover-subtle: rgba(240, 236, 226, 0.06);
+  --bg-highlight-faint: rgba(240, 236, 226, 0.03);
+  --border-bright: rgba(240, 236, 226, 0.3);
+
+  --shadow-soft: rgba(0, 0, 0, 0.35);
+  --shadow-mid: rgba(0, 0, 0, 0.45);
+  --shadow-strong: rgba(0, 0, 0, 0.55);
+  --shadow-heavy: rgba(0, 0, 0, 0.7);
+  --shadow-e1: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-e2: 0 2px 10px rgba(0, 0, 0, 0.5);
+  --shadow-e3: 0 8px 28px rgba(0, 0, 0, 0.6);
 }
 
 *,

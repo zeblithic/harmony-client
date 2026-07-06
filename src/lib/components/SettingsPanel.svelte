@@ -21,6 +21,7 @@
   import type { OpenCardPayload } from './MemberRow.svelte';
 
   import ProfileEditor from './ProfileEditor.svelte';
+  import AppearanceSettings from './AppearanceSettings.svelte';
   import IdentityPanel from './IdentityPanel.svelte';
   import DevicesPanel from './DevicesPanel.svelte';
   import NotificationSettingsPanel from './NotificationSettingsPanel.svelte';
@@ -28,7 +29,7 @@
   import IrohRelaySettings from './IrohRelaySettings.svelte';
   import FriendsPanel from './FriendsPanel.svelte';
 
-  type SettingsTab = 'profile' | 'account' | 'notifications' | 'network' | 'friends';
+  type SettingsTab = 'profile' | 'appearance' | 'account' | 'notifications' | 'network' | 'friends';
 
   let {
     profile,
@@ -72,6 +73,7 @@
 
   const TABS: { id: SettingsTab; label: string }[] = [
     { id: 'profile', label: 'Profile' },
+    { id: 'appearance', label: 'Appearance' },
     { id: 'account', label: 'Account' },
     { id: 'notifications', label: 'Notifications' },
     { id: 'network', label: 'Network' },
@@ -144,6 +146,15 @@
     hidden={activeTab !== 'profile'}
   >
     <ProfileEditor {profile} {ownerIdHex} onSave={onProfileSave} />
+  </div>
+  <div
+    class="tab-content"
+    role="tabpanel"
+    id="settings-tabpanel-appearance"
+    aria-labelledby="settings-tab-appearance"
+    hidden={activeTab !== 'appearance'}
+  >
+    <AppearanceSettings />
   </div>
   <div
     class="tab-content"

@@ -9,6 +9,7 @@ import {
   trustScoreLabel,
   type TrustScore,
 } from './trust-score';
+import { COMMONS_FALLBACK } from './theme-colors';
 
 describe('buildScore', () => {
   it('encodes all zeros as 0x00', () => {
@@ -90,27 +91,27 @@ describe('dimension extractors', () => {
 
 describe('trustScoreColor', () => {
   it('returns gray for null (unscored)', () => {
-    expect(trustScoreColor(null)).toBe('#72767d');
+    expect(trustScoreColor(null)).toBe(COMMONS_FALLBACK['--text-muted']);
   });
 
   it('returns red for low trust (avg < 1)', () => {
-    expect(trustScoreColor(buildScore(0, 0, 0, 0))).toBe('#ed4245');
-    expect(trustScoreColor(buildScore(0, 1, 1, 1))).toBe('#ed4245'); // avg 0.75
+    expect(trustScoreColor(buildScore(0, 0, 0, 0))).toBe(COMMONS_FALLBACK['--danger']);
+    expect(trustScoreColor(buildScore(0, 1, 1, 1))).toBe(COMMONS_FALLBACK['--danger']); // avg 0.75
   });
 
   it('returns amber for cautious (avg >= 1, < 2)', () => {
-    expect(trustScoreColor(buildScore(1, 1, 1, 1))).toBe('#faa61a'); // avg 1.0
-    expect(trustScoreColor(buildScore(1, 2, 2, 2))).toBe('#faa61a'); // avg 1.75
+    expect(trustScoreColor(buildScore(1, 1, 1, 1))).toBe(COMMONS_FALLBACK['--warning']); // avg 1.0
+    expect(trustScoreColor(buildScore(1, 2, 2, 2))).toBe(COMMONS_FALLBACK['--warning']); // avg 1.75
   });
 
   it('returns green for trusted (avg >= 2, < 2.5)', () => {
-    expect(trustScoreColor(buildScore(2, 2, 2, 2))).toBe('#43b581'); // avg 2.0
-    expect(trustScoreColor(buildScore(2, 2, 3, 2))).toBe('#43b581'); // avg 2.25
+    expect(trustScoreColor(buildScore(2, 2, 2, 2))).toBe(COMMONS_FALLBACK['--presence-online']); // avg 2.0
+    expect(trustScoreColor(buildScore(2, 2, 3, 2))).toBe(COMMONS_FALLBACK['--presence-online']); // avg 2.25
   });
 
-  it('returns accent blue for highly trusted (avg >= 2.5)', () => {
-    expect(trustScoreColor(buildScore(3, 3, 2, 2))).toBe('#5865f2'); // avg 2.5
-    expect(trustScoreColor(buildScore(3, 3, 3, 3))).toBe('#5865f2'); // avg 3.0
+  it('returns info for highly trusted (avg >= 2.5)', () => {
+    expect(trustScoreColor(buildScore(3, 3, 2, 2))).toBe(COMMONS_FALLBACK['--info']); // avg 2.5
+    expect(trustScoreColor(buildScore(3, 3, 3, 3))).toBe(COMMONS_FALLBACK['--info']); // avg 3.0
   });
 });
 

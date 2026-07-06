@@ -1,21 +1,26 @@
 <script lang="ts">
   import type { RingBuffer } from '../ring-buffer';
+  import { tokenColor } from '../theme-colors';
 
   let {
     data,
     label,
-    color = '#43b581',
+    color = null as string | null,
     height = 32,
     fixedMin = null as number | null,
     fixedMax = null as number | null,
   }: {
     data: RingBuffer<number>;
     label: string;
-    color?: string;
+    color?: string | null;
     height?: number;
     fixedMin?: number | null;
     fixedMax?: number | null;
   } = $props();
+
+  // Resolve the default at render time (not the init-time prop default) so a
+  // theme switch repaints an uncolored sparkline.
+  let strokeColor = $derived(color ?? tokenColor('--presence-online'));
 
   let points = $derived.by(() => {
     const values = data.toArray();
@@ -43,7 +48,7 @@
     <polyline
       {points}
       fill="none"
-      stroke={color}
+      stroke={strokeColor}
       stroke-width="1.5"
       stroke-linejoin="round"
       stroke-linecap="round"

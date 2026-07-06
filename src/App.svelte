@@ -1,5 +1,15 @@
 <script lang="ts">
+  // ZEB-605: self-hosted Commons fonts (bundled woff2 — offline; no CDN).
+  import '@fontsource-variable/newsreader/opsz.css';
+  import '@fontsource/public-sans/400.css';
+  import '@fontsource/public-sans/500.css';
+  import '@fontsource/public-sans/600.css';
+  import '@fontsource/public-sans/700.css';
+  import '@fontsource/ibm-plex-mono/400.css';
+  import '@fontsource/ibm-plex-mono/500.css';
+  import '@fontsource/ibm-plex-mono/600.css';
   import './app.css';
+  import { connectOwnerTheme } from './lib/theme-service';
   import Layout from './lib/components/Layout.svelte';
   import { makeCloseRequestedHandler, makeTrayResidentNotifier } from './lib/window-close';
   import NavPanel from './lib/components/NavPanel.svelte';
@@ -112,9 +122,9 @@
   // ZEB-545: which Settings tab is active. Held here (not just inside
   // SettingsPanel) so the app can route to a specific section — see
   // handleExportRequested, which opens Settings → Account for the backup wizard.
-  let settingsTab = $state<'profile' | 'account' | 'notifications' | 'network' | 'friends'>(
-    'profile',
-  );
+  let settingsTab = $state<
+    'profile' | 'appearance' | 'account' | 'notifications' | 'network' | 'friends'
+  >('profile');
   let appMode = $state<AppMode>('messages');
 
   // ZEB-405 (WS-C): user-controlled reveal + width of the messages-mode media
@@ -950,6 +960,7 @@
     // ZEB-341 Task 1: seed the card using the newly-minted owner identity.
     // MintIpcResult.state.ownerId is available from the mint response.
     selfOwnerId = result.state.ownerId;
+    connectOwnerTheme(result.state.ownerId);
     // ZEB-586: re-load the profile under the freshly-minted owner so a prior
     // identity's cached name can't seed/broadcast from this one. A fresh owner
     // has no owner-scoped entry → 'Anonymous', which the name prompt below picks
@@ -1791,6 +1802,7 @@
           const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
           if (ownerState !== null) {
             selfOwnerId = ownerState.ownerId;
+            connectOwnerTheme(ownerState.ownerId);
             // ZEB-586: load this returning owner's profile from its owner-scoped
             // cache before seeding/broadcasting the card, so no other identity's
             // name on this machine can leak into the boot republish below.
@@ -2004,6 +2016,7 @@
               const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
               if (ownerState !== null) {
                 selfOwnerId = ownerState.ownerId;
+                connectOwnerTheme(ownerState.ownerId);
                 // ZEB-586: this is the third owner-resolution path (owner loads
                 // after start_node). Like the other two, load the owner-scoped
                 // profile before seeding/publishing so tryBootPublishCard can't
@@ -3934,7 +3947,7 @@
   }
   .startup-error-modal .error {
     color: var(--danger);
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
     font-size: 0.85rem;
     word-break: break-word;
   }

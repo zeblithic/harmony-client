@@ -22,7 +22,7 @@
   .hint-bar {
     text-align: center;
     padding: 6px 12px;
-    font-family: 'Courier New', Courier, monospace;
+    font-family: var(--font-mono);
     font-size: 1.1rem;
     color: var(--text-secondary);
     border-top: 1px solid var(--border);

@@ -342,7 +342,7 @@
     color: var(--text-primary);
   }
   .dw-addr-tail {
-    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-family: var(--font-mono);
     font-size: 0.78rem;
     color: var(--text-secondary);
     margin-left: 4px;

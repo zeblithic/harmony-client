@@ -376,7 +376,7 @@
   .popover-address {
     font-size: 11px;
     color: var(--text-muted);
-    font-family: monospace;
+    font-family: var(--font-mono);
     margin-top: 4px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -407,7 +407,7 @@
   .ownerid-hex {
     font-size: 11px;
     color: var(--text-muted);
-    font-family: monospace;
+    font-family: var(--font-mono);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

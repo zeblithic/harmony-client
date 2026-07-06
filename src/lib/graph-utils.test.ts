@@ -3,7 +3,7 @@ import {
   heatToColor,
   badgePosition,
   linkDashPattern,
-  CAPABILITY_COLORS,
+  capabilityColor,
   linkUtilizationColor,
   linkWidth,
   findNodeAtPoint,
@@ -11,31 +11,32 @@ import {
   advanceParticle,
   nodeRadius,
 } from './graph-utils';
+import { COMMONS_FALLBACK } from './theme-colors';
 
 describe('heatToColor', () => {
   it('returns green for 0% online non-local', () => {
-    expect(heatToColor(0, 'online', false)).toBe('#43b581');
+    expect(heatToColor(0, 'online', false)).toBe(COMMONS_FALLBACK['--presence-online']);
   });
 
   it('returns amber for 50% online non-local', () => {
-    expect(heatToColor(50, 'online', false)).toBe('#faa61a');
+    expect(heatToColor(50, 'online', false)).toBe(COMMONS_FALLBACK['--warning']);
   });
 
   it('returns red for 100% online non-local', () => {
-    expect(heatToColor(100, 'online', false)).toBe('#ed4245');
+    expect(heatToColor(100, 'online', false)).toBe(COMMONS_FALLBACK['--danger']);
   });
 
   it('returns gray for offline', () => {
-    expect(heatToColor(50, 'offline', false)).toBe('#72767d');
+    expect(heatToColor(50, 'offline', false)).toBe(COMMONS_FALLBACK['--text-muted']);
   });
 
   it('returns amber for degraded regardless of heat', () => {
-    expect(heatToColor(0, 'degraded', false)).toBe('#faa61a');
-    expect(heatToColor(80, 'degraded', false)).toBe('#faa61a');
+    expect(heatToColor(0, 'degraded', false)).toBe(COMMONS_FALLBACK['--warning']);
+    expect(heatToColor(80, 'degraded', false)).toBe(COMMONS_FALLBACK['--warning']);
   });
 
-  it('returns accent blue for local node', () => {
-    expect(heatToColor(50, 'online', true)).toBe('#5865f2');
+  it('returns info for local node', () => {
+    expect(heatToColor(50, 'online', true)).toBe(COMMONS_FALLBACK['--info']);
   });
 
   it('clamps below 0 to same as 0%', () => {
@@ -49,8 +50,8 @@ describe('heatToColor', () => {
   it('interpolates at 25%', () => {
     const color = heatToColor(25, 'online', false);
     expect(color).toMatch(/^#[0-9a-f]{6}$/);
-    expect(color).not.toBe('#43b581');
-    expect(color).not.toBe('#faa61a');
+    expect(color).not.toBe(COMMONS_FALLBACK['--presence-online']);
+    expect(color).not.toBe(COMMONS_FALLBACK['--warning']);
   });
 });
 
@@ -94,44 +95,44 @@ describe('linkDashPattern', () => {
   });
 });
 
-describe('CAPABILITY_COLORS', () => {
-  it('maps inference to blurple', () => {
-    expect(CAPABILITY_COLORS.inference).toBe('#5865f2');
+describe('capabilityColor', () => {
+  it('maps inference to info', () => {
+    expect(capabilityColor('inference')).toBe(COMMONS_FALLBACK['--info']);
   });
 
-  it('maps storage to green', () => {
-    expect(CAPABILITY_COLORS.storage).toBe('#57f287');
+  it('maps storage to gov green', () => {
+    expect(capabilityColor('storage')).toBe(COMMONS_FALLBACK['--success-gov']);
   });
 
-  it('maps routing to yellow', () => {
-    expect(CAPABILITY_COLORS.routing).toBe('#fee75c');
+  it('maps routing to flashcard hint', () => {
+    expect(capabilityColor('routing')).toBe(COMMONS_FALLBACK['--flashcard-hint']);
   });
 
-  it('maps compute to pink', () => {
-    expect(CAPABILITY_COLORS.compute).toBe('#eb459e');
+  it('maps compute to cat purple', () => {
+    expect(capabilityColor('compute')).toBe(COMMONS_FALLBACK['--cat-purple']);
   });
 });
 
 describe('linkUtilizationColor', () => {
-  it('returns dim gray for idle (0-20%)', () => {
-    expect(linkUtilizationColor(10)).toBe('#4f545c');
+  it('returns faint for idle (0-20%)', () => {
+    expect(linkUtilizationColor(10)).toBe(COMMONS_FALLBACK['--text-faint']);
   });
 
   it('returns green for moderate (20-60%)', () => {
-    expect(linkUtilizationColor(40)).toBe('#43b581');
+    expect(linkUtilizationColor(40)).toBe(COMMONS_FALLBACK['--presence-online']);
   });
 
   it('returns amber for busy (60-85%)', () => {
-    expect(linkUtilizationColor(70)).toBe('#faa61a');
+    expect(linkUtilizationColor(70)).toBe(COMMONS_FALLBACK['--warning']);
   });
 
   it('returns red for saturated (85%+)', () => {
-    expect(linkUtilizationColor(90)).toBe('#ed4245');
+    expect(linkUtilizationColor(90)).toBe(COMMONS_FALLBACK['--danger']);
   });
 
   it('clamps to 0-100 range', () => {
-    expect(linkUtilizationColor(-5)).toBe('#4f545c');
-    expect(linkUtilizationColor(110)).toBe('#ed4245');
+    expect(linkUtilizationColor(-5)).toBe(COMMONS_FALLBACK['--text-faint']);
+    expect(linkUtilizationColor(110)).toBe(COMMONS_FALLBACK['--danger']);
   });
 });
 

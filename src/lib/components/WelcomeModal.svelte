@@ -20,6 +20,7 @@
   import { trapFocus } from '../focus-trap';
   import PairingJoiner from './PairingJoiner.svelte';
   import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
+  import HarmonyMark from './HarmonyMark.svelte';
 
   interface Props {
     open: boolean;
@@ -194,7 +195,10 @@
       tabindex="-1"
     >
       {#if stage === 'explain' || stage === 'minting'}
-        <h2 id="welcome-title">Welcome to Harmony</h2>
+        <div class="welcome-header">
+          <HarmonyMark size={58} withDot={true} />
+          <h2 id="welcome-title">Welcome to Harmony</h2>
+        </div>
         <p>
           Harmony is a federated, polycentric social fabric built on
           user-owned identity. Your identity lives <strong>only on this
@@ -348,6 +352,14 @@
     width: 90%;
   }
   .modal-content h2 { margin: 0 0 1rem; font-size: 1.25rem; }
+  .welcome-header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+  }
+  .welcome-header h2 { margin: 0; }
   .modal-content p { margin: 0 0 1rem; line-height: 1.5; }
   .muted { color: var(--text-secondary); font-size: 0.9rem; }
   label { display: block; margin-bottom: 0.4rem; font-size: 0.9rem; }

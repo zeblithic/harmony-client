@@ -178,7 +178,7 @@
   }
 
   .overall-score {
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
     color: var(--text-secondary);
   }

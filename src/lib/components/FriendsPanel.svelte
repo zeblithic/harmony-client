@@ -1289,7 +1289,7 @@
   .friend-addr {
     font-size: 11px;
     color: var(--text-secondary);
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
   }
 
   /* ZEB-419: the short-hex line doubles as the identity drill-down trigger.
@@ -1377,7 +1377,7 @@
     border: 1px solid var(--border);
     background: var(--bg-tertiary);
     color: var(--text-primary);
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
   }
 
   .add-label {

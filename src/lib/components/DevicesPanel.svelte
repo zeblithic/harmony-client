@@ -654,7 +654,7 @@
   .owner-fingerprint {
     font-size: 12px;
     color: var(--text-muted);
-    font-family: monospace;
+    font-family: var(--font-mono);
   }
   .restore-link {
     margin-top: 8px;
@@ -723,7 +723,7 @@
   .trust-badge.provisional { color: var(--warning-bright); }
   .trust-badge.refused { color: var(--danger); }
   .separator { margin: 0 6px; color: var(--text-muted); }
-  .fingerprint { font-family: monospace; }
+  .fingerprint { font-family: var(--font-mono); }
   .add-another-footer .explainer {
     font-size: 12px;
     color: var(--text-secondary);

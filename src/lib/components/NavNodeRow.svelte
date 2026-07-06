@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { NavNode, DisplayMode, SortOrder } from '../types';
-  import { NAV_PALETTE } from '../nav-utils';
+  import { navPaletteColor } from '../nav-utils';
   import Avatar from './Avatar.svelte';
 
   const DISPLAY_MODE_CYCLE: DisplayMode[] = ['text', 'icon', 'both'];
@@ -115,7 +115,7 @@
   {#each colorAncestry as colorIdx, i}
     <span
       class="color-band"
-      style="left: {i * 4}px; background: {NAV_PALETTE[colorIdx]}"
+      style="left: {i * 4}px; background: {navPaletteColor(colorIdx)}"
     ></span>
   {/each}
 

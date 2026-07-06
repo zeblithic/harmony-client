@@ -138,7 +138,7 @@
     margin-bottom: 6px;
   }
   .token-code {
-    font-family: monospace;
+    font-family: var(--font-mono);
     background: var(--bg-tertiary);
     padding: 1px 5px;
     border-radius: 3px;
@@ -153,7 +153,7 @@
     border-radius: 4px;
     color: var(--text-primary);
     font-size: 0.875rem;
-    font-family: monospace;
+    font-family: var(--font-mono);
     box-sizing: border-box;
   }
   .token-input:focus {

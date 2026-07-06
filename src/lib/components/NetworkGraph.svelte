@@ -23,8 +23,18 @@
     advanceParticle,
     badgePosition,
     linkDashPattern,
-    CAPABILITY_COLORS,
+    capabilityColor,
   } from '../graph-utils';
+  import { tokenColor } from '../theme-colors';
+
+  // Compose a resolved 6-digit hex token with an alpha channel for canvas
+  // rgba() fills — canvas cannot consume var(--…) directly.
+  function hexToRgba(hex: string, alpha: number): string {
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
 
   interface SimNode extends SimulationNodeDatum {
     address: string;
@@ -200,8 +210,8 @@
 
   function drawBackground(ctx: CanvasRenderingContext2D, w: number, h: number) {
     const gradient = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.max(w, h) / 2);
-    gradient.addColorStop(0, '#1e1f22');
-    gradient.addColorStop(1, '#1a1b1e');
+    gradient.addColorStop(0, tokenColor('--bg-primary'));
+    gradient.addColorStop(1, tokenColor('--paper'));
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, w, h);
   }
@@ -215,7 +225,7 @@
       // Encrypted link glow
       if (link.encrypted) {
         ctx.save();
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        ctx.strokeStyle = hexToRgba(tokenColor('--text-primary'), 0.1);
         ctx.lineWidth = linkWidth(link.utilizationPercent) * 2;
         ctx.setLineDash(linkDashPattern(link.transportType));
         ctx.beginPath();
@@ -253,7 +263,7 @@
 
       ctx.beginPath();
       ctx.arc(x, y, 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+      ctx.fillStyle = hexToRgba(tokenColor('--text-primary'), alpha);
       ctx.fill();
     }
   }
@@ -285,13 +295,13 @@
       if (hoveredAddress && node.address === hoveredAddress) {
         ctx.beginPath();
         ctx.arc(node.x, node.y, radius + 2, 0, Math.PI * 2);
-        ctx.strokeStyle = '#ffffff';
+        ctx.strokeStyle = tokenColor('--text-primary');
         ctx.lineWidth = 2;
         ctx.stroke();
       }
 
       // Label
-      ctx.fillStyle = '#b5bac1';
+      ctx.fillStyle = tokenColor('--text-secondary');
       ctx.font = '11px sans-serif';
       ctx.textAlign = 'center';
       const label =
@@ -305,9 +315,9 @@
           const { dx, dy } = badgePosition(cap, r);
           ctx.beginPath();
           ctx.arc(node.x + dx, node.y + dy, 4, 0, Math.PI * 2);
-          ctx.fillStyle = CAPABILITY_COLORS[cap];
+          ctx.fillStyle = capabilityColor(cap);
           ctx.fill();
-          ctx.strokeStyle = '#1e1f22';
+          ctx.strokeStyle = tokenColor('--bg-primary');
           ctx.lineWidth = 1;
           ctx.stroke();
         }
