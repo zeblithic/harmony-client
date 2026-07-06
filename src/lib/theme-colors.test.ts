@@ -26,4 +26,22 @@ describe('tokenColor', () => {
     document.dispatchEvent(new CustomEvent(THEME_APPLIED_EVENT, { detail: 'dark' }));
     expect(tokenColor('--accent')).toBe(COMMONS_FALLBACK['--accent']); // cache dropped
   });
+
+  it('normalizes computed rgb()/rgba() to #rrggbb (registered-property future-proofing)', () => {
+    // PR #407 Greptile P1s: downstream parsers (lerpColor, hexToRgba) require
+    // hex; tokenColor enforces the contract rather than assuming authorship.
+    document.documentElement.style.setProperty('--accent', 'rgb(18, 52, 86)');
+    expect(tokenColor('--accent')).toBe('#123456');
+    _clearTokenColorCacheForTest();
+    document.documentElement.style.setProperty('--accent', 'rgb(18 52 86)');
+    expect(tokenColor('--accent')).toBe('#123456');
+    _clearTokenColorCacheForTest();
+    document.documentElement.style.setProperty('--accent', 'rgba(18, 52, 86, 1)');
+    expect(tokenColor('--accent')).toBe('#123456');
+    _clearTokenColorCacheForTest();
+    // Alpha-carrying values pass through untouched — never corrupt them.
+    document.documentElement.style.setProperty('--accent', 'rgba(18, 52, 86, 0.5)');
+    expect(tokenColor('--accent')).toBe('rgba(18, 52, 86, 0.5)');
+    document.documentElement.style.removeProperty('--accent');
+  });
 });

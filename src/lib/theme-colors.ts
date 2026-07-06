@@ -40,6 +40,35 @@ function ensureInvalidationListener(): void {
   listenerInstalled = true;
 }
 
+/** Enforce tokenColor's `#rrggbb` contract instead of assuming it.
+ *
+ *  Unregistered custom properties compute to their authored token stream, so
+ *  app.css's hex tokens come back as hex today. But a future `@property`
+ *  registration (syntax '<color>') — or a token re-authored as rgb() — would
+ *  surface as `rgb(…)`/`rgba(…)` and silently NaN the downstream hex parsers
+ *  (lerpColor, hexToRgba) on the canvas (PR #407 Greptile P1s). Opaque
+ *  rgb/rgba values are normalized to hex; alpha-carrying values pass through
+ *  unchanged (no consumer requests alpha tokens; do not corrupt them). */
+function normalizeToHex(value: string): string {
+  const m = value.match(
+    /^rgba?\(\s*(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i
+  );
+  if (!m) {
+    return value;
+  }
+  const rawAlpha = m[4];
+  if (rawAlpha !== undefined) {
+    const alpha = rawAlpha.endsWith('%')
+      ? Number(rawAlpha.slice(0, -1)) / 100
+      : Number(rawAlpha);
+    if (!(alpha >= 1)) {
+      return value;
+    }
+  }
+  const hex = (n: string) => Math.min(255, Number(n)).toString(16).padStart(2, '0');
+  return `#${hex(m[1])}${hex(m[2])}${hex(m[3])}`;
+}
+
 export function tokenColor(name: string): string {
   ensureInvalidationListener();
   const cached = cache.get(name);
@@ -54,6 +83,8 @@ export function tokenColor(name: string): string {
   }
   if (value === '') {
     value = COMMONS_FALLBACK[name] ?? '#000000';
+  } else {
+    value = normalizeToHex(value);
   }
   cache.set(name, value);
   return value;
