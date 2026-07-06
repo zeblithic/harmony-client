@@ -237,6 +237,17 @@
   // onboarding into a first community. The CTA reuses the same onRedeemInvite
   // callback the FAB does, so it opens the identical RedeemInviteDialog flow.
   let hasCommunities = $derived(navNodes.some((n) => n.type === 'community'));
+
+  // ZEB-606: render-time partition of TOP-LEVEL nodes into Commons sections.
+  // NavService data and the NavNode DTO are untouched; search filtering
+  // (filteredNodes) runs before partitioning so hits stay sectioned.
+  const isDmNode = (n: NavNode) => n.type === 'dm' || n.type === 'group-chat';
+  const isCommunityNode = (n: NavNode) => n.type === 'community';
+  const isUnheadedTop = (n: NavNode) => !isCommunityNode(n) && !isDmNode(n);
+  let filteredTop = $derived(getChildNodes(filteredNodes, null));
+  let hasUnheadedTop = $derived(filteredTop.some(isUnheadedTop));
+  let hasCommunitiesTop = $derived(filteredTop.some(isCommunityNode));
+  let hasDmsTop = $derived(filteredTop.some(isDmNode));
 </script>
 
 <svelte:window onkeydown={handleWindowKeyDown} onmousedown={handleWindowMouseDown} />
@@ -297,17 +308,50 @@
             <span>Notes</span>
           </button>
         {/if}
-        <NavTree
-          nodes={filteredNodes}
-          parentId={null}
-          {activeNodeId}
-          onToggle={toggleFolder}
-          onClick={onNodeClick}
-          onDisplayModeChange={changeDisplayMode}
-          onSortOrderChange={changeSortOrder}
-          {profileLookup}
-          {presenceOnline}
-        />
+        {#if hasUnheadedTop}
+          <NavTree
+            nodes={filteredNodes}
+            parentId={null}
+            filterTop={isUnheadedTop}
+            {activeNodeId}
+            onToggle={toggleFolder}
+            onClick={onNodeClick}
+            onDisplayModeChange={changeDisplayMode}
+            onSortOrderChange={changeSortOrder}
+            {profileLookup}
+            {presenceOnline}
+          />
+        {/if}
+        {#if hasCommunitiesTop}
+          <div class="nav-section-header">Communities</div>
+          <NavTree
+            nodes={filteredNodes}
+            parentId={null}
+            filterTop={isCommunityNode}
+            {activeNodeId}
+            onToggle={toggleFolder}
+            onClick={onNodeClick}
+            onDisplayModeChange={changeDisplayMode}
+            onSortOrderChange={changeSortOrder}
+            {profileLookup}
+            {presenceOnline}
+          />
+        {/if}
+        {#if hasDmsTop}
+          <div class="nav-section-header">Direct messages</div>
+          <NavTree
+            nodes={filteredNodes}
+            parentId={null}
+            filterTop={isDmNode}
+            {activeNodeId}
+            onToggle={toggleFolder}
+            onClick={onNodeClick}
+            onDisplayModeChange={changeDisplayMode}
+            onSortOrderChange={changeSortOrder}
+            {profileLookup}
+            {presenceOnline}
+          />
+        {/if}
         <!-- ZEB-553 item 13: zero-community empty-state CTA. Suppressed while a
              search is active (the empty nav is then a "no results" state, not a
              true zero-community home). -->
@@ -424,8 +468,8 @@
   /* ZEB-569: active (Settings open) — mirrors the .active convention used by
      .notes-nav-row / .mode-toggle in this rail. */
   .settings-btn.active {
-    background: var(--accent);
-    color: var(--text-primary);
+    background: var(--primary-soft);
+    color: var(--primary-deep);
     border-radius: 4px;
   }
 
@@ -434,7 +478,7 @@
     padding: 6px 10px;
     border: none;
     border-radius: 4px;
-    background: var(--bg-primary);
+    background: var(--surface);
     color: var(--text-primary);
     font-size: 13px;
     outline: none;
@@ -448,6 +492,17 @@
     flex: 1;
     padding: 4px 0;
     overflow-y: auto;
+  }
+
+  /* ZEB-606: Commons section headers — uppercase micro-labels. */
+  .nav-section-header {
+    padding: 10px 12px 4px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    user-select: none;
   }
 
   /* ZEB-334: pinned, always-present self-notes row at the top of the
@@ -469,7 +524,7 @@
     cursor: pointer;
   }
   .notes-nav-row:hover { background: var(--bg-tertiary); }
-  .notes-nav-row.active { background: var(--accent); color: var(--text-primary); }
+  .notes-nav-row.active { background: var(--primary-soft); color: var(--primary-deep); }
   .notes-nav-icon { font-size: 0.95rem; }
 
   /* ZEB-553 item 13: zero-community empty-state redeem CTA. */
@@ -577,8 +632,8 @@
   }
 
   .mode-toggle.active {
-    background: var(--accent);
-    color: var(--text-primary);
+    background: var(--primary-soft);
+    color: var(--primary-deep);
   }
 
   /* ── ZEB-263: FAB + fan-out menu ──────────────────────────────────── */

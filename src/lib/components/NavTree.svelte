@@ -14,6 +14,7 @@
     onSortOrderChange,
     profileLookup,
     presenceOnline,
+    filterTop,
   }: {
     nodes: NavNode[];
     parentId: string | null;
@@ -25,12 +26,17 @@
     profileLookup?: (address: string) => string | undefined;
     /** ZEB-600: presence-dot resolver, threaded down to every NavNodeRow. */
     presenceOnline?: (node: NavNode) => boolean;
+    /** ZEB-606: keep only matching nodes at THIS level. Passed by NavPanel at
+     *  the root to partition top-level nodes into headed sections; recursive
+     *  calls below do not thread it, so descendants are never filtered. */
+    filterTop?: (n: NavNode) => boolean;
   } = $props();
 
   let sortedChildren = $derived.by(() => {
     const children = getChildNodes(nodes, parentId);
+    const kept = filterTop ? children.filter(filterTop) : children;
     const order = parentId ? getInheritedSortOrder(nodes, parentId) : 'activity';
-    return sortNodes(children, order);
+    return sortNodes(kept, order);
   });
 </script>
 

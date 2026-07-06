@@ -78,7 +78,6 @@
     if (n.type === 'channel') return '#';
     if (n.type === 'dm' || n.type === 'group-chat') return '@';
     if (n.type === 'folder') return n.expanded ? '\u25BE' : '\u25B8';
-    if (n.type === 'community') return '🏛️';
     return '';
   }
 
@@ -133,16 +132,16 @@
       <!-- Text or both mode -->
       <!--
         Communities render BOTH the chevron button (▾/▸) and the type
-        icon (🏛️). They encode different things: chevron is the
-        expand/collapse affordance, 🏛️ is the type identifier
-        (community vs folder vs channel). VSCode and macOS Finder
-        use the same `[chevron] [type-icon] [name]` pattern. Folders
-        elide the type icon because the chevron itself signals
-        folder-ness — but if we did that here, communities would
-        be visually indistinguishable from folders in the nav tree.
-        Cursor flagged this as "redundant" on commit 502056e — it's
-        not, but the comment is here so future review passes don't
-        re-flag the design.
+        identifier (ZEB-606: a letter chip; formerly the 🏛️ type icon).
+        They encode different things: chevron is the expand/collapse
+        affordance, the chip is the type identifier (community vs folder
+        vs channel). VSCode and macOS Finder use the same
+        `[chevron] [type-icon] [name]` pattern. Folders elide the type
+        identifier because the chevron itself signals folder-ness — but
+        if we did that here, communities would be visually
+        indistinguishable from folders in the nav tree. Cursor flagged
+        this as "redundant" on commit 502056e — it's not, but the comment
+        is here so future review passes don't re-flag the design.
       -->
       {#if node.type === 'community'}
         <button
@@ -152,7 +151,11 @@
           onclick={toggleCommunity}
         >{node.expanded ? '▾' : '▸'}</button>
       {/if}
-      <span class="type-icon">{typeIcon(node)}</span>
+      {#if node.type === 'community'}
+        <span class="community-chip" aria-hidden="true">{node.name.charAt(0).toUpperCase()}</span>
+      {:else}
+        <span class="type-icon">{typeIcon(node)}</span>
+      {/if}
       {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
         <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={20} />
       {/if}
@@ -238,8 +241,23 @@
   }
 
   .nav-row.active {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
+    background: var(--primary-soft);
+    color: var(--primary-deep);
+  }
+
+  /* ZEB-606: Commons community letter chip — replaces the 🏛️ type icon. */
+  .community-chip {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: var(--text-bright);
+    font-size: 11px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   /* ZEB-254: pending community — greyed and italic until countersign arrives. */
