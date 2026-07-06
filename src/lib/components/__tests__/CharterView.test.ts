@@ -1,0 +1,149 @@
+import { describe, it, expect, vi } from 'vitest';
+import { render, fireEvent, waitFor } from '@testing-library/svelte';
+import CharterView from '../CharterView.svelte';
+import type { CommunityMember } from '../../types';
+import type { VotingAdapter } from '../../voting-adapter';
+import type { Tier3PollSummary } from '../../types/voting';
+
+const alice: CommunityMember = { address: 'aa'.repeat(20), displayName: 'Alice', power: 100, status: 'joined' };
+const bob: CommunityMember = { address: 'bb'.repeat(20), displayName: 'Bob', power: 0, status: 'joined' };
+const carol: CommunityMember = { address: 'cc'.repeat(20), displayName: 'Carol', power: 100, status: 'joined' };
+const daveLeft: CommunityMember = { address: 'dd'.repeat(20), displayName: 'Dave', power: 0, status: 'left' };
+
+function poll(overrides: Partial<Tier3PollSummary> = {}): Tier3PollSummary {
+  return {
+    pollId: 'p1',
+    communityId: 'cid',
+    proposalText: 'Adopt a code of conduct',
+    proposer: 'ee'.repeat(20),
+    stage: 'fi',
+    pollCreateHlcMs: 1735689600000, // 2025-01-01T00:00:00Z
+    sortitionSize: 5,
+    winnerText: 'Adopted with amendments',
+    privacyMode: 'pu',
+    ...overrides,
+  };
+}
+
+function makeAdapter(polls: Tier3PollSummary[] | Error): VotingAdapter {
+  return {
+    listTier3Polls: vi.fn(() =>
+      polls instanceof Error ? Promise.reject(polls) : Promise.resolve(polls),
+    ),
+  } as unknown as VotingAdapter;
+}
+
+const baseProps = {
+  communityId: 'cid',
+  communityName: 'IPFS Crew',
+  members: [alice, bob, carol, daveLeft],
+  adminQuorum: 2,
+  onProposeAmendment: vi.fn(),
+};
+
+describe('CharterView', () => {
+  it('derives the plural amendment-count pill and joined-members-bound line', async () => {
+    const adapter = makeAdapter([
+      poll({ pollId: 'p1' }),
+      poll({ pollId: 'p2', pollCreateHlcMs: 1738368000000 }), // 2025-02-01
+      poll({ pollId: 'p3', stage: 'de' }), // in deliberation — NOT ratified
+    ]);
+    const { getByText } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(getByText('✓ 2 ratified amendments')).toBeTruthy();
+    });
+    // daveLeft has status 'left' — only joined members are bound.
+    expect(getByText('3 members bound')).toBeTruthy();
+  });
+
+  it('uses the singular form for exactly one amendment', async () => {
+    const adapter = makeAdapter([poll()]);
+    const { getByText } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(getByText('✓ 1 ratified amendment')).toBeTruthy();
+    });
+  });
+
+  it('zero-state shows "No amendments yet" and no on-record section', async () => {
+    const adapter = makeAdapter([]);
+    const { getByText, container } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(getByText('✓ No amendments yet')).toBeTruthy();
+    });
+    expect(container.querySelector('.on-record')).toBeNull();
+  });
+
+  it('renders all three articles gracefully when the poll fetch rejects', async () => {
+    const adapter = makeAdapter(new Error('adapter not connected'));
+    const { container, getByText } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect((adapter.listTier3Polls as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    });
+    expect(getByText('✓ …')).toBeTruthy(); // neutral not-loaded pill, never a fake zero
+    expect(getByText(/Article I · Membership/)).toBeTruthy();
+    expect(getByText(/Article II · How we decide/)).toBeTruthy();
+    expect(getByText(/Article III · Amendment/)).toBeTruthy();
+    expect(container.querySelector('.on-record')).toBeNull();
+  });
+
+  it('renders the generated preamble framing', async () => {
+    const adapter = makeAdapter([]);
+    const { getByText } = render(CharterView, { props: { ...baseProps, adapter } });
+    expect(getByText(/generated from its live governance state/)).toBeTruthy();
+  });
+
+  it('capability matrix has the 6 derived rows, an admin-only bottom row, and the v1 footnote', async () => {
+    const adapter = makeAdapter([]);
+    const { container } = render(CharterView, { props: { ...baseProps, adapter } });
+    const rows = container.querySelectorAll('.capability-matrix tbody tr');
+    expect(rows.length).toBe(6);
+    const last = rows[5];
+    expect(last.textContent).toContain('Set roles · change decision rules');
+    const caps = last.querySelectorAll('.cap');
+    expect(caps[0].textContent).toBe('—');
+    expect(caps[1].textContent).toBe('—');
+    expect(caps[2].textContent).toBe('●');
+    // Honesty footnote — thresholds are GLOBAL v1 constants (spec §0.1).
+    expect(container.textContent).toContain('Thresholds are platform-wide in v1.');
+  });
+
+  it('role cards show the real POWER_THRESHOLDS values', async () => {
+    const adapter = makeAdapter([]);
+    const { getByText } = render(CharterView, { props: { ...baseProps, adapter } });
+    expect(getByText('power 0')).toBeTruthy();
+    expect(getByText('power ≥ 50')).toBeTruthy();
+    expect(getByText('power ≥ 100')).toBeTruthy();
+  });
+
+  it('admin quorum card shows k of n from real data with a matching pip meter', async () => {
+    const adapter = makeAdapter([]);
+    const { container, getByText } = render(CharterView, { props: { ...baseProps, adapter } });
+    // n = joined members with power >= 100 (alice, carol); k = adminQuorum prop.
+    expect(getByText('2 of 2')).toBeTruthy();
+    expect(container.querySelectorAll('.quorum-card .pip').length).toBe(2);
+    expect(container.querySelectorAll('.quorum-card .pip.filled').length).toBe(2);
+    expect(getByText(/No single admin can act alone/)).toBeTruthy();
+  });
+
+  it('Propose amendment fires the callback', async () => {
+    const onProposeAmendment = vi.fn();
+    const adapter = makeAdapter([]);
+    const { getByRole } = render(CharterView, {
+      props: { ...baseProps, adapter, onProposeAmendment },
+    });
+    await fireEvent.click(getByRole('button', { name: 'Propose amendment' }));
+    expect(onProposeAmendment).toHaveBeenCalledTimes(1);
+  });
+
+  it('on-record rows render proposed-date, title, ratified outcome, and short proposer', async () => {
+    const adapter = makeAdapter([poll()]);
+    const { container, getByText } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(container.querySelector('.on-record')).toBeTruthy();
+    });
+    expect(getByText(/2025-01-01 · proposed/)).toBeTruthy();
+    expect(getByText('Adopt a code of conduct')).toBeTruthy();
+    expect(getByText('Ratified: Adopted with amendments')).toBeTruthy();
+    expect(getByText('eeeeeeee…eeee')).toBeTruthy(); // shortAddr 8…4
+  });
+});
