@@ -2991,7 +2991,7 @@ mod tests {
         // The floor still fires at the ORIGINAL absolute deadline: just shy
         // → nothing; cross it → exactly one persisted fire.
         let now = start.elapsed().as_millis() as u64;
-        tokio::time::advance(Duration::from_millis(DEADLINE_MS - 1 - now)).await;
+        tokio::time::advance(Duration::from_millis((DEADLINE_MS - 1).saturating_sub(now))).await;
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -3066,7 +3066,7 @@ mod tests {
         );
         // Floor fires at the ORIGINAL absolute deadline.
         let now = start.elapsed().as_millis() as u64;
-        tokio::time::advance(Duration::from_millis(DEADLINE_MS - 1 - now)).await;
+        tokio::time::advance(Duration::from_millis((DEADLINE_MS - 1).saturating_sub(now))).await;
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }

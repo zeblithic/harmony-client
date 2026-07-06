@@ -23,9 +23,10 @@ edit. No frontend changes.
   repo root (git-add new/changed test files FIRST — untracked files are
   invisible to the always-run set). Paste the printed `round=… bucket=…`
   summary into the task report.
-- Per-task lint gate: `cargo clippy --locked -p harmony-app --features
-  test-fixtures --no-deps -- -D warnings` then `cargo fmt --all` (both from
-  `src-tauri/`).
+- Per-task lint gate: `cargo clippy --locked -p harmony-app --all-targets
+  --features test-fixtures --no-deps -- -D warnings` then `cargo fmt --all`
+  (both from `src-tauri/`). (`--all-targets` is load-bearing for inline
+  `#[cfg(test)]` code — Qodo PR #406 R1; matches what the tasks ran.)
 - Final sweep (after Task 4, controller-run): `cargo fmt --all -- --check`;
   `cargo clippy --locked --all-targets --features test-fixtures --no-deps
   -- -D warnings`; `cargo nextest run --locked --workspace --all-targets
