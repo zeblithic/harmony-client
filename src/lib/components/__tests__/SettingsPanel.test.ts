@@ -1,11 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, within } from '@testing-library/svelte';
 
-// The container's only job is tab routing. Mock the six inner panels to a no-op
+// The container's only job is tab routing. Mock the inner panels to a no-op
 // stub (they each fire Tauri IPC / construct services on mount) so this test
 // isolates which section is shown per tab, not the panels' internals.
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('../ProfileEditor.svelte', () => import('./settings-panel-stub.svelte'));
+vi.mock('../AppearanceSettings.svelte', () => import('./settings-panel-stub.svelte'));
 vi.mock('../IdentityPanel.svelte', () => import('./settings-panel-stub.svelte'));
 vi.mock('../DevicesPanel.svelte', () => import('./settings-panel-stub.svelte'));
 vi.mock('../NotificationSettingsPanel.svelte', () => import('./settings-panel-stub.svelte'));
@@ -27,10 +28,10 @@ const baseProps = {
   friendService: {} as unknown as FriendService,
 };
 
-const TAB_LABELS = ['Profile', 'Account', 'Notifications', 'Network', 'Friends'];
+const TAB_LABELS = ['Profile', 'Appearance', 'Account', 'Notifications', 'Network', 'Friends'];
 
 describe('SettingsPanel tab routing', () => {
-  it('renders the five tabs in order with Profile active by default', () => {
+  it('renders the tabs in order with Profile active by default', () => {
     render(SettingsPanel, { props: baseProps });
     const tabs = screen.getAllByRole('tab');
     expect(tabs.map((t) => t.textContent?.trim())).toEqual(TAB_LABELS);
@@ -86,11 +87,11 @@ describe('SettingsPanel tab routing', () => {
     expect(tab('Account').getAttribute('tabindex')).toBe('-1');
 
     await fireEvent.keyDown(tab('Profile'), { key: 'ArrowRight' });
-    expect(tab('Account').getAttribute('aria-selected')).toBe('true');
-    expect(tab('Account').getAttribute('tabindex')).toBe('0');
+    expect(tab('Appearance').getAttribute('aria-selected')).toBe('true');
+    expect(tab('Appearance').getAttribute('tabindex')).toBe('0');
     expect(tab('Profile').getAttribute('tabindex')).toBe('-1');
 
-    await fireEvent.keyDown(tab('Account'), { key: 'End' });
+    await fireEvent.keyDown(tab('Appearance'), { key: 'End' });
     expect(tab('Friends').getAttribute('aria-selected')).toBe('true');
 
     await fireEvent.keyDown(tab('Friends'), { key: 'Home' });

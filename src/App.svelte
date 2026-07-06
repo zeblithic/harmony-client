@@ -122,9 +122,9 @@
   // ZEB-545: which Settings tab is active. Held here (not just inside
   // SettingsPanel) so the app can route to a specific section — see
   // handleExportRequested, which opens Settings → Account for the backup wizard.
-  let settingsTab = $state<'profile' | 'account' | 'notifications' | 'network' | 'friends'>(
-    'profile',
-  );
+  let settingsTab = $state<
+    'profile' | 'appearance' | 'account' | 'notifications' | 'network' | 'friends'
+  >('profile');
   let appMode = $state<AppMode>('messages');
 
   // ZEB-405 (WS-C): user-controlled reveal + width of the messages-mode media
