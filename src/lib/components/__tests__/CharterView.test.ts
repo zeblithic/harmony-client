@@ -130,6 +130,55 @@ describe('CharterView', () => {
     expect(getByText(/No single admin can act alone/)).toBeTruthy();
   });
 
+  it('a quorum of 1 does NOT claim co-signing is required (PR #410 CodeRabbit)', async () => {
+    const adapter = makeAdapter([]);
+    const { getByText, queryByText } = render(CharterView, {
+      props: { ...baseProps, adapter, adminQuorum: 1 },
+    });
+    expect(getByText(/Any single admin can enact admin actions on their own/)).toBeTruthy();
+    expect(queryByText(/No single admin can act alone/)).toBeNull();
+  });
+
+  it('an unresolved quorum shows a neutral placeholder, never a fake value (PR #410 CodeRabbit)', async () => {
+    const adapter = makeAdapter([]);
+    const { container, queryByText } = render(CharterView, {
+      props: { ...baseProps, adapter, adminQuorum: null },
+    });
+    const card = container.querySelector('.quorum-card')!;
+    expect(card.querySelector('.quorum-value')?.textContent).toBe('…');
+    // No meter and no false "must co-sign / can act alone" copy while unknown.
+    expect(card.querySelectorAll('.pip').length).toBe(0);
+    expect(queryByText(/No single admin can act alone/)).toBeNull();
+    expect(queryByText(/must co-sign admin actions/)).toBeNull();
+  });
+
+  it('capability cells expose Can/Cannot to assistive tech (PR #410 CodeRabbit a11y)', async () => {
+    const adapter = makeAdapter([]);
+    const { container } = render(CharterView, { props: { ...baseProps, adapter } });
+    const firstRow = container.querySelectorAll('.capability-matrix tbody tr')[0];
+    const memberCell = firstRow.querySelectorAll('.cap')[0];
+    // Member CAN post/vote/propose/invite (row 0).
+    expect(memberCell.getAttribute('aria-label')).toBe('Can');
+    // The glyph itself is hidden from the accessibility tree.
+    expect(memberCell.querySelector('[aria-hidden="true"]')?.textContent).toBe('●');
+    const lastRow = container.querySelectorAll('.capability-matrix tbody tr')[5];
+    expect(lastRow.querySelectorAll('.cap')[0].getAttribute('aria-label')).toBe('Cannot');
+  });
+
+  it('a finalized poll with no winner text is not counted as a ratified amendment (PR #410 CodeRabbit)', async () => {
+    // Defensive: winnerText is nullable at the DTO boundary; a null-winner
+    // finalized poll must not inflate the pill (the record already renders no
+    // "Ratified:" row for it).
+    const adapter = makeAdapter([
+      poll({ pollId: 'real', proposalText: 'Rename #general', winnerText: 'Renamed to #square' }),
+      poll({ pollId: 'nowinner', proposalText: 'Ghost poll', winnerText: null }),
+    ]);
+    const { getByText } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(getByText('✓ 1 ratified amendment')).toBeTruthy();
+    });
+  });
+
   it('Propose amendment fires the callback', async () => {
     const onProposeAmendment = vi.fn();
     const adapter = makeAdapter([]);

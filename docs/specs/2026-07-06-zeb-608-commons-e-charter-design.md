@@ -126,8 +126,11 @@ semantics across forks are unresolved; the charter header does without it.
    (7-day half-life by default) toward a dynamic threshold; delegable, recallable."*; **Tier 3 ·
    Charter** — *"Amends how the community works. A sortition-selected mini-public deliberates,
    drafts and ratifies by STAR ballot."* Below: ONE meter card — **Admin quorum**: header +
-   mono `{k} of {n}` + PipMeter + caption *"{k} of {n} admins must co-sign admin actions. No
-   single admin can act alone."* (n = joined members with power ≥ 100, k = D1 value).
+   mono `{k} of {n}` + PipMeter + a caption **derived from k** (k ≥ 2: *"{k} of {n} admins must
+   co-sign admin actions. No single admin can act alone."*; k ≤ 1: *"Any single admin can enact
+   admin actions on their own."* — the co-signing claim is false at quorum 1, PR #410 CodeRabbit).
+   When the governance value is not yet loaded the card shows a neutral `…` rather than a fake
+   value, mirroring the amendments pill (n = joined members with power ≥ 100, k = D1 value).
 5. **Article III · Amendment** — `--primary-soft` callout, `--primary-border`, radius 10: ✎ +
    *"No clause here is permanent. Any member may open a Tier-3 proposal to amend how
    {communityName} works; if it ratifies, the change is signed by the mini-public and recorded.

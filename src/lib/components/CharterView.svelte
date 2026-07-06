@@ -26,8 +26,11 @@
     communityId: string;
     communityName: string;
     members: CommunityMember[];
-    /** Current materialized admin quorum (get_community_governance, D1). */
-    adminQuorum: number;
+    /** Current materialized admin quorum (get_community_governance, D1).
+     *  `null` = not yet loaded OR the governance fetch failed — the quorum
+     *  card then shows a neutral '…' rather than a fake value, keeping the
+     *  charter's "live governance state" promise honest (PR #410 CodeRabbit). */
+    adminQuorum: number | null;
     adapter: VotingAdapter;
     /** Fired by "Propose amendment" — the parent switches to the
      *  Constitutional tab (spec §0.6: create-form prefill is YAGNI v1). */
@@ -78,7 +81,15 @@
   function isUpheld(p: Tier3PollSummary): boolean {
     return p.winnerText === STATUS_QUO_TEXT;
   }
-  let adoptedCount = $derived(finalized.filter((p) => !isUpheld(p)).length);
+  // An adopted amendment is a finalized poll that has an actual winner text
+  // and did not uphold the status quo. Guarding on winnerText (which the DTO
+  // types as nullable) keeps the pill count consistent with the record, whose
+  // "Ratified: …" row already renders only when winnerText is present
+  // (PR #410 CodeRabbit).
+  function isAdopted(p: Tier3PollSummary): boolean {
+    return !!p.winnerText && !isUpheld(p);
+  }
+  let adoptedCount = $derived(finalized.filter(isAdopted).length);
   let ratifiedPillText = $derived(
     polls === null
       ? '✓ …'
@@ -92,6 +103,17 @@
   function proposedDate(hlcMs: number): string {
     return new Date(hlcMs).toISOString().slice(0, 10);
   }
+
+  // The quorum caption is derived, not hardcoded: with a quorum of 1 a single
+  // admin genuinely can act alone, so the "no single admin can act alone"
+  // claim only holds at quorum ≥ 2 (PR #410 CodeRabbit).
+  let quorumCaption = $derived(
+    adminQuorum === null
+      ? ''
+      : adminQuorum <= 1
+        ? 'Any single admin can enact admin actions on their own.'
+        : `${adminQuorum} of ${adminCount} admins must co-sign admin actions. No single admin can act alone.`,
+  );
 
   // Capability matrix (spec D3 Article I): derived from the REAL consumer
   // checks — invite ≥ invite (0, i.e. any joined member; backend verify at
@@ -177,9 +199,15 @@
           {#each MATRIX_ROWS as row (row.action)}
             <tr>
               <td class="action-col">{row.action}</td>
-              <td class="cap" class:can={row.member}>{row.member ? '●' : '—'}</td>
-              <td class="cap" class:can={row.mod}>{row.mod ? '●' : '—'}</td>
-              <td class="cap" class:can={row.admin}>{row.admin ? '●' : '—'}</td>
+              <td class="cap" class:can={row.member} aria-label={row.member ? 'Can' : 'Cannot'}>
+                <span aria-hidden="true">{row.member ? '●' : '—'}</span>
+              </td>
+              <td class="cap" class:can={row.mod} aria-label={row.mod ? 'Can' : 'Cannot'}>
+                <span aria-hidden="true">{row.mod ? '●' : '—'}</span>
+              </td>
+              <td class="cap" class:can={row.admin} aria-label={row.admin ? 'Can' : 'Cannot'}>
+                <span aria-hidden="true">{row.admin ? '●' : '—'}</span>
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -215,12 +243,14 @@
       </div>
       <div class="quorum-card">
         <h3 class="quorum-heading">Admin quorum</h3>
-        <span class="quorum-value">{adminQuorum} of {adminCount}</span>
-        <PipMeter filled={adminQuorum} total={adminCount} label="Admin quorum meter" />
-        <p class="quorum-caption">
-          {adminQuorum} of {adminCount} admins must co-sign admin actions. No single admin can
-          act alone.
-        </p>
+        {#if adminQuorum === null}
+          <span class="quorum-value">…</span>
+          <p class="quorum-caption">Loading current quorum…</p>
+        {:else}
+          <span class="quorum-value">{adminQuorum} of {adminCount}</span>
+          <PipMeter filled={adminQuorum} total={adminCount} label="Admin quorum meter" />
+          <p class="quorum-caption">{quorumCaption}</p>
+        {/if}
       </div>
     </section>
 

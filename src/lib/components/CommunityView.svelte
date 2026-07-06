@@ -476,7 +476,7 @@
         {communityId}
         {communityName}
         {members}
-        adminQuorum={governance?.adminQuorum ?? 1}
+        adminQuorum={governance?.adminQuorum ?? null}
         adapter={votingAdapter}
         onProposeAmendment={() => { activeView = 'tier3'; }}
       />
