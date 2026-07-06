@@ -904,7 +904,11 @@
           role="separator"
           aria-label="Forked from {row.originalCommunityName}"
         >
-          ───── Forked from {row.originalCommunityName} on {new Date(row.forkedAtMs).toLocaleDateString()} ─────
+          <span class="fork-divider-glyph" aria-hidden="true">⑂</span>
+          <span class="fork-divider-text">
+            <span class="fork-divider-title">Forked from {row.originalCommunityName}</span>
+            <span class="fork-divider-meta">{new Date(row.forkedAtMs).toLocaleDateString()} · {snapshotMessages.length} message{snapshotMessages.length === 1 ? '' : 's'} carried</span>
+          </span>
         </div>
       {:else if 'msg' in row}
         {@const msg = row.msg}
@@ -1470,16 +1474,47 @@
     font-size: 0.8rem;
     margin-left: auto;
   }
-  /* ZEB-285 Task 11: fork-point divider */
+  /* ZEB-609: Commons fork-divider band (clay card). */
   .fork-divider {
-    text-align: center;
-    font-size: 0.75rem;
-    color: var(--text-secondary);
-    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
     margin: 4px 16px;
-    border-top: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
+    padding: 10px 14px;
+    background: var(--gov-clay-soft);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 35%, var(--surface-raised));
+    border-radius: 10px;
+    box-shadow: var(--shadow-e1);
     user-select: none;
+  }
+  .fork-divider-glyph {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: var(--gov-clay);
+    color: var(--text-bright);
+    font-size: 0.9rem;
+  }
+  .fork-divider-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .fork-divider-title {
+    font-family: var(--font-ui);
+    font-weight: 600;
+    font-size: 0.8rem;
+    color: var(--gov-clay-deep);
+  }
+  .fork-divider-meta {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
   }
   /* Pre-fork messages rendered with muted opacity to visually distinguish
    * them from live post-fork messages per spec §6.4. */

@@ -582,6 +582,46 @@ describe('ChannelMessageFeed', () => {
     // Compose retains text on failure so user can retry.
     expect(textarea.value).toBe('will fail');
   });
+
+  it('renders the Commons fork-divider band with the real carried count', async () => {
+    const preFork1 = {
+      messageId: 'pf1', communityId: 'aa'.repeat(16), channelId: 'bb'.repeat(16),
+      author: 'ee'.repeat(20), at: { wallMs: 400, logical: 0, deviceId: 'd' },
+      body: Array.from(new TextEncoder().encode('old 1')),
+    };
+    const preFork2 = {
+      ...preFork1, messageId: 'pf2', at: { wallMs: 500, logical: 0, deviceId: 'd' },
+      body: Array.from(new TextEncoder().encode('old 2')),
+    };
+    const { adapter, container } = await setup({
+      snapshotMessages: [preFork1, preFork2],
+      originalCommunityName: 'OldCommunity',
+      forkedAtMs: 1000,
+    });
+    // A live post-fork message (wallMs after the snapshot) creates the boundary.
+    const handler = adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16), channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'live1', communityId: 'aa'.repeat(16), channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20), at: { wallMs: 2000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('new message')),
+        },
+      },
+    });
+    let divider: Element | null = null;
+    await waitFor(() => {
+      divider = container.querySelector('.fork-divider');
+      expect(divider).toBeTruthy();
+    });
+    expect(divider!.getAttribute('role')).toBe('separator');
+    expect(divider!.getAttribute('aria-label')).toBe('Forked from OldCommunity');
+    expect(divider!.textContent).toContain('Forked from OldCommunity');
+    expect(divider!.textContent).toContain('⑂');
+    // Real carried count = snapshotMessages.length = 2.
+    expect(divider!.textContent).toContain('2 messages carried');
+  });
 });
 
 describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
