@@ -56,7 +56,10 @@
   />
 {:else}
   <Modal {onCancel} ariaLabelledby={titleId} canDismissOnBackdrop={true}>
-    <h3 class="modal-title" id={titleId}>Fork this community</h3>
+    <div class="fork-header">
+      <span class="fork-glyph" aria-hidden="true">⑂</span>
+      <h3 class="modal-title" id={titleId}>Fork this community</h3>
+    </div>
 
     <p class="modal-description">
       This creates a new community with a frozen copy of the history you can see
@@ -94,6 +97,12 @@
         Snapshot will include your accessible message history (up to 5000 messages).
       {/if}
     </p>
+    <p class="snapshot-note">A frozen snapshot of every channel is always included.</p>
+
+    <p class="consent-note">
+      Forking writes a permanent divider into the new community's history. You
+      become its first admin, and the original community is never affected.
+    </p>
 
     <div class="action-row">
       <button class="confirm-btn" disabled={!nameValid} onclick={handleCreateFork}>
@@ -106,10 +115,29 @@
 {/if}
 
 <style>
+  .fork-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .fork-glyph {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: var(--gov-clay-soft);
+    color: var(--gov-clay);
+    font-size: 1rem;
+  }
   .modal-title {
     color: var(--text-primary);
-    font-size: 1rem;
-    margin: 0 0 12px;
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+    margin: 0;
   }
   .modal-description {
     color: var(--text-secondary);
@@ -138,8 +166,9 @@
     font-size: 0.875rem;
   }
   .name-input:focus {
-    outline: 2px solid var(--accent);
-    outline-offset: -1px;
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .checkbox-field {
     margin-bottom: 10px;
@@ -157,6 +186,21 @@
     font-size: 0.875rem;
     margin: 12px 0 16px;
   }
+  .snapshot-note {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    margin: 0 0 12px;
+  }
+  .consent-note {
+    background: var(--primary-soft);
+    border: 1px solid var(--primary-border);
+    color: var(--primary-deep);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    margin: 0 0 16px;
+  }
   .action-row {
     display: flex;
     gap: 8px;
@@ -164,24 +208,25 @@
   }
   .spacer { flex: 1; }
   .confirm-btn {
-    background: var(--accent);
-    color: var(--text-primary);
+    background: var(--gov-clay);
+    color: var(--text-bright);
     border: none;
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.875rem;
+    font-weight: 600;
   }
   .confirm-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
   }
   .cancel-btn {
-    background: var(--bg-tertiary);
+    background: var(--surface-raised);
     color: var(--text-secondary);
-    border: none;
+    border: 1px solid var(--border);
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.875rem;
   }
