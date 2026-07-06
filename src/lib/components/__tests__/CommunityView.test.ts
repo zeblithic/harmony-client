@@ -37,6 +37,20 @@ function makeVoiceSessionStub(): VoiceSession {
   } as unknown as VoiceSession;
 }
 
+/** ZEB-608: VotingAdapter stub with the tier3 surface CommunityView's
+ *  tabs touch (list + lifecycle subscriptions), unconnected-safe. */
+function makeVotingAdapterStub(): VotingAdapter {
+  const votingAdapter = new VotingAdapter();
+  votingAdapter.listTier3Polls = vi.fn().mockResolvedValue([]);
+  const noopUnsub = () => {};
+  votingAdapter.subscribeTier3PollCreated = vi.fn().mockReturnValue(noopUnsub);
+  votingAdapter.subscribeTier3SortitionComplete = vi.fn().mockReturnValue(noopUnsub);
+  votingAdapter.subscribeTier3DraftingOpen = vi.fn().mockReturnValue(noopUnsub);
+  votingAdapter.subscribeTier3RatificationOpen = vi.fn().mockReturnValue(noopUnsub);
+  votingAdapter.subscribeTier3Finalized = vi.fn().mockReturnValue(noopUnsub);
+  return votingAdapter;
+}
+
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
   const listeners = new Map<string, Function>();
   return {
@@ -77,11 +91,17 @@ const voiceLounge = {
   createdAt: { wallMs: 400, logical: 0, deviceId: 'd' },
 };
 
-async function setup(channelList: any[] = [general, announcements], propOverrides: Record<string, unknown> = {}) {
+async function setup(
+  channelList: any[] = [general, announcements],
+  propOverrides: Record<string, unknown> = {},
+  invokeOverrides: Record<string, () => Promise<unknown>> = {},
+) {
   const adapter = makeAdapter();
   (adapter.invoke as any).mockImplementation((cmd: string) => {
+    if (cmd in invokeOverrides) return invokeOverrides[cmd]();
     if (cmd === 'list_channels') return Promise.resolve(channelList);
     if (cmd === 'list_channel_messages') return Promise.resolve([]);
+    if (cmd === 'get_community_governance') return Promise.resolve({ adminQuorum: 1 });
     return Promise.resolve(undefined);
   });
   const communityService = new CommunityService();
@@ -382,6 +402,78 @@ describe('CommunityView', () => {
     });
     await waitFor(() => {
       expect(container.querySelector('.community-proposals')).toBeTruthy();
+    });
+  });
+
+  it('Charter tab mounts CharterView when votingAdapter is provided (ZEB-608)', async () => {
+    const { container, getByText } = await setup(undefined, {
+      votingAdapter: makeVotingAdapterStub(),
+    });
+    await waitFor(() => {
+      expect(getByText('Charter')).toBeTruthy();
+    });
+    await fireEvent.click(getByText('Charter'));
+    await waitFor(() => {
+      expect(container.querySelector('.charter-view')).toBeTruthy();
+    });
+  });
+
+  it('activeView is externally drivable to charter (deep-link)', async () => {
+    const { container } = await setup(undefined, {
+      votingAdapter: makeVotingAdapterStub(),
+      activeView: 'charter',
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.charter-view')).toBeTruthy();
+    });
+  });
+
+  it('a governance activeView without a votingAdapter shows an unavailable state, not the channel feed (Greptile #410)', async () => {
+    // Deep-linked to a governance view before the voting adapter is ready:
+    // the guarded governance branches fall through, and we must NOT silently
+    // render channel content under a governance tab state.
+    const { container } = await setup([general, announcements], {
+      votingAdapter: undefined,
+      activeView: 'charter',
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.channel-sub-sidebar')).toBeTruthy();
+    });
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      'live connection to community governance',
+    );
+    expect(container.querySelector('.channel-message-feed')).toBeNull();
+  });
+
+  it('Propose amendment switches the view to the Constitutional tab', async () => {
+    const { container, getByText, getByRole } = await setup(undefined, {
+      votingAdapter: makeVotingAdapterStub(),
+      activeView: 'charter',
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.charter-view')).toBeTruthy();
+    });
+    await fireEvent.click(getByRole('button', { name: 'Propose amendment' }));
+    await waitFor(() => {
+      expect(container.querySelector('.tier3-panel')).toBeTruthy();
+    });
+    expect(getByText('Constitutional').getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('threads the fetched admin quorum into the settings panel (fixes always-shows-1, ZEB-608 §0.2)', async () => {
+    const { container, getByLabelText, getByText } = await setup(
+      undefined,
+      {},
+      { get_community_governance: () => Promise.resolve({ adminQuorum: 2 }) },
+    );
+    await waitFor(() => {
+      expect(container.querySelector('.channel-sub-sidebar')).toBeTruthy();
+    });
+    await fireEvent.click(getByLabelText(/Open community settings/i));
+    await waitFor(() => {
+      // adminMember (myPower 100) sees the admin-governance section with the
+      // REAL fetched quorum, not the component default of 1.
+      expect(getByText(/Current admin quorum: 2 of/)).toBeTruthy();
     });
   });
 });

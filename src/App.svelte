@@ -1039,7 +1039,7 @@
   // ZEB-606: App-held mirror of CommunityView's middle-column view, bound
   // via bind:activeView so the nav proposals row / Assembly rail can
   // deep-link and show an active state.
-  let communityActiveView = $state<'channels' | 'proposals' | 'tier3'>('channels');
+  let communityActiveView = $state<'channels' | 'proposals' | 'tier3' | 'charter'>('channels');
   // ZEB-606: identity-chip signals. Ring = "you appear online to others"
   // (visibility toggle + identity present); presence rosters never contain
   // self (zenoh doesn't loop our own beacon), so presenceService can't

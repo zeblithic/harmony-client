@@ -442,6 +442,16 @@ describe('CommunityService', () => {
     await service2.listChannels('aa'.repeat(16));
     expect(adapter2.invoke).toHaveBeenCalledTimes(1);
   });
+
+  it('getCommunityGovernance invokes the IPC and returns the camelCase DTO (ZEB-608)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({ adminQuorum: 2 });
+    const result = await service.getCommunityGovernance('aa'.repeat(16));
+    expect(adapter.invoke).toHaveBeenCalledWith('get_community_governance', {
+      communityId: 'aa'.repeat(16),
+    });
+    expect(result.adminQuorum).toBe(2);
+  });
 });
 
 describe('rosterHasJoinedAuthor (ZEB-404)', () => {

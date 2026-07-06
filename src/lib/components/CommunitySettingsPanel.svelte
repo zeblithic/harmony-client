@@ -17,6 +17,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import PendingAdminProposalsPanel from './PendingAdminProposalsPanel.svelte';
   import ChangeQuorumDialog from './ChangeQuorumDialog.svelte';
+  import RoleBadge from './governance/RoleBadge.svelte';
+  import PipMeter from './governance/PipMeter.svelte';
 
   let {
     communityId,
@@ -366,7 +368,7 @@
         <div class="key">Members</div><div>{joinedMembers.length} joined</div>
         <div class="key">Your role</div>
         <div>
-          <span class="role-badge" data-role={myRole}>{myRole.toUpperCase()}</span>
+          <RoleBadge role={myRole} />
           (power {myPower})
         </div>
         <div class="key">Sync status</div>
@@ -457,7 +459,7 @@
               <div class="name">{m.displayName ?? m.address.slice(0, 8)}{m.address === myAddress ? ' (you)' : ''}</div>
               <div class="addr">{m.address}</div>
             </div>
-            <span class="role-badge" data-role={powerToRole(m.power)}>{powerToRole(m.power).toUpperCase()}</span>
+            <RoleBadge role={powerToRole(m.power)} />
             {#if canSetPower(m)}
               <button class="set-role" onclick={() => (setPowerTarget = m)}>Set role</button>
             {/if}
@@ -502,6 +504,11 @@
           Current admin quorum: {currentAdminQuorum} of {currentAdminCount} admins required for
           admin-affecting actions.
         </p>
+        <PipMeter
+          filled={currentAdminQuorum}
+          total={currentAdminCount}
+          label="Admin quorum meter"
+        />
         <button class="change-quorum-btn" onclick={() => (showChangeQuorumDialog = true)}>
           Change quorum…
         </button>
@@ -551,7 +558,7 @@
       {/if}
     </div>
 
-    <div class="section">
+    <div class="section danger-zone">
       <div class="section-label">Danger zone</div>
       <button class="leave-btn" onclick={() => {
         if (amOnlyAdmin) {
@@ -672,7 +679,13 @@
     align-items: center;
     justify-content: space-between;
   }
-  .panel-title { color: var(--text-primary); margin: 0; font-size: 1.1rem; }
+  .panel-title {
+    color: var(--text-primary);
+    margin: 0;
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: 1.15rem;
+  }
   .subtitle { color: var(--text-secondary); font-size: 0.75rem; }
   .close-btn {
     background: transparent;
@@ -688,11 +701,15 @@
   }
   .section:last-child { border-bottom: none; }
   .section-label {
-    font-size: 0.7rem;
-    color: var(--text-secondary);
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.1em;
     margin-bottom: 12px;
+  }
+  .danger-zone .section-label {
+    color: var(--vote-against);
   }
   .info-grid {
     display: grid;
@@ -702,27 +719,24 @@
     color: var(--text-primary);
   }
   .info-grid .key { color: var(--text-secondary); }
-  .role-badge {
-    padding: 1px 7px;
-    border-radius: 8px;
-    font-size: 0.6rem;
-    font-weight: bold;
-  }
-  .role-badge[data-role="member"] { background: var(--bg-tertiary); color: var(--text-secondary); }
-  .role-badge[data-role="mod"] { background: var(--role-mod); color: var(--text-inverse-dark); }
-  .role-badge[data-role="admin"] { background: var(--accent); color: var(--text-primary); }
-  .healthy { color: #7acc7a; }
+  .healthy { color: var(--presence-online); }
   .degraded { color: var(--role-mod); }
   .muted { color: var(--text-secondary); }
-  .member-list { display: flex; flex-direction: column; }
+  .member-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
   .member-row {
     display: flex;
     align-items: center;
-    padding: 6px 6px;
+    padding: 8px 10px;
     gap: 10px;
-    border-bottom: 1px solid var(--border);
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: var(--shadow-e1);
   }
-  .member-row:last-child { border-bottom: none; }
   .avatar {
     width: 28px;
     height: 28px;
@@ -740,29 +754,25 @@
   .member-name .addr { font-size: 0.65rem; color: var(--text-secondary); font-family: var(--font-mono); }
   .set-role,
   .kick {
-    font-size: 0.65rem;
-    padding: 2px 7px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 4px;
+    border: none;
+    background: none;
     border-radius: 3px;
     cursor: pointer;
   }
-  .set-role {
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-  }
-  .kick {
-    background: var(--bg-tertiary);
-    color: var(--danger-text-muted);
-    border: 1px solid var(--danger-border-muted);
-  }
+  .set-role { color: var(--vote-for); }
+  .kick { color: var(--vote-against); }
   .leave-btn {
-    background: var(--bg-tertiary);
-    color: var(--danger-text-muted);
+    background: color-mix(in srgb, var(--vote-against) 8%, var(--surface-raised));
+    color: var(--vote-against);
     border: 1px solid var(--danger-border-muted);
     padding: 6px 14px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.8rem;
+    font-weight: 600;
   }
   .hint {
     font-size: 0.7rem;
@@ -773,9 +783,9 @@
     display: block;
     margin-top: 10px;
     padding: 6px 10px;
-    background: var(--bg-tertiary);
+    background: var(--surface-raised);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 7px;
     color: var(--text-secondary);
     font-size: 0.75rem;
     cursor: pointer;
@@ -794,7 +804,7 @@
   .search-input {
     width: 100%;
     padding: 6px 10px;
-    background: var(--bg-tertiary);
+    background: var(--input-bg);
     border: 1px solid var(--border);
     border-radius: 4px;
     color: var(--text-primary);
@@ -836,11 +846,11 @@
     line-height: 1.4;
   }
   .fork-btn {
-    background: var(--bg-tertiary);
+    background: var(--surface-raised);
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 6px 14px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.8rem;
   }
@@ -864,11 +874,11 @@
     margin: 0 0 8px;
   }
   .change-quorum-btn {
-    background: var(--bg-tertiary);
+    background: var(--surface-raised);
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 4px 10px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.75rem;
     margin-bottom: 8px;

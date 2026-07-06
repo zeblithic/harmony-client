@@ -16,6 +16,7 @@ vi.mock('@tauri-apps/api/event', () => ({
 const adminMember: CommunityMember = { address: 'a3f8c1d2', displayName: 'Alice', power: 100, status: 'joined' };
 const modMember: CommunityMember = { address: 'cc99', displayName: 'Charlie', power: 50, status: 'joined' };
 const plainMember: CommunityMember = { address: 'b1c4', displayName: 'Bob', power: 0, status: 'joined' };
+const secondAdmin: CommunityMember = { address: 'dd11', displayName: 'Dana', power: 100, status: 'joined' };
 
 const baseProps = {
   communityId: 'aabbccdd' + 'ee'.repeat(28),
@@ -588,5 +589,27 @@ describe('CommunitySettingsPanel', () => {
       expect(el.disabled).toBe(false);
       expect(el.checked).toBe(true); // unclobbered
     });
+  });
+
+  // ── ZEB-608: Commons restyle (D5) — pip meter + token migration ───────────
+
+  it('admin governance renders the quorum pip meter from real counts (ZEB-608)', () => {
+    const { container } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        myPower: 100,
+        adminQuorum: 2,
+        members: [adminMember, secondAdmin, plainMember],
+      },
+    });
+    // n = 2 joined admins → 2 pips; k = 2 → both filled.
+    expect(container.querySelectorAll('.admin-governance-section .pip').length).toBe(2);
+    expect(container.querySelectorAll('.admin-governance-section .pip.filled').length).toBe(2);
+  });
+
+  it('sync-status healthy row keeps its copy after the token migration (ZEB-608)', () => {
+    const { getByText } = render(CommunitySettingsPanel, { props: baseProps });
+    // Copy is pinned; the color moved from raw #7acc7a to var(--presence-online).
+    expect(getByText('● Healthy')).toBeTruthy();
   });
 });

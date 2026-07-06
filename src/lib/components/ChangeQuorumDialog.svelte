@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import PipMeter from './governance/PipMeter.svelte';
   import type { AdminActionResult } from '../types';
 
   let {
@@ -107,6 +108,16 @@
     <span class="of-label">of {currentAdminCount} admins</span>
   </div>
 
+  <div class="quorum-preview">
+    <PipMeter filled={proposedQuorum} total={currentAdminCount} label="Proposed quorum preview" />
+  </div>
+
+  <!-- Copy on ONE line: the test matches raw textContent (no whitespace
+       normalization), so a line break inside the sentence would break it. -->
+  <div class="quorum-warning">
+    ⚖ This change is itself an admin action — it needs the current {currentQuorum}-of-{currentAdminCount} quorum to take effect.
+  </div>
+
   {#if errorMessage}
     <p class="error">{errorMessage}</p>
   {/if}
@@ -117,17 +128,70 @@
       onclick={propose}
       disabled={submitting || proposedQuorum < 1 || proposedQuorum > currentAdminCount || proposedQuorum === currentQuorum}
     >
-      Propose
+      Propose change
     </button>
   </div>
 </dialog>
 
 <style>
-  .change-quorum-dialog { padding: 1.5rem; min-width: 24rem; }
+  .change-quorum-dialog {
+    padding: 1.5rem;
+    min-width: 24rem;
+    max-width: 30rem;
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow-e2);
+    color: var(--text-primary);
+  }
+  .change-quorum-dialog::backdrop { background: var(--overlay); }
+  h2 {
+    margin: 0 0 0.5rem;
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: 1.2rem;
+  }
   .control-row { display: flex; align-items: center; gap: 0.75rem; margin-block: 1rem; }
   .control-row input[type="range"] { flex: 1; }
-  .control-row input[type="number"] { width: 5rem; }
-  .of-label { white-space: nowrap; font-size: 0.9rem; color: var(--muted); }
+  .control-row input[type="number"] {
+    width: 5rem;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 4px 8px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+  }
+  .of-label { white-space: nowrap; font-size: 0.9rem; color: var(--text-muted); }
+  .quorum-preview { margin-block: 0.75rem; }
+  .quorum-warning {
+    background: var(--gov-clay-soft);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 35%, var(--surface-raised));
+    color: var(--gov-clay-deep);
+    border-radius: 7px;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    margin-block: 1rem;
+  }
   .actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
+  .actions button {
+    padding: 6px 14px;
+    border-radius: 7px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .actions button:disabled { cursor: not-allowed; opacity: 0.5; }
+  .actions button:first-child {
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
+  }
+  .actions button:last-child {
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--text-bright);
+    font-weight: 600;
+  }
   .error { color: var(--danger-deep); }
 </style>

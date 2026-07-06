@@ -18,6 +18,7 @@
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
   import CommunityProposalsPanel from './CommunityProposalsPanel.svelte';
   import Tier3ProposalPanel from './Tier3ProposalPanel.svelte';
+  import CharterView from './CharterView.svelte';
   import type { VotingAdapter } from '../voting-adapter';
   import type { ResolvedCard } from '../member-card-service';
   import type { VoiceSession } from '../voice-session';
@@ -124,8 +125,9 @@
     onBeforeVoiceJoin?: () => Promise<void>;
     /** ZEB-606: which middle-column view is active. Bindable so App can
      *  deep-link (nav proposals row / Assembly rail "View all"). Default
-     *  'channels' preserves the ZEB-291 behavior for non-binding parents. */
-    activeView?: 'channels' | 'proposals' | 'tier3';
+     *  'channels' preserves the ZEB-291 behavior for non-binding parents.
+     *  ZEB-608 adds 'charter'. */
+    activeView?: 'channels' | 'proposals' | 'tier3' | 'charter';
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
@@ -158,6 +160,38 @@
   // ZEB-285 Task 11: pre-fork snapshot for unified timeline rendering.
   // Loaded once per community view. null = non-fork community; undefined = not yet loaded.
   let preForkSnapshot = $state<PreForkSnapshotDto | null | undefined>(undefined);
+
+  // ZEB-608 D1: per-community governance snapshot (admin quorum). Loaded on
+  // every community switch, stale-guarded like the other per-community loads.
+  // null until the IPC resolves or on failure. The charter treats null as
+  // "not loaded" (shows '…', staying honest about live state); the settings
+  // panel keeps its operational `?? 1` fallback (its long-standing contract).
+  let governance = $state<{ adminQuorum: number } | null>(null);
+
+  $effect(() => {
+    const cid = communityId;
+    // Per-run cancellation flag (matches the preForkSnapshot effect below). A
+    // bare `cid !== communityId` compare is NOT enough: an A→B→A switch returns
+    // to the same id, so a late-resolving first-A fetch would pass the compare
+    // and clobber the re-entered A's fresh value. The cleanup fires on every
+    // re-run, so only the latest visit's completion is ever applied (PR #410
+    // Qodo; same guard class as PR #97/#144/#357).
+    let cancelled = false;
+    governance = null;
+    void communityService
+      .getCommunityGovernance(cid)
+      .then((g) => {
+        if (cancelled) return;
+        governance = g ?? null;
+      })
+      .catch(() => {
+        if (cancelled) return;
+        governance = null;
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
 
   let activeChannel = $derived(channels.find((c) => c.channelId === activeChannelId) ?? null);
 
@@ -370,6 +404,13 @@
           aria-pressed={activeView === 'tier3'}
           onclick={() => { activeView = 'tier3'; }}
         >Constitutional</button>
+        <button
+          type="button"
+          class="view-tab"
+          class:active={activeView === 'charter'}
+          aria-pressed={activeView === 'charter'}
+          onclick={() => { activeView = 'charter'; }}
+        >Charter</button>
       </nav>
     {/if}
     <div class="header-actions">
@@ -440,7 +481,16 @@
       onModifyClick={(c) => { modifyDialogChannel = c; }}
       onDeleteClick={(c) => { deleteConfirmChannel = c; }}
     />
-    {#if activeView === 'tier3' && votingAdapter}
+    {#if activeView === 'charter' && votingAdapter}
+      <CharterView
+        {communityId}
+        {communityName}
+        {members}
+        adminQuorum={governance?.adminQuorum ?? null}
+        adapter={votingAdapter}
+        onProposeAmendment={() => { activeView = 'tier3'; }}
+      />
+    {:else if activeView === 'tier3' && votingAdapter}
       <Tier3ProposalPanel
         {communityId}
         adapter={votingAdapter}
@@ -454,6 +504,16 @@
         myAddr={ownAddress}
         communityMembers={members}
       />
+    {:else if activeView !== 'channels'}
+      <!-- A governance view (charter / tier3 / proposals) is selected but the
+           voting adapter isn't available (pre-connect, or connect failed), so
+           the guarded branches above fell through. Render an explicit
+           unavailable state instead of silently showing the channel feed while
+           the tab still reads as the governance view (PR #410 Greptile P1). -->
+      <div class="empty-channels" role="status">
+        <p>This view needs a live connection to community governance.</p>
+        <p>It’ll appear here once the connection is ready.</p>
+      </div>
     {:else if activeChannel}
       {#if activeChannel.kind === 'voice'}
         {#if voiceSession}
@@ -523,6 +583,7 @@
     {myPower}
     {isDegraded}
     {sharedInProfile}
+    adminQuorum={governance?.adminQuorum ?? 1}
     {onToggleSharedInProfile}
     onClose={() => { settingsModalOpen = false; }}
     onKick={onKickMember}

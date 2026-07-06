@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import Modal from './Modal.svelte';
+  import RoleBadge from './governance/RoleBadge.svelte';
   import { powerToRole, POWER_THRESHOLDS } from '../types';
 
   let {
@@ -25,6 +26,12 @@
 
   let power = $state(untrack(() => currentPower));
   let role = $derived(powerToRole(power));
+  // ZEB-608 D6: helper copy keyed to the PREVIEWED role (design frame C1).
+  const ROLE_HELP: Record<ReturnType<typeof powerToRole>, string> = {
+    member: 'Member can post, vote, propose, invite, delegate and fork.',
+    mod: 'Moderator can manage channels & join requests.',
+    admin: 'Admin can set roles and change decision rules — under quorum.',
+  };
   let safeMax = $derived(Math.max(0, Math.min(POWER_THRESHOLDS.max, actorMaxPower)));
   let canSubmit = $derived(Number.isFinite(power) && power >= 0 && power <= safeMax);
   const titleId = `set-power-title-${Math.random().toString(36).slice(2)}`;
@@ -47,11 +54,23 @@
   <p class="dialog-subtitle"><code>{targetAddress}</code> · currently {powerToRole(currentPower)} (power {currentPower})</p>
 
   <div class="role-preview">
-    <span class="role-badge" data-role={role}>{role.toUpperCase()}</span>
+    <RoleBadge {role} />
   </div>
+  <p class="role-help">{ROLE_HELP[role]}</p>
 
   <div class="control-row">
-    <input type="range" min="0" max={safeMax} step="1" bind:value={power} class="slider" aria-label="Power level slider" />
+    <div class="slider-stack">
+      <input type="range" min="0" max={safeMax} step="1" bind:value={power} class="slider" aria-label="Power level slider" />
+      <!-- ZEB-608 D6: banded track — widths from POWER_THRESHOLDS. The admin
+           band is a fixed end-cap: the admin threshold IS the scale max
+           (setPower == max == 100), so its data-width is zero; the cap marks
+           "admin sits at the top of the scale" without inventing a range. -->
+      <div class="band-track" aria-hidden="true">
+        <span class="band band-member" style="flex-grow: {POWER_THRESHOLDS.kick - POWER_THRESHOLDS.invite}"></span>
+        <span class="band band-mod" style="flex-grow: {POWER_THRESHOLDS.setPower - POWER_THRESHOLDS.kick}"></span>
+        <span class="band band-admin"></span>
+      </div>
+    </div>
     <input
       type="number"
       min="0"
@@ -80,21 +99,40 @@
   .dialog-title { color: var(--text-primary); font-size: 1.05rem; margin: 0 0 4px; }
   .dialog-subtitle { color: var(--text-secondary); font-size: 0.8rem; margin: 0 0 16px; }
   .dialog-subtitle code { font-family: var(--font-mono); }
-  .role-preview { text-align: center; margin-bottom: 12px; }
-  .role-badge { padding: 3px 14px; border-radius: 12px; font-size: 0.75rem; font-weight: bold; }
-  .role-badge[data-role="member"] { background: var(--bg-tertiary); color: var(--text-secondary); }
-  .role-badge[data-role="mod"] { background: var(--role-mod); color: var(--text-inverse-dark); }
-  .role-badge[data-role="admin"] { background: var(--accent); color: var(--text-primary); }
+  .role-preview { text-align: center; margin-bottom: 6px; }
+  .role-help {
+    text-align: center;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    margin: 0 0 12px;
+  }
   .control-row { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }
-  .slider { flex: 1; }
+  .slider-stack {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .slider { width: 100%; }
+  .band-track {
+    display: flex;
+    height: 6px;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .band { min-height: 100%; }
+  .band-member { background: var(--status-drafting-bg); }
+  .band-mod { background: var(--gov-clay-soft); }
+  .band-admin { flex: 0 0 12px; background: var(--primary-soft); }
   .number-input {
     width: 64px;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--accent);
-    border-radius: 4px;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
     padding: 6px 8px;
-    color: var(--text-primary);
+    color: var(--vote-for);
     font-size: 0.9rem;
+    font-weight: 600;
     text-align: center;
     font-family: var(--font-mono);
   }
@@ -108,27 +146,28 @@
   }
   .threshold { text-align: center; }
   .threshold.member { color: var(--text-secondary); }
-  .threshold.mod { color: var(--role-mod); }
-  .threshold.admin { color: var(--accent); }
+  .threshold.mod { color: var(--gov-clay-deep); }
+  .threshold.admin { color: var(--vote-for); }
   .threshold .bar { display: block; }
   .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
   .cancel-btn {
-    background: var(--bg-tertiary);
+    background: transparent;
     color: var(--text-secondary);
-    border: none;
+    border: 1px solid var(--border);
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.875rem;
   }
   .confirm-btn {
     background: var(--accent);
-    color: var(--text-primary);
-    border: none;
+    color: var(--text-bright);
+    border: 1px solid var(--accent);
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.875rem;
+    font-weight: 600;
   }
   .cancel-btn:focus-visible,
   .confirm-btn:focus-visible {

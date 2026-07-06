@@ -66,4 +66,28 @@ describe('SetPowerDialog', () => {
     await fireEvent.click(getByText('Set role'));
     expect(onSubmit).toHaveBeenCalledWith(50);
   });
+
+  it('renders the power band track with threshold-derived flex widths (ZEB-608 D6)', () => {
+    const { container } = render(SetPowerDialog, { props: baseProps });
+    const bands = container.querySelectorAll('.band');
+    expect(bands.length).toBe(3);
+    expect(bands[0].classList.contains('band-member')).toBe(true);
+    expect(bands[1].classList.contains('band-mod')).toBe(true);
+    expect(bands[2].classList.contains('band-admin')).toBe(true);
+    // Widths derive from POWER_THRESHOLDS (member: 0→50, mod: 50→100).
+    expect((bands[0] as HTMLElement).style.flexGrow).toBe('50');
+    expect((bands[1] as HTMLElement).style.flexGrow).toBe('50');
+  });
+
+  it('helper line tracks the previewed role (ZEB-608 D6)', async () => {
+    const { container } = render(SetPowerDialog, { props: baseProps });
+    expect(container.querySelector('.role-help')?.textContent).toContain('Member can');
+    const slider = container.querySelector('input[type="range"]') as HTMLInputElement;
+    await fireEvent.input(slider, { target: { value: '60' } });
+    expect(container.querySelector('.role-help')?.textContent).toContain(
+      'Moderator can manage channels & join requests.',
+    );
+    await fireEvent.input(slider, { target: { value: '100' } });
+    expect(container.querySelector('.role-help')?.textContent).toContain('Admin can');
+  });
 });

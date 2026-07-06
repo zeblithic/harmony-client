@@ -202,4 +202,24 @@ describe('ChangeQuorumDialog', () => {
     expect(container.textContent).toMatch(/N\+1/);
     expect(container.textContent).toMatch(/survivability/i);
   });
+
+  it('renders the net-new self-referential quorum warning (ZEB-608 D7)', () => {
+    const { container } = render(ChangeQuorumDialog, {
+      props: { communityId: 'c-x', currentQuorum: 2, currentAdminCount: 4, onClose: vi.fn() },
+    });
+    const warning = container.querySelector('.quorum-warning');
+    expect(warning?.textContent).toMatch(/itself an admin action/);
+    expect(warning?.textContent).toMatch(/current 2-of-4 quorum/);
+  });
+
+  it('pip preview tracks the PROPOSED quorum (ZEB-608 D7)', async () => {
+    const { container } = render(ChangeQuorumDialog, {
+      props: { communityId: 'c-x', currentQuorum: 1, currentAdminCount: 4, onClose: vi.fn() },
+    });
+    expect(container.querySelectorAll('.pip').length).toBe(4);
+    expect(container.querySelectorAll('.pip.filled').length).toBe(1);
+    const number = screen.getByLabelText('Quorum number') as HTMLInputElement;
+    await fireEvent.input(number, { target: { value: '3' } });
+    expect(container.querySelectorAll('.pip.filled').length).toBe(3);
+  });
 });
