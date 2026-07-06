@@ -80,14 +80,18 @@
   }
 
   // Capability matrix (spec D3 Article I): derived from the REAL consumer
-  // checks — invite ≥ 0; channel manage/moderate/join-approval ≥ kick (50);
-  // set-roles/kick-admin/change-quorum ≥ setPower (100). ● = can, — = cannot.
+  // checks — invite ≥ invite (0, i.e. any joined member; backend verify at
+  // community_membership.rs:3159); channel manage/moderate & kick ≥ kick (50);
+  // set-roles/kick-admin/change-quorum ≥ setPower (100). Join-vouch is
+  // deliberately absent: enforcement is member-level (rs:246) while the
+  // moderation UI surfaces requests at ≥50 — a row would mislead either way.
+  // ● = can, — = cannot.
   const MATRIX_ROWS: Array<{ action: string; member: boolean; mod: boolean; admin: boolean }> = [
-    { action: 'Post, vote & propose', member: true, mod: true, admin: true },
+    { action: 'Post, vote, propose & invite', member: true, mod: true, admin: true },
     { action: 'Delegate & recall', member: true, mod: true, admin: true },
     { action: 'Fork the community', member: true, mod: true, admin: true },
-    { action: 'Manage channels & invites', member: false, mod: true, admin: true },
-    { action: 'Approve joins · remove members', member: false, mod: true, admin: true },
+    { action: 'Manage & moderate channels', member: false, mod: true, admin: true },
+    { action: 'Remove & ban members', member: false, mod: true, admin: true },
     { action: 'Set roles · change decision rules', member: false, mod: false, admin: true },
   ];
 </script>

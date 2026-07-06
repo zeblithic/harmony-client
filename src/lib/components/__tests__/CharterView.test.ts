@@ -97,6 +97,11 @@ describe('CharterView', () => {
     const { container } = render(CharterView, { props: { ...baseProps, adapter } });
     const rows = container.querySelectorAll('.capability-matrix tbody tr');
     expect(rows.length).toBe(6);
+    // Invite is MEMBER-level (backend gate = POWER_THRESHOLDS.invite = 0) —
+    // regression pin for the T3-review mis-tiering fix.
+    const first = rows[0];
+    expect(first.textContent).toContain('invite');
+    expect(first.querySelectorAll('.cap')[0].textContent).toBe('●');
     const last = rows[5];
     expect(last.textContent).toContain('Set roles · change decision rules');
     const caps = last.querySelectorAll('.cap');
