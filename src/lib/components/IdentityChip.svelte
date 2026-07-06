@@ -40,7 +40,10 @@
   <span class="chip-avatar" aria-hidden="true">
     {initials}
     {#if selfOnline}
-      <span class="presence-ring" role="img" aria-label="Online" title="Online"></span>
+      <!-- Decorative only: the aria-hidden avatar ancestor removes this from
+           the a11y tree, so a role/aria-label here would be dead markup
+           (ZEB-606 final review M1). -->
+      <span class="presence-ring"></span>
     {/if}
   </span>
   <span class="chip-text">
