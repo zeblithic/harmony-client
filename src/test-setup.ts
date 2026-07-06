@@ -48,3 +48,21 @@ if (!HTMLDialogElement.prototype.close) {
     this.dispatchEvent(new Event('close'));
   };
 }
+
+// jsdom lacks matchMedia; theme-service (ZEB-605) queries prefers-color-scheme.
+// Static stub resolves 'system' to light; tests needing control stub their own.
+if (typeof window !== 'undefined' && typeof window.matchMedia !== 'function') {
+  (window as unknown as { matchMedia: (query: string) => MediaQueryList }).matchMedia = (
+    query: string
+  ) =>
+    ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }) as unknown as MediaQueryList;
+}

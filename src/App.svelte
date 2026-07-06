@@ -9,6 +9,7 @@
   import '@fontsource/ibm-plex-mono/500.css';
   import '@fontsource/ibm-plex-mono/600.css';
   import './app.css';
+  import { connectOwnerTheme } from './lib/theme-service';
   import Layout from './lib/components/Layout.svelte';
   import { makeCloseRequestedHandler, makeTrayResidentNotifier } from './lib/window-close';
   import NavPanel from './lib/components/NavPanel.svelte';
@@ -959,6 +960,7 @@
     // ZEB-341 Task 1: seed the card using the newly-minted owner identity.
     // MintIpcResult.state.ownerId is available from the mint response.
     selfOwnerId = result.state.ownerId;
+    connectOwnerTheme(result.state.ownerId);
     // ZEB-586: re-load the profile under the freshly-minted owner so a prior
     // identity's cached name can't seed/broadcast from this one. A fresh owner
     // has no owner-scoped entry → 'Anonymous', which the name prompt below picks
@@ -1800,6 +1802,7 @@
           const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
           if (ownerState !== null) {
             selfOwnerId = ownerState.ownerId;
+            connectOwnerTheme(ownerState.ownerId);
             // ZEB-586: load this returning owner's profile from its owner-scoped
             // cache before seeding/broadcasting the card, so no other identity's
             // name on this machine can leak into the boot republish below.
@@ -2013,6 +2016,7 @@
               const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
               if (ownerState !== null) {
                 selfOwnerId = ownerState.ownerId;
+                connectOwnerTheme(ownerState.ownerId);
                 // ZEB-586: this is the third owner-resolution path (owner loads
                 // after start_node). Like the other two, load the owner-scoped
                 // profile before seeding/publishing so tryBootPublishCard can't
