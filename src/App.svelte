@@ -1030,6 +1030,12 @@
   // mirror so the NavPanel resolver re-reads (presenceVersion idiom).
   const proposalCountService = new ProposalCountService();
   let proposalCountVersion = $state(0);
+  // ZEB-606 (PR #408 Qodo R1): true once votingAdapter.connectAdapter has
+  // resolved — until then VotingAdapter rejects every invoke, so voting-backed
+  // UI (Assembly tab) must not mount and the badge ensure() pass must re-run
+  // on the flip. On connect failure this stays false and the rail degrades to
+  // media-only instead of a permanent error state.
+  let votingReady = $state(false);
   // ZEB-606: App-held mirror of CommunityView's middle-column view, bound
   // via bind:activeView so the nav proposals row / Assembly rail can
   // deep-link and show an active state.
@@ -1486,7 +1492,11 @@
 
   // ZEB-606: lazily load Tier-2 proposal counts for every community in the
   // nav (one IPC each on first sight; events keep them fresh afterwards).
+  // Reading votingReady re-runs the pass once the adapter connects — without
+  // it, nav nodes populated before connect would never get their initial
+  // fetch (ensure() no-ops pre-connect; PR #408 Qodo R1 bug 3).
   $effect(() => {
+    void votingReady;
     for (const n of navNodes) {
       if (n.type === 'community') proposalCountService.ensure(n.id);
     }
@@ -1799,9 +1809,13 @@
             proposalCountVersion += 1;
           };
           proposalCountService.connectAdapter(votingAdapter);
+          votingReady = true;
         })
         .catch((err) => {
-          console.warn('[harmony-client] votingAdapter connect failed:', err);
+          console.warn(
+            '[harmony-client] votingAdapter connect failed:',
+            err instanceof Error ? err.message : String(err),
+          );
         });
 
       // Per-service connect wrapper: logs failures with the adapter name but
@@ -3301,7 +3315,7 @@
   {#snippet mediaFeed()}
     <MessagesRail
       communityId={selectedCommunityNode?.id ?? null}
-      {votingAdapter}
+      votingAdapter={votingReady ? votingAdapter : undefined}
       onViewAllProposals={openCommunityProposals}
       messages={mediaMessages}
       {trustService}
