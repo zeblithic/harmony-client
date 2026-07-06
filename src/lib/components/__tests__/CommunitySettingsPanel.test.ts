@@ -336,6 +336,24 @@ describe('CommunitySettingsPanel', () => {
     expect(container.querySelector('.fork-of-callout')).toBeNull();
   });
 
+  it('shows the callout without an "Open" button when the parent is not locally known', () => {
+    const parentHex = '22'.repeat(16);
+    const lineage: CommunityLineageDto = {
+      forkedFrom: parentHex,
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [{ spaceId: parentHex, name: 'Origin Community', forkedAtWallMs: null }],
+      selfSpaceId: '33'.repeat(16),
+      selfName: 'The Fork',
+    };
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, phase2Lineage: lineage, localNavIds: new Set() },
+    });
+    const callout = container.querySelector('.fork-of-callout');
+    expect(callout).toBeTruthy();
+    // Parent not in localNavIds → no navigable "Open" affordance.
+    expect(callout!.querySelector('.fork-of-open')).toBeNull();
+  });
+
   // ── ZEB-250: Admin governance section tests ───────────────────────────────
 
   it('admin_governance_section_renders_for_admin', async () => {

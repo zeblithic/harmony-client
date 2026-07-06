@@ -547,7 +547,7 @@
             <span class="fork-of-name">{parent.name}</span>
           </span>
           {#if localNavIds.has(parent.spaceId)}
-            <button class="fork-of-open" onclick={() => onForkLineageNavigate?.(parent.spaceId)}>Open ↗</button>
+            <button class="fork-of-open" onclick={() => onForkLineageNavigate?.(parent.spaceId)}>Open <span aria-hidden="true">↗</span></button>
           {/if}
         </div>
       {/if}

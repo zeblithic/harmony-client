@@ -127,7 +127,7 @@
         <span class="node-name">{lineage.selfName}</span>
         <span class="node-sub">{selfSub}</span>
       </span>
-      <span class="lineage-badge you-here">&#x25CF; You are here</span>
+      <span class="lineage-badge you-here"><span aria-hidden="true">&#x25CF;</span> You are here</span>
     </span>
   </li>
 
@@ -150,7 +150,7 @@
             <span class="node-name">&#x21B3; {display}</span>
             <span class="node-sub">forked {formatDate(desc.forkedAtWallMs)} · by {forker}</span>
           </span>
-          <span class="lineage-badge member">&#x2713; Member</span>
+          <span class="lineage-badge member"><span aria-hidden="true">&#x2713;</span> Member</span>
         </button>
       {:else}
         <span class="lineage-card lineage-unknown" title="You're not a member of this fork.">
