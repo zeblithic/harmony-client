@@ -28,22 +28,35 @@ function makeVotingMock(initial: Tier2ProposalExport[]) {
   const reached: H<{ communityId: string; proposalId: string; thresholdReachedAtMs: number }> = [];
   const reverted: H<{ communityId: string; proposalId: string; revertedAtMs: number }> = [];
   const finalized: H<{ communityId: string; proposalId: string }> = [];
+  const signalCast: H<{ proposalId: string; voter: string; support: boolean }> = [];
+  const delegation: H<{ communityId: string; delegator: string; delegate: string | null }> = [];
   const listTier2Proposals = vi.fn(async (_cid: string) => listResult);
+  const getMyDelegate = vi.fn(async (_cid: string): Promise<string | null> => null);
   const adapter = {
     listTier2Proposals,
+    getMyDelegate,
     subscribeProposalCreated: (h: (typeof created)[number]) => { created.push(h); return () => created.splice(created.indexOf(h), 1); },
     subscribeThresholdReached: (h: (typeof reached)[number]) => { reached.push(h); return () => reached.splice(reached.indexOf(h), 1); },
     subscribeThresholdReverted: (h: (typeof reverted)[number]) => { reverted.push(h); return () => reverted.splice(reverted.indexOf(h), 1); },
     subscribeProposalFinalized: (h: (typeof finalized)[number]) => { finalized.push(h); return () => finalized.splice(finalized.indexOf(h), 1); },
+    subscribeSignalCast: (h: (typeof signalCast)[number]) => { signalCast.push(h); return () => signalCast.splice(signalCast.indexOf(h), 1); },
+    subscribeDelegationChanged: (h: (typeof delegation)[number]) => { delegation.push(h); return () => delegation.splice(delegation.indexOf(h), 1); },
   } as unknown as VotingAdapter;
   return {
     adapter,
     listTier2Proposals,
+    getMyDelegate,
     setList: (l: Tier2ProposalExport[]) => { listResult = l; },
     emitCreated: (p: { proposalId: string; communityId: string }) => [...created].forEach((h) => h(p)),
-    handlerCount: () => created.length + reached.length + reverted.length + finalized.length,
+    emitSignalCast: (p: { proposalId: string; voter: string; support: boolean }) => [...signalCast].forEach((h) => h(p)),
+    emitDelegationChanged: (p: { communityId: string; delegator: string; delegate: string | null }) => [...delegation].forEach((h) => h(p)),
+    handlerCount: () =>
+      created.length + reached.length + reverted.length + finalized.length + signalCast.length + delegation.length,
   };
 }
+
+const MY_ADDR = 'me'.repeat(16);
+const OTHER_ADDR = 'ee'.repeat(16);
 
 describe('AssemblyRail (ZEB-606)', () => {
   it('renders active proposals, ThresholdReached first then conviction desc', async () => {
@@ -91,8 +104,54 @@ describe('AssemblyRail (ZEB-606)', () => {
   it('unsubscribes all handlers on destroy', async () => {
     const mock = makeVotingMock([]);
     const { unmount } = render(AssemblyRail, { props: { communityId: 'c1', adapter: mock.adapter } });
-    await waitFor(() => expect(mock.handlerCount()).toBe(4));
+    await waitFor(() => expect(mock.handlerCount()).toBe(6));
     unmount();
     expect(mock.handlerCount()).toBe(0);
+  });
+
+  // PR #408 Greptile P1: remote casts refresh totals; own casts stay
+  // optimistic-only; casts on unlisted proposals are out of scope.
+  it('refetches on a remote signal-cast for a listed proposal only', async () => {
+    const mock = makeVotingMock([makeProposal({ proposal_id: 'p1', proposal_text: 'Listed one' })]);
+    render(AssemblyRail, { props: { communityId: 'c1', adapter: mock.adapter, myAddr: MY_ADDR } });
+    await waitFor(() => expect(screen.getByText('Listed one')).toBeTruthy());
+    expect(mock.listTier2Proposals).toHaveBeenCalledTimes(1);
+    // Own cast → no refetch (card handles its own optimistic state).
+    mock.emitSignalCast({ proposalId: 'p1', voter: MY_ADDR, support: true });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(mock.listTier2Proposals).toHaveBeenCalledTimes(1);
+    // Cast on a proposal we don't list → no refetch.
+    mock.emitSignalCast({ proposalId: 'p-unknown', voter: OTHER_ADDR, support: true });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(mock.listTier2Proposals).toHaveBeenCalledTimes(1);
+    // Remote cast on a listed proposal → refetch.
+    mock.emitSignalCast({ proposalId: 'p1', voter: OTHER_ADDR, support: true });
+    await waitFor(() => expect(mock.listTier2Proposals).toHaveBeenCalledTimes(2));
+  });
+
+  // PR #408 Greptile P1: delegate context reaches the rail cards so a
+  // delegated voter sees the same override affordance as the full view.
+  it('threads the delegate into cards and re-reads it on delegation-changed', async () => {
+    const mock = makeVotingMock([makeProposal({ proposal_id: 'p1', proposal_text: 'Delegated one' })]);
+    mock.getMyDelegate.mockResolvedValue(OTHER_ADDR);
+    render(AssemblyRail, {
+      props: {
+        communityId: 'c1',
+        adapter: mock.adapter,
+        myAddr: MY_ADDR,
+        communityMembers: [
+          { address: OTHER_ADDR, displayName: 'Devin Ross', power: 1, status: 'joined' },
+        ],
+      },
+    });
+    await waitFor(() => expect(screen.getByText('Devin Ross')).toBeTruthy());
+    expect(mock.getMyDelegate).toHaveBeenCalledTimes(1);
+    // Someone ELSE's delegation change is ignored…
+    mock.emitDelegationChanged({ communityId: 'c1', delegator: OTHER_ADDR, delegate: null });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(mock.getMyDelegate).toHaveBeenCalledTimes(1);
+    // …but my own re-reads the delegate.
+    mock.emitDelegationChanged({ communityId: 'c1', delegator: MY_ADDR, delegate: null });
+    await waitFor(() => expect(mock.getMyDelegate).toHaveBeenCalledTimes(2));
   });
 });

@@ -983,7 +983,12 @@ In `src/App.svelte`:
           proposalCountService.connectAdapter(votingAdapter);
         })
         .catch((err) => {
-          console.warn('[harmony-client] votingAdapter connect failed:', err);
+          // Amended in PR #408 R1 (Qodo rule 571712): normalize the IPC
+          // rejection instead of logging the raw value.
+          console.warn(
+            '[harmony-client] votingAdapter connect failed:',
+            err instanceof Error ? err.message : String(err),
+          );
         });
 ```
 

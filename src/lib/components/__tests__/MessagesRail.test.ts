@@ -11,14 +11,17 @@ beforeEach(() => {
 
 const noMessages: Message[] = [];
 
-/** Minimal voting stub — the rail only needs list + the 4 subscribes. */
+/** Minimal voting stub — the rail needs list/delegate reads + the 6 subscribes. */
 function makeVotingStub(): VotingAdapter {
   return {
     listTier2Proposals: vi.fn(async () => []),
+    getMyDelegate: vi.fn(async () => null),
     subscribeProposalCreated: () => () => {},
     subscribeThresholdReached: () => () => {},
     subscribeThresholdReverted: () => () => {},
     subscribeProposalFinalized: () => () => {},
+    subscribeSignalCast: () => () => {},
+    subscribeDelegationChanged: () => () => {},
   } as unknown as VotingAdapter;
 }
 

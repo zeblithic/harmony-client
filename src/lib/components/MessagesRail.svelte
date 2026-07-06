@@ -10,7 +10,7 @@
    * selection) the rail is media-only with no tab chrome — pixel-identical
    * to the pre-ZEB-606 experience.
    */
-  import type { Message } from '../types';
+  import type { CommunityMember, Message } from '../types';
   import type { TrustService } from '../trust-service';
   import type { VotingAdapter } from '../voting-adapter';
   import { loadRailTab, saveRailTab, type RailTab } from '../media-panel-prefs';
@@ -20,6 +20,8 @@
   let {
     communityId = null,
     votingAdapter,
+    myAddr = '',
+    communityMembers = [],
     onViewAllProposals,
     messages,
     trustService,
@@ -32,6 +34,10 @@
     /** Active community, or null outside community contexts (media-only). */
     communityId?: string | null;
     votingAdapter?: VotingAdapter;
+    /** Caller's OwnerAddr + roster — delegate context for the rail cards
+     *  (PR #408 Greptile P1). */
+    myAddr?: string;
+    communityMembers?: CommunityMember[];
     /** Deep-link to the community's Proposals view ("View all"). */
     onViewAllProposals?: (communityId: string) => void;
     /* MediaFeed pass-through (same contract as before ZEB-606): */
@@ -78,6 +84,8 @@
   <AssemblyRail
     {communityId}
     adapter={votingAdapter}
+    {myAddr}
+    {communityMembers}
     onViewAllProposals={() => onViewAllProposals?.(communityId)}
   />
 {:else}

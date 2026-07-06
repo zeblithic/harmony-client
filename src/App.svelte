@@ -3316,6 +3316,8 @@
     <MessagesRail
       communityId={selectedCommunityNode?.id ?? null}
       votingAdapter={votingReady ? votingAdapter : undefined}
+      myAddr={selfOwnerId ?? ''}
+      {communityMembers}
       onViewAllProposals={openCommunityProposals}
       messages={mediaMessages}
       {trustService}
