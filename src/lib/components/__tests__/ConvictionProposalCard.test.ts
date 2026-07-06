@@ -55,7 +55,7 @@ describe('ConvictionProposalCard', () => {
     expect(screen.getByLabelText('Lifecycle').textContent).toBe('Open');
   });
 
-  it('shows "Signal support" when the caller has not yet signaled', () => {
+  it('shows "▲ Support" when the caller has not yet signaled', () => {
     render(ConvictionProposalCard, {
       props: {
         communityId: COMMUNITY_ID,
@@ -64,11 +64,11 @@ describe('ConvictionProposalCard', () => {
       },
     });
     const btn = screen.getByRole('button');
-    expect(btn.textContent).toContain('Signal support');
+    expect(btn.textContent).toContain('▲ Support');
     expect((btn as HTMLButtonElement).getAttribute('aria-pressed')).toBe('false');
   });
 
-  it('shows "Withdraw signal" when the caller is currently supporting', () => {
+  it('shows "Withdraw support" when the caller is currently supporting', () => {
     render(ConvictionProposalCard, {
       props: {
         communityId: COMMUNITY_ID,
@@ -77,7 +77,7 @@ describe('ConvictionProposalCard', () => {
       },
     });
     const btn = screen.getByRole('button');
-    expect(btn.textContent).toContain('Withdraw signal');
+    expect(btn.textContent).toContain('Withdraw support');
     expect((btn as HTMLButtonElement).getAttribute('aria-pressed')).toBe('true');
   });
 
@@ -94,7 +94,7 @@ describe('ConvictionProposalCard', () => {
     expect(screen.getByLabelText('Lifecycle').textContent).toBe('Finalized');
   });
 
-  it('calls signalTier2(proposal_id, true) when clicking Signal support', async () => {
+  it('calls signalTier2(proposal_id, true) when clicking ▲ Support', async () => {
     render(ConvictionProposalCard, {
       props: {
         communityId: COMMUNITY_ID,
@@ -110,7 +110,7 @@ describe('ConvictionProposalCard', () => {
     expect(signalMock).toHaveBeenCalledWith(PROPOSAL_ID, true);
   });
 
-  it('calls signalTier2(proposal_id, false) when clicking Withdraw signal', async () => {
+  it('calls signalTier2(proposal_id, false) when clicking Withdraw support', async () => {
     render(ConvictionProposalCard, {
       props: {
         communityId: COMMUNITY_ID,
@@ -140,9 +140,9 @@ describe('ConvictionProposalCard', () => {
     await waitFor(() => {
       expect(screen.getByRole('alert').textContent).toContain('voting_signal_tier2: not a member');
     });
-    // Roll-back: button should now be back to "Signal support" (the
-    // optimistic flip to "Withdraw signal" reverted).
-    expect(screen.getByRole('button').textContent).toContain('Signal support');
+    // Roll-back: button should now be back to "▲ Support" (the
+    // optimistic flip to "Withdraw support" reverted).
+    expect(screen.getByRole('button').textContent).toContain('▲ Support');
   });
 
   // ─── ZEB-292 Phase 3: per-proposal override affordance ────────────
@@ -176,7 +176,7 @@ describe('ConvictionProposalCard', () => {
       });
       expect(screen.queryByRole('status', { name: /delegate signaling on your behalf/i })).toBeNull();
       // The standard signal toggle is visible instead.
-      expect(screen.getByRole('button', { name: /withdraw signal/i })).toBeTruthy();
+      expect(screen.getByRole('button', { name: /withdraw support/i })).toBeTruthy();
     });
 
     it('hides the override pill when caller has no delegate', () => {
@@ -190,7 +190,7 @@ describe('ConvictionProposalCard', () => {
         },
       });
       expect(screen.queryByRole('status', { name: /delegate signaling on your behalf/i })).toBeNull();
-      expect(screen.getByRole('button', { name: /signal support/i })).toBeTruthy();
+      expect(screen.getByRole('button', { name: /▲ support/i })).toBeTruthy();
     });
 
     it('clicking "Vote directly" fires signalTier2(proposalId, true)', async () => {

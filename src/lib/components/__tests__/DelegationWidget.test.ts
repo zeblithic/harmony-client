@@ -151,7 +151,7 @@ describe('DelegationWidget', () => {
       },
     });
     await fireEvent.click(screen.getByText(/revoke delegation/i));
-    const dialog = await screen.findByRole('alertdialog', { name: /type-to-confirm revoke/i });
+    const dialog = await screen.findByRole('dialog', { name: /type-to-confirm revoke/i });
     expect(dialog).toBeInTheDocument();
     // Typing wrong word should NOT enable the confirm button.
     const input = screen.getByPlaceholderText('revoke') as HTMLInputElement;
@@ -163,6 +163,35 @@ describe('DelegationWidget', () => {
     await waitFor(() => {
       expect(undelegateMock).toHaveBeenCalledWith(COMMUNITY_ID);
     });
+  });
+
+  it('surfaces a typed-revoke failure in-flow and closes the modal', async () => {
+    // Silent-failure regression guard: when undelegateTier2 rejects from
+    // the typed-confirm path, the modal (a position:fixed overlay) must
+    // close so the .dw-error line is visible in the widget body rather
+    // than rendering behind the overlay.
+    listProposalsMock.mockResolvedValueOnce([
+      makeProposal({ lifecycle: 'Open', total_supply: 10, voter_count: 3 }),
+    ]);
+    undelegateMock.mockRejectedValueOnce(new Error('revoke failed'));
+    render(DelegationWidget, {
+      props: {
+        communityId: COMMUNITY_ID,
+        adapter,
+        myAddr: ME,
+        communityMembers: members,
+        currentDelegate: BOB,
+      },
+    });
+    await fireEvent.click(screen.getByText(/revoke delegation/i));
+    await screen.findByRole('dialog', { name: /type-to-confirm revoke/i });
+    const input = screen.getByPlaceholderText('revoke') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: 'revoke' } });
+    await fireEvent.click(screen.getByRole('button', { name: /confirm revoke/i }));
+    // Error text renders in the visible widget body...
+    expect(await screen.findByText(/revoke failed/)).toBeInTheDocument();
+    // ...and the modal overlay that would have hidden it is gone.
+    expect(screen.queryByRole('dialog')).toBeNull();
   });
 
   it('resets busy on community switch so the widget recovers when IPC was in-flight', async () => {

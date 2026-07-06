@@ -48,3 +48,25 @@ export function setupDelegateOnBehalfToast(adapter: VotingAdapter): () => void {
     toastStore.show(formatDelegateOnBehalfMessage(payload), 5000);
   });
 }
+
+/** ZEB-607 D6 — signed-vote feedback toasts. ~2.1s dwell matches the
+ *  design prototype; deliberately shorter than the 5s delegate-on-
+ *  behalf toast above (whose copy is locked by ZEB-298 Task 10). */
+const SIGNED_TOAST_MS = 2100;
+
+export function showSignalCastToast(support: boolean): void {
+  toastStore.show(
+    support
+      ? '✓ Support signaled · signed with your key'
+      : '✓ Support withdrawn · signed with your key',
+    SIGNED_TOAST_MS,
+  );
+}
+
+export function showDelegationToast(delegateName: string): void {
+  toastStore.show(`↪ Proxied to ${delegateName}`, SIGNED_TOAST_MS);
+}
+
+export function showRecallToast(): void {
+  toastStore.show('↩ Delegation recalled — your vote is yours again', SIGNED_TOAST_MS);
+}

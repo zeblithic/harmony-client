@@ -11,6 +11,8 @@
     DeliberationStatementExport,
   } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
+  import { shortId } from '../short-addr';
+  import TallyBar from './governance/TallyBar.svelte';
 
   let {
     detail,
@@ -60,9 +62,7 @@
     }
   }
 
-  function authorShort(addr: string): string {
-    return addr.length > 8 ? `${addr.slice(0, 8)}…` : addr;
-  }
+  const authorShort = shortId;
 
   function myVote(s: DeliberationStatementExport): DeliberationVoteCode | undefined {
     return myVoteMap.get(s.statementEventHash);
@@ -122,6 +122,20 @@
             >⊘ Pass</button>
           </div>
         {:else}
+          {@const total = s.agreeCount + s.disagreeCount + s.passCount}
+          {#if total > 0}
+            <div class="chips-tally">
+              <TallyBar
+                height={5}
+                label="Statement votes"
+                segments={[
+                  { pct: (s.agreeCount / total) * 100, token: '--vote-for' },
+                  { pct: (s.disagreeCount / total) * 100, token: '--vote-against' },
+                  { pct: (s.passCount / total) * 100, token: '--vote-abstain' },
+                ]}
+              />
+            </div>
+          {/if}
           <div class="chips">
             <span class="chip agree">👍 {s.agreeCount}</span>
             <span class="chip disagree">👎 {s.disagreeCount}</span>
@@ -150,13 +164,14 @@
     background: var(--chip-bg); color: var(--text-chip); border: 1px solid transparent;
     padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.8rem; cursor: pointer;
   }
-  .tri-button button.active { border-color: var(--accent); }
+  .tri-button button.active { border-color: var(--vote-for); }
   .tri-button button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .chips-tally { margin-top: 0.4rem; }
   .chips { margin-top: 0.4rem; display: flex; gap: 0.4rem; font-size: 0.8rem; }
   .chip { padding: 0.1rem 0.4rem; background: var(--chip-bg); border-radius: 2px; color: var(--text-faint); }
-  .chip.agree { color: var(--success-gov); }
-  .chip.disagree { color: var(--danger-alt); }
+  .chip.agree { color: var(--vote-for); }
+  .chip.disagree { color: var(--vote-against); }
   .chip.own { color: var(--text-chip); background: var(--chip-bg-active); }
   .empty { color: var(--text-faint); font-style: italic; }
-  .error { color: var(--danger-alt); }
+  .error { color: var(--danger); }
 </style>

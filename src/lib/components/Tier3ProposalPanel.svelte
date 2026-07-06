@@ -35,6 +35,7 @@
   import DraftingPanel from './DraftingPanel.svelte';
   import StarRatificationBallot from './StarRatificationBallot.svelte';
   import DeliberationView from './DeliberationView.svelte';
+  import GovConfirmModal from './governance/GovConfirmModal.svelte';
 
   let {
     communityId,
@@ -440,20 +441,17 @@
   </form>
 
   {#if confirmingCreate}
-    <div class="confirm-modal" role="dialog" aria-modal="true" aria-label="Confirm new Tier 3 proposal">
-      <div class="confirm-card">
-        <p>Confirm new Tier 3 proposal</p>
-        <p class="confirm-summary">
-          "{proposalText.slice(0, 120)}{proposalText.length > 120 ? '…' : ''}"
-        </p>
-        <div class="confirm-actions">
-          <button type="button" onclick={() => (confirmingCreate = false)} disabled={creating}>Cancel</button>
-          <button type="button" onclick={submitCreate} disabled={creating}>
-            {creating ? 'Creating…' : 'Confirm'}
-          </button>
-        </div>
-      </div>
-    </div>
+    <GovConfirmModal
+      title="Confirm new Tier 3 proposal"
+      confirmLabel={creating ? 'Creating…' : 'Confirm'}
+      busy={creating}
+      onConfirm={submitCreate}
+      onCancel={() => (confirmingCreate = false)}
+    >
+      <p class="confirm-summary">
+        "{proposalText.slice(0, 120)}{proposalText.length > 120 ? '…' : ''}"
+      </p>
+    </GovConfirmModal>
   {/if}
 
   <h3 class="list-heading">Existing proposals</h3>
@@ -565,6 +563,7 @@
 
 <style>
   .tier3-panel { padding: 1rem; max-width: 880px; margin: 0 auto; }
+  h2 { font-family: var(--font-display); font-weight: 500; }
   .create-form {
     display: flex;
     flex-direction: column;
@@ -598,28 +597,7 @@
     cursor: pointer;
   }
   button[type="submit"]:disabled { opacity: 0.5; cursor: not-allowed; }
-  .confirm-modal {
-    position: fixed;
-    inset: 0;
-    background: var(--overlay);
-    display: grid;
-    place-items: center;
-    z-index: 100;
-  }
-  .confirm-card {
-    background: var(--panel-bg);
-    padding: 1.25rem 1.5rem;
-    border-radius: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    max-width: 480px;
-  }
-  .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
-  .confirm-actions button:last-child {
-    background: var(--accent);
-    color: var(--text-bright);
-  }
+  .confirm-summary { margin: 0; color: var(--text-secondary); }
   .list-heading { margin-top: 1.5rem; font-size: 1rem; }
   .poll-list { list-style: none; padding: 0; }
   .poll-row { display: flex; gap: 0.5rem; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--chip-bg); }
@@ -637,7 +615,7 @@
     padding: 0.25rem 0.5rem;
     border-radius: 4px;
   }
-  .poll-row-button.selected { background: color-mix(in srgb, var(--info) 10%, transparent); }
+  .poll-row-button.selected { background: var(--primary-soft); }
   .proposal-text { font-weight: 500; }
   .retry-btn {
     background: transparent;
@@ -654,9 +632,9 @@
     border-radius: 8px;
   }
   .stage-label { color: var(--text-faint); font-size: 0.85rem; margin-top: -0.25rem; }
-  .error { color: var(--danger-alt); }
+  .error { color: var(--danger); }
   .empty { color: var(--text-faint); }
-  .failed-detail { color: var(--danger-alt); }
+  .failed-detail { color: var(--vote-against); }
   /* ZEB-295 Phase 6 Task 11: ballot-secret affordances. Lock-icon chip
      on the list row, help text under the create-form privacy toggle,
      and the awaiting-tally banner on the ratification detail pane. */
@@ -664,7 +642,7 @@
     font-size: 0.85rem;
     padding: 0.05rem 0.35rem;
     border-radius: 3px;
-    background: rgba(170, 130, 255, 0.12);
+    background: var(--sortition-bg);
     color: var(--gov-purple);
   }
   .help-text {
@@ -692,8 +670,8 @@
     margin-right: 0.4rem;
     font-weight: 500;
   }
-  .badge.winner { background: var(--success-bg); color: var(--success-gov); }
-  .badge.runner-up { background: color-mix(in srgb, var(--info) 15%, transparent); color: var(--accent); }
+  .badge.winner { background: var(--status-passed-bg); color: var(--status-passed-fg); }
+  .badge.runner-up { background: var(--status-drafting-bg); color: var(--status-drafting-fg); }
   .finalists { margin-top: 0.5rem; color: var(--text-faint); font-size: 0.85rem; }
   .finalists ol { margin: 0.25rem 0; padding-left: 1.25rem; }
 </style>

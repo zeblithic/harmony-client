@@ -52,31 +52,30 @@
     gap: 0.25rem;
     padding: 0;
     margin: 0;
-    font-size: 0.85rem;
+    font-size: 11px;
   }
   .stage-chip {
-    padding: 0.25rem 0.6rem;
-    border-radius: 999px;
-    background: var(--chip-bg);
-    color: var(--chip-fg);
-    border: 1px solid transparent;
+    padding: 4px 11px;
+    border-radius: 20px;
+    font-weight: 600;
+    background: var(--status-drafting-bg);
+    color: var(--status-drafting-fg);
   }
   .stage-chip.past {
-    color: var(--text-faint);
+    opacity: 0.6;
   }
   .stage-chip.current {
-    background: var(--accent);
-    color: var(--text-bright);
-    border-color: var(--accent);
+    background: var(--status-open-bg);
+    color: var(--status-open-fg);
   }
   .failed-badge {
-    color: var(--danger-alt);
+    color: var(--vote-against);
     font-weight: 600;
   }
   .finalized-badge {
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    color: var(--success-gov);
+    color: var(--vote-for);
   }
 </style>

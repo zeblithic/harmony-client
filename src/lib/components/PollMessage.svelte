@@ -34,6 +34,7 @@
     type PollMeta,
   } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
+  import StatusPill from './governance/StatusPill.svelte';
 
   let {
     pollId,
@@ -187,9 +188,11 @@
 <article class="poll-message" data-poll-id={pollId} aria-label="Poll">
   <header class="poll-header">
     <span class="poll-tier" aria-label="Tier">{tierLabel(meta.tier)}</span>
-    <span class="poll-lifecycle" class:open={isOpen} aria-label="Lifecycle">
-      {state?.meta.lifecycle ?? meta.lifecycle}
-    </span>
+    <StatusPill
+      variant={isOpen ? 'open' : 'archived'}
+      label={state?.meta.lifecycle ?? meta.lifecycle}
+      ariaLabel="Lifecycle"
+    />
   </header>
 
   {#if loadError}
@@ -254,13 +257,6 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
-  .poll-lifecycle {
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-  .poll-lifecycle.open {
-    color: var(--accent);
-  }
   .poll-options {
     list-style: none;
     margin: 0;
@@ -286,15 +282,15 @@
     font: inherit;
   }
   .poll-option-btn:hover:not(:disabled) {
-    border-color: var(--accent);
+    border-color: var(--vote-for);
   }
   .poll-option-btn:disabled {
     cursor: not-allowed;
     opacity: 0.7;
   }
   .poll-option-btn.selected {
-    border-color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 10%, var(--bg-primary));
+    border-color: var(--vote-for);
+    background: color-mix(in srgb, var(--vote-for) 10%, var(--bg-primary));
   }
   .poll-option-label {
     grid-column: 1;
@@ -309,16 +305,16 @@
   .poll-option-bar {
     grid-column: 1 / -1;
     grid-row: 2;
-    height: 4px;
-    background: var(--border);
-    border-radius: 2px;
+    height: 6px;
+    background: var(--tally-track);
+    border-radius: 3px;
     overflow: hidden;
   }
   .poll-option-bar-fill {
     display: block;
     height: 100%;
-    background: var(--accent);
-    transition: width 200ms ease;
+    background: var(--vote-for);
+    transition: width 0.35s ease;
   }
   .poll-footer {
     display: flex;

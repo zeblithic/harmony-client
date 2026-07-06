@@ -7,6 +7,7 @@
    * Per ZEB-287 R4: every $props field destructured below.
    */
   import type { Tier3PollExport } from '../types/voting';
+  import { shortAddr } from '../short-addr';
 
   let {
     detail,
@@ -15,10 +16,6 @@
     detail: Tier3PollExport;
     myAddr: string;
   } = $props();
-
-  function shortAddr(hex: string): string {
-    return hex.length > 16 ? `${hex.slice(0, 8)}…${hex.slice(-4)}` : hex;
-  }
 
   // Banner state is driven by `detail.myRole`, which the backend projects
   // from the *effective* mini-public (current_mini_public after declines +
@@ -83,8 +80,8 @@
     font-weight: 500;
   }
   .backup-banner {
-    background: color-mix(in srgb, var(--info) 15%, transparent);
-    color: var(--accent);
+    background: var(--primary-soft);
+    color: var(--primary-deep);
     padding: 0.5rem 0.75rem;
     border-radius: 4px;
   }
@@ -105,7 +102,7 @@
     border-radius: 3px;
   }
   .roster li.declined code { text-decoration: line-through; opacity: 0.6; }
-  .roster li.self { background: color-mix(in srgb, var(--info) 10%, transparent); }
+  .roster li.self { background: var(--primary-soft); }
   .tag {
     font-size: 0.7rem;
     color: var(--text-faint);

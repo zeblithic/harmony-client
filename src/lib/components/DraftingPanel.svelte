@@ -8,6 +8,7 @@
    */
   import type { Tier3PollExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
+  import { shortAddr as shortHex } from '../short-addr';
 
   let {
     detail,
@@ -32,7 +33,7 @@
 
   function shortAddr(hex: string | null): string {
     if (!hex) return 'system';
-    return hex.length > 16 ? `${hex.slice(0, 8)}…${hex.slice(-4)}` : hex;
+    return shortHex(hex);
   }
 
   async function submitCandidate() {
@@ -130,6 +131,13 @@
 
 <style>
   .drafting-panel { margin-top: 1rem; }
+  h5 {
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
   .candidate-list { list-style: none; padding: 0; }
   .candidate {
     display: flex;
@@ -175,5 +183,5 @@
   }
   .form-footer button:disabled { opacity: 0.5; cursor: not-allowed; }
   .empty { color: var(--text-faint); }
-  .error { color: var(--danger-alt); }
+  .error { color: var(--danger); }
 </style>

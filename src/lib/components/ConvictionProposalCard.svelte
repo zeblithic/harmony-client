@@ -27,6 +27,11 @@
 
   import { convictionPercent, type Tier2ProposalExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
+  import { shortId } from '../short-addr';
+  import { showSignalCastToast } from '../voting-toast-wiring';
+  import StatusPill, { type StatusPillVariant } from './governance/StatusPill.svelte';
+  import TallyBar from './governance/TallyBar.svelte';
+  import CountChip from './governance/CountChip.svelte';
 
   let {
     communityId: _communityId,
@@ -34,6 +39,7 @@
     adapter,
     myDelegate = null,
     delegateName = null,
+    hideText = false,
   }: {
     /** Hex community id this proposal lives in. Currently unused inside
      *  the card (the proposal already carries it) but accepted for
@@ -56,6 +62,8 @@
      *  by the parent panel from the community member roster) — used
      *  in the override pill copy. Null when myDelegate is null. */
     delegateName?: string | null;
+    /** ZEB-607: detail vote-column mounts the card next to the doc column, which already shows the text. */
+    hideText?: boolean;
   } = $props();
 
   let signaling = $state(false);
@@ -120,6 +128,21 @@
     }
   });
 
+  /** ZEB-607 D3: lifecycle → Commons pill variant. */
+  let lifecycleVariant = $derived.by((): StatusPillVariant => {
+    switch (proposal.lifecycle) {
+      case 'Open':
+        return 'open';
+      case 'ThresholdReached':
+        return 'passing';
+      case 'Finalized':
+        return 'passed';
+      default:
+        return 'archived';
+    }
+  });
+  let halfLifeDays = $derived(Math.round(proposal.half_life_seconds / 86_400));
+
   async function toggleSignal() {
     if (signaling || !canSignal) return;
     // Compute the "intended next direction": if currently supporting,
@@ -136,6 +159,7 @@
     signalError = null;
     try {
       await adapter.signalTier2(proposal.proposal_id, nextSupport);
+      showSignalCastToast(nextSupport); // ZEB-607 D6: signed-vote feedback
       // Success: leave the optimistic state in place. The
       // signal-cast event will fire a refetch through the parent,
       // which will then reset optimisticSignal via the $effect above.
@@ -155,50 +179,39 @@
   aria-label="Conviction proposal"
 >
   <header class="cp-header">
-    <span
-      class="cp-lifecycle"
-      class:open={proposal.lifecycle === 'Open'}
-      class:threshold={proposal.lifecycle === 'ThresholdReached'}
-      class:finalized={proposal.lifecycle === 'Finalized'}
-      aria-label="Lifecycle"
-    >
-      {lifecycleLabel}
-    </span>
-    <span class="cp-voter-count" aria-label="Supporters">
-      {proposal.voter_count} / {proposal.total_supply} supporting
-    </span>
+    <span class="cp-id-pill" aria-label="Proposal id">{shortId(proposal.proposal_id)}</span>
+    <StatusPill variant={lifecycleVariant} label={lifecycleLabel} ariaLabel="Lifecycle" />
+    <span class="cp-half-life" aria-label="Half-life">half-life {halfLifeDays}d</span>
   </header>
 
-  <p class="cp-text">{proposal.proposal_text}</p>
+  {#if !hideText}
+    <p class="cp-text">{proposal.proposal_text}</p>
+  {/if}
 
   <div class="cp-bar-wrap" aria-label="Conviction progress">
-    <div class="cp-bar-track">
-      <div
-        class="cp-bar-fill"
-        class:past-threshold={pctFilled >= 100}
-        style="width: {pctFilled}%"
-      ></div>
-      <!-- Threshold line marker — visually anchors the 100% point so
-        the user reads bar fill as "% of threshold reached". For a
-        Q96.32 bar capped at 100% the line sits at the right edge; if
-        we later let the bar overflow to 110%/120% the line can stay
-        at the inner 100% mark and the overflow visually pokes past. -->
-      <div class="cp-bar-threshold" aria-hidden="true"></div>
-    </div>
+    <TallyBar
+      segments={[{ pct: pctFilled, token: pctFilled >= 100 ? '--gov-clay' : '--vote-for' }]}
+      label="Conviction vs threshold"
+    />
     <span class="cp-bar-pct" aria-label="Percent of threshold">
       {pctFilled.toFixed(1)}%
     </span>
   </div>
 
+  <div class="cp-chips">
+    <CountChip tone="sage" label="Threshold" value={`${pctFilled.toFixed(0)}% reached`} />
+    <CountChip
+      tone="clay"
+      label="Supporters"
+      value={`${proposal.voter_count} / ${proposal.total_supply}`}
+    />
+  </div>
+
   {#if showOverridePill}
-    <!-- ZEB-292 Phase 3: override affordance. Single click → cast a
-         direct Signal(true) on this proposal, which moves the caller's
-         weight out of the delegate's effective conviction (per spec §5
-         override rule enforced by community_voting_conviction.rs:583).
-         Copy describes the routing relationship (always true while a
-         delegate edge exists) rather than asserting the delegate has
-         signaled — the proposal DTO doesn't surface per-voter state,
-         so claiming "X voted" would be unverifiable (Cursor R4). -->
+    <!-- ZEB-292 Phase 3 override affordance, restyled as the Commons
+         proxied footer (spec D5 + amendment 2: the action is "Vote
+         directly" — the real per-proposal override verb; community-
+         scoped Recall lives in DelegationWidget only). -->
     <div class="cp-override-pill" role="status" aria-label="Delegate signaling on your behalf">
       <span class="cp-override-text">
         Your conviction follows <strong>{delegateName ?? 'your delegate'}</strong> on this proposal.
@@ -225,7 +238,7 @@
         aria-pressed={optimisticSignal === true}
         onclick={toggleSignal}
       >
-        {optimisticSignal === true ? 'Withdraw signal' : 'Signal support'}
+        {optimisticSignal === true ? 'Withdraw support' : '▲ Support'}
       </button>
       {#if signalError}
         <span class="cp-error" role="alert">Signal failed: {signalError}</span>
@@ -241,30 +254,38 @@
     gap: 10px;
     padding: 14px 16px;
     border: 1px solid var(--border);
+    border-left: 3px solid var(--gov-clay);
     border-radius: 8px;
-    background: var(--bg-secondary);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-e1);
     max-width: 520px;
   }
   .cp-header {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    font-size: 0.78rem;
-    color: var(--text-secondary);
+    gap: 8px;
+    flex-wrap: wrap;
   }
-  .cp-lifecycle {
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+  .cp-id-pill {
+    font-family: var(--font-mono);
     font-weight: 600;
+    font-size: 0.62rem;
+    color: var(--text-bright);
+    background: var(--gov-clay);
+    padding: 2px 6px;
+    border-radius: 3px;
   }
-  .cp-lifecycle.open { color: var(--accent); }
-  .cp-lifecycle.threshold { color: var(--warning-bright); }
-  .cp-lifecycle.finalized { color: var(--text-secondary); }
+  .cp-half-life {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--faint);
+  }
   .cp-text {
     margin: 0;
     color: var(--text-primary);
     font-size: 0.95rem;
-    line-height: 1.4;
+    line-height: 1.5;
     white-space: pre-wrap;
   }
   .cp-bar-wrap {
@@ -272,37 +293,21 @@
     align-items: center;
     gap: 8px;
   }
-  .cp-bar-track {
-    position: relative;
+  .cp-bar-wrap > :global(.tally-track) {
     flex: 1;
-    height: 8px;
-    background: var(--border);
-    border-radius: 4px;
-    overflow: hidden;
-  }
-  .cp-bar-fill {
-    height: 100%;
-    background: var(--accent);
-    transition: width 250ms ease;
-  }
-  .cp-bar-fill.past-threshold {
-    background: var(--warning-bright);
-  }
-  .cp-bar-threshold {
-    position: absolute;
-    top: 0;
-    right: 0;
-    width: 2px;
-    height: 100%;
-    background: var(--text-secondary);
-    opacity: 0.5;
   }
   .cp-bar-pct {
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
     font-size: 0.8rem;
-    color: var(--text-secondary);
+    color: var(--text-muted);
     min-width: 48px;
     text-align: right;
+  }
+  .cp-chips {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .cp-signal-row {
     display: flex;
@@ -311,24 +316,25 @@
     flex-wrap: wrap;
   }
   .cp-signal-btn {
-    padding: 6px 14px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--bg-primary);
-    color: var(--text-primary);
+    padding: 8px 16px;
+    border: 1px solid var(--vote-for);
+    border-radius: 7px;
+    background: var(--vote-for);
+    color: var(--status-passed-fg);
     font: inherit;
+    font-weight: 600;
+    font-size: 0.85rem;
     cursor: pointer;
-  }
-  .cp-signal-btn:hover:not(:disabled) {
-    border-color: var(--accent);
   }
   .cp-signal-btn:disabled {
     cursor: not-allowed;
     opacity: 0.6;
   }
   .cp-signal-btn.supporting {
-    border-color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
+    background: var(--surface-raised);
+    color: var(--vote-for);
+    border-color: var(--primary-border);
+    font-weight: 600;
   }
   .cp-error {
     color: var(--danger);
@@ -340,22 +346,28 @@
     gap: 10px;
     flex-wrap: wrap;
     padding: 8px 12px;
-    border: 1px solid var(--warning-bright);
-    border-radius: 4px;
-    background: color-mix(in srgb, var(--warning-bright) 8%, var(--bg-primary));
+    border-top: 1px solid var(--line-soft);
+    background: var(--paper);
+    border-radius: 0 0 6px 6px;
+    margin: 2px -6px -4px;
   }
   .cp-override-text {
     flex: 1 1 auto;
-    color: var(--text-primary);
-    font-size: 0.85rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+  }
+  .cp-override-text strong {
+    color: var(--vote-for);
   }
   .cp-override-btn {
     padding: 4px 12px;
-    border: 1px solid var(--warning-bright);
-    background: var(--warning-bright);
-    color: var(--bg-primary);
-    border-radius: 4px;
+    border: 1px solid var(--primary-border);
+    background: transparent;
+    color: var(--vote-for);
+    border-radius: 7px;
     font: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
     cursor: pointer;
   }
   .cp-override-btn:disabled {

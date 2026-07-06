@@ -10,6 +10,7 @@
   import { untrack } from 'svelte';
   import type { Tier3PollExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
+  import GovConfirmModal from './governance/GovConfirmModal.svelte';
 
   let {
     detail,
@@ -153,21 +154,18 @@
 </section>
 
 {#if confirming}
-  <div class="confirm-modal" role="dialog" aria-modal="true" aria-label="Confirm ratification ballot">
-    <div class="confirm-card">
-      <p>Confirm ratification ballot</p>
-      <ul class="ballot-summary">
-        {#each detail.ratificationCandidates as c, i}
-          <li><strong>{scores[i]}</strong> — {c.text}</li>
-        {/each}
-      </ul>
-      <p class="caveat">You can re-cast later if the ratification window is still open.</p>
-      <div class="confirm-actions">
-        <button type="button" onclick={() => (confirming = false)}>Cancel</button>
-        <button type="button" onclick={confirmCast}>Confirm</button>
-      </div>
-    </div>
-  </div>
+  <GovConfirmModal
+    title="Confirm ratification ballot"
+    onConfirm={confirmCast}
+    onCancel={() => (confirming = false)}
+  >
+    <ul class="ballot-summary">
+      {#each detail.ratificationCandidates as c, i}
+        <li><strong>{scores[i]}</strong> — {c.text}</li>
+      {/each}
+    </ul>
+    <p class="caveat">You can re-cast later if the ratification window is still open.</p>
+  </GovConfirmModal>
 {/if}
 
 <style>
@@ -215,31 +213,9 @@
     cursor: pointer;
   }
   .ballot-footer button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .success { color: var(--success-gov); font-size: 0.85rem; }
-  .error { color: var(--danger-alt); }
-  .confirm-modal {
-    position: fixed;
-    inset: 0;
-    background: var(--overlay);
-    display: grid;
-    place-items: center;
-    z-index: 100;
-  }
-  .confirm-card {
-    background: var(--panel-bg);
-    padding: 1.25rem 1.5rem;
-    border-radius: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    max-width: 480px;
-  }
+  .success { color: var(--vote-for); font-size: 0.85rem; }
+  .error { color: var(--danger); }
   .ballot-summary { list-style: none; padding: 0; margin: 0; }
   .ballot-summary li { padding: 0.1rem 0; }
   .caveat { color: var(--text-faint); font-size: 0.8rem; }
-  .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
-  .confirm-actions button:last-child {
-    background: var(--accent);
-    color: var(--text-bright);
-  }
 </style>

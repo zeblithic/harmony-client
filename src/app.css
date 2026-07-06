@@ -50,6 +50,16 @@
   --status-recalled-fg: #7d2a1e;
   --status-recalled-bg: #f3ddd7;
 
+  /* ZEB-607: live-verdict pill aliases. Pure var() refs — custom
+     properties substitute at use time against the cascaded theme
+     values, so these track light/dark automatically and need no
+     dark-block duplicates. Tied/quorum verdicts reuse the open and
+     drafting pairs directly (spec D3). */
+  --verdict-passing-fg: var(--primary-deep);
+  --verdict-passing-bg: var(--primary-soft);
+  --verdict-failing-fg: var(--danger-deep);
+  --verdict-failing-bg: var(--status-recalled-bg);
+
   /* Adopted seams (ZEB-604 sweep 2; Commons values per the ZEB-605 remap table) */
   --bg-tertiary-hover: #e0d9c8;
   --border-default: #d8d2c2;

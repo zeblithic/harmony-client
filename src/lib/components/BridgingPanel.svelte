@@ -9,6 +9,7 @@
    * feedback_design_for_eventual_state.
    */
   import type { BridgingScoreExport } from '../types/voting';
+  import { shortId } from '../short-addr';
 
   let {
     scores,
@@ -32,9 +33,7 @@
     return Math.round((q32 / 2 ** 32) * 100);
   }
 
-  function authorShort(addr: string): string {
-    return addr.length > 8 ? `${addr.slice(0, 8)}…` : addr;
-  }
+  const authorShort = shortId;
 </script>
 
 <aside class="bridging-panel">
@@ -71,12 +70,12 @@
   .subtitle { color: var(--text-faint); font-size: 0.8rem; margin: 0 0 0.5rem 0; }
   ol { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.4rem; }
   .card { position: relative; padding: 0.5rem; background: var(--panel-bg); border-radius: 4px; overflow: hidden; }
-  .heat-bar { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(to right, color-mix(in srgb, var(--success-gov) 18%, transparent), color-mix(in srgb, var(--success-gov) 0%, transparent)); z-index: 0; }
+  .heat-bar { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(to right, color-mix(in srgb, var(--gov-clay) 18%, transparent), color-mix(in srgb, var(--gov-clay) 0%, transparent)); z-index: 0; }
   .content { position: relative; z-index: 1; }
   .text { margin: 0; font-weight: 500; }
   .meta { margin-top: 0.3rem; display: flex; gap: 0.5rem; font-size: 0.75rem; color: var(--text-faint); align-items: center; }
   .chip { padding: 0.05rem 0.35rem; background: var(--chip-bg); border-radius: 2px; }
-  .chip.agree { color: var(--success-gov); }
+  .chip.agree { color: var(--vote-for); }
   .empty { color: var(--text-faint); font-style: italic; }
-  .error { color: var(--danger-alt); }
+  .error { color: var(--danger); }
 </style>

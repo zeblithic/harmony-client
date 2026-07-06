@@ -6,6 +6,7 @@
    */
   import type { Tier3PollExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
+  import GovConfirmModal from './governance/GovConfirmModal.svelte';
 
   let {
     detail,
@@ -74,17 +75,14 @@
 </section>
 
 {#if confirming}
-  <div class="confirm-modal" role="dialog" aria-modal="true" aria-label="Confirm statement">
-    <div class="confirm-card">
-      <p>Confirm statement submission</p>
-      <blockquote class="preview">{text}</blockquote>
-      <p class="caveat">Statements are immutable — once submitted, you cannot edit or retract.</p>
-      <div class="actions">
-        <button type="button" onclick={() => (confirming = false)}>Cancel</button>
-        <button type="button" onclick={confirmSubmit}>Confirm</button>
-      </div>
-    </div>
-  </div>
+  <GovConfirmModal
+    title="Confirm statement submission"
+    onConfirm={confirmSubmit}
+    onCancel={() => (confirming = false)}
+  >
+    <blockquote class="preview">{text}</blockquote>
+    <p class="caveat">Statements are immutable — once submitted, you cannot edit or retract.</p>
+  </GovConfirmModal>
 {/if}
 
 <style>
@@ -93,14 +91,10 @@
   .footer { display: flex; justify-content: space-between; align-items: center; margin-top: 0.4rem; }
   .char-count { color: var(--text-faint); font-size: 0.85rem; }
   .cap-note { color: var(--text-faint); font-size: 0.8rem; margin: 0 0 0.4rem 0; }
-  .cap-warning { color: #d9b438; font-size: 0.85rem; }
-  .error { color: var(--danger-alt); }
+  .cap-warning { color: var(--warning); font-size: 0.85rem; }
+  .error { color: var(--danger); }
   button { background: var(--accent); color: var(--text-bright); border: 0; padding: 0.35rem 0.9rem; border-radius: 3px; cursor: pointer; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .confirm-modal { position: fixed; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: 100; }
-  .confirm-card { background: var(--panel-bg); padding: 1.25rem; border-radius: 8px; max-width: 480px; display: flex; flex-direction: column; gap: 0.6rem; }
   .preview { background: var(--input-bg); padding: 0.6rem; border-left: 3px solid var(--accent); margin: 0; font-style: normal; }
   .caveat { color: var(--text-faint); font-size: 0.8rem; }
-  .actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
-  .actions button:last-child { background: var(--accent); color: var(--text-bright); }
 </style>

@@ -1,7 +1,6 @@
 {
   "lib/components/BackupReminderBanner.svelte": 1,
   "lib/components/CommunitySettingsPanel.svelte": 1,
-  "lib/components/DelegationGraph.svelte": 1,
   "lib/components/DiagnosticExportModal.svelte": 1,
   "lib/components/DmCreateDialog.svelte": 1,
   "lib/components/FileActions.svelte": 1,
@@ -12,8 +11,6 @@
   "lib/components/MintLedger.svelte": 1,
   "lib/components/NetworkHealthView.svelte": 2,
   "lib/components/PendingJoinsPanel.svelte": 1,
-  "lib/components/StatementComposer.svelte": 1,
-  "lib/components/Tier3ProposalPanel.svelte": 1,
   "lib/components/VinePlayer.svelte": 3,
   "lib/components/VinePublishDialog.svelte": 1
 }
