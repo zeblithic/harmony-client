@@ -70,7 +70,7 @@
     margin: 0 0 8px;
   }
   .required {
-    font-family: monospace;
+    font-family: var(--font-mono);
     background: var(--bg-tertiary);
     padding: 2px 6px;
     border-radius: 3px;
@@ -83,7 +83,7 @@
     border: 1px solid var(--border);
     border-radius: 4px;
     color: var(--text-primary);
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.875rem;
     margin-bottom: 16px;
     box-sizing: border-box;

@@ -71,7 +71,7 @@
     background: var(--bg-tertiary);
     padding: 2px 6px;
     border-radius: 3px;
-    font-family: monospace;
+    font-family: var(--font-mono);
     color: var(--text-primary);
   }
 

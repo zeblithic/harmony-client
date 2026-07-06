@@ -110,7 +110,7 @@
     flex: 1;
     font-size: 0.7rem;
     color: var(--text-secondary);
-    font-family: monospace;
+    font-family: var(--font-mono);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

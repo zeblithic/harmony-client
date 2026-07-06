@@ -78,7 +78,7 @@
     font-size: 0.875rem;
     font-weight: 600;
     color: var(--text-primary);
-    font-family: 'Courier New', Courier, monospace;
+    font-family: var(--font-mono);
     margin: 0;
   }
 </style>

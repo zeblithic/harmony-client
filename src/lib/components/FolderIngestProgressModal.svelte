@@ -136,7 +136,7 @@
   }
 
   .current-path {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 0.8rem;
     color: var(--text-muted);
     word-break: break-all;

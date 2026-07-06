@@ -737,7 +737,7 @@
   }
   .member-name { flex: 1; }
   .member-name .name { color: var(--text-primary); font-size: 0.8rem; }
-  .member-name .addr { font-size: 0.65rem; color: var(--text-secondary); font-family: monospace; }
+  .member-name .addr { font-size: 0.65rem; color: var(--text-secondary); font-family: var(--font-mono); }
   .set-role,
   .kick {
     font-size: 0.65rem;

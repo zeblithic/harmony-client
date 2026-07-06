@@ -70,7 +70,7 @@
   .sr-only { position: absolute; width: 1px; height: 1px; clip: rect(0,0,0,0); }
   .addr-input {
     width: 100%; box-sizing: border-box; padding: 8px 10px;
-    font-family: monospace; font-size: 0.9rem;
+    font-family: var(--font-mono); font-size: 0.9rem;
     background: var(--bg-tertiary); border: 1px solid var(--border);
     color: var(--text-primary); border-radius: 4px;
   }

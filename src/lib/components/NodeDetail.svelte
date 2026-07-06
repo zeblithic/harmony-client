@@ -265,7 +265,7 @@
     border-radius: 10px;
     background: var(--bg-secondary);
     color: var(--text-secondary);
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 11px;
     cursor: pointer;
   }

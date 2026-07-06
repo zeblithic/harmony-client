@@ -179,7 +179,7 @@
     font-size: 12px;
     color: var(--text-muted);
     border-bottom: 1px solid var(--border);
-    font-family: monospace;
+    font-family: var(--font-mono);
   }
 
   .code-block pre {

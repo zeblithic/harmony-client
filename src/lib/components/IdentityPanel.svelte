@@ -1129,7 +1129,7 @@
   }
   .hash-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
   .hash-display {
-    font-family: ui-monospace, monospace;
+    font-family: var(--font-mono);
     background: var(--bg-tertiary);
     padding: 6px 10px;
     border-radius: 4px;
@@ -1161,7 +1161,7 @@
     background: var(--bg-tertiary);
     border-radius: 6px;
     padding: 12px 12px 12px 36px; /* left padding leaves room for the list marker */
-    font-family: ui-monospace, monospace;
+    font-family: var(--font-mono);
     font-size: 0.85em;
     margin: 12px 0;
     list-style: decimal;
@@ -1188,7 +1188,7 @@
     gap: 8px;
     flex-wrap: wrap;
     margin: 12px 0;
-    font-family: ui-monospace, monospace;
+    font-family: var(--font-mono);
     font-size: 0.85em;
   }
   .hash-diff-label { color: var(--text-muted); }
@@ -1215,7 +1215,7 @@
   }
   .passphrase-row input { flex: 1; }
   .mnemonic-textarea {
-    font-family: ui-monospace, monospace;
+    font-family: var(--font-mono);
     padding: 6px 8px;
     border: 1px solid var(--border);
     border-radius: 4px;

@@ -147,7 +147,7 @@
   }
 
   .section .path {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--font-mono);
     word-break: break-all;
   }
 

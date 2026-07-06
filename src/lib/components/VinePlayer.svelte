@@ -357,7 +357,7 @@
   .cid-label {
     font-size: 0.7rem;
     color: var(--text-muted);
-    font-family: monospace;
+    font-family: var(--font-mono);
     opacity: 0.6;
     max-width: 80%;
     overflow: hidden;

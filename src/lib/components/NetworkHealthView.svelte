@@ -472,7 +472,7 @@
     margin-top: 0;
   }
   .transport-disabled .reason {
-    font-family: monospace;
+    font-family: var(--font-mono);
     word-break: break-word;
   }
   /* ZEB-623: inline per-peer protocol-incompatibility badge. Same crimson
@@ -499,7 +499,7 @@
   .self-test-steps {
     list-style: none;
     padding-left: 0;
-    font-family: monospace;
+    font-family: var(--font-mono);
   }
   .dial-counters {
     list-style: none;
@@ -517,7 +517,7 @@
   .dial-recent {
     list-style: none;
     padding-left: 0;
-    font-family: monospace;
+    font-family: var(--font-mono);
   }
   .badge {
     display: inline-block;

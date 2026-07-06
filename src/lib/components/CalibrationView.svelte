@@ -408,7 +408,7 @@
     font-size: 4rem;
     font-weight: 600;
     color: var(--text-primary);
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
   }
 
   .syllable-hint {

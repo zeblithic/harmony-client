@@ -194,7 +194,7 @@
   .number-input {
     width: 64px; background: var(--bg-tertiary); border: 1px solid var(--accent);
     border-radius: 4px; padding: 6px 8px; color: var(--text-primary);
-    font-size: 0.9rem; text-align: center; font-family: monospace;
+    font-size: 0.9rem; text-align: center; font-family: var(--font-mono);
   }
   .error-banner {
     background: var(--bg-tertiary); border: 1px solid var(--danger-muted); color: var(--danger-muted);

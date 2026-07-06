@@ -260,7 +260,7 @@
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.85rem;
     resize: vertical;
   }

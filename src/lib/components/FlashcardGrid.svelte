@@ -58,7 +58,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    font-family: 'Courier New', Courier, monospace;
+    font-family: var(--font-mono);
     user-select: none;
   }
 

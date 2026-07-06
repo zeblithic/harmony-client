@@ -168,8 +168,8 @@
     background: var(--bg-primary); border: 1px solid var(--border); border-radius: 4px;
     margin-bottom: 4px; cursor: pointer; }
   .peer-row:hover { background: var(--bg-tertiary); }
-  .owner-id { font-family: monospace; font-size: 11px; color: var(--text-muted); margin-left: 8px; }
-  .sas-display { font-family: monospace; font-size: 32px; font-weight: 600;
+  .owner-id { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); margin-left: 8px; }
+  .sas-display { font-family: var(--font-mono); font-size: 32px; font-weight: 600;
     text-align: center; padding: 16px; background: var(--bg-primary); border-radius: 8px;
     letter-spacing: 4px; }
 </style>

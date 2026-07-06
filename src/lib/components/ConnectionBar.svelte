@@ -124,7 +124,7 @@
     border-radius: 4px;
     background: var(--bg-primary);
     color: var(--text-primary);
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 11px;
   }
 

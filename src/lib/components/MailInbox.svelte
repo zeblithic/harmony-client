@@ -249,7 +249,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.75rem;
   }
 

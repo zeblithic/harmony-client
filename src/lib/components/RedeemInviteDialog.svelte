@@ -251,7 +251,7 @@
     border: 1px solid var(--border);
     border-radius: 4px;
     color: var(--text-primary);
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.75rem;
     margin-bottom: 12px;
     box-sizing: border-box;
@@ -287,7 +287,7 @@
   }
   .diagnostic {
     padding: 8px 0 0 0;
-    font-family: monospace;
+    font-family: var(--font-mono);
   }
   .diagnostic code {
     color: var(--text-primary);
