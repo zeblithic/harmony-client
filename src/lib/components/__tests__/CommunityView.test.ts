@@ -366,4 +366,22 @@ describe('CommunityView', () => {
     unmount();
     expect(unsubscribeCards).toHaveBeenCalled();
   });
+
+  it('activeView is externally drivable to proposals (ZEB-606 deep-link)', async () => {
+    const votingHost = makeAdapter();
+    (votingHost.invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === 'voting_list_tier2_proposals') return Promise.resolve([]);
+      if (cmd === 'voting_get_my_delegate') return Promise.resolve(null);
+      return Promise.resolve(undefined);
+    });
+    const votingAdapter = new VotingAdapter();
+    await votingAdapter.connectAdapter(votingHost);
+    const { container } = await setup([general, announcements], {
+      votingAdapter,
+      activeView: 'proposals',
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.community-proposals')).toBeTruthy();
+    });
+  });
 });

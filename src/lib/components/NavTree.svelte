@@ -3,6 +3,7 @@
   import { getChildNodes, sortNodes, getColorAncestry, getInheritedDisplayMode, getInheritedSortOrder } from '../nav-utils';
   import NavNodeRow from './NavNodeRow.svelte';
   import NavTree from './NavTree.svelte';
+  import ProposalsNavRow from './ProposalsNavRow.svelte';
 
   let {
     nodes,
@@ -14,6 +15,10 @@
     onSortOrderChange,
     profileLookup,
     presenceOnline,
+    filterTop,
+    proposalCount,
+    onSelectProposals,
+    proposalsActiveFor,
   }: {
     nodes: NavNode[];
     parentId: string | null;
@@ -25,12 +30,23 @@
     profileLookup?: (address: string) => string | undefined;
     /** ZEB-600: presence-dot resolver, threaded down to every NavNodeRow. */
     presenceOnline?: (node: NavNode) => boolean;
+    /** ZEB-606: keep only matching nodes at THIS level. Passed by NavPanel at
+     *  the root to partition top-level nodes into headed sections; recursive
+     *  calls below do not thread it, so descendants are never filtered. */
+    filterTop?: (n: NavNode) => boolean;
+    /** ZEB-606: active Tier-2 count resolver (undefined = feature absent). */
+    proposalCount?: (node: NavNode) => number | undefined;
+    /** ZEB-606: open the community's Proposals view. */
+    onSelectProposals?: (communityId: string) => void;
+    /** ZEB-606: community id whose Proposals view is currently open. */
+    proposalsActiveFor?: string | null;
   } = $props();
 
   let sortedChildren = $derived.by(() => {
     const children = getChildNodes(nodes, parentId);
+    const kept = filterTop ? children.filter(filterTop) : children;
     const order = parentId ? getInheritedSortOrder(nodes, parentId) : 'activity';
-    return sortNodes(children, order);
+    return sortNodes(kept, order);
   });
 </script>
 
@@ -56,6 +72,15 @@
   />
 
   {#if (child.type === 'folder' || child.type === 'community') && child.expanded}
-    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} {presenceOnline} />
+    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} {presenceOnline} {proposalCount} {onSelectProposals} {proposalsActiveFor} />
+    {#if child.type === 'community' && proposalCount && onSelectProposals}
+      <ProposalsNavRow
+        communityId={child.id}
+        indent={ancestry.length}
+        count={proposalCount(child)}
+        active={proposalsActiveFor === child.id}
+        onSelect={() => onSelectProposals(child.id)}
+      />
+    {/if}
   {/if}
 {/each}

@@ -398,10 +398,11 @@ describe('NavPanel', () => {
       },
     ];
 
-    it('renders a community-kind node with its name and 🏛️ icon', () => {
+    it('renders a community-kind node with its name and a letter chip (ZEB-606)', () => {
       const { container } = render(NavPanel, { props: { nodes: communityNodes, collapsed: false } });
       expect(screen.getByText('IPFS Crew')).toBeTruthy();
-      expect(container.textContent).toContain('🏛️');
+      expect(container.textContent).not.toContain('🏛️');
+      expect(container.querySelector('.community-chip')?.textContent?.trim()).toBe('I');
     });
 
     it('clicking a community node fires onNodeClick with the node id', async () => {
@@ -409,6 +410,50 @@ describe('NavPanel', () => {
       render(NavPanel, { props: { nodes: communityNodes, collapsed: false, onNodeClick } });
       await fireEvent.click(screen.getByText('IPFS Crew'));
       expect(onNodeClick).toHaveBeenCalledWith('comm-1');
+    });
+  });
+
+  describe('Section headers (ZEB-606)', () => {
+    const base = { expanded: false, unreadCount: 0, unreadLevel: 'none' as const };
+    const mixedNodes: NavNode[] = [
+      { id: 'work', parentId: null, type: 'folder', name: 'Work', ...base, expanded: true, lastActivity: 3 },
+      { id: 'comm-1', parentId: null, type: 'community', name: 'IPFS Crew', ...base, lastActivity: 2 },
+      { id: 'dm-1', parentId: null, type: 'dm', name: 'alice', ...base, lastActivity: 1 },
+    ];
+
+    it('shows Communities and Direct messages headers when those groups exist', () => {
+      render(NavPanel, { props: { nodes: mixedNodes, collapsed: false } });
+      expect(screen.getByText('Communities')).toBeTruthy();
+      expect(screen.getByText('Direct messages')).toBeTruthy();
+    });
+
+    it('omits headers for empty groups', () => {
+      render(NavPanel, { props: { nodes: [mixedNodes[0]], collapsed: false } });
+      expect(screen.queryByText('Communities')).toBeNull();
+      expect(screen.queryByText('Direct messages')).toBeNull();
+    });
+
+    it('renders un-headed folder trees before the Communities section', () => {
+      const { container } = render(NavPanel, { props: { nodes: mixedNodes, collapsed: false } });
+      const text = container.querySelector('.nav-tree-container')?.textContent ?? '';
+      expect(text.indexOf('Work')).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf('Work')).toBeLessThan(text.indexOf('Communities'));
+    });
+
+    it('renders the Communities header before the Direct messages header', () => {
+      const { container } = render(NavPanel, { props: { nodes: mixedNodes, collapsed: false } });
+      const text = container.querySelector('.nav-tree-container')?.textContent ?? '';
+      expect(text.indexOf('Communities')).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf('Communities')).toBeLessThan(text.indexOf('Direct messages'));
+    });
+
+    it('group-chat nodes land under Direct messages', () => {
+      const nodes: NavNode[] = [
+        { id: 'g1', parentId: null, type: 'group-chat', name: 'weekend crew', ...base, lastActivity: 1 },
+      ];
+      render(NavPanel, { props: { nodes, collapsed: false } });
+      expect(screen.getByText('Direct messages')).toBeTruthy();
+      expect(screen.queryByText('Communities')).toBeNull();
     });
   });
 
@@ -477,6 +522,98 @@ describe('NavPanel', () => {
     it('does not show the CTA when no onRedeemInvite handler is wired', () => {
       render(NavPanel, { props: { nodes: dmOnlyNodes, collapsed: false } });
       expect(screen.queryByText(/No communities yet/i)).toBeNull();
+    });
+  });
+
+  describe('Proposals nav row (ZEB-606)', () => {
+    const base = { unreadCount: 0, unreadLevel: 'none' as const };
+    const expandedCommunity: NavNode[] = [
+      { id: 'comm-1', parentId: null, type: 'community', name: 'IPFS Crew', expanded: true, ...base, lastActivity: 2 },
+      { id: 'chan-1', parentId: 'comm-1', type: 'channel', name: 'general', expanded: false, ...base, lastActivity: 1 },
+    ];
+
+    it('renders the row with a mono count badge inside an expanded community', () => {
+      const { container } = render(NavPanel, {
+        props: {
+          nodes: expandedCommunity,
+          collapsed: false,
+          proposalCount: () => 3,
+          onSelectProposals: vi.fn(),
+        },
+      });
+      const row = container.querySelector('[data-testid="proposals-row-comm-1"]');
+      expect(row).toBeTruthy();
+      expect(row?.textContent).toContain('proposals');
+      expect(row?.querySelector('.count-badge')?.textContent).toBe('3');
+    });
+
+    it('shows no badge for zero or unknown counts (row still renders)', () => {
+      const { container } = render(NavPanel, {
+        props: {
+          nodes: expandedCommunity,
+          collapsed: false,
+          proposalCount: () => 0,
+          onSelectProposals: vi.fn(),
+        },
+      });
+      const row = container.querySelector('[data-testid="proposals-row-comm-1"]');
+      expect(row).toBeTruthy();
+      expect(row?.querySelector('.count-badge')).toBeNull();
+    });
+
+    it('clicking the row fires onSelectProposals with the community id', async () => {
+      const onSelectProposals = vi.fn();
+      const { container } = render(NavPanel, {
+        props: { nodes: expandedCommunity, collapsed: false, proposalCount: () => 1, onSelectProposals },
+      });
+      await fireEvent.click(container.querySelector('[data-testid="proposals-row-comm-1"]')!);
+      expect(onSelectProposals).toHaveBeenCalledWith('comm-1');
+    });
+
+    it('is active when proposalsActiveFor matches the community', () => {
+      const { container } = render(NavPanel, {
+        props: {
+          nodes: expandedCommunity,
+          collapsed: false,
+          proposalCount: () => 1,
+          onSelectProposals: vi.fn(),
+          proposalsActiveFor: 'comm-1',
+        },
+      });
+      expect(container.querySelector('[data-testid="proposals-row-comm-1"]')?.classList.contains('active')).toBe(true);
+    });
+
+    it('renders no row without the resolver (no votingAdapter contexts)', () => {
+      const { container } = render(NavPanel, { props: { nodes: expandedCommunity, collapsed: false } });
+      expect(container.querySelector('[data-testid="proposals-row-comm-1"]')).toBeNull();
+    });
+
+    it('renders no row for a collapsed community', () => {
+      const collapsedNodes = [{ ...expandedCommunity[0], expanded: false }];
+      const { container } = render(NavPanel, {
+        props: { nodes: collapsedNodes, collapsed: false, proposalCount: () => 1, onSelectProposals: vi.fn() },
+      });
+      expect(container.querySelector('[data-testid="proposals-row-comm-1"]')).toBeNull();
+    });
+  });
+
+  describe('Identity chip (ZEB-606)', () => {
+    it('renders the chip when identity is provided', () => {
+      const { container } = render(NavPanel, {
+        props: {
+          nodes: [],
+          collapsed: false,
+          identity: { displayName: 'Jake Englund', ownerIdHex: 'ab'.repeat(16), selfOnline: true, selfSovereign: true },
+        },
+      });
+      expect(container.querySelector('[data-testid="identity-chip"]')).toBeTruthy();
+      expect(screen.getByText('Jake Englund')).toBeTruthy();
+      expect(screen.getByText('● self-sovereign')).toBeTruthy();
+    });
+
+    it('renders no chip without identity (bare construction)', () => {
+      const { container } = render(NavPanel, { props: { nodes: [], collapsed: false } });
+      expect(container.querySelector('[data-testid="identity-chip"]')).toBeNull();
     });
   });
 });

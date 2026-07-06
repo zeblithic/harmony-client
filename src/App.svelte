@@ -15,7 +15,7 @@
   import NavPanel from './lib/components/NavPanel.svelte';
   import TextFeed from './lib/components/TextFeed.svelte';
   import NotesView from './lib/components/NotesView.svelte';
-  import MediaFeed from './lib/components/MediaFeed.svelte';
+  import MessagesRail from './lib/components/MessagesRail.svelte';
   import VineFeed from './lib/components/VineFeed.svelte';
   import FileBrowser from './lib/components/FileBrowser.svelte';
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
@@ -45,6 +45,7 @@
   import GroupCallBar from './lib/components/GroupCallBar.svelte';
   import GroupCallBanner from './lib/components/GroupCallBanner.svelte';
   import { VotingAdapter } from './lib/voting-adapter';
+  import { ProposalCountService } from './lib/proposal-count-service';
   import { setupDelegateOnBehalfToast } from './lib/voting-toast-wiring';
   import { LibraryDirectoryService } from './lib/library-directory-service';
   import {
@@ -1025,6 +1026,30 @@
   // instance regardless of Tauri-init ordering; `connectAdapter` runs
   // exactly once below, after the TauriAdapter is established.
   const votingAdapter = new VotingAdapter();
+  // ZEB-606: nav proposals-row badge counts. onChange bumps the $state
+  // mirror so the NavPanel resolver re-reads (presenceVersion idiom).
+  const proposalCountService = new ProposalCountService();
+  let proposalCountVersion = $state(0);
+  // ZEB-606 (PR #408 Qodo R1): true once votingAdapter.connectAdapter has
+  // resolved — until then VotingAdapter rejects every invoke, so voting-backed
+  // UI (Assembly tab) must not mount and the badge ensure() pass must re-run
+  // on the flip. On connect failure this stays false and the rail degrades to
+  // media-only instead of a permanent error state.
+  let votingReady = $state(false);
+  // ZEB-606: App-held mirror of CommunityView's middle-column view, bound
+  // via bind:activeView so the nav proposals row / Assembly rail can
+  // deep-link and show an active state.
+  let communityActiveView = $state<'channels' | 'proposals' | 'tier3'>('channels');
+  // ZEB-606: identity-chip signals. Ring = "you appear online to others"
+  // (visibility toggle + identity present); presence rosters never contain
+  // self (zenoh doesn't loop our own beacon), so presenceService can't
+  // answer this. Microline = self-sovereign identity minted and loaded.
+  let identityChipInfo = $derived({
+    displayName: myProfile?.displayName ?? '',
+    ownerIdHex: selfOwnerId,
+    selfOnline: presenceVisible && ownerIdentityState === 'present',
+    selfSovereign: ownerIdentityState === 'present',
+  });
   // Captured unsubscribe handle from setupDelegateOnBehalfToast. Stored
   // so any future re-init / remount path can tear down the prior toast
   // subscription before registering a new one (preventing duplicate
@@ -1082,6 +1107,9 @@
   // behind the backend signal until the next members-changed event.
   function changeSelectedCommunity(id: string | null) {
     if (selectedCommunityId !== id) {
+      // ZEB-606: a community switch always lands on Channels unless a
+      // deep-link (openCommunityProposals) overrides it afterwards.
+      communityActiveView = 'channels';
       communityMembers = [];
       // ZEB-404: new community session → reset the refetch throttle.
       lastMessageRosterRefetchAt = 0;
@@ -1113,6 +1141,16 @@
     if (id !== null) notesSelected = false;
     selectedCommunityId = id;
     isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
+  }
+
+  /** ZEB-606: nav proposals-row / Assembly-rail deep link — select the
+   *  community and land on its Proposals view. */
+  function openCommunityProposals(communityId: string) {
+    if (appMode !== 'messages') switchMode('messages');
+    changeSelectedCommunity(communityId);
+    void refreshCommunityMembers(communityId);
+    showSettings = false;
+    communityActiveView = 'proposals';
   }
 
   async function refreshCommunityMembers(id: string) {
@@ -1452,6 +1490,18 @@
 
   let navNodes = $state([...navService.nodes]);
 
+  // ZEB-606: lazily load Tier-2 proposal counts for every community in the
+  // nav (one IPC each on first sight; events keep them fresh afterwards).
+  // Reading votingReady re-runs the pass once the adapter connects — without
+  // it, nav nodes populated before connect would never get their initial
+  // fetch (ensure() no-ops pre-connect; PR #408 Qodo R1 bug 3).
+  $effect(() => {
+    void votingReady;
+    for (const n of navNodes) {
+      if (n.type === 'community') proposalCountService.ensure(n.id);
+    }
+  });
+
   // Share the same resolver with the member-card service so peer-card avatars
   // (member rows, message feed) resolve through the identical fetch cache as
   // nav nodes. Task 11's setAvatarResolver does NOT touch resolver.onChange, so
@@ -1754,9 +1804,18 @@
           // twice (e.g. a future reconnect path).
           toastUnsubscribe?.();
           toastUnsubscribe = setupDelegateOnBehalfToast(votingAdapter);
+          // ZEB-606: badge counts subscribe to the same Tier-2 events.
+          proposalCountService.onChange = () => {
+            proposalCountVersion += 1;
+          };
+          proposalCountService.connectAdapter(votingAdapter);
+          votingReady = true;
         })
         .catch((err) => {
-          console.warn('[harmony-client] votingAdapter connect failed:', err);
+          console.warn(
+            '[harmony-client] votingAdapter connect failed:',
+            err instanceof Error ? err.message : String(err),
+          );
         });
 
       // Per-service connect wrapper: logs failures with the adapter name but
@@ -3045,6 +3104,15 @@
           }
           return false;
         }}
+        proposalCount={(node) => {
+          // Reading proposalCountVersion registers the reactive dependency.
+          void proposalCountVersion;
+          return proposalCountService.countFor(node.id);
+        }}
+        onSelectProposals={openCommunityProposals}
+        proposalsActiveFor={communityActiveView === 'proposals' ? selectedCommunityId : null}
+        identity={identityChipInfo}
+        showConnectionStatus={true}
         onModeChange={switchMode}
         {appMode}
         contentItems={allFileContents}
@@ -3103,6 +3171,7 @@
         {trustService}
         {navService}
         {votingAdapter}
+        bind:activeView={communityActiveView}
         onForkSuccess={(forkSpaceId) => {
           // ZEB-285: navigate to the newly created fork community and
           // refresh its member roster (matching create/join/redeem flows).
@@ -3244,7 +3313,12 @@
     {/if}
   {/snippet}
   {#snippet mediaFeed()}
-    <MediaFeed
+    <MessagesRail
+      communityId={selectedCommunityNode?.id ?? null}
+      votingAdapter={votingReady ? votingAdapter : undefined}
+      myAddr={selfOwnerId ?? ''}
+      {communityMembers}
+      onViewAllProposals={openCommunityProposals}
       messages={mediaMessages}
       {trustService}
       {trustVersion}
