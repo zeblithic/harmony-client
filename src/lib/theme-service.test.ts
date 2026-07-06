@@ -44,6 +44,32 @@ describe('pre-paint init', () => {
     initThemePrePaint();
     expect(document.documentElement.dataset.theme).toBe('light');
   });
+
+  it('installs the system-follow listener (network-window path, no owner ever)', () => {
+    let matches = false;
+    const listeners = new Set<() => void>();
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches,
+      media: query,
+      onchange: null,
+      addEventListener: (_: string, cb: () => void) => listeners.add(cb),
+      removeEventListener: (_: string, cb: () => void) => listeners.delete(cb),
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }));
+    try {
+      initThemePrePaint();
+      expect(document.documentElement.dataset.theme).toBe('light');
+      matches = true;
+      listeners.forEach((cb) => cb());
+      // No connectOwnerTheme call — the effective preference is 'system',
+      // so the OS flip must be followed live (PR #407 Qodo R1 bug 2).
+      expect(document.documentElement.dataset.theme).toBe('dark');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe('owner-scoped preference', () => {

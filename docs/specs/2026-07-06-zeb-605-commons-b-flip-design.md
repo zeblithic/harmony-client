@@ -39,7 +39,8 @@ per-owner; fonts load offline.
    ticket's step 4 is "if needed", and no in-app brand element exists today to update.
 6. **Network window** (`NetworkApp`, second Vite entry): gets pre-paint theme apply + fonts (it
    already imports app.css) but no Settings surface and no owner-scoped read — it follows the
-   device hint / system preference. Documented limitation; converges when settings sync exists.
+   device hint at launch and then live-follows `prefers-color-scheme` (PR #407 R1); no owner
+   preference is read there. Documented limitation; converges when settings sync exists.
 
 ## §1 Token flip (`src/app.css`)
 
@@ -186,12 +187,15 @@ localStorage + DOM):
     light on every boot.
 - **Boot sequence (two-phase):**
   1. `initThemePrePaint()` called from `src/main.ts` and `src/network-main.ts` before `mount()`:
-     applies `last-applied` hint if present, else `matchMedia('(prefers-color-scheme: dark)')`.
-  2. `connectOwner(ownerId)` called from App.svelte where `selfOwnerId` lands (both the boot IIFE
-     path and the mint path): reads the owner preference (default `'system'`), applies, installs a
-     `matchMedia` change listener that re-applies only while the preference is `'system'`.
-- `setPreference(pref)`: persists under the connected owner's key (no owner → apply only, persist
-  nothing, matching the loadProfile contract), applies, updates the exported
+     applies `last-applied` hint if present, else `matchMedia('(prefers-color-scheme: dark)')`,
+     and installs the system-follow listener (PR #407 R1 amendment — so the hint-only network
+     window live-follows the OS; the listener re-applies only while the preference is `'system'`).
+  2. `connectOwnerTheme(ownerId)` called from App.svelte where `selfOwnerId` lands (all three
+     owner-resolution sites: the boot IIFE path, the mint path, and the
+     owner-loads-after-start_node path found during implementation): reads the owner preference
+     (default `'system'`), applies, and ensures the same system-follow listener.
+- `setThemePreference(pref)`: persists under the connected owner's key (no owner → apply only,
+  persist nothing, matching the loadProfile contract), applies, updates the exported
   `themePreference: Readable<ThemePreference>` store.
 - **Settings UI:** new `AppearanceSettings.svelte` mounted as a new `appearance` tab in
   `SettingsPanel.svelte` (extend the `SettingsTab` union at :31, `TABS` at :73, add the

@@ -60,6 +60,29 @@ function applyPreference(pref: ThemePreference): void {
   applyResolved(resolveTheme(pref));
 }
 
+/** Install the prefers-color-scheme change listener once. The handler
+ *  re-applies only while the effective preference is 'system', so explicit
+ *  owner preferences always win. Called from BOTH entry paths: pre-paint
+ *  (so the hint-only network window live-follows the OS — PR #407 Qodo R1)
+ *  and owner connect. */
+function ensureSystemFollowListener(): void {
+  if (mediaCleanup !== null) {
+    return;
+  }
+  try {
+    const mql = window.matchMedia(DARK_QUERY);
+    const onChange = () => {
+      if (currentPreference === 'system') {
+        applyResolved(systemTheme());
+      }
+    };
+    mql.addEventListener('change', onChange);
+    mediaCleanup = () => mql.removeEventListener('change', onChange);
+  } catch {
+    mediaCleanup = null;
+  }
+}
+
 /** Pre-paint apply. Called from main.ts / network-main.ts BEFORE mount(). */
 export function initThemePrePaint(): void {
   let hint: string | null = null;
@@ -69,6 +92,7 @@ export function initThemePrePaint(): void {
     hint = null;
   }
   applyResolved(hint === 'dark' || hint === 'light' ? hint : systemTheme());
+  ensureSystemFollowListener();
 }
 
 /** Owner identity resolved: load the owner's preference and start following
@@ -82,20 +106,7 @@ export function connectOwnerTheme(ownerId: string): void {
     stored = null;
   }
   applyPreference(isPreference(stored) ? stored : 'system');
-  if (mediaCleanup === null) {
-    try {
-      const mql = window.matchMedia(DARK_QUERY);
-      const onChange = () => {
-        if (currentPreference === 'system') {
-          applyResolved(systemTheme());
-        }
-      };
-      mql.addEventListener('change', onChange);
-      mediaCleanup = () => mql.removeEventListener('change', onChange);
-    } catch {
-      mediaCleanup = null;
-    }
-  }
+  ensureSystemFollowListener();
 }
 
 /** Settings entry point. Persists only when an owner is connected (matching

@@ -19,8 +19,9 @@
   // Bind the STORE (the preference), not dataset.theme: before an owner
   // resolves the preference reads 'system' while dataset.theme may already show
   // the device-hint theme — the control must reflect the preference.
-  let current = $state<ThemePreference>('system');
-  $effect(() => themePreference.subscribe((v) => (current = v)));
+  // Store auto-subscription reads synchronously, so the initial render already
+  // shows the resolved preference (PR #407 R1: CodeRabbit + Qodo).
+  const current = $derived($themePreference);
 
   /** Element refs keyed by preference value, for programmatic focus.
    *  `$state` so `bind:this` into its properties is reactive (Svelte 5). */
