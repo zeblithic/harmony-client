@@ -49,17 +49,25 @@
 
   $effect(() => {
     const cid = communityId;
+    // Per-run cancellation flag: a bare `cid !== communityId` compare misses
+    // the A→B→A case (same id returned), letting a late first-A fetch clobber
+    // the re-entered A. The cleanup fires on every re-run, so only the latest
+    // visit's result is applied (PR #410 Qodo).
+    let cancelled = false;
     polls = null;
     void adapter
       .listTier3Polls(cid)
       .then((list) => {
-        if (cid !== communityId) return; // stale — community switched
+        if (cancelled) return;
         polls = list;
       })
       .catch(() => {
-        if (cid !== communityId) return;
+        if (cancelled) return;
         polls = null;
       });
+    return () => {
+      cancelled = true;
+    };
   });
 
   // A Tier-3 poll ALWAYS carries a synthetic "status quo" candidate that

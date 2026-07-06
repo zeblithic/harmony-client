@@ -163,24 +163,34 @@
 
   // ZEB-608 D1: per-community governance snapshot (admin quorum). Loaded on
   // every community switch, stale-guarded like the other per-community loads.
-  // null until the IPC resolves — consumers fall back to the pre-ZEB-608
-  // default of 1, so a failed fetch degrades to the old behavior instead of
-  // blanking the UI.
+  // null until the IPC resolves or on failure. The charter treats null as
+  // "not loaded" (shows '…', staying honest about live state); the settings
+  // panel keeps its operational `?? 1` fallback (its long-standing contract).
   let governance = $state<{ adminQuorum: number } | null>(null);
 
   $effect(() => {
     const cid = communityId;
+    // Per-run cancellation flag (matches the preForkSnapshot effect below). A
+    // bare `cid !== communityId` compare is NOT enough: an A→B→A switch returns
+    // to the same id, so a late-resolving first-A fetch would pass the compare
+    // and clobber the re-entered A's fresh value. The cleanup fires on every
+    // re-run, so only the latest visit's completion is ever applied (PR #410
+    // Qodo; same guard class as PR #97/#144/#357).
+    let cancelled = false;
     governance = null;
     void communityService
       .getCommunityGovernance(cid)
       .then((g) => {
-        if (cid !== communityId) return; // stale — community switched
+        if (cancelled) return;
         governance = g ?? null;
       })
       .catch(() => {
-        if (cid !== communityId) return;
+        if (cancelled) return;
         governance = null;
       });
+    return () => {
+      cancelled = true;
+    };
   });
 
   let activeChannel = $derived(channels.find((c) => c.channelId === activeChannelId) ?? null);
