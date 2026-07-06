@@ -596,4 +596,24 @@ describe('NavPanel', () => {
       expect(container.querySelector('[data-testid="proposals-row-comm-1"]')).toBeNull();
     });
   });
+
+  describe('Identity chip (ZEB-606)', () => {
+    it('renders the chip when identity is provided', () => {
+      const { container } = render(NavPanel, {
+        props: {
+          nodes: [],
+          collapsed: false,
+          identity: { displayName: 'Jake Englund', ownerIdHex: 'ab'.repeat(16), selfOnline: true, selfSovereign: true },
+        },
+      });
+      expect(container.querySelector('[data-testid="identity-chip"]')).toBeTruthy();
+      expect(screen.getByText('Jake Englund')).toBeTruthy();
+      expect(screen.getByText('● self-sovereign')).toBeTruthy();
+    });
+
+    it('renders no chip without identity (bare construction)', () => {
+      const { container } = render(NavPanel, { props: { nodes: [], collapsed: false } });
+      expect(container.querySelector('[data-testid="identity-chip"]')).toBeNull();
+    });
+  });
 });

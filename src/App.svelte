@@ -1034,6 +1034,16 @@
   // via bind:activeView so the nav proposals row / Assembly rail can
   // deep-link and show an active state.
   let communityActiveView = $state<'channels' | 'proposals' | 'tier3'>('channels');
+  // ZEB-606: identity-chip signals. Ring = "you appear online to others"
+  // (visibility toggle + identity present); presence rosters never contain
+  // self (zenoh doesn't loop our own beacon), so presenceService can't
+  // answer this. Microline = self-sovereign identity minted and loaded.
+  let identityChipInfo = $derived({
+    displayName: myProfile?.displayName ?? '',
+    ownerIdHex: selfOwnerId,
+    selfOnline: presenceVisible && ownerIdentityState === 'present',
+    selfSovereign: ownerIdentityState === 'present',
+  });
   // Captured unsubscribe handle from setupDelegateOnBehalfToast. Stored
   // so any future re-init / remount path can tear down the prior toast
   // subscription before registering a new one (preventing duplicate
@@ -3087,6 +3097,8 @@
         }}
         onSelectProposals={openCommunityProposals}
         proposalsActiveFor={communityActiveView === 'proposals' ? selectedCommunityId : null}
+        identity={identityChipInfo}
+        showConnectionStatus={true}
         onModeChange={switchMode}
         {appMode}
         contentItems={allFileContents}

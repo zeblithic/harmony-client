@@ -7,6 +7,8 @@
   import QuickFilters from './QuickFilters.svelte';
   import StorageBuddySummary from './StorageBuddySummary.svelte';
   import MoreMenu from './MoreMenu.svelte';
+  import IdentityChip from './IdentityChip.svelte';
+  import ConnectionStatusChip from './ConnectionStatusChip.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
   let {
@@ -42,6 +44,8 @@
     proposalCount,
     onSelectProposals,
     proposalsActiveFor = null,
+    identity,
+    showConnectionStatus = false,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
@@ -87,6 +91,12 @@
     onSelectProposals?: (communityId: string) => void;
     /** ZEB-606: community id whose Proposals view is open (row active state). */
     proposalsActiveFor?: string | null;
+    /** ZEB-606: identity-chip signals (App-computed). Chip renders only when
+     *  provided, so bare test construction stays chip-free. */
+    identity?: { displayName: string; ownerIdHex: string | null; selfOnline: boolean; selfSovereign: boolean };
+    /** ZEB-606: mount the connection-status strip (fires network-health IPC
+     *  on mount — default off so bare construction makes no IPC calls). */
+    showConnectionStatus?: boolean;
   } = $props();
 
   // ZEB-544: resolve the nav-rail gate map once per mount (a single localStorage
@@ -425,6 +435,17 @@
       >
         Network Viz
       </button>
+      {#if identity}
+        <IdentityChip
+          displayName={identity.displayName}
+          ownerIdHex={identity.ownerIdHex}
+          selfOnline={identity.selfOnline}
+          selfSovereign={identity.selfSovereign}
+        />
+      {/if}
+      {#if showConnectionStatus}
+        <ConnectionStatusChip />
+      {/if}
     </div>
   {:else}
     <nav class="collapsed-icons">
