@@ -34,9 +34,9 @@ Functionality wins over mock: no invented fields, verbs, or stages.
 6. **Delegation is community-wide, not per-topic or per-proposal.** The real API is
    `delegateTier2(communityId, delegate)` / `undelegateTier2(communityId)` (`voting-adapter.ts:699/:704`).
    Frame 4's "by topic" cards and the mobile per-proposal delegate sheet do not map. The
-   DelegationWidget remains the single delegation + recall surface; the card's proxied-to footer
-   shows the community delegate and its Recall routes to the community-scoped recall with the
-   existing severity-tiered confirmation.
+   DelegationWidget remains the single delegation + recall surface (severity-tiered confirmation);
+   the card's proxied-to footer shows the community delegate and offers **Vote directly** — the
+   real per-proposal override verb — not a card-level Recall.
 7. **No proposal metadata beyond `proposal_text` exists** (Tier-2 DTO: `proposal_id, community_id,
    proposal_text, lifecycle, total_conviction_ms, threshold_conviction_ms, half_life_seconds,
    auto_exec, total_supply, voter_count`). The design's "Why now" callout, byline working-group,
@@ -95,7 +95,8 @@ Real lifecycles → pill variants (all pills via StatusPill):
 | Tier-3 `fi` | `passed` | `--status-passed-fg/bg` |
 | Tier-3 `fa` | `failed` | `--status-failed-fg/bg` |
 
-**New tokens in `src/app.css`: pure `var()` aliases only, zero new hex** (both theme blocks):
+**New tokens in `src/app.css`: pure `var()` aliases only, zero new hex** (`:root` only — `var()`
+references substitute at use time against cascaded theme values, so no dark-block duplicates):
 `--verdict-passing-fg: var(--primary-deep); --verdict-passing-bg: var(--primary-soft);
 --verdict-failing-fg: var(--danger-deep); --verdict-failing-bg: var(--status-recalled-bg);`
 (failing/tied/quorum variants defined for completeness; the design's Tied/Quorum-not-met reuse the
@@ -139,8 +140,9 @@ ZEB-606). Migration map:
 - **ConvictionProposalCard** renders in 2 regimes — CommunityView middle column AND AssemblyRail
   rail (< 500px) — both capped 520px. Commons anatomy per ADOPTION Phase 2 (header: mono ID pill on
   `--gov-clay` + StatusPill; title Public Sans 600; single-axis TallyBar; threshold + conviction
-  CountChips; `▲ Support` filled / `Withdraw` outline; proxied-to footer with Recall) laid out to
-  survive both regimes. ID pill shows `shortAddr(proposal_id)` — no invented P-nn numbering.
+  CountChips; `▲ Support` filled / `Withdraw` outline; proxied-to footer with the Vote-directly
+  override, §0.6) laid out to survive both regimes. ID pill shows the shortened `proposal_id` —
+  no invented P-nn numbering.
 - **Proposals hub rows** (CommunityProposalsPanel list state): white card, `--border`,
   `border-left: 3px var(--gov-clay)` for active proposals (`--vote-abstain` for archived), radius 8,
   `--shadow-e1`; row = ID pill + StatusPill + inline TallyBar + mono meta. Grouping/filters follow
