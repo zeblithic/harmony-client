@@ -57,10 +57,16 @@ describe('ForkLineageTree', () => {
       forkedAtWallMs: 1_700_000_000_000,
       parentLineage: [{ spaceId: 'ab'.repeat(16), name: '', forkedAtWallMs: null }],
     };
-    const { getByText } = render(ForkLineageTree, {
+    const { getByText, container } = render(ForkLineageTree, {
       props: { lineage, descendants: [], localNavIds: new Set() },
     });
     expect(getByText(/0xabababab…/)).toBeTruthy();
+    // The avatar initial must derive from the SAME resolved display as the
+    // label (matching the descendant rows), so a blank name yields '0' from
+    // the 0x… id — never the raw-name '⑂' placeholder (PR #411 Qodo re-flag).
+    expect(
+      container.querySelector('.lineage-ancestor .node-avatar')?.textContent?.trim(),
+    ).toBe('0');
   });
 
   it('renders_descendants_only_for_root_with_forks', () => {

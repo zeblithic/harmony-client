@@ -166,7 +166,9 @@
     font-size: 0.875rem;
   }
   .name-input:focus {
-    outline: none;
+    /* Transparent outline keeps the focus ring visible under Windows High
+       Contrast / forced-colors, where box-shadow is dropped (CodeRabbit #411). */
+    outline: 2px solid transparent;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }

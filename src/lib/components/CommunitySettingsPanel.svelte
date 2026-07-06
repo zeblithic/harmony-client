@@ -541,11 +541,12 @@
 
       {#if phase2Lineage?.forkedFrom && phase2Lineage.parentLineage.length > 0}
         {@const parent = phase2Lineage.parentLineage[phase2Lineage.parentLineage.length - 1]}
+        {@const parentName = nonEmpty(parent.name) ?? ('0x' + parent.spaceId.slice(0, 8) + '…')}
         <div class="fork-of-callout">
-          <span class="fork-of-avatar" aria-hidden="true">{(parent.name.trim().charAt(0) || '⑂').toUpperCase()}</span>
+          <span class="fork-of-avatar" aria-hidden="true">{(parentName.trim().charAt(0) || '⑂').toUpperCase()}</span>
           <span class="fork-of-body">
             <span class="fork-of-label">This is a fork of</span>
-            <span class="fork-of-name">{nonEmpty(parent.name) ?? ('0x' + parent.spaceId.slice(0, 8) + '…')}</span>
+            <span class="fork-of-name">{parentName}</span>
           </span>
           {#if localNavIds.has(parent.spaceId)}
             <button class="fork-of-open" onclick={() => onForkLineageNavigate?.(parent.spaceId)}>Open <span aria-hidden="true">↗</span></button>

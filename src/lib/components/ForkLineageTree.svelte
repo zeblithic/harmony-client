@@ -103,7 +103,7 @@
     >
       {#if known}
         <button class="lineage-card lineage-clickable" onclick={() => handleClick(entry.spaceId)}>
-          <span class="node-avatar" aria-hidden="true">{initial(entry.name)}</span>
+          <span class="node-avatar" aria-hidden="true">{initial(nameOrId(entry.name, entry.spaceId))}</span>
           <span class="node-body">
             <span class="node-name">&#x21B3; {nameOrId(entry.name, entry.spaceId)}</span>
             {#if entry.forkedAtWallMs != null}<span class="node-sub">forked {formatDate(entry.forkedAtWallMs)}</span>{/if}
@@ -111,7 +111,7 @@
         </button>
       {:else}
         <span class="lineage-card lineage-unknown" title="You're not a member of this community.">
-          <span class="node-avatar" aria-hidden="true">{initial(entry.name)}</span>
+          <span class="node-avatar" aria-hidden="true">{initial(nameOrId(entry.name, entry.spaceId))}</span>
           <span class="node-body">
             <span class="node-name">&#x21B3; {nameOrId(entry.name, entry.spaceId)}</span>
             {#if entry.forkedAtWallMs != null}<span class="node-sub">forked {formatDate(entry.forkedAtWallMs)}</span>{/if}
@@ -130,7 +130,7 @@
     style="padding-left: calc({selfDepth} * 1.5rem);"
   >
     <span class="lineage-card self-card">
-      <span class="node-avatar node-avatar-self" aria-hidden="true">{initial(lineage.selfName)}</span>
+      <span class="node-avatar node-avatar-self" aria-hidden="true">{initial(nameOrId(lineage.selfName, lineage.selfSpaceId))}</span>
       <span class="node-body">
         <span class="node-name">{nameOrId(lineage.selfName, lineage.selfSpaceId)}</span>
         <span class="node-sub">{selfSub}</span>
