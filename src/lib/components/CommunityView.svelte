@@ -494,6 +494,16 @@
         myAddr={ownAddress}
         communityMembers={members}
       />
+    {:else if activeView !== 'channels'}
+      <!-- A governance view (charter / tier3 / proposals) is selected but the
+           voting adapter isn't available (pre-connect, or connect failed), so
+           the guarded branches above fell through. Render an explicit
+           unavailable state instead of silently showing the channel feed while
+           the tab still reads as the governance view (PR #410 Greptile P1). -->
+      <div class="empty-channels" role="status">
+        <p>This view needs a live connection to community governance.</p>
+        <p>It’ll appear here once the connection is ready.</p>
+      </div>
     {:else if activeChannel}
       {#if activeChannel.kind === 'voice'}
         {#if voiceSession}

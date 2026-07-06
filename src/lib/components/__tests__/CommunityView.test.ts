@@ -428,6 +428,23 @@ describe('CommunityView', () => {
     });
   });
 
+  it('a governance activeView without a votingAdapter shows an unavailable state, not the channel feed (Greptile #410)', async () => {
+    // Deep-linked to a governance view before the voting adapter is ready:
+    // the guarded governance branches fall through, and we must NOT silently
+    // render channel content under a governance tab state.
+    const { container } = await setup([general, announcements], {
+      votingAdapter: undefined,
+      activeView: 'charter',
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.channel-sub-sidebar')).toBeTruthy();
+    });
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      'live connection to community governance',
+    );
+    expect(container.querySelector('.channel-message-feed')).toBeNull();
+  });
+
   it('Propose amendment switches the view to the Constitutional tab', async () => {
     const { container, getByText, getByRole } = await setup(undefined, {
       votingAdapter: makeVotingAdapterStub(),
