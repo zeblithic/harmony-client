@@ -569,6 +569,16 @@ export class CommunityService {
     }
   }
 
+  /**
+   * ZEB-608 D1: read-only governance values for a community. Readable by
+   * ANY Joined member (no power gate) — powers the CharterView admin-quorum
+   * card and the settings panel's real quorum display (fixes the
+   * always-shows-1 default, spec §0.2).
+   */
+  async getCommunityGovernance(communityId: string): Promise<{ adminQuorum: number }> {
+    return this.invoke<{ adminQuorum: number }>('get_community_governance', { communityId });
+  }
+
   destroy(): void {
     for (const fn of this.unlisteners) fn();
     this.unlisteners = [];

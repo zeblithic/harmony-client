@@ -35482,6 +35482,80 @@ pub fn filter_recent_counter_signs(
     out
 }
 
+// ── ZEB-608 D1: get_community_governance IPC ──────────────────────────────
+//
+// Member-facing read-only governance snapshot. Unlike
+// `list_pending_admin_proposals` (admin-gated), ANY Joined member may read
+// this — it powers the CharterView "Admin quorum" card and fixes the
+// settings panel's always-shows-1 default (spec §0.2).
+
+/// DTO returned by `get_community_governance`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityGovernanceDto {
+    /// Current materialized admin quorum (ZEB-250). Default 1.
+    pub admin_quorum: u8,
+}
+
+/// Pure extraction: caller must be a Joined member — any power level; the
+/// charter is member-facing. Extracted for unit testing without NodeState.
+pub fn compute_community_governance(
+    materialized: &crate::community_membership::MaterializedMembership,
+    caller: crate::owner_state_types::OwnerAddr,
+) -> Result<CommunityGovernanceDto, String> {
+    let caller_status = materialized.members.get(&caller).map(|m| m.status);
+    if !matches!(
+        caller_status,
+        Some(crate::community_membership::MemberStatus::Joined)
+    ) {
+        return Err("get_community_governance: caller is not a Joined member".to_string());
+    }
+    Ok(CommunityGovernanceDto {
+        admin_quorum: materialized.admin_quorum,
+    })
+}
+
+/// ZEB-608 D1: read-only governance values for a community, readable by any
+/// Joined member (no power gate — deliberately weaker than
+/// `list_pending_admin_proposals`).
+#[tauri::command]
+async fn get_community_governance(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<CommunityGovernanceDto, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (registry, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+        )
+    };
+
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let admin_addr = engine_arc.admin_addr();
+    let materialized = {
+        let state = engine_arc.state();
+        let g = state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+    compute_community_governance(&materialized, self_owner)
+}
+
 // ── ZEB-250 Task 10: list_pending_admin_proposals IPC ─────────────────────
 //
 // Admin governance feed IPC. Walks the raw signed event log, computes
@@ -52622,6 +52696,7 @@ pub fn run() {
             list_pending_joins,
             list_recent_counter_signs,
             list_pending_admin_proposals,
+            get_community_governance,
             countersign_admin_proposal,
             propose_change_quorum,
             create_channel,
@@ -58015,6 +58090,87 @@ mod admin_action_result_routing_tests {
             state.events.contains_key(&proposal_id),
             "proposal must be in the CRDT event log"
         );
+    }
+}
+
+// ── ZEB-608 D1: get_community_governance unit tests ────────────────────────
+//
+// Exercise `compute_community_governance` directly (no NodeState / Tauri
+// runtime). The IPC wrapper adds only hex-decode + engine lookup, both
+// covered by every other community IPC.
+#[cfg(test)]
+mod get_community_governance_tests {
+    use super::*;
+    use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
+    use crate::owner_state_types::{Hlc, OwnerAddr};
+    use std::collections::BTreeSet;
+
+    fn member(status: MemberStatus) -> MemberState {
+        MemberState {
+            status,
+            joined_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn returns_materialized_quorum_for_power_zero_member() {
+        // The charter is member-facing: a Joined member with NO power_levels
+        // entry (power 0) must be able to read the quorum — this is the
+        // deliberate difference from admin-gated list_pending_admin_proposals.
+        let caller = OwnerAddr([0x01; 16]);
+        let mut m = MaterializedMembership {
+            admin_quorum: 3,
+            ..Default::default()
+        };
+        m.members.insert(caller, member(MemberStatus::Joined));
+
+        let dto = compute_community_governance(&m, caller).expect("readable at power 0");
+        assert_eq!(dto.admin_quorum, 3);
+    }
+
+    #[test]
+    fn default_quorum_is_one() {
+        let caller = OwnerAddr([0x01; 16]);
+        let mut m = MaterializedMembership::default();
+        m.members.insert(caller, member(MemberStatus::Joined));
+
+        let dto = compute_community_governance(&m, caller).expect("joined member");
+        assert_eq!(dto.admin_quorum, 1);
+    }
+
+    #[test]
+    fn rejects_non_member_caller() {
+        let caller = OwnerAddr([0x02; 16]);
+        let m = MaterializedMembership::default();
+
+        let err = compute_community_governance(&m, caller).unwrap_err();
+        assert!(err.contains("not a Joined member"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_left_and_banned_members() {
+        let left = OwnerAddr([0x03; 16]);
+        let banned = OwnerAddr([0x04; 16]);
+        let mut m = MaterializedMembership::default();
+        m.members.insert(left, member(MemberStatus::Left));
+        m.members.insert(banned, member(MemberStatus::Banned));
+
+        assert!(compute_community_governance(&m, left).is_err());
+        assert!(compute_community_governance(&m, banned).is_err());
+    }
+
+    #[test]
+    fn dto_serializes_admin_quorum_camel_case() {
+        // Pins the wire key the TS binding reads (e2e camelCase rule).
+        let dto = CommunityGovernanceDto { admin_quorum: 2 };
+        let json = serde_json::to_string(&dto).expect("serialize");
+        assert_eq!(json, r#"{"adminQuorum":2}"#);
     }
 }
 
