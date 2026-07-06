@@ -7,6 +7,7 @@
     type CommunityMember,
     type ForkDescendantDto,
   } from '../types';
+  import { nonEmpty } from '../display-label';
   import ConfirmationModal from './ConfirmationModal.svelte';
   import SetPowerDialog from './SetPowerDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
@@ -538,6 +539,21 @@
         continuity if members want to take their conversation elsewhere.
       </p>
 
+      {#if phase2Lineage?.forkedFrom && phase2Lineage.parentLineage.length > 0}
+        {@const parent = phase2Lineage.parentLineage[phase2Lineage.parentLineage.length - 1]}
+        {@const parentName = nonEmpty(parent.name) ?? ('0x' + parent.spaceId.slice(0, 8) + '…')}
+        <div class="fork-of-callout">
+          <span class="fork-of-avatar" aria-hidden="true">{(parentName.trim().charAt(0) || '⑂').toUpperCase()}</span>
+          <span class="fork-of-body">
+            <span class="fork-of-label">This is a fork of</span>
+            <span class="fork-of-name">{parentName}</span>
+          </span>
+          {#if localNavIds.has(parent.spaceId)}
+            <button class="fork-of-open" onclick={() => onForkLineageNavigate?.(parent.spaceId)}>Open <span aria-hidden="true">↗</span></button>
+          {/if}
+        </div>
+      {/if}
+
       {#if phase2Lineage}
         <ForkLineageTree
           lineage={phase2Lineage}
@@ -845,18 +861,63 @@
     margin: 0 0 0.75rem;
     line-height: 1.4;
   }
-  .fork-btn {
+  .fork-of-callout {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--primary-soft);
+    border: 1px solid var(--primary-border);
+    border-radius: 9px;
+    padding: 8px 12px;
+    margin: 0 0 12px;
+  }
+  .fork-of-avatar {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--text-bright);
+    font-family: var(--font-display);
+    font-weight: 600;
+  }
+  .fork-of-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .fork-of-label {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--primary-deep);
+  }
+  .fork-of-name {
+    font-family: var(--font-display);
+    font-size: 0.95rem;
+    color: var(--text-primary);
+  }
+  .fork-of-open {
+    margin-left: auto;
+    flex: 0 0 auto;
     background: var(--surface-raised);
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
+    color: var(--primary-deep);
+    border: 1px solid var(--primary-border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .fork-btn {
+    background: var(--gov-clay-soft);
+    color: var(--gov-clay-deep);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 35%, var(--surface-raised));
     padding: 6px 14px;
     border-radius: 7px;
     cursor: pointer;
     font-size: 0.8rem;
   }
   .fork-btn:hover {
-    color: var(--text-primary);
-    border-color: var(--accent);
+    border-color: var(--gov-clay);
   }
   .fork-btn:focus-visible {
     outline: 2px solid var(--accent);

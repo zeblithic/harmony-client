@@ -128,4 +128,10 @@ describe('ForkConfirmDialog', () => {
     await fireEvent.input(input, { target: { value: 'My fork' } });
     expect(btn.disabled).toBe(false);
   });
+
+  it('shows the always-included snapshot note and the sage consent callout', () => {
+    render(ForkConfirmDialog, { props: { ...baseProps } });
+    expect(screen.getByText(/a frozen snapshot of every channel is always included/i)).toBeTruthy();
+    expect(screen.getByText(/you become its first admin/i)).toBeTruthy();
+  });
 });

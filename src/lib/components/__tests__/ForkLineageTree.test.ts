@@ -48,6 +48,27 @@ describe('ForkLineageTree', () => {
     expect(getByText(/Leaf/)).toBeTruthy();
   });
 
+  it('falls back to the truncated space-id when a lineage name is blank (PR #411 Qodo)', () => {
+    // Legacy/corrupted snapshots can carry an empty frozen name; the card must
+    // show the real space-id, never a blank label (team nonEmpty() idiom).
+    const lineage: CommunityLineageDto = {
+      ...emptyLineage('Leaf'),
+      forkedFrom: 'ab'.repeat(16),
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [{ spaceId: 'ab'.repeat(16), name: '', forkedAtWallMs: null }],
+    };
+    const { getByText, container } = render(ForkLineageTree, {
+      props: { lineage, descendants: [], localNavIds: new Set() },
+    });
+    expect(getByText(/0xabababab…/)).toBeTruthy();
+    // The avatar initial must derive from the SAME resolved display as the
+    // label (matching the descendant rows), so a blank name yields '0' from
+    // the 0x… id — never the raw-name '⑂' placeholder (PR #411 Qodo re-flag).
+    expect(
+      container.querySelector('.lineage-ancestor .node-avatar')?.textContent?.trim(),
+    ).toBe('0');
+  });
+
   it('renders_descendants_only_for_root_with_forks', () => {
     const descendants: ForkDescendantDto[] = [
       {
@@ -308,5 +329,38 @@ describe('ForkLineageTree', () => {
     const selfRow = container.querySelector('[aria-current="page"]');
     expect(selfRow).toBeTruthy();
     expect(selfRow?.textContent).toMatch(/My Self/);
+  });
+
+  it('shows the sage "You are here" badge on the self row', () => {
+    const { container } = render(ForkLineageTree, {
+      props: { lineage: emptyLineage('Root'), descendants: [], localNavIds: new Set() },
+    });
+    const selfRow = container.querySelector('[aria-current="page"]')!;
+    const badge = selfRow.querySelector('.lineage-badge.you-here');
+    expect(badge).toBeTruthy();
+    expect(badge!.textContent).toMatch(/You are here/);
+  });
+
+  it('badges a locally-known descendant "Member" and an unknown one "not joined"', () => {
+    const descendants: ForkDescendantDto[] = [
+      { forkSpaceId: '33'.repeat(16), forkerAddr: 'ab'.repeat(16), forkerDisplayName: 'Maya', forkedAtWallMs: 1_715_000_000_000, locallyKnown: true },
+      { forkSpaceId: '44'.repeat(16), forkerAddr: 'cd'.repeat(16), forkerDisplayName: null, forkedAtWallMs: 1_716_000_000_000, locallyKnown: false },
+    ];
+    const { container } = render(ForkLineageTree, {
+      props: {
+        lineage: emptyLineage('Root'),
+        descendants,
+        localNavIds: new Set(['33'.repeat(16)]),
+        resolveLocalName: (hex: string) => (hex === '33'.repeat(16) ? 'Maya Fork' : null),
+      },
+    });
+    const rows = container.querySelectorAll('.lineage-descendant');
+    expect(rows.length).toBe(2);
+    // Locally-known → sage Member badge, and it is a button.
+    expect(rows[0].querySelector('.lineage-badge.member')?.textContent).toMatch(/Member/);
+    expect(rows[0].querySelector('button')).toBeTruthy();
+    // Unknown → muted "not joined", and zero buttons.
+    expect(rows[1].querySelector('.lineage-badge.not-joined')?.textContent).toMatch(/not joined/);
+    expect(rows[1].querySelector('button')).toBeNull();
   });
 });

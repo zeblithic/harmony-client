@@ -296,6 +296,80 @@ describe('CommunitySettingsPanel', () => {
     expect(forkButton?.textContent).toMatch(/Fork this community/);
   });
 
+  it('shows the "This is a fork of {parent}" callout for a forked community', async () => {
+    const parentHex = '22'.repeat(16);
+    const lineage: CommunityLineageDto = {
+      forkedFrom: parentHex,
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [{ spaceId: parentHex, name: 'Origin Community', forkedAtWallMs: null }],
+      selfSpaceId: '33'.repeat(16),
+      selfName: 'The Fork',
+    };
+    const onNav = vi.fn();
+    const { container } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        phase2Lineage: lineage,
+        localNavIds: new Set([parentHex]),
+        onForkLineageNavigate: onNav,
+      },
+    });
+    const callout = container.querySelector('.fork-of-callout');
+    expect(callout).toBeTruthy();
+    expect(callout!.textContent).toContain('This is a fork of');
+    expect(callout!.textContent).toContain('Origin Community');
+    // "Open ↗" is present because the parent is locally known, and it navigates.
+    const openBtn = callout!.querySelector('.fork-of-open') as HTMLButtonElement;
+    expect(openBtn).toBeTruthy();
+    await fireEvent.click(openBtn);
+    expect(onNav).toHaveBeenCalledWith(parentHex);
+  });
+
+  it('omits the "fork of" callout for a root community', () => {
+    const lineage: CommunityLineageDto = {
+      forkedFrom: null, forkedAtWallMs: null, parentLineage: [],
+      selfSpaceId: '11'.repeat(16), selfName: 'Root',
+    };
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, phase2Lineage: lineage },
+    });
+    expect(container.querySelector('.fork-of-callout')).toBeNull();
+  });
+
+  it('shows the callout without an "Open" button when the parent is not locally known', () => {
+    const parentHex = '22'.repeat(16);
+    const lineage: CommunityLineageDto = {
+      forkedFrom: parentHex,
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [{ spaceId: parentHex, name: 'Origin Community', forkedAtWallMs: null }],
+      selfSpaceId: '33'.repeat(16),
+      selfName: 'The Fork',
+    };
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, phase2Lineage: lineage, localNavIds: new Set() },
+    });
+    const callout = container.querySelector('.fork-of-callout');
+    expect(callout).toBeTruthy();
+    // Parent not in localNavIds → no navigable "Open" affordance.
+    expect(callout!.querySelector('.fork-of-open')).toBeNull();
+  });
+
+  it('falls back to a truncated id when the fork parent name is blank (PR #411 Qodo)', () => {
+    const parentHex = 'ab'.repeat(16);
+    const lineage: CommunityLineageDto = {
+      forkedFrom: parentHex,
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [{ spaceId: parentHex, name: '', forkedAtWallMs: null }],
+      selfSpaceId: '33'.repeat(16),
+      selfName: 'The Fork',
+    };
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, phase2Lineage: lineage, localNavIds: new Set() },
+    });
+    const name = container.querySelector('.fork-of-callout .fork-of-name');
+    expect(name?.textContent).toContain('0xabababab…');
+  });
+
   // ── ZEB-250: Admin governance section tests ───────────────────────────────
 
   it('admin_governance_section_renders_for_admin', async () => {
