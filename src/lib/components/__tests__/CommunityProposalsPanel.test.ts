@@ -215,6 +215,16 @@ describe('CommunityProposalsPanel', () => {
         h({ proposalId: 'aa'.repeat(32), communityId: COMMUNITY_ID });
       }
       await waitFor(() => expect(screen.queryByText('On the record')).toBeNull());
+
+      // PR #409 Qodo: the stale id must be CLEARED, not just visually
+      // hidden — if the proposal reappears on a later refetch, the
+      // detail must NOT silently reopen without a user click.
+      listMock.mockResolvedValue([makeProposal('gone', { voter_count: 3, total_supply: 10 })]);
+      for (const h of [...createdHandlers]) {
+        h({ proposalId: 'aa'.repeat(32), communityId: COMMUNITY_ID });
+      }
+      await waitFor(() => expect(screen.getByText(/open ballot/i)).toBeTruthy());
+      expect(screen.queryByText('On the record')).toBeNull();
     });
   });
 });

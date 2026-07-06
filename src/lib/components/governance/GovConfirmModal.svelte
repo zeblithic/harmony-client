@@ -32,11 +32,16 @@
   } = $props();
 
   let typedInput = $state('');
-  let confirmEnabled = $derived(
-    !busy &&
-      (severity === 'click' ||
-        typedInput.trim().toLowerCase() === typedMatch.toLowerCase()),
-  );
+  let confirmEnabled = $derived.by(() => {
+    if (busy) return false;
+    if (severity === 'click') return true;
+    const match = typedMatch.trim();
+    // An empty match string must never enable the confirm — a caller
+    // accidentally passing typedMatch="" would otherwise disable the
+    // typed-confirm protection outright (PR #409 Qodo).
+    if (match.length === 0) return false;
+    return typedInput.trim().toLowerCase() === match.toLowerCase();
+  });
 </script>
 
 <div class="confirm-modal" role="dialog" aria-modal="true" aria-label={title}>

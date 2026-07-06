@@ -86,6 +86,21 @@
         )
       : 0,
   );
+  // Clear a stale selection once the list has LOADED without it — the
+  // derived above already falls back to the hub visually, but a
+  // retained id would silently reopen the detail if the proposal
+  // reappeared on a later refetch (PR #409 Qodo). `proposals === null`
+  // (initial/community-swap load) must not clear: the selection may
+  // simply not have resolved yet.
+  $effect(() => {
+    if (
+      proposals !== null &&
+      selectedProposalId !== null &&
+      !proposals.some((p) => p.proposal_id === selectedProposalId)
+    ) {
+      selectedProposalId = null;
+    }
+  });
   /** ZEB-292 Phase 3: caller's current delegate hex (32 chars) or
    *  null. Loaded on mount and refreshed on every
    *  voting-delegation-changed event for the local user. Passed to

@@ -90,6 +90,16 @@ describe('GovConfirmModal', () => {
     await fireEvent.click(confirmBtn);
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });
+  it('typed severity with an empty typedMatch never enables confirm', async () => {
+    const onConfirm = vi.fn();
+    render(GovConfirmModal, {
+      props: { title: 'T', severity: 'typed', typedMatch: '', onConfirm, onCancel: vi.fn() },
+    });
+    const confirmBtn = screen.getByRole('button', { name: 'Confirm' });
+    expect((confirmBtn as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.input(screen.getByLabelText(/to confirm$/), { target: { value: 'anything' } });
+    expect((confirmBtn as HTMLButtonElement).disabled).toBe(true);
+  });
   it('busy disables both buttons', () => {
     render(GovConfirmModal, {
       props: { title: 'T', busy: true, onConfirm: vi.fn(), onCancel: vi.fn() },
