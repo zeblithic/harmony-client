@@ -25,7 +25,7 @@ blocks Practice entirely (not chosen, broken) is red. A metric at 88% (elevated,
 clay; at 97% (failure-adjacent) it is red.
 
 Five decisions (#1, #2, #5, #9, #10) fall out of this ladder — though **#1 and #9 turn out to
-serve only mock-data surfaces and are recorded-but-deferred** (§3, §4); the other five
+serve only the mock-dominated Network Viz surface and are recorded-but-deferred** (§3, §4); the other five
 (#3, #4, #6, #7, #8) are pure form/anatomy calls.
 
 ## 2. Guardrails (bind every change below)
@@ -48,7 +48,7 @@ serve only mock-data surfaces and are recorded-but-deferred** (§3, §4); the ot
 
 ### Theme A — the valence ladder
 
-#### 9. CountChip danger-tone + three-tier severity ladder — **RECORDED, DEFERRED (mock-only consumer)**
+#### 9. CountChip danger-tone + three-tier severity ladder — **RECORDED, DEFERRED (mock-dominated consumer)**
 
 **Correction (2026-07-07 review):** the audit framed this as "the keystone gating ZEB-653/655."
 That framing was wrong. `governance/CountChip.svelte` already ships `sage | clay | neutral`, and
@@ -58,9 +58,12 @@ danger tone, so **neither was ever blocked** — both proceed today against the 
 
 The `danger` tone + the three-tier resource-severity ladder (CPU/Mem/Disk 85/95) have **exactly one
 consumer: `NodeDetail`**, which renders **only** in the standalone "Network Viz" webview window
-(`network-main.ts` → `NetworkApp.svelte`), fed by `MockNetworkDataService` (fabricated 8–12 random
-nodes + synthetic metrics). `NetworkHealthView` (the real IPC surface) shows relay/transport
-*states*, not resource percentages — it is **not** a consumer. So this is mock-only investment.
+(`network-main.ts` → `NetworkApp.svelte`). That window always seeds 8–12 fabricated
+`MockNetworkDataService` nodes and — under Tauri with Zenoh connected — *merges* live-discovered
+nodes in (`NetworkApp.svelte:94` `mergeNodes`); the fabricated nodes always dominate, so the graph
+is not a faithful topology and its metric tiles are largely synthetic. `NetworkHealthView` (the real
+IPC surface) shows relay/transport *states*, not resource percentages — so it is **not** a consumer.
+Building a resource-severity ladder for this mock-dominated surface isn't worth it now.
 
 **Decision:** **record the design, defer the build.** When a real resource-severity surface exists,
 apply: CountChip gains a 4th `danger` tone (`.danger { background: var(--status-recalled-bg); }` /
@@ -106,7 +109,8 @@ confirm/reveal button uses clay (`--gov-clay` fill or outline per the card's but
 
 **Decision:** `.ptt-hint.error` (mic permission **denied**, which blocks Practice entirely)
 changes from `--text-warning` (clay) to the **red** family — specifically
-`--danger-text-muted` (= `--mail-error-text`, a paper-legible muted red).
+`--danger-text-muted`, a paper-legible muted red (the same idea as the mail-error text — the two
+tokens coincide in the light theme and diverge slightly in warm-dark, so pin `--danger-text-muted`).
 
 **Rationale:** A denied mic is an unchosen hard blocker that breaks the feature → red, per the
 ladder. `--danger-text-muted` keeps the hint legible as body text on the light paper canvas
@@ -115,12 +119,14 @@ harsher pure `--danger`.
 
 **Change:** `FlashcardView.svelte` — `.ptt-hint.error { color: var(--danger-text-muted); }`.
 
-#### 1. NetworkGraph heat-map — **RECORDED, DEFERRED (mock-only surface)**
+#### 1. NetworkGraph heat-map — **RECORDED, DEFERRED (mock-dominated surface)**
 
 **Correction (2026-07-07 review):** `NetworkGraph` renders **only** in the standalone "Network Viz"
-webview window (`network-main.ts` → `NetworkApp.svelte`), fed by `MockNetworkDataService` — a
-fabricated 8–12-node demo topology, not a live reflection of how the network coalesces. Restyling
-it now is investment in mock data.
+webview window (`network-main.ts` → `NetworkApp.svelte`). That window always seeds 8–12 fabricated
+`MockNetworkDataService` nodes and — under Tauri with Zenoh connected — *merges* live-discovered
+nodes in (`NetworkApp.svelte:94` `mergeNodes`), but the fabricated nodes always dominate, so the
+graph is not a faithful reflection of how the network coalesces. Restyling it now is low-value
+while the topology is mock-dominated.
 
 **Decision:** **record the design, defer the build.** If/when Network Viz is backed by real topology
 data, apply: keep the intuitive green → clay → red load ramp (cool → hot) but source it from the
@@ -131,7 +137,7 @@ paper canvas; leave `capabilityColor` categorical (borrowing flashcard/category 
 distinctness is fine — YAGNI on a dedicated capability palette). Until then, no `graph-utils.ts` /
 `NetworkGraph.svelte` changes.
 
-**Related disposition:** the "Network Viz" window itself is mock-only — see §4 for the proposed
+**Related disposition:** the "Network Viz" window itself is mock-dominated — see §4 for the proposed
 hide/gate follow-up.
 
 ### Theme B — form / anatomy
@@ -211,8 +217,9 @@ surrounding reaction toolbar/picker chrome was already handled in the ZEB-611 sw
 ## 4. Downstream implementation impact
 
 This document is decision-only. Two of the ten calls (#1, #9) are **recorded but deferred** because
-their only consumers are mock-data surfaces (the "Network Viz" webview / `NodeDetail`). The
-remaining eight are real-surface work.
+their only consumers live in the mock-dominated "Network Viz" webview (`NetworkGraph` / `NodeDetail`
+— which seeds fabricated nodes and merges live Zenoh discoveries under Tauri, but the fakes always
+dominate). The remaining eight are real-surface work.
 
 **Already unblocked, independent of this doc:** ZEB-653 (PendingJoinsPanel) and ZEB-655
 (BridgingPanel) use `CountChip`'s existing `sage`/`clay`/`neutral` tones — they were never blocked
@@ -226,13 +233,15 @@ bundle-small), each independently shippable and reviewable:
   #6 ProfileEditor (flat section) + #8 reaction-chip (20px pill).
 - #7 DiagnosticsPanel: decision = *keep utilitarian* → **no work**.
 
-**Deferred (mock-only, no work now):** #1 NetworkGraph heat-map; #9 CountChip danger tone +
+**Deferred (mock-dominated, no work now):** #1 NetworkGraph heat-map; #9 CountChip danger tone +
 three-tier severity ladder + NodeDetail tiles. Designs recorded in §3 for if/when the surfaces get
 real data.
 
 **Proposed follow-up (product call, outside Commons scope):** the "Network Viz" window
-(`network-main.ts` → `NetworkApp.svelte`, `MockNetworkDataService`) is mock-only and does not
-reflect real network coalescence. Recommend a separate ticket to **hide/gate its entry points** —
+(`network-main.ts` → `NetworkApp.svelte`) is fabricated-node-dominated — it seeds
+`MockNetworkDataService` nodes and merges live Zenoh discoveries under Tauri, but the fakes dominate,
+so it does not faithfully reflect real network coalescence. Recommend a separate ticket to
+**hide/gate its entry points** —
 the `NavPanel.svelte` "Network Viz" affordance + the `network-viz` `WebviewWindow` — behind a dev
 flag until it is backed by real data. Treatment (remove vs dev-flag-gate) is Jake's call.
 
@@ -241,7 +250,7 @@ New tickets for the two real-surface PRs to be filed as ZEB-603 children once th
 ## 5. Self-review
 
 - **Coverage:** all 10 audit ND items resolved (§3 #1–#10); #1 and #9 recorded-but-deferred as
-  mock-only, the other eight scoped for two real-surface PRs (§4). ✅
+  mock-dominated, the other eight scoped for two real-surface PRs (§4). ✅
 - **Token safety:** every token named (`--status-recalled-bg`, `--danger-deep`,
   `--net-ok/warn/danger-*`, `--gov-clay*`, `--accent`, `--danger-text-muted`,
   `--presence-online`, `--info`, `--surface-raised`, `--border`, `--shadow-e1`, `--font-display`)
