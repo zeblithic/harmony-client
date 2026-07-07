@@ -93,8 +93,11 @@
 
 <style>
   .untrusted-card {
-    background: var(--bg-tertiary);
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--gov-clay);
     border-radius: 8px;
+    box-shadow: var(--shadow-e1);
     overflow: hidden;
     scroll-margin-top: 12px;
   }
@@ -183,8 +186,8 @@
   }
 
   .action-btn.confirming:not(:disabled) {
-    border-color: var(--accent);
-    color: var(--accent);
+    border-color: var(--gov-clay);
+    color: var(--gov-clay);
   }
 
   .cancel-btn {
