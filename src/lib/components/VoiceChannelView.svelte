@@ -265,6 +265,7 @@
         <button
           class="ctrl"
           class:active={!$voiceState.muted}
+          class:restrictive={$voiceState.muted}
           aria-pressed={!$voiceState.muted}
           onclick={toggleMute}
           aria-label={$voiceState.muted ? 'Unmute' : 'Mute'}
@@ -286,7 +287,7 @@
       </button>
       <button
         class="ctrl"
-        class:active={$voiceState.deafened}
+        class:restrictive={$voiceState.deafened}
         aria-pressed={$voiceState.deafened}
         onclick={toggleDeafen}
         aria-label="Deafen"
@@ -511,6 +512,11 @@
   .ctrl.active {
     background: var(--accent);
     border-color: var(--accent);
+    color: var(--text-primary);
+  }
+  .ctrl.restrictive {
+    background: var(--gov-clay);
+    border-color: var(--gov-clay);
     color: var(--text-primary);
   }
   /* Reconnecting badge: a small amber pill on the control bar while the inbound

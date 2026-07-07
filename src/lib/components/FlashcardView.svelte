@@ -660,6 +660,6 @@
   }
 
   .ptt-hint.error {
-    color: var(--text-warning);
+    color: var(--danger-text-muted);
   }
 </style>

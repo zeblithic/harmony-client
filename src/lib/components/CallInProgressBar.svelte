@@ -73,6 +73,7 @@
         <button
           class="ctrl"
           class:active={!$callState?.muted}
+          class:restrictive={$callState?.muted}
           aria-pressed={!$callState?.muted}
           onclick={toggleMute}
           aria-label={$callState?.muted ? 'Unmute' : 'Mute'}
@@ -91,7 +92,7 @@
       </button>
       <button
         class="ctrl"
-        class:active={$callState?.deafened}
+        class:restrictive={$callState?.deafened}
         data-testid="deafen"
         aria-pressed={$callState?.deafened}
         onclick={toggleDeafen}
@@ -165,6 +166,11 @@
   .ctrl.active {
     background: var(--accent);
     border-color: var(--accent);
+    color: var(--text-bright);
+  }
+  .ctrl.restrictive {
+    background: var(--gov-clay);
+    border-color: var(--gov-clay);
     color: var(--text-bright);
   }
   .ptt-hold {
