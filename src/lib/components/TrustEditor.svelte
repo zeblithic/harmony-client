@@ -104,6 +104,7 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-secondary);
+    font-family: var(--font-display);
   }
 
   .dimension {
@@ -145,7 +146,7 @@
     width: 32px;
     height: 28px;
     border: 1px solid var(--bg-tertiary);
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--bg-secondary);
     color: var(--text-secondary);
     font-size: 12px;
@@ -190,7 +191,7 @@
   .clear-button {
     padding: 4px 12px;
     border: 1px solid var(--bg-tertiary);
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--bg-secondary);
     color: var(--text-secondary);
     font: inherit;

@@ -53,9 +53,10 @@
     margin: 0 0 0.25rem;
     padding: 0.25rem;
     list-style: none;
-    background: var(--bg-secondary);
+    background: var(--surface-raised);
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 8px;
+    box-shadow: var(--shadow-e2);
     max-height: 12rem;
     overflow-y: auto;
     z-index: 50;
@@ -69,7 +70,7 @@
     background: transparent;
     border: none;
     color: var(--text-primary);
-    border-radius: 4px;
+    border-radius: 5px;
     cursor: pointer;
     font: inherit;
   }

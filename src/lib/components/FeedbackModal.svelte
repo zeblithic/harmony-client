@@ -234,10 +234,12 @@
     z-index: 1000;
   }
   .modal-content {
-    background: var(--bg-secondary);
+    background: var(--surface-raised);
     color: var(--text-primary);
     padding: 1.5rem;
     border-radius: 8px;
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-e3);
     max-width: 640px;
     width: 90%;
     max-height: 80vh;
@@ -246,6 +248,7 @@
   .modal-content h2 {
     margin: 0 0 1rem;
     font-size: 1.25rem;
+    font-family: var(--font-display);
   }
   .field-label {
     display: block;
@@ -259,8 +262,8 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    font-family: var(--font-mono);
+    border-radius: 5px;
+    font-family: var(--font-ui);
     font-size: 0.85rem;
     resize: vertical;
   }
@@ -282,7 +285,7 @@
     font-size: 0.75rem;
   }
   .error {
-    color: crimson;
+    color: var(--danger);
     margin: 0.5rem 0;
     font-size: 0.85rem;
   }

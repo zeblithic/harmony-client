@@ -454,21 +454,21 @@
     color: var(--net-ok-deep);
   }
   .status-degraded {
-    color: orange;
+    color: var(--net-warn-fg);
   }
   .status-unreachable {
-    color: crimson;
+    color: var(--net-danger-fg);
   }
   /* ZEB-450: persistent "node can't network" banner. */
   .transport-disabled {
-    border: 1px solid crimson;
+    border: 1px solid var(--net-danger-fg);
     border-radius: 6px;
     padding: 0.75rem 1rem;
     margin-bottom: 1rem;
-    background: rgba(220, 20, 60, 0.06);
+    background: var(--net-danger-bg);
   }
   .transport-disabled h2 {
-    color: crimson;
+    color: var(--net-danger-fg);
     margin-top: 0;
   }
   .transport-disabled .reason {
@@ -494,7 +494,7 @@
     margin-left: 0.5em;
   }
   .error {
-    color: crimson;
+    color: var(--net-danger-fg);
   }
   .self-test-steps {
     list-style: none;
@@ -512,7 +512,7 @@
     color: var(--net-ok-deep);
   }
   .dial-fail {
-    color: crimson;
+    color: var(--net-danger-fg);
   }
   .dial-recent {
     list-style: none;

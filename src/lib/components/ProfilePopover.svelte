@@ -340,13 +340,13 @@
   .profile-popover {
     position: fixed;
     z-index: 100;
-    background: var(--bg-tertiary);
+    background: var(--surface-raised);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 16px;
     min-width: 240px;
     max-width: 300px;
-    box-shadow: 0 4px 16px var(--shadow-mid);
+    box-shadow: var(--shadow-e2);
   }
 
   .popover-header {
@@ -365,6 +365,7 @@
     font-size: 16px;
     font-weight: 700;
     color: var(--text-primary);
+    font-family: var(--font-display);
   }
 
   .popover-status {

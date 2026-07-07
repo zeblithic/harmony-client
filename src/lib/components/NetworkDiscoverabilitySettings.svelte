@@ -593,7 +593,7 @@
     background: var(--bg-tertiary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-radius: 5px;
   }
 
   .relay-add-btn,

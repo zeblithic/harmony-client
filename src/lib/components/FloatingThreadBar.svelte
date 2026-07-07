@@ -77,7 +77,7 @@
     gap: 4px;
     padding: 4px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 3px;
     background: var(--bg-tertiary);
     color: var(--text-secondary);
     font-size: 11px;
@@ -111,6 +111,7 @@
   .entry-count {
     color: var(--text-muted);
     font-size: 10px;
+    font-family: var(--font-mono);
   }
 
   .pin-icon {

@@ -1279,7 +1279,7 @@
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
-  .reaction-count { color: var(--text-secondary); }
+  .reaction-count { color: var(--text-secondary); font-family: var(--font-mono); }
   .reaction-chip.mine .reaction-count { color: var(--text-primary); }
   /* ZEB-541: keep the inline custom-emoji image vertically centered in the chip. */
   .reaction-emoji { display: inline-flex; align-items: center; }
@@ -1323,10 +1323,10 @@
     align-items: center;
     gap: 2px;
     padding: 2px;
-    background: var(--bg-secondary);
+    background: var(--surface-raised);
     border: 1px solid var(--border);
-    border-radius: 6px;
-    box-shadow: 0 1px 4px var(--shadow-mid);
+    border-radius: 8px;
+    box-shadow: var(--shadow-e1);
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.08s ease;
@@ -1347,7 +1347,7 @@
     font-size: 0.95rem;
     line-height: 1;
     padding: 3px 5px;
-    border-radius: 4px;
+    border-radius: 5px;
   }
   .quick-react:hover,
   .picker-toggle:hover,
@@ -1374,10 +1374,10 @@
     grid-template-columns: repeat(5, 1fr);
     gap: 2px;
     padding: 4px;
-    background: var(--bg-secondary);
+    background: var(--surface-raised);
     border: 1px solid var(--border);
-    border-radius: 6px;
-    box-shadow: 0 2px 8px var(--shadow-strong);
+    border-radius: 8px;
+    box-shadow: var(--shadow-e2);
     z-index: 10;
   }
   /* The picker is a 5-col grid; `grid-column: 1 / -1` drops the checkbox + hint

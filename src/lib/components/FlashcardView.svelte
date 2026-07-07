@@ -630,7 +630,7 @@
   .hint-toggle {
     padding: 4px 12px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--bg-tertiary);
     color: var(--text-secondary);
     cursor: pointer;
@@ -647,7 +647,7 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     padding: 16px 0;
   }
 

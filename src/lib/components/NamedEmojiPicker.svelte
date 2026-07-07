@@ -141,7 +141,7 @@
 
 <style>
   .named-emoji-picker { display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem; min-width: 14rem; max-width: 18rem; }
-  .named-search, .named-rename { width: 100%; box-sizing: border-box; padding: 0.25rem 0.4rem; }
+  .named-search, .named-rename { width: 100%; box-sizing: border-box; padding: 0.25rem 0.4rem; border: 1px solid var(--border); border-radius: 5px; background: var(--input-bg); color: var(--text-primary); font: inherit; }
   .named-rename-wrap { display: inline-flex; flex-direction: column; gap: 0.1rem; }
   .named-rename-error { font-size: 0.7em; color: var(--danger-muted); }
   .named-grid { display: flex; flex-wrap: wrap; gap: 0.35rem; }

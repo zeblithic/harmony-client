@@ -229,7 +229,7 @@
     font-size: 0.85em;
   }
   .error {
-    color: crimson;
+    color: var(--danger);
   }
   dl {
     display: grid;

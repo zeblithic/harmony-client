@@ -30,7 +30,7 @@
     align-items: center;
     gap: 4px;
     padding: 2px 8px;
-    border-radius: 4px;
+    border-radius: 3px;
     font-size: 0.8rem;
     font-weight: 500;
   }

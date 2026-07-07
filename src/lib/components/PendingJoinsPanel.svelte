@@ -274,7 +274,7 @@
         color: var(--text-dim);
     }
     .error {
-        color: #c33;
+        color: var(--danger-text-muted);
     }
     summary {
         cursor: pointer;
