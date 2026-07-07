@@ -8,6 +8,15 @@ describe('NamePromptModal — ZEB-336 first-run name', () => {
     expect(screen.getByTestId('name-prompt-input')).toBeTruthy();
   });
 
+  // ZEB-610 (Commons G) restyle regression guard: the Commons chrome pass
+  // touches only the <style> block, so the primary (Save) and skip controls
+  // must keep resolving by their pinned testids afterwards.
+  it('primary and skip controls still resolve after the Commons restyle', () => {
+    render(NamePromptModal, { props: { open: true, onSave: vi.fn(), onSkip: vi.fn() } });
+    expect(screen.getByTestId('name-prompt-save')).toBeTruthy();
+    expect(screen.getByTestId('name-prompt-skip')).toBeTruthy();
+  });
+
   it('does not render when closed', () => {
     render(NamePromptModal, { props: { open: false, onSave: vi.fn(), onSkip: vi.fn() } });
     expect(screen.queryByTestId('name-prompt-input')).toBeNull();

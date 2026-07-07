@@ -112,10 +112,15 @@
 
 {#if visible}
   <div class="backup-banner" data-testid="backup-reminder-banner" role="status">
-    <span class="warn">⚠ Your identity hasn't been backed up.</span>
+    <span class="warn"><span class="icon" aria-hidden="true">🔑</span> Your identity hasn't been backed up.</span>
     {#if !showPassphrase}
       <button data-testid="backup-reminder-backup-now" onclick={startBackup}>Back up now</button>
-      <button class="ghost" data-testid="backup-reminder-dismiss" onclick={dismiss}>Dismiss</button>
+      <button
+        class="ghost"
+        data-testid="backup-reminder-dismiss"
+        onclick={dismiss}
+        aria-label="Dismiss"
+        title="Dismiss">✕</button>
     {:else}
       <input
         data-testid="backup-reminder-passphrase"
@@ -139,32 +144,47 @@
 {/if}
 
 <style>
+  /* Commons "clay" banner — one of the two sanctioned clay surfaces. */
   .backup-banner {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     padding: 0.5rem 0.75rem;
-    background: #4a3a1a;
-    color: var(--text-primary);
+    background: var(--gov-clay-soft);
+    color: var(--gov-clay-deep);
     font-size: 0.85rem;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid color-mix(in srgb, var(--gov-clay) 35%, var(--surface-raised));
   }
   .warn { flex: 0 0 auto; }
+  .icon { margin-right: 0.15rem; }
+  /* Primary actions ("Back up now", "Save") are clay-filled. */
   .backup-banner button {
     padding: 0.25rem 0.6rem;
-    border: 1px solid var(--border);
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
+    border: 1px solid var(--gov-clay);
+    background: var(--gov-clay);
+    color: var(--text-bright);
     border-radius: 4px;
     cursor: pointer;
   }
-  .backup-banner button.ghost { background: transparent; }
+  .backup-banner button:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  /* Dismiss is a low-emphasis clay "✕". */
+  .backup-banner button.ghost {
+    background: transparent;
+    border-color: transparent;
+    color: var(--gov-clay-deep);
+    font-size: 1rem;
+    line-height: 1;
+    padding: 0.25rem 0.4rem;
+  }
   .backup-banner input {
     padding: 0.25rem 0.5rem;
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
+    background: var(--surface-raised);
+    color: var(--gov-clay-deep);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 35%, var(--surface-raised));
     border-radius: 4px;
   }
-  .error { color: crimson; }
+  .error { color: var(--fg-error); }
 </style>

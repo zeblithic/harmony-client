@@ -108,19 +108,70 @@
 </Modal>
 
 <style>
+  h3 {
+    color: var(--text-primary);
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 16px;
+  }
+  p {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    line-height: 1.5;
+    margin: 0 0 8px;
+  }
+  .hint { font-size: 0.8rem; color: var(--text-muted); margin: 4px 0 0; }
+  .error { color: var(--danger); font-size: 0.85rem; margin: 8px 0; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-  .primary, .secondary { padding: 6px 12px; border-radius: 4px; border: 1px solid var(--border);
-    cursor: pointer; font-size: 13px; }
+  .primary, .secondary {
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--border-default);
+    cursor: pointer;
+    font-family: var(--font-ui);
+    font-size: 0.875rem;
+  }
   .primary { background: var(--accent); color: var(--text-bright); border-color: var(--accent); }
-  .secondary { background: var(--bg-primary); color: var(--text-primary); }
-  .error { color: var(--danger); font-size: 13px; margin: 8px 0; }
-  .hint { font-size: 12px; color: var(--text-muted); margin: 4px 0; }
-  .peer-list { list-style: none; padding: 0; margin: 0; }
-  .peer-row { display: block; width: 100%; text-align: left; padding: 8px;
-    background: var(--bg-primary); border: 1px solid var(--border); border-radius: 4px;
-    margin-bottom: 4px; cursor: pointer; }
-  .peer-row:hover { background: var(--bg-tertiary); }
-  .sas-display { font-family: var(--font-mono); font-size: 32px; font-weight: 600;
-    text-align: center; padding: 16px; background: var(--bg-primary); border-radius: 8px;
-    letter-spacing: 4px; }
+  .secondary { background: var(--bg-tertiary); color: var(--text-secondary); }
+  .primary:focus-visible, .secondary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .peer-list { list-style: none; padding: 0; margin: 8px 0 0; }
+  .peer-row {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 10px 12px;
+    background: var(--surface-raised);
+    border: 1px solid var(--primary-border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .peer-row:hover {
+    background: color-mix(in srgb, var(--accent) 8%, var(--surface-raised));
+    border-color: var(--accent);
+  }
+  .peer-row:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .sas-display {
+    font-family: var(--font-mono);
+    font-size: 2rem;
+    font-weight: 600;
+    text-align: center;
+    padding: 20px;
+    background: var(--surface-raised);
+    border: 1px solid var(--primary-border);
+    border-radius: 10px;
+    letter-spacing: 0.35em;
+    color: var(--accent);
+  }
 </style>

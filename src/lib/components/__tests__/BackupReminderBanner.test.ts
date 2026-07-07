@@ -100,6 +100,16 @@ describe('BackupReminderBanner visibility (owner-scoped, ZEB-587)', () => {
     await vi.waitFor(() => expect(queryByTestId('backup-reminder-banner')).toBeTruthy());
   });
 
+  // After the clay restyle + tokenization (the amber #4a3a1a literal is gone),
+  // the banner must still render with its primary action + dismiss control.
+  it('renders the clay backup banner with its action + dismiss', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    const { getByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(getByTestId('backup-reminder-banner')).toBeTruthy();
+    expect(getByTestId('backup-reminder-backup-now')).toBeTruthy();
+    expect(getByTestId('backup-reminder-dismiss')).toBeTruthy();
+  });
+
   it('back up now runs export flow and marks owner-scoped backed-up on success', async () => {
     localStorage.setItem(skippedKey(OWNER), 'true');
     issueRecoveryTokenMock.mockResolvedValue('tok');

@@ -23,6 +23,18 @@ beforeEach(() => {
 });
 
 describe('OwnerRestoreWizard (ZEB-454)', () => {
+  // ZEB-610 Commons chrome regression guard: the 24-word entry stays a Commons
+  // field — the `owner-restore-words` textarea still resolves and carries the
+  // `.words` field class the restyle targets. Pins the input-only surface.
+  it('renders the recovery-phrase entry as a Commons textarea field', () => {
+    const { getByTestId } = render(OwnerRestoreWizard, {
+      props: { currentOwnerId: null, onRestored: vi.fn(), onCancel: vi.fn() },
+    });
+    const words = getByTestId('owner-restore-words');
+    expect(words.tagName).toBe('TEXTAREA');
+    expect(words.classList.contains('words')).toBe(true);
+  });
+
   it('fresh install: restores non-destructively (force=false), no typed gate', async () => {
     mockInvoke('aabbccdd0011');
     const onRestored = vi.fn();

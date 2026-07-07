@@ -100,35 +100,57 @@
     z-index: 1000;
   }
   .modal-content {
-    background: var(--bg-secondary);
+    background: var(--surface-raised);
     color: var(--text-primary);
+    font-family: var(--font-ui);
     padding: 1.5rem;
-    border-radius: 8px;
+    border: 1px solid var(--border-default);
+    border-radius: 10px;
+    box-shadow: var(--shadow-e3);
     max-width: 460px;
     width: 90%;
   }
-  .modal-content h2 { margin: 0 0 1rem; font-size: 1.25rem; }
+  .modal-content h2 {
+    margin: 0 0 1rem;
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
   .muted { color: var(--text-secondary); font-size: 0.9rem; margin: 0 0 1rem; line-height: 1.5; }
   label { display: block; margin-bottom: 0.4rem; font-size: 0.9rem; }
   input {
     width: 100%;
     box-sizing: border-box;
-    padding: 0.5rem;
+    padding: 0.5rem 0.6rem;
     background: var(--bg-primary);
     color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
     margin-bottom: 1rem;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  input:focus {
+    /* Keep the focus ring visible under forced-colors / High Contrast,
+       where box-shadow is dropped (Qodo #412; see ForkConfirmDialog #411). */
+    outline: 2px solid transparent;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .actions { display: flex; gap: 0.5rem; }
   .actions button {
     padding: 0.5rem 1rem;
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-default);
     background: var(--bg-tertiary);
     color: var(--text-primary);
-    border-radius: 4px;
+    border-radius: 6px;
+    font-family: var(--font-ui);
     cursor: pointer;
   }
-  .actions button.primary { background: var(--accent); border-color: var(--accent); }
+  .actions button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--text-bright);
+  }
   .actions button:disabled { opacity: 0.5; cursor: default; }
 </style>

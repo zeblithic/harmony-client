@@ -70,4 +70,20 @@ describe('PairingInviter', () => {
     expect(dialog).toHaveAttribute('aria-modal', 'true');
     expect(dialog).toHaveAttribute('aria-labelledby', 'invite-heading');
   });
+
+  // ZEB-610 Commons chrome regression guard: the SAS stays in a mono display
+  // block (`.sas-display`) with the digits rendered as text (whitespace-only
+  // between triplets — no injected separator). Pins the restyle so a later
+  // change can't drop the class the visual card depends on.
+  it('renders the SAS in a mono display block (Commons chrome)', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      kind: 'handshaking',
+      peerSessionId: '00000000-0000-0000-0000-000000000002',
+      sasDigits: '987654',
+    });
+    mockedInvoke.mockResolvedValueOnce(undefined);
+    const { container } = render(PairingInviter, { props: { hostname: 'KRILE' } });
+    expect(await screen.findByText(/987\s*654|987654/)).toBeInTheDocument();
+    expect(container.querySelector('.sas-display')).toBeTruthy();
+  });
 });

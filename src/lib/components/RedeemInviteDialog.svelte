@@ -241,31 +241,38 @@
 <style>
   .dialog-title {
     color: var(--text-primary);
-    font-size: 1.1rem;
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
     margin: 0 0 16px;
   }
   .url-input {
     width: 100%;
     padding: 8px 12px;
     background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
     color: var(--text-primary);
     font-family: var(--font-mono);
     font-size: 0.75rem;
     margin-bottom: 12px;
     box-sizing: border-box;
     resize: vertical;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
   }
   .url-input:focus {
-    outline: 2px solid var(--accent);
-    outline-offset: -1px;
+    /* Keep the focus ring visible under forced-colors / High Contrast,
+       where box-shadow is dropped (Qodo #412; see ForkConfirmDialog #411). */
+    outline: 2px solid transparent;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .error-banner {
     background: var(--bg-tertiary);
     border: 1px solid var(--danger-muted);
     padding: 10px 12px;
-    border-radius: 4px;
+    border-radius: 6px;
     margin-bottom: 12px;
   }
   .error-banner .summary {
@@ -321,28 +328,18 @@
   .cancel-btn {
     background: var(--bg-tertiary);
     color: var(--text-secondary);
-    border: none;
+    border: 1px solid var(--border-default);
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
+    font-family: var(--font-ui);
     font-size: 0.875rem;
   }
-  .confirm-btn {
-    background: var(--accent);
-    color: var(--text-primary);
-    border: none;
-    padding: 8px 16px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 0.875rem;
-  }
-  .confirm-btn:disabled,
   .cancel-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
   }
   .cancel-btn:focus-visible,
-  .confirm-btn:focus-visible,
   .iroh-btn:focus-visible,
   .fallback-btn:focus-visible {
     outline: 2px solid var(--accent);
@@ -350,11 +347,12 @@
   }
   .iroh-btn {
     background: var(--accent);
-    color: var(--text-primary);
-    border: none;
+    color: var(--text-bright);
+    border: 1px solid var(--accent);
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
+    font-family: var(--font-ui);
     font-size: 0.875rem;
   }
   .iroh-btn:disabled {
@@ -364,10 +362,11 @@
   .fallback-btn {
     background: var(--bg-tertiary);
     color: var(--text-secondary);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-default);
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
+    font-family: var(--font-ui);
     font-size: 0.875rem;
   }
   .fallback-btn:disabled {
