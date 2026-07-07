@@ -198,6 +198,54 @@ describe('WelcomeModal hard gate + flow', () => {
   });
 });
 
+describe('Commons chrome (ZEB-610)', () => {
+  // Local render harness mirroring the existing backup-stage tests: mint()
+  // resolves with hex-bearing seed material + a 32-hex ownerId so the redaction
+  // guard below has something real to catch if the restyle ever surfaces it.
+  function renderWelcome() {
+    return render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+  }
+
+  async function advanceToBackupStage() {
+    mintMock.mockResolvedValue({
+      state: {
+        ownerId: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6',
+        ownerDisplayName: 'x',
+        devices: [],
+        canBackUp: true,
+      },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
+    });
+    const utils = renderWelcome();
+    await fireEvent.click(utils.getByTestId('welcome-create-identity'));
+    // wait a tick for the mint promise + stage transition
+    await Promise.resolve();
+    await Promise.resolve();
+    return utils;
+  }
+
+  // The wizard progress rail is present on the welcome stage.
+  it('renders the wizard pip rail on the welcome stage', () => {
+    const { getByTestId } = renderWelcome();
+    expect(getByTestId('wizard-progress')).toBeTruthy();
+  });
+
+  // The backup (Step 3) stage shows the real encrypted-file passphrase field,
+  // NOT a recovery-phrase word grid (honesty ledger §0.1).
+  it('backup stage offers the encrypted-file passphrase, not a phrase grid', async () => {
+    const { getByTestId, queryByText } = await advanceToBackupStage();
+    expect(getByTestId('welcome-backup-passphrase')).toBeTruthy();
+    // No 12/24-word mnemonic grid is rendered.
+    expect(queryByText(/recovery phrase · 12 words/i)).toBeNull();
+  });
+
+  // Redaction invariant still holds after restyle.
+  it('never leaks a 32+ hex run in the DOM after restyle', async () => {
+    const { container } = await advanceToBackupStage();
+    expect(container.innerHTML).not.toMatch(/[0-9a-f]{32,}/i);
+  });
+});
+
 describe('WelcomeModal ZEB-494 — join an existing device', () => {
   it('explain pane offers a "join another of my devices" path alongside mint', () => {
     const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });

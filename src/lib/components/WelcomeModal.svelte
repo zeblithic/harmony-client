@@ -21,6 +21,7 @@
   import PairingJoiner from './PairingJoiner.svelte';
   import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
   import HarmonyMark from './HarmonyMark.svelte';
+  import WizardProgress from './WizardProgress.svelte';
 
   interface Props {
     open: boolean;
@@ -30,6 +31,17 @@
 
   type Stage = 'explain' | 'minting' | 'backup' | 'skip-confirm' | 'joining' | 'restore';
   let stage = $state<Stage>('explain');
+
+  // ZEB-610 (Commons G): the mint hard gate is a 3-step wizard — Welcome →
+  // Create (both sage) → Back up (clay: the one stage where losing the file is
+  // irreversible). The pip rail visualizes that arc; clay lives ONLY on the
+  // backup step's pip + its warning callout.
+  const WIZARD_STEPS = [
+    { label: 'Welcome', accent: 'sage' as const },
+    { label: 'Create', accent: 'sage' as const },
+    { label: 'Back up', accent: 'clay' as const },
+  ];
+  const wizardIndex = $derived(stage === 'backup' ? 2 : stage === 'minting' ? 1 : 0);
   let mintResult = $state<MintIpcResult | null>(null);
   let mintError = $state<string | null>(null);
   let backupPassphrase = $state('');
@@ -198,6 +210,7 @@
         <div class="welcome-header">
           <HarmonyMark size={58} withDot={true} />
           <h2 id="welcome-title">Welcome to Harmony</h2>
+          <p class="tagline">User-owned identity, only on this device.</p>
         </div>
         <p>
           Harmony is a federated, polycentric social fabric built on
@@ -252,6 +265,7 @@
               {stage === 'minting' ? 'Creating your identity…' : 'Create my identity'}
             </button>
             <button
+              class="linklike"
               data-testid="welcome-join-existing"
               onclick={handleJoinExisting}
               disabled={stage === 'minting'}
@@ -259,6 +273,7 @@
               Join another of my devices
             </button>
             <button
+              class="linklike"
               data-testid="welcome-restore-mnemonic"
               onclick={handleRestoreExisting}
               disabled={stage === 'minting'}
@@ -267,12 +282,24 @@
             </button>
           {/if}
         </div>
+        <div class="wizard-rail">
+          <WizardProgress
+            steps={WIZARD_STEPS}
+            activeIndex={wizardIndex}
+            showCounter={stage !== 'explain'}
+          />
+        </div>
       {:else if stage === 'backup'}
         <h2 id="welcome-title">Your identity is ready</h2>
-        <p>
-          Back up your recovery artifact now. Without it, you can't prove this
-          identity is yours if this device is lost.
-        </p>
+        <div class="backup-callout" role="note">
+          <span class="backup-callout-glyph" aria-hidden="true">🔑</span>
+          <p>
+            You hold the <strong>only copy</strong> of this identity. Back up
+            the encrypted recovery file now — without it, you can't prove this
+            identity is yours if this device is lost. There's no central
+            recovery.
+          </p>
+        </div>
         <p class="muted">
           The recovery file is encrypted with your passphrase. Save it
           somewhere safe (USB drive, password-manager attachment, etc.).
@@ -288,6 +315,10 @@
         {#if backupError}
           <p class="error" data-testid="welcome-backup-error">{backupError}</p>
         {/if}
+        <p class="keychain-note">
+          Your identity key is already stored in this device's secure keychain —
+          this file is your portable backup for a lost or replaced device.
+        </p>
         <div class="actions">
           <button
             class="primary"
@@ -297,9 +328,16 @@
           >
             {backupInFlight ? 'Saving…' : 'Save recovery file'}
           </button>
-          <button data-testid="welcome-skip-backup" onclick={handleSkipRequest} disabled={backupInFlight}>
+          <button class="linklike" data-testid="welcome-skip-backup" onclick={handleSkipRequest} disabled={backupInFlight}>
             Skip for now
           </button>
+        </div>
+        <div class="wizard-rail">
+          <WizardProgress
+            steps={WIZARD_STEPS}
+            activeIndex={wizardIndex}
+            showCounter={stage !== 'explain'}
+          />
         </div>
       {:else if stage === 'skip-confirm'}
         <h2 id="welcome-title">Are you sure?</h2>
@@ -344,48 +382,115 @@
     z-index: 1000;
   }
   .modal-content {
-    background: var(--bg-secondary);
+    background: var(--surface-raised);
     color: var(--text-primary);
-    padding: 1.5rem;
-    border-radius: 8px;
+    font-family: var(--font-ui);
+    padding: 1.75rem;
+    border: 1px solid var(--border-default);
+    border-radius: 10px;
+    box-shadow: var(--shadow-e3);
     max-width: 520px;
     width: 90%;
   }
-  .modal-content h2 { margin: 0 0 1rem; font-size: 1.25rem; }
+  .modal-content h2 {
+    margin: 0 0 1rem;
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
   .welcome-header {
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 0.5rem;
-    margin-bottom: 1rem;
+    margin-bottom: 1.25rem;
   }
   .welcome-header h2 { margin: 0; }
+  p.tagline {
+    margin: 0;
+    font-family: var(--font-display);
+    font-style: italic;
+    font-size: 1rem;
+    color: var(--accent);
+  }
   .modal-content p { margin: 0 0 1rem; line-height: 1.5; }
   .muted { color: var(--text-secondary); font-size: 0.9rem; }
+
+  /* Step 3 (backup) — the ONE clay stage. Warning callout: you hold the only
+     copy. Clay tokens appear here and on the backup pip only; sage elsewhere. */
+  .backup-callout {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    padding: 0.75rem 0.85rem;
+    margin: 0 0 1rem;
+    background: var(--gov-clay-soft);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 35%, var(--surface-raised));
+    border-radius: 8px;
+  }
+  .backup-callout-glyph { font-size: 1.15rem; line-height: 1.4; }
+  .backup-callout p {
+    margin: 0;
+    color: var(--gov-clay-deep);
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+  p.keychain-note {
+    margin: 0 0 0.75rem;
+    color: var(--accent);
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+
   label { display: block; margin-bottom: 0.4rem; font-size: 0.9rem; }
   input {
     width: 100%;
     box-sizing: border-box;
-    padding: 0.5rem;
+    padding: 0.5rem 0.6rem;
     background: var(--bg-primary);
     color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
     margin-bottom: 0.5rem;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
   }
-  .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+  input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; align-items: center; }
   .actions button {
     padding: 0.5rem 1rem;
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-default);
     background: var(--bg-tertiary);
     color: var(--text-primary);
-    border-radius: 4px;
+    border-radius: 6px;
+    font-family: var(--font-ui);
     cursor: pointer;
   }
-  .actions button.primary { background: var(--accent); border-color: var(--accent); }
-  .actions button.danger { background: var(--danger); border-color: var(--danger); }
+  .actions button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--text-bright);
+  }
+  .actions button.danger {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--text-bright);
+  }
+  /* Secondary affordances (join / restore / skip) read as sage links, not
+     competing filled buttons. */
+  .actions button.linklike {
+    background: transparent;
+    border-color: transparent;
+    color: var(--accent);
+    padding: 0.5rem 0.5rem;
+  }
+  .actions button.linklike:hover:not(:disabled) { text-decoration: underline; }
   .actions button:disabled { opacity: 0.5; cursor: default; }
-  .error { color: crimson; font-size: 0.85rem; margin: 0 0 0.5rem; }
+  .error { color: var(--fg-error); font-size: 0.85rem; margin: 0 0 0.5rem; }
   .mint-error-summary { margin: 0 0 0.35rem; }
   .mint-error details { color: var(--text-secondary); }
   .mint-error summary { cursor: pointer; }
@@ -397,6 +502,11 @@
     font-size: 0.78rem;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .wizard-rail {
+    display: flex;
+    justify-content: center;
+    margin-top: 1.5rem;
   }
   footer { margin-top: 1rem; font-size: 0.85rem; }
   .version { display: inline-block; margin-right: 1rem; color: var(--text-secondary); opacity: 0.7; }
