@@ -230,6 +230,35 @@ describe('Commons chrome (ZEB-610)', () => {
     expect(getByTestId('wizard-progress')).toBeTruthy();
   });
 
+  // The rail also shows on the middle (minting) stage with the step-2 counter —
+  // the design requires it on all three stages (explain/minting/backup); this
+  // closes the coverage gap between the welcome and backup cases (CodeRabbit #412).
+  it('shows the wizard rail with the step-2 counter while minting', async () => {
+    let resolveMint!: (value: unknown) => void;
+    mintMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveMint = resolve;
+      }),
+    );
+    const { getByTestId, queryByText } = renderWelcome();
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve();
+    // Mint promise still pending → stage is 'minting': rail present, step 2 of 3.
+    expect(getByTestId('wizard-progress')).toBeTruthy();
+    expect(queryByText('Step 2 of 3')).toBeTruthy();
+    // Resolve so the pending mint leaves no dangling promise.
+    resolveMint({
+      state: {
+        ownerId: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6',
+        ownerDisplayName: 'x',
+        devices: [],
+        canBackUp: true,
+      },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
+    });
+    await Promise.resolve();
+  });
+
   // The backup (Step 3) stage shows the real encrypted-file passphrase field,
   // NOT a recovery-phrase word grid (honesty ledger §0.1).
   it('backup stage offers the encrypted-file passphrase, not a phrase grid', async () => {

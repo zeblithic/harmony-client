@@ -131,7 +131,9 @@
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
   }
   input:focus {
-    outline: none;
+    /* Keep the focus ring visible under forced-colors / High Contrast,
+       where box-shadow is dropped (Qodo #412; see ForkConfirmDialog #411). */
+    outline: 2px solid transparent;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
