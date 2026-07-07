@@ -14,12 +14,14 @@
   {#if showCounter}
     <span class="wizard-progress-counter">Step {activeIndex + 1} of {steps.length}</span>
   {/if}
-  <ol class="wizard-progress-pips" aria-hidden="true">
+  <ol class="wizard-progress-pips" aria-label="Progress">
     {#each steps as step, i (i)}
       <li
         class="wizard-progress-pip"
         class:is-active={i === activeIndex}
         class:accent-clay={step.accent === 'clay'}
+        aria-label={step.label}
+        aria-current={i === activeIndex ? 'step' : undefined}
       ></li>
     {/each}
   </ol>
