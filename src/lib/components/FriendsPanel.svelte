@@ -1228,6 +1228,7 @@
     flex-shrink: 0;
     font-size: 12px;
     padding: 4px 10px;
+    font-family: var(--font-ui);
   }
 
   .nickname-input {
@@ -1235,7 +1236,7 @@
     min-width: 90px;
     font-size: 12px;
     padding: 4px 6px;
-    border-radius: 4px;
+    border-radius: 5px;
     border: 1px solid var(--border);
     background: var(--bg-secondary);
     color: var(--text-primary);
@@ -1271,11 +1272,12 @@
   .already-friend-badge {
     flex-shrink: 0;
     font-size: 10px;
-    padding: 1px 6px;
-    border-radius: 8px;
+    padding: 1px 8px;
+    border-radius: 20px;
     background: var(--bg-tertiary);
     color: var(--text-secondary);
     border: 1px solid var(--border);
+    font-family: var(--font-ui);
   }
 
   .friend-name {
@@ -1315,11 +1317,12 @@
     flex-shrink: 0;
     font-size: 12px;
     padding: 4px 10px;
-    border-radius: 4px;
+    border-radius: 5px;
     border: 1px solid var(--border);
     background: transparent;
     color: var(--text-secondary);
     cursor: pointer;
+    font-family: var(--font-ui);
   }
 
   .unfriend-btn:hover:not(:disabled) {
@@ -1339,11 +1342,12 @@
   .primary-btn {
     font-size: 13px;
     padding: 6px 12px;
-    border-radius: 4px;
+    border-radius: 5px;
     border: 1px solid var(--accent);
     background: var(--accent);
     color: var(--text-bright);
     cursor: pointer;
+    font-family: var(--font-ui);
   }
 
   .primary-btn:disabled {
@@ -1354,11 +1358,12 @@
   .secondary-btn {
     font-size: 13px;
     padding: 6px 12px;
-    border-radius: 4px;
+    border-radius: 5px;
     border: 1px solid var(--border);
     background: transparent;
     color: var(--text-primary);
     cursor: pointer;
+    font-family: var(--font-ui);
   }
 
   .generated-row,
@@ -1373,7 +1378,7 @@
     min-width: 0;
     font-size: 12px;
     padding: 6px 8px;
-    border-radius: 4px;
+    border-radius: 5px;
     border: 1px solid var(--border);
     background: var(--bg-tertiary);
     color: var(--text-primary);
@@ -1449,11 +1454,12 @@
     flex-shrink: 0;
     font-size: 12px;
     padding: 4px 10px;
-    border-radius: 4px;
+    border-radius: 5px;
     border: 1px solid var(--accent);
     background: transparent;
     color: var(--accent);
     cursor: pointer;
+    font-family: var(--font-ui);
   }
 
   .accept-btn:hover:not(:disabled) {
