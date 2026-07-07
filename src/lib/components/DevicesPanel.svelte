@@ -360,8 +360,12 @@
       <div class="owner-header">
         <div class="label">OWNER IDENTITY</div>
         <div class="owner-row">
-          <div>
-            <div class="owner-name">{state.ownerDisplayName}</div>
+          <div class="owner-avatar" aria-hidden="true">{deviceInitial(state.ownerDisplayName)}</div>
+          <div class="owner-identity">
+            <div class="owner-name-row">
+              <span class="owner-name">{state.ownerDisplayName}</span>
+              <span class="ss-badge">● self-sovereign</span>
+            </div>
             <div class="owner-fingerprint">{formatOwnerFingerprint(state.ownerId)}</div>
           </div>
           <button
@@ -485,7 +489,7 @@
       canCancel={!backupDialogInFlight && !backupInFlight}
       ariaLabelledby="backup-modal-heading"
     >
-      <h3 id="backup-modal-heading">Back up owner identity</h3>
+      <h3 class="modal-title" id="backup-modal-heading">Back up owner identity</h3>
       {#if backupSavedPath}
         <p>Recovery file written to <code>{backupSavedPath}</code>. Keep it somewhere safe.</p>
         <button class="primary" onclick={closeBackup}>Done</button>
@@ -554,7 +558,7 @@
       canCancel={!mintInFlight}
       ariaLabelledby="modal-heading"
     >
-      <h3 id="modal-heading">Create your owner identity</h3>
+      <h3 class="modal-title" id="modal-heading">Create your owner identity</h3>
       <p>
         This will create your owner identity. This device will be bound as the first device.
         You'll receive a recovery file to back up — you can do this immediately or later.
@@ -579,12 +583,15 @@
     padding: 16px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 10px;
     margin-bottom: 16px;
   }
   .devices-panel h2 {
     margin: 0 0 12px;
-    font-size: 14px;
+    font-family: var(--font-display);
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
     color: var(--text-primary);
   }
   .empty .explainer {
@@ -595,9 +602,10 @@
   .empty-actions { display: flex; flex-direction: column; gap: 8px; }
   .primary, .secondary {
     padding: 6px 12px;
-    border-radius: 4px;
+    border-radius: 8px;
     border: 1px solid var(--border);
     cursor: pointer;
+    font-family: var(--font-ui);
     font-size: 13px;
   }
   .primary {
@@ -605,13 +613,32 @@
     color: var(--text-bright);
     border-color: var(--accent);
   }
+  .primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
   .secondary {
-    background: var(--bg-primary);
+    background: var(--surface-raised);
     color: var(--text-primary);
+  }
+  .secondary:hover:not(:disabled) {
+    background: var(--bg-tertiary);
   }
   .primary:disabled, .secondary:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  .primary:focus-visible, .secondary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .modal-title {
+    margin: 0 0 12px;
+    font-family: var(--font-display);
+    font-size: 1.3rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text-primary);
   }
   .modal-actions {
     display: flex;
@@ -636,28 +663,73 @@
     letter-spacing: 0.5px;
     margin-bottom: 6px;
   }
+  /* ① Owner identity → Commons card */
   .owner-header {
-    padding-bottom: 14px;
-    border-bottom: 1px solid var(--border);
+    padding: 14px;
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow-e1);
     margin-bottom: 14px;
   }
   .owner-row {
     display: flex;
-    justify-content: space-between;
     align-items: center;
     gap: 12px;
   }
+  .owner-avatar {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: var(--accent);
+    color: var(--text-bright);
+    font-family: var(--font-display);
+    font-size: 18px;
+    font-weight: 600;
+  }
+  .owner-identity {
+    flex: 1;
+    min-width: 0;
+  }
+  .owner-name-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
   .owner-name {
+    font-family: var(--font-display);
+    font-size: 1.05rem;
     font-weight: 600;
     color: var(--text-primary);
+  }
+  /* "● self-sovereign" — RoleBadge grammar (mono 600 uppercase pill) */
+  .ss-badge {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 10px;
+    line-height: 1.4;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 20px;
+    white-space: nowrap;
+    color: var(--primary-deep);
+    background: var(--primary-soft);
   }
   .owner-fingerprint {
     font-size: 12px;
     color: var(--text-muted);
     font-family: var(--font-mono);
+    margin-top: 2px;
   }
   .restore-link {
-    margin-top: 8px;
+    margin-top: 12px;
     padding: 0;
     background: none;
     border: none;
@@ -668,11 +740,10 @@
     text-align: left;
   }
   .restore-link:hover {
-    opacity: 0.85;
+    color: var(--accent-hover);
   }
+  /* ② Device rows → white cards */
   .devices-list {
-    padding-bottom: 14px;
-    border-bottom: 1px solid var(--border);
     margin-bottom: 14px;
   }
   .device-row {
@@ -680,15 +751,20 @@
     align-items: center;
     gap: 12px;
     padding: 10px;
-    background: var(--bg-primary);
-    border-radius: 4px;
+    background: var(--surface-raised);
+    border: 1px solid var(--line-soft);
+    border-radius: 8px;
+  }
+  .device-row + .device-row {
+    margin-top: 8px;
   }
   .device-icon {
     width: 32px;
     height: 32px;
-    border-radius: 6px;
-    background: var(--accent);
-    color: var(--text-bright);
+    border-radius: 8px;
+    /* Trust-blue rejection: neutral tertiary chip, never a cool blue. */
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -710,9 +786,15 @@
     font-weight: 600;
     color: var(--text-primary);
   }
+  /* "this device" → sage pill */
   .this-device-marker {
-    font-size: 11px;
-    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    padding: 2px 8px;
+    border-radius: 20px;
+    color: var(--primary-deep);
+    background: var(--primary-soft);
   }
   .device-secondary {
     font-size: 12px;
@@ -730,13 +812,16 @@
     line-height: 1.5;
     margin: 0;
   }
+  .add-another-footer .primary {
+    margin-bottom: 8px;
+  }
   .rename-btn {
     font-size: 11px;
     padding: 4px 8px;
     border: 1px solid var(--border);
-    background: var(--bg-primary);
+    background: var(--surface-raised);
     color: var(--text-primary);
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
   }
   .rename-btn:hover {

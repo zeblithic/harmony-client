@@ -117,6 +117,31 @@ describe('DevicesPanel — populated state', () => {
     expect(screen.getByText(/back up owner identity/i)).toBeInTheDocument();
   });
 
+  it('shows a self-sovereign badge but no rotation/revoke/danger chrome', async () => {
+    // Honesty ledger §0.5: the self-sovereign badge is honest (always true for
+    // the owner viewing this panel). Rotation / revoke / danger-zone chrome
+    // must NOT be invented — there is no backing IPC for any of them.
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+      ownerDisplayName: 'zeblith',
+      devices: [{
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this device',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    render(DevicesPanel);
+    await screen.findByText('zeblith');
+    expect(screen.getByText(/self-sovereign/i)).toBeTruthy();
+    expect(screen.queryByText(/rotate keys/i)).toBeNull();
+    expect(screen.queryByText(/^revoke$/i)).toBeNull();
+    expect(screen.queryByText(/delete this identity/i)).toBeNull();
+  });
+
   it('renders device row with name, this-device marker, trust badge, fingerprint, enrolled date', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1c8239b7dd809abcdef0123456789',
