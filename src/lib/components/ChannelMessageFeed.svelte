@@ -1263,7 +1263,8 @@
     gap: 4px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    /* ZEB-661 (#8): round count-affordance (20px), not the 10px pill-by-coincidence. */
+    border-radius: 20px;
     padding: 1px 8px;
     font-size: 0.8rem;
     line-height: 1.4;

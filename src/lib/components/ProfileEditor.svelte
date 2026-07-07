@@ -509,19 +509,21 @@
 </section>
 
 <style>
+  /* ZEB-661 (#6): flat inline section (drop the box) — ProfileEditor renders
+     inside the Settings tabbed panel, not a modal; a card here would nest a card.
+     Matches FriendsPanel's .friends-section. */
   .profile-editor {
     display: flex;
     flex-direction: column;
     gap: 16px;
     padding: 16px;
-    background: var(--bg-secondary);
-    border-radius: 8px;
   }
 
   .section-title {
     margin: 0;
     font-size: 14px;
     font-weight: 600;
+    font-family: var(--font-display);
     color: var(--text-primary);
   }
 
