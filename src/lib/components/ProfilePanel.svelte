@@ -275,6 +275,7 @@
     font-size: 18px;
     font-weight: 700;
     color: var(--text-primary);
+    font-family: var(--font-display);
   }
 
   .panel-status {

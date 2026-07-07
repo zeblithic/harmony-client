@@ -162,7 +162,7 @@
   }
 
   .tab-btn {
-    padding: 6px 16px;
+    padding: 8px 16px;
     border: none;
     border-radius: 4px;
     background: var(--bg-tertiary);
@@ -187,7 +187,7 @@
   .level-selector select {
     padding: 4px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--bg-tertiary);
     color: var(--text-primary);
     font-size: 0.8125rem;
@@ -204,7 +204,7 @@
   .express-selector select {
     padding: 4px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--bg-tertiary);
     color: var(--text-primary);
     font-size: 0.8125rem;

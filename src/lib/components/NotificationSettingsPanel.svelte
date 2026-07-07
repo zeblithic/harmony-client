@@ -390,6 +390,7 @@
     font-size: 14px;
     font-weight: 600;
     color: var(--text-primary);
+    font-family: var(--font-display);
   }
 
   .close-btn {
@@ -457,7 +458,7 @@
   .policy-row select {
     padding: 4px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--bg-primary);
     color: var(--text-primary);
     font-size: 12px;

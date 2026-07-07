@@ -67,7 +67,7 @@
     gap: 12px;
     justify-content: center;
     padding: 4px 8px;
-    border-radius: 6px;
+    border-radius: 5px;
     border: 2px solid transparent;
     transition: border-color 0.15s ease;
   }
@@ -90,8 +90,8 @@
     align-items: center;
     line-height: 1.1;
     letter-spacing: 0;
-    padding: 4px 6px;
-    border-radius: 4px;
+    padding: 4px 8px;
+    border-radius: 3px;
     transition: background 0.15s ease;
   }
 

@@ -75,7 +75,7 @@
     font-size: 18px;
     cursor: pointer;
     padding: 2px 6px;
-    border-radius: 4px;
+    border-radius: 5px;
   }
 
   .thread-close:hover {

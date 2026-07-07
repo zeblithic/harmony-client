@@ -1,14 +1,9 @@
 {
   "lib/components/DiagnosticExportModal.svelte": 1,
-  "lib/components/DmCreateDialog.svelte": 1,
   "lib/components/FileActions.svelte": 1,
-  "lib/components/FriendsPanel.svelte": 1,
   "lib/components/LibraryDirectoryBrowser.svelte": 3,
-  "lib/components/MailCompose.svelte": 1,
   "lib/components/MediaCard.svelte": 1,
   "lib/components/MintLedger.svelte": 1,
-  "lib/components/NetworkHealthView.svelte": 2,
-  "lib/components/PendingJoinsPanel.svelte": 1,
   "lib/components/VinePlayer.svelte": 3,
   "lib/components/VinePublishDialog.svelte": 1
 }

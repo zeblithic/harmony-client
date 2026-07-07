@@ -109,7 +109,7 @@
     background: var(--accent);
     color: var(--text-bright);
     padding: 4px 14px;
-    border-radius: 4px;
+    border-radius: 5px;
     font-size: 0.85rem;
     cursor: pointer;
     flex-shrink: 0;

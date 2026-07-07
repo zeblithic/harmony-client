@@ -226,7 +226,7 @@
     margin: 8px 0;
   }
   .counter.at-cap {
-    color: #f99;
+    color: var(--gov-clay);
   }
   .counter .hint {
     display: block;

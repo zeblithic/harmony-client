@@ -247,6 +247,7 @@
     align-items: center;
     gap: 6px;
     color: var(--text-primary);
+    font-family: var(--font-display);
   }
 
   .status-dot {
@@ -262,7 +263,7 @@
     margin-top: 2px;
     padding: 2px 8px;
     border: 1px solid var(--bg-tertiary);
-    border-radius: 10px;
+    border-radius: 3px;
     background: var(--bg-secondary);
     color: var(--text-secondary);
     font-family: var(--font-mono);
@@ -349,7 +350,7 @@
     width: 100%;
     padding: 6px 10px;
     border: none;
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--bg-secondary);
     color: var(--text-primary);
     font: inherit;

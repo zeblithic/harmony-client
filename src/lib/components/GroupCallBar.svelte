@@ -187,6 +187,7 @@
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
+    font-family: var(--font-mono);
   }
   .reconnecting {
     font-size: 0.78rem;
@@ -265,7 +266,7 @@
     background: var(--bg-tertiary);
     color: var(--text-secondary);
     padding: 4px 12px;
-    border-radius: 4px;
+    border-radius: 5px;
     font-size: 0.8rem;
     cursor: pointer;
   }
@@ -288,7 +289,7 @@
     background: var(--danger);
     color: var(--text-bright);
     padding: 4px 14px;
-    border-radius: 4px;
+    border-radius: 5px;
     font-size: 0.85rem;
     cursor: pointer;
     flex-shrink: 0;

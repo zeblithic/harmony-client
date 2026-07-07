@@ -219,6 +219,7 @@
     font-size: 14px;
     font-weight: 600;
     color: var(--text-primary);
+    font-family: var(--font-display);
   }
 
   .close-btn {

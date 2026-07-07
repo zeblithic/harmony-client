@@ -102,6 +102,7 @@
     font-size: 0.8rem;
     font-weight: 600;
     color: var(--text-primary);
+    font-family: var(--font-display);
   }
 
   .header-icon {
@@ -134,7 +135,7 @@
     align-items: center;
     gap: 8px;
     padding: 4px 8px;
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--buddy-bg);
   }
 
@@ -204,7 +205,7 @@
     width: 100%;
     padding: 4px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--bg-tertiary);
     color: var(--text-primary);
     font-size: 0.8rem;

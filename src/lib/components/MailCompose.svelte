@@ -164,7 +164,7 @@
   .field input, .field textarea {
     padding: 0.5rem 0.625rem;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--surface);
     color: var(--text-primary);
     font-size: 0.875rem;
@@ -187,7 +187,7 @@
   }
 
   .error-msg {
-    color: #e55;
+    color: var(--mail-error-text);
     font-size: 0.8125rem;
   }
 

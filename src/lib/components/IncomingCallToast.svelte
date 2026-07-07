@@ -56,8 +56,8 @@
     padding: 0.75rem 1rem;
     background: var(--toast-bg);
     color: var(--toast-fg);
-    border-radius: 6px;
-    box-shadow: 0 4px 12px var(--shadow-soft);
+    border-radius: 8px;
+    box-shadow: var(--shadow-e3);
     min-width: 280px;
     max-width: 380px;
     font-size: 0.9rem;

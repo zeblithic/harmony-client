@@ -68,7 +68,7 @@
   }
 
   .quota-fill.warning {
-    background: var(--danger-muted);
+    background: var(--gov-clay);
   }
 
   .quota-text {
