@@ -29,6 +29,24 @@ describe('RedeemInviteDialog', () => {
     expect(getByTestId('iroh-redeem-btn')).toBeTruthy();
   });
 
+  // ZEB-610 (Commons G) honesty ledger §0.4: the redeem surface must never
+  // render fabricated member/channel counts — an un-joined community's roster
+  // and channel list are unknowable to the redeemer. This dialog carries no
+  // community/inviter props (it is a URL-paste redeem form), so this is a
+  // standing regression guard against a future "142 members · 6 channels"
+  // preview being bolted on with invented numbers.
+  it('does not render invented member or channel counts', () => {
+    const { queryByText } = render(RedeemInviteDialog, {
+      props: {
+        onSubmit: vi.fn(),
+        onCancel: vi.fn(),
+        initialUrl: 'harmony://invite/v1?ci=abc',
+      },
+    });
+    expect(queryByText(/\d+\s+members/i)).toBeNull();
+    expect(queryByText(/\d+\s+channels/i)).toBeNull();
+  });
+
   it('Redeem button disabled until URL contains harmony://invite/', async () => {
     const { getByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
       props: { onSubmit: vi.fn(), onCancel: vi.fn() },

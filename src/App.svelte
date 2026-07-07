@@ -3967,18 +3967,20 @@
     box-shadow: -4px 0 16px var(--shadow-mid);
   }
 
-  /* ZEB-254: transient join-status banner (pending vs joined). */
+  /* ZEB-254: transient join-status banner (pending vs joined).
+     ZEB-610 (Commons G): sage / --primary-soft tint with e2 elevation. */
   .redeem-status-banner {
     position: fixed;
     bottom: 20px;
     left: 50%;
     transform: translateX(-50%);
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: 6px;
+    background: var(--primary-soft);
+    border: 1px solid var(--primary-border);
+    border-radius: 8px;
     padding: 10px 18px;
-    color: var(--text-primary);
+    color: var(--primary-deep);
     font-size: 0.875rem;
+    box-shadow: var(--shadow-e2);
     z-index: 1000;
     pointer-events: none;
     /* R3 (M2): allow wrapping so long community names don't overflow the
@@ -4004,16 +4006,27 @@
     height: 100vh;
   }
 
-  /* ZEB-338 / PR #169: startup-error overlay (start_node failed). */
+  /* ZEB-338 / PR #169: startup-error overlay (start_node failed).
+     ZEB-610 (Commons G): Commons chrome — overrides the shared .modal-content
+     base (surface-raised card, border, radius 10, e3 elevation) without
+     touching that shared rule; sage retry, danger detail line preserved. */
   .startup-error-modal {
+    background: var(--surface-raised);
     color: var(--text-primary);
+    font-family: var(--font-ui);
     padding: 1.5rem;
+    border: 1px solid var(--border-default);
+    border-radius: 10px;
+    box-shadow: var(--shadow-e3);
     max-width: 520px;
     width: 90%;
   }
   .startup-error-modal h2 {
     margin: 0 0 1rem;
-    font-size: 1.25rem;
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
   }
   .startup-error-modal p {
     margin: 0 0 1rem;
@@ -4032,15 +4045,17 @@
   }
   .startup-error-actions button {
     padding: 0.5rem 1rem;
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-default);
     background: var(--bg-tertiary);
     color: var(--text-primary);
-    border-radius: 4px;
+    border-radius: 6px;
+    font-family: var(--font-ui);
     cursor: pointer;
   }
   .startup-error-actions button.primary {
     background: var(--accent);
     border-color: var(--accent);
+    color: var(--text-bright);
   }
 
 </style>
