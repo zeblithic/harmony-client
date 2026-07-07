@@ -25,8 +25,8 @@ blocks Practice entirely (not chosen, broken) is red. A metric at 88% (elevated,
 clay; at 97% (failure-adjacent) it is red.
 
 Five decisions (#1, #2, #5, #9, #10) fall out of this ladder — though **#1 and #9 turn out to
-serve only mock-data surfaces and are recorded-but-deferred** (§3, §4); the other five (#3, #4,
-#6, #7, #8) are pure form/anatomy calls.
+serve only mock-data surfaces and are recorded-but-deferred** (§3, §4); the other five
+(#3, #4, #6, #7, #8) are pure form/anatomy calls.
 
 ## 2. Guardrails (bind every change below)
 
@@ -176,10 +176,10 @@ its test if it asserts the dot.
 FriendsPanel's `.friends-section`.
 
 **Rationale:** ProfileEditor renders as one section **inside** the Settings tabbed panel
-(`SettingsPanel.svelte:148`), not a standalone modal. Its current `background: var(--bg-secondary)
-+ border-radius: 8px` (`ProfileEditor.svelte:512`) reads as a half-card; promoting it to a real
-elevated card would nest a card inside the Settings panel. Flat is the coherent choice for a
-sub-section.
+(`SettingsPanel.svelte:148`), not a standalone modal. Its current
+`background: var(--bg-secondary) + border-radius: 8px` (`ProfileEditor.svelte:512`) reads as a
+half-card; promoting it to a real elevated card would nest a card inside the Settings panel. Flat
+is the coherent choice for a sub-section.
 
 **Change:** `ProfileEditor.svelte` — `.profile-editor` drops `background` and `border-radius`
 (keep `gap`/`padding`); `.section-title` (`h3`) gains `font-family: var(--font-display)`.
