@@ -200,8 +200,11 @@
 <style>
   .title {
     color: var(--text-primary);
-    font-size: 1rem;
-    margin: 0 0 12px;
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 16px;
   }
   .desc {
     color: var(--text-secondary);
@@ -214,12 +217,18 @@
     box-sizing: border-box;
     padding: 8px 12px;
     background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
     color: var(--text-primary);
     font-family: var(--font-mono);
     font-size: 0.875rem;
     resize: vertical;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .words:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .field-label {
     display: block;
@@ -247,7 +256,7 @@
     color: var(--text-primary);
     background: color-mix(in srgb, var(--danger-muted) 12%, transparent);
     border: 1px solid var(--danger-muted);
-    border-radius: 4px;
+    border-radius: 6px;
     padding: 8px 12px;
     font-size: 0.85rem;
     margin: 0 0 12px;
@@ -262,12 +271,18 @@
     box-sizing: border-box;
     padding: 8px 12px;
     background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
     color: var(--text-primary);
     font-family: var(--font-mono);
     font-size: 0.875rem;
     margin-bottom: 12px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .typed-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .error {
     color: var(--fg-error);
@@ -280,19 +295,25 @@
   }
   .actions button {
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
+    font-family: var(--font-ui);
     font-size: 0.875rem;
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-default);
+  }
+  .actions button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
   }
   .actions .primary {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--text-bright);
     border-color: var(--accent);
   }
   .actions .primary.danger {
     background: var(--danger-muted);
     border-color: var(--danger-muted);
+    color: var(--text-bright);
   }
   .actions .primary:disabled {
     opacity: 0.4;

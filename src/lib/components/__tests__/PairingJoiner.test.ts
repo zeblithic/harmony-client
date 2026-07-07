@@ -79,6 +79,20 @@ describe('PairingJoiner', () => {
     expect(invoke).not.toHaveBeenCalledWith('cancel_pairing');
   });
 
+  // ZEB-610 Commons chrome regression guard: the SAS stays in a mono display
+  // block (`.sas-display`), digits rendered as text with whitespace-only
+  // separation between triplets. Pins the restyle.
+  it('renders the SAS in a mono display block (Commons chrome)', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      kind: 'handshaking',
+      peerSessionId: '00000000-0000-0000-0000-000000000001',
+      sasDigits: '012845',
+    });
+    const { container } = render(PairingJoiner);
+    expect(await screen.findByText(/012\s*845|012845/)).toBeInTheDocument();
+    expect(container.querySelector('.sas-display')).toBeTruthy();
+  });
+
   // Guard the inverse: Escape in a non-terminal state keeps cancel semantics
   // (backend cancel IPC + onClose), and never fires onComplete.
   it('Escape in a non-terminal state still cancels via onClose', async () => {
