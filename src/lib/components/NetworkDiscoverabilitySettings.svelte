@@ -27,6 +27,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import type { RelayHealth } from '../types/network-health';
   import NetworkStatusPill from './NetworkStatusPill.svelte';
+  import { relayStatusLabel } from '../relay-status-label';
 
   // Current persisted value — loaded on mount, updated on toggle.
   let enabled = $state(false);
@@ -174,12 +175,6 @@
     } finally {
       relayPending = false;
     }
-  }
-
-  function relayStateLabel(relay: RelayHealth): string {
-    if (relay.state.kind === 'healthy') return 'Healthy';
-    const secsLeft = Math.max(0, Math.ceil((relay.state.untilMs - now) / 1000));
-    return `Cooling down (${secsLeft}s)`;
   }
 
   onMount(async () => {
@@ -380,7 +375,7 @@
         <code class="relay-url" data-testid="relay-url">{relay.url}</code>
         <NetworkStatusPill
           variant={relay.state.kind === 'healthy' ? 'healthy' : 'cooling'}
-          label={relayStateLabel(relay)}
+          label={relayStatusLabel(relay, now)}
           data-testid="relay-badge"
         />
         <button

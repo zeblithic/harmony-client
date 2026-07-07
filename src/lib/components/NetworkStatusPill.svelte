@@ -18,14 +18,19 @@
   let {
     variant,
     label,
+    class: className,
     ...rest
   }: {
     variant: NetworkStatusVariant;
     label: string;
   } & HTMLAttributes<HTMLSpanElement> = $props();
+
+  // Merge (not override) a caller-supplied class: `class` is pulled out of
+  // `rest` so the `{...rest}` spread can't clobber the base + variant classes.
+  let classAttr = $derived(['net-pill', variant, className].filter(Boolean).join(' '));
 </script>
 
-<span class="net-pill {variant}" {...rest}>{label}</span>
+<span class={classAttr} {...rest}>{label}</span>
 
 <style>
   .net-pill {

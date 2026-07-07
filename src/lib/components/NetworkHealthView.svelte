@@ -26,8 +26,10 @@
     SelfTestReport,
     PeerHealth,
     RelayOutcome,
-    RelayHealth,
   } from '../types/network-health';
+  import { relayStatusLabel } from '../relay-status-label';
+  import DiagnosticExportModal from './DiagnosticExportModal.svelte';
+  import NetworkStatusPill from './NetworkStatusPill.svelte';
 
   function relayOutcomeLabel(outcome: RelayOutcome): string {
     if (outcome.kind === 'timeout') return 'Last error: timeout';
@@ -35,17 +37,6 @@
     if (outcome.kind === 'http') return `Last error: http ${outcome.status}`;
     return '';
   }
-
-  // ZEB-651: relay badge label — 'Healthy' or 'Cooling down (Ns)'. Mirrors the
-  // string NetworkDiscoverabilitySettings.relayStateLabel() produces so the two
-  // shared-NetworkStatusPill consumers read identically.
-  function relayBadgeLabel(relay: RelayHealth, nowMs: number): string {
-    if (relay.state.kind === 'healthy') return 'Healthy';
-    const secsLeft = Math.max(0, Math.ceil((relay.state.untilMs - nowMs) / 1000));
-    return `Cooling down (${secsLeft}s)`;
-  }
-  import DiagnosticExportModal from './DiagnosticExportModal.svelte';
-  import NetworkStatusPill from './NetworkStatusPill.svelte';
 
   let snap = $state<NetworkHealthSnapshot | null>(null);
   let report = $state<SelfTestReport | null>(null);
@@ -429,7 +420,7 @@
               <code>{relay.url}</code>
               <NetworkStatusPill
                 variant={relay.state.kind === 'healthy' ? 'healthy' : 'cooling'}
-                label={relayBadgeLabel(relay, now)}
+                label={relayStatusLabel(relay, now)}
                 data-testid="nh-relay-badge"
               />
               {#if relay.lastOutcome && relay.lastOutcome.kind !== 'success'}

@@ -33,4 +33,15 @@ describe('NetworkStatusPill', () => {
     expect(pill.textContent).toContain('⚠ incompatible');
     expect(pill.classList.contains('incompat')).toBe(true);
   });
+
+  it('merges a caller-provided class without dropping the base/variant classes', () => {
+    const { container } = render(NetworkStatusPill, {
+      props: { variant: 'healthy', label: 'Healthy', class: 'extra-class' },
+    });
+    const pill = container.querySelector('.net-pill');
+    expect(pill).toBeTruthy();
+    expect(pill!.classList.contains('net-pill')).toBe(true);
+    expect(pill!.classList.contains('healthy')).toBe(true);
+    expect(pill!.classList.contains('extra-class')).toBe(true);
+  });
 });
