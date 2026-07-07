@@ -26,6 +26,7 @@
   } from '../connectivity-adapter';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import type { RelayHealth } from '../types/network-health';
+  import NetworkStatusPill from './NetworkStatusPill.svelte';
 
   // Current persisted value — loaded on mount, updated on toggle.
   let enabled = $state(false);
@@ -377,12 +378,11 @@
     {#each relays as relay (relay.url)}
       <li class="relay-row" data-testid="relay-row">
         <code class="relay-url" data-testid="relay-url">{relay.url}</code>
-        <span
-          class="relay-badge {relay.state.kind === 'healthy' ? 'badge-healthy' : 'badge-cooling'}"
+        <NetworkStatusPill
+          variant={relay.state.kind === 'healthy' ? 'healthy' : 'cooling'}
+          label={relayStateLabel(relay)}
           data-testid="relay-badge"
-        >
-          {relayStateLabel(relay)}
-        </span>
+        />
         <button
           class="relay-remove"
           data-testid="relay-remove"
@@ -554,24 +554,6 @@
     font-size: 11px;
     flex: 1;
     word-break: break-all;
-  }
-
-  .relay-badge {
-    font-size: 10px;
-    font-weight: 600;
-    padding: 1px 5px;
-    border-radius: 3px;
-    white-space: nowrap;
-  }
-
-  .badge-healthy {
-    background: var(--net-ok-bg);
-    color: var(--net-ok-fg);
-  }
-
-  .badge-cooling {
-    background: var(--net-warn-bg);
-    color: var(--net-warn-fg);
   }
 
   .relay-remove {
