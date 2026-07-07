@@ -26,6 +26,7 @@
     SelfTestReport,
     PeerHealth,
     RelayOutcome,
+    RelayHealth,
   } from '../types/network-health';
 
   function relayOutcomeLabel(outcome: RelayOutcome): string {
@@ -34,7 +35,17 @@
     if (outcome.kind === 'http') return `Last error: http ${outcome.status}`;
     return '';
   }
+
+  // ZEB-651: relay badge label — 'Healthy' or 'Cooling down (Ns)'. Mirrors the
+  // string NetworkDiscoverabilitySettings.relayStateLabel() produces so the two
+  // shared-NetworkStatusPill consumers read identically.
+  function relayBadgeLabel(relay: RelayHealth, nowMs: number): string {
+    if (relay.state.kind === 'healthy') return 'Healthy';
+    const secsLeft = Math.max(0, Math.ceil((relay.state.untilMs - nowMs) / 1000));
+    return `Cooling down (${secsLeft}s)`;
+  }
   import DiagnosticExportModal from './DiagnosticExportModal.svelte';
+  import NetworkStatusPill from './NetworkStatusPill.svelte';
 
   let snap = $state<NetworkHealthSnapshot | null>(null);
   let report = $state<SelfTestReport | null>(null);
@@ -287,12 +298,13 @@
                   <!-- ZEB-623: loud per-peer signal that the tunnel-v2 hello
                        negotiation could not agree a compatible protocol. Scaled-
                        down sibling of the transport-disabled role="alert" banner. -->
-                  <span
-                    class="peer-incompat"
+                  <NetworkStatusPill
+                    variant="incompat"
+                    label="⚠ incompatible"
                     role="alert"
                     title={p.protocolIncompatReason}
-                    data-testid="nh-peer-incompat">⚠ incompatible</span
-                  >
+                    data-testid="nh-peer-incompat"
+                  />
                 {/if}
                 {#if p.rttMs !== null}<span>{p.rttMs}ms</span>{/if}
                 {#if p.lastSeenMs !== null}
@@ -415,16 +427,11 @@
           {#each snap.pkarrStatus.relays ?? [] as relay (relay.url)}
             <li data-testid="nh-relay-row">
               <code>{relay.url}</code>
-              {#if relay.state.kind === 'healthy'}
-                <span class="badge badge-healthy" data-testid="nh-relay-badge">Healthy</span>
-              {:else}
-                <span class="badge badge-cooling" data-testid="nh-relay-badge"
-                  >Cooling down ({Math.max(
-                    0,
-                    Math.ceil((relay.state.untilMs - now) / 1000),
-                  )}s)</span
-                >
-              {/if}
+              <NetworkStatusPill
+                variant={relay.state.kind === 'healthy' ? 'healthy' : 'cooling'}
+                label={relayBadgeLabel(relay, now)}
+                data-testid="nh-relay-badge"
+              />
               {#if relay.lastOutcome && relay.lastOutcome.kind !== 'success'}
                 <span class="muted" data-testid="nh-relay-last-error"
                   >{relayOutcomeLabel(relay.lastOutcome)}</span
@@ -447,6 +454,26 @@
     padding: 1rem;
     max-width: 800px;
   }
+  /* ZEB-651: Commons card anatomy for the content sections. */
+  .my-network,
+  .peers,
+  .dynamic-dials,
+  .self-test,
+  .pkarr-relays {
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: var(--shadow-e1);
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .network-health h1,
+  .network-health h2 {
+    font-family: var(--font-display);
+  }
+  .network-health code {
+    font-family: var(--font-mono);
+  }
   .muted {
     color: var(--color-text-secondary);
   }
@@ -460,12 +487,15 @@
     color: var(--net-danger-fg);
   }
   /* ZEB-450: persistent "node can't network" banner. */
+  /* ZEB-651: Commons danger attention-card (left-border idiom). */
   .transport-disabled {
-    border: 1px solid var(--net-danger-fg);
-    border-radius: 6px;
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--net-danger-fg);
+    border-radius: 8px;
+    box-shadow: var(--shadow-e1);
     padding: 0.75rem 1rem;
     margin-bottom: 1rem;
-    background: var(--net-danger-bg);
   }
   .transport-disabled h2 {
     color: var(--net-danger-fg);
@@ -474,20 +504,6 @@
   .transport-disabled .reason {
     font-family: var(--font-mono);
     word-break: break-word;
-  }
-  /* ZEB-623: inline per-peer protocol-incompatibility badge. Same crimson
-     alarm palette as the transport-disabled banner, scaled to a row badge. */
-  .peer-incompat {
-    display: inline-block;
-    padding: 1px 6px;
-    border: 1px solid var(--net-danger-fg);
-    border-radius: 3px;
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--net-danger-fg);
-    background: var(--net-danger-bg);
-    margin-left: 4px;
-    cursor: help;
   }
   .info-hover {
     cursor: help;
@@ -518,22 +534,6 @@
     list-style: none;
     padding-left: 0;
     font-family: var(--font-mono);
-  }
-  .badge {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-size: 11px;
-    font-weight: 600;
-    margin-left: 6px;
-  }
-  .badge-healthy {
-    background: var(--net-ok-bg);
-    color: var(--net-ok-fg);
-  }
-  .badge-cooling {
-    background: var(--net-warn-bg);
-    color: var(--net-warn-fg);
   }
   .pkarr-relays ul {
     list-style: none;
