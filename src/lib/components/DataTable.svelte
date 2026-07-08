@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { NetworkNode } from '../network-types';
   import { heatToColor } from '../graph-utils';
+  import { appliedTheme } from '../theme-service';
 
   type SortKey = 'displayName' | 'status' | 'hopDistance' | 'cpuPercent' | 'memory' | 'disk';
 
@@ -50,6 +51,15 @@
       return sortAsc ? cmp : -cmp;
     });
     return copy;
+  });
+
+  // Status-dot colors, theme-reactive (ZEB-645): void $appliedTheme re-runs the
+  // map on a flip (heatToColor -> the non-reactive tokenColor). Precomputed
+  // rather than called inline because the keyed {#each} reuses same-reference
+  // node objects, so an inline call would not re-evaluate on a theme change.
+  let nodeColors = $derived.by(() => {
+    void $appliedTheme;
+    return sortedNodes.map((n) => heatToColor(n.heatPercent, n.status, n.isLocal));
   });
 
   function toggleSort(key: SortKey) {
@@ -115,7 +125,7 @@
     </tr>
   </thead>
   <tbody>
-    {#each sortedNodes as node (node.address)}
+    {#each sortedNodes as node, i (node.address)}
       <tr
         class="data-row"
         class:selected={selectedAddress === node.address}
@@ -126,7 +136,7 @@
       >
         <td class="name-cell">{node.displayName}</td>
         <td>
-          <span class="status-dot" style="background: {heatToColor(node.heatPercent, node.status, node.isLocal)}"></span>
+          <span class="status-dot" style="background: {nodeColors[i]}"></span>
           {node.status}
         </td>
         <td>{node.hopDistance}</td>

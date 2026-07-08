@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { NetworkNode, NetworkLink } from '../network-types';
   import { heatToColor } from '../graph-utils';
+  import { appliedTheme } from '../theme-service';
   import NodeDetail from './NodeDetail.svelte';
   import LinkDetail from './LinkDetail.svelte';
 
@@ -25,6 +26,7 @@
   }
 
   let healthBreakdown = $derived.by((): StatusCount[] => {
+    void $appliedTheme; // re-resolve status colors on a theme flip (ZEB-645)
     const counts: Record<string, number> = {};
     for (const node of nodes) {
       counts[node.status] = (counts[node.status] || 0) + 1;
