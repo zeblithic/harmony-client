@@ -185,8 +185,10 @@
     margin-bottom: 8px;
   }
   .chip {
-    background: color-mix(in srgb, var(--library-accent) 20%, transparent);
-    border-radius: 12px;
+    /* ZEB-661 (#3): removable recipient person-token → Commons sage + 20px pill
+       (was Library-blue + 12px). */
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    border-radius: 20px;
     padding: 2px 8px;
     font-size: 12px;
     cursor: pointer;
@@ -255,9 +257,12 @@
   }
   .actions button {
     padding: 6px 12px;
+    /* ZEB-661 (#3): rubric button radius (5px); keeps Start DM + Cancel consistent. */
+    border-radius: 5px;
   }
   .primary {
-    background: color-mix(in srgb, var(--library-accent) 40%, transparent);
+    /* ZEB-661 (#3): Commons sage identity, not Library-blue. */
+    background: color-mix(in srgb, var(--accent) 40%, transparent);
   }
   .primary:disabled {
     opacity: 0.4;
