@@ -39,8 +39,47 @@ const CSS_COMMENT = /\/\*[\s\S]*?\*\//g;
 const COLOR_FN =
   /\b(?:rgb|rgba|hsl|hsla|oklch|oklab|lab|lch|hwb|color-mix)\(((?:[^()]|\([^()]*\))*)\)/gi;
 const HEX = /#[0-9a-f]{3,8}\b/gi;
-const NAMED =
-  /(?<=[:\s,(])(?:white|black|red|green|blue|yellow|orange|purple|pink|(?:dark|light)?gr[ae]y)(?=[\s;,)}!])/gi;
+// ZEB-658: the guard's named-color regex used to be a hand-picked subset that
+// silently missed colors like `crimson`, `hotpink`, `steelblue` — a raw color
+// could slip the budget-0 ratchet entirely (the audit found 5 uncounted
+// `crimson` literals). Enumerate the *complete* CSS Color Module Level 4 named
+// set instead, so the guard has no blind spots (CodeRabbit #420).
+// `transparent`/`currentcolor` are intentionally excluded — compositional
+// keywords, not themeable colors. The value-position boundaries in NAMED keep
+// English-word colors (`tan`, `plum`, `lime`) from matching property names like
+// `white-space`, and stop `green` from matching inside `darkgreen`.
+const CSS_NAMED_COLORS = [
+  'aliceblue', 'antiquewhite', 'aqua', 'aquamarine', 'azure', 'beige', 'bisque',
+  'black', 'blanchedalmond', 'blue', 'blueviolet', 'brown', 'burlywood', 'cadetblue',
+  'chartreuse', 'chocolate', 'coral', 'cornflowerblue', 'cornsilk', 'crimson', 'cyan',
+  'darkblue', 'darkcyan', 'darkgoldenrod', 'darkgray', 'darkgreen', 'darkgrey',
+  'darkkhaki', 'darkmagenta', 'darkolivegreen', 'darkorange', 'darkorchid', 'darkred',
+  'darksalmon', 'darkseagreen', 'darkslateblue', 'darkslategray', 'darkslategrey',
+  'darkturquoise', 'darkviolet', 'deeppink', 'deepskyblue', 'dimgray', 'dimgrey',
+  'dodgerblue', 'firebrick', 'floralwhite', 'forestgreen', 'fuchsia', 'gainsboro',
+  'ghostwhite', 'gold', 'goldenrod', 'gray', 'green', 'greenyellow', 'grey', 'honeydew',
+  'hotpink', 'indianred', 'indigo', 'ivory', 'khaki', 'lavender', 'lavenderblush',
+  'lawngreen', 'lemonchiffon', 'lightblue', 'lightcoral', 'lightcyan',
+  'lightgoldenrodyellow', 'lightgray', 'lightgreen', 'lightgrey', 'lightpink',
+  'lightsalmon', 'lightseagreen', 'lightskyblue', 'lightslategray', 'lightslategrey',
+  'lightsteelblue', 'lightyellow', 'lime', 'limegreen', 'linen', 'magenta', 'maroon',
+  'mediumaquamarine', 'mediumblue', 'mediumorchid', 'mediumpurple', 'mediumseagreen',
+  'mediumslateblue', 'mediumspringgreen', 'mediumturquoise', 'mediumvioletred',
+  'midnightblue', 'mintcream', 'mistyrose', 'moccasin', 'navajowhite', 'navy', 'oldlace',
+  'olive', 'olivedrab', 'orange', 'orangered', 'orchid', 'palegoldenrod', 'palegreen',
+  'paleturquoise', 'palevioletred', 'papayawhip', 'peachpuff', 'peru', 'pink', 'plum',
+  'powderblue', 'purple', 'rebeccapurple', 'red', 'rosybrown', 'royalblue', 'saddlebrown',
+  'salmon', 'sandybrown', 'seagreen', 'seashell', 'sienna', 'silver', 'skyblue',
+  'slateblue', 'slategray', 'slategrey', 'snow', 'springgreen', 'steelblue', 'tan', 'teal',
+  'thistle', 'tomato', 'turquoise', 'violet', 'wheat', 'white', 'whitesmoke', 'yellow',
+  'yellowgreen',
+];
+// Longest-first so alternation prefers e.g. `darkgreen` over `green` at a shared
+// start (the right-boundary lookahead already forces this, but it's belt-and-braces).
+const NAMED = new RegExp(
+  `(?<=[:\\s,(])(?:${[...CSS_NAMED_COLORS].sort((a, b) => b.length - a.length).join('|')})(?=[\\s;,)}!])`,
+  'gi',
+);
 
 // A color function only counts as raw if its arguments carry raw color
 // components. `color-mix(in srgb, var(--accent) 15%, transparent)` is
@@ -50,7 +89,12 @@ function isRawFunctionArgs(args: string): boolean {
     .replace(/var\(\s*--[\w-]+\s*\)/g, '')
     .replace(/\d+(?:\.\d+)?%/g, '')
     .replace(/\bin\s+[\w-]+/g, '');
-  return /[0-9#]/.test(cleaned) || new RegExp(NAMED.source, 'i').test(cleaned);
+  // NAMED requires a value-boundary on its left, which holds when scanning full
+  // CSS but not when a named color sits at index 0 of this cleaned fragment
+  // (e.g. `color-mix(teal 20%, var(--accent))` → cleaned `teal , `). Prepend a
+  // boundary space so a leading raw color is still detected — otherwise the
+  // whole function goes uncounted and a raw color slips the ratchet.
+  return /[0-9#]/.test(cleaned) || new RegExp(NAMED.source, 'i').test(` ${cleaned}`);
 }
 
 function svelteFiles(dir: string): string[] {
@@ -116,5 +160,46 @@ describe('style token guard', () => {
     }
 
     expect(problems, `\n${problems.join('\n')}\n`).toEqual([]);
+  });
+});
+
+describe('named-color detection (ZEB-658)', () => {
+  const wrap = (css: string) => `<style>${css}</style>`;
+
+  it('counts crimson + lightgreen (previously missed by the regex)', () => {
+    expect(countRawColors(wrap('.a { color: crimson; }'))).toBe(1);
+    expect(countRawColors(wrap('.a { color: lightgreen; }'))).toBe(1);
+  });
+
+  it('counts the newly-added common named colors', () => {
+    for (const c of [
+      'coral', 'salmon', 'tomato', 'gold', 'khaki', 'olive', 'teal', 'navy',
+      'indigo', 'maroon', 'turquoise', 'orchid', 'plum', 'lavender',
+    ]) {
+      expect(countRawColors(wrap(`.a { color: ${c}; }`)), c).toBe(1);
+    }
+  });
+
+  it('still ignores compositional keywords and token references', () => {
+    expect(countRawColors(wrap('.a { color: transparent; background: currentcolor; }'))).toBe(0);
+    expect(countRawColors(wrap('.a { color: var(--danger); }'))).toBe(0);
+    expect(countRawColors(wrap('.a { background: color-mix(in srgb, var(--accent) 20%, transparent); }'))).toBe(0);
+  });
+
+  it('does not false-positive on tan()/white-space (value-boundary guard)', () => {
+    expect(countRawColors(wrap('.a { transform: rotate(tan(45deg)); }'))).toBe(0);
+    expect(countRawColors(wrap('.a { white-space: nowrap; }'))).toBe(0);
+  });
+
+  it('counts a color-mix that carries a raw named color', () => {
+    expect(countRawColors(wrap('.a { background: color-mix(in srgb, teal 20%, white); }'))).toBe(1);
+  });
+
+  it('counts a leading named color in function args (index-0 boundary guard)', () => {
+    // The named color is the sole non-token arg and sits at index 0 of the
+    // cleaned fragment — must still be detected (regression for the reused
+    // NAMED lookbehind, Qodo #420). Without the prepended boundary this was 0,
+    // letting a raw color slip the budget-0 ratchet.
+    expect(countRawColors(wrap('.a { background: color-mix(teal 20%, var(--accent)); }'))).toBe(1);
   });
 });

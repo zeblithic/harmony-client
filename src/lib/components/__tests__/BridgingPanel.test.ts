@@ -41,4 +41,14 @@ describe('BridgingPanel', () => {
     const { getByText } = render(BridgingPanel, { props: { scores: [], error: 'IPC failed' } });
     expect(getByText(/IPC failed/i)).toBeTruthy();
   });
+
+  it('renders agree as a sage CountChip and diversity as a neutral CountChip', () => {
+    // ZEB-655: the bespoke agree/diversity chips became CountChips — agree is
+    // sage (positive cross-cutting consensus), diversity is a neutral tally.
+    const { container } = render(BridgingPanel, { props: { scores: [score1], error: null } });
+    const sage = container.querySelector('.count-chip.sage');
+    const neutral = container.querySelector('.count-chip.neutral');
+    expect(sage?.querySelector('.cc-value')?.textContent).toBe('10'); // score1.agreeCount
+    expect(neutral?.querySelector('.cc-value')?.textContent).toBe('50%'); // diversityQ32 ≈ 0.5
+  });
 });
