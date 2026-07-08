@@ -317,6 +317,7 @@
   }
   .actions button.primary {
     background: var(--accent);
+    color: var(--on-accent);
     border-color: var(--accent);
   }
   .actions button:disabled {

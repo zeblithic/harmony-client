@@ -590,7 +590,7 @@
   button[type="submit"] {
     align-self: flex-start;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border: 0;
     padding: 0.5rem 1rem;
     border-radius: 4px;

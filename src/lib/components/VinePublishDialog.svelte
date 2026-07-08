@@ -397,7 +397,7 @@
 
   .btn-primary {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
 
   .btn-primary:disabled {

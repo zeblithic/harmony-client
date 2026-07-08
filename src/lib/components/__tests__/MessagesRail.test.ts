@@ -37,16 +37,20 @@ function baseProps(overrides: Record<string, unknown> = {}) {
 }
 
 describe('MessagesRail (ZEB-606)', () => {
-  it('defaults to the Assembly tab when a community is active', async () => {
+  it('defaults to the Assembly segment when a community is active', async () => {
     render(MessagesRail, { props: baseProps() });
-    expect(screen.getByRole('tab', { name: '⚖ Assembly' })).toBeTruthy();
+    // ZEB-646: segmented aria-pressed toggle, not APG tabs.
+    expect(screen.getByRole('button', { name: '⚖ Assembly' }).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('button', { name: 'Media' }).getAttribute('aria-pressed')).toBe('false');
     await waitFor(() => expect(screen.getByText('No open proposals')).toBeTruthy());
     expect(screen.queryByText('No media yet')).toBeNull();
   });
 
   it('switches to Media and persists the choice', async () => {
     render(MessagesRail, { props: baseProps() });
-    await fireEvent.click(screen.getByRole('tab', { name: 'Media' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Media' }));
+    expect(screen.getByRole('button', { name: 'Media' }).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('button', { name: '⚖ Assembly' }).getAttribute('aria-pressed')).toBe('false');
     expect(screen.getByText('No media yet')).toBeTruthy();
     expect(localStorage.getItem('harmony-rail-tab')).toBe('media');
   });
@@ -59,13 +63,13 @@ describe('MessagesRail (ZEB-606)', () => {
 
   it('renders media-only (no tabs) without a community', () => {
     render(MessagesRail, { props: baseProps({ communityId: null }) });
-    expect(screen.queryByRole('tab', { name: '⚖ Assembly' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '⚖ Assembly' })).toBeNull();
     expect(screen.getByText('No media yet')).toBeTruthy();
   });
 
   it('renders media-only (no tabs) without a votingAdapter', () => {
     render(MessagesRail, { props: baseProps({ votingAdapter: undefined }) });
-    expect(screen.queryByRole('tab', { name: '⚖ Assembly' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '⚖ Assembly' })).toBeNull();
     expect(screen.getByText('No media yet')).toBeTruthy();
   });
 

@@ -96,7 +96,7 @@
 
   .codec-option.selected {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
   }
 
   .codec-option:hover:not(.selected):not([aria-disabled='true']) {

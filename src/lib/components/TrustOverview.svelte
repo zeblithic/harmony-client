@@ -8,6 +8,7 @@
     trustScoreColor,
   } from '../trust-score';
   import TrustBadge from './TrustBadge.svelte';
+  import { appliedTheme } from '../theme-service';
 
   interface PeerInfo {
     address: string;
@@ -30,18 +31,25 @@
   let sortAsc: boolean = $state(true);
 
   let rows = $derived.by(() => {
+    void $appliedTheme; // re-resolve trust colors on a theme flip (ZEB-645)
     const myEdges = new Map(
       edges.filter((e) => e.source === localAddress).map((e) => [e.target, e.score]),
     );
     const theirEdges = new Map(
       edges.filter((e) => e.target === localAddress).map((e) => [e.source, e.score]),
     );
-    return peers.map((p) => ({
-      address: p.address,
-      displayName: p.displayName,
-      myScore: myEdges.get(p.address) ?? null,
-      theirScore: theirEdges.get(p.address) ?? null,
-    }));
+    return peers.map((p) => {
+      const myScore = myEdges.get(p.address) ?? null;
+      const theirScore = theirEdges.get(p.address) ?? null;
+      return {
+        address: p.address,
+        displayName: p.displayName,
+        myScore,
+        theirScore,
+        myScoreColor: trustScoreColor(myScore),
+        theirScoreColor: trustScoreColor(theirScore),
+      };
+    });
   });
 
   let sortedRows = $derived.by(() => {
@@ -138,8 +146,8 @@
           <TrustBadge score={row.myScore} />
           {row.displayName}
         </td>
-        <td style="color: {trustScoreColor(row.myScore)}">{formatScore(row.myScore)}</td>
-        <td style="color: {trustScoreColor(row.theirScore)}">{formatScore(row.theirScore)}</td>
+        <td style="color: {row.myScoreColor}">{formatScore(row.myScore)}</td>
+        <td style="color: {row.theirScoreColor}">{formatScore(row.theirScore)}</td>
         <td>{dimValue(row.myScore, getIdentity)}</td>
         <td>{dimValue(row.myScore, getCompliance)}</td>
         <td>{dimValue(row.myScore, getAssociation)}</td>

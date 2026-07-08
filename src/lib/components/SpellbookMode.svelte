@@ -174,7 +174,7 @@
 
   .tab-btn.active {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
   }
 
   .toolbar-controls {

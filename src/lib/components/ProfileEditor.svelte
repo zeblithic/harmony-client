@@ -716,7 +716,7 @@
     border: none;
     border-radius: 4px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;

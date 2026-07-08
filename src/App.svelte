@@ -4055,7 +4055,7 @@
   .startup-error-actions button.primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
 
 </style>

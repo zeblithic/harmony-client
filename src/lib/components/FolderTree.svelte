@@ -185,7 +185,7 @@
   .folder-btn.selected,
   .folder-btn[aria-current="true"] {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
 
   .folder-icon {

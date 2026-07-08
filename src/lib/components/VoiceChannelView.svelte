@@ -368,7 +368,7 @@
     padding: 8px 22px;
     border-radius: 4px;
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     font-size: 0.9rem;
     cursor: pointer;
   }
@@ -512,7 +512,7 @@
   .ctrl.active {
     background: var(--accent);
     border-color: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
   }
   .ctrl.restrictive {
     background: var(--gov-clay);

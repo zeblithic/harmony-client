@@ -311,7 +311,7 @@
   }
   .actions .primary {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border-color: var(--accent);
   }
   .actions .primary.danger {

@@ -451,7 +451,7 @@
     border: 1px solid var(--accent);
     border-radius: 4px;
     background: var(--accent);
-    color: var(--bg-primary);
+    color: var(--on-accent);
     font: inherit;
     cursor: pointer;
   }

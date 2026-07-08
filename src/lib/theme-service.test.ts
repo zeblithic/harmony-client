@@ -3,6 +3,7 @@ import { get } from 'svelte/store';
 import {
   THEME_APPLIED_EVENT,
   _resetThemeServiceForTest,
+  appliedTheme,
   connectOwnerTheme,
   initThemePrePaint,
   resolveTheme,
@@ -120,6 +121,37 @@ describe('owner-scoped preference', () => {
     setThemePreference('dark');
     document.removeEventListener(THEME_APPLIED_EVENT, listener);
     expect(seen).toContain('dark');
+  });
+});
+
+describe('appliedTheme store (ZEB-645)', () => {
+  it('defaults to light and tracks the resolved theme on explicit prefs', () => {
+    expect(get(appliedTheme)).toBe('light');
+    connectOwnerTheme(OWNER);
+    setThemePreference('dark');
+    expect(get(appliedTheme)).toBe('dark');
+    setThemePreference('light');
+    expect(get(appliedTheme)).toBe('light');
+  });
+
+  it('reflects the resolved theme for a system preference', () => {
+    // global matchMedia stub: matches=false → system resolves to light.
+    connectOwnerTheme(OWNER); // pref defaults to 'system'
+    expect(get(appliedTheme)).toBe('light');
+  });
+
+  it('is set AFTER the tokenColor cache-clear event, so deriveds read fresh', () => {
+    connectOwnerTheme(OWNER); // settles at light
+    const order: string[] = [];
+    const onEvent = () => order.push('event');
+    document.addEventListener(THEME_APPLIED_EVENT, onEvent);
+    const unsub = appliedTheme.subscribe((t) => order.push(`store:${t}`));
+    order.length = 0; // drop the immediate subscribe tick (store:light)
+    setThemePreference('dark');
+    unsub();
+    document.removeEventListener(THEME_APPLIED_EVENT, onEvent);
+    // The cache-clear event must precede the reactive store update.
+    expect(order).toEqual(['event', 'store:dark']);
   });
 });
 

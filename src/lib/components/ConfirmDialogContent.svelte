@@ -69,7 +69,7 @@
 
   .confirm-btn {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border: none;
     padding: 8px 16px;
     border-radius: 7px;
@@ -77,8 +77,11 @@
     font-size: 0.875rem;
   }
 
+  /* Destructive variant keeps its own foreground: the base .confirm-btn now
+     carries --on-accent (for the accent bg), wrong on --danger-muted. */
   .confirm-btn.destructive {
     background: var(--danger-muted);
+    color: var(--text-primary);
   }
 
   .cancel-btn:focus-visible,

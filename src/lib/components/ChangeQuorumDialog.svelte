@@ -190,7 +190,7 @@
   .actions button:last-child {
     border: 1px solid var(--accent);
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-weight: 600;
   }
   .error { color: var(--danger-deep); }

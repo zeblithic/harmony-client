@@ -165,7 +165,7 @@
 
   .done-btn {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border: 1px solid var(--border);
     padding: 6px 14px;
     border-radius: 4px;

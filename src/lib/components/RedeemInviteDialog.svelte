@@ -347,7 +347,7 @@
   }
   .iroh-btn {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border: 1px solid var(--accent);
     padding: 8px 16px;
     border-radius: 6px;

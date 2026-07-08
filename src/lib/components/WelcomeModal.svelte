@@ -475,7 +475,7 @@
   .actions button.primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
   .actions button.danger {
     background: var(--danger);

@@ -74,7 +74,7 @@
 <style>
   .selected-banner {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     padding: 0.5rem 0.75rem;
     border-radius: 4px;
     font-weight: 500;

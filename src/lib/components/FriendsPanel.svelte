@@ -1345,7 +1345,7 @@
     border-radius: 5px;
     border: 1px solid var(--accent);
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     cursor: pointer;
     font-family: var(--font-ui);
   }
@@ -1464,7 +1464,7 @@
 
   .accept-btn:hover:not(:disabled) {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
 
   .accept-btn:disabled {

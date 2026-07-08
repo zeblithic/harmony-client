@@ -150,7 +150,7 @@
   .actions button.primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
   .actions button:disabled { opacity: 0.5; cursor: default; }
 </style>

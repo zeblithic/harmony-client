@@ -237,7 +237,7 @@
   }
   .node-avatar-self {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
   .node-body {
     display: flex;

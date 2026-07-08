@@ -178,7 +178,7 @@
   }
   .primary-btn.unban {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
   }
   .primary-btn:disabled {
     opacity: 0.55;
@@ -201,7 +201,8 @@
   }
   .primary-btn.unban .spinner {
     border-color: var(--border-bright);
-    border-top-color: var(--text-primary);
+    /* Match the unban button's --on-accent foreground on the accent bg. */
+    border-top-color: var(--on-accent);
   }
   @keyframes spin {
     to { transform: rotate(360deg); }

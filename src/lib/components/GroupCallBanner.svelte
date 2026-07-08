@@ -107,7 +107,7 @@
   .btn-join {
     border: none;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     padding: 4px 14px;
     border-radius: 5px;
     font-size: 0.85rem;

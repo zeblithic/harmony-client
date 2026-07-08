@@ -1,6 +1,7 @@
 <script lang="ts">
   import { trustScoreColor, trustScoreLabel } from '../trust-score';
   import type { TrustScore } from '../trust-score';
+  import { appliedTheme } from '../theme-service';
 
   let {
     score = null,
@@ -8,7 +9,12 @@
     score?: TrustScore | null;
   } = $props();
 
-  let color = $derived(trustScoreColor(score));
+  // void $appliedTheme re-runs the color on a theme flip (trustScoreColor calls
+  // the non-reactive tokenColor; ZEB-645). The label is theme-independent.
+  let color = $derived.by(() => {
+    void $appliedTheme;
+    return trustScoreColor(score);
+  });
   let label = $derived(trustScoreLabel(score));
 </script>
 

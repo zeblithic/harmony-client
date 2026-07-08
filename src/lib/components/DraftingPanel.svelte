@@ -155,7 +155,7 @@
   .approval-count { color: var(--text-faint); font-size: 0.8rem; }
   .candidate-actions button {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border: 0;
     padding: 0.25rem 0.6rem;
     border-radius: 3px;
@@ -175,7 +175,7 @@
   .char-count { color: var(--text-faint); font-size: 0.75rem; }
   .form-footer button {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border: 0;
     padding: 0.3rem 0.8rem;
     border-radius: 3px;

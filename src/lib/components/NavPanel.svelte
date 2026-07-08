@@ -592,7 +592,7 @@
     border: none;
     border-radius: 4px;
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     font-size: 0.82rem;
     cursor: pointer;
   }
@@ -627,6 +627,7 @@
 
   .icon-button:hover {
     background: var(--accent);
+    color: var(--on-accent);
   }
 
   .nav-footer {
@@ -651,7 +652,7 @@
 
   .nav-action-btn:hover {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
   }
 
   /* ZEB-333: wrap the mode toggles into a responsive grid so every mode
@@ -690,7 +691,7 @@
     font-size: 0.9rem;
     padding: 4px 10px;
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border: none;
     border-radius: 4px;
     cursor: pointer;

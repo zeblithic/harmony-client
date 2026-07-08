@@ -2,6 +2,7 @@
   import type { NetworkLink, NetworkNode, LinkSnapshot } from '../network-types';
   import { linkUtilizationColor } from '../graph-utils';
   import { tokenColor } from '../theme-colors';
+  import { appliedTheme } from '../theme-service';
   import Sparkline from './Sparkline.svelte';
   import { RingBuffer } from '../ring-buffer';
 
@@ -18,7 +19,16 @@
   let sourceName = $derived(sourceNode?.displayName ?? link.source);
   let targetName = $derived(targetNode?.displayName ?? link.target);
 
-  let utilizationColor = $derived(linkUtilizationColor(link.utilizationPercent));
+  // void $appliedTheme re-runs these on a theme flip (linkUtilizationColor and
+  // tokenColor aren't reactive on their own; ZEB-645).
+  let utilizationColor = $derived.by(() => {
+    void $appliedTheme;
+    return linkUtilizationColor(link.utilizationPercent);
+  });
+  let latencyColor = $derived.by(() => {
+    void $appliedTheme;
+    return tokenColor('--accent');
+  });
 
   // Extract sparkline data from utilization history
   let utilizationData = $derived.by(() => {
@@ -85,7 +95,7 @@
         <span class="metric-label">Latency</span>
         <span class="metric-value">{Math.round(link.latencyMs)} ms</span>
       </div>
-      <Sparkline data={latencyData} label="Link latency history" color={tokenColor('--accent')} />
+      <Sparkline data={latencyData} label="Link latency history" color={latencyColor} />
     </div>
 
     {#if lastSnapshot}

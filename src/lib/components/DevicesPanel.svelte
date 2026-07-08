@@ -610,7 +610,7 @@
   }
   .primary {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border-color: var(--accent);
   }
   .primary:hover:not(:disabled) {
@@ -686,7 +686,7 @@
     height: 40px;
     border-radius: 10px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-family: var(--font-display);
     font-size: 18px;
     font-weight: 600;

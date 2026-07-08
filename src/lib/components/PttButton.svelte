@@ -137,7 +137,7 @@
 
   .ptt-button.active {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     box-shadow: 0 0 20px color-mix(in srgb, var(--accent) 40%, transparent);
   }
 

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ConnectionStatus } from '../zenoh-service';
   import { tokenColor } from '../theme-colors';
+  import { appliedTheme } from '../theme-service';
 
   let {
     connectionStatus,
@@ -60,10 +61,13 @@
     reconnecting: '--warning',
   };
 
-  // Resolved at call time (in the template) so a theme switch repaints the dot.
-  function statusColor(status: ConnectionStatus): string {
-    return tokenColor(STATUS_TOKENS[status]);
-  }
+  // A derived (not a call-time function) so a theme switch repaints the dot:
+  // void $appliedTheme re-runs it on a flip — tokenColor() isn't reactive on
+  // its own (ZEB-645).
+  let statusColorValue = $derived.by(() => {
+    void $appliedTheme;
+    return tokenColor(STATUS_TOKENS[connectionStatus]);
+  });
 
   let statusLabel = $derived.by(() => {
     switch (connectionStatus) {
@@ -101,7 +105,7 @@
   {/if}
 
   <div class="status-indicator" role="status" aria-label={statusLabel}>
-    <span class="status-dot" style="background: {statusColor(connectionStatus)}"></span>
+    <span class="status-dot" style="background: {statusColorValue}"></span>
     <span class="status-text">{statusLabel}</span>
   </div>
 </div>
@@ -142,7 +146,7 @@
     border: none;
     border-radius: 4px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-size: 11px;
     font-weight: 600;
     cursor: pointer;
@@ -156,8 +160,11 @@
     outline-offset: 2px;
   }
 
+  /* Disconnect variant keeps its own foreground: the base .connect-btn now
+     carries --on-accent (for the accent bg), wrong on the neutral --bg-tertiary. */
   .connect-btn.disconnect {
     background: var(--bg-tertiary);
+    color: var(--text-primary);
   }
 
   .connect-btn:disabled {

@@ -382,7 +382,7 @@
     padding: 4px 12px;
     border: 1px solid var(--accent);
     background: var(--accent);
-    color: var(--bg-primary);
+    color: var(--on-accent);
     border-radius: 4px;
     cursor: pointer;
     font: inherit;
