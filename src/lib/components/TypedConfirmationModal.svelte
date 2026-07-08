@@ -55,6 +55,7 @@
 <style>
   .modal-title {
     color: var(--text-primary);
+    font-family: var(--font-display);
     font-size: 1rem;
     margin: 0 0 12px;
   }
@@ -81,7 +82,7 @@
     padding: 8px 12px;
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     color: var(--text-primary);
     font-family: var(--font-mono);
     font-size: 0.875rem;
@@ -103,7 +104,7 @@
     color: var(--text-primary);
     border: none;
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.875rem;
   }
@@ -113,11 +114,11 @@
     cursor: not-allowed;
   }
   .cancel-btn {
-    background: var(--bg-tertiary);
+    background: var(--surface-raised);
     color: var(--text-secondary);
-    border: none;
+    border: 1px solid var(--border);
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.875rem;
   }
