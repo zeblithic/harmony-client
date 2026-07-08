@@ -4,8 +4,9 @@
    * existing Layout media cell, implemented entirely App-side so
    * Layout.svelte (resize/collapse/prefs/aria contract) is untouched.
    *
-   * When a community is active AND a votingAdapter exists, a two-tab header
-   * swaps AssemblyRail vs the existing MediaFeed; the last choice persists
+   * When a community is active AND a votingAdapter exists, a two-button
+   * segmented toggle (aria-pressed, matching the nav footer mode-switcher;
+   * ZEB-646) swaps AssemblyRail vs the existing MediaFeed; the last choice persists
    * device-scoped (harmony-rail-tab). Outside community contexts (DMs, no
    * selection) the rail is media-only with no tab chrome — pixel-identical
    * to the pre-ZEB-606 experience.
@@ -61,21 +62,19 @@
 </script>
 
 {#if assemblyAvailable}
-  <div class="rail-tabs" role="tablist" aria-label="Right rail content">
+  <div class="rail-tabs" role="group" aria-label="Right rail content">
     <button
       type="button"
-      role="tab"
       class="rail-tab"
       class:active={railTab === 'assembly'}
-      aria-selected={railTab === 'assembly'}
+      aria-pressed={railTab === 'assembly'}
       onclick={() => selectTab('assembly')}
     >⚖ Assembly</button>
     <button
       type="button"
-      role="tab"
       class="rail-tab"
       class:active={railTab === 'media'}
-      aria-selected={railTab === 'media'}
+      aria-pressed={railTab === 'media'}
       onclick={() => selectTab('media')}
     >Media</button>
   </div>
