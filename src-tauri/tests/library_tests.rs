@@ -16,6 +16,14 @@
 //! runs every `#[test]` in its own process, so `#[serial]` isolation is unchanged.
 //!
 //! Run just this group: `cargo nextest run -E 'binary(library_tests)'`.
+//!
+//! ZEB-442/ZEB-428: this harness bundles fixtures-only modules (and, for
+//! identity, the keychain-refusal guard test), so it requires `--features
+//! test-fixtures`. The whole harness is gated at the crate root: feature-off it
+//! compiles out to an empty binary, so `cargo test` without the feature can
+//! never run these tests against the real OS keychain. Every CI job sets the
+//! feature, so this is a no-op there.
+#![cfg(feature = "test-fixtures")]
 
 #[path = "common/mod.rs"]
 mod common;
