@@ -54,7 +54,12 @@ function isRawFunctionArgs(args: string): boolean {
     .replace(/var\(\s*--[\w-]+\s*\)/g, '')
     .replace(/\d+(?:\.\d+)?%/g, '')
     .replace(/\bin\s+[\w-]+/g, '');
-  return /[0-9#]/.test(cleaned) || new RegExp(NAMED.source, 'i').test(cleaned);
+  // NAMED requires a value-boundary on its left, which holds when scanning full
+  // CSS but not when a named color sits at index 0 of this cleaned fragment
+  // (e.g. `color-mix(teal 20%, var(--accent))` → cleaned `teal , `). Prepend a
+  // boundary space so a leading raw color is still detected — otherwise the
+  // whole function goes uncounted and a raw color slips the ratchet.
+  return /[0-9#]/.test(cleaned) || new RegExp(NAMED.source, 'i').test(` ${cleaned}`);
 }
 
 function svelteFiles(dir: string): string[] {
@@ -153,5 +158,13 @@ describe('named-color detection (ZEB-658)', () => {
 
   it('counts a color-mix that carries a raw named color', () => {
     expect(countRawColors(wrap('.a { background: color-mix(in srgb, teal 20%, white); }'))).toBe(1);
+  });
+
+  it('counts a leading named color in function args (index-0 boundary guard)', () => {
+    // The named color is the sole non-token arg and sits at index 0 of the
+    // cleaned fragment — must still be detected (regression for the reused
+    // NAMED lookbehind, Qodo #420). Without the prepended boundary this was 0,
+    // letting a raw color slip the budget-0 ratchet.
+    expect(countRawColors(wrap('.a { background: color-mix(teal 20%, var(--accent)); }'))).toBe(1);
   });
 });
