@@ -282,9 +282,37 @@ pub async fn handle_relay_deposit_core(
         )
         .map_err(|_| RelayDepositReject::BadSig)?;
 
-    // Step 4 — NO DECRYPT. The relay NEVER opens sealed_blob (which is sealed
-    // to the RECIPIENT's device key, not the relay's). Compute the content id
-    // over the opaque sealed bytes so the recipient can identify what to pull.
+    // Steps 4-6 — NO DECRYPT, content-id, atomic persist-with-caps, ack.
+    // Factored into `persist_relay_hold_from_frame` so the sender's own
+    // relay-rung self-deposit (ZEB-524) reuses the exact persist path.
+    persist_relay_hold_from_frame(frame, ctx).await
+}
+
+/// Steps 4-6 of the relay deposit pipeline, factored out of
+/// [`handle_relay_deposit_core`] so the sender's own relay-rung **self-deposit**
+/// (ZEB-524 — when the sending node is also the community's only relay host)
+/// can reuse the exact persist path without re-running the remote-sender
+/// admission checks (steps 0-3):
+///
+/// - **NO DECRYPT** — the relay NEVER opens `sealed_blob` (sealed to the
+///   RECIPIENT's device key). Compute `content_id = ContentId::for_book(..)`
+///   over the opaque bytes so the recipient can identify what to pull;
+/// - build the [`RelayHoldEntry`] (`held_by` = this relay device, fresh HLC);
+/// - atomic persist-with-caps + durable flush BEFORE the ack exists (D7: an
+///   ack never lies) — insert-once on the key; an occupied key bypasses the
+///   caps so a redelivery after a lost ack is absorbed even at a full store;
+/// - return the [`RelayDepositAck`].
+///
+/// The acceptor calls this AFTER verifying a remote sender's cert + signature +
+/// co-membership. The self-deposit path calls it DIRECTLY: the depositing node
+/// authored and signed the frame, so those admission checks are trivially its
+/// own and are skipped — but the cap enforcement and byte-for-byte hold shape
+/// are identical, so a self-deposited hold is indistinguishable from a
+/// dialed-in one when the recipient later pulls it.
+pub async fn persist_relay_hold_from_frame(
+    frame: &RelayDepositFrame,
+    ctx: &dyn RelayDepositCtx,
+) -> Result<RelayDepositAck, RelayDepositReject> {
     let content_id = ContentId::for_book(
         &frame.sealed_blob,
         ContentFlags {
@@ -305,17 +333,12 @@ pub async fn handle_relay_deposit_core(
     };
     let key = RelayHoldDoc::key(&frame.recipient_owner, &content_id.to_bytes());
 
-    // Step 5 — atomic persist-with-caps + durable flush BEFORE the ack
-    // exists (D7: an ack never lies). Insert-once on the key; an occupied key
-    // bypasses the caps so a redelivery after a lost ack is absorbed even at a
-    // full hold store.
     match ctx.persist_hold(key, entry).await {
         Ok(RelayPersistVerdict::Inserted) | Ok(RelayPersistVerdict::Duplicate) => {}
         Ok(RelayPersistVerdict::CapExceeded) => return Err(RelayDepositReject::CapExceeded),
         Err(e) => return Err(RelayDepositReject::PersistFailed(e)),
     }
 
-    // Step 6 — ack.
     Ok(RelayDepositAck {
         content_id: content_id.to_bytes(),
     })
