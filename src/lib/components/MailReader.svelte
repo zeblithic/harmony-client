@@ -107,7 +107,7 @@
     flex-direction: column;
     height: 100%;
     overflow-y: auto;
-    padding: 1rem;
+    padding: 16px;
   }
 
   .empty-state {
@@ -121,15 +121,15 @@
   .reader-toolbar {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    margin-bottom: 1rem;
+    gap: 8px;
+    margin-bottom: 16px;
     flex-shrink: 0;
   }
 
   .back-btn, .reply-btn {
-    padding: 0.375rem 0.75rem;
+    padding: 6px 12px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     background: transparent;
     color: var(--text-primary);
     cursor: pointer;
@@ -143,13 +143,14 @@
   }
 
   .reader-header {
-    margin-bottom: 1rem;
-    padding-bottom: 0.75rem;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
     border-bottom: 1px solid var(--border);
   }
 
   .subject {
-    margin: 0 0 0.5rem;
+    margin: 0 0 8px;
+    font-family: var(--font-display);
     font-size: 1.125rem;
     color: var(--text-primary);
   }
@@ -169,7 +170,7 @@
   }
 
   .recipients {
-    margin-top: 0.25rem;
+    margin-top: 4px;
     font-size: 0.75rem;
     color: var(--text-secondary);
   }
@@ -189,13 +190,13 @@
   }
 
   .attachments {
-    margin-top: 1rem;
-    padding-top: 0.75rem;
+    margin-top: 16px;
+    padding-top: 12px;
     border-top: 1px solid var(--border);
   }
 
   .attachments h4 {
-    margin: 0 0 0.5rem;
+    margin: 0 0 8px;
     font-size: 0.8125rem;
     color: var(--text-secondary);
   }
@@ -203,7 +204,7 @@
   .attachment-item {
     display: flex;
     justify-content: space-between;
-    padding: 0.25rem 0;
+    padding: 4px 0;
     font-size: 0.8125rem;
   }
 
@@ -222,8 +223,8 @@
     align-items: center;
     justify-content: center;
     height: 100%;
-    gap: 0.5rem;
-    padding: 1rem;
+    gap: 8px;
+    padding: 16px;
     color: var(--text-secondary);
   }
 
@@ -240,8 +241,8 @@
   .reader-error .error-msg {
     background: color-mix(in srgb, var(--mail-danger) 8%, transparent);
     border: 1px solid color-mix(in srgb, var(--mail-danger) 30%, transparent);
-    border-radius: 4px;
-    padding: 0.5rem;
+    border-radius: 5px;
+    padding: 8px;
     font-size: 0.8125rem;
     color: var(--mail-error-text);
     white-space: pre-wrap;

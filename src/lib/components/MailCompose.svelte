@@ -116,18 +116,19 @@
     display: flex;
     flex-direction: column;
     height: 100%;
-    padding: 1rem;
+    padding: 16px;
   }
 
   .compose-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 1rem;
+    margin-bottom: 16px;
   }
 
   .compose-header h3 {
     margin: 0;
+    font-family: var(--font-display);
     font-size: 1rem;
     color: var(--text-primary);
   }
@@ -138,20 +139,20 @@
     color: var(--text-secondary);
     cursor: pointer;
     font-size: 1.25rem;
-    padding: 0.25rem;
+    padding: 4px;
   }
 
   .compose-form {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
+    gap: 12px;
     flex: 1;
   }
 
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: 4px;
   }
 
   .field label {
@@ -162,7 +163,7 @@
   }
 
   .field input, .field textarea {
-    padding: 0.5rem 0.625rem;
+    padding: 8px;
     border: 1px solid var(--border);
     border-radius: 5px;
     background: var(--surface);
@@ -194,13 +195,13 @@
   .compose-actions {
     display: flex;
     justify-content: flex-end;
-    padding-top: 0.5rem;
+    padding-top: 8px;
   }
 
   .send-btn {
-    padding: 0.5rem 1.5rem;
+    padding: 8px 24px;
     border: none;
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--accent);
     color: var(--text-bright);
     cursor: pointer;

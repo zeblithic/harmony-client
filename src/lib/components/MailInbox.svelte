@@ -158,20 +158,23 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.5rem 0.75rem;
+    padding: 8px 12px;
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }
 
   .folder-tabs {
     display: flex;
-    gap: 0.25rem;
+    gap: 4px;
   }
 
   .folder-tab {
-    padding: 0.25rem 0.625rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
     border: none;
-    border-radius: 4px;
+    border-radius: 5px;
     background: transparent;
     color: var(--text-secondary);
     cursor: pointer;
@@ -183,22 +186,22 @@
     color: var(--text-primary);
   }
 
+  /* Notification-count idiom, shared with NavNodeRow .unread-badge (ZEB-654 D2):
+     accent pill beside the folder label — not the stacked CountChip data box. */
   .unread-badge {
-    display: inline-block;
-    min-width: 1rem;
-    padding: 0 0.25rem;
-    margin-left: 0.25rem;
-    border-radius: 8px;
     background: var(--accent);
     color: var(--text-bright);
     font-size: 0.6875rem;
-    text-align: center;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 8px;
+    flex-shrink: 0;
   }
 
   .compose-btn {
-    padding: 0.375rem 0.75rem;
+    padding: 6px 12px;
     border: none;
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--accent);
     color: var(--text-bright);
     cursor: pointer;
@@ -211,7 +214,7 @@
   }
 
   .empty-state {
-    padding: 2rem;
+    padding: 32px;
     text-align: center;
     color: var(--text-secondary);
   }
@@ -220,9 +223,9 @@
     display: grid;
     grid-template-columns: 8rem 1fr auto auto;
     align-items: center;
-    gap: 0.5rem;
+    gap: 8px;
     width: 100%;
-    padding: 0.5rem 0.75rem;
+    padding: 8px 12px;
     border: none;
     border-bottom: 1px solid var(--border);
     background: transparent;
@@ -267,7 +270,7 @@
 
   .mail-actions {
     display: flex;
-    gap: 0.25rem;
+    gap: 4px;
     opacity: 0;
   }
 
@@ -282,7 +285,7 @@
     color: var(--text-secondary);
     cursor: pointer;
     font-size: 1rem;
-    padding: 0 0.25rem;
+    padding: 0 4px;
   }
 
   .action-btn:hover {
@@ -292,8 +295,8 @@
   .sync-controls {
     display: inline-flex;
     align-items: center;
-    gap: 0.25rem;
-    margin-left: 0.5rem;
+    gap: 4px;
+    margin-left: 8px;
   }
   .sync-spinner {
     display: inline-block;
@@ -313,10 +316,10 @@
   .sync-refresh-btn {
     background: transparent;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 5px;
     color: var(--text-secondary);
     cursor: pointer;
-    padding: 0.125rem 0.4rem;
+    padding: 2px 6px;
     font-size: 0.8125rem;
   }
   .sync-refresh-btn:hover {
