@@ -31,6 +31,13 @@
 //!
 //! All four tests mutate `$HOME`/`$USERPROFILE` (process-global), so they
 //! run `#[serial]` (the workspace already depends on `serial_test`).
+//!
+//! ZEB-442: uses `mint_owner_identity_inner_for_test` (gated behind
+//! `feature = "test-fixtures"`), so the module self-gates — matching the
+//! sibling harness modules — so the consolidated `mint_tests` binary still
+//! builds feature-off (the module compiles out, like it did as a standalone
+//! binary) instead of failing on the unresolved fixtures-only import.
+#![cfg(feature = "test-fixtures")]
 
 use harmony_app::owner_commands::mint_owner_identity_inner_for_test;
 use harmony_app::NodeState;
