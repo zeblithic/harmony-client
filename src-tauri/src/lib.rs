@@ -8548,7 +8548,10 @@ pub async fn start_node_inner(
                         if link_mgr
                             .install_community_relay_deposit_acceptor(std::sync::Arc::new(
                                 crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor::new(
-                                    relay_deposit_ctx,
+                                    // ZEB-524: the deposit client below shares this
+                                    // SAME ctx (same relay-hold doc + flush) for its
+                                    // local self-hold path, so clone rather than move.
+                                    std::sync::Arc::clone(&relay_deposit_ctx),
                                 ),
                             ))
                             .is_err()
@@ -8737,6 +8740,13 @@ pub async fn start_node_inner(
                                             ),
                                             crdt_state: std::sync::Arc::clone(&crdt_state),
                                             membership: std::sync::Arc::clone(&relay_membership),
+                                            // ZEB-524: same ctx the deposit acceptor
+                                            // uses (same relay-hold doc + flush), so a
+                                            // self relay target is held locally instead
+                                            // of dialing ourselves.
+                                            local_relay_ctx: Some(std::sync::Arc::clone(
+                                                &relay_deposit_ctx,
+                                            )),
                                         },
                                     );
                                     outbox
