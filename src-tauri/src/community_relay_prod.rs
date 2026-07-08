@@ -844,13 +844,13 @@ pub struct ProdCommunityRelayDepositClient {
     /// ZEB-524: when this sender is ALSO a relay host for a shared community,
     /// the fan-out resolves its OWN `CommunityRelayAnnounce` and would iroh-dial
     /// itself (which iroh rejects → nothing held). This is the local relay-hold
-    /// sink: for a self relay target the recipient's sealed copy is persisted
-    /// directly into our own rung via
-    /// [`crate::iroh_community_relay_acceptor::persist_relay_hold_from_frame`]
-    /// (byte-identical to a dialed-in hold; the recipient's normal relay-pull
-    /// recover flow retrieves it) instead of dialing. `None` disables the
-    /// self-host shortcut, preserving the pre-ZEB-524 behavior (self relays are
-    /// skipped, so a sole-host sender holds nothing).
+    /// sink: for a self relay target the recipient's sealed copy is held in our
+    /// own rung by running the full acceptor pipeline
+    /// ([`crate::iroh_community_relay_acceptor::handle_relay_deposit_core`])
+    /// against this ctx instead of dialing — same admission gates as a dialed-in
+    /// deposit, byte-identical hold. `None` disables the self-host shortcut,
+    /// preserving the pre-ZEB-524 behavior (self relays are skipped, so a
+    /// sole-host sender holds nothing).
     pub local_relay_ctx: Option<Arc<dyn crate::iroh_community_relay_acceptor::RelayDepositCtx>>,
 }
 
@@ -957,22 +957,28 @@ impl ProdCommunityRelayDepositClient {
             .collect()
     }
 
-    /// ZEB-524 self-deposit: persist a self-authored deposit `frame` into our
-    /// OWN relay rung with no dial. We built and signed this frame, so the
-    /// acceptor's remote-sender admission (cert/sig/co-member/opt-in) is
-    /// trivially our own and skipped; the persist still flows through
-    /// `persist_hold` for the atomic caps + durable flush, producing a
-    /// `RelayHoldEntry` byte-identical to a dialed-in hold that the recipient's
-    /// normal relay-pull recover flow later retrieves.
+    /// ZEB-524 self-deposit: hold a self-authored deposit `frame` in our OWN
+    /// relay rung with no dial, by running the FULL acceptor pipeline
+    /// ([`crate::iroh_community_relay_acceptor::handle_relay_deposit_core`])
+    /// against our own ctx. A self-deposit is thereby treated exactly like a
+    /// deposit that arrived from ourselves over the wire: it can never admit
+    /// anything a dialed-in deposit couldn't — the opt-in (`serves_community`),
+    /// byte-ceiling, co-membership, cert, and signature gates ALL apply, and the
+    /// atomic caps + durable flush produce a `RelayHoldEntry` byte-identical to
+    /// a dialed-in hold that the recipient's normal relay-pull recover flow
+    /// later retrieves. (Re-verifying our own cert/sig is negligible and keeps
+    /// the admission policy single-sourced in the acceptor — critically, it
+    /// closes the opt-out-with-fresh-ad hole where a self-hold would otherwise
+    /// succeed but the pull acceptor would refuse to serve it.)
     async fn local_relay_hold(
         &self,
         frame: &crate::community_relay::RelayDepositFrame,
         ctx: &dyn crate::iroh_community_relay_acceptor::RelayDepositCtx,
     ) -> Result<(), String> {
-        crate::iroh_community_relay_acceptor::persist_relay_hold_from_frame(frame, ctx)
+        crate::iroh_community_relay_acceptor::handle_relay_deposit_core(frame, ctx)
             .await
             .map(|_ack| ())
-            .map_err(|e| format!("local relay hold: {e}"))
+            .map_err(|e| format!("local relay hold rejected: {e}"))
     }
 }
 
@@ -1115,7 +1121,100 @@ fn now_epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::community_membership::{mint_test_owner, TestOwner};
     use std::collections::{BTreeSet, HashSet};
+
+    // ---------------------------------------------------------------
+    // ZEB-524 self-hold: a mock RelayDepositCtx that records persisted
+    // entries and lets a test toggle the opt-in gate (`serves_community`).
+    // `now_secs` is pinned to the minted-cert validity window so the FULL
+    // acceptor pipeline (cert/sig verify included) admits a self-deposit.
+    // ---------------------------------------------------------------
+    struct TestSelfRelayCtx {
+        /// Whether this node currently serves (is opted in + joined for) the
+        /// community — the gate a self-hold must honor.
+        serves: bool,
+        /// Insert-once record of what was held.
+        store: Arc<std::sync::Mutex<BTreeMap<String, RelayHoldEntry>>>,
+    }
+
+    #[async_trait]
+    impl RelayDepositCtx for TestSelfRelayCtx {
+        fn relay_device_id(&self) -> String {
+            "self-relay-dev".into()
+        }
+        async fn serves_community(&self, _c: &SpaceId) -> bool {
+            self.serves
+        }
+        async fn both_co_members(&self, _c: &SpaceId, _s: &[u8; 16], _r: &[u8; 16]) -> bool {
+            true
+        }
+        fn now_secs(&self) -> u64 {
+            // Same fixed value the acceptor tests use — within mint_test_owner's
+            // cert validity window (real wall-clock would read the cert expired).
+            1_700_000_100
+        }
+        async fn mint_hlc(&self) -> Hlc {
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "self-relay-dev".into(),
+            }
+        }
+        async fn persist_hold(
+            &self,
+            key: String,
+            entry: RelayHoldEntry,
+        ) -> Result<RelayPersistVerdict, String> {
+            let mut s = self.store.lock().unwrap();
+            if s.contains_key(&key) {
+                return Ok(RelayPersistVerdict::Duplicate);
+            }
+            s.insert(key, entry);
+            Ok(RelayPersistVerdict::Inserted)
+        }
+    }
+
+    /// Build a deposit client whose SENDER is a real minted owner (valid
+    /// Master-issued cert + enrolled device key) wired with a mock self-relay
+    /// ctx (`serves` toggles the opt-in gate). A valid identity is required
+    /// because the self-hold runs the full acceptor pipeline. Returns the
+    /// client + the record of what the ctx held.
+    fn deposit_client_self_minted(
+        sender: &TestOwner,
+        recipient: [u8; 16],
+        relay_resolver: Arc<CommunityRelayResolver>,
+        dial: Arc<dyn RelayDepositDial>,
+        cas: Arc<dyn crate::content_store::ContentStore>,
+        community_byte: u8,
+        serves: bool,
+    ) -> (
+        ProdCommunityRelayDepositClient,
+        Arc<std::sync::Mutex<BTreeMap<String, RelayHoldEntry>>>,
+    ) {
+        let store = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let ctx: Arc<dyn RelayDepositCtx> = Arc::new(TestSelfRelayCtx {
+            serves,
+            store: Arc::clone(&store),
+        });
+        let community = SpaceId([community_byte; 16]);
+        let client = ProdCommunityRelayDepositClient {
+            butler_resolver: Arc::new(FakeButlerSetResolve {
+                targets: vec![target(0xAA)],
+            }),
+            relay_resolver,
+            dial,
+            cas,
+            sender_owner: sender.owner.0,
+            enrollment_cert_bytes: harmony_owner::cbor::to_canonical(&sender.cert)
+                .expect("encode sender cert"),
+            device_signing_key: Arc::new(sender.device_key.clone()),
+            crdt_state: crdt_with_spaces(&[(community_byte, SpaceKind::Community)]),
+            membership: fake(&[(community, sender.owner.0), (community, recipient)]),
+            local_relay_ctx: Some(ctx),
+        };
+        (client, store)
+    }
 
     fn space(b: u8) -> SpaceId {
         SpaceId([b; 16])
@@ -2323,30 +2422,28 @@ mod tests {
     async fn deposit_self_relay_holds_locally_without_dialing() {
         // The ONLY relay advertiser for the community is THIS node itself
         // (relay vk == our device signing vk). Pre-fix, the fan-out iroh-dialed
-        // our own endpoint (rejected) and nothing was held. Now we persist B's
-        // sealed copy into our own rung with NO dial. deposit → true, zero
-        // dials, one entry held for the recipient.
-        let sender = [0x01; 16];
+        // our own endpoint (rejected) and nothing was held. Now we hold B's
+        // sealed copy in our own rung via the full acceptor pipeline with NO
+        // dial. deposit → true, zero dials, one entry held for the recipient.
+        let sender = mint_test_owner(0x51);
         let recipient = [0x02; 16];
         let community_byte = 0xC1;
         let community = SpaceId([community_byte; 16]);
         let cid = ContentId::from_bytes([0x33; 32]);
         let calls = Arc::new(AtomicUsize::new(0));
+        let self_vk = sender.device_key.verifying_key().to_bytes();
 
-        let (client, hold_doc) = deposit_client_with_local(
-            Arc::new(FakeButlerSetResolve {
-                targets: vec![target(0xAA)],
-            }),
-            relay_resolver_with_vks(&[(community_byte, 0x0A, self_relay_vk())], TEST_NOW),
+        let (client, store) = deposit_client_self_minted(
+            &sender,
+            recipient,
+            relay_resolver_with_vks(&[(community_byte, 0x0A, self_vk)], TEST_NOW),
             Arc::new(MockDial {
                 acking: HashSet::new(), // dialing ourselves must never happen
                 calls: calls.clone(),
             }),
             cas_with_blob(&cid, vec![1, 2, 3]).await,
-            sender,
-            crdt_with_spaces(&[(community_byte, SpaceKind::Community)]),
-            fake(&[(community, sender), (community, recipient)]),
-            community,
+            community_byte,
+            true, // opted in
         );
 
         assert!(
@@ -2358,12 +2455,54 @@ mod tests {
             0,
             "a self relay is held locally, never dialed"
         );
-        let doc = hold_doc.lock().await;
-        assert_eq!(doc.entries.len(), 1, "exactly one sealed copy held");
-        let entry = doc.entries.values().next().unwrap();
+        let held = store.lock().unwrap();
+        assert_eq!(held.len(), 1, "exactly one sealed copy held");
+        let entry = held.values().next().unwrap();
         assert_eq!(entry.recipient_owner, recipient);
-        assert_eq!(entry.sender_owner, sender);
+        assert_eq!(entry.sender_owner, sender.owner.0);
         assert_eq!(entry.community_id, community);
+    }
+
+    #[tokio::test]
+    async fn deposit_self_hold_rejected_when_opted_out() {
+        // ZEB-524 (Qodo): a self relay that is OPTED OUT (`serves_community` =
+        // false) must NOT hold — else deposit would report success but our own
+        // pull acceptor would refuse to serve it, a silent delivery failure.
+        // Because the self-hold runs the full acceptor pipeline, the opt-in gate
+        // rejects it exactly as a dialed-in deposit to an opted-out host would.
+        let sender = mint_test_owner(0x51);
+        let recipient = [0x02; 16];
+        let community_byte = 0xC1;
+        let cid = ContentId::from_bytes([0x33; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let self_vk = sender.device_key.verifying_key().to_bytes();
+
+        let (client, store) = deposit_client_self_minted(
+            &sender,
+            recipient,
+            relay_resolver_with_vks(&[(community_byte, 0x0A, self_vk)], TEST_NOW),
+            Arc::new(MockDial {
+                acking: HashSet::new(),
+                calls: calls.clone(),
+            }),
+            cas_with_blob(&cid, vec![1, 2, 3]).await,
+            community_byte,
+            false, // OPTED OUT — but the self-ad is still fresh in the resolver
+        );
+
+        assert!(
+            !client.deposit(&req(recipient, cid)).await,
+            "opted-out self relay must not hold → false"
+        );
+        assert!(
+            store.lock().unwrap().is_empty(),
+            "nothing held when opted out (no silent delivery failure)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a self relay is never dialed"
+        );
     }
 
     #[tokio::test]
@@ -2417,21 +2556,20 @@ mod tests {
         // A distinct host advertises but is unreachable; this node also
         // advertises. The distinct host is tried first (fails), then we fall
         // back to a local self-hold. deposit → true, one (failed) dial, one held.
-        let sender = [0x01; 16];
+        let sender = mint_test_owner(0x51);
         let recipient = [0x02; 16];
         let community_byte = 0xC1;
-        let community = SpaceId([community_byte; 16]);
         let cid = ContentId::from_bytes([0x33; 32]);
         let calls = Arc::new(AtomicUsize::new(0));
+        let self_vk = sender.device_key.verifying_key().to_bytes();
 
-        let (client, hold_doc) = deposit_client_with_local(
-            Arc::new(FakeButlerSetResolve {
-                targets: vec![target(0xAA)],
-            }),
+        let (client, store) = deposit_client_self_minted(
+            &sender,
+            recipient,
             relay_resolver_with_vks(
                 &[
-                    (community_byte, 0x0A, self_relay_vk()), // self
-                    (community_byte, 0x0B, [0x0B; 32]),      // distinct host
+                    (community_byte, 0x0A, self_vk),    // self
+                    (community_byte, 0x0B, [0x0B; 32]), // distinct host
                 ],
                 TEST_NOW,
             ),
@@ -2440,10 +2578,8 @@ mod tests {
                 calls: calls.clone(),
             }),
             cas_with_blob(&cid, vec![1, 2, 3]).await,
-            sender,
-            crdt_with_spaces(&[(community_byte, SpaceKind::Community)]),
-            fake(&[(community, sender), (community, recipient)]),
-            community,
+            community_byte,
+            true, // opted in
         );
 
         assert!(client.deposit(&req(recipient, cid)).await);
@@ -2453,7 +2589,7 @@ mod tests {
             "distinct host dialed once (failed); the self relay is not dialed"
         );
         assert_eq!(
-            hold_doc.lock().await.entries.len(),
+            store.lock().unwrap().len(),
             1,
             "fell back to a local self-hold"
         );
