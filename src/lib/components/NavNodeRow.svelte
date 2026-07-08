@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { NavNode, DisplayMode, SortOrder } from '../types';
   import { navPaletteColor } from '../nav-utils';
+  import { appliedTheme } from '../theme-service';
   import Avatar from './Avatar.svelte';
 
   const DISPLAY_MODE_CYCLE: DisplayMode[] = ['text', 'icon', 'both'];
@@ -54,6 +55,12 @@
   let showSortMenu = $state(false);
 
   let paddingLeft = $derived(colorAncestry.length * 4 + 8);
+  // Color-band hex per ancestry index, theme-reactive (ZEB-645): void
+  // $appliedTheme re-runs the map on a flip (navPaletteColor -> tokenColor).
+  let bandColors = $derived.by(() => {
+    void $appliedTheme;
+    return colorAncestry.map(navPaletteColor);
+  });
   // ZEB-600: whether to show the "online" presence dot for this node.
   let showPresenceDot = $derived(presenceOnline?.(node) ?? false);
 
@@ -111,10 +118,10 @@
   onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleClick(e); }}
 >
   <!-- Color bands -->
-  {#each colorAncestry as colorIdx, i}
+  {#each bandColors as bandColor, i}
     <span
       class="color-band"
-      style="left: {i * 4}px; background: {navPaletteColor(colorIdx)}"
+      style="left: {i * 4}px; background: {bandColor}"
     ></span>
   {/each}
 

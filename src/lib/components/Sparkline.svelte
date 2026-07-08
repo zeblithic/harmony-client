@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { RingBuffer } from '../ring-buffer';
   import { tokenColor } from '../theme-colors';
+  import { appliedTheme } from '../theme-service';
 
   let {
     data,
@@ -19,8 +20,12 @@
   } = $props();
 
   // Resolve the default at render time (not the init-time prop default) so a
-  // theme switch repaints an uncolored sparkline.
-  let strokeColor = $derived(color ?? tokenColor('--presence-online'));
+  // theme switch repaints an uncolored sparkline. void $appliedTheme makes the
+  // derived re-run on a flip — tokenColor() isn't reactive on its own (ZEB-645).
+  let strokeColor = $derived.by(() => {
+    void $appliedTheme;
+    return color ?? tokenColor('--presence-online');
+  });
 
   let points = $derived.by(() => {
     const values = data.toArray();

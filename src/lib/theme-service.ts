@@ -40,6 +40,12 @@ export function resolveTheme(pref: ThemePreference): ResolvedTheme {
 }
 
 const preferenceWritable: Writable<ThemePreference> = writable('system');
+// ZEB-645: the RESOLVED theme as a reactive store. tokenColor() cannot be a
+// rune, so $derived colors that call it have no reactive dependency on the
+// theme and keep the previous theme's value after a switch. Referencing this
+// store in those deriveds makes a flip invalidate them. Set in applyResolved
+// AFTER the cache-clear event, so a re-running derived reads fresh values.
+const appliedThemeWritable: Writable<ResolvedTheme> = writable('light');
 let connectedOwnerId: string | null = null;
 let currentPreference: ThemePreference = 'system';
 let mediaCleanup: (() => void) | null = null;
@@ -52,6 +58,10 @@ function applyResolved(theme: ResolvedTheme): void {
     // Sandboxed WebView storage failure is non-fatal; the theme still applies.
   }
   document.dispatchEvent(new CustomEvent(THEME_APPLIED_EVENT, { detail: theme }));
+  // Signal reactive consumers AFTER the event above has cleared tokenColor's
+  // cache, so a $derived re-running on this change reads the new theme's hex.
+  // writable's safe_not_equal guard means same-theme re-applies don't notify.
+  appliedThemeWritable.set(theme);
 }
 
 function applyPreference(pref: ThemePreference): void {
@@ -124,11 +134,17 @@ export function setThemePreference(pref: ThemePreference): void {
 
 export const themePreference: Readable<ThemePreference> = preferenceWritable;
 
+/** ZEB-645: resolved theme ('light' | 'dark') as a store. Reference it in a
+ *  token-color `$derived` (e.g. `void $appliedTheme;`) so the derived re-runs
+ *  when the theme flips. Value-less by intent — only its CHANGES matter. */
+export const appliedTheme: Readable<ResolvedTheme> = appliedThemeWritable;
+
 /** Test-only reset. */
 export function _resetThemeServiceForTest(): void {
   connectedOwnerId = null;
   currentPreference = 'system';
   preferenceWritable.set('system');
+  appliedThemeWritable.set('light');
   if (mediaCleanup !== null) {
     mediaCleanup();
     mediaCleanup = null;

@@ -4,6 +4,7 @@
   import { generateIdenticon } from '../identicon';
   import { heatToColor, linkUtilizationColor } from '../graph-utils';
   import { tokenColor } from '../theme-colors';
+  import { appliedTheme } from '../theme-service';
   import Sparkline from './Sparkline.svelte';
   import { RingBuffer } from '../ring-buffer';
 
@@ -32,7 +33,13 @@
       : node.address,
   );
 
-  let statusColor = $derived(heatToColor(node.heatPercent, node.status, node.isLocal));
+  // void $appliedTheme re-runs the token-color deriveds on a theme flip
+  // (heatToColor / sparklineColor / linkUtilizationColor call the non-reactive
+  // tokenColor; ZEB-645).
+  let statusColor = $derived.by(() => {
+    void $appliedTheme;
+    return heatToColor(node.heatPercent, node.status, node.isLocal);
+  });
 
   let hopLabel = $derived(
     node.hopDistance === 0 ? 'local' : node.hopDistance === 1 ? '1 hop' : `${node.hopDistance} hops`,
@@ -69,21 +76,27 @@
     return buf;
   });
 
-  let cpuColor = $derived(sparklineColor(node.metrics.cpuPercent));
+  let cpuColor = $derived.by(() => { void $appliedTheme; return sparklineColor(node.metrics.cpuPercent); });
   let memPercent = $derived(
     (node.metrics.memoryUsedBytes / node.metrics.memoryTotalBytes) * 100,
   );
-  let memColor = $derived(sparklineColor(memPercent));
+  let memColor = $derived.by(() => { void $appliedTheme; return sparklineColor(memPercent); });
   let diskPercent = $derived(
     (node.metrics.diskUsedBytes / node.metrics.diskTotalBytes) * 100,
   );
-  let diskColor = $derived(sparklineColor(diskPercent));
+  let diskColor = $derived.by(() => { void $appliedTheme; return sparklineColor(diskPercent); });
 
   let connectedLinks = $derived(
     links.filter(
       (l) => l.source === node.address || l.target === node.address,
     ),
   );
+
+  // Per-link utilization colors, theme-reactive (ZEB-645).
+  let linkColors = $derived.by(() => {
+    void $appliedTheme;
+    return connectedLinks.map((l) => linkUtilizationColor(l.utilizationPercent));
+  });
 
   function sparklineColor(value: number): string {
     if (value < 60) return tokenColor('--presence-online');
@@ -193,7 +206,7 @@
   <div class="links-section">
     <h3 class="links-heading">Links ({connectedLinks.length})</h3>
     <ul class="links-list">
-      {#each connectedLinks as link}
+      {#each connectedLinks as link, i}
         <li>
           <button
             class="link-item"
@@ -202,7 +215,7 @@
           >
             <span class="link-type">{link.interfaceType.toUpperCase()}</span>
             <span class="link-stats">
-              <span style="color: {linkUtilizationColor(link.utilizationPercent)}">{formatPercent(link.utilizationPercent)}</span>
+              <span style="color: {linkColors[i]}">{formatPercent(link.utilizationPercent)}</span>
               · {Math.round(link.latencyMs)}ms
             </span>
           </button>
