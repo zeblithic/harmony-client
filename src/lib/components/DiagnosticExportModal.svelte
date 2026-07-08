@@ -157,10 +157,10 @@
     margin-top: 1rem;
   }
   .error {
-    color: crimson;
+    color: var(--danger);
   }
   .toast {
-    color: lightgreen;
+    color: var(--success);
     margin-top: 0.5rem;
   }
 </style>

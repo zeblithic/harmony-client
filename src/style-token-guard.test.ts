@@ -39,8 +39,12 @@ const CSS_COMMENT = /\/\*[\s\S]*?\*\//g;
 const COLOR_FN =
   /\b(?:rgb|rgba|hsl|hsla|oklch|oklab|lab|lch|hwb|color-mix)\(((?:[^()]|\([^()]*\))*)\)/gi;
 const HEX = /#[0-9a-f]{3,8}\b/gi;
+// ZEB-658: expanded to catch `crimson` (+ light/dark red/green/blue and ~25 other
+// common CSS named colors) after the audit found 5 uncounted `crimson` literals
+// slipping the budget-0 ratchet. Value-position boundaries keep English-word
+// colors (`tan`, `plum`, `lime`) from false-positiving on property names.
 const NAMED =
-  /(?<=[:\s,(])(?:white|black|red|green|blue|yellow|orange|purple|pink|(?:dark|light)?gr[ae]y)(?=[\s;,)}!])/gi;
+  /(?<=[:\s,(])(?:(?:dark|light)?(?:red|green|blue|gr[ae]y)|white|black|yellow|orange|purple|pink|crimson|coral|salmon|tomato|gold|khaki|olive|lime|teal|cyan|aqua|navy|indigo|violet|magenta|fuchsia|maroon|brown|tan|beige|ivory|silver|turquoise|orchid|plum|lavender)(?=[\s;,)}!])/gi;
 
 // A color function only counts as raw if its arguments carry raw color
 // components. `color-mix(in srgb, var(--accent) 15%, transparent)` is
@@ -116,5 +120,38 @@ describe('style token guard', () => {
     }
 
     expect(problems, `\n${problems.join('\n')}\n`).toEqual([]);
+  });
+});
+
+describe('named-color detection (ZEB-658)', () => {
+  const wrap = (css: string) => `<style>${css}</style>`;
+
+  it('counts crimson + lightgreen (previously missed by the regex)', () => {
+    expect(countRawColors(wrap('.a { color: crimson; }'))).toBe(1);
+    expect(countRawColors(wrap('.a { color: lightgreen; }'))).toBe(1);
+  });
+
+  it('counts the newly-added common named colors', () => {
+    for (const c of [
+      'coral', 'salmon', 'tomato', 'gold', 'khaki', 'olive', 'teal', 'navy',
+      'indigo', 'maroon', 'turquoise', 'orchid', 'plum', 'lavender',
+    ]) {
+      expect(countRawColors(wrap(`.a { color: ${c}; }`)), c).toBe(1);
+    }
+  });
+
+  it('still ignores compositional keywords and token references', () => {
+    expect(countRawColors(wrap('.a { color: transparent; background: currentcolor; }'))).toBe(0);
+    expect(countRawColors(wrap('.a { color: var(--danger); }'))).toBe(0);
+    expect(countRawColors(wrap('.a { background: color-mix(in srgb, var(--accent) 20%, transparent); }'))).toBe(0);
+  });
+
+  it('does not false-positive on tan()/white-space (value-boundary guard)', () => {
+    expect(countRawColors(wrap('.a { transform: rotate(tan(45deg)); }'))).toBe(0);
+    expect(countRawColors(wrap('.a { white-space: nowrap; }'))).toBe(0);
+  });
+
+  it('counts a color-mix that carries a raw named color', () => {
+    expect(countRawColors(wrap('.a { background: color-mix(in srgb, teal 20%, white); }'))).toBe(1);
   });
 });
