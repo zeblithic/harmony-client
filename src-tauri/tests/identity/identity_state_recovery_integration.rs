@@ -2,7 +2,7 @@
 
 #![cfg(feature = "test-fixtures")]
 
-mod common;
+use crate::common;
 
 use common::set_env;
 use harmony_app::backup_state;

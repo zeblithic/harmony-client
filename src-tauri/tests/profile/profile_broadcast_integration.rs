@@ -12,7 +12,7 @@
 //!
 //! Spec §11.3.
 
-mod common;
+use crate::common;
 
 use common::profile_fixtures::{
     build_test_owner_identity, fixture_hlc, fixture_space_id, mock_profile_broadcast,

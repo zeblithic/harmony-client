@@ -10,7 +10,7 @@
 //! All calls use the `_with_keychain(None)` injected variants so the tests
 //! never read or write the developer's real OS keychain entry.
 
-mod common;
+use crate::common;
 
 use common::set_env;
 use harmony_app::{identity, identity_commands, recovery_cli};

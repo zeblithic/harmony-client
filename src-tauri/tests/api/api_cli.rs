@@ -6,7 +6,7 @@
 // full-node flow). ZEB-428 hermetic: tempdir HOME + HARMONY_PASSPHRASE,
 // and no node is ever started so no identity is written anywhere.
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, Mutex};
 

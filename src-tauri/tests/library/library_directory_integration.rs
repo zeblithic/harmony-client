@@ -26,7 +26,7 @@
 
 #![cfg(feature = "test-fixtures")]
 
-mod common;
+use crate::common;
 
 use harmony_app::community_invite::{
     encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, MaterializedCommunityState,
