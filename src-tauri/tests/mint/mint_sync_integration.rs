@@ -1,4 +1,11 @@
 //! Two-engine convergence tests for Mint Phase 2 sync.
+//!
+//! ZEB-442: uses `MintSyncEngine::*_for_test` (gated behind
+//! `feature = "test-fixtures"`), so the module self-gates — matching the
+//! sibling harness modules — so the consolidated `mint_tests` binary still
+//! builds feature-off instead of failing on the unresolved fixtures-only
+//! import.
+#![cfg(feature = "test-fixtures")]
 
 use harmony_app::content_store::InMemoryStub;
 use harmony_app::mint::{
