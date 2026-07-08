@@ -81,11 +81,6 @@
     background: var(--danger-muted);
   }
 
-  .confirm-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
   .cancel-btn:focus-visible,
   .confirm-btn:focus-visible {
     outline: 2px solid var(--accent);
