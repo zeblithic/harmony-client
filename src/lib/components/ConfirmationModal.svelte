@@ -34,6 +34,7 @@
 <style>
   .modal-title {
     color: var(--text-primary);
+    font-family: var(--font-display);
     font-size: 1rem;
     margin: 0 0 12px;
   }
@@ -54,17 +55,17 @@
     color: var(--text-primary);
     border: none;
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.875rem;
   }
   .confirm-btn.danger { background: var(--danger-muted); }
   .cancel-btn {
-    background: var(--bg-tertiary);
+    background: var(--surface-raised);
     color: var(--text-secondary);
-    border: none;
+    border: 1px solid var(--border);
     padding: 8px 16px;
-    border-radius: 4px;
+    border-radius: 7px;
     cursor: pointer;
     font-size: 0.875rem;
   }

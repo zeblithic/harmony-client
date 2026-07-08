@@ -58,10 +58,14 @@
     z-index: 1000;
   }
   .modal {
-    background: var(--bg-secondary);
+    /* ZEB-656: Commons elevation — warm raised paper + soft shadow, matching
+       the already-aligned governance/GovConfirmModal. App-wide: every
+       Modal-based dialog gains this lift. Radius (8px) + border already correct. */
+    background: var(--surface-raised);
     padding: 24px;
     border-radius: 8px;
     max-width: 480px;
     border: 1px solid var(--border);
+    box-shadow: var(--shadow-e2);
   }
 </style>
