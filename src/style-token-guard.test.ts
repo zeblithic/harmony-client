@@ -39,12 +39,47 @@ const CSS_COMMENT = /\/\*[\s\S]*?\*\//g;
 const COLOR_FN =
   /\b(?:rgb|rgba|hsl|hsla|oklch|oklab|lab|lch|hwb|color-mix)\(((?:[^()]|\([^()]*\))*)\)/gi;
 const HEX = /#[0-9a-f]{3,8}\b/gi;
-// ZEB-658: expanded to catch `crimson` (+ light/dark red/green/blue and ~25 other
-// common CSS named colors) after the audit found 5 uncounted `crimson` literals
-// slipping the budget-0 ratchet. Value-position boundaries keep English-word
-// colors (`tan`, `plum`, `lime`) from false-positiving on property names.
-const NAMED =
-  /(?<=[:\s,(])(?:(?:dark|light)?(?:red|green|blue|gr[ae]y)|white|black|yellow|orange|purple|pink|crimson|coral|salmon|tomato|gold|khaki|olive|lime|teal|cyan|aqua|navy|indigo|violet|magenta|fuchsia|maroon|brown|tan|beige|ivory|silver|turquoise|orchid|plum|lavender)(?=[\s;,)}!])/gi;
+// ZEB-658: the guard's named-color regex used to be a hand-picked subset that
+// silently missed colors like `crimson`, `hotpink`, `steelblue` — a raw color
+// could slip the budget-0 ratchet entirely (the audit found 5 uncounted
+// `crimson` literals). Enumerate the *complete* CSS Color Module Level 4 named
+// set instead, so the guard has no blind spots (CodeRabbit #420).
+// `transparent`/`currentcolor` are intentionally excluded — compositional
+// keywords, not themeable colors. The value-position boundaries in NAMED keep
+// English-word colors (`tan`, `plum`, `lime`) from matching property names like
+// `white-space`, and stop `green` from matching inside `darkgreen`.
+const CSS_NAMED_COLORS = [
+  'aliceblue', 'antiquewhite', 'aqua', 'aquamarine', 'azure', 'beige', 'bisque',
+  'black', 'blanchedalmond', 'blue', 'blueviolet', 'brown', 'burlywood', 'cadetblue',
+  'chartreuse', 'chocolate', 'coral', 'cornflowerblue', 'cornsilk', 'crimson', 'cyan',
+  'darkblue', 'darkcyan', 'darkgoldenrod', 'darkgray', 'darkgreen', 'darkgrey',
+  'darkkhaki', 'darkmagenta', 'darkolivegreen', 'darkorange', 'darkorchid', 'darkred',
+  'darksalmon', 'darkseagreen', 'darkslateblue', 'darkslategray', 'darkslategrey',
+  'darkturquoise', 'darkviolet', 'deeppink', 'deepskyblue', 'dimgray', 'dimgrey',
+  'dodgerblue', 'firebrick', 'floralwhite', 'forestgreen', 'fuchsia', 'gainsboro',
+  'ghostwhite', 'gold', 'goldenrod', 'gray', 'green', 'greenyellow', 'grey', 'honeydew',
+  'hotpink', 'indianred', 'indigo', 'ivory', 'khaki', 'lavender', 'lavenderblush',
+  'lawngreen', 'lemonchiffon', 'lightblue', 'lightcoral', 'lightcyan',
+  'lightgoldenrodyellow', 'lightgray', 'lightgreen', 'lightgrey', 'lightpink',
+  'lightsalmon', 'lightseagreen', 'lightskyblue', 'lightslategray', 'lightslategrey',
+  'lightsteelblue', 'lightyellow', 'lime', 'limegreen', 'linen', 'magenta', 'maroon',
+  'mediumaquamarine', 'mediumblue', 'mediumorchid', 'mediumpurple', 'mediumseagreen',
+  'mediumslateblue', 'mediumspringgreen', 'mediumturquoise', 'mediumvioletred',
+  'midnightblue', 'mintcream', 'mistyrose', 'moccasin', 'navajowhite', 'navy', 'oldlace',
+  'olive', 'olivedrab', 'orange', 'orangered', 'orchid', 'palegoldenrod', 'palegreen',
+  'paleturquoise', 'palevioletred', 'papayawhip', 'peachpuff', 'peru', 'pink', 'plum',
+  'powderblue', 'purple', 'rebeccapurple', 'red', 'rosybrown', 'royalblue', 'saddlebrown',
+  'salmon', 'sandybrown', 'seagreen', 'seashell', 'sienna', 'silver', 'skyblue',
+  'slateblue', 'slategray', 'slategrey', 'snow', 'springgreen', 'steelblue', 'tan', 'teal',
+  'thistle', 'tomato', 'turquoise', 'violet', 'wheat', 'white', 'whitesmoke', 'yellow',
+  'yellowgreen',
+];
+// Longest-first so alternation prefers e.g. `darkgreen` over `green` at a shared
+// start (the right-boundary lookahead already forces this, but it's belt-and-braces).
+const NAMED = new RegExp(
+  `(?<=[:\\s,(])(?:${[...CSS_NAMED_COLORS].sort((a, b) => b.length - a.length).join('|')})(?=[\\s;,)}!])`,
+  'gi',
+);
 
 // A color function only counts as raw if its arguments carry raw color
 // components. `color-mix(in srgb, var(--accent) 15%, transparent)` is
