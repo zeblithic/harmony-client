@@ -206,7 +206,7 @@
   .ballot-footer { margin-top: 0.75rem; display: flex; justify-content: flex-end; gap: 0.75rem; align-items: center; }
   .ballot-footer button {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border: 0;
     padding: 0.35rem 0.9rem;
     border-radius: 3px;

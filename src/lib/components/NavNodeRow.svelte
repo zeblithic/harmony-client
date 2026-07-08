@@ -252,7 +252,7 @@
     height: 20px;
     border-radius: 6px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-size: 11px;
     font-weight: 700;
     display: flex;
@@ -368,7 +368,7 @@
 
   .unread-badge {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-size: 11px;
     font-weight: 700;
     padding: 1px 6px;

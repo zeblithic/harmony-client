@@ -101,7 +101,7 @@
   .spacer { flex: 1; }
   .confirm-btn {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border: none;
     padding: 8px 16px;
     border-radius: 7px;

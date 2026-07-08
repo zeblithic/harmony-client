@@ -758,7 +758,7 @@
     height: 28px;
     border-radius: 50%;
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -880,7 +880,7 @@
     height: 30px;
     border-radius: 8px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-family: var(--font-display);
     font-weight: 600;
   }

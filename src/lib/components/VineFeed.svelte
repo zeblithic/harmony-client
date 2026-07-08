@@ -293,7 +293,7 @@
     align-items: center;
     gap: 4px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border: none;
     padding: 6px 12px;
     border-radius: 6px;
@@ -390,7 +390,7 @@
     align-items: center;
     gap: 6px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border: none;
     padding: 8px 16px;
     border-radius: 6px;

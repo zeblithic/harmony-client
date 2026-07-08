@@ -347,7 +347,7 @@
   }
   .tier-badge[data-power="100"] {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
   }
   /* Moderator: power >= 50 but not 100 — handled via data attribute fallback */
   .tier-badge:not([data-status="banned"]):not([data-power="100"]) {

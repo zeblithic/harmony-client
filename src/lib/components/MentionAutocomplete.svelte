@@ -77,5 +77,6 @@
   .option.active button,
   .option button:hover {
     background: var(--accent);
+    color: var(--on-accent);
   }
 </style>

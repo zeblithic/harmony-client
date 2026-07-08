@@ -14,6 +14,8 @@
   --text-muted: #767a6c;
   --accent: #466b4c;
   --accent-hover: #2f4a35;
+  /* ZEB-644: AA foreground for --accent / --accent-hover fills (white on light sage = 6.05:1). */
+  --on-accent: #ffffff;
   --danger: #b1402f;
   --border: #e3ddcf;
 
@@ -181,6 +183,9 @@
   --text-muted: #8f897a;
   --accent: #7fa886;
   --accent-hover: #97bd9d;
+  /* ZEB-644: AA foreground for --accent / --accent-hover fills (near-black on light sage:
+     6.74:1 on --accent, 8.76:1 on --accent-hover). Matches --status-passed-fg. */
+  --on-accent: #14160f;
   --danger: #d98377;
   --border: #38342c;
 

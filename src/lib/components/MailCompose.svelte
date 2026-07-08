@@ -203,7 +203,7 @@
     border: none;
     border-radius: 5px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     cursor: pointer;
     font-size: 0.875rem;
   }

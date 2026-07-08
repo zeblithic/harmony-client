@@ -114,7 +114,7 @@
   }
   .btn-accept {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
   .btn-accept:hover {
     filter: brightness(1.1);

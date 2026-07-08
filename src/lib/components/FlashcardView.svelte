@@ -639,7 +639,7 @@
 
   .hint-toggle.active {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border-color: var(--accent);
   }
 

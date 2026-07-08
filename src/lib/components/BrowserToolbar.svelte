@@ -124,7 +124,7 @@
 
   .section-btn.active {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border-color: var(--accent);
   }
 
@@ -173,7 +173,7 @@
 
   .view-btn[aria-pressed='true'] {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border-color: var(--accent);
   }
 
@@ -194,7 +194,7 @@
 
   .action-btn.active {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border-color: var(--accent);
   }
 

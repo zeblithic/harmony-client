@@ -252,7 +252,7 @@
 
   .dialog-actions button:last-child {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
   }
 
   .dialog-actions button:disabled {

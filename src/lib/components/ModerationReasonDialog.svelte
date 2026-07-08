@@ -178,7 +178,7 @@
   }
   .primary-btn.unban {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
   }
   .primary-btn:disabled {
     opacity: 0.55;

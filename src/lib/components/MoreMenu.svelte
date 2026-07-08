@@ -198,6 +198,7 @@
   }
   .more-icon-button:hover {
     background: var(--accent);
+    color: var(--on-accent);
   }
   .more-caret {
     font-size: 0.7rem;

@@ -191,7 +191,7 @@
   .filter-btn.active {
     background: var(--accent);
     border-color: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
 
   .published-list {

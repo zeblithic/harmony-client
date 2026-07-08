@@ -1467,7 +1467,7 @@
   }
   .retry-btn {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border: none;
     padding: 4px 12px;
     border-radius: 4px;

@@ -174,7 +174,7 @@
 
   .publish-btn {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
 
   .publish-btn:hover {

@@ -93,7 +93,7 @@
   .cap-note { color: var(--text-faint); font-size: 0.8rem; margin: 0 0 0.4rem 0; }
   .cap-warning { color: var(--warning); font-size: 0.85rem; }
   .error { color: var(--danger); }
-  button { background: var(--accent); color: var(--text-bright); border: 0; padding: 0.35rem 0.9rem; border-radius: 3px; cursor: pointer; }
+  button { background: var(--accent); color: var(--on-accent); border: 0; padding: 0.35rem 0.9rem; border-radius: 3px; cursor: pointer; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .preview { background: var(--input-bg); padding: 0.6rem; border-left: 3px solid var(--accent); margin: 0; font-style: normal; }
   .caveat { color: var(--text-faint); font-size: 0.8rem; }

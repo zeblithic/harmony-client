@@ -258,7 +258,7 @@
     width: fit-content;
     transition: background 0.15s, color 0.15s;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     border: 1px solid var(--accent);
   }
 

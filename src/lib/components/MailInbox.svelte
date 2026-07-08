@@ -190,7 +190,7 @@
      accent pill beside the folder label — not the stacked CountChip data box. */
   .unread-badge {
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-size: 0.6875rem;
     font-weight: 700;
     padding: 1px 6px;
@@ -203,7 +203,7 @@
     border: none;
     border-radius: 5px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     cursor: pointer;
     font-size: 0.8125rem;
   }

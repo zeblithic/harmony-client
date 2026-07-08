@@ -69,7 +69,7 @@
     height: 30px;
     border-radius: 8px;
     background: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
     font-size: 12px;
     font-weight: 700;
     display: flex;

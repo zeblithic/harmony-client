@@ -278,7 +278,7 @@
   .ctrl.active {
     background: var(--accent);
     border-color: var(--accent);
-    color: var(--text-bright);
+    color: var(--on-accent);
   }
   .ctrl.restrictive {
     background: var(--gov-clay);

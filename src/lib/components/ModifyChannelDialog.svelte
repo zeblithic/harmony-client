@@ -168,7 +168,7 @@
     cursor: pointer; font-size: 0.875rem;
   }
   .cancel-btn { background: var(--bg-tertiary); color: var(--text-secondary); }
-  .confirm-btn { background: var(--accent); color: var(--text-primary); }
+  .confirm-btn { background: var(--accent); color: var(--on-accent); }
   .confirm-btn:disabled, .cancel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .cancel-btn:focus-visible, .confirm-btn:focus-visible {
     outline: 2px solid var(--accent); outline-offset: 1px;

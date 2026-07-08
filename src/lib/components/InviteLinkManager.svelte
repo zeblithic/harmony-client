@@ -120,7 +120,7 @@
   .copy-btn,
   .regen-btn {
     background: var(--accent);
-    color: var(--text-primary);
+    color: var(--on-accent);
     border: none;
     padding: 6px 14px;
     border-radius: 4px;

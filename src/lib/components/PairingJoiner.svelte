@@ -206,7 +206,7 @@
     font-family: var(--font-ui);
     font-size: 0.875rem;
   }
-  .primary { background: var(--accent); color: var(--text-bright); border-color: var(--accent); }
+  .primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
   .secondary { background: var(--bg-tertiary); color: var(--text-secondary); }
   .primary:disabled, .secondary:disabled { opacity: 0.5; cursor: not-allowed; }
   .primary:focus-visible, .secondary:focus-visible {
