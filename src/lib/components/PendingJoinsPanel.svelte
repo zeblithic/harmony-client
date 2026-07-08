@@ -1,8 +1,13 @@
 <script lang="ts">
+    import { onDestroy } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
-    import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-    export let communityId: string;
-    export let canModerate: boolean;
+    import { listen } from '@tauri-apps/api/event';
+    import CountChip from './governance/CountChip.svelte';
+
+    let { communityId, canModerate }: {
+        communityId: string;
+        canModerate: boolean;
+    } = $props();
 
     interface PendingJoinDto {
         eventId: string;
@@ -17,22 +22,24 @@
         countersignedAtHlc: { wallMs: number; logical: number; deviceId: string };
     }
 
-    let pending: PendingJoinDto[] = [];
-    let recent: CounterSignDto[] = [];
-    let convergedUnlisten: UnlistenFn | null = null;
-    let errorMessage = '';
+    let pending: PendingJoinDto[] = $state([]);
+    let recent: CounterSignDto[] = $state([]);
+    let errorMessage = $state('');
     // R3 (M4): start non-loading so the !canModerate branch doesn't flash
     // a transient "Loading…" state. refresh() flips this to true at the
     // start of each fetch (M4 fix).
-    let loading = false;
-    // R4-7: monotonically-increasing token captured at the start of each
-    // refresh(). Out-of-order async responses (e.g., a stale invoke()
-    // still in-flight when communityId / canModerate changes — or when
-    // a converged event triggers a refresh while a manual kickJoiner-
-    // triggered refresh is mid-flight) must NOT overwrite the results
-    // of the latest refresh. Each refresh checks `myCallId === latestCallId`
-    // before committing pending/recent/errorMessage/loading.
+    let loading = $state(false);
+
+    // Non-reactive stale-guard tokens (plain `let`, NOT `$state`): these are
+    // monotonic counters/handles used only inside async guards, never rendered.
+    // R4-7: latestCallId is captured at the start of each refresh(); out-of-order
+    // async responses must not overwrite the results of the latest refresh.
     let latestCallId = 0;
+    // R5-3: latestWatchId is the analogous token for $effect invocations, so a
+    // stale effect (deps changed mid-flight) doesn't register a listener for the
+    // OLD community or clobber convergedUnlisten.
+    let latestWatchId = 0;
+    let convergedUnlisten: (() => void) | null = null;
 
     async function refresh() {
         // R3 (M4): reset loading state at the start of every refresh so
@@ -100,51 +107,36 @@
         return new Date(hlc.wallMs).toLocaleString();
     }
 
-    // R3 (M3): switch from onMount to a reactive statement so the panel
-    // re-fetches when `canModerate` or `communityId` change. onMount only
-    // fires once at component instantiation — if the parent toggles
-    // canModerate (e.g., power-level change observed via state-root sync)
-    // or swaps the displayed community without unmounting, the old
-    // onMount-fetched data would stay stuck. Svelte 4 reactive statement
-    // shape; the project hasn't moved to runes yet for this component.
-    let lastWatchedCanModerate: boolean | undefined = undefined;
-    let lastWatchedCommunityId: string | undefined = undefined;
-    // R5-3: monotonic token for watchDeps() invocations, separate from
-    // latestCallId. Each watchDeps() call captures `myWatchId =
-    // ++latestWatchId` at entry and re-checks it after every `await`
-    // boundary. If a newer watchDeps() invocation has started while we
-    // were awaiting (because canModerate or communityId changed mid-
-    // flight), the stale invocation bails out without registering a
-    // listener for the OLD community / overwriting convergedUnlisten.
-    // Without this, an `await refresh()` can resume after a newer
-    // deps-change has occurred, and the listener registered next would
-    // refresh the wrong panel on later converge events.
-    let latestWatchId = 0;
-    $: void watchDeps(canModerate, communityId);
+    // Teardown of a Tauri unlisten handle must never throw mid-sequence: if it
+    // did, the cleanup/handoff below could abort and leave the converged listener
+    // registered (stale refresh callbacks firing after a deps change/unmount).
+    // Swallow — the listener is being discarded regardless (restores the Svelte-4
+    // original's try/catch teardowns).
+    function safeUnlisten(fn: (() => void) | null | undefined) {
+        try {
+            fn?.();
+        } catch {
+            /* ignore — teardown errors are non-fatal */
+        }
+    }
 
-    async function watchDeps(canMod: boolean, cid: string) {
-        if (canMod === lastWatchedCanModerate && cid === lastWatchedCommunityId) {
-            return;
-        }
+    // R3 (M3): re-fetch when `canModerate` or `communityId` change. Svelte-5
+    // $effect re-runs only when its tracked deps change and cleans up the prior
+    // run first, so it natively replaces the Svelte-4 reactive-statement +
+    // manual `lastWatched*` dedup. The stale-guard tokens below preserve the
+    // original R4-7/R5-3 race protections.
+    $effect(() => {
         const myWatchId = ++latestWatchId;
-        lastWatchedCanModerate = canMod;
-        lastWatchedCommunityId = cid;
-        // Tear down any prior listener before re-registering.
-        if (convergedUnlisten) {
-            try {
-                convergedUnlisten();
-            } catch {
-                /* ignore */
-            }
-            convergedUnlisten = null;
-        }
+        // Read deps synchronously so the effect re-runs when they change.
+        const cid = communityId;
+        const canMod = canModerate;
+
         if (!canMod) {
-            // Non-moderator path: clear any prior data and stop.
-            // R4-7: bump latestCallId so any in-flight refresh (kicked
-            // off before canMod flipped to false) discards its result
-            // when it resolves rather than re-populating pending/recent
-            // for a community the caller is no longer authorized to
-            // moderate.
+            // Non-moderator path: clear any prior data and register no listener.
+            // R4-7: bump latestCallId so any in-flight refresh (kicked off before
+            // canMod flipped to false) discards its result when it resolves rather
+            // than re-populating pending/recent for a community the caller is no
+            // longer authorized to moderate.
             ++latestCallId;
             pending = [];
             recent = [];
@@ -152,55 +144,44 @@
             loading = false;
             return;
         }
-        await refresh();
-        // R5-3: post-refresh stale-check. If a newer watchDeps()
-        // invocation has started while refresh() was awaiting (e.g.,
-        // user switched community or canModerate flipped), abandon
-        // listener registration for the OLD community. The newer
-        // invocation owns convergedUnlisten now.
-        if (
-            myWatchId !== latestWatchId ||
-            cid !== communityId ||
-            canMod !== canModerate ||
-            !canModerate
-        ) {
-            return;
-        }
-        try {
-            const unlisten = await listen('community-state-sync-converged', async (evt) => {
-                const payload = evt.payload as { communityId?: string };
-                if (payload?.communityId === cid) {
-                    await refresh();
-                }
-            });
-            // R5-3: post-listen stale-check. Even after a successful
-            // refresh, the `await listen(...)` itself can race a deps
-            // change. If we are no longer the latest watch, tear down
-            // the listener we just registered (without overwriting
-            // convergedUnlisten — that belongs to the newer invocation).
-            if (
-                myWatchId !== latestWatchId ||
-                cid !== communityId ||
-                canMod !== canModerate ||
-                !canModerate
-            ) {
-                try {
-                    unlisten();
-                } catch {
-                    /* ignore */
-                }
-                return;
-            }
-            convergedUnlisten = unlisten;
-        } catch (e) {
-            // Event listener registration may fail in some test environments —
-            // that's OK; manual refresh still works.
-        }
-    }
 
-    import { onDestroy } from 'svelte';
+        void refresh();
+
+        // R5-3: `cancelled` (per-run) + `myWatchId` guard the async listen()
+        // registration against a deps change that starts a newer effect run while
+        // this listen() promise is still in flight.
+        let cancelled = false;
+        listen('community-state-sync-converged', async (evt) => {
+            if (myWatchId !== latestWatchId) return;
+            const payload = evt.payload as { communityId?: string };
+            if (payload?.communityId === cid) {
+                await refresh();
+            }
+        })
+            .then((unlisten) => {
+                if (cancelled || myWatchId !== latestWatchId) {
+                    safeUnlisten(unlisten);
+                    return;
+                }
+                const prev = convergedUnlisten;
+                convergedUnlisten = unlisten;
+                safeUnlisten(prev);
+            })
+            .catch(() => {
+                // Event listener registration may fail in some test environments —
+                // that's OK; manual refresh still works.
+            });
+
+        return () => {
+            cancelled = true;
+            safeUnlisten(convergedUnlisten);
+            convergedUnlisten = null;
+        };
+    });
+
     onDestroy(() => {
-        convergedUnlisten?.();
+        safeUnlisten(convergedUnlisten);
+        convergedUnlisten = null;
     });
 </script>
 
@@ -210,8 +191,10 @@
             <p class="error">{errorMessage}</p>
         {/if}
 
-        <details open={pending.length > 0}>
-            <summary>Awaiting counter-sign ({pending.length})</summary>
+        <details class="join-section" open={pending.length > 0}>
+            <summary class="section-summary">
+                <CountChip label="Awaiting counter-sign" value={String(pending.length)} tone="neutral" />
+            </summary>
             {#if loading}
                 <p class="muted">Loading…</p>
             {:else if pending.length === 0}
@@ -219,18 +202,22 @@
             {:else}
                 <ul>
                     {#each pending as p (p.eventId)}
-                        <li>
+                        <li class="join-row">
                             <span class="joiner">{p.inviteeHint ?? p.joinerAddr.slice(0, 12)}</span>
                             <span class="time">since {formatHlc(p.pendingAtHlc)}</span>
-                            <button on:click={() => kickJoiner(p.joinerAddr)}>Reject (kick)</button>
+                            <button class="reject-btn" type="button" onclick={() => kickJoiner(p.joinerAddr)}>
+                                Reject (kick)
+                            </button>
                         </li>
                     {/each}
                 </ul>
             {/if}
         </details>
 
-        <details>
-            <summary>Recent joins ({recent.length})</summary>
+        <details class="join-section">
+            <summary class="section-summary">
+                <CountChip label="Recent joins" value={String(recent.length)} tone="neutral" />
+            </summary>
             {#if loading}
                 <p class="muted">Loading…</p>
             {:else if recent.length === 0}
@@ -238,7 +225,7 @@
             {:else}
                 <ul>
                     {#each recent as r (r.joinEventId)}
-                        <li>
+                        <li class="join-row">
                             <span class="joiner">{r.joinerAddr.slice(0, 12)}</span>
                             <span class="time">at {formatHlc(r.countersignedAtHlc)}</span>
                         </li>
@@ -250,34 +237,76 @@
 {/if}
 
 <style>
+    /* ZEB-653: flat panel (the parent CommunitySettingsPanel frames it in a
+       .section with a "Join requests" label; the reference PendingAdminProposalsPanel
+       keeps its panel flat too) — cards live on the rows, not nested on the panel. */
     .pending-joins-panel {
-        margin: 1em 0;
+        margin: 16px 0;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+    .section-summary {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        padding: 4px 0;
     }
     .pending-joins-panel ul {
         list-style: none;
         padding: 0;
-    }
-    .pending-joins-panel li {
-        padding: 0.4em 0;
+        margin: 8px 0 0;
         display: flex;
-        gap: 0.6em;
-        align-items: center;
+        flex-direction: column;
+        gap: 8px;
     }
+    /* Commons card anatomy per join row (surface-raised + border + 8px + e1 shadow). */
+    .join-row {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        padding: 12px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--surface-raised);
+        box-shadow: var(--shadow-e1);
+    }
+    /* Truncated ID + HLC timestamp read as machine data → mono. */
     .joiner {
         font-weight: 600;
+        font-family: var(--font-mono);
     }
     .time {
         color: var(--text-dim);
-        font-size: 0.9em;
+        font-size: 0.8rem;
+        font-family: var(--font-mono);
     }
     .muted {
         color: var(--text-dim);
+        padding: 4px 0;
     }
     .error {
         color: var(--danger-text-muted);
     }
-    summary {
+    /* Destructive inline action — matches the LastAdminWarningDialog convention
+       (--danger-muted fill + --text-bright), rubric 5px radius. */
+    .reject-btn {
+        margin-left: auto;
+        padding: 4px 10px;
+        border: 1px solid var(--danger-muted);
+        border-radius: 5px;
+        background: var(--danger-muted);
+        color: var(--text-bright);
+        font: inherit;
+        font-weight: 600;
         cursor: pointer;
-        padding: 0.4em 0;
+    }
+    .reject-btn:hover {
+        filter: brightness(1.05);
+    }
+    .reject-btn:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 1px;
     }
 </style>
