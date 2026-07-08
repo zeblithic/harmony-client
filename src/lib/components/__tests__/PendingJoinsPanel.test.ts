@@ -103,4 +103,37 @@ describe('PendingJoinsPanel', () => {
             expect(recentLis.length).toBeGreaterThanOrEqual(1);
         });
     });
+
+    test('renders a neutral CountChip with the pending count in the summary', async () => {
+        const { invoke } = await import('@tauri-apps/api/core');
+        (invoke as any).mockImplementation((cmd: string) => {
+            if (cmd === 'list_pending_joins') {
+                return Promise.resolve([
+                    {
+                        eventId: 'aaa',
+                        joinerAddr: '1122334455667788',
+                        pendingAtHlc: { wallMs: 1700000000000, logical: 0, deviceId: '00' },
+                    },
+                    {
+                        eventId: 'bbb',
+                        joinerAddr: '5566778899AABBCC',
+                        pendingAtHlc: { wallMs: 1700000001000, logical: 0, deviceId: '00' },
+                    },
+                ]);
+            }
+            if (cmd === 'list_recent_counter_signs') return Promise.resolve([]);
+            return Promise.resolve(null);
+        });
+        const { container, getByText } = render(PendingJoinsPanel, {
+            props: { communityId: 'abc', canModerate: true },
+        });
+        await waitFor(() => {
+            // ZEB-653: the parenthetical "(N)" count is now a neutral CountChip
+            // (label + mono value) in the section summary.
+            expect(getByText('Awaiting counter-sign')).toBeTruthy();
+            const chip = container.querySelector('details:first-of-type .count-chip');
+            expect(chip?.classList.contains('neutral')).toBe(true);
+            expect(chip?.querySelector('.cc-value')?.textContent).toBe('2');
+        });
+    });
 });
