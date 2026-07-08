@@ -160,8 +160,11 @@
     outline-offset: 2px;
   }
 
+  /* Disconnect variant keeps its own foreground: the base .connect-btn now
+     carries --on-accent (for the accent bg), wrong on the neutral --bg-tertiary. */
   .connect-btn.disconnect {
     background: var(--bg-tertiary);
+    color: var(--text-primary);
   }
 
   .connect-btn:disabled {

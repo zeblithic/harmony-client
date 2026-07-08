@@ -119,8 +119,11 @@
     font-size: 0.875rem;
   }
 
+  /* Destructive variant keeps its own foreground: the base .confirm-btn now
+     carries --on-accent (for the accent bg), wrong on --danger-muted. */
   .confirm-btn.destructive {
     background: var(--danger-muted);
+    color: var(--text-primary);
   }
 
   .confirm-btn:disabled {

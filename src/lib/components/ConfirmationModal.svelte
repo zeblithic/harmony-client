@@ -59,7 +59,9 @@
     cursor: pointer;
     font-size: 0.875rem;
   }
-  .confirm-btn.danger { background: var(--danger-muted); }
+  /* Danger variant keeps its own foreground: the base .confirm-btn now carries
+     --on-accent (for the accent bg), which would be wrong on --danger-muted. */
+  .confirm-btn.danger { background: var(--danger-muted); color: var(--text-primary); }
   .cancel-btn {
     background: var(--surface-raised);
     color: var(--text-secondary);
