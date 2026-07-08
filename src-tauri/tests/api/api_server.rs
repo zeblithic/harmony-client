@@ -21,7 +21,7 @@
 //! test-fixtures builds, so the mint persists through the encrypted-file
 //! fallback (`HARMONY_PASSPHRASE`) inside the tempdir HOME.
 
-mod common;
+use crate::common;
 
 use futures_util::StreamExt;
 use std::sync::{Arc, Mutex};

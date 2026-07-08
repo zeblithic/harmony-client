@@ -20,7 +20,7 @@
 
 #![cfg(feature = "test-fixtures")]
 
-mod common;
+use crate::common;
 
 use harmony_app::library_directory::{
     AnnounceOutcome, AnnounceVerifyError, LibraryDirectory, MAX_ANNOUNCE_WIRE_BYTES,

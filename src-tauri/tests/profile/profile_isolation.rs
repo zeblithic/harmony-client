@@ -8,7 +8,7 @@
 //! ZEB-474: removed `occupied_reticulum_port_degrades_instead_of_failing_boot`
 //! test — it exercised the now-removed Reticulum UDP bind degradation path.
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, Mutex};
 
