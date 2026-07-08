@@ -107,6 +107,19 @@
         return new Date(hlc.wallMs).toLocaleString();
     }
 
+    // Teardown of a Tauri unlisten handle must never throw mid-sequence: if it
+    // did, the cleanup/handoff below could abort and leave the converged listener
+    // registered (stale refresh callbacks firing after a deps change/unmount).
+    // Swallow — the listener is being discarded regardless (restores the Svelte-4
+    // original's try/catch teardowns).
+    function safeUnlisten(fn: (() => void) | null | undefined) {
+        try {
+            fn?.();
+        } catch {
+            /* ignore — teardown errors are non-fatal */
+        }
+    }
+
     // R3 (M3): re-fetch when `canModerate` or `communityId` change. Svelte-5
     // $effect re-runs only when its tracked deps change and cleans up the prior
     // run first, so it natively replaces the Svelte-4 reactive-statement +
@@ -147,12 +160,12 @@
         })
             .then((unlisten) => {
                 if (cancelled || myWatchId !== latestWatchId) {
-                    unlisten();
+                    safeUnlisten(unlisten);
                     return;
                 }
                 const prev = convergedUnlisten;
                 convergedUnlisten = unlisten;
-                prev?.();
+                safeUnlisten(prev);
             })
             .catch(() => {
                 // Event listener registration may fail in some test environments —
@@ -161,13 +174,13 @@
 
         return () => {
             cancelled = true;
-            convergedUnlisten?.();
+            safeUnlisten(convergedUnlisten);
             convergedUnlisten = null;
         };
     });
 
     onDestroy(() => {
-        convergedUnlisten?.();
+        safeUnlisten(convergedUnlisten);
         convergedUnlisten = null;
     });
 </script>
