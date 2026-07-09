@@ -1082,3 +1082,80 @@ describe('NavService — per-channel unread (ZEB-665)', () => {
     expect(c1.unreadLevel).toBe('quiet');
   });
 });
+
+describe('NavService — DM unread + space-change hook (ZEB-666)', () => {
+  function withDm(): NavService {
+    const s = new NavService({ seedMockData: false });
+    s.addOrUpdateNavSpace({
+      action: 'added', spaceId: 'dm1', kind: 'dm', name: 'DM with abcd',
+      members: ['aaaa', 'bbbb'],
+    });
+    s.addOrUpdateNavSpace({
+      action: 'added', spaceId: 'g1', kind: 'group-dm', name: 'Weekend crew',
+      members: ['aaaa', 'bbbb', 'cccc'],
+    });
+    return s;
+  }
+
+  it('setUnread drives a dm node (count + standard level) and clears at 0', () => {
+    const s = withDm();
+    s.setUnread('dm1', 4);
+    const dm = s.nodes.find((n) => n.id === 'dm1')!;
+    expect(dm.unreadCount).toBe(4);
+    expect(dm.unreadLevel).toBe('standard');
+    s.setUnread('dm1', 0);
+    expect(s.nodes.find((n) => n.id === 'dm1')!.unreadLevel).toBe('none');
+  });
+
+  it('setUnread drives a group-chat node', () => {
+    const s = withDm();
+    s.setUnread('g1', 2);
+    const g = s.nodes.find((n) => n.id === 'g1')!;
+    expect(g.unreadCount).toBe(2);
+    expect(g.unreadLevel).toBe('standard');
+  });
+
+  it('setUnread on a DM node never touches community rollup', () => {
+    const s = withDm();
+    s.nodes = [
+      ...s.nodes,
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    s.setUnread('dm1', 7);
+    const c1 = s.nodes.find((n) => n.id === 'c1')!;
+    expect(c1.unreadCount).toBe(0);
+    expect(c1.unreadLevel).toBe('none');
+  });
+
+  it('onDmSpaceChange fires added for dm/group-dm adds and modifies', () => {
+    const s = new NavService({ seedMockData: false });
+    const events: Array<[string, string]> = [];
+    s.onDmSpaceChange = (action, spaceId) => events.push([action, spaceId]);
+    s.addOrUpdateNavSpace({ action: 'added', spaceId: 'dm1', kind: 'dm', name: 'D' });
+    s.addOrUpdateNavSpace({ action: 'modified', spaceId: 'dm1', kind: 'dm', name: 'D2' });
+    s.addOrUpdateNavSpace({ action: 'added', spaceId: 'g1', kind: 'group-dm', name: 'G' });
+    expect(events).toEqual([
+      ['added', 'dm1'],
+      ['added', 'dm1'], // modified self-heals as added; seeding is idempotent
+      ['added', 'g1'],
+    ]);
+  });
+
+  it('onDmSpaceChange fires removed on dm removal', () => {
+    const s = new NavService({ seedMockData: false });
+    const events: Array<[string, string]> = [];
+    s.addOrUpdateNavSpace({ action: 'added', spaceId: 'dm1', kind: 'dm', name: 'D' });
+    s.onDmSpaceChange = (action, spaceId) => events.push([action, spaceId]);
+    s.addOrUpdateNavSpace({ action: 'removed', spaceId: 'dm1', kind: 'dm', name: 'D' });
+    expect(events).toEqual([['removed', 'dm1']]);
+  });
+
+  it('onDmSpaceChange does NOT fire for community payloads', () => {
+    const s = new NavService({ seedMockData: false });
+    const events: Array<[string, string]> = [];
+    s.onDmSpaceChange = (action, spaceId) => events.push([action, spaceId]);
+    s.addOrUpdateNavSpace({ action: 'added', spaceId: 'c1', kind: 'community', name: 'C' });
+    s.addOrUpdateNavSpace({ action: 'removed', spaceId: 'c1', kind: 'community', name: 'C' });
+    expect(events).toEqual([]);
+  });
+});
