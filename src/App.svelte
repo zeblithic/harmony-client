@@ -265,6 +265,8 @@
   let incomingCallAlerter: import('./lib/incoming-call-alert').IncomingCallAlerter | null = null;
   // ZEB-662: mention-notification alerter (created in the Tauri-transport IIFE).
   let mentionAlerter: import('./lib/mention-alert').MentionAlertService | null = null;
+  // ZEB-665: per-channel unread tracker (created in the Tauri-transport IIFE).
+  let channelUnread: import('./lib/channel-unread-service').ChannelUnreadService | null = null;
 
   // ── ZEB-353 Voice V5: SPA-unmount teardown ────────────────────────
   // Leave any active voice channel / end any in-progress DM call when the
@@ -1145,6 +1147,7 @@
     selectedChannelId = target;
     communityService.setSelectedChannel(cid, target);
     navService.clearMention(target); // landing on it marks its mentions seen
+    channelUnread?.markChannelRead(cid, target); // ZEB-665: …and its unread read
   });
   // Count only currently-joined members so the overview matches the
   // "X joined" line in CommunitySettingsPanel — invited/banned/left
@@ -1227,6 +1230,8 @@
     communityActiveView = 'channels';
     // ZEB-663: viewing a channel clears its unseen-mention indicator.
     navService.clearMention(channelId);
+    // ZEB-665: open-clears-all — stamp the read cursor + zero the badge.
+    channelUnread?.markChannelRead(communityId, channelId);
   }
 
   // ZEB-663: nav channel management — gated to the selected community at power
@@ -1442,9 +1447,21 @@
   // direct service refs beyond the three lambdas below.
   const channelNavSync = new ChannelNavSyncService({
     listChannels: (id) => communityService.listChannels(id),
-    setChannels: (id, channels) => navService.setChannels(id, channels),
+    setChannels: (id, channels) => {
+      navService.setChannels(id, channels);
+      // ZEB-665: channels just materialized/re-synced — seed unseen channels'
+      // unread state and re-push known counts onto the (possibly rebuilt) nodes.
+      void channelUnread?.onChannelsMaterialized(id, channels);
+    },
     listCommunityIds: () =>
       navService.nodes.filter((n) => n.type === 'community').map((n) => n.id),
+  });
+  // ZEB-665: (re)connect the unread cursor store when the owner identity lands
+  // (or changes) — pre-identity the store no-ops all reads/writes, and any
+  // channels materialized before this point get re-seeded by connectOwner.
+  $effect(() => {
+    const oid = selfOwnerId;
+    if (oid) channelUnread?.connectOwner(oid);
   });
   // ── Friend service (ZEB-370) ───────────────────────────────────────
   // Same eager-construct / adapter-wired-in-IIFE / destroy-on-unmount
@@ -1883,6 +1900,10 @@
     void mentionAlerter
       ?.onMessage(communityId, channelId, message)
       ?.catch((e) => console.warn('[harmony-client] mention alert failed:', e));
+    // ZEB-665: unread tracking, also for EVERY community. Self-gates on
+    // cursor/author/focused-active (and ingest fires this for list/backfill
+    // deliveries too — the service's ID set dedupes those by design).
+    channelUnread?.onMessage(communityId, channelId, message);
     if (communityId !== selectedCommunityId) return;
     if (rosterHasJoinedAuthor(communityMembers, message.author)) return;
     const now = Date.now();
@@ -2356,6 +2377,40 @@
         fileManagerService.addUnlisten(() => { mentionAlerter = null; });
       } catch (e) {
         console.warn('[harmony-client] mention alerter init failed:', e);
+      }
+
+      // ── ZEB-665: per-channel unread counts. Seeds via list_channel_messages
+      // directly (NOT channelMessageService.listMessages — that would ingest
+      // into the feed cache and re-fire onMessage). Self-gates on cursor,
+      // author, and focused-active; NavService renders the badges.
+      try {
+        const { ChannelUnreadService } = await import('./lib/channel-unread-service');
+        const { LocalStorageUnreadCursorStore } = await import('./lib/unread-cursor-store');
+        channelUnread = new ChannelUnreadService({
+          listMessagesSince: (communityId, channelId, since, limit) =>
+            invoke('list_channel_messages', { communityId, channelId, since, limit }) as Promise<
+              import('./lib/channel-message-service').ChannelMessageDto[]
+            >,
+          setUnread: (channelId, count) => navService.setUnread(channelId, count),
+          // Same "looking right at it" contract as the mention alerter above.
+          isActiveChannel: (communityId, channelId) =>
+            appMode === 'messages' &&
+            selectedCommunityId === communityId &&
+            communityActiveView === 'channels' &&
+            communityService.getSelectedChannel(communityId) === channelId,
+          isFocused: () => document.hasFocus(),
+          selfOwnerId: () => selfOwnerId ?? null,
+          storage: new LocalStorageUnreadCursorStore(),
+          now: () => Date.now(),
+        });
+        // Owner may already be known (the $effect only re-fires on change).
+        if (selfOwnerId) channelUnread.connectOwner(selfOwnerId);
+        fileManagerService.addUnlisten(() => { channelUnread = null; });
+      } catch (e) {
+        console.warn(
+          '[harmony-client] channel-unread init failed:',
+          e instanceof Error ? e.message : String(e),
+        );
       }
 
       // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
