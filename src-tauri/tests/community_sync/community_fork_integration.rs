@@ -295,6 +295,7 @@ async fn run_fork_inner(
             original_community_id,
             forker_addr,
             fork_space_id,
+            "integration-test fork reason".to_string(),
             signing_key.as_ref(),
             test_hlc(
                 std::time::SystemTime::now()
