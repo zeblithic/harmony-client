@@ -61,6 +61,10 @@
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
   import { NotificationService } from './lib/notification-service';
+  import {
+    loadNotificationSettings,
+    attachNotificationSettingsPersistence,
+  } from './lib/notification-settings-persistence';
   import { loadProfile, saveProfile } from './lib/profile-service';
   import { Stq8Service } from './lib/stq8-service';
   import * as stq8ProfileStorage from './lib/stq8-profile-storage';
@@ -254,6 +258,8 @@
   // ── ZEB-356: incoming-call OS notification + window attention ──────
   // Built in the Tauri-init IIFE below (real Tauri deps); null in web/dev.
   let incomingCallAlerter: import('./lib/incoming-call-alert').IncomingCallAlerter | null = null;
+  // ZEB-662: mention-notification alerter (created in the Tauri-transport IIFE).
+  let mentionAlerter: import('./lib/mention-alert').MentionAlertService | null = null;
 
   // ── ZEB-353 Voice V5: SPA-unmount teardown ────────────────────────
   // Leave any active voice channel / end any in-progress DM call when the
@@ -1597,6 +1603,19 @@
   }
 
   const notificationService = new NotificationService();
+
+  // ZEB-662: persist notification settings owner-scoped (localStorage). Hydrate
+  // once the owner id is known, then save on every settings change. Idempotent
+  // across owner changes; load() runs before attach() so hydration is not re-saved.
+  let notifPersistenceOwner: string | null = null;
+  $effect(() => {
+    const owner = selfOwnerId;
+    if (owner && owner !== notifPersistenceOwner) {
+      notifPersistenceOwner = owner;
+      loadNotificationSettings(notificationService, owner);
+      attachNotificationSettingsPersistence(notificationService, owner);
+    }
+  });
   const trustService = new TrustService();
   const fileManagerService = new FileManagerService();
   $effect(() => () => fileManagerService.destroy());
@@ -1733,7 +1752,12 @@
   // own community (== selectedCommunityId here); refreshCommunityMembers' own
   // stale-response guard drops the result if the selection changed in-flight.
   const ROSTER_REFETCH_MIN_INTERVAL_MS = 3000;
-  channelMessageService.onMessage = (communityId, _channelId, message) => {
+  channelMessageService.onMessage = (communityId, channelId, message) => {
+    // ZEB-662: drive mention notifications for EVERY community (including
+    // background ones) — must run before the selected-community early-return
+    // below, which only scopes the roster refetch. The alerter self-gates on
+    // active channel / focus / policy, so this is safe to call unconditionally.
+    void mentionAlerter?.onMessage(communityId, channelId, message);
     if (communityId !== selectedCommunityId) return;
     if (rosterHasJoinedAuthor(communityMembers, message.author)) return;
     const now = Date.now();
@@ -2163,6 +2187,23 @@
         fileManagerService.addUnlisten(() => { incomingCallAlerter?.dispose(); incomingCallAlerter = null; });
       } catch (e) {
         console.warn('[harmony-client] incoming-call alerter init failed:', e);
+      }
+
+      // ── ZEB-662: build the mention-notification alerter. Reuses the same
+      // Tauri focus/notification rails as the call alerter; self-gates on
+      // active channel, focus, and the NotificationService policy.
+      try {
+        const { createDefaultMentionAlerter } = await import('./lib/mention-alert');
+        mentionAlerter = await createDefaultMentionAlerter({
+          getSelfOwnerId: () => selfOwnerId ?? undefined,
+          getActiveChannelId: () => activeChannel,
+          resolve: (p, peer, community) => notificationService.resolve(p, peer, community),
+          incMention: (channelId) => navService.incMention(channelId),
+          showToast: (m) => { toastStore.show(m); },
+        });
+        fileManagerService.addUnlisten(() => { mentionAlerter = null; });
+      } catch (e) {
+        console.warn('[harmony-client] mention alerter init failed:', e);
       }
 
       // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
@@ -2762,6 +2803,8 @@
     changeSelectedCommunity(null);
     const switched = id !== activeChannel;
     activeChannel = node.id;
+    // ZEB-662: opening a channel clears its unseen-mention indicator.
+    navService.clearMention(node.id);
     activeHub = findNearestFolder(navNodes, node.id) ?? '';
     activeChannelName = node.name;
     activeChannelType = node.type as 'channel' | 'dm' | 'group-chat';
