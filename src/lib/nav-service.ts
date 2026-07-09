@@ -394,13 +394,6 @@ export class NavService {
       }
     }
 
-    // Mentions on channels absent from the incoming set must leave the bubble.
-    const nextIds = new Set(channels.map((c) => c.channelId));
-    let removedMentions = 0;
-    for (const [id, node] of prev) {
-      if (!nextIds.has(id)) removedMentions += node.mentionCount;
-    }
-
     if (!changed) return; // idempotent re-sync — stay silent
 
     // Rebuild the child block in listChannels order, preserving live state.
@@ -432,9 +425,14 @@ export class NavService {
       ...others.slice(communityIdx + 1),
     ];
 
-    if (removedMentions > 0) {
-      community.mentionCount = Math.max(0, community.mentionCount - removedMentions);
-    }
+    // ZEB-663: enforce the sum invariant — the community bubble equals the sum
+    // of its channels' mention counts. Besides handling removals, this
+    // self-heals a boot-race stray: a mention that landed on the community node
+    // (channel-else-community fallback) before its channels were populated
+    // reconciles to the children sum the moment channels appear, instead of
+    // stranding a phantom badge that nothing can clear (the ZEB-662 community-
+    // open clear was removed because it zeroed legit child-bubbled counts too).
+    community.mentionCount = nextChildren.reduce((sum, c) => sum + c.mentionCount, 0);
 
     this.onChange?.();
   }

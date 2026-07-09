@@ -911,6 +911,20 @@ describe('NavService.setChannels reconcile (ZEB-663)', () => {
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1); // b's 1 subtracted
   });
 
+  it('self-heals a boot-race stray: reconciles the community bubble to the children sum', () => {
+    const s = withCommunity();
+    // Boot race: a mention lands on the community node before its channels are
+    // populated (incMention's channel-else-community fallback). No channel nodes
+    // exist yet, so the community node carries the stray.
+    s.incMention('c1', 'a');
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1);
+    // Channels populate → the community bubble reconciles to the children sum (0),
+    // instead of stranding a phantom badge that nothing can clear.
+    s.setChannels('c1', [ch('a', 'general')]);
+    expect(s.nodes.find((n) => n.id === 'a')!.mentionCount).toBe(0);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
+  });
+
   it('fires onChange only when the reconcile changes the tree', () => {
     const s = withCommunity();
     let changed = 0;

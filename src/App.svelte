@@ -1153,6 +1153,11 @@
       // ZEB-606: a community switch always lands on Channels unless a
       // deep-link (openCommunityProposals) overrides it afterwards.
       communityActiveView = 'channels';
+      // ZEB-663: drop the prior community's selected channel so the active-row
+      // highlight falls back to the community row (not a stale cross-community
+      // channel) until the resolution effect re-picks this community's channel.
+      // openCommunityChannel sets the concrete channel right after this call.
+      selectedChannelId = null;
       communityMembers = [];
       // ZEB-404: new community session → reset the refetch throttle.
       lastMessageRosterRefetchAt = 0;
