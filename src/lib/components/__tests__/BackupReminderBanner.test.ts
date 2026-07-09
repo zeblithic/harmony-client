@@ -130,3 +130,36 @@ describe('BackupReminderBanner visibility (owner-scoped, ZEB-587)', () => {
     expect(queryByTestId('backup-reminder-banner')).toBeNull();
   });
 });
+
+describe('BackupReminderBanner day count (ZEB-650 slice 1)', () => {
+  const skippedAtKey = (id: string) => `harmony.onboarding.backupSkippedAt:owner-${id}`;
+
+  it('shows "skipped N days ago" when the stamp is old enough', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    localStorage.setItem(skippedAtKey(OWNER), String(Date.now() - 3 * 86_400_000 - 60_000));
+    const { getByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(getByTestId('backup-reminder-days').textContent).toContain('3 days ago');
+  });
+
+  it('uses singular copy for exactly 1 day', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    localStorage.setItem(skippedAtKey(OWNER), String(Date.now() - 86_400_000 - 60_000));
+    const { getByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(getByTestId('backup-reminder-days').textContent).toContain('1 day ago');
+    expect(getByTestId('backup-reminder-days').textContent).not.toContain('1 days');
+  });
+
+  it('renders no day count on the skip day (0 days)', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    localStorage.setItem(skippedAtKey(OWNER), String(Date.now()));
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(queryByTestId('backup-reminder-days')).toBeNull();
+  });
+
+  it('renders no day count for a legacy owner without a stamp', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    const { queryByTestId, getByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(queryByTestId('backup-reminder-days')).toBeNull();
+    expect(getByTestId('backup-reminder-banner').textContent).toContain("hasn't been backed up");
+  });
+});

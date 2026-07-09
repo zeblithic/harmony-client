@@ -19,6 +19,7 @@
   import { OwnerService, extractError } from '../owner-service';
   import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
   import {
+    daysSinceBackupSkipped,
     isBackupReminderVisible,
     markBannerDismissed,
     markRecoveryBackedUp,
@@ -50,6 +51,10 @@
   const visible = $derived(
     isBackupReminderVisible(ownerId) && !dismissedThisSession && !backedUpThisSession,
   );
+
+  // ZEB-650: day count derives from the owner-scoped skippedAt stamp; null
+  // (legacy owner) or 0 (skipped today) keeps the base copy unchanged.
+  const skippedDays = $derived(ownerId ? daysSinceBackupSkipped(ownerId) : null);
 
   // Tie the per-session overrides to the owner that set them. If the owner prop
   // changes while this component stays mounted (e.g. the owner resolves after
@@ -112,7 +117,7 @@
 
 {#if visible}
   <div class="backup-banner" data-testid="backup-reminder-banner" role="status">
-    <span class="warn"><span class="icon" aria-hidden="true">🔑</span> Your identity hasn't been backed up.</span>
+    <span class="warn"><span class="icon" aria-hidden="true">🔑</span> Your identity hasn't been backed up.{#if skippedDays !== null && skippedDays >= 1}<span data-testid="backup-reminder-days"> You skipped backup {skippedDays} {skippedDays === 1 ? 'day' : 'days'} ago.</span>{/if}</span>
     {#if !showPassphrase}
       <button data-testid="backup-reminder-backup-now" onclick={startBackup}>Back up now</button>
       <button
