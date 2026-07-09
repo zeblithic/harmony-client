@@ -15,14 +15,23 @@ const msg = (over: Partial<{ mentions: string[]; author: string }> = {}) => ({
 });
 
 function harness(over: Partial<MentionAlertDeps> = {}) {
-  const calls = { inc: [] as string[], toast: [] as string[], os: 0, osBody: '' };
+  const calls = {
+    inc: [] as string[],
+    incArgs: [] as Array<[string, string]>,
+    toast: [] as string[],
+    os: 0,
+    osBody: '',
+  };
   const deps: MentionAlertDeps = {
     getSelfOwnerId: () => ME,
-    getActiveChannelId: () => null,
+    isActiveChannel: () => false,
     isFocused: () => true,
     resolve: () => 'notify' as NotificationAction,
-    incMention: (id) => calls.inc.push(id),
-    getChannelName: (id) => `#${id}`,
+    incMention: (communityId, channelId) => {
+      calls.inc.push(channelId);
+      calls.incArgs.push([communityId, channelId]);
+    },
+    getChannelName: (_communityId, channelId) => `#${channelId}`,
     showToast: (m) => calls.toast.push(m),
     sendOsNotification: (o) => {
       calls.os++;
@@ -43,15 +52,24 @@ describe('MentionAlertService (ZEB-662)', () => {
   });
 
   it('suppresses when the mentioned channel is active and focused', async () => {
-    const { svc, calls } = harness({ getActiveChannelId: () => 'ch1', isFocused: () => true });
+    const { svc, calls } = harness({ isActiveChannel: () => true, isFocused: () => true });
     await svc.onMessage('c1', 'ch1', msg());
     expect(calls.inc).toEqual([]);
     expect(calls.toast).toEqual([]);
     expect(calls.os).toBe(0);
   });
 
+  it('still notifies for a mention in the active channel when unfocused', async () => {
+    // Active-channel suppression only applies when the window is focused; a
+    // background mention in the same channel must still notify (OS).
+    const { svc, calls } = harness({ isActiveChannel: () => true, isFocused: () => false });
+    await svc.onMessage('c1', 'ch1', msg());
+    expect(calls.inc).toEqual(['ch1']);
+    expect(calls.os).toBe(1);
+  });
+
   it('still notifies for a mention in a non-active channel even when focused', async () => {
-    const { svc, calls } = harness({ getActiveChannelId: () => 'other', isFocused: () => true });
+    const { svc, calls } = harness({ isActiveChannel: () => false, isFocused: () => true });
     await svc.onMessage('c1', 'ch1', msg());
     expect(calls.inc).toEqual(['ch1']);
     expect(calls.toast.length).toBe(1);
@@ -67,7 +85,7 @@ describe('MentionAlertService (ZEB-662)', () => {
   });
 
   it('dot_only: nav dot, no toast, no OS', async () => {
-    const { svc, calls } = harness({ resolve: () => 'dot_only', getActiveChannelId: () => 'other' });
+    const { svc, calls } = harness({ resolve: () => 'dot_only', isActiveChannel: () => false });
     await svc.onMessage('c1', 'ch1', msg());
     expect(calls.inc).toEqual(['ch1']);
     expect(calls.toast).toEqual([]);
@@ -84,7 +102,7 @@ describe('MentionAlertService (ZEB-662)', () => {
 
   it('sound/break_dnd behave like notify (toast when focused)', async () => {
     for (const action of ['sound', 'break_dnd'] as NotificationAction[]) {
-      const { svc, calls } = harness({ resolve: () => action, getActiveChannelId: () => 'other' });
+      const { svc, calls } = harness({ resolve: () => action, isActiveChannel: () => false });
       await svc.onMessage('c1', 'ch1', msg());
       expect(calls.inc).toEqual(['ch1']);
       expect(calls.toast.length).toBe(1);
@@ -94,9 +112,21 @@ describe('MentionAlertService (ZEB-662)', () => {
 
   it('resolve is called with loud + sender + community', async () => {
     const resolve = vi.fn(() => 'notify' as NotificationAction);
-    const { svc } = harness({ resolve, getActiveChannelId: () => 'other' });
+    const { svc } = harness({ resolve, isActiveChannel: () => false });
     await svc.onMessage('c1', 'ch1', msg());
     expect(resolve).toHaveBeenCalledWith('loud', SENDER, 'c1');
+  });
+
+  it('threads communityId + channelId through the seen-check, nav, and name', async () => {
+    const isActiveChannel = vi.fn(() => false);
+    const getChannelName = vi.fn(() => 'general');
+    const { svc, calls } = harness({ isActiveChannel, getChannelName });
+    await svc.onMessage('c1', 'ch1', msg());
+    // Community channels aren't nav nodes, so every dep must receive the
+    // (communityId, channelId) pair — not a bare channel id.
+    expect(isActiveChannel).toHaveBeenCalledWith('c1', 'ch1');
+    expect(getChannelName).toHaveBeenCalledWith('c1', 'ch1');
+    expect(calls.incArgs).toEqual([['c1', 'ch1']]);
   });
 
   it('swallows an OS-notification throw', async () => {
@@ -118,7 +148,7 @@ describe('MentionAlertService (ZEB-662)', () => {
 
   it('uses the resolved channel name in the toast body', async () => {
     const { svc, calls } = harness({
-      getActiveChannelId: () => 'other',
+      isActiveChannel: () => false,
       getChannelName: () => 'general',
     });
     await svc.onMessage('c1', 'ch1', msg());
@@ -135,7 +165,7 @@ describe('MentionAlertService (ZEB-662)', () => {
   });
 
   it('does not notify for my own message that lists me', async () => {
-    const { svc, calls } = harness({ getActiveChannelId: () => 'other' });
+    const { svc, calls } = harness({ isActiveChannel: () => false });
     await svc.onMessage('c1', 'ch1', msg({ author: ME, mentions: [ME] }));
     expect(calls.inc).toEqual([]);
     expect(calls.toast).toEqual([]);

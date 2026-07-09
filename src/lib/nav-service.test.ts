@@ -789,37 +789,55 @@ describe('mention counts (ZEB-662)', () => {
     return s;
   }
 
-  it('incMention bumps the channel and bubbles the community sum', () => {
+  // Production has no channel nav nodes — only the community node.
+  function prodSvc(): NavService {
+    const s = new NavService();
+    s.nodes = [
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    return s;
+  }
+
+  it('dev-mock: incMention bumps the channel node and bubbles the community sum', () => {
     const s = svc();
     let changed = 0;
     s.onChange = () => {
       changed++;
     };
-    s.incMention('ch1');
-    s.incMention('ch1');
-    s.incMention('ch2');
+    s.incMention('c1', 'ch1');
+    s.incMention('c1', 'ch1');
+    s.incMention('c1', 'ch2');
     expect(s.nodes.find((n) => n.id === 'ch1')!.mentionCount).toBe(2);
     expect(s.nodes.find((n) => n.id === 'ch2')!.mentionCount).toBe(1);
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(3); // bubbled sum
     expect(changed).toBe(3);
   });
 
-  it('clearMention zeroes the channel and recomputes the community sum', () => {
+  it('dev-mock: clearMention zeroes the channel node and recomputes the community sum', () => {
     const s = svc();
-    s.incMention('ch1');
-    s.incMention('ch2');
+    s.incMention('c1', 'ch1');
+    s.incMention('c1', 'ch2');
     s.clearMention('ch1');
     expect(s.nodes.find((n) => n.id === 'ch1')!.mentionCount).toBe(0);
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1); // only ch2 remains
   });
 
-  it('incMention on an unknown channel is a no-op', () => {
-    const s = svc();
-    s.incMention('nope');
+  it('production: channel is not a nav node → the community node carries the badge', () => {
+    const s = prodSvc();
+    s.incMention('c1', 'ch-a'); // ch-a / ch-b aren't nav nodes in prod
+    s.incMention('c1', 'ch-b');
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // aggregate on community
+    s.clearMention('c1'); // opening the community clears its aggregate
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
   });
 
-  it('clearMention on an already-zero channel does not fire onChange', () => {
+  it('incMention with an unknown community and channel is a no-op', () => {
+    const s = svc();
+    s.incMention('nope-c', 'nope-ch');
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
+  });
+
+  it('clearMention on an already-zero node does not fire onChange', () => {
     const s = svc();
     let changed = 0;
     s.onChange = () => {

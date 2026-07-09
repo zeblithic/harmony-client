@@ -12,16 +12,19 @@ import { messageMentionsOwner } from './mention-detect';
 
 export interface MentionAlertDeps {
   getSelfOwnerId(): string | undefined;
-  getActiveChannelId(): string | null;
+  /** True iff the viewer is looking right at this exact community channel's
+   *  feed (community channels live in CommunityView state, not NavService, so
+   *  this can't be a bare channel-id compare). */
+  isActiveChannel(communityId: string, channelId: string): boolean;
   isFocused(): boolean | Promise<boolean>;
   resolve(
     priority: 'quiet' | 'standard' | 'loud',
     peerAddress: string,
     communityId?: string,
   ): NotificationAction;
-  incMention(channelId: string): void;
+  incMention(communityId: string, channelId: string): void;
   /** Human-readable channel name for the notification body (fallback allowed). */
-  getChannelName(channelId: string): string;
+  getChannelName(communityId: string, channelId: string): string;
   showToast(message: string): void;
   sendOsNotification(o: { title: string; body: string }): void;
 }
@@ -48,17 +51,17 @@ export class MentionAlertService {
     // Resolve focus once per mention (reused by the seen-check and delivery).
     const focused = await this.focusedSafe();
     // Looking right at it → treat as seen.
-    if (channelId === this.deps.getActiveChannelId() && focused) return;
+    if (focused && this.deps.isActiveChannel(communityId, channelId)) return;
 
     const action = this.deps.resolve('loud', message.author, communityId);
     if (action === 'silent') return;
 
     // dot_only and above: always record the nav indicator.
-    this.deps.incMention(channelId);
+    this.deps.incMention(communityId, channelId);
     if (!NOTIFY_ACTIONS.has(action)) return;
 
     const title = 'New mention';
-    const body = `You were mentioned in ${this.deps.getChannelName(channelId)}`;
+    const body = `You were mentioned in ${this.deps.getChannelName(communityId, channelId)}`;
     if (focused) {
       this.deps.showToast(body);
     } else {

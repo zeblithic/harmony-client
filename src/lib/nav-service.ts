@@ -390,16 +390,26 @@ export class NavService {
     this.onChange?.();
   }
 
-  /** ZEB-662: increment a channel's unseen-mention count and bubble to its community. */
-  incMention(channelId: string): void {
-    this.applyMentionDelta(channelId, 1);
+  /** ZEB-662: increment an unseen-mention count for a community channel.
+   *  When the channel is itself a nav node (dev/mock seed) increment it and
+   *  bubble to its community. In production, community channels aren't nav
+   *  nodes, so the indicator lives directly on the community node (the only
+   *  per-community surface the nav has). Target selection is the seam between
+   *  the two models — no `import.meta.env.DEV` branch needed. */
+  incMention(communityId: string, channelId: string): void {
+    const target = this.nodes.some((n) => n.id === channelId)
+      ? channelId
+      : communityId;
+    this.applyMentionDelta(target, 1);
   }
 
-  /** ZEB-662: clear a channel's mention count (channel opened) and re-bubble. */
-  clearMention(channelId: string): void {
-    const node = this.nodes.find((n) => n.id === channelId);
+  /** ZEB-662: clear a node's mention count (its channel/DM opened, or — in
+   *  production — its community opened) and re-bubble. Accepts either a channel
+   *  node id (dev/mock) or a community node id (production aggregate). */
+  clearMention(id: string): void {
+    const node = this.nodes.find((n) => n.id === id);
     if (!node || node.mentionCount === 0) return;
-    this.applyMentionDelta(channelId, -node.mentionCount);
+    this.applyMentionDelta(id, -node.mentionCount);
   }
 
   /**

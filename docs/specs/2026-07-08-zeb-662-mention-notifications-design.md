@@ -49,6 +49,13 @@ There is intentionally no separate step for `sound`/`break_dnd`: with no in-app 
 
 **Clear-on-view:** `handleNodeSelect(channelId)` (`App.svelte:2763`) calls `nav.clearMention(channelId)` and recomputes the community bubble.
 
+> **Correction (production nav model, made during review — PR #427).** Steps 2, 4, and `getChannelName`/clear-on-view above were drafted against the nav model where a community's channels are `NavNode`s. That holds only for the DEV mock seed; in production `connectAdapter()` clears it and `nav-updated` never creates channel nodes (channel/folder kinds are "reserved for later phases"). Community channels live in `CommunityView` / `CommunityService` state. So the implementation threads `communityId` into the alerter deps and:
+> - **Seen-check (2):** `isActiveChannel(communityId, channelId)` = messages-mode ∧ that community selected ∧ on its channels tab ∧ `communityService.getSelectedChannel(communityId) === channelId` — not a bare `activeChannel` compare (App `activeChannel` is a DM/messages channel, never a community one).
+> - **Nav indicator (4):** `nav.incMention(communityId, channelId)` targets the channel node when it exists (dev-mock) else the **community node** (production aggregate — the only per-community nav surface). Clear happens when the community is opened.
+> - **Name:** resolved from `communityService.getCachedChannelName` (the `listChannels` session cache), falling back to `"a channel"`.
+>
+> Per-channel indicators + precise per-channel clear return with the deferred "community channels as nav nodes" work.
+
 ### Components / files
 
 | File | Change |

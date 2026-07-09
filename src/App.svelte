@@ -2198,19 +2198,24 @@
         const { createDefaultMentionAlerter } = await import('./lib/mention-alert');
         mentionAlerter = await createDefaultMentionAlerter({
           getSelfOwnerId: () => selfOwnerId ?? undefined,
-          // "Viewing this channel's feed" is true only in messages mode with
-          // neither Notes nor a community overview on screen — both of those
-          // replace the feed while leaving `activeChannel` stale, so a mention
-          // in that channel must still notify. Mirrors the on-screen selector
-          // `notesSelected ? null : (selectedCommunityId ?? activeChannel)`.
-          getActiveChannelId: () =>
-            appMode === 'messages' && !notesSelected && selectedCommunityId === null
-              ? activeChannel
-              : null,
+          // Community channels live in CommunityView / CommunityService state,
+          // NOT NavService — the viewer is "looking right at" a channel only in
+          // messages mode, with that community selected, on its channels tab,
+          // and that channel being its session-selected one. (App-level
+          // `activeChannel` is a DM/messages channel and never a community one.)
+          isActiveChannel: (communityId, channelId) =>
+            appMode === 'messages' &&
+            selectedCommunityId === communityId &&
+            communityActiveView === 'channels' &&
+            communityService.getSelectedChannel(communityId) === channelId,
           resolve: (p, peer, community) => notificationService.resolve(p, peer, community),
-          incMention: (channelId) => navService.incMention(channelId),
-          getChannelName: (channelId) =>
-            navService.nodes.find((n) => n.id === channelId)?.name ?? 'a channel',
+          incMention: (communityId, channelId) =>
+            navService.incMention(communityId, channelId),
+          // Community channels aren't nav nodes in production; resolve the name
+          // from CommunityService's session cache (populated when the community
+          // was opened), falling back to a generic label.
+          getChannelName: (communityId, channelId) =>
+            communityService.getCachedChannelName(communityId, channelId) ?? 'a channel',
           showToast: (m) => { toastStore.show(m); },
         });
         fileManagerService.addUnlisten(() => { mentionAlerter = null; });
@@ -2802,6 +2807,10 @@
     if (node.type === 'community') {
       changeSelectedCommunity(id);
       void refreshCommunityMembers(id);
+      // ZEB-662: opening a community clears its aggregate unseen-mention badge
+      // (production carries the count on the community node, since its channels
+      // aren't nav nodes — see NavService.incMention).
+      navService.clearMention(id);
       if (appMode !== 'messages') {
         switchMode('messages');
       }
