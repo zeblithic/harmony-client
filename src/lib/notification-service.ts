@@ -148,7 +148,7 @@ export class NotificationService {
     const toMap = <V>(v: unknown): Map<string, V> =>
       isObj(v) ? new Map(Object.entries(v) as [string, V][]) : new Map();
     if (isObj(p.global)) {
-      this.settings.global = { ...DEFAULT_POLICY, ...(p.global as NotificationPolicy) };
+      this.settings.global = { ...DEFAULT_POLICY, ...(p.global as unknown as Partial<NotificationPolicy>) };
     }
     this.settings.perCommunity = toMap(p.perCommunity);
     this.settings.perPeer = toMap(p.perPeer);

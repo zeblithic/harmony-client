@@ -11,6 +11,7 @@ function makeNode(overrides: Partial<NavNode> = {}): NavNode {
     name: 'general',
     expanded: false,
     unreadCount: 0,
+    mentionCount: 0,
     unreadLevel: 'none',
     ...overrides,
   };

@@ -27,6 +27,7 @@ const testNodes: NavNode[] = [
     expanded: true,
     sortOrder: 'activity',
     unreadCount: 0,
+    mentionCount: 0,
     unreadLevel: 'none',
     lastActivity: 1000,
   },
@@ -37,6 +38,7 @@ const testNodes: NavNode[] = [
     name: 'general',
     expanded: false,
     unreadCount: 3,
+    mentionCount: 0,
     unreadLevel: 'standard',
     lastActivity: 900,
   },
@@ -48,6 +50,7 @@ const testNodes: NavNode[] = [
     expanded: true,
     sortOrder: 'pinned',
     unreadCount: 0,
+    mentionCount: 0,
     unreadLevel: 'none',
     lastActivity: 500,
   },
@@ -58,6 +61,7 @@ const testNodes: NavNode[] = [
     name: 'Bob',
     expanded: false,
     unreadCount: 0,
+    mentionCount: 0,
     unreadLevel: 'none',
     lastActivity: 400,
   },
@@ -68,6 +72,7 @@ const testNodes: NavNode[] = [
     name: 'Eve',
     expanded: false,
     unreadCount: 0,
+    mentionCount: 0,
     unreadLevel: 'none',
     lastActivity: 300,
   },
@@ -393,6 +398,7 @@ describe('NavPanel', () => {
         name: 'IPFS Crew',
         expanded: true,
         unreadCount: 0,
+        mentionCount: 0,
         unreadLevel: 'none',
         lastActivity: 1000,
       },
@@ -414,7 +420,7 @@ describe('NavPanel', () => {
   });
 
   describe('Section headers (ZEB-606)', () => {
-    const base = { expanded: false, unreadCount: 0, unreadLevel: 'none' as const };
+    const base = { expanded: false, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' as const };
     const mixedNodes: NavNode[] = [
       { id: 'work', parentId: null, type: 'folder', name: 'Work', ...base, expanded: true, lastActivity: 3 },
       { id: 'comm-1', parentId: null, type: 'community', name: 'IPFS Crew', ...base, lastActivity: 2 },
@@ -469,6 +475,7 @@ describe('NavPanel', () => {
         name: 'Eve',
         expanded: false,
         unreadCount: 0,
+        mentionCount: 0,
         unreadLevel: 'none',
         lastActivity: 300,
       },
@@ -481,6 +488,7 @@ describe('NavPanel', () => {
         name: 'IPFS Crew',
         expanded: true,
         unreadCount: 0,
+        mentionCount: 0,
         unreadLevel: 'none',
         lastActivity: 1000,
       },
@@ -526,7 +534,7 @@ describe('NavPanel', () => {
   });
 
   describe('Proposals nav row (ZEB-606)', () => {
-    const base = { unreadCount: 0, unreadLevel: 'none' as const };
+    const base = { unreadCount: 0, mentionCount: 0, unreadLevel: 'none' as const };
     const expandedCommunity: NavNode[] = [
       { id: 'comm-1', parentId: null, type: 'community', name: 'IPFS Crew', expanded: true, ...base, lastActivity: 2 },
       { id: 'chan-1', parentId: 'comm-1', type: 'channel', name: 'general', expanded: false, ...base, lastActivity: 1 },

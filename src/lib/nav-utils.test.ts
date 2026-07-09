@@ -17,6 +17,7 @@ function node(overrides: Partial<NavNode> & Pick<NavNode, 'id' | 'parentId' | 't
   return {
     expanded: false,
     unreadCount: 0,
+    mentionCount: 0,
     unreadLevel: 'none',
     ...overrides,
   };

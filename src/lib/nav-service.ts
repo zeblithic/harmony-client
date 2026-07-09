@@ -212,6 +212,7 @@ export class NavService {
         parentId: parentId ?? null,
         expanded: true, // default expanded; user can collapse
         unreadCount: 0,
+        mentionCount: 0,
         unreadLevel: 'none',
         peer: undefined,
         // ZEB-285: carry fork lineage through to the NavNode so the
@@ -236,6 +237,7 @@ export class NavService {
                   parentId: existing.parentId,
                   expanded: existing.expanded,
                   unreadCount: existing.unreadCount,
+                  mentionCount: existing.mentionCount ?? 0,
                   unreadLevel: existing.unreadLevel,
                   forkedFrom: forkedFrom ?? existing.forkedFrom,
                 }
@@ -305,6 +307,7 @@ export class NavService {
       parentId: parentId ?? null,
       expanded: false,
       unreadCount: 0,
+      mentionCount: 0,
       unreadLevel: 'none',
       peer,
     };
@@ -325,6 +328,7 @@ export class NavService {
           parentId: existing.parentId,
           expanded: existing.expanded,
           unreadCount: existing.unreadCount,
+          mentionCount: existing.mentionCount ?? 0,
           unreadLevel: existing.unreadLevel,
           peer: peerWasDerivedFromPayload ? newNode.peer : existing.peer,
         };
@@ -352,6 +356,50 @@ export class NavService {
         this.nodes = [...this.nodes, newNode];
       }
     }
+    this.onChange?.();
+  }
+
+  /** ZEB-662: walk parentId up to the owning community node id (or null). */
+  private communityIdOf(node: NavNode): string | null {
+    let cur: NavNode | undefined = node;
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur.id)) {
+      if (cur.type === 'community') return cur.id;
+      seen.add(cur.id);
+      cur = cur.parentId ? this.nodes.find((n) => n.id === cur!.parentId) : undefined;
+    }
+    return null;
+  }
+
+  /** ZEB-662: recompute a community node's mentionCount = sum of descendant
+   *  channels' counts (channels whose ancestor community is this one). */
+  private recomputeCommunityMentions(communityId: string): void {
+    const comm = this.nodes.find((n) => n.id === communityId);
+    if (!comm) return;
+    let sum = 0;
+    for (const n of this.nodes) {
+      if (n.type === 'channel' && this.communityIdOf(n) === communityId) sum += n.mentionCount;
+    }
+    comm.mentionCount = sum;
+  }
+
+  /** ZEB-662: increment a channel's unseen-mention count and bubble to its community. */
+  incMention(channelId: string): void {
+    const node = this.nodes.find((n) => n.id === channelId);
+    if (!node) return;
+    node.mentionCount += 1;
+    const cid = this.communityIdOf(node);
+    if (cid) this.recomputeCommunityMentions(cid);
+    this.onChange?.();
+  }
+
+  /** ZEB-662: clear a channel's mention count (channel opened) and re-bubble. */
+  clearMention(channelId: string): void {
+    const node = this.nodes.find((n) => n.id === channelId);
+    if (!node || node.mentionCount === 0) return;
+    node.mentionCount = 0;
+    const cid = this.communityIdOf(node);
+    if (cid) this.recomputeCommunityMentions(cid);
     this.onChange?.();
   }
 

@@ -17,6 +17,7 @@ const mockCommunities: NavNode[] = [
     name: 'Work',
     expanded: true,
     unreadCount: 0,
+    mentionCount: 0,
     unreadLevel: 'none',
   },
 ];
