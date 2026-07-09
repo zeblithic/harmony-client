@@ -169,11 +169,17 @@ export class DmUnreadService {
       return;
     }
     const page = await this.deps.listThreadPage(spaceId, UNREAD_TRACK_CAP);
+    // Re-read the cursor: it may have advanced during the await —
+    // markThreadRead from a user click, or a focused+active live arrival —
+    // and filtering against the pre-await snapshot would resurrect
+    // just-read messages (CodeRabbit PR #432). Cursors only move forward,
+    // so the fresh read is always the stricter filter.
+    const fresh = this.deps.storage.get(NS, spaceId) ?? cursor;
     const set = this.setFor(spaceId); // union with event-race arrivals
     for (const m of page) {
       this.bumpMaxSeen(spaceId, m.receivedAt);
       if (m.isSelfOutbound) continue;
-      if (m.receivedAt <= cursor.wallMs) continue; // page is uncursored; filter client-side
+      if (m.receivedAt <= fresh.wallMs) continue; // page is uncursored; filter client-side
       if (set.size < UNREAD_TRACK_CAP || set.has(m.messageCid)) {
         set.add(m.messageCid);
       }

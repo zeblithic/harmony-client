@@ -2145,7 +2145,15 @@
         messageService.onDmReceived = (p) => dm.onDmReceived(p);
         // Owner may already be known (the $effect only re-fires on change).
         if (selfOwnerId) dm.connectOwner(selfOwnerId);
-        fileManagerService.addUnlisten(() => { dmUnread = null; });
+        fileManagerService.addUnlisten(() => {
+          dmUnread = null;
+          // Also clear the hook fields — they close over `dm`, so leaving
+          // them installed would retain the dead service across a
+          // teardown/remount boundary and risk duplicate callbacks (Qodo
+          // PR #432).
+          navService.onDmSpaceChange = undefined;
+          messageService.onDmReceived = undefined;
+        });
       } catch (e) {
         console.warn(
           '[harmony-client] dm-unread init failed:',
@@ -2207,6 +2215,32 @@
         const msg = err instanceof Error ? err.message : String(err);
         console.warn('[harmony-client] community rehydration failed:', msg);
       }
+
+      // Fetch our node address so self-sent messages/vines echo back as
+      // 'self'/'You'. Try immediately (node may already be connected after
+      // hot reload / auto-start), and also retry on later zenoh-status
+      // events. Runs BEFORE the DM rehydration below (CodeRabbit PR #432):
+      // addOrUpdateNavSpace derives a 1:1 DM's peer as "whichever member
+      // isn't me" and falls back to members[0] when ownAddress is null —
+      // a wrong (self) peer attachment never self-corrects because profile
+      // updates only refresh nodes whose peer.address matches.
+      async function fetchOwnAddress() {
+        try {
+          const addr = await invoke('get_node_addr') as string;
+          messageService.ownAddress = addr;
+          vineService.ownAddress = addr;
+          navService.ownAddress = addr;
+          // ZEB-263: keep our reactive copy in sync so CommunitySettingsPanel
+          // can identify "you" + gate kick/setPower self-actions.
+          myAddress = addr;
+        } catch (err) {
+          // Expected while start_node is still racing with boot; the
+          // zenoh-status listener below retries on 'connected'. Logged at
+          // debug so it's discoverable but doesn't pollute the normal log.
+          console.debug('[harmony-client] get_node_addr not yet available:', err);
+        }
+      }
+      await fetchOwnAddress();
 
       // ZEB-666: rehydrate persisted DM / group-DM rows the same way — the
       // nav otherwise boots with NO DM rows (push-only; only runtime
@@ -2311,28 +2345,6 @@
             );
         }
       }
-
-      // Fetch our node address so self-sent messages/vines echo back as
-      // 'self'/'You'. Try immediately (node may already be connected after
-      // hot reload / auto-start), and also retry on later zenoh-status
-      // events.
-      async function fetchOwnAddress() {
-        try {
-          const addr = await invoke('get_node_addr') as string;
-          messageService.ownAddress = addr;
-          vineService.ownAddress = addr;
-          navService.ownAddress = addr;
-          // ZEB-263: keep our reactive copy in sync so CommunitySettingsPanel
-          // can identify "you" + gate kick/setPower self-actions.
-          myAddress = addr;
-        } catch (err) {
-          // Expected while start_node is still racing with boot; the
-          // zenoh-status listener below retries on 'connected'. Logged at
-          // debug so it's discoverable but doesn't pollute the normal log.
-          console.debug('[harmony-client] get_node_addr not yet available:', err);
-        }
-      }
-      await fetchOwnAddress();
 
       // Re-hydrate backend-dependent state when Zenoh reports connected.
       // On initial boot, mail_mgr / follow list may not be ready yet (e.g.

@@ -19640,7 +19640,10 @@ pub fn dm_spaces_for_nav(state: &crate::owner_state_crdt::OwnerState) -> Vec<DmN
             space_id: hex::encode(s.id.0),
             kind: match s.kind {
                 SpaceKind::GroupDm => "group-dm".to_string(),
-                _ => "dm".to_string(),
+                SpaceKind::Dm => "dm".to_string(),
+                // The filter above restricts to Dm | GroupDm; keep the arms
+                // explicit so a loosened filter can't silently misclassify.
+                _ => unreachable!("dm_spaces_for_nav filters to Dm | GroupDm"),
             },
             name: s.custom_name.clone().unwrap_or_else(|| s.name.clone()),
             members: s.members.iter().map(|m| hex::encode(m.0)).collect(),

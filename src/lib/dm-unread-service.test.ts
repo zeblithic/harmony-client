@@ -106,6 +106,19 @@ describe('DmUnreadService (ZEB-666)', () => {
     expect(lastCount(pushes, 's1')).toBe(1);
   });
 
+  it('seed in flight when markThreadRead lands filters against the fresh cursor (TOCTOU)', async () => {
+    let resolvePage!: (v: DmThreadPageEntry[]) => void;
+    const { svc, store, pushes } = harness({
+      listThreadPage: () => new Promise<DmThreadPageEntry[]>((r) => { resolvePage = r; }),
+    });
+    store.set('dm', 's1', { wallMs: 100, logical: 0, deviceId: '' });
+    const seeding = svc.onDmSpaceMaterialized('s1'); // seed awaits the page
+    svc.markThreadRead('s1'); // user opens the thread mid-flight → cursor stamps now()
+    resolvePage([entry('m2', 300), entry('m1', 200)]); // newer than the OLD cursor only
+    await seeding;
+    expect(lastCount(pushes, 's1')).toBe(0); // nothing resurrected past the read stamp
+  });
+
   it('live arrival for a non-active thread counts once (re-delivery dedupes)', async () => {
     const { svc, store, pushes } = harness();
     store.set('dm', 's1', { wallMs: 100, logical: 0, deviceId: '' });

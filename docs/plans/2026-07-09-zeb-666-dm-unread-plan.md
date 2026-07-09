@@ -1207,10 +1207,15 @@ git commit -m "ZEB-666: design spec + implementation plan"
 ```bash
 cd src-tauri && cargo fmt --all -- --check
 cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
-scripts/test-select --context task   # from repo root; paste round=… bucket=… into the report
+scripts/test-select --context task   # local iterative gate; paste round=… bucket=… into the report
 ```
 
 Expected: fmt clean, clippy clean, selected tests PASS.
+
+`scripts/test-select` is the *local iterative* gate only (ZEB-631). Final
+validation is the full workspace sweep — `cargo nextest run --locked
+--workspace --all-targets --features test-fixtures` — which CI's `rust-test`
+job runs on the PR and which must be green before merge.
 
 - [ ] **Step 3: Frontend gates**
 
