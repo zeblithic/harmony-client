@@ -78,6 +78,7 @@
   import { VineService } from './lib/vine-service';
   import { resolveOriginalCreator } from './lib/vine-utils';
   import { NavService } from './lib/nav-service';
+  import { ChannelNavSyncService } from './lib/channel-nav-sync';
   import { AvatarResolver } from './lib/avatar-resolver';
   import { ProfilePageResolver } from './lib/profile-page-resolver';
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
@@ -1147,6 +1148,10 @@
     if (id !== null) notesSelected = false;
     selectedCommunityId = id;
     isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
+    // ZEB-663: ensure this community's channels are populated in the nav tree
+    // (covers communities joined after boot, which start()'s snapshot missed).
+    // Idempotent + cache-hit for already-synced communities.
+    if (id != null) void channelNavSync.resync(id);
   }
 
   /** ZEB-606: nav proposals-row / Assembly-rail deep link — select the
@@ -1323,6 +1328,16 @@
   // unmount via $effect cleanup.
   const communityService = new CommunityService();
   $effect(() => () => communityService.destroy());
+  // ── ZEB-663: channel→nav bridge ────────────────────────────────────
+  // Populates each community's channel children as first-class NavNodes so
+  // the unified nav tree renders channels inline. Pure dep-injection — no
+  // direct service refs beyond the three lambdas below.
+  const channelNavSync = new ChannelNavSyncService({
+    listChannels: (id) => communityService.listChannels(id),
+    setChannels: (id, channels) => navService.setChannels(id, channels),
+    listCommunityIds: () =>
+      navService.nodes.filter((n) => n.type === 'community').map((n) => n.id),
+  });
   // ── Friend service (ZEB-370) ───────────────────────────────────────
   // Same eager-construct / adapter-wired-in-IIFE / destroy-on-unmount
   // pattern as CommunityService. Surfaced in the Settings panel via
@@ -1961,6 +1976,13 @@
       await tryConnect('vine.loadFollowed', vineService.loadFollowed());
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
+      // ZEB-663: base channel-config handler — keep the nav tree's channel
+      // children fresh on create/rename/delete. CommunityView (when mounted)
+      // chains its own feed-list refresh on top of this via the existing
+      // prev-handler chain.
+      communityService.onChannelConfigChanged = (cid) => {
+        void channelNavSync.resync(cid);
+      };
       await tryConnect('friend', friendService.connectAdapter(adapter));
       // ZEB-431: hydrate the DM contact picker from the friend graph.
       // Fire-and-forget: pre-owner-load failure is recovered by the
@@ -1999,6 +2021,11 @@
         const msg = err instanceof Error ? err.message : String(err);
         console.warn('[harmony-client] community rehydration failed:', msg);
       }
+
+      // ZEB-663: now that nav communities are hydrated, populate their
+      // channels as nav nodes. Fire-and-forget; per-community failures are
+      // isolated inside ChannelNavSync and never block boot.
+      void channelNavSync.start();
 
       // ZEB-600: subscribe presence for ALL joined communities (not just the
       // active one) so the sidebar + DM dots reflect every community. A shared

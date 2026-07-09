@@ -82,7 +82,8 @@
   }
 
   function typeIcon(n: NavNode): string {
-    if (n.type === 'channel') return '#';
+    // ZEB-663: voice channels get the speaker glyph (matches ChannelSubSidebar).
+    if (n.type === 'channel') return n.channelKind === 'voice' ? '\uD83D\uDD0A' : '#';
     if (n.type === 'dm' || n.type === 'group-chat') return '@';
     if (n.type === 'folder') return n.expanded ? '\u25BE' : '\u25B8';
     return '';
