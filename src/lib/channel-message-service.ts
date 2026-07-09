@@ -1,4 +1,5 @@
 import type { TauriAdapter } from './zenoh-service';
+import { compareHlc } from './hlc';
 
 export interface HlcDto {
   wallMs: number;
@@ -704,10 +705,4 @@ function sortedInsertIndex(arr: ChannelMessageDto[], msg: ChannelMessageDto): nu
     if (compareHlc(arr[i].at, msg.at) <= 0) return i + 1;
   }
   return 0;
-}
-
-function compareHlc(a: HlcDto, b: HlcDto): number {
-  if (a.wallMs !== b.wallMs) return a.wallMs - b.wallMs;
-  if (a.logical !== b.logical) return a.logical - b.logical;
-  return a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0;
 }

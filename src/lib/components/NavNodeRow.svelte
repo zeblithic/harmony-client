@@ -306,11 +306,12 @@
       >@{node.mentionCount}</span>
     {/if}
 
-    <!-- Unread indicators -->
+    <!-- Unread indicators (ZEB-665: display caps at 99+; the tracker's
+         internal set is capped at 100, so 100 means "at least 100"). -->
     {#if node.unreadLevel === 'standard' && node.unreadCount > 0}
-      <span class="unread-badge">{node.unreadCount}</span>
+      <span class="unread-badge">{node.unreadCount > 99 ? '99+' : node.unreadCount}</span>
     {:else if node.unreadLevel === 'loud' && node.unreadCount > 0}
-      <span class="unread-badge loud">{node.unreadCount}</span>
+      <span class="unread-badge loud">{node.unreadCount > 99 ? '99+' : node.unreadCount}</span>
     {:else if node.unreadLevel === 'quiet' && node.unreadCount > 0}
       <span class="unread-dot"></span>
     {/if}

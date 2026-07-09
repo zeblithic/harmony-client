@@ -467,6 +467,8 @@ export class NavService {
     // stranding a phantom badge that nothing can clear (the ZEB-662 community-
     // open clear was removed because it zeroed legit child-bubbled counts too).
     community.mentionCount = nextChildren.reduce((sum, c) => sum + c.mentionCount, 0);
+    // ZEB-665: same sum invariant for unread (a removal drops its child count).
+    this.rollUpCommunityUnread(communityId);
 
     this.onChange?.();
   }
@@ -533,6 +535,45 @@ export class NavService {
     const node = this.nodes.find((n) => n.id === id);
     if (!node || node.mentionCount === 0) return;
     this.applyMentionDelta(id, -node.mentionCount);
+  }
+
+  /** ZEB-665: absolute per-channel unread count (from ChannelUnreadService's
+   *  capped ID-set — a recomputable projection, so no boot-race queue like
+   *  mentions: the service re-pushes when channels materialize). Rolls the
+   *  owning community up to Σ(children) with a `quiet` dot (numbers on
+   *  channels, dot on the community — deliberate messenger idiom). */
+  setUnread(channelId: string, count: number): void {
+    const node = this.nodes.find((n) => n.id === channelId && n.type === 'channel');
+    if (!node) return;
+    const next = Math.max(0, count);
+    const nextLevel: NavNode['unreadLevel'] = next > 0 ? 'standard' : 'none';
+    if (node.unreadCount === next && node.unreadLevel === nextLevel) return;
+    const delta = next - node.unreadCount;
+    node.unreadCount = next;
+    node.unreadLevel = nextLevel;
+    // Incremental community rollup (the applyMentionDelta idiom) — setUnread
+    // sits on the per-message hot path, so no full-node scan here. setChannels
+    // still full-recomputes via rollUpCommunityUnread when structure changes.
+    const cid = this.communityIdOf(node);
+    if (cid) {
+      const comm = this.nodes.find((n) => n.id === cid);
+      if (comm) {
+        comm.unreadCount = Math.max(0, comm.unreadCount + delta);
+        comm.unreadLevel = comm.unreadCount > 0 ? 'quiet' : 'none';
+      }
+    }
+    this.onChange?.();
+  }
+
+  /** ZEB-665: community unread = Σ(channel children); level quiet/none. */
+  private rollUpCommunityUnread(communityId: string): void {
+    const comm = this.nodes.find((n) => n.id === communityId && n.type === 'community');
+    if (!comm) return;
+    const sum = this.nodes
+      .filter((n) => n.parentId === communityId && n.type === 'channel')
+      .reduce((acc, c) => acc + c.unreadCount, 0);
+    comm.unreadCount = sum;
+    comm.unreadLevel = sum > 0 ? 'quiet' : 'none';
   }
 
   /**

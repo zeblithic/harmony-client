@@ -995,3 +995,90 @@ describe('NavService community removal drops channel children (ZEB-663)', () => 
     expect(s.nodes.some((n) => n.id === 'a')).toBe(false); // child dropped too
   });
 });
+
+describe('NavService — per-channel unread (ZEB-665)', () => {
+  const HLC = { wallMs: 0, logical: 0, deviceId: 'd' };
+  const info = (channelId: string, name: string) => ({
+    channelId,
+    name,
+    writePower: 0,
+    kind: 'text' as const,
+    createdAt: HLC,
+  });
+
+  function seeded(): NavService {
+    const s = new NavService({ seedMockData: false });
+    s.nodes = [
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    s.setChannels('c1', [info('ch1', 'general'), info('ch2', 'random')]);
+    return s;
+  }
+
+  it('setUnread sets count + standard level and rolls up a quiet community dot', () => {
+    const s = seeded();
+    s.setUnread('ch1', 3);
+    const ch1 = s.nodes.find((n) => n.id === 'ch1')!;
+    const c1 = s.nodes.find((n) => n.id === 'c1')!;
+    expect(ch1.unreadCount).toBe(3);
+    expect(ch1.unreadLevel).toBe('standard');
+    expect(c1.unreadCount).toBe(3);
+    expect(c1.unreadLevel).toBe('quiet');
+  });
+
+  it('setUnread(0) clears the level and the rollup follows the sum', () => {
+    const s = seeded();
+    s.setUnread('ch1', 2);
+    s.setUnread('ch2', 5);
+    s.setUnread('ch1', 0);
+    const ch1 = s.nodes.find((n) => n.id === 'ch1')!;
+    const c1 = s.nodes.find((n) => n.id === 'c1')!;
+    expect(ch1.unreadLevel).toBe('none');
+    expect(c1.unreadCount).toBe(5);
+    expect(c1.unreadLevel).toBe('quiet');
+    s.setUnread('ch2', 0);
+    expect(c1.unreadCount).toBe(0);
+    expect(c1.unreadLevel).toBe('none');
+  });
+
+  it('setUnread on a missing node is a silent no-op', () => {
+    const s = seeded();
+    let changed = 0;
+    s.onChange = () => { changed++; };
+    expect(() => s.setUnread('nope', 4)).not.toThrow();
+    expect(changed).toBe(0);
+  });
+
+  it('setUnread notifies onChange once per effective change and not on no-ops', () => {
+    const s = seeded();
+    let changed = 0;
+    s.onChange = () => { changed++; };
+    s.setUnread('ch1', 3);
+    expect(changed).toBe(1);
+    s.setUnread('ch1', 3); // same value — no-op
+    expect(changed).toBe(1);
+  });
+
+  it('setUnread does not touch mention counts (parallel counters)', () => {
+    const s = seeded();
+    s.incMention('c1', 'ch1');
+    s.setUnread('ch1', 4);
+    const ch1 = s.nodes.find((n) => n.id === 'ch1')!;
+    const c1 = s.nodes.find((n) => n.id === 'c1')!;
+    expect(ch1.mentionCount).toBe(1);
+    expect(c1.mentionCount).toBe(1);
+    expect(ch1.unreadCount).toBe(4);
+  });
+
+  it('setChannels preserves per-channel unread and recomputes the rollup on removal', () => {
+    const s = seeded();
+    s.setUnread('ch1', 2);
+    s.setUnread('ch2', 7);
+    s.setChannels('c1', [info('ch1', 'general')]); // ch2 removed
+    const ch1 = s.nodes.find((n) => n.id === 'ch1')!;
+    const c1 = s.nodes.find((n) => n.id === 'c1')!;
+    expect(ch1.unreadCount).toBe(2);
+    expect(c1.unreadCount).toBe(2); // rollup follows survivors, ch2's 7 gone
+    expect(c1.unreadLevel).toBe('quiet');
+  });
+});

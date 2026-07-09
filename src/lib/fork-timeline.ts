@@ -6,7 +6,8 @@
  * without a DOM environment.
  */
 
-import type { ChannelMessageDto, HlcDto } from './channel-message-service';
+import type { ChannelMessageDto } from './channel-message-service';
+import { compareHlc } from './hlc';
 
 /** A message in the unified timeline — either from the snapshot (pre-fork)
  *  or from the live channel log (post-fork). */
@@ -31,8 +32,8 @@ export type TimelineRow = TimelineMessage | ForkDivider;
  * boundary between the last pre-fork message and the first live message.
  * The divider is only inserted when both lists are non-empty.
  *
- * HLC ordering: wallMs primary → logical secondary → deviceId tertiary.
- * This mirrors the `compareHlc` convention in channel-message-service.ts.
+ * HLC ordering: wallMs primary → logical secondary → deviceId tertiary
+ * (the shared `compareHlc` in hlc.ts).
  */
 export function buildUnifiedTimeline(
   snapshotMessages: ChannelMessageDto[],
@@ -122,11 +123,4 @@ function mergeSortedByHlc(
   while (ai < a.length) result.push(a[ai++]);
   while (bi < b.length) result.push(b[bi++]);
   return result;
-}
-
-/** HLC comparison: wallMs → logical → deviceId. Returns negative/0/positive. */
-function compareHlc(a: HlcDto, b: HlcDto): number {
-  if (a.wallMs !== b.wallMs) return a.wallMs - b.wallMs;
-  if (a.logical !== b.logical) return a.logical - b.logical;
-  return a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0;
 }
