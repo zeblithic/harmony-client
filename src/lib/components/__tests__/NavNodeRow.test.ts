@@ -176,6 +176,45 @@ describe('NavNodeRow', () => {
   });
 });
 
+describe('NavNodeRow — unread badge display cap (ZEB-665)', () => {
+  it('renders "99+" when unreadCount exceeds 99', () => {
+    render(NavNodeRow, {
+      props: {
+        node: makeNode({ unreadCount: 100, unreadLevel: 'standard' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    expect(screen.getByText('99+')).toBeTruthy();
+  });
+
+  it('renders the exact count at or below 99', () => {
+    render(NavNodeRow, {
+      props: {
+        node: makeNode({ unreadCount: 99, unreadLevel: 'standard' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    expect(screen.getByText('99')).toBeTruthy();
+  });
+
+  it('community quiet level renders the dot, not a number', () => {
+    const { container } = render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'community', name: 'Crew', unreadCount: 12, unreadLevel: 'quiet' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    expect(container.querySelector('.unread-dot')).toBeTruthy();
+    expect(container.querySelector('.unread-badge')).toBeNull();
+  });
+});
+
 describe('NavNodeRow — channel kind glyph (ZEB-663)', () => {
   it('renders 🔊 for a voice channel and NOT #', () => {
     const { container } = render(NavNodeRow, {
