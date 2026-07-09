@@ -267,6 +267,9 @@
   let mentionAlerter: import('./lib/mention-alert').MentionAlertService | null = null;
   // ZEB-665: per-channel unread tracker (created in the Tauri-transport IIFE).
   let channelUnread: import('./lib/channel-unread-service').ChannelUnreadService | null = null;
+  // ZEB-666: DM/group-DM unread tracker (created in the Tauri-transport IIFE,
+  // BEFORE messageService/navService connect — see the init-order comment there).
+  let dmUnread: import('./lib/dm-unread-service').DmUnreadService | null = null;
 
   // ── ZEB-353 Voice V5: SPA-unmount teardown ────────────────────────
   // Leave any active voice channel / end any in-progress DM call when the
@@ -1456,12 +1459,16 @@
     listCommunityIds: () =>
       navService.nodes.filter((n) => n.type === 'community').map((n) => n.id),
   });
-  // ZEB-665: (re)connect the unread cursor store when the owner identity lands
-  // (or changes) — pre-identity the store no-ops all reads/writes, and any
-  // channels materialized before this point get re-seeded by connectOwner.
+  // ZEB-665/ZEB-666: (re)connect the unread cursor stores when the owner
+  // identity lands (or changes) — pre-identity the store no-ops all
+  // reads/writes, and anything materialized before this point gets re-seeded
+  // by connectOwner.
   $effect(() => {
     const oid = selfOwnerId;
-    if (oid) channelUnread?.connectOwner(oid);
+    if (oid) {
+      channelUnread?.connectOwner(oid);
+      dmUnread?.connectOwner(oid);
+    }
   });
   // ── Friend service (ZEB-370) ───────────────────────────────────────
   // Same eager-construct / adapter-wired-in-IIFE / destroy-on-unmount
@@ -2096,6 +2103,56 @@
         console.warn('[harmony-client] listSharedSet hydration failed:', msg);
       }
 
+      // ── ZEB-666: DM/group-DM unread counts. Constructed (and BOTH hooks
+      // assigned) BEFORE messageService/navService connect so no dm-received
+      // or nav-updated event can fire into a null hook (the ZEB-665 Qodo
+      // lesson: an optional-chained hook is a silent no-op, and nothing
+      // replays it). Seeds via read_dm_thread directly (newest-first page —
+      // NOT messageService.loadDmThread, which ingests into the feed and
+      // advances its own pagination cursor). Shares ONE cursor-store
+      // instance with ChannelUnreadService below: both persist into the
+      // same owner-scoped localStorage blob, so separate instances would
+      // clobber each other's keys on every write.
+      let unreadCursorStore:
+        | import('./lib/unread-cursor-store').LocalStorageUnreadCursorStore
+        | null = null;
+      try {
+        const { DmUnreadService } = await import('./lib/dm-unread-service');
+        const { LocalStorageUnreadCursorStore } = await import('./lib/unread-cursor-store');
+        unreadCursorStore = new LocalStorageUnreadCursorStore();
+        const dm = new DmUnreadService({
+          listThreadPage: (spaceId, limit) =>
+            invoke('read_dm_thread', { spaceId, limit, beforeHlc: null }) as Promise<
+              import('./lib/dm-unread-service').DmThreadPageEntry[]
+            >,
+          setUnread: (spaceId, count) => navService.setUnread(spaceId, count),
+          // Same "looking right at it" contract as channelUnread's
+          // isActiveChannel below, in DM terms.
+          isActiveThread: (spaceId) =>
+            appMode === 'messages' &&
+            activeChannel === spaceId &&
+            (activeChannelType === 'dm' || activeChannelType === 'group-chat'),
+          isFocused: () => document.hasFocus(),
+          selfOwnerId: () => selfOwnerId ?? null,
+          storage: unreadCursorStore,
+          now: () => Date.now(),
+        });
+        dmUnread = dm;
+        navService.onDmSpaceChange = (action, spaceId) => {
+          if (action === 'added') void dm.onDmSpaceMaterialized(spaceId);
+          else dm.onDmSpaceRemoved(spaceId);
+        };
+        messageService.onDmReceived = (p) => dm.onDmReceived(p);
+        // Owner may already be known (the $effect only re-fires on change).
+        if (selfOwnerId) dm.connectOwner(selfOwnerId);
+        fileManagerService.addUnlisten(() => { dmUnread = null; });
+      } catch (e) {
+        console.warn(
+          '[harmony-client] dm-unread init failed:',
+          e instanceof Error ? e.message : String(e),
+        );
+      }
+
       await tryConnect('message', messageService.connectAdapter(adapter));
       // Mail connect may fail if mail_mgr isn't ready yet (race with
       // start_node); non-blocking so other services proceed. The
@@ -2151,6 +2208,33 @@
         console.warn('[harmony-client] community rehydration failed:', msg);
       }
 
+      // ZEB-666: rehydrate persisted DM / group-DM rows the same way — the
+      // nav otherwise boots with NO DM rows (push-only; only runtime
+      // nav-updated events re-create them), which would strand the persisted
+      // read cursors. Pull (not a boot emit) for the same no-race reason;
+      // addOrUpdateNavSpace is cold-replay idempotent, and each row fires
+      // onDmSpaceChange → unread seeding. Non-fatal.
+      try {
+        const dms = (await invoke('list_owner_dm_spaces')) as Array<{
+          spaceId: string;
+          kind: 'dm' | 'group-dm';
+          name: string;
+          members: string[];
+        }>;
+        for (const d of dms) {
+          navService.addOrUpdateNavSpace({
+            action: 'added',
+            spaceId: d.spaceId,
+            kind: d.kind,
+            name: d.name,
+            members: d.members,
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('[harmony-client] dm rehydration failed:', msg);
+      }
+
       // ── ZEB-665: per-channel unread counts. Constructed BEFORE
       // channelNavSync.start() so the very first setChannels materialization
       // seeds deterministically (Qodo PR #430: the optional-chained hook is a
@@ -2182,7 +2266,9 @@
             communityService.getSelectedChannel(communityId) === channelId,
           isFocused: () => document.hasFocus(),
           selfOwnerId: () => selfOwnerId ?? null,
-          storage: new LocalStorageUnreadCursorStore(),
+          // ZEB-666: shared with DmUnreadService — separate instances would
+          // clobber each other's keys in the same owner-scoped blob.
+          storage: unreadCursorStore ?? new LocalStorageUnreadCursorStore(),
           now: () => Date.now(),
         });
         // Owner may already be known (the $effect only re-fires on change).
@@ -3056,6 +3142,9 @@
     // pagination cursor in MessageService prevents repeat fetches of
     // the same page on rapid switches; no-op when offline / pre-adapter.
     if (node.type === 'dm' || node.type === 'group-chat') {
+      // ZEB-666: opening the thread clears its unread badge (open-clears-all;
+      // stamps the cursor past maxSeen so replays don't resurrect it).
+      dmUnread?.markThreadRead(node.id);
       messageService.loadDmThread(node.id).catch((e) => {
         console.error('loadDmThread failed:', e);
       });
