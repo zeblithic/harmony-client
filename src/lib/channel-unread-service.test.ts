@@ -82,6 +82,22 @@ describe('ChannelUnreadService (ZEB-665)', () => {
     expect(lastCount(pushes, 'ch1')).toBe(UNREAD_TRACK_CAP);
   });
 
+  it('seed in flight when markChannelRead lands filters against the fresh cursor (TOCTOU)', async () => {
+    let resolveList!: (v: ChannelMessageDto[]) => void;
+    const { svc, store, pushes } = harness({
+      listMessagesSince: () =>
+        new Promise<ChannelMessageDto[]>((r) => {
+          resolveList = r;
+        }),
+    });
+    store.set('c1', 'ch1', hlc(100));
+    const seeding = svc.onChannelsMaterialized('c1', [ch('ch1')]); // seed awaits the list
+    svc.markChannelRead('c1', 'ch1'); // user opens the channel mid-flight → cursor stamps now()
+    resolveList([msg('m2', hlc(300)), msg('m1', hlc(200))]); // newer than the OLD cursor only
+    await seeding;
+    expect(lastCount(pushes, 'ch1')).toBe(0); // nothing resurrected past the read stamp
+  });
+
   it('live message for a non-active channel counts once (backfill re-emission dedupes)', async () => {
     const { svc, store, pushes } = harness();
     store.set('c1', 'ch1', hlc(100));
