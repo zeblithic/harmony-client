@@ -26,8 +26,12 @@ export const UNREAD_TRACK_CAP = 100;
 
 export interface ChannelUnreadDeps {
   /** Raw `list_channel_messages` IPC (exclusive strictly-newer `since`,
-   *  oldest-first, server-capped). NOT ChannelMessageService.listMessages —
-   *  that ingests into the feed cache and re-fires onMessage. */
+   *  server-capped), wired newest-first via `order: 'desc'` (ZEB-602).
+   *  Counts and maxSeen don't depend on reply order, but WHICH message IDs
+   *  survive an over-cap seed does (the seed loop stops adding at the cap) —
+   *  newest-first is load-bearing for the "keep the newest under cap"
+   *  guarantee. NOT ChannelMessageService.listMessages — that ingests into
+   *  the feed cache and re-fires onMessage. */
   listMessagesSince(
     communityId: string,
     channelId: string,
@@ -124,9 +128,9 @@ export class ChannelUnreadService {
   }
 
   /** Open-clears-all: stamp the cursor past everything we know about and wipe
-   *  the set. The wall-clock stamp component is load-bearing under seed
-   *  overflow — the seed saw only the OLDEST 100 unread, so maxSeen alone
-   *  would under-stamp and leave a residual badge after opening. */
+   *  the set. With the newest-first seed (ZEB-602) maxSeen reflects the true
+   *  newest even under overflow; the wall-clock stamp stays as belt-and-braces
+   *  (e.g. a failed seed) so opening always clears. */
   markChannelRead(communityId: string, channelId: string): void {
     const candidates: Hlc[] = [{ wallMs: this.deps.now(), logical: 0, deviceId: '' }];
     const cursor = this.deps.storage.get(communityId, channelId);

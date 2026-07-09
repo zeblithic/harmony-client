@@ -23181,10 +23181,15 @@ async fn list_emoji_names(
 /// `0` means "use the engine's default (256)"; the IPC enforces a hard
 /// cap of 1000 per spec §9.2 (rejected before reaching the engine).
 ///
-/// Returns DTOs in HLC order (segments first, then in-memory tail).
+/// `order` (ZEB-602) selects the walk direction: `None`/`"asc"` returns
+/// DTOs in HLC order (segments first, then in-memory tail) with `limit`
+/// bounding from the OLDEST end — the original behavior; `"desc"`
+/// returns newest-first with `limit` bounding from the NEWEST end (the
+/// cheap "latest N" query).
 ///
 /// Errors:
 /// - `Err("limit {N} exceeds max 1000")` — boundary cap.
+/// - `Err("invalid order ...")` — anything other than `"asc"`/`"desc"`.
 /// - `Err("community_id must be 16 bytes (32 hex chars)")` /
 ///   `Err("channel_id must be 16 bytes (32 hex chars)")`.
 /// - `Err("invalid {field} hex: ...")`.
@@ -23199,8 +23204,17 @@ async fn list_channel_messages(
     channel_id: String,
     since: Option<crate::community_channel_log_engine::HlcDto>,
     limit: u32,
+    order: Option<String>,
 ) -> Result<Vec<crate::community_channel_log_engine::ChannelMessageDto>, String> {
-    list_channel_messages_impl(state_lock.inner(), community_id, channel_id, since, limit).await
+    list_channel_messages_impl(
+        state_lock.inner(),
+        community_id,
+        channel_id,
+        since,
+        limit,
+        order,
+    )
+    .await
 }
 
 /// ZEB-445: shared IPC/RPC seam.
@@ -23210,10 +23224,22 @@ pub(crate) async fn list_channel_messages_impl(
     channel_id: String,
     since: Option<crate::community_channel_log_engine::HlcDto>,
     limit: u32,
+    order: Option<String>,
 ) -> Result<Vec<crate::community_channel_log_engine::ChannelMessageDto>, String> {
     if limit > 1000 {
         return Err(format!("limit {limit} exceeds max 1000"));
     }
+    // ZEB-602: validate at the boundary, like `limit` — an unknown order
+    // must fail loudly, not silently fall back to oldest-first.
+    let newest_first = match order.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(other) => {
+            return Err(format!(
+                "invalid order \"{other}\": expected \"asc\" or \"desc\""
+            ));
+        }
+    };
     if community_id.len() != 32 {
         return Err("community_id must be 16 bytes (32 hex chars)".to_string());
     }
@@ -23253,10 +23279,14 @@ pub(crate) async fn list_channel_messages_impl(
         device_id: h.device_id,
     });
 
-    let dtos = engine
-        .list_message_dtos(since_hlc, limit as usize)
-        .await
-        .map_err(|e| e.to_string())?;
+    let dtos = if newest_first {
+        engine
+            .list_message_dtos_desc(since_hlc, limit as usize)
+            .await
+    } else {
+        engine.list_message_dtos(since_hlc, limit as usize).await
+    }
+    .map_err(|e| e.to_string())?;
 
     Ok(dtos)
 }
@@ -25705,10 +25735,16 @@ mod create_community_inner_tests {
 
         // Materialize: the message DTO's reactions must carry the custom emoji
         // with emojiCid set and an empty unicode emoji string.
-        let dtos =
-            list_channel_messages_impl(&node_state, community_id_hex, channel_id_hex, None, 100)
-                .await
-                .expect("list_channel_messages_impl must succeed");
+        let dtos = list_channel_messages_impl(
+            &node_state,
+            community_id_hex,
+            channel_id_hex,
+            None,
+            100,
+            None,
+        )
+        .await
+        .expect("list_channel_messages_impl must succeed");
         let msg = dtos
             .iter()
             .find(|d| d.message_id == message_id_hex)
@@ -56080,7 +56116,7 @@ mod channel_message_ipc_tests {
     async fn list_channel_messages_rejects_limit_over_cap() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 1001)
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 1001, None)
             .await
             .expect_err("over-cap limit must error");
         assert_eq!(err, "limit 1001 exceeds max 1000");
@@ -56094,7 +56130,7 @@ mod channel_message_ipc_tests {
         // validation passed.
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 0)
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 0, None)
             .await
             .expect_err("missing registry must error");
         assert!(
@@ -56107,7 +56143,7 @@ mod channel_message_ipc_tests {
     async fn list_channel_messages_accepts_limit_at_cap() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 1000)
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 1000, None)
             .await
             .expect_err("missing registry must error");
         assert!(
@@ -56120,10 +56156,54 @@ mod channel_message_ipc_tests {
     async fn list_channel_messages_rejects_short_community_id() {
         let app = mock_app_with_default_node_state();
         let state = app.state::<StdMutex<NodeState>>();
-        let err = list_channel_messages(state, "ab".into(), "00".repeat(16), None, 10)
+        let err = list_channel_messages(state, "ab".into(), "00".repeat(16), None, 10, None)
             .await
             .expect_err("short cid must error");
         assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    /// ZEB-602: an unknown `order` value must fail loudly at the boundary,
+    /// not silently fall back to oldest-first.
+    #[tokio::test]
+    async fn list_channel_messages_rejects_invalid_order() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            None,
+            10,
+            Some("newest".into()),
+        )
+        .await
+        .expect_err("bad order must error");
+        assert!(err.contains("invalid order"), "got: {err}");
+    }
+
+    /// ZEB-602: `None`/`"asc"`/`"desc"` all pass boundary validation and
+    /// fall through to the registry-lookup step (missing registry), which
+    /// proves the order check accepted them.
+    #[tokio::test]
+    async fn list_channel_messages_accepts_asc_and_desc_order() {
+        let app = mock_app_with_default_node_state();
+        for order in [None, Some("asc".to_string()), Some("desc".to_string())] {
+            let state = app.state::<StdMutex<NodeState>>();
+            let err = list_channel_messages(
+                state,
+                "00".repeat(16),
+                "00".repeat(16),
+                None,
+                10,
+                order.clone(),
+            )
+            .await
+            .expect_err("missing registry must error");
+            assert!(
+                err.contains("channel_log_registry missing"),
+                "order {order:?} should pass validation; got: {err}"
+            );
+        }
     }
 
     #[tokio::test]

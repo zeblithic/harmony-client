@@ -1377,6 +1377,30 @@ impl ChannelLogEngine {
         since: Option<Hlc>,
         limit: usize,
     ) -> Result<Vec<ChannelMessageDto>, ChannelLogEngineError> {
+        self.list_message_dtos_ordered(since, limit, false).await
+    }
+
+    /// ZEB-602: newest-first counterpart of `list_message_dtos`. Same
+    /// strictly-newer-than `since` floor and POST-paging semantics, but the
+    /// walk starts from the newest end — in-memory tail (reversed), then
+    /// sealed segments newest→oldest — so `limit` bounds from the newest
+    /// end and a "latest N" query usually never touches disk. Returns DTOs
+    /// newest-first: the reply equals the unbounded oldest-first listing,
+    /// reversed, truncated to `limit`.
+    pub async fn list_message_dtos_desc(
+        &self,
+        since: Option<Hlc>,
+        limit: usize,
+    ) -> Result<Vec<ChannelMessageDto>, ChannelLogEngineError> {
+        self.list_message_dtos_ordered(since, limit, true).await
+    }
+
+    async fn list_message_dtos_ordered(
+        &self,
+        since: Option<Hlc>,
+        limit: usize,
+        newest_first: bool,
+    ) -> Result<Vec<ChannelMessageDto>, ChannelLogEngineError> {
         let effective_limit = if limit == 0 {
             self.config.backfill_default_limit
         } else {
@@ -1386,47 +1410,71 @@ impl ChannelLogEngine {
         let log = self.log.lock().await;
         let mut out: Vec<ChannelMessageDto> = Vec::new();
 
-        for seg in &log.manifest.segments {
-            if let Some(since_hlc) = &since {
-                if !seg.range.1.is_strictly_newer_than(since_hlc) {
-                    continue;
-                }
-            }
-            let events = log
-                .read_segment(seg)
-                .map_err(ChannelLogEngineError::Persist)?;
-            for ev in &events {
-                if let Some(since_hlc) = &since {
-                    if !ev.at().is_strictly_newer_than(since_hlc) {
-                        continue;
-                    }
-                }
-                if !matches!(ev, SignedChannelEvent::Post { .. }) {
-                    continue;
-                }
-                let mut dto = self.message_dto_for_event(ev);
-                dto.reactions = log.reactions_for(ev.id(), &self.self_owner);
-                out.push(dto);
-                if out.len() >= effective_limit {
-                    return Ok(out);
-                }
-            }
-        }
-
-        for ev in &log.tail {
+        // Shared per-event step: `since` floor + Post filter + DTO
+        // projection with the materialized reaction view folded in.
+        // Returns true iff the event was retained (counts toward the
+        // POST page budget).
+        let push_if_post = |ev: &SignedChannelEvent, out: &mut Vec<ChannelMessageDto>| -> bool {
             if let Some(since_hlc) = &since {
                 if !ev.at().is_strictly_newer_than(since_hlc) {
-                    continue;
+                    return false;
                 }
             }
             if !matches!(ev, SignedChannelEvent::Post { .. }) {
-                continue;
+                return false;
             }
             let mut dto = self.message_dto_for_event(ev);
             dto.reactions = log.reactions_for(ev.id(), &self.self_owner);
             out.push(dto);
-            if out.len() >= effective_limit {
-                return Ok(out);
+            true
+        };
+
+        if newest_first {
+            // Newest end first: tail reversed, then segments newest→oldest
+            // with events reversed within each. The `since` filter stays
+            // `continue`-style (no early break), mirroring the oldest-first
+            // walk's conservatism about intra-log ordering — the result is
+            // defined as the reversed unbounded asc listing, truncated.
+            for ev in log.tail.iter().rev() {
+                if push_if_post(ev, &mut out) && out.len() >= effective_limit {
+                    return Ok(out);
+                }
+            }
+            for seg in log.manifest.segments.iter().rev() {
+                if let Some(since_hlc) = &since {
+                    if !seg.range.1.is_strictly_newer_than(since_hlc) {
+                        continue;
+                    }
+                }
+                let events = log
+                    .read_segment(seg)
+                    .map_err(ChannelLogEngineError::Persist)?;
+                for ev in events.iter().rev() {
+                    if push_if_post(ev, &mut out) && out.len() >= effective_limit {
+                        return Ok(out);
+                    }
+                }
+            }
+        } else {
+            for seg in &log.manifest.segments {
+                if let Some(since_hlc) = &since {
+                    if !seg.range.1.is_strictly_newer_than(since_hlc) {
+                        continue;
+                    }
+                }
+                let events = log
+                    .read_segment(seg)
+                    .map_err(ChannelLogEngineError::Persist)?;
+                for ev in &events {
+                    if push_if_post(ev, &mut out) && out.len() >= effective_limit {
+                        return Ok(out);
+                    }
+                }
+            }
+            for ev in &log.tail {
+                if push_if_post(ev, &mut out) && out.len() >= effective_limit {
+                    return Ok(out);
+                }
             }
         }
 
@@ -6863,6 +6911,209 @@ mod tests {
             .expect("p2");
         assert_eq!(page2.len(), 1, "paging past reactions reaches Q (no stall)");
         assert_eq!(page2[0].body, b"Q".to_vec());
+    }
+
+    // ── ZEB-602: list_message_dtos_desc (newest-first) ────────────────
+
+    /// ZEB-602: `desc` returns the newest N posts, newest-first — `limit`
+    /// bounds from the NEWEST end, not the oldest (the whole point of the
+    /// ticket: "the latest 2" must not mean "the oldest 2").
+    #[tokio::test]
+    async fn list_message_dtos_desc_returns_newest_n_newest_first() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        for b in [b"A".to_vec(), b"B".to_vec(), b"C".to_vec(), b"D".to_vec()] {
+            Arc::clone(&fix.engine)
+                .publish(b, None, None, None)
+                .await
+                .expect("post");
+        }
+        let page = fix
+            .engine
+            .list_message_dtos_desc(None, 2)
+            .await
+            .expect("list");
+        let bodies: Vec<Vec<u8>> = page.iter().map(|d| d.body.clone()).collect();
+        assert_eq!(bodies, vec![b"D".to_vec(), b"C".to_vec()]);
+    }
+
+    /// ZEB-602: the strictly-newer-than `since` floor applies in desc too.
+    #[tokio::test]
+    async fn list_message_dtos_desc_applies_since_floor() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        for b in [b"A".to_vec(), b"B".to_vec(), b"C".to_vec()] {
+            Arc::clone(&fix.engine)
+                .publish(b, None, None, None)
+                .await
+                .expect("post");
+        }
+        let events = fix.engine.list_messages(None, 100).await.expect("evs");
+        let b_hlc = events
+            .iter()
+            .find(|e| matches!(e, SignedChannelEvent::Post { body, .. } if body == "B"))
+            .map(|e| e.at().clone())
+            .expect("B in log");
+        let page = fix
+            .engine
+            .list_message_dtos_desc(Some(b_hlc), 100)
+            .await
+            .expect("list");
+        let bodies: Vec<Vec<u8>> = page.iter().map(|d| d.body.clone()).collect();
+        assert_eq!(bodies, vec![b"C".to_vec()], "B itself excluded (strict)");
+    }
+
+    /// ZEB-602: the desc walk crosses the tail→segment and segment→segment
+    /// boundaries newest-first, cuts mid-segment on `limit`, and honors the
+    /// `since` segment skip. seal=4, 10 events ⇒ seg0 [msg-0..3],
+    /// seg1 [msg-4..7], tail [msg-8, msg-9] (same layout as the asc
+    /// characterization test `collect_events_offlock_order_paging_and_since_across_segments`).
+    #[tokio::test]
+    async fn list_message_dtos_desc_spans_seal_boundaries() {
+        let fix = build_engine_fixture(4, 250, 1000).await;
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for i in 0..10u64 {
+                let ev = make_signed_event(
+                    fix.community_id,
+                    fix.channel_id,
+                    fix.self_owner,
+                    Hlc {
+                        wall_ms: 100 + i,
+                        logical: 0,
+                        device_id: "test-device".to_string(),
+                    },
+                    &format!("msg-{i}"),
+                    &fix.signing_key,
+                );
+                log.append(ev).expect("append");
+                if (i + 1) % 4 == 0 {
+                    log.seal_and_persist().expect("seal");
+                }
+            }
+            assert_eq!(log.manifest.segments.len(), 2, "expected 2 sealed segments");
+            assert_eq!(log.tail.len(), 2, "expected 2 tail events");
+        }
+
+        let bodies = |dtos: Vec<ChannelMessageDto>| -> Vec<String> {
+            dtos.into_iter()
+                .map(|d| String::from_utf8(d.body).expect("utf8"))
+                .collect()
+        };
+
+        // Unbounded desc == full asc listing reversed.
+        let all = bodies(
+            fix.engine
+                .list_message_dtos_desc(None, 1000)
+                .await
+                .expect("list"),
+        );
+        assert_eq!(
+            all,
+            (0..10)
+                .rev()
+                .map(|i| format!("msg-{i}"))
+                .collect::<Vec<_>>(),
+            "newest-first ordering preserved across tail + both segments"
+        );
+
+        // limit=5 takes the tail (msg-9, msg-8) then cuts INSIDE seg1.
+        let capped = bodies(
+            fix.engine
+                .list_message_dtos_desc(None, 5)
+                .await
+                .expect("list"),
+        );
+        assert_eq!(
+            capped,
+            (5..10)
+                .rev()
+                .map(|i| format!("msg-{i}"))
+                .collect::<Vec<_>>(),
+            "limit bounds from the newest end and cuts mid-segment"
+        );
+
+        // since = msg-3's HLC: seg0.range.1 is not strictly newer, so seg0
+        // is skipped wholesale; tail + seg1 contribute msg-9..msg-4.
+        let since = Hlc {
+            wall_ms: 103,
+            logical: 0,
+            device_id: "test-device".to_string(),
+        };
+        let after = bodies(
+            fix.engine
+                .list_message_dtos_desc(Some(since), 1000)
+                .await
+                .expect("list"),
+        );
+        assert_eq!(
+            after,
+            (4..10)
+                .rev()
+                .map(|i| format!("msg-{i}"))
+                .collect::<Vec<_>>(),
+            "since skips the fully-older first segment and filters within"
+        );
+    }
+
+    /// ZEB-602: desc pages by POSTS (a reaction run never consumes the
+    /// budget) and folds the materialized reaction view in, same as asc.
+    #[tokio::test]
+    async fn list_message_dtos_desc_skips_reactions_and_folds_view() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let p = Arc::clone(&fix.engine)
+            .publish(b"P".to_vec(), None, None, None)
+            .await
+            .expect("post P");
+        for i in 0..5u8 {
+            Arc::clone(&fix.engine)
+                .react(p, format!("e{i}"), true, None)
+                .await
+                .expect("react");
+        }
+        Arc::clone(&fix.engine)
+            .publish(b"Q".to_vec(), None, None, None)
+            .await
+            .expect("post Q");
+
+        let page = fix
+            .engine
+            .list_message_dtos_desc(None, 2)
+            .await
+            .expect("list");
+        let bodies: Vec<Vec<u8>> = page.iter().map(|d| d.body.clone()).collect();
+        assert_eq!(bodies, vec![b"Q".to_vec(), b"P".to_vec()]);
+        assert_eq!(
+            page[1].reactions.len(),
+            5,
+            "P carries its full reaction view in desc"
+        );
+        assert!(page[0].reactions.is_empty(), "Q has no reactions");
+    }
+
+    /// ZEB-602: `limit=0` falls back to the engine default in desc too, and
+    /// an empty log returns empty rather than erroring.
+    #[tokio::test]
+    async fn list_message_dtos_desc_limit_zero_default_and_empty_log() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let empty = fix
+            .engine
+            .list_message_dtos_desc(None, 100)
+            .await
+            .expect("list");
+        assert!(empty.is_empty());
+
+        for b in [b"A".to_vec(), b"B".to_vec()] {
+            Arc::clone(&fix.engine)
+                .publish(b, None, None, None)
+                .await
+                .expect("post");
+        }
+        let page = fix
+            .engine
+            .list_message_dtos_desc(None, 0)
+            .await
+            .expect("list");
+        let bodies: Vec<Vec<u8>> = page.iter().map(|d| d.body.clone()).collect();
+        assert_eq!(bodies, vec![b"B".to_vec(), b"A".to_vec()]);
     }
 
     /// ZEB-536 (CodeRabbit PR #314): the Post-only accessor that backs the

@@ -2157,16 +2157,22 @@
       // silent no-op while channelUnread is null, and nothing replays it).
       // Seeds via list_channel_messages directly (NOT
       // channelMessageService.listMessages — that would ingest into the feed
-      // cache and re-fire onMessage). Self-gates on cursor, author, and
-      // focused-active; NavService renders the badges.
+      // cache and re-fire onMessage), newest-first (ZEB-602) so a seed that
+      // overflows the tracking cap holds the NEWEST cap-worth of unread.
+      // Self-gates on cursor, author, and focused-active; NavService renders
+      // the badges.
       try {
         const { ChannelUnreadService } = await import('./lib/channel-unread-service');
         const { LocalStorageUnreadCursorStore } = await import('./lib/unread-cursor-store');
         channelUnread = new ChannelUnreadService({
           listMessagesSince: (communityId, channelId, since, limit) =>
-            invoke('list_channel_messages', { communityId, channelId, since, limit }) as Promise<
-              import('./lib/channel-message-service').ChannelMessageDto[]
-            >,
+            invoke('list_channel_messages', {
+              communityId,
+              channelId,
+              since,
+              limit,
+              order: 'desc',
+            }) as Promise<import('./lib/channel-message-service').ChannelMessageDto[]>,
           setUnread: (channelId, count) => navService.setUnread(channelId, count),
           // Same "looking right at it" contract as the mention alerter below.
           isActiveChannel: (communityId, channelId) =>
