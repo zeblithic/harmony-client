@@ -346,6 +346,53 @@ describe('MessageService DM events', () => {
     expect(svc.onChange).toHaveBeenCalled();
   });
 
+  it('onDmReceived hook fires post-dedup with the raw payload (ZEB-666)', async () => {
+    const { adapter, emit } = createMockAdapter();
+    const hook = vi.fn();
+    svc.onDmReceived = hook;
+    await svc.connectAdapter(adapter);
+
+    const payload = {
+      spaceId: 'aabbccdd',
+      messageCid: 'cid-1',
+      from: 'peer-hex',
+      sentAt: 1,
+      receivedAt: 2,
+      body: hexEncode('hi'),
+      mimeType: 'text/plain',
+    };
+    emit('dm-received', payload);
+    emit('dm-received', payload); // duplicate delivery → deduped
+
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledWith(expect.objectContaining({
+      spaceId: 'aabbccdd',
+      messageCid: 'cid-1',
+      from: 'peer-hex',
+      receivedAt: 2,
+    }));
+  });
+
+  it('onDmReceived hook also fires for self-echoed DMs (service filters self itself)', async () => {
+    const { adapter, emit } = createMockAdapter();
+    const hook = vi.fn();
+    svc.onDmReceived = hook;
+    svc.ownAddress = 'my-own-hex';
+    await svc.connectAdapter(adapter);
+
+    emit('dm-received', {
+      spaceId: 'aabbccdd',
+      messageCid: 'self-cid-2',
+      from: 'my-own-hex',
+      sentAt: 1,
+      receivedAt: 2,
+      body: hexEncode('echo'),
+      mimeType: 'text/plain',
+    });
+
+    expect(hook).toHaveBeenCalledTimes(1);
+  });
+
   it('transitions self-Message to delivered on dm-delivered (ZEB-231)', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);

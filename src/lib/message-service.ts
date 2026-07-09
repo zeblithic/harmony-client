@@ -48,6 +48,20 @@ export class MessageService {
   messages: Message[] = [];
   /** Called whenever the message list changes so the UI can re-render. */
   onChange?: () => void;
+  /** ZEB-666: post-dedup hook for `dm-received` — fires once per unique
+   *  messageCid with the raw wire payload (DmUnreadService consumes
+   *  spaceId/messageCid/from/receivedAt; it does its own self-filtering
+   *  via selfOwnerId). Assign BEFORE connectAdapter (an optional-chained
+   *  hook is a silent no-op; nothing replays it). */
+  onDmReceived?: (payload: {
+    spaceId: string;
+    messageCid: string;
+    from: string;
+    sentAt: number;
+    receivedAt: number;
+    body: string;
+    mimeType: string;
+  }) => void;
   /** Hex-encoded node address — set after Zenoh connects so we can
    *  identify self-sent messages in the echo. */
   ownAddress: string | null = null;
@@ -164,6 +178,8 @@ export class MessageService {
         // Dedupe across reconnect/cold-start replay (messageCid is content-addressed).
         if (this.seenIds.has(payload.messageCid)) return;
         this.seenIds.add(payload.messageCid);
+        // ZEB-666: unread tracking sees exactly one event per CID.
+        this.onDmReceived?.(payload);
 
         const text = hexToUtf8(payload.body);
         const sender = (this.ownAddress && payload.from === this.ownAddress)

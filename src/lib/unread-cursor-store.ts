@@ -35,6 +35,12 @@ export class LocalStorageUnreadCursorStore implements UnreadCursorStore {
   private map = new Map<string, Hlc>();
 
   connectOwner(ownerId: string): void {
+    // ZEB-666: the instance is shared by ChannelUnreadService and
+    // DmUnreadService, both of which connect the same owner — a same-owner
+    // reconnect must not clear/reparse the live map out from under the
+    // other service (every set() persists synchronously, so there is
+    // nothing newer in localStorage to pick up).
+    if (this.ownerId === ownerId) return;
     this.ownerId = ownerId;
     this.map = new Map();
     try {

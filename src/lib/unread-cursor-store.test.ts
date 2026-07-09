@@ -29,6 +29,20 @@ describe('LocalStorageUnreadCursorStore (ZEB-665)', () => {
     expect(s.get('c1', 'ch1')).toBeNull();
   });
 
+  it('same-owner reconnect is a no-op (shared-instance guard, ZEB-666)', () => {
+    const s = new LocalStorageUnreadCursorStore();
+    s.connectOwner('owner-a');
+    s.set('c1', 'ch1', HLC);
+    // Wipe the persisted blob: a reload would lose the live map, so a
+    // surviving cursor proves the same-owner reconnect didn't reparse.
+    localStorage.clear();
+    s.connectOwner('owner-a');
+    expect(s.get('c1', 'ch1')).toEqual(HLC);
+    // A real owner change still reloads.
+    s.connectOwner('owner-b');
+    expect(s.get('c1', 'ch1')).toBeNull();
+  });
+
   it('persists across instances for the same owner', () => {
     const a = new LocalStorageUnreadCursorStore();
     a.connectOwner('owner-a');

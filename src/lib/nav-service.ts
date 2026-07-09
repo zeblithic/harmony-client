@@ -44,6 +44,12 @@ export class NavService {
   onChange?: () => void;
   /** Hex-encoded own address — profile updates matching this are filtered. */
   ownAddress: string | null = null;
+  /** ZEB-666: fired from `addOrUpdateNavSpace`'s dm/group-dm path so
+   *  DmUnreadService can seed ('added' — also fired for modified, which
+   *  self-heals as added; seeding is idempotent) or drop ('removed')
+   *  per-thread unread state. Assign BEFORE connectAdapter (an
+   *  optional-chained hook is a silent no-op; nothing replays it). */
+  onDmSpaceChange?: (action: 'added' | 'removed', spaceId: string) => void;
 
   private adapter: TauriAdapter | null = null;
   private connecting = false;
@@ -282,6 +288,7 @@ export class NavService {
       const before = this.nodes.length;
       this.nodes = this.nodes.filter((n) => n.id !== spaceId);
       if (this.nodes.length !== before) this.onChange?.();
+      this.onDmSpaceChange?.('removed', spaceId);
       return;
     }
 
@@ -365,6 +372,7 @@ export class NavService {
       }
     }
     this.onChange?.();
+    this.onDmSpaceChange?.('added', spaceId);
   }
 
   /**
@@ -537,13 +545,19 @@ export class NavService {
     this.applyMentionDelta(id, -node.mentionCount);
   }
 
-  /** ZEB-665: absolute per-channel unread count (from ChannelUnreadService's
-   *  capped ID-set — a recomputable projection, so no boot-race queue like
-   *  mentions: the service re-pushes when channels materialize). Rolls the
+  /** ZEB-665/ZEB-666: absolute per-node unread count (from the unread
+   *  services' capped ID-sets — recomputable projections, so no boot-race
+   *  queue like mentions: the services re-push when nodes materialize).
+   *  Drives channel, dm, and group-chat nodes; only channels roll the
    *  owning community up to Σ(children) with a `quiet` dot (numbers on
-   *  channels, dot on the community — deliberate messenger idiom). */
+   *  channels, dot on the community — deliberate messenger idiom; DM rows
+   *  have no aggregation target). */
   setUnread(channelId: string, count: number): void {
-    const node = this.nodes.find((n) => n.id === channelId && n.type === 'channel');
+    const node = this.nodes.find(
+      (n) =>
+        n.id === channelId &&
+        (n.type === 'channel' || n.type === 'dm' || n.type === 'group-chat'),
+    );
     if (!node) return;
     const next = Math.max(0, count);
     const nextLevel: NavNode['unreadLevel'] = next > 0 ? 'standard' : 'none';
@@ -554,12 +568,15 @@ export class NavService {
     // Incremental community rollup (the applyMentionDelta idiom) — setUnread
     // sits on the per-message hot path, so no full-node scan here. setChannels
     // still full-recomputes via rollUpCommunityUnread when structure changes.
-    const cid = this.communityIdOf(node);
-    if (cid) {
-      const comm = this.nodes.find((n) => n.id === cid);
-      if (comm) {
-        comm.unreadCount = Math.max(0, comm.unreadCount + delta);
-        comm.unreadLevel = comm.unreadCount > 0 ? 'quiet' : 'none';
+    // Channel nodes only: a DM's parentId is a user folder, not a community.
+    if (node.type === 'channel') {
+      const cid = this.communityIdOf(node);
+      if (cid) {
+        const comm = this.nodes.find((n) => n.id === cid);
+        if (comm) {
+          comm.unreadCount = Math.max(0, comm.unreadCount + delta);
+          comm.unreadLevel = comm.unreadCount > 0 ? 'quiet' : 'none';
+        }
       }
     }
     this.onChange?.();
