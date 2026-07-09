@@ -20071,6 +20071,9 @@ pub struct ForkDescendantDto {
     /// Whether the descendant community is locally known
     /// (in the joiner's OwnerState). UI uses this to gate clickability.
     pub locally_known: bool,
+    /// ZEB-649: the forker's stated why, straight off the Fork event.
+    /// None for pre-ZEB-649 events (minted before the field existed).
+    pub reason: Option<String>,
 }
 
 /// Pure-helper for `list_community_forks` IPC: takes the engine state's
@@ -20118,10 +20121,11 @@ pub fn build_fork_descendants(
     let dtos: Vec<ForkDescendantDto> = fork_events
         .into_iter()
         .map(|signed| {
-            let fork_space_id = match &signed.kind {
+            let (fork_space_id, reason) = match &signed.kind {
                 crate::community_membership::MembershipEventKind::Fork {
-                    fork_space_id, ..
-                } => fork_space_id,
+                    fork_space_id,
+                    reason,
+                } => (fork_space_id, reason.clone()),
                 // Unreachable: filtered above.
                 _ => unreachable!("non-Fork event survived filter"),
             };
@@ -20141,6 +20145,7 @@ pub fn build_fork_descendants(
                 forker_display_name,
                 forked_at_wall_ms: signed.at.wall_ms,
                 locally_known: locally_known.contains(fork_space_id),
+                reason,
             }
         })
         .collect();
@@ -20640,6 +20645,56 @@ mod list_community_forks_tests {
         assert_eq!(result[0].forker_addr, hex::encode(caller.0));
         assert_eq!(result[0].forked_at_wall_ms, 200);
         assert!(result[0].locally_known);
+        assert_eq!(
+            result[0].reason, None,
+            "pre-ZEB-649 event (no rs) projects reason: None"
+        );
+    }
+
+    /// ZEB-649: a Fork event carrying a reason projects it onto the DTO
+    /// verbatim; a reason-less (pre-ZEB-649) event projects None. Both
+    /// shapes coexist in one log.
+    #[test]
+    fn list_community_forks_projects_reason() {
+        let cid = SpaceId([0xac; 16]);
+        let caller = OwnerAddr([0xc2; 16]);
+
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            synth_signed(
+                0x01,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xf3; 16]),
+                    reason: Some("Treasury split".to_string()),
+                },
+                caller,
+                100,
+            ),
+        );
+        events.insert(
+            [0x02; 16],
+            synth_signed(
+                0x02,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xf4; 16]),
+                    reason: None,
+                },
+                caller,
+                200,
+            ),
+        );
+
+        let materialized = materialized_with_join(caller, MemberStatus::Joined);
+        let locally_known: BTreeSet<SpaceId> = BTreeSet::new();
+
+        let result = build_fork_descendants(&events, &materialized, &locally_known, caller)
+            .expect("Joined caller must succeed");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].reason.as_deref(), Some("Treasury split"));
+        assert_eq!(result[1].reason, None);
     }
 
     #[test]
