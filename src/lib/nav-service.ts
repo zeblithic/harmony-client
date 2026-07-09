@@ -58,6 +58,12 @@ export class NavService {
    *  mocks on `connectAdapter()` while preserving any locally-added
    *  profiles from the pre-connect window (ZEB-209 bot R1). */
   private mockProfileKeys = new Set<string>();
+  /** ZEB-663: boot-race mentions, keyed by `channelId`, for channels whose nav
+   *  nodes don't exist yet. `incMention` queues here; `setChannels` drains onto
+   *  the channel when it materializes (see those methods). Entries for channels
+   *  that never materialize are harmless and bounded by distinct channelIds
+   *  mentioned during a boot gap. */
+  private pendingChannelMentions = new Map<string, number>();
 
   /**
    * @param opts.seedMockData Whether to seed the nav tree + profile map with
@@ -382,23 +388,51 @@ export class NavService {
         .map((n) => [n.id, n] as const),
     );
 
-    // Detect structural change (id set, names, or kinds differ).
-    let changed = prev.size !== channels.length;
+    // Detect structural change: a differing id set, any per-channel name/kind
+    // change, or a pure reorder. Order is load-bearing — sibling render order
+    // follows array order among same-parent nodes (channels have no
+    // `lastActivity`, so `sortNodes('activity')` is a stable no-op) — so a
+    // reordered-but-otherwise-identical list must still rebuild + re-render.
+    // `prev` is built by filtering `this.nodes` in order, so its key order is
+    // the current render order.
+    const prevOrder = [...prev.keys()];
+    let changed = prevOrder.length !== channels.length;
     if (!changed) {
-      for (const info of channels) {
+      for (let i = 0; i < channels.length; i++) {
+        const info = channels[i];
         const old = prev.get(info.channelId);
-        if (!old || old.name !== info.name || old.channelKind !== info.kind) {
+        if (
+          !old ||
+          old.name !== info.name ||
+          old.channelKind !== info.kind ||
+          prevOrder[i] !== info.channelId
+        ) {
           changed = true;
           break;
         }
       }
     }
 
-    if (!changed) return; // idempotent re-sync — stay silent
+    // A pending boot-race mention for any materializing channel must be
+    // replayed even if the channel set is otherwise idempotent, so don't
+    // early-return while there's queued work for an incoming channel.
+    const hasPendingReplay = channels.some((c) =>
+      this.pendingChannelMentions.has(c.channelId),
+    );
+
+    if (!changed && !hasPendingReplay) return; // idempotent re-sync — stay silent
 
     // Rebuild the child block in listChannels order, preserving live state.
+    // A channel materializing for the first time drains any boot-race mentions
+    // that `incMention` queued for it while its nav node didn't exist yet — so
+    // a real unseen-mention badge migrates onto the correct channel instead of
+    // being lost or stranded on the community (`old` and `pending` are mutually
+    // exclusive: once a channel is a node, incMention targets it directly and
+    // never queues).
     const nextChildren: NavNode[] = channels.map((info) => {
       const old = prev.get(info.channelId);
+      const pending = this.pendingChannelMentions.get(info.channelId) ?? 0;
+      if (pending) this.pendingChannelMentions.delete(info.channelId);
       return {
         id: info.channelId,
         parentId: communityId,
@@ -407,7 +441,7 @@ export class NavService {
         name: info.name,
         expanded: old?.expanded ?? false,
         unreadCount: old?.unreadCount ?? 0,
-        mentionCount: old?.mentionCount ?? 0,
+        mentionCount: (old?.mentionCount ?? 0) + pending,
         unreadLevel: old?.unreadLevel ?? 'none',
       };
     });
@@ -468,17 +502,28 @@ export class NavService {
     this.onChange?.();
   }
 
-  /** ZEB-662: increment an unseen-mention count for a community channel.
-   *  When the channel is itself a nav node (dev/mock seed) increment it and
-   *  bubble to its community. In production, community channels aren't nav
-   *  nodes, so the indicator lives directly on the community node (the only
-   *  per-community surface the nav has). Target selection is the seam between
-   *  the two models — no `import.meta.env.DEV` branch needed. */
+  /** ZEB-662/663: increment an unseen-mention count for a community channel.
+   *  When the channel's nav node exists, bump it and bubble to its community.
+   *  When it doesn't yet — the boot-race window before `ChannelNavSync` has
+   *  materialized this community's channels — queue the delta by `channelId`
+   *  so `setChannels` can replay it onto the right channel the moment it
+   *  appears. Queuing (rather than parking an unattributable count on the
+   *  community node) is what lets `setChannels` hold `community == Σ(children)`
+   *  without either losing the mention or stranding a phantom badge. */
   incMention(communityId: string, channelId: string): void {
-    const target = this.nodes.some((n) => n.id === channelId)
-      ? channelId
-      : communityId;
-    this.applyMentionDelta(target, 1);
+    if (this.nodes.some((n) => n.id === channelId)) {
+      this.applyMentionDelta(channelId, 1);
+      return;
+    }
+    // Channel node absent. Only queue for a community we're actually in — a
+    // stray for an unknown community is dropped (matches the prior no-op).
+    if (!this.nodes.some((n) => n.id === communityId && n.type === 'community')) {
+      return;
+    }
+    this.pendingChannelMentions.set(
+      channelId,
+      (this.pendingChannelMentions.get(channelId) ?? 0) + 1,
+    );
   }
 
   /** ZEB-662: clear a node's mention count (its channel/DM opened, or — in

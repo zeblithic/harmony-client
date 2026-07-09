@@ -148,4 +148,21 @@ describe('NavTree — AddChannelNavRow gating (ZEB-663)', () => {
     await fireEvent.click(getByTestId('add-channel-row-c1'));
     expect(onAddChannel).toHaveBeenCalledWith('c1');
   });
+
+  it('Space activation suppresses the browser default (page scroll) and adds a channel', () => {
+    const onAddChannel = vi.fn();
+    const { getByTestId } = render(NavTree, {
+      props: {
+        nodes: commNodes,
+        parentId: null,
+        canManageChannels: () => true,
+        onAddChannel,
+      },
+    });
+    const row = getByTestId('add-channel-row-c1');
+    const evt = new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
+    row.dispatchEvent(evt);
+    expect(evt.defaultPrevented).toBe(true); // Space would otherwise scroll the page
+    expect(onAddChannel).toHaveBeenCalledWith('c1');
+  });
 });

@@ -209,7 +209,8 @@
       // selected-channel fallback (its resolution effect re-picks when the
       // active channel is removed from the nav children).
       void refreshChannels().catch((e) => {
-        console.warn('CommunityView: refreshChannels failed in onChannelConfigChanged:', e);
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn('CommunityView: refreshChannels failed in onChannelConfigChanged:', msg);
       });
     };
   });

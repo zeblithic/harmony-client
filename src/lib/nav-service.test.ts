@@ -822,16 +822,28 @@ describe('mention counts (ZEB-662)', () => {
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1); // only ch2 remains
   });
 
-  it('production: channel is not a nav node → the community node carries the badge', () => {
+  it('boot race: a mention for a not-yet-materialized channel queues off the community bubble (ZEB-663)', () => {
     const s = prodSvc();
-    s.incMention('c1', 'ch-a'); // ch-a / ch-b aren't nav nodes in prod
+    const HLC = { wallMs: 0, logical: 0, deviceId: 'd' };
+    const info = (channelId: string, name: string) => ({
+      channelId,
+      name,
+      writePower: 0,
+      kind: 'text' as const,
+      createdAt: HLC,
+    });
+    // Channels aren't nav nodes yet (the boot gap before ChannelNavSync.start).
+    // incMention queues by channelId rather than parking an unattributable
+    // aggregate on the community node, so the community bubble stays clean.
+    s.incMention('c1', 'ch-a');
     s.incMention('c1', 'ch-b');
-    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // aggregate on community
-    // clearMention on a community node still zeroes its aggregate (method-level);
-    // the ZEB-662 community-open *call* was removed in ZEB-663 (clearing is
-    // per-channel now), but the boot-race fallback still lands on the community.
-    s.clearMention('c1');
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
+    // The queued mentions replay onto their channels once setChannels runs, so
+    // a real unseen-mention badge is preserved (not lost, not stranded).
+    s.setChannels('c1', [info('ch-a', 'general'), info('ch-b', 'random')]);
+    expect(s.nodes.find((n) => n.id === 'ch-a')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'ch-b')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // bubbled sum
   });
 
   it('incMention with an unknown community and channel is a no-op', () => {
@@ -911,18 +923,41 @@ describe('NavService.setChannels reconcile (ZEB-663)', () => {
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1); // b's 1 subtracted
   });
 
-  it('self-heals a boot-race stray: reconciles the community bubble to the children sum', () => {
+  it('replays a boot-race mention onto its channel when channels materialize (ZEB-663)', () => {
     const s = withCommunity();
-    // Boot race: a mention lands on the community node before its channels are
-    // populated (incMention's channel-else-community fallback). No channel nodes
-    // exist yet, so the community node carries the stray.
+    // Boot race: a mention arrives for channel 'a' before its nav node exists.
+    // incMention queues it by channelId (no unattributable parking on the
+    // community), so the community bubble stays 0 until channels materialize.
     s.incMention('c1', 'a');
-    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1);
-    // Channels populate → the community bubble reconciles to the children sum (0),
-    // instead of stranding a phantom badge that nothing can clear.
-    s.setChannels('c1', [ch('a', 'general')]);
-    expect(s.nodes.find((n) => n.id === 'a')!.mentionCount).toBe(0);
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
+    // Channels populate → the queued mention migrates onto 'a' and bubbles up.
+    // The real unseen-mention badge is preserved, not wiped (was the
+    // "mentions vanish after sync" regression) and not stranded on the community.
+    s.setChannels('c1', [ch('a', 'general')]);
+    expect(s.nodes.find((n) => n.id === 'a')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1);
+  });
+
+  it('a queued boot-race mention drains exactly once (survives a later idempotent resync)', () => {
+    const s = withCommunity();
+    s.incMention('c1', 'a');
+    s.setChannels('c1', [ch('a', 'general')]); // materialize → replay onto 'a'
+    s.setChannels('c1', [ch('a', 'general')]); // idempotent re-sync must not re-add
+    expect(s.nodes.find((n) => n.id === 'a')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1);
+  });
+
+  it('reorders channel children (and re-renders) when only the order changes', () => {
+    const s = withCommunity();
+    let changed = 0;
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'random')]);
+    s.onChange = () => { changed++; };
+    // Same id/name/kind set, different order → must rebuild + fire onChange,
+    // because sibling render order follows array order among same-parent nodes.
+    s.setChannels('c1', [ch('b', 'random'), ch('a', 'general')]);
+    const kids = s.nodes.filter((n) => n.parentId === 'c1' && n.type === 'channel');
+    expect(kids.map((n) => n.id)).toEqual(['b', 'a']);
+    expect(changed).toBe(1);
   });
 
   it('fires onChange only when the reconcile changes the tree', () => {

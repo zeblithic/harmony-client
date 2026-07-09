@@ -18,6 +18,14 @@ export interface ChannelNavSyncDeps {
 export class ChannelNavSyncService {
   constructor(private deps: ChannelNavSyncDeps) {}
 
+  /** Per-community issue counter for last-write-wins ordering. App triggers
+   *  resync from boot start(), community switches, and channel-config-updated,
+   *  and CommunityService.listChannels is cached but not single-flight — so
+   *  overlapping resyncs for the same community can resolve out of order. Each
+   *  resync captures its issue number and only applies its snapshot if no newer
+   *  resync superseded it, so a slow stale fetch can't clobber a fresh one. */
+  private seq = new Map<string, number>();
+
   /** Eager boot: populate channels for every joined community. Per-community
    *  failures are isolated (a stalled/erroring community renders childless and
    *  self-heals on its next resync); start() never rejects. */
@@ -32,15 +40,18 @@ export class ChannelNavSyncService {
    *  cache, so listChannels re-fetches. Swallows failures (never throws into
    *  boot / event handlers). */
   async resync(communityId: string): Promise<void> {
+    const issue = (this.seq.get(communityId) ?? 0) + 1;
+    this.seq.set(communityId, issue);
     try {
       const channels = await this.deps.listChannels(communityId);
+      // A newer resync superseded us while we awaited — its snapshot is fresher,
+      // so drop ours rather than regress the nav tree with stale data.
+      if (this.seq.get(communityId) !== issue) return;
       const live = channels.filter((c) => c.deletedAt === undefined);
       this.deps.setChannels(communityId, live);
     } catch (e) {
-      console.warn(
-        `[channel-nav-sync] resync failed for ${communityId}:`,
-        e instanceof Error ? e.message : String(e),
-      );
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`[channel-nav-sync] resync failed for ${communityId}:`, msg);
     }
   }
 }

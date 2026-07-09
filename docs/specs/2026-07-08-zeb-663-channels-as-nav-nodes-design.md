@@ -44,7 +44,7 @@ Selection and management move to App level (the nav is App-scoped), making the n
 |---|---|
 | `src/lib/types.ts` | `NavNode.channelKind?: 'text' \| 'voice'` (set only on channel nodes). |
 | `src/lib/nav-service.ts` | `setChannels(communityId, ChannelInfo[])` reconcile; community-remove also drops channel children; remove the ZEB-662 community-open clear path (clear is per-channel now). |
-| `src/lib/channel-nav-sync.ts` | **New.** `ChannelNavSyncService` (injected deps) + `start()` / `resync(communityId)` / `onCommunityAdded(communityId)`. |
+| `src/lib/channel-nav-sync.ts` | **New.** `ChannelNavSyncService` (injected deps) + `start()` / `resync(communityId)`. (Post-boot community joins are covered by `resync` on community-switch rather than a dedicated `onCommunityAdded` — see the bridge note below.) |
 | `src/lib/components/NavNodeRow.svelte` | Channel-row rendering: `#`/`🔊` glyph by `channelKind`, per-channel mention badge (existing ZEB-662 badge), active styling (`--primary-soft` bg + `--primary-deep` text per Commons), power-gated context menu (rename/delete) + §6.8 demotion guard. |
 | `src/lib/components/NavTree.svelte` | Channel-row `onClick` → `openCommunityChannel`; per-community ＋ add-channel affordance (power-gated, selected community only). |
 | `src/lib/components/CommunityView.svelte` | Remove `ChannelSubSidebar` + channel-management dialogs/state/handlers; `.three-cols` → 2-col (feed \| members); drop the "Channels" view-tab. |
@@ -77,11 +77,10 @@ interface ChannelNavSyncDeps {
 }
 ```
 
-- `start()` — eager boot: for each joined community id, `listChannels` → filter `deletedAt` → `setChannels`. Per-community try/catch (see edges).
+- `start()` — eager boot: for each joined community id, `listChannels` → filter `deletedAt` → `setChannels`. Per-community try/catch (see edges). Overlapping resyncs for one community apply last-write-wins (a per-community issue counter drops a stale in-flight snapshot).
 - `resync(communityId)` — on `channel-config-updated` (create/rename/delete): the event already invalidated `communityService`'s cache, so `listChannels` re-fetches → `setChannels`.
-- `onCommunityAdded(communityId)` — when a community joins (App's `nav-updated added` path), populate its channels.
 
-App wires: call `start()` once nav communities are hydrated; subscribe the `channel-config-updated` listener to `resync(p.communityId)`; call `onCommunityAdded` from the community-added path.
+App wires: call `start()` once nav communities are hydrated; subscribe the `channel-config-updated` listener to `resync(p.communityId)`. **Post-boot community joins** are covered by calling `resync(id)` from `changeSelectedCommunity` (the first switch into a freshly-joined community populates its channels) rather than a dedicated `onCommunityAdded` hook — one fewer bridge method, and a community you never open needs no channel nodes yet.
 
 ### Selection — `openCommunityChannel(communityId, channelId)`
 
@@ -129,7 +128,7 @@ Remove `ChannelSubSidebar` and the channel-management dialogs/state/handlers. `.
 
 ## Testing
 
-- **`channel-nav-sync.test.ts` (new):** `start()` eager-populates every joined community; `resync` reconciles add/rename/delete; `onCommunityAdded` populates; a `listChannels` rejection is swallowed and doesn't block other communities; all deps injected.
+- **`channel-nav-sync.test.ts` (new):** `start()` eager-populates every joined community; `resync` reconciles add/rename/delete; a stale overlapping resync is dropped (last-write-wins); a `listChannels` rejection is swallowed and doesn't block other communities; all deps injected.
 - **`nav-service.test.ts`:** `setChannels` reconcile (add / update-name / remove, **preserve `mentionCount`**, `listChannels` order); community-remove drops channel children; per-channel `incMention` bubbles to community; boot-race fallback (channel absent) still lands on the community node.
 - **Selection:** `openCommunityChannel` sets community + selected channel + `activeView='channels'`; voice vs text resolves in the feed pane.
 - **Management:** context-menu power-gating (only the selected community, `power >= kick`); create/rename/delete open the hoisted dialogs; §6.8 demotion closes the menu.

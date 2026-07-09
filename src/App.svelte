@@ -1225,16 +1225,27 @@
     return communityId === selectedCommunityId && myCommunityPower >= POWER_THRESHOLDS.kick;
   }
 
+  // Wired as fire-and-forget nav-row callbacks (onRenameChannel/onDeleteChannel
+  // aren't awaited), so an unguarded listChannels rejection would surface as an
+  // unhandled promise rejection and the menu action would silently do nothing.
   async function openRenameChannel(communityId: string, channelId: string) {
-    const list = await communityService.listChannels(communityId);
-    const ch = list.find((c) => c.channelId === channelId);
-    if (ch) modifyChannelTarget = ch;
+    try {
+      const list = await communityService.listChannels(communityId);
+      const ch = list.find((c) => c.channelId === channelId);
+      if (ch) modifyChannelTarget = ch;
+    } catch (e) {
+      console.warn('openRenameChannel: listChannels failed:', e instanceof Error ? e.message : String(e));
+    }
   }
 
   async function openDeleteChannel(communityId: string, channelId: string) {
-    const list = await communityService.listChannels(communityId);
-    const ch = list.find((c) => c.channelId === channelId);
-    if (ch) deleteChannelTarget = ch;
+    try {
+      const list = await communityService.listChannels(communityId);
+      const ch = list.find((c) => c.channelId === channelId);
+      if (ch) deleteChannelTarget = ch;
+    } catch (e) {
+      console.warn('openDeleteChannel: listChannels failed:', e instanceof Error ? e.message : String(e));
+    }
   }
 
   async function confirmDeleteChannel() {
@@ -2921,7 +2932,13 @@
     if (!node || node.type === 'folder') return;
     // ZEB-663: a channel row routes to its community + channel feed.
     if (node.type === 'channel') {
-      if (node.parentId) openCommunityChannel(node.parentId, node.id);
+      if (node.parentId) {
+        openCommunityChannel(node.parentId, node.id);
+      } else {
+        // Unreachable: setChannels always assigns parentId. A warning makes a
+        // future regression (a click that visibly no-ops) discoverable.
+        console.warn(`handleNodeClick: channel node ${node.id} has no parentId; ignoring click`);
+      }
       return;
     }
     // ZEB-334: selecting any real space leaves the self-notes view.

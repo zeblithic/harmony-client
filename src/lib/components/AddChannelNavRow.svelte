@@ -28,7 +28,13 @@
   tabindex="0"
   data-testid="add-channel-row-{communityId}"
   onclick={activate}
-  onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') activate(e); }}
+  onkeydown={(e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      // Suppress the browser's default Space-scroll on this role="button" row.
+      e.preventDefault();
+      activate(e);
+    }
+  }}
 >
   <span class="row-content" style="padding-left: {paddingLeft}px">
     <span class="add-glyph" aria-hidden="true">＋</span>

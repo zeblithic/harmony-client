@@ -63,4 +63,37 @@ describe('ChannelNavSyncService (ZEB-663)', () => {
     await expect(svc.resync('c1')).resolves.toBeUndefined();
     expect(setCalls).toHaveLength(0);
   });
+
+  it('drops a stale resync when a newer resync for the same community superseded it', async () => {
+    // Two overlapping resyncs for c1; the FIRST (stale) resolves LAST. Without
+    // the last-write-wins guard the stale snapshot would clobber the fresh one.
+    const resolvers: Array<(v: ChannelInfo[]) => void> = [];
+    const setCalls: Array<[string, ChannelInfo[]]> = [];
+    let call = 0;
+    const deps: ChannelNavSyncDeps = {
+      listChannels: () =>
+        new Promise<ChannelInfo[]>((resolve) => {
+          resolvers[call++] = resolve;
+        }),
+      setChannels: (id, channels) => setCalls.push([id, channels]),
+      listCommunityIds: () => ['c1'],
+    };
+    const svc = new ChannelNavSyncService(deps);
+    const p1 = svc.resync('c1'); // issue 1 — stale snapshot
+    const p2 = svc.resync('c1'); // issue 2 — fresh snapshot
+    resolvers[1]([ch('fresh', 'fresh')]); // newer completes first
+    resolvers[0]([ch('stale', 'stale')]); // older completes last
+    await Promise.all([p1, p2]);
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0][1].map((c) => c.channelId)).toEqual(['fresh']);
+  });
+
+  it('applies resyncs independently per community (no cross-community suppression)', async () => {
+    const { svc, setCalls } = harness(
+      { c1: [ch('a', 'general')], c2: [ch('b', 'lobby')] },
+      ['c1', 'c2'],
+    );
+    await Promise.all([svc.resync('c1'), svc.resync('c2')]);
+    expect(setCalls.map(([id]) => id).sort()).toEqual(['c1', 'c2']);
+  });
 });
