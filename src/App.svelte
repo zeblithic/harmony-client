@@ -2196,9 +2196,13 @@
         const { createDefaultMentionAlerter } = await import('./lib/mention-alert');
         mentionAlerter = await createDefaultMentionAlerter({
           getSelfOwnerId: () => selfOwnerId ?? undefined,
-          getActiveChannelId: () => activeChannel,
+          // Only the messages-mode feed counts as "viewing" a channel; in other
+          // modes the last-open channel isn't on screen, so mentions there notify.
+          getActiveChannelId: () => (appMode === 'messages' ? activeChannel : null),
           resolve: (p, peer, community) => notificationService.resolve(p, peer, community),
           incMention: (channelId) => navService.incMention(channelId),
+          getChannelName: (channelId) =>
+            navService.nodes.find((n) => n.id === channelId)?.name ?? 'a channel',
           showToast: (m) => { toastStore.show(m); },
         });
         fileManagerService.addUnlisten(() => { mentionAlerter = null; });

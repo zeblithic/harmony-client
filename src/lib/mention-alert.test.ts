@@ -15,16 +15,18 @@ const msg = (over: Partial<{ mentions: string[]; author: string }> = {}) => ({
 });
 
 function harness(over: Partial<MentionAlertDeps> = {}) {
-  const calls = { inc: [] as string[], toast: [] as string[], os: 0 };
+  const calls = { inc: [] as string[], toast: [] as string[], os: 0, osBody: '' };
   const deps: MentionAlertDeps = {
     getSelfOwnerId: () => ME,
     getActiveChannelId: () => null,
     isFocused: () => true,
     resolve: () => 'notify' as NotificationAction,
     incMention: (id) => calls.inc.push(id),
+    getChannelName: (id) => `#${id}`,
     showToast: (m) => calls.toast.push(m),
-    sendOsNotification: () => {
+    sendOsNotification: (o) => {
       calls.os++;
+      calls.osBody = o.body;
     },
     ...over,
   };
@@ -112,6 +114,24 @@ describe('MentionAlertService (ZEB-662)', () => {
     const { svc, calls } = harness({ getSelfOwnerId: () => undefined });
     await svc.onMessage('c1', 'ch1', msg());
     expect(calls.inc).toEqual([]);
+  });
+
+  it('uses the resolved channel name in the toast body', async () => {
+    const { svc, calls } = harness({
+      getActiveChannelId: () => 'other',
+      getChannelName: () => 'general',
+    });
+    await svc.onMessage('c1', 'ch1', msg());
+    expect(calls.toast[0]).toBe('You were mentioned in general');
+  });
+
+  it('uses the resolved channel name in the OS-notification body (unfocused)', async () => {
+    const { svc, calls } = harness({
+      isFocused: () => false,
+      getChannelName: () => 'general',
+    });
+    await svc.onMessage('c1', 'ch1', msg());
+    expect(calls.osBody).toBe('You were mentioned in general');
   });
 
   it('does not notify for my own message that lists me', async () => {

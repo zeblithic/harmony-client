@@ -20,6 +20,8 @@ export interface MentionAlertDeps {
     communityId?: string,
   ): NotificationAction;
   incMention(channelId: string): void;
+  /** Human-readable channel name for the notification body (fallback allowed). */
+  getChannelName(channelId: string): string;
   showToast(message: string): void;
   sendOsNotification(o: { title: string; body: string }): void;
 }
@@ -55,7 +57,7 @@ export class MentionAlertService {
     if (!NOTIFY_ACTIONS.has(action)) return;
 
     const title = 'New mention';
-    const body = `You were mentioned in ${channelId}`;
+    const body = `You were mentioned in ${this.deps.getChannelName(channelId)}`;
     if (await this.focusedSafe()) {
       this.deps.showToast(body);
     } else {
