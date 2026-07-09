@@ -26,10 +26,12 @@ export const UNREAD_TRACK_CAP = 100;
 
 export interface ChannelUnreadDeps {
   /** Raw `list_channel_messages` IPC (exclusive strictly-newer `since`,
-   *  server-capped; wired newest-first via `order: 'desc'` — ZEB-602 — so an
-   *  over-cap seed keeps the newest messages; the service itself is
-   *  order-agnostic). NOT ChannelMessageService.listMessages — that ingests
-   *  into the feed cache and re-fires onMessage. */
+   *  server-capped), wired newest-first via `order: 'desc'` (ZEB-602).
+   *  Counts and maxSeen don't depend on reply order, but WHICH message IDs
+   *  survive an over-cap seed does (the seed loop stops adding at the cap) —
+   *  newest-first is load-bearing for the "keep the newest under cap"
+   *  guarantee. NOT ChannelMessageService.listMessages — that ingests into
+   *  the feed cache and re-fires onMessage. */
   listMessagesSince(
     communityId: string,
     channelId: string,
