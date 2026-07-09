@@ -418,4 +418,47 @@ describe('NavNodeRow — keyboard-accessible ⋯ trigger (ZEB-664)', () => {
     await fireEvent.keyDown(menu, { key: 'Escape' });
     expect(document.activeElement).toBe(getByTestId('channel-menu-trigger-ch1'));
   });
+
+  it('Tab closes the menu (focus moves on, popup must not linger)', async () => {
+    const { container, getByTestId } = renderRow();
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    const menu = container.querySelector('.channel-context-menu') as HTMLElement;
+    await fireEvent.keyDown(menu, { key: 'Tab' });
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+  });
+
+  it('demotion while the menu is focused parks focus on the row, not body', async () => {
+    const { container, getByTestId, rerender } = renderRow();
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    // Menu is open and its first item holds focus (auto-focused on open).
+    expect((document.activeElement as HTMLElement).getAttribute('role')).toBe('menuitem');
+    await rerender({
+      node: channel(),
+      colorAncestry: [],
+      displayMode: 'text',
+      isLastChild: false,
+      canManageChannel: () => false,
+      onRenameChannel: vi.fn(),
+      onDeleteChannel: vi.fn(),
+    });
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+    expect(document.activeElement).toBe(getByTestId('nav-row-ch1'));
+  });
+
+  it('demotion while the trigger is focused (menu closed) parks focus on the row', async () => {
+    const { getByTestId, rerender } = renderRow();
+    const trigger = getByTestId('channel-menu-trigger-ch1');
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+    await rerender({
+      node: channel(),
+      colorAncestry: [],
+      displayMode: 'text',
+      isLastChild: false,
+      canManageChannel: () => false,
+      onRenameChannel: vi.fn(),
+      onDeleteChannel: vi.fn(),
+    });
+    expect(document.activeElement).toBe(getByTestId('nav-row-ch1'));
+  });
 });

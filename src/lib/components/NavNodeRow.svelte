@@ -70,10 +70,25 @@
   let channelMenuEl: HTMLElement | undefined = $state();
   // ZEB-664: visible, tabbable menu trigger (⋯) — the keyboard entry point.
   let channelTriggerEl: HTMLButtonElement | undefined = $state();
+  let rowEl: HTMLElement | undefined = $state();
+  // Event-maintained: by the time the demotion $effect runs, the trigger is
+  // already unmounted (unmount fires no blur), so containment checks against
+  // document.activeElement can't see it — this flag can.
+  let triggerFocused = false;
 
-  // §6.8: close a stale moderation menu when the viewer is demoted.
+  // §6.8: close a stale moderation menu when the viewer is demoted. If focus
+  // was inside the menu (auto-focused on open) or on the trigger, both of
+  // which unmount here, park it on the row instead of letting it fall to body.
   $effect(() => {
-    if (!canManage) channelMenu = null;
+    if (!canManage) {
+      const active = document.activeElement;
+      const inMenu = !!(channelMenu && channelMenuEl && active && channelMenuEl.contains(active));
+      if (inMenu || triggerFocused) {
+        rowEl?.focus();
+        triggerFocused = false;
+      }
+      channelMenu = null;
+    }
   });
 
   $effect(() => {
@@ -120,6 +135,12 @@
       e.stopPropagation();
       channelMenu = null;
       channelTriggerEl?.focus();
+      return;
+    }
+    if (e.key === 'Tab') {
+      // Menu-button pattern: Tab moves on, so the popup must not linger.
+      // No preventDefault — focus proceeds to the next tabbable naturally.
+      channelMenu = null;
       return;
     }
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -196,6 +217,7 @@
 </script>
 
 <div
+  bind:this={rowEl}
   class="nav-row"
   class:active
   class:pending={node.pending}
@@ -307,6 +329,8 @@
       aria-label="Channel options for {node.name}"
       title="Channel options"
       onclick={toggleChannelMenuFromTrigger}
+      onfocus={() => (triggerFocused = true)}
+      onblur={() => (triggerFocused = false)}
       onkeydown={(e) => {
         // Enter/Space activate the button natively (click); without this
         // stop they'd also bubble to the row's keydown and select the channel.
