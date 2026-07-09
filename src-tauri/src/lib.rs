@@ -20444,6 +20444,7 @@ async fn get_community_lineage(
                     // wall_ms of how THIS-parent-was-forked-from-its-parent
                     // is unknown for Phase 1 / single-hop synthesis; None.
                     forked_at_wall_ms: None,
+                    reason: None,
                 }]
             } else {
                 parent_lineage_clone
@@ -20498,11 +20499,13 @@ mod get_community_lineage_tests {
                 space_id: SpaceId([0x11; 16]),
                 name: "Root".into(),
                 forked_at_wall_ms: None,
+                reason: None,
             },
             ParentLineageEntry {
                 space_id: SpaceId([0x22; 16]),
                 name: "Middle".into(),
                 forked_at_wall_ms: Some(1_700_000_000_000),
+                reason: None,
             },
         ];
 
@@ -28669,6 +28672,16 @@ where
                 let mut capped_lineage = snapshot.parent_lineage.clone();
                 crate::community_invite::apply_lineage_cap(&mut capped_lineage);
                 state_g.parent_lineage = capped_lineage;
+                // ZEB-649: mirror the fork's why (None for pre-ZEB-649
+                // snapshots). Bound it like verify_event does — the
+                // snapshot bypasses the membership-event verify path, so
+                // an oversized value is truncated at the codepoint cap
+                // rather than trusted verbatim.
+                state_g.fork_reason = snapshot.fork_reason.as_ref().map(|r| {
+                    r.chars()
+                        .take(crate::community_membership::MAX_MODERATION_REASON_CHARS)
+                        .collect()
+                });
             }
         } else {
             tracing::warn!(
@@ -29770,6 +29783,7 @@ mod redeem_invite_inner_tests {
                 device_id: "fork-dev".into(),
             },
             parent_lineage: Vec::new(),
+            fork_reason: None,
         };
 
         let invite_payload = CommunityInvitePayload {
@@ -29875,11 +29889,14 @@ mod redeem_invite_inner_tests {
             space_id: SpaceId([0xc0; 16]),
             name: "Grandparent C".into(),
             forked_at_wall_ms: None, // C is root of the chain
+            reason: None,
         };
         let b_entry = crate::community_invite::ParentLineageEntry {
             space_id: SpaceId([0xb0; 16]),
             name: "Parent-of-parent B".into(),
             forked_at_wall_ms: Some(1_650_000_000_000),
+            // ZEB-649: per-hop reason must mirror through verbatim.
+            reason: Some("B split from C over governance".into()),
         };
 
         let snapshot = crate::community_invite::PreForkSnapshot {
@@ -29896,6 +29913,9 @@ mod redeem_invite_inner_tests {
                 device_id: "fork-dev".into(),
             },
             parent_lineage: vec![c_entry.clone(), b_entry.clone()],
+            // ZEB-649: the fork's own why must mirror into
+            // CommunityState.fork_reason at redeem.
+            fork_reason: Some("Treasury split".into()),
         };
 
         let invite_payload = CommunityInvitePayload {
@@ -29966,7 +29986,13 @@ mod redeem_invite_inner_tests {
         assert_eq!(
             state_g.parent_lineage,
             vec![c_entry, b_entry],
-            "ZEB-287: parent_lineage must mirror snapshot.parent_lineage"
+            "ZEB-287: parent_lineage must mirror snapshot.parent_lineage \
+             (ZEB-649: including per-hop reasons)"
+        );
+        assert_eq!(
+            state_g.fork_reason.as_deref(),
+            Some("Treasury split"),
+            "ZEB-649: fork_reason must mirror snapshot.fork_reason"
         );
     }
 
@@ -30003,6 +30029,7 @@ mod redeem_invite_inner_tests {
                 device_id: "phase1-dev".into(),
             },
             parent_lineage: Vec::new(), // Phase 1 default
+            fork_reason: None,
         };
 
         let invite_payload = CommunityInvitePayload {
@@ -54985,6 +55012,7 @@ mod generate_invite_helper_tests {
                 device_id: "fork-dev".into(),
             },
             parent_lineage: Vec::new(),
+            fork_reason: None,
         };
 
         let payload = CommunityInvitePayload {

@@ -532,6 +532,13 @@ pub struct ParentLineageEntry {
     /// the chain — never forked, has no predecessor).
     #[serde(rename = "at", skip_serializing_if = "Option::is_none", default)]
     pub forked_at_wall_ms: Option<u64>,
+
+    /// ZEB-649: the stated reason THIS ancestor was forked from its
+    /// predecessor (parallel to `forked_at_wall_ms`). `None` for the root
+    /// and for ancestors forked before ZEB-649. Byte-compatible (omitted
+    /// when None).
+    #[serde(rename = "rs", skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
 }
 
 impl CanonicalPayloadSealed for ParentLineageEntry {}
@@ -605,6 +612,14 @@ pub struct PreForkSnapshot {
     /// encode without this field; decoded as empty Vec via `default`.
     #[serde(rename = "pl", skip_serializing_if = "Vec::is_empty", default)]
     pub parent_lineage: Vec<ParentLineageEntry>,
+
+    /// ZEB-649: the forker's stated reason for creating the fork this
+    /// snapshot belongs to. Mirrored into the joiner's
+    /// `CommunityState.fork_reason` at redeem-time so fork members see
+    /// the "why" in their lineage/divider UI. `None` for snapshots built
+    /// before ZEB-649. Byte-compatible (omitted when None).
+    #[serde(rename = "fr", skip_serializing_if = "Option::is_none", default)]
+    pub fork_reason: Option<String>,
 }
 
 impl CanonicalPayloadSealed for PreForkSnapshot {}
@@ -651,12 +666,18 @@ pub fn build_parent_lineage(
     forker_id: SpaceId,
     forker_name: &str,
     forker_forked_at_wall_ms: Option<u64>,
+    forker_fork_reason: Option<String>,
 ) -> Vec<ParentLineageEntry> {
     let mut chain: Vec<ParentLineageEntry> = forker_lineage.to_vec();
     chain.push(ParentLineageEntry {
         space_id: forker_id,
         name: forker_name.to_string(),
         forked_at_wall_ms: forker_forked_at_wall_ms,
+        // ZEB-649: why the FORKER itself was forked from its own parent —
+        // its own `fork_reason` — so reasons accumulate down the chain.
+        // (The NEW fork's reason lives on the fork's state/snapshot, not
+        // in this chain, until the fork is itself forked.)
+        reason: forker_fork_reason,
     });
     apply_lineage_cap(&mut chain);
     chain
@@ -2834,6 +2855,7 @@ mod tests {
                 device_id: "t".to_string(),
             },
             parent_lineage: Vec::new(),
+            fork_reason: None,
         };
 
         let bytes = canonical_cbor_encode(&snapshot).expect("encode");
@@ -2943,6 +2965,7 @@ mod tests {
                 device_id: "t".to_string(),
             },
             parent_lineage: Vec::new(),
+            fork_reason: None,
         };
 
         let payload = CommunityInvitePayload {

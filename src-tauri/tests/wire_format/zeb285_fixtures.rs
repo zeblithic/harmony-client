@@ -152,6 +152,57 @@ fn fork_event_with_reason_canonical_cbor_pinned() {
     assert_eq!(hex, expected_hex, "Fork-with-reason wire format changed");
 }
 
+/// ZEB-649: structural pins for the reason fields — `fr` on PreForkSnapshot
+/// (top-level), `rs` on ParentLineageEntry, `fr` on CommunityState — present
+/// when Some, ABSENT when None (the absence is the wire-compat guarantee;
+/// the untouched pre-ZEB-649 pinned fixtures in this file prove the None
+/// case byte-exactly).
+#[test]
+fn zeb649_reason_fields_present_when_some_absent_when_none() {
+    // PreForkSnapshot.fork_reason → top-level "fr".
+    let mut snapshot = PreForkSnapshot {
+        original_community_id: SpaceId([0xa0; 16]),
+        original_community_name: "Pinned".to_string(),
+        membership_events: vec![],
+        channel_log: BoundedChannelLogSnapshot::default(),
+        identity_pubs: BTreeMap::new(),
+        forked_at: fixture_hlc(),
+        parent_lineage: Vec::new(),
+        fork_reason: Some("Treasury split".to_string()),
+    };
+    let bytes = canonical_cbor_encode(&snapshot).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &["fr"], &[], "snapshot with fork_reason");
+    snapshot.fork_reason = None;
+    let bytes = canonical_cbor_encode(&snapshot).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &[], &["fr"], "snapshot without fork_reason");
+
+    // ParentLineageEntry.reason → "rs".
+    let mut entry = ParentLineageEntry {
+        space_id: SpaceId([0x11; 16]),
+        name: "Root".to_string(),
+        forked_at_wall_ms: Some(1),
+        reason: Some("split over governance".to_string()),
+    };
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &["rs"], &[], "entry with reason");
+    let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, entry);
+    entry.reason = None;
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &[], &["rs"], "entry without reason");
+
+    // CommunityState.fork_reason → "fr", roundtrips.
+    let mut state = CommunityState::new(SpaceId([0xcc; 16]));
+    state.fork_reason = Some("Treasury split".to_string());
+    let bytes = canonical_cbor_encode(&state).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &["fr"], &[], "state with fork_reason");
+    let decoded: CommunityState = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded.fork_reason.as_deref(), Some("Treasury split"));
+    state.fork_reason = None;
+    let bytes = canonical_cbor_encode(&state).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &[], &["fr"], "state without fork_reason");
+}
+
 /// Fixture 2: pins the canonical-CBOR bytes of a minimal PreForkSnapshot.
 ///
 /// Empty membership_events, empty channel_log, empty identity_pubs —
@@ -168,6 +219,7 @@ fn pre_fork_snapshot_canonical_cbor_pinned() {
         // ZEB-287 Phase 2: empty lineage → skip-if-empty drops `pl` key,
         // preserving Phase 1 byte-identity for this fixture.
         parent_lineage: Vec::new(),
+        fork_reason: None,
     };
 
     let bytes = canonical_cbor_encode(&snapshot).expect("encode");
@@ -196,6 +248,7 @@ fn community_invite_with_fork_fields_pinned() {
         // ZEB-287 Phase 2: empty lineage → skip-if-empty preserves Phase 1
         // byte-identity for this fixture.
         parent_lineage: Vec::new(),
+        fork_reason: None,
     };
 
     let payload = CommunityInvitePayload {
@@ -249,6 +302,7 @@ fn parent_lineage_entry_canonical_cbor() {
         space_id: SpaceId([0x42; 16]),
         name: "Cool Community".to_string(),
         forked_at_wall_ms: Some(1_715_811_234_567),
+        reason: None,
     };
     let bytes = canonical_cbor_encode(&entry).expect("encode");
     let hex = hex::encode(&bytes);
@@ -266,6 +320,7 @@ fn parent_lineage_entry_root_omits_at_canonical_cbor() {
         space_id: SpaceId([0x11; 16]),
         name: "Root".to_string(),
         forked_at_wall_ms: None,
+        reason: None,
     };
     let bytes = canonical_cbor_encode(&entry).expect("encode");
     let hex = hex::encode(&bytes);
@@ -293,13 +348,16 @@ fn pre_fork_snapshot_with_parent_lineage_canonical_cbor() {
                 space_id: SpaceId([0x11; 16]),
                 name: "Root".to_string(),
                 forked_at_wall_ms: None,
+                reason: None,
             },
             ParentLineageEntry {
                 space_id: SpaceId([0x22; 16]),
                 name: "Mid".to_string(),
                 forked_at_wall_ms: Some(1_650_000_000_000),
+                reason: None,
             },
         ],
+        fork_reason: None,
     };
 
     let bytes = canonical_cbor_encode(&snapshot).expect("encode");
@@ -329,6 +387,7 @@ fn community_state_with_parent_lineage_canonical_cbor() {
         space_id: SpaceId([0x11; 16]),
         name: "Root".to_string(),
         forked_at_wall_ms: None,
+        reason: None,
     }];
 
     let bytes = canonical_cbor_encode(&state).expect("encode");

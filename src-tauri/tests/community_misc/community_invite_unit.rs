@@ -1463,6 +1463,7 @@ mod zeb287_parent_lineage_entry {
             space_id: SpaceId([0x42; 16]),
             name: "Cool Community".to_string(),
             forked_at_wall_ms: Some(1_715_811_234_567),
+            reason: None,
         };
         let bytes = canonical_cbor_encode(&entry).expect("encode");
         let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes).expect("decode");
@@ -1475,6 +1476,7 @@ mod zeb287_parent_lineage_entry {
             space_id: SpaceId([0x11; 16]),
             name: "Project Cool".to_string(),
             forked_at_wall_ms: None,
+            reason: None,
         };
         let bytes_no_at = canonical_cbor_encode(&entry).expect("encode");
         let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes_no_at).expect("decode");
@@ -1517,6 +1519,7 @@ mod zeb287_pre_fork_snapshot_lineage {
                 device_id: "d".into(),
             },
             parent_lineage: Vec::new(),
+            fork_reason: None,
         }
     }
 
@@ -1544,11 +1547,13 @@ mod zeb287_pre_fork_snapshot_lineage {
                 space_id: SpaceId([0x11; 16]),
                 name: "Project Cool".to_string(),
                 forked_at_wall_ms: None,
+                reason: None,
             },
             ParentLineageEntry {
                 space_id: SpaceId([0x22; 16]),
                 name: "Cool Community".to_string(),
                 forked_at_wall_ms: Some(1_715_000_000_000),
+                reason: None,
             },
         ];
 
@@ -1591,19 +1596,28 @@ mod zeb287_lineage_build_logic {
             space_id: SpaceId([0x11; 16]),
             name: "C".to_string(),
             forked_at_wall_ms: None, // C is root
+            reason: None,
         };
         let forker_lineage = vec![c_entry.clone()];
         let b_id = SpaceId([0x22; 16]);
         let b_name = "B";
         let b_forked_at = Some(1_700_000_000_000u64);
 
-        let new_lineage = build_parent_lineage(&forker_lineage, b_id, b_name, b_forked_at);
+        // ZEB-649: the forker's own fork_reason rides on its pushed entry.
+        let new_lineage = build_parent_lineage(
+            &forker_lineage,
+            b_id,
+            b_name,
+            b_forked_at,
+            Some("B split from C".to_string()),
+        );
 
         assert_eq!(new_lineage.len(), 2);
         assert_eq!(new_lineage[0], c_entry);
         assert_eq!(new_lineage[1].space_id, b_id);
         assert_eq!(new_lineage[1].name, b_name);
         assert_eq!(new_lineage[1].forked_at_wall_ms, b_forked_at);
+        assert_eq!(new_lineage[1].reason.as_deref(), Some("B split from C"));
     }
 
     #[test]
@@ -1615,6 +1629,7 @@ mod zeb287_lineage_build_logic {
                 space_id: SpaceId([i; 16]),
                 name: format!("ancestor_{i}"),
                 forked_at_wall_ms: if i == 0 { None } else { Some(i as u64) },
+                reason: None,
             })
             .collect();
 
@@ -1638,9 +1653,11 @@ mod zeb287_lineage_build_logic {
                 space_id: SpaceId([i; 16]),
                 name: format!("a_{i}"),
                 forked_at_wall_ms: Some(i as u64),
+                reason: None,
             })
             .collect();
-        let new_short = build_parent_lineage(&short_chain, SpaceId([0xff; 16]), "forker", Some(99));
+        let new_short =
+            build_parent_lineage(&short_chain, SpaceId([0xff; 16]), "forker", Some(99), None);
         assert_eq!(new_short.len(), 4);
         assert_eq!(new_short[0].name, "a_0");
         assert_eq!(new_short[3].name, "forker");
@@ -1653,9 +1670,11 @@ mod zeb287_lineage_build_logic {
                 space_id: SpaceId([i; 16]),
                 name: format!("a_{i}"),
                 forked_at_wall_ms: if i == 0 { None } else { Some(i as u64) },
+                reason: None,
             })
             .collect();
-        let new_max = build_parent_lineage(&max_chain, SpaceId([0xfe; 16]), "forker", Some(999));
+        let new_max =
+            build_parent_lineage(&max_chain, SpaceId([0xfe; 16]), "forker", Some(999), None);
         assert_eq!(new_max.len(), MAX_LINEAGE_DEPTH);
         // a_0 dropped: first entry is a_1.
         assert_eq!(new_max[0].name, "a_1");
@@ -1663,7 +1682,7 @@ mod zeb287_lineage_build_logic {
         assert_eq!(new_max[MAX_LINEAGE_DEPTH - 1].name, "forker");
 
         // Empty input: just the new entry.
-        let new_empty = build_parent_lineage(&[], SpaceId([0xfd; 16]), "first", None);
+        let new_empty = build_parent_lineage(&[], SpaceId([0xfd; 16]), "first", None, None);
         assert_eq!(new_empty.len(), 1);
         assert_eq!(new_empty[0].name, "first");
         assert_eq!(new_empty[0].forked_at_wall_ms, None);
@@ -1682,6 +1701,7 @@ mod zeb287_lineage_build_logic {
                 space_id: SpaceId([i; 16]),
                 name: format!("evil_{i}"),
                 forked_at_wall_ms: Some(i as u64),
+                reason: None,
             })
             .collect();
         assert_eq!(payload_lineage.len(), 20);

@@ -315,6 +315,7 @@ pub async fn fork_community(
         materialized,
         original_parent_lineage,
         original_forked_at_wall_ms,
+        original_fork_reason,
     ) = {
         let state_arc = original_engine.state();
         let state_g = state_arc.lock().await;
@@ -339,6 +340,10 @@ pub async fn fork_community(
         // can extend the chain into the new fork's PreForkSnapshot.
         let forker_parent_lineage = state_g.parent_lineage.clone();
         let forker_forked_at_wall_ms = state_g.forked_at_wall_ms;
+        // ZEB-649: the original's OWN fork_reason rides on its lineage
+        // entry (why IT split from its parent), keeping reasons stacked
+        // down the chain.
+        let forker_fork_reason = state_g.fork_reason.clone();
         // Derive original community name from owner-state crdt.
         let name = {
             let crdt_g = crdt_state.lock().await;
@@ -354,6 +359,7 @@ pub async fn fork_community(
             mat,
             forker_parent_lineage,
             forker_forked_at_wall_ms,
+            forker_fork_reason,
         )
     };
 
@@ -518,6 +524,7 @@ pub async fn fork_community(
         original_id,
         &original_name,
         original_forked_at_wall_ms,
+        original_fork_reason,
     );
 
     // Step 5: Build PreForkSnapshot (with correct fork_space_id already known).
@@ -531,6 +538,9 @@ pub async fn fork_community(
         // R1-1b: clone — we also mutate the new fork's CommunityState
         // below with this same chain.
         parent_lineage: new_parent_lineage.clone(),
+        // ZEB-649: THIS fork's why — joiners mirror it into their
+        // CommunityState.fork_reason at redeem-time.
+        fork_reason: Some(reason.clone()),
     };
 
     // Step 6 (pre-spawn): write pre_fork_snapshot.bin to the fork's data dir.
@@ -710,6 +720,9 @@ pub async fn fork_community(
         state_g.forked_from = Some(original_id);
         state_g.forked_at_wall_ms = Some(fork_hlc.wall_ms);
         state_g.parent_lineage = new_parent_lineage;
+        // ZEB-649: the fork's own why, for its lineage/divider UI and for
+        // the lineage entry it hands to ITS future forks.
+        state_g.fork_reason = Some(reason.clone());
     }
 
     // Generation fence (mirrors create_community_inner).
