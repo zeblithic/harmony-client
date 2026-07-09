@@ -20262,6 +20262,10 @@ pub struct ParentLineageDto {
     /// wall_ms of this ancestor's fork-from-parent event; None for the
     /// root of the chain.
     pub forked_at_wall_ms: Option<u64>,
+    /// ZEB-649: the stated reason this ancestor forked from its
+    /// predecessor. None for the root, pre-ZEB-649 hops, and Phase 1
+    /// synthesized entries.
+    pub reason: Option<String>,
 }
 
 /// ZEB-287 Phase 2: lineage metadata returned by `get_community_lineage`
@@ -20301,6 +20305,10 @@ pub struct PhaseTwoCommunityLineageDto {
     pub self_space_id: String,
     /// This community's own display name.
     pub self_name: String,
+    /// ZEB-649: THIS community's own fork reason (why it split from
+    /// `forked_from`). None for top-level communities and pre-ZEB-649
+    /// forks. Drives the divider quote + self-card sub-line.
+    pub fork_reason: Option<String>,
 }
 
 /// Pure helper: project Phase 2 `CommunityState` lineage data into the
@@ -20312,6 +20320,7 @@ pub fn build_community_lineage_dto(
     forked_from: Option<crate::owner_state_types::SpaceId>,
     forked_at_wall_ms: Option<u64>,
     parent_lineage: &[crate::community_invite::ParentLineageEntry],
+    fork_reason: Option<String>,
 ) -> PhaseTwoCommunityLineageDto {
     PhaseTwoCommunityLineageDto {
         forked_from: forked_from.map(|s| hex::encode(s.0)),
@@ -20322,10 +20331,12 @@ pub fn build_community_lineage_dto(
                 space_id: hex::encode(e.space_id.0),
                 name: e.name.clone(),
                 forked_at_wall_ms: e.forked_at_wall_ms,
+                reason: e.reason.clone(),
             })
             .collect(),
         self_space_id: hex::encode(self_space_id.0),
         self_name,
+        fork_reason,
     }
 }
 
@@ -20395,13 +20406,14 @@ async fn get_community_lineage(
         )
     })?;
 
-    let (forked_from, forked_at_wall_ms, parent_lineage_clone, materialized) = {
+    let (forked_from, forked_at_wall_ms, parent_lineage_clone, fork_reason, materialized) = {
         let g = engine_state.lock().await;
         let mat = g.materialize_now(admin_addr);
         (
             g.forked_from,
             g.forked_at_wall_ms,
             g.parent_lineage.clone(),
+            g.fork_reason.clone(),
             mat,
         )
     };
@@ -20459,6 +20471,7 @@ async fn get_community_lineage(
         forked_from,
         forked_at_wall_ms,
         &lineage_for_dto,
+        fork_reason,
     ))
 }
 
@@ -20480,6 +20493,7 @@ mod get_community_lineage_tests {
             Some(parent_id),
             None,
             &[], // empty parent_lineage = Phase 1 shape
+            None,
         );
 
         assert_eq!(dto.self_space_id, hex::encode(self_id.0));
@@ -20487,6 +20501,7 @@ mod get_community_lineage_tests {
         assert_eq!(dto.forked_from, Some(hex::encode(parent_id.0)));
         assert_eq!(dto.forked_at_wall_ms, None);
         assert!(dto.parent_lineage.is_empty());
+        assert_eq!(dto.fork_reason, None);
     }
 
     #[test]
@@ -20505,7 +20520,7 @@ mod get_community_lineage_tests {
                 space_id: SpaceId([0x22; 16]),
                 name: "Middle".into(),
                 forked_at_wall_ms: Some(1_700_000_000_000),
-                reason: None,
+                reason: Some("Middle split from Root".into()),
             },
         ];
 
@@ -20515,6 +20530,7 @@ mod get_community_lineage_tests {
             Some(parent_id),
             Some(1_710_000_000_000),
             &lineage,
+            Some("MyFork split from parent".into()),
         );
 
         assert_eq!(dto.self_space_id, hex::encode(self_id.0));
@@ -20528,12 +20544,19 @@ mod get_community_lineage_tests {
             dto.parent_lineage[1].forked_at_wall_ms,
             Some(1_700_000_000_000)
         );
+        // ZEB-649: reasons project through — per-hop and self.
+        assert_eq!(dto.parent_lineage[0].reason, None);
+        assert_eq!(
+            dto.parent_lineage[1].reason.as_deref(),
+            Some("Middle split from Root")
+        );
+        assert_eq!(dto.fork_reason.as_deref(), Some("MyFork split from parent"));
     }
 
     #[test]
     fn build_community_lineage_dto_top_level_community() {
         let self_id = SpaceId([0x88; 16]);
-        let dto = build_community_lineage_dto(self_id, "Top".into(), None, None, &[]);
+        let dto = build_community_lineage_dto(self_id, "Top".into(), None, None, &[], None);
 
         assert_eq!(dto.forked_from, None);
         assert_eq!(dto.forked_at_wall_ms, None);
@@ -32727,6 +32750,9 @@ pub struct ForkSnapshotMetadataDto {
     pub forked_at_ms: u64,
     /// Total message count captured in the snapshot (after §4.2 trim).
     pub snapshot_message_count: usize,
+    /// ZEB-649: the forker's stated why — drives the divider quote.
+    /// None for pre-ZEB-649 snapshots.
+    pub fork_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -32777,6 +32803,13 @@ async fn get_fork_snapshot_metadata(
         original_community_name: snapshot.original_community_name,
         forked_at_ms: snapshot.forked_at.wall_ms,
         snapshot_message_count,
+        // Bound like the redeem mirror: the snapshot file bypasses
+        // verify_event, so truncate rather than trust verbatim.
+        fork_reason: snapshot.fork_reason.as_ref().map(|r| {
+            r.chars()
+                .take(crate::community_membership::MAX_MODERATION_REASON_CHARS)
+                .collect()
+        }),
     }))
 }
 
