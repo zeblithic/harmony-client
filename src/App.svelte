@@ -1757,7 +1757,9 @@
     // background ones) — must run before the selected-community early-return
     // below, which only scopes the roster refetch. The alerter self-gates on
     // active channel / focus / policy, so this is safe to call unconditionally.
-    void mentionAlerter?.onMessage(communityId, channelId, message);
+    void mentionAlerter
+      ?.onMessage(communityId, channelId, message)
+      ?.catch((e) => console.warn('[harmony-client] mention alert failed:', e));
     if (communityId !== selectedCommunityId) return;
     if (rosterHasJoinedAuthor(communityMembers, message.author)) return;
     const now = Date.now();
@@ -2196,9 +2198,15 @@
         const { createDefaultMentionAlerter } = await import('./lib/mention-alert');
         mentionAlerter = await createDefaultMentionAlerter({
           getSelfOwnerId: () => selfOwnerId ?? undefined,
-          // Only the messages-mode feed counts as "viewing" a channel; in other
-          // modes the last-open channel isn't on screen, so mentions there notify.
-          getActiveChannelId: () => (appMode === 'messages' ? activeChannel : null),
+          // "Viewing this channel's feed" is true only in messages mode with
+          // neither Notes nor a community overview on screen — both of those
+          // replace the feed while leaving `activeChannel` stale, so a mention
+          // in that channel must still notify. Mirrors the on-screen selector
+          // `notesSelected ? null : (selectedCommunityId ?? activeChannel)`.
+          getActiveChannelId: () =>
+            appMode === 'messages' && !notesSelected && selectedCommunityId === null
+              ? activeChannel
+              : null,
           resolve: (p, peer, community) => notificationService.resolve(p, peer, community),
           incMention: (channelId) => navService.incMention(channelId),
           getChannelName: (channelId) =>

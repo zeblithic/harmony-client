@@ -165,6 +165,10 @@ describe('persistence (ZEB-662)', () => {
     s.clearCommunityPolicy('c');
     s.setPeerPolicy('p', {});
     s.clearPeerPolicy('p');
-    expect(n).toBe(5);
+    s.setPeerSoundOverrides('p', {});
+    s.clearPeerSoundOverrides('p');
+    s.setCommunitySoundOverrides('c', {});
+    s.clearCommunitySoundOverrides('c');
+    expect(n).toBe(9);
   });
 });

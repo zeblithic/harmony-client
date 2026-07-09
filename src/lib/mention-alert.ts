@@ -45,9 +45,10 @@ export class MentionAlertService {
     // Never self-notify for your own message that happens to @-mention you.
     if (message.author === self) return;
 
+    // Resolve focus once per mention (reused by the seen-check and delivery).
+    const focused = await this.focusedSafe();
     // Looking right at it → treat as seen.
-    const active = this.deps.getActiveChannelId();
-    if (channelId === active && (await this.focusedSafe())) return;
+    if (channelId === this.deps.getActiveChannelId() && focused) return;
 
     const action = this.deps.resolve('loud', message.author, communityId);
     if (action === 'silent') return;
@@ -58,7 +59,7 @@ export class MentionAlertService {
 
     const title = 'New mention';
     const body = `You were mentioned in ${this.deps.getChannelName(channelId)}`;
-    if (await this.focusedSafe()) {
+    if (focused) {
       this.deps.showToast(body);
     } else {
       try {

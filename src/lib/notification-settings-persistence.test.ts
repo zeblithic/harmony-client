@@ -63,4 +63,20 @@ describe('notification-settings-persistence (ZEB-662)', () => {
     loadNotificationSettings(s, OWNER, store as unknown as Storage);
     expect(s.settings.global).toEqual({ quiet: 'dot_only', standard: 'sound', loud: 'break_dnd' });
   });
+
+  it('swallows a storage write failure (quota/denied)', () => {
+    const throwing = {
+      getItem: () => null,
+      setItem: () => {
+        throw new Error('quota exceeded');
+      },
+      removeItem: () => {},
+      clear: () => {},
+      key: () => null,
+      length: 0,
+    } as unknown as Storage;
+    const s = new NotificationService();
+    attachNotificationSettingsPersistence(s, OWNER, throwing);
+    expect(() => s.setGlobalPolicy({ quiet: 'silent', standard: 'silent', loud: 'silent' })).not.toThrow();
+  });
 });
