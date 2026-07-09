@@ -39,6 +39,11 @@
   const bodyId = `${uid}-body`;
 
   let typedInput = $state('');
+  // ZEB-647 (Qodo PR #433): explicit initial-focus targets — children render
+  // before the controls, so a focusable element in the body copy would
+  // otherwise steal initial focus by DOM order.
+  let typedInputEl: HTMLInputElement | null = $state(null);
+  let cancelEl: HTMLButtonElement | null = $state(null);
   let confirmEnabled = $derived.by(() => {
     if (busy) return false;
     if (severity === 'click') return true;
@@ -58,7 +63,11 @@
     aria-modal="true"
     aria-labelledby={titleId}
     aria-describedby={children ? bodyId : undefined}
-    use:trapFocus={{ onCancel, canCancel: !busy }}
+    use:trapFocus={{
+      onCancel,
+      canCancel: !busy,
+      initialFocus: () => (severity === 'typed' ? typedInputEl : cancelEl),
+    }}
   >
     <p class="confirm-title" id={titleId}>{title}</p>
     {#if children}
@@ -70,6 +79,7 @@
       <input
         class="typed-input"
         type="text"
+        bind:this={typedInputEl}
         bind:value={typedInput}
         placeholder={typedMatch}
         aria-label={`Type the word ${typedMatch} to confirm`}
@@ -77,7 +87,13 @@
       />
     {/if}
     <div class="confirm-actions">
-      <button type="button" class="cancel" onclick={onCancel} disabled={busy}>
+      <button
+        type="button"
+        class="cancel"
+        bind:this={cancelEl}
+        onclick={onCancel}
+        disabled={busy}
+      >
         {cancelLabel}
       </button>
       <button type="button" class="confirm" onclick={onConfirm} disabled={!confirmEnabled}>

@@ -1,6 +1,14 @@
 export interface TrapFocusParams {
   onCancel?: () => void;
   canCancel?: boolean;
+  /**
+   * Explicit initial-focus target — wins over first-in-DOM-order when it
+   * resolves to a currently-focusable element inside the node. For dialogs
+   * that render arbitrary children before their controls (GovConfirmModal's
+   * body copy), DOM order alone would let a focusable child steal the
+   * intended initial focus.
+   */
+  initialFocus?: () => HTMLElement | null | undefined;
 }
 
 const FOCUSABLE_SELECTOR = [
@@ -28,7 +36,10 @@ export function trapFocus(node: HTMLElement, params: TrapFocusParams) {
 
   const focusables = focusableIn(node);
   const setTabindexFallback = focusables.length === 0;
-  if (setTabindexFallback) {
+  const requested = params.initialFocus?.();
+  if (requested && focusables.includes(requested)) {
+    requested.focus();
+  } else if (setTabindexFallback) {
     if (originalTabindex === null) node.setAttribute('tabindex', '-1');
     node.focus();
   } else {

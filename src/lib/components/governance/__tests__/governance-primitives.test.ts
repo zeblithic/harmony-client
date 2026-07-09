@@ -146,6 +146,33 @@ describe('GovConfirmModal', () => {
     await fireEvent.keyDown(screen.getByRole('alertdialog'), { key: 'Escape' });
     expect(onCancel).not.toHaveBeenCalled();
   });
+  it('typed severity: focusable children do not steal initial focus (Qodo PR #433)', () => {
+    const children = createRawSnippet(() => ({
+      render: () => '<p>Warning with a <a href="https://example.com">link</a></p>',
+    }));
+    render(GovConfirmModal, {
+      props: {
+        title: 'T',
+        severity: 'typed',
+        typedMatch: 'revoke',
+        onConfirm: vi.fn(),
+        onCancel: vi.fn(),
+        children,
+      },
+    });
+    expect(document.activeElement).toBe(
+      screen.getByLabelText('Type the word revoke to confirm'),
+    );
+  });
+  it('click severity: focusable children do not steal initial focus', () => {
+    const children = createRawSnippet(() => ({
+      render: () => '<p><a href="https://example.com">details</a></p>',
+    }));
+    render(GovConfirmModal, {
+      props: { title: 'T', onConfirm: vi.fn(), onCancel: vi.fn(), children },
+    });
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Cancel' }));
+  });
   it('exposes alertdialog with title + body wiring', () => {
     const children = createRawSnippet(() => ({
       render: () => '<p>Irreversible warning</p>',

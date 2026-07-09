@@ -20,11 +20,16 @@ the *high*-severity typed modal is plain `dialog`). Fix all of it once, here.
 implements everything the ticket's "suggested shape" asks for, with 17 tests
 pinning its behavior:
 
-* **Initial focus** — focuses the first focusable in DOM order at mount.
-  GovConfirmModal's DOM order is `typed input → Cancel → Confirm`, so this
-  lands exactly where the ticket wants it *by construction*: the typed input
-  under `severity="typed"`, the Cancel button under `severity="click"`
-  (Cancel-first is the safe default for destructive confirms).
+* **Initial focus** — the typed input under `severity="typed"`, the Cancel
+  button under `severity="click"` (Cancel-first is the safe default for
+  destructive confirms). *Converge amendment (Qodo, PR #433 round 1):*
+  originally this relied on the intended control being first in DOM order,
+  but the `children` snippet renders before the controls, so a focusable
+  element in a future consumer's body copy would steal it. `trapFocus` now
+  takes an explicit `initialFocus?: () => HTMLElement | null` param (falls
+  back to first-focusable when the target isn't currently focusable, e.g.
+  disabled while `busy`), and GovConfirmModal passes the severity-appropriate
+  ref.
 * **Escape → `onCancel()`** — gated by `canCancel`; we pass `canCancel: !busy`,
   which is precisely the ticket's "unless `busy`" guard.
 * **Tab/Shift+Tab trap** — cycles within the node, re-querying focusables per
