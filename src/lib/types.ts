@@ -111,6 +111,10 @@ export interface NavNode {
   displayMode?: DisplayMode;
   sortOrder?: SortOrder;
   unreadCount: number;
+  /** ZEB-662: session-ephemeral count of unseen @-mentions in this node.
+   *  On a community node it is the sum of its descendant channels' counts.
+   *  Reset on restart; cleared when the channel is opened. */
+  mentionCount: number;
   unreadLevel: UnreadLevel;
   lastActivity?: number;
   peer?: Peer;

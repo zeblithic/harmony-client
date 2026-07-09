@@ -301,6 +301,7 @@ describe('NavService DM handling', () => {
             parentId: 'family-folder',
             expanded: true,
             unreadCount: 5,
+            mentionCount: 0,
             unreadLevel: 'standard',
           }
         : n,
@@ -616,8 +617,8 @@ describe('NavService.resolveForkParentName (ZEB-285)', () => {
     const svc = new NavService();
     // Replace mock-seeded nodes with controlled fixture.
     svc.nodes = [
-      { id: 'original-id', name: 'Cool Community', type: 'community', parentId: null, expanded: true, unreadCount: 0, unreadLevel: 'none' },
-      { id: 'fork-id', name: 'Cool Community (fork)', type: 'community', parentId: null, expanded: true, unreadCount: 0, unreadLevel: 'none', forkedFrom: 'original-id' },
+      { id: 'original-id', name: 'Cool Community', type: 'community', parentId: null, expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+      { id: 'fork-id', name: 'Cool Community (fork)', type: 'community', parentId: null, expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none', forkedFrom: 'original-id' },
     ];
     expect(svc.resolveForkParentName('original-id')).toBe('Cool Community');
   });
@@ -626,7 +627,7 @@ describe('NavService.resolveForkParentName (ZEB-285)', () => {
     const svc = new NavService();
     // Only the fork is present — user left the original (alsoLeave=true).
     svc.nodes = [
-      { id: 'fork-id', name: 'Cool Community (fork)', type: 'community', parentId: null, expanded: true, unreadCount: 0, unreadLevel: 'none', forkedFrom: 'original-id' },
+      { id: 'fork-id', name: 'Cool Community (fork)', type: 'community', parentId: null, expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none', forkedFrom: 'original-id' },
     ];
     expect(svc.resolveForkParentName('original-id')).toBe(null);
   });
@@ -774,5 +775,75 @@ describe('NavService — pending community (ZEB-254)', () => {
     const node = svc.nodes.find((n) => n.id === 'listen-pending-id');
     expect(node!.pending).toBe(false);
     svc.destroy();
+  });
+});
+
+describe('mention counts (ZEB-662)', () => {
+  function svc(): NavService {
+    const s = new NavService();
+    s.nodes = [
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+      { id: 'ch1', parentId: 'c1', type: 'channel', name: 'general', expanded: false, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+      { id: 'ch2', parentId: 'c1', type: 'channel', name: 'random', expanded: false, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    return s;
+  }
+
+  // Production has no channel nav nodes — only the community node.
+  function prodSvc(): NavService {
+    const s = new NavService();
+    s.nodes = [
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    return s;
+  }
+
+  it('dev-mock: incMention bumps the channel node and bubbles the community sum', () => {
+    const s = svc();
+    let changed = 0;
+    s.onChange = () => {
+      changed++;
+    };
+    s.incMention('c1', 'ch1');
+    s.incMention('c1', 'ch1');
+    s.incMention('c1', 'ch2');
+    expect(s.nodes.find((n) => n.id === 'ch1')!.mentionCount).toBe(2);
+    expect(s.nodes.find((n) => n.id === 'ch2')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(3); // bubbled sum
+    expect(changed).toBe(3);
+  });
+
+  it('dev-mock: clearMention zeroes the channel node and recomputes the community sum', () => {
+    const s = svc();
+    s.incMention('c1', 'ch1');
+    s.incMention('c1', 'ch2');
+    s.clearMention('ch1');
+    expect(s.nodes.find((n) => n.id === 'ch1')!.mentionCount).toBe(0);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1); // only ch2 remains
+  });
+
+  it('production: channel is not a nav node → the community node carries the badge', () => {
+    const s = prodSvc();
+    s.incMention('c1', 'ch-a'); // ch-a / ch-b aren't nav nodes in prod
+    s.incMention('c1', 'ch-b');
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // aggregate on community
+    s.clearMention('c1'); // opening the community clears its aggregate
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
+  });
+
+  it('incMention with an unknown community and channel is a no-op', () => {
+    const s = svc();
+    s.incMention('nope-c', 'nope-ch');
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
+  });
+
+  it('clearMention on an already-zero node does not fire onChange', () => {
+    const s = svc();
+    let changed = 0;
+    s.onChange = () => {
+      changed++;
+    };
+    s.clearMention('ch1');
+    expect(changed).toBe(0);
   });
 });

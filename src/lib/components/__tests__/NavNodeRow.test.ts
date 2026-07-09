@@ -11,6 +11,7 @@ function makeNode(overrides: Partial<NavNode> = {}): NavNode {
     name: 'general',
     expanded: false,
     unreadCount: 0,
+    mentionCount: 0,
     unreadLevel: 'none',
     ...overrides,
   };
@@ -28,6 +29,32 @@ describe('NavNodeRow', () => {
     });
     expect(screen.getByText('#')).toBeTruthy();
     expect(screen.getByText('general')).toBeTruthy();
+  });
+
+  it('shows a clay mention badge when mentionCount > 0 (ZEB-662)', () => {
+    render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'channel', name: 'general', mentionCount: 2 }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    const badge = screen.getByTestId('mention-badge');
+    expect(badge.textContent).toBe('@2');
+    expect(badge.getAttribute('aria-label')).toBe('2 unread mentions');
+  });
+
+  it('renders no mention badge when mentionCount is 0 (ZEB-662)', () => {
+    render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'channel', name: 'general', mentionCount: 0 }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    expect(screen.queryByTestId('mention-badge')).toBeNull();
   });
 
   it('renders color bands matching ancestry depth', () => {

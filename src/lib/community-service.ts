@@ -428,6 +428,17 @@ export class CommunityService {
     this.selectedChannelByCommunity.set(communityId, channelId);
   }
 
+  /** ZEB-662: synchronous best-effort channel-name lookup from the session
+   *  cache that `listChannels` populates (community channels aren't nav nodes
+   *  in production, so the mention alerter can't resolve names via NavService).
+   *  Returns undefined if the community's channels haven't been fetched this
+   *  session — the caller falls back to a generic label. */
+  getCachedChannelName(communityId: string, channelId: string): string | undefined {
+    return this.channelCache
+      .get(communityId)
+      ?.find((c) => c.channelId === channelId)?.name;
+  }
+
   /**
    * Fetch a community's members. Returns the per-community in-memory cache
    * when present and `forceRefresh` is false.

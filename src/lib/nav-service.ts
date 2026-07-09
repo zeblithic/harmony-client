@@ -212,6 +212,7 @@ export class NavService {
         parentId: parentId ?? null,
         expanded: true, // default expanded; user can collapse
         unreadCount: 0,
+        mentionCount: 0,
         unreadLevel: 'none',
         peer: undefined,
         // ZEB-285: carry fork lineage through to the NavNode so the
@@ -236,6 +237,7 @@ export class NavService {
                   parentId: existing.parentId,
                   expanded: existing.expanded,
                   unreadCount: existing.unreadCount,
+                  mentionCount: existing.mentionCount ?? 0,
                   unreadLevel: existing.unreadLevel,
                   forkedFrom: forkedFrom ?? existing.forkedFrom,
                 }
@@ -305,6 +307,7 @@ export class NavService {
       parentId: parentId ?? null,
       expanded: false,
       unreadCount: 0,
+      mentionCount: 0,
       unreadLevel: 'none',
       peer,
     };
@@ -325,6 +328,7 @@ export class NavService {
           parentId: existing.parentId,
           expanded: existing.expanded,
           unreadCount: existing.unreadCount,
+          mentionCount: existing.mentionCount ?? 0,
           unreadLevel: existing.unreadLevel,
           peer: peerWasDerivedFromPayload ? newNode.peer : existing.peer,
         };
@@ -353,6 +357,59 @@ export class NavService {
       }
     }
     this.onChange?.();
+  }
+
+  /** ZEB-662: walk parentId up to the owning community node id (or null). */
+  private communityIdOf(node: NavNode): string | null {
+    let cur: NavNode | undefined = node;
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur.id)) {
+      if (cur.type === 'community') return cur.id;
+      seen.add(cur.id);
+      cur = cur.parentId ? this.nodes.find((n) => n.id === cur!.parentId) : undefined;
+    }
+    return null;
+  }
+
+  /** ZEB-662: apply a signed delta to a channel's mentionCount and mirror it on
+   *  the owning community node (incremental — O(tree depth), not a full scan).
+   *  The community node's count stays == the sum of its channels' counts because
+   *  inc/clear are the only mutators and each applies the same delta to both. */
+  private applyMentionDelta(channelId: string, delta: number): void {
+    const node = this.nodes.find((n) => n.id === channelId);
+    if (!node) return;
+    const next = Math.max(0, node.mentionCount + delta);
+    const applied = next - node.mentionCount;
+    if (applied === 0) return;
+    node.mentionCount = next;
+    const cid = this.communityIdOf(node);
+    if (cid && cid !== node.id) {
+      const comm = this.nodes.find((n) => n.id === cid);
+      if (comm) comm.mentionCount = Math.max(0, comm.mentionCount + applied);
+    }
+    this.onChange?.();
+  }
+
+  /** ZEB-662: increment an unseen-mention count for a community channel.
+   *  When the channel is itself a nav node (dev/mock seed) increment it and
+   *  bubble to its community. In production, community channels aren't nav
+   *  nodes, so the indicator lives directly on the community node (the only
+   *  per-community surface the nav has). Target selection is the seam between
+   *  the two models — no `import.meta.env.DEV` branch needed. */
+  incMention(communityId: string, channelId: string): void {
+    const target = this.nodes.some((n) => n.id === channelId)
+      ? channelId
+      : communityId;
+    this.applyMentionDelta(target, 1);
+  }
+
+  /** ZEB-662: clear a node's mention count (its channel/DM opened, or — in
+   *  production — its community opened) and re-bubble. Accepts either a channel
+   *  node id (dev/mock) or a community node id (production aggregate). */
+  clearMention(id: string): void {
+    const node = this.nodes.find((n) => n.id === id);
+    if (!node || node.mentionCount === 0) return;
+    this.applyMentionDelta(id, -node.mentionCount);
   }
 
   /**

@@ -184,6 +184,15 @@
       </span>
     {/if}
 
+    <!-- ZEB-662: mention badge — clay-toned, higher-signal than unread. -->
+    {#if node.mentionCount > 0}
+      <span
+        class="mention-badge"
+        data-testid="mention-badge"
+        aria-label={`${node.mentionCount} unread mention${node.mentionCount === 1 ? '' : 's'}`}
+      >@{node.mentionCount}</span>
+    {/if}
+
     <!-- Unread indicators -->
     {#if node.unreadLevel === 'standard' && node.unreadCount > 0}
       <span class="unread-badge">{node.unreadCount}</span>
@@ -375,6 +384,19 @@
 
   .unread-badge {
     background: var(--accent);
+    color: var(--on-accent);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+
+  /* ZEB-662: nav mention badge — clay-toned so it's distinct from the accent
+     unread badge. gov-clay-deep is dark-in-light / light-in-dark, so it pairs
+     with --on-accent for AA-safe contrast in both themes. */
+  .mention-badge {
+    background: var(--gov-clay-deep);
     color: var(--on-accent);
     font-size: 11px;
     font-weight: 700;
