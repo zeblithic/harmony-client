@@ -1,5 +1,6 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
+import { createRawSnippet } from 'svelte';
 import StatusPill from '../StatusPill.svelte';
 import TallyBar from '../TallyBar.svelte';
 import CountChip from '../CountChip.svelte';
@@ -108,6 +109,100 @@ describe('GovConfirmModal', () => {
     });
     expect((screen.getByRole('button', { name: 'Confirm' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // ZEB-647 — focus management + alertdialog semantics (via trapFocus).
+  it('typed severity: autofocuses the typed input on open', () => {
+    render(GovConfirmModal, {
+      props: {
+        title: 'T',
+        severity: 'typed',
+        typedMatch: 'revoke',
+        onConfirm: vi.fn(),
+        onCancel: vi.fn(),
+      },
+    });
+    expect(document.activeElement).toBe(
+      screen.getByLabelText('Type the word revoke to confirm'),
+    );
+  });
+  it('click severity: autofocuses the Cancel button on open', () => {
+    render(GovConfirmModal, { props: { title: 'T', onConfirm: vi.fn(), onCancel: vi.fn() } });
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Cancel' }));
+  });
+  it('Escape fires onCancel', async () => {
+    const onCancel = vi.fn();
+    render(GovConfirmModal, { props: { title: 'T', onConfirm: vi.fn(), onCancel } });
+    // trap-focus binds keydown on the dialog node (not window) — dispatch on
+    // the alertdialog element, same pattern as ReshareConfirmDialog.test.ts.
+    await fireEvent.keyDown(screen.getByRole('alertdialog'), { key: 'Escape' });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+  it('Escape during busy does not cancel', async () => {
+    const onCancel = vi.fn();
+    render(GovConfirmModal, {
+      props: { title: 'T', busy: true, onConfirm: vi.fn(), onCancel },
+    });
+    await fireEvent.keyDown(screen.getByRole('alertdialog'), { key: 'Escape' });
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+  it('typed severity: focusable children do not steal initial focus (Qodo PR #433)', () => {
+    const children = createRawSnippet(() => ({
+      render: () => '<p>Warning with a <a href="https://example.com">link</a></p>',
+    }));
+    render(GovConfirmModal, {
+      props: {
+        title: 'T',
+        severity: 'typed',
+        typedMatch: 'revoke',
+        onConfirm: vi.fn(),
+        onCancel: vi.fn(),
+        children,
+      },
+    });
+    expect(document.activeElement).toBe(
+      screen.getByLabelText('Type the word revoke to confirm'),
+    );
+  });
+  it('click severity: focusable children do not steal initial focus', () => {
+    const children = createRawSnippet(() => ({
+      render: () => '<p><a href="https://example.com">details</a></p>',
+    }));
+    render(GovConfirmModal, {
+      props: { title: 'T', onConfirm: vi.fn(), onCancel: vi.fn(), children },
+    });
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Cancel' }));
+  });
+  it('exposes alertdialog with title + body wiring', () => {
+    const children = createRawSnippet(() => ({
+      render: () => '<p>Irreversible warning</p>',
+    }));
+    render(GovConfirmModal, {
+      props: { title: 'Confirm thing', onConfirm: vi.fn(), onCancel: vi.fn(), children },
+    });
+    const dialog = screen.getByRole('alertdialog');
+    expect(dialog.getAttribute('aria-modal')).toBe('true');
+    const titleEl = document.getElementById(dialog.getAttribute('aria-labelledby')!);
+    expect(titleEl?.textContent).toBe('Confirm thing');
+    const bodyEl = document.getElementById(dialog.getAttribute('aria-describedby')!);
+    expect(bodyEl?.textContent).toContain('Irreversible warning');
+  });
+  it('omits aria-describedby without children', () => {
+    render(GovConfirmModal, { props: { title: 'T', onConfirm: vi.fn(), onCancel: vi.fn() } });
+    expect(screen.getByRole('alertdialog').hasAttribute('aria-describedby')).toBe(false);
+  });
+  it('restores focus to the opener on unmount', () => {
+    const trigger = document.createElement('button');
+    trigger.textContent = 'Open';
+    document.body.appendChild(trigger);
+    trigger.focus();
+    const { unmount } = render(GovConfirmModal, {
+      props: { title: 'T', onConfirm: vi.fn(), onCancel: vi.fn() },
+    });
+    expect(document.activeElement).not.toBe(trigger);
+    unmount();
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
   });
 });
 

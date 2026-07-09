@@ -265,6 +265,32 @@ describe('trap-focus action', () => {
     expect(modal.getAttribute('tabindex')).toBe('0');
   });
 
+  it('focuses the initialFocus target instead of the first focusable', () => {
+    document.body.innerHTML = `
+      <div id="modal">
+        <button id="b1">B1</button>
+        <input id="i1" type="text" aria-label="i1" />
+      </div>
+    `;
+    const modal = document.querySelector<HTMLElement>('#modal')!;
+    const input = document.querySelector<HTMLInputElement>('#i1')!;
+    cleanup = trapFocus(modal, { initialFocus: () => input });
+    expect(document.activeElement?.id).toBe('i1');
+  });
+
+  it('falls back to the first focusable when the initialFocus target is not focusable', () => {
+    document.body.innerHTML = `
+      <div id="modal">
+        <button id="b1">B1</button>
+        <input id="i1" type="text" aria-label="i1" disabled />
+      </div>
+    `;
+    const modal = document.querySelector<HTMLElement>('#modal')!;
+    const input = document.querySelector<HTMLInputElement>('#i1')!;
+    cleanup = trapFocus(modal, { initialFocus: () => input });
+    expect(document.activeElement?.id).toBe('b1');
+  });
+
   it('honors canCancel changes via update()', () => {
     document.body.innerHTML = `
       <div id="modal"><button id="b1">B1</button></div>
