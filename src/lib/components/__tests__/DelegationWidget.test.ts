@@ -151,7 +151,7 @@ describe('DelegationWidget', () => {
       },
     });
     await fireEvent.click(screen.getByText(/revoke delegation/i));
-    const dialog = await screen.findByRole('dialog', { name: /type-to-confirm revoke/i });
+    const dialog = await screen.findByRole('alertdialog', { name: /type-to-confirm revoke/i });
     expect(dialog).toBeInTheDocument();
     // Typing wrong word should NOT enable the confirm button.
     const input = screen.getByPlaceholderText('revoke') as HTMLInputElement;
@@ -184,14 +184,14 @@ describe('DelegationWidget', () => {
       },
     });
     await fireEvent.click(screen.getByText(/revoke delegation/i));
-    await screen.findByRole('dialog', { name: /type-to-confirm revoke/i });
+    await screen.findByRole('alertdialog', { name: /type-to-confirm revoke/i });
     const input = screen.getByPlaceholderText('revoke') as HTMLInputElement;
     await fireEvent.input(input, { target: { value: 'revoke' } });
     await fireEvent.click(screen.getByRole('button', { name: /confirm revoke/i }));
     // Error text renders in the visible widget body...
     expect(await screen.findByText(/revoke failed/)).toBeInTheDocument();
     // ...and the modal overlay that would have hidden it is gone.
-    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByRole('alertdialog')).toBeNull();
   });
 
   it('resets busy on community switch so the widget recovers when IPC was in-flight', async () => {
