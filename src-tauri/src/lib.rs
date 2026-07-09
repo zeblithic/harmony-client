@@ -20119,9 +20119,9 @@ pub fn build_fork_descendants(
         .into_iter()
         .map(|signed| {
             let fork_space_id = match &signed.kind {
-                crate::community_membership::MembershipEventKind::Fork { fork_space_id } => {
-                    fork_space_id
-                }
+                crate::community_membership::MembershipEventKind::Fork {
+                    fork_space_id, ..
+                } => fork_space_id,
                 // Unreachable: filtered above.
                 _ => unreachable!("non-Fork event survived filter"),
             };
@@ -20607,6 +20607,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 caller,
                 200,
@@ -20657,6 +20658,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 caller,
                 200,
@@ -20686,6 +20688,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 forker,
                 200,
@@ -20723,6 +20726,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 caller,
                 200,
@@ -20751,6 +20755,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 caller,
                 200,
@@ -20783,7 +20788,10 @@ mod list_community_forks_tests {
             synth_signed(
                 0x01,
                 cid,
-                MembershipEventKind::Fork { fork_space_id: f_a },
+                MembershipEventKind::Fork {
+                    fork_space_id: f_a,
+                    reason: None,
+                },
                 caller,
                 200,
             ),
@@ -20793,7 +20801,10 @@ mod list_community_forks_tests {
             synth_signed(
                 0x02,
                 cid,
-                MembershipEventKind::Fork { fork_space_id: f_b },
+                MembershipEventKind::Fork {
+                    fork_space_id: f_b,
+                    reason: None,
+                },
                 caller,
                 100,
             ),
@@ -20803,7 +20814,10 @@ mod list_community_forks_tests {
             synth_signed(
                 0x03,
                 cid,
-                MembershipEventKind::Fork { fork_space_id: f_c },
+                MembershipEventKind::Fork {
+                    fork_space_id: f_c,
+                    reason: None,
+                },
                 caller,
                 300,
             ),
@@ -20843,6 +20857,7 @@ mod list_community_forks_tests {
                 community_id: cid,
                 kind: MembershipEventKind::Fork {
                     fork_space_id: f_high,
+                    reason: None,
                 },
                 actor: caller,
                 at: Hlc {
@@ -20862,6 +20877,7 @@ mod list_community_forks_tests {
                 community_id: cid,
                 kind: MembershipEventKind::Fork {
                     fork_space_id: f_low,
+                    reason: None,
                 },
                 actor: caller,
                 at: Hlc {

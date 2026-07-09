@@ -571,7 +571,7 @@ async fn visible_fork_announces_in_original_log() {
     let engine_a = engines.registry_a.engine_arc(&community_id).await.unwrap();
     let state_a = engine_a.state().lock().await.clone();
     let has_fork = state_a.events.values().any(|e| {
-        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid } if *fid == fork_space_id)
+        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. } if *fid == fork_space_id)
     });
     assert!(
         has_fork,
@@ -603,7 +603,7 @@ async fn visible_fork_announces_in_original_log() {
 
     let state_b = engine_b.state().lock().await.clone();
     let b_has_fork = state_b.events.values().any(|e| {
-        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid } if *fid == fork_space_id)
+        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. } if *fid == fork_space_id)
     });
     assert!(
         b_has_fork,
@@ -905,7 +905,7 @@ async fn also_leave_emits_fork_and_leave_events() {
     let state = engine_a.state().lock().await.clone();
 
     let has_fork = state.events.values().any(|e| {
-        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid }
+        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. }
             if *fid == result.fork_space_id)
     });
     let has_leave = state

@@ -219,12 +219,22 @@ pub enum MembershipEventKind {
     /// event's HLC (power threshold = 0, "any joined member, any time").
     ///
     /// Variant tag "x" (1-char value, lowercase, unused before this).
-    /// Inner field key "fs" (2-char) per same-length-keys invariant at this
-    /// nesting level. See `docs/specs/2026-05-14-zeb-285-phase1-community-forking-design.md` §3.1.
+    /// Inner field keys "fs"/"rs" (2-char) per same-length-keys invariant at
+    /// this nesting level. See `docs/specs/2026-05-14-zeb-285-phase1-community-forking-design.md` §3.1.
+    ///
+    /// ZEB-649: `reason` is the forker's stated why, capped at
+    /// `MAX_MODERATION_REASON_CHARS` in `verify_event`. Optional ON THE WIRE
+    /// only — `Option` + `skip_serializing_if` keeps pre-ZEB-649 Fork events
+    /// re-encoding byte-identically through the `verify_signature`
+    /// decode→re-encode path (a bare String default would break every old
+    /// event's signature). The IPC layer (`fork_community`) makes it
+    /// mandatory for newly minted events.
     #[serde(rename = "x")]
     Fork {
         #[serde(rename = "fs")]
         fork_space_id: SpaceId,
+        #[serde(rename = "rs", skip_serializing_if = "Option::is_none", default)]
+        reason: Option<String>,
     },
 
     /// ZEB-254: joiner-signed pending join for invite-only communities.
@@ -3381,7 +3391,7 @@ pub fn verify_event(
                 return Err(VerifyError::EpochEventUnauthorized);
             }
         }
-        MembershipEventKind::Fork { .. } => {
+        MembershipEventKind::Fork { reason, .. } => {
             // ZEB-285: any joined non-Banned member can fork at any time.
             // Power threshold 0 — same as Leave. Non-mutating: doesn't
             // affect membership/power/channels, doesn't trigger EpochRotation.
@@ -3392,6 +3402,14 @@ pub fn verify_event(
             // existence on the forker's device.
             if actor_power < POWER_THRESHOLDS.invite {
                 return Err(VerifyError::ActorPowerInsufficient);
+            }
+            // ZEB-649: bound the reason at the CRDT layer (same
+            // defense-in-depth as Kick/Unban) so a malicious peer can't
+            // bypass the UI cap and persist a giant reason on every replica.
+            if let Some(r) = reason {
+                if r.chars().count() > MAX_MODERATION_REASON_CHARS {
+                    return Err(VerifyError::ReasonTooLong);
+                }
             }
         }
         MembershipEventKind::PendingJoin { .. } => {
@@ -6095,7 +6113,10 @@ mod tests {
         use crate::owner_state_crypto::canonical_cbor_encode;
 
         let fork_space_id = SpaceId([0xfa; 16]);
-        let event = MembershipEventKind::Fork { fork_space_id };
+        let event = MembershipEventKind::Fork {
+            fork_space_id,
+            reason: None,
+        };
 
         let bytes = canonical_cbor_encode(&event).expect("encode");
         let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
@@ -6191,6 +6212,7 @@ mod tests {
             },
             MembershipEventKind::Fork {
                 fork_space_id: SpaceId([0xfa; 16]),
+                reason: None,
             },
             // ZEB-495: unit variant, no body.
             MembershipEventKind::DeviceAnnounce,
@@ -6203,6 +6225,156 @@ mod tests {
                 .unwrap_or_else(|e| panic!("decode failed for {variant:?}: {e}"));
             assert_eq!(variant, &decoded, "roundtrip mismatch for {variant:?}");
         }
+    }
+
+    /// ZEB-649: Fork with a reason roundtrips and writes the `rs` inner key;
+    /// a reason-less Fork omits the key entirely (skip_serializing_if) —
+    /// the omission is what keeps pre-ZEB-649 Fork signatures re-verifiable
+    /// through verify_signature's decode→re-encode path.
+    #[test]
+    fn fork_event_with_reason_cbor_roundtrip_and_rs_key() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let event = MembershipEventKind::Fork {
+            fork_space_id: SpaceId([0xfa; 16]),
+            reason: Some("Treasury split".to_string()),
+        };
+        let bytes = canonical_cbor_encode(&event).expect("encode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(event, decoded);
+
+        fn inner_map_keys(bytes: &[u8]) -> Vec<String> {
+            let value: ciborium::Value = ciborium::de::from_reader(bytes).expect("as value");
+            let map = value.as_map().expect("outer is map");
+            let vl = map
+                .iter()
+                .find_map(|(k, v): &(ciborium::Value, ciborium::Value)| {
+                    if k.as_text() == Some("vl") {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                })
+                .expect("vl key");
+            vl.as_map()
+                .expect("vl is map")
+                .iter()
+                .filter_map(|(k, _): &(ciborium::Value, ciborium::Value)| {
+                    k.as_text().map(str::to_string)
+                })
+                .collect()
+        }
+
+        let with_reason_keys = inner_map_keys(&bytes);
+        assert!(
+            with_reason_keys.iter().any(|k| k == "rs"),
+            "inner has rs key"
+        );
+        assert!(
+            with_reason_keys.iter().any(|k| k == "fs"),
+            "inner keeps fs key"
+        );
+
+        let bare = MembershipEventKind::Fork {
+            fork_space_id: SpaceId([0xfa; 16]),
+            reason: None,
+        };
+        let bare_bytes = canonical_cbor_encode(&bare).expect("encode bare");
+        let bare_keys = inner_map_keys(&bare_bytes);
+        assert!(
+            !bare_keys.iter().any(|k| k == "rs"),
+            "reason-less Fork must omit rs entirely (wire-compat guarantee)"
+        );
+    }
+
+    /// ZEB-649: Fork with a reason longer than `MAX_MODERATION_REASON_CHARS`
+    /// must be rejected at verify_event so an oversized reason cannot bypass
+    /// the UI cap and persist to every replica (same defense-in-depth as
+    /// Kick/Unban).
+    #[test]
+    fn fork_event_rejected_when_reason_exceeds_max_chars() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (regular_priv, _regular_pub, regular_addr) = make_identity(0xb1);
+
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        let regular_join = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+        let prior = materialize(&[admin_join, regular_join], admin_addr);
+
+        let oversized: String = "a".repeat(MAX_MODERATION_REASON_CHARS + 1);
+        let fork_event = sign_with_identity(
+            EventPayload {
+                id: [0x03; 16],
+                community_id,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xfe; 16]),
+                    reason: Some(oversized),
+                },
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 3,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+        };
+        assert_eq!(
+            verify_event(&fork_event, &prior, &ctx),
+            Err(VerifyError::ReasonTooLong)
+        );
+
+        // At exactly the cap it must pass (boundary check).
+        let at_cap: String = "a".repeat(MAX_MODERATION_REASON_CHARS);
+        let ok_event = sign_with_identity(
+            EventPayload {
+                id: [0x04; 16],
+                community_id,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xfe; 16]),
+                    reason: Some(at_cap),
+                },
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 4,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+        assert_eq!(verify_event(&ok_event, &prior, &ctx), Ok(()));
     }
 
     /// ZEB-285 Step 6/9: verify_event allows a Fork from any joined member
@@ -6253,6 +6425,7 @@ mod tests {
                 community_id,
                 kind: MembershipEventKind::Fork {
                     fork_space_id: SpaceId([0xfe; 16]),
+                    reason: None,
                 },
                 actor: regular_addr,
                 at: Hlc {
@@ -6282,6 +6455,7 @@ mod tests {
                 community_id,
                 kind: MembershipEventKind::Fork {
                     fork_space_id: SpaceId([0xfe; 16]),
+                    reason: None,
                 },
                 actor: admin_addr,
                 at: Hlc {
@@ -6335,6 +6509,7 @@ mod tests {
                 community_id,
                 kind: MembershipEventKind::Fork {
                     fork_space_id: SpaceId([0xfe; 16]),
+                    reason: None,
                 },
                 actor: outsider_addr,
                 at: Hlc {
@@ -6375,6 +6550,7 @@ mod tests {
             community_id,
             kind: MembershipEventKind::Fork {
                 fork_space_id: SpaceId([0xfe; 16]),
+                reason: None,
             },
             actor: admin,
             at: Hlc {
@@ -6420,6 +6596,7 @@ mod tests {
             community_id,
             kind: MembershipEventKind::Fork {
                 fork_space_id: SpaceId([0xfe; 16]),
+                reason: None,
             },
             actor: admin,
             at: Hlc {

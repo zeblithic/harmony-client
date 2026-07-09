@@ -181,7 +181,10 @@ pub fn mint_fork_event(
     let payload = EventPayload {
         id: event_id_bytes,
         community_id: original_community_id,
-        kind: MembershipEventKind::Fork { fork_space_id },
+        kind: MembershipEventKind::Fork {
+            fork_space_id,
+            reason: None,
+        },
         actor: self_owner,
         at: hlc,
     };

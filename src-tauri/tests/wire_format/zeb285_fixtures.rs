@@ -89,7 +89,10 @@ fn fixture_signed_event_zeb285(kind: MembershipEventKind) -> SignedMembershipEve
 #[test]
 fn fork_event_canonical_cbor_pinned() {
     let fork_space_id = SpaceId([0xfa; 16]);
-    let signed = fixture_signed_event_zeb285(MembershipEventKind::Fork { fork_space_id });
+    let signed = fixture_signed_event_zeb285(MembershipEventKind::Fork {
+        fork_space_id,
+        reason: None,
+    });
 
     let bytes = canonical_cbor_encode(&signed).expect("encode");
     let hex = hex::encode(&bytes);
@@ -97,6 +100,56 @@ fn fork_event_canonical_cbor_pinned() {
 
     let expected_hex = "a6626964504242424242424242424242424242424262636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626b6ea2627467617862766ca162667350fafafafafafafafafafafafafafafafa62616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa626174a361771b0000018bcfe56800616c0061646b746573742d6465766963656273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     assert_eq!(hex, expected_hex, "Fork event wire format changed");
+}
+
+/// ZEB-649 compat proof: the pre-ZEB-649 pinned Fork bytes (Fixture 1's
+/// hex, minted before `reason` existed) must decode with `reason: None`
+/// and re-encode BYTE-IDENTICALLY. This is exactly the round-trip
+/// `verify_signature` performs (decode → re-encode → verify_strict), so
+/// this test failing means every pre-ZEB-649 Fork event's signature would
+/// break. Do not "fix" this test by re-pinning — fix the serde shape.
+#[test]
+fn fork_event_pre_zeb649_bytes_decode_reason_none_and_reencode_identical() {
+    let pre_zeb649_hex = "a6626964504242424242424242424242424242424262636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626b6ea2627467617862766ca162667350fafafafafafafafafafafafafafafafa62616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa626174a361771b0000018bcfe56800616c0061646b746573742d6465766963656273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let bytes = hex::decode(pre_zeb649_hex).expect("hex");
+
+    let decoded: SignedMembershipEvent =
+        canonical_cbor_decode(&bytes).expect("pre-ZEB-649 Fork event must still decode");
+    match &decoded.kind {
+        MembershipEventKind::Fork {
+            fork_space_id,
+            reason,
+        } => {
+            assert_eq!(*fork_space_id, SpaceId([0xfa; 16]));
+            assert_eq!(*reason, None, "absent rs key must decode to None");
+        }
+        other => panic!("expected Fork, got {other:?}"),
+    }
+
+    let reencoded = canonical_cbor_encode(&decoded).expect("re-encode");
+    assert_eq!(
+        hex::encode(&reencoded),
+        pre_zeb649_hex,
+        "re-encode of a pre-ZEB-649 Fork event must be byte-identical \
+         (signature re-verification depends on it)"
+    );
+}
+
+/// ZEB-649 Fixture 1b: pins the canonical-CBOR bytes of a signed Fork
+/// event WITH a reason (`rs` key present inside `vl`).
+#[test]
+fn fork_event_with_reason_canonical_cbor_pinned() {
+    let signed = fixture_signed_event_zeb285(MembershipEventKind::Fork {
+        fork_space_id: SpaceId([0xfa; 16]),
+        reason: Some("Treasury split".to_string()),
+    });
+
+    let bytes = canonical_cbor_encode(&signed).expect("encode");
+    let hex = hex::encode(&bytes);
+    eprintln!("fork_event_with_reason_canonical_cbor_pinned hex: {hex}");
+
+    let expected_hex = "a6626964504242424242424242424242424242424262636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626b6ea2627467617862766ca262667350fafafafafafafafafafafafafafafafa6272736e54726561737572792073706c697462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa626174a361771b0000018bcfe56800616c0061646b746573742d6465766963656273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    assert_eq!(hex, expected_hex, "Fork-with-reason wire format changed");
 }
 
 /// Fixture 2: pins the canonical-CBOR bytes of a minimal PreForkSnapshot.
