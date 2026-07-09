@@ -804,6 +804,13 @@ pub fn build_registry() -> RpcRegistry {
             crate::read_dm_thread_impl(state, a.space_id, a.limit, a.before_hlc).await
         }
     );
+    // DM nav rehydration (ZEB-666).
+    rpc!(
+        m,
+        "list_owner_dm_spaces",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_owner_dm_spaces_impl(state).await }
+    );
 
     // Relay rung (ZEB-487).
     rpc!(
@@ -1295,6 +1302,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_owner_dm_spaces_dispatches_with_ipc_parity_pre_node() {
+        // ZEB-666: must dispatch through the SAME `*_impl` seam the Tauri
+        // IPC layer uses, observing the shared pre-node error string.
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_owner_dm_spaces",
+                test_state(),
+                test_sink(),
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            RpcError::Command(msg) => assert_eq!(
+                msg,
+                crate::OWNER_NOT_LOADED_MSG,
+                "must share the IPC owner-not-loaded error string"
+            ),
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn connectivity_get_my_identity_pub_hex_returns_null_pre_owner() {
         let reg = build_registry();
         let out = reg
@@ -1549,6 +1580,8 @@ mod tests {
             "add_space",
             "send_dm",
             "read_dm_thread",
+            // DM nav rehydration (ZEB-666)
+            "list_owner_dm_spaces",
             // relay rung (ZEB-487)
             "set_community_relay_opt_in",
             "get_community_relay_status",

@@ -19607,6 +19607,73 @@ pub(crate) async fn list_owner_communities_impl(
     Ok(communities_for_nav(&state))
 }
 
+/// ZEB-666: a persisted DM / group-DM space shaped for the nav sidebar.
+/// `space_id` is the 32-char lowercase hex of the 16-byte SpaceId; `kind`
+/// uses the `nav-updated` vocabulary ("dm" | "group-dm") so the frontend can
+/// feed rows straight into `addOrUpdateNavSpace`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DmNavDto {
+    pub space_id: String,
+    pub kind: String,
+    /// `custom_name` (user rename) wins over the space's original name.
+    pub name: String,
+    /// Hex-encoded member OwnerAddrs (self included — the frontend derives
+    /// the 1:1 peer as "whichever member isn't me", exactly as it does for
+    /// the runtime `nav-updated` emit's `members`).
+    pub members: Vec<String>,
+}
+
+/// ZEB-666: owner-state DM / group-DM spaces shaped for boot rehydration of
+/// the nav sidebar (the ZEB-393 `communities_for_nav` pattern). Filters to
+/// live (non-left) spaces. The frontend has no other way to learn "which DM
+/// threads do I have" — DM nav rows are otherwise push-only (runtime
+/// `nav-updated` / `handleDmCreate`) and vanish on every restart, which
+/// would strand the persisted per-thread read cursors.
+pub fn dm_spaces_for_nav(state: &crate::owner_state_crdt::OwnerState) -> Vec<DmNavDto> {
+    use crate::owner_state_types::SpaceKind;
+    state
+        .spaces
+        .values()
+        .filter(|s| matches!(s.kind, SpaceKind::Dm | SpaceKind::GroupDm) && s.left_at.is_none())
+        .map(|s| DmNavDto {
+            space_id: hex::encode(s.id.0),
+            kind: match s.kind {
+                SpaceKind::GroupDm => "group-dm".to_string(),
+                _ => "dm".to_string(),
+            },
+            name: s.custom_name.clone().unwrap_or_else(|| s.name.clone()),
+            members: s.members.iter().map(|m| hex::encode(m.0)).collect(),
+        })
+        .collect()
+}
+
+/// ZEB-666: enumerate the viewer's live DM / group-DM spaces for boot
+/// rehydration of the nav sidebar. Read-only over the in-memory owner-state
+/// CRDT (populated at `start_node` by `load_crdt`). App.svelte calls this
+/// right after community rehydration (after `navService.connectAdapter`)
+/// and seeds via `addOrUpdateNavSpace`.
+#[tauri::command]
+async fn list_owner_dm_spaces(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<DmNavDto>, String> {
+    list_owner_dm_spaces_impl(state_lock.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_owner_dm_spaces_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Vec<DmNavDto>, String> {
+    let crdt_state = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let state = crdt_state.lock().await;
+    Ok(dm_spaces_for_nav(&state))
+}
+
 #[cfg(test)]
 mod zeb393_communities_for_nav_tests {
     use super::*;
@@ -19688,6 +19755,91 @@ mod zeb393_communities_for_nav_tests {
     #[test]
     fn empty_state_yields_empty() {
         assert!(communities_for_nav(&OwnerState::default()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod zeb666_dm_spaces_for_nav_tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    fn hlc() -> Hlc {
+        Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn dm_space(id: u8, kind: SpaceKind, name: &str, custom: Option<&str>, left: bool) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind,
+            parent: None,
+            community_id: None,
+            name: name.into(),
+            transport: None,
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
+            custom_name: custom.map(Into::into),
+            notification_pref: None,
+            left_at: if left { Some(hlc()) } else { None },
+            created_at: hlc(),
+            updated_at: hlc(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    #[test]
+    fn returns_live_dm_and_group_dm_with_kind_name_members() {
+        let mut st = OwnerState::default();
+        for s in [
+            dm_space(1, SpaceKind::Dm, "DM with abcd", None, false),
+            dm_space(
+                2,
+                SpaceKind::GroupDm,
+                "Group chat",
+                Some("Weekend crew"),
+                false,
+            ),
+            dm_space(3, SpaceKind::Dm, "Left DM", None, true), // left → excluded
+            dm_space(4, SpaceKind::Community, "Not a DM", None, false), // wrong kind → excluded
+        ] {
+            st.spaces.insert(s.id, s);
+        }
+
+        let mut got = dm_spaces_for_nav(&st);
+        got.sort_by(|a, b| a.space_id.cmp(&b.space_id));
+
+        assert_eq!(got.len(), 2, "only the two live DM-kind spaces");
+        assert_eq!(got[0].space_id, hex::encode([1u8; 16]));
+        assert_eq!(got[0].kind, "dm");
+        assert_eq!(
+            got[0].name, "DM with abcd",
+            "no custom_name → original name"
+        );
+        assert_eq!(
+            got[0].members,
+            vec![hex::encode([1u8; 16]), hex::encode([2u8; 16])]
+        );
+        assert_eq!(got[1].kind, "group-dm");
+        assert_eq!(
+            got[1].name, "Weekend crew",
+            "custom_name (user rename) wins"
+        );
+    }
+
+    #[test]
+    fn empty_state_yields_empty() {
+        assert!(dm_spaces_for_nav(&OwnerState::default()).is_empty());
     }
 }
 
@@ -52724,6 +52876,7 @@ pub fn run() {
             pairing_commands::get_pairing_state,
             list_community_members,
             list_owner_communities,
+            list_owner_dm_spaces,
             generate_invite,
             create_community,
             redeem_invite,
