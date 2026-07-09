@@ -301,9 +301,10 @@ describe('CommunitySettingsPanel', () => {
     const lineage: CommunityLineageDto = {
       forkedFrom: parentHex,
       forkedAtWallMs: 1_700_000_000_000,
-      parentLineage: [{ spaceId: parentHex, name: 'Origin Community', forkedAtWallMs: null }],
+      parentLineage: [{ spaceId: parentHex, name: 'Origin Community', forkedAtWallMs: null, reason: null }],
       selfSpaceId: '33'.repeat(16),
       selfName: 'The Fork',
+      forkReason: null,
     };
     const onNav = vi.fn();
     const { container } = render(CommunitySettingsPanel, {
@@ -329,6 +330,7 @@ describe('CommunitySettingsPanel', () => {
     const lineage: CommunityLineageDto = {
       forkedFrom: null, forkedAtWallMs: null, parentLineage: [],
       selfSpaceId: '11'.repeat(16), selfName: 'Root',
+      forkReason: null,
     };
     const { container } = render(CommunitySettingsPanel, {
       props: { ...baseProps, phase2Lineage: lineage },
@@ -341,9 +343,10 @@ describe('CommunitySettingsPanel', () => {
     const lineage: CommunityLineageDto = {
       forkedFrom: parentHex,
       forkedAtWallMs: 1_700_000_000_000,
-      parentLineage: [{ spaceId: parentHex, name: 'Origin Community', forkedAtWallMs: null }],
+      parentLineage: [{ spaceId: parentHex, name: 'Origin Community', forkedAtWallMs: null, reason: null }],
       selfSpaceId: '33'.repeat(16),
       selfName: 'The Fork',
+      forkReason: null,
     };
     const { container } = render(CommunitySettingsPanel, {
       props: { ...baseProps, phase2Lineage: lineage, localNavIds: new Set() },
@@ -359,9 +362,10 @@ describe('CommunitySettingsPanel', () => {
     const lineage: CommunityLineageDto = {
       forkedFrom: parentHex,
       forkedAtWallMs: 1_700_000_000_000,
-      parentLineage: [{ spaceId: parentHex, name: '', forkedAtWallMs: null }],
+      parentLineage: [{ spaceId: parentHex, name: '', forkedAtWallMs: null, reason: null }],
       selfSpaceId: '33'.repeat(16),
       selfName: 'The Fork',
+      forkReason: null,
     };
     const { container } = render(CommunitySettingsPanel, {
       props: { ...baseProps, phase2Lineage: lineage, localNavIds: new Set() },
@@ -453,6 +457,7 @@ describe('CommunitySettingsPanel', () => {
       parentLineage: [],
       selfSpaceId: selfHex,
       selfName: 'Root',
+      forkReason: null,
     };
     const descendants: ForkDescendantDto[] = [
       {
@@ -461,6 +466,7 @@ describe('CommunitySettingsPanel', () => {
         forkerDisplayName: 'Maya',
         forkedAtWallMs: 1_715_000_000_000,
         locallyKnown: true,
+        reason: null,
       },
     ];
     const resolver = vi.fn((hex: string) =>

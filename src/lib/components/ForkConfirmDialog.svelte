@@ -11,13 +11,21 @@
   }: {
     originalName: string;
     messageCount: number;
-    onConfirm: (opts: { name: string; silent: boolean; alsoLeave: boolean }) => void;
+    onConfirm: (opts: {
+      name: string;
+      silent: boolean;
+      alsoLeave: boolean;
+      reason: string;
+    }) => void;
     onCancel: () => void;
   } = $props();
 
   // Intentionally snapshot the initial prop value — the user may freely edit
   // the fork name, so reactive re-derivation on prop change is undesirable.
   let name = $state(untrack(() => originalName) + ' (fork)');
+  // ZEB-649: mandatory — the permanent "why" recorded on the Fork event
+  // and both communities' lineage.
+  let reason = $state('');
   let silent = $state(false);
   let alsoLeave = $state(false);
   let typedConfirmOpen = $state(false);
@@ -25,18 +33,20 @@
   const titleId = `fork-confirm-title-${Math.random().toString(36).slice(2)}`;
 
   let nameValid = $derived(name.trim().length > 0);
+  let reasonValid = $derived(reason.trim().length > 0);
+  let formValid = $derived(nameValid && reasonValid);
 
   function handleCreateFork() {
-    if (!nameValid) return;
+    if (!formValid) return;
     if (alsoLeave) {
       typedConfirmOpen = true;
     } else {
-      onConfirm({ name: name.trim(), silent, alsoLeave: false });
+      onConfirm({ name: name.trim(), silent, alsoLeave: false, reason: reason.trim() });
     }
   }
 
   function handleTypedConfirm() {
-    onConfirm({ name: name.trim(), silent, alsoLeave: true });
+    onConfirm({ name: name.trim(), silent, alsoLeave: true, reason: reason.trim() });
     typedConfirmOpen = false;
   }
 
@@ -76,6 +86,22 @@
       />
     </div>
 
+    <div class="reason-field">
+      <label for="fork-reason">Why is this fork happening?</label>
+      <textarea
+        id="fork-reason"
+        bind:value={reason}
+        class="reason-input"
+        rows="3"
+        maxlength="280"
+        placeholder="e.g. Treasury split — a faction wanted a larger reserve floor after P-14."
+      ></textarea>
+      <p class="reason-help">
+        Shown in both communities' lineage. Be specific — this is the
+        permanent record of the split.
+      </p>
+    </div>
+
     <div class="checkbox-field">
       <label>
         <input type="checkbox" bind:checked={silent} />
@@ -105,7 +131,7 @@
     </p>
 
     <div class="action-row">
-      <button class="confirm-btn" disabled={!nameValid} onclick={handleCreateFork}>
+      <button class="confirm-btn" disabled={!formValid} onclick={handleCreateFork}>
         Create fork
       </button>
       <div class="spacer"></div>
@@ -171,6 +197,36 @@
     outline: 2px solid transparent;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .reason-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .reason-field label {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+  }
+  .reason-input {
+    padding: 6px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 0.875rem;
+    resize: vertical;
+  }
+  .reason-input:focus {
+    outline: 2px solid transparent;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .reason-help {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    margin: 0;
   }
   .checkbox-field {
     margin-bottom: 10px;

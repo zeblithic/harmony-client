@@ -70,7 +70,7 @@
     onOpenMembersPanel?: () => void;
     /** ZEB-285: if provided, the "Fork this community" button is wired to this
      *  callback which handles the actual IPC call + nav transition. */
-    onFork?: (opts: { name: string; silent: boolean; alsoLeave: boolean }) => Promise<void>;
+    onFork?: (opts: { name: string; silent: boolean; alsoLeave: boolean; reason: string }) => Promise<void>;
     /** ZEB-285: fork lineage metadata — present when this community was forked
      *  from another. Populated by the caller via get_fork_snapshot_metadata IPC. */
     lineage?: {

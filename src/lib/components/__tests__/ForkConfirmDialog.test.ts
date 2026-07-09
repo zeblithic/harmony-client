@@ -48,21 +48,29 @@ describe('ForkConfirmDialog', () => {
     expect(cb.checked).toBe(true);
   });
 
-  it('calls onConfirm with {name, silent, alsoLeave} when also_leave is false', async () => {
+  it('calls onConfirm with {name, silent, alsoLeave, reason} when also_leave is false', async () => {
     const onConfirm = vi.fn();
     render(ForkConfirmDialog, { props: { ...baseProps, onConfirm } });
+    // ZEB-649: reason is mandatory — fill it (with padding to pin the trim).
+    await fireEvent.input(screen.getByLabelText(/why is this fork happening/i), {
+      target: { value: '  Treasury split  ' },
+    });
     const btn = screen.getByRole('button', { name: /create fork/i });
     await fireEvent.click(btn);
     expect(onConfirm).toHaveBeenCalledWith({
       name: 'Cool Community (fork)',
       silent: false,
       alsoLeave: false,
+      reason: 'Treasury split',
     });
   });
 
   it('opens typed-confirm second stage when also_leave is checked, requires "leave"', async () => {
     const onConfirm = vi.fn();
     render(ForkConfirmDialog, { props: { ...baseProps, onConfirm } });
+    await fireEvent.input(screen.getByLabelText(/why is this fork happening/i), {
+      target: { value: 'Treasury split' },
+    });
     await fireEvent.click(screen.getByLabelText(/also leave/i));
     await fireEvent.click(screen.getByRole('button', { name: /create fork/i }));
 
@@ -90,6 +98,7 @@ describe('ForkConfirmDialog', () => {
       name: 'Cool Community (fork)',
       silent: false,
       alsoLeave: true,
+      reason: 'Treasury split',
     });
   });
 
@@ -116,8 +125,12 @@ describe('ForkConfirmDialog', () => {
 
   it('disables Create fork button when name is empty or whitespace-only', async () => {
     render(ForkConfirmDialog, { props: { ...baseProps } });
-    const input = screen.getByLabelText(/name/i) as HTMLInputElement;
+    const input = screen.getByLabelText(/^name/i) as HTMLInputElement;
     const btn = screen.getByRole('button', { name: /create fork/i }) as HTMLButtonElement;
+    // Satisfy the reason gate so this test isolates the NAME gate.
+    await fireEvent.input(screen.getByLabelText(/why is this fork happening/i), {
+      target: { value: 'Treasury split' },
+    });
 
     await fireEvent.input(input, { target: { value: '' } });
     expect(btn.disabled).toBe(true);
@@ -127,6 +140,26 @@ describe('ForkConfirmDialog', () => {
 
     await fireEvent.input(input, { target: { value: 'My fork' } });
     expect(btn.disabled).toBe(false);
+  });
+
+  it('ZEB-649: reason is mandatory — button gated until non-whitespace reason; maxlength 280', async () => {
+    render(ForkConfirmDialog, { props: { ...baseProps } });
+    const reason = screen.getByLabelText(/why is this fork happening/i) as HTMLTextAreaElement;
+    const btn = screen.getByRole('button', { name: /create fork/i }) as HTMLButtonElement;
+
+    // Name is prefilled valid; reason starts empty → gated.
+    expect(btn.disabled).toBe(true);
+
+    await fireEvent.input(reason, { target: { value: '   ' } });
+    expect(btn.disabled).toBe(true);
+
+    await fireEvent.input(reason, { target: { value: 'Treasury split' } });
+    expect(btn.disabled).toBe(false);
+
+    // UI cap mirrors the wire cap (280; UTF-16 vs codepoint skew accepted
+    // per the moderation-reason precedent).
+    expect(reason.getAttribute('maxlength')).toBe('280');
+    expect(screen.getByText(/permanent record of the split/i)).toBeTruthy();
   });
 
   it('shows the always-included snapshot note and the sage consent callout', () => {

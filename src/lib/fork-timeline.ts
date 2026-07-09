@@ -21,6 +21,9 @@ export interface ForkDivider {
   kind: 'fork-divider';
   originalCommunityName: string;
   forkedAtMs: number;
+  /** ZEB-649: the forker's stated why, quoted on the divider band.
+   *  Null for forks created before the reason field existed. */
+  forkReason: string | null;
 }
 
 /** A single row in the rendered timeline — either a message or a divider. */
@@ -40,6 +43,7 @@ export function buildUnifiedTimeline(
   liveMessages: ChannelMessageDto[],
   originalCommunityName: string,
   forkedAtMs: number,
+  forkReason: string | null = null,
 ): TimelineRow[] {
   const pre: TimelineMessage[] = snapshotMessages.map((msg) => ({ msg, isPreFork: true }));
   const live: TimelineMessage[] = liveMessages.map((msg) => ({ msg, isPreFork: false }));
@@ -96,6 +100,7 @@ export function buildUnifiedTimeline(
     kind: 'fork-divider',
     originalCommunityName,
     forkedAtMs,
+    forkReason,
   };
 
   return [

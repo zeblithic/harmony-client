@@ -32828,6 +32828,9 @@ async fn get_fork_snapshot_metadata(
 pub struct PreForkSnapshotDto {
     pub original_community_name: String,
     pub forked_at_ms: u64,
+    /// ZEB-649: the forker's stated why — divider quote. None for
+    /// pre-ZEB-649 snapshots.
+    pub fork_reason: Option<String>,
     /// Per-channel snapshot messages. Key = channel-id hex (32 chars),
     /// value = messages sorted HLC ascending.
     pub channel_log: std::collections::BTreeMap<
@@ -32965,6 +32968,13 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
     Ok(Some(PreForkSnapshotDto {
         original_community_name: snapshot.original_community_name,
         forked_at_ms: snapshot.forked_at.wall_ms,
+        // Bound like the redeem mirror: the snapshot file bypasses
+        // verify_event, so truncate rather than trust verbatim.
+        fork_reason: snapshot.fork_reason.as_ref().map(|r| {
+            r.chars()
+                .take(crate::community_membership::MAX_MODERATION_REASON_CHARS)
+                .collect()
+        }),
         channel_log,
     }))
 }

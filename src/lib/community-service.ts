@@ -104,6 +104,8 @@ export interface ChannelInfo {
 export interface PreForkSnapshotDto {
   originalCommunityName: string;
   forkedAtMs: number;
+  /** ZEB-649: the forker's stated why; null for pre-ZEB-649 snapshots. */
+  forkReason: string | null;
   channelLog: Record<string, ChannelMessageDto[]>;
 }
 
@@ -316,7 +318,9 @@ export class CommunityService {
 
   async forkCommunity(
     communityId: string,
-    opts: { name: string; silent?: boolean; alsoLeave?: boolean },
+    // ZEB-649: reason is mandatory — the backend rejects empty/oversize
+    // before any state change.
+    opts: { name: string; reason: string; silent?: boolean; alsoLeave?: boolean },
   ): Promise<{ forkSpaceId: string; visible: boolean; snapshotMessageCount: number }> {
     try {
       return await this.invoke<{
@@ -534,11 +538,13 @@ export class CommunityService {
     originalCommunityName: string;
     forkedAtMs: number;
     snapshotMessageCount: number;
+    forkReason: string | null;
   } | null> {
     const dto = await this.invoke<{
       originalCommunityName: string;
       forkedAtMs: number;
       snapshotMessageCount: number;
+      forkReason: string | null;
     } | null>('get_fork_snapshot_metadata', { communityId });
     return dto ?? null;
   }

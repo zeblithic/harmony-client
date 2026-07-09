@@ -356,6 +356,9 @@ export interface ParentLineageDto {
   name: string;
   /** wall_ms of this ancestor's fork-from-parent event; null for the root. */
   forkedAtWallMs: number | null;
+  /** ZEB-649: why this ancestor forked from its predecessor; null for the
+   *  root, pre-ZEB-649 hops, and Phase-1 synthesized entries. */
+  reason: string | null;
 }
 
 export interface CommunityLineageDto {
@@ -369,6 +372,9 @@ export interface CommunityLineageDto {
   selfSpaceId: string;
   /** This community's own display name. */
   selfName: string;
+  /** ZEB-649: THIS community's own fork reason; null for top-level and
+   *  pre-ZEB-649 forks. */
+  forkReason: string | null;
 }
 
 export interface ForkDescendantDto {
@@ -382,6 +388,8 @@ export interface ForkDescendantDto {
   forkedAtWallMs: number;
   /** Whether the descendant community is in local NavService/OwnerState. */
   locallyKnown: boolean;
+  /** ZEB-649: the forker's stated why; null for pre-ZEB-649 Fork events. */
+  reason: string | null;
 }
 
 // Mirrors backend POWER_THRESHOLDS in src-tauri/src/community_membership.rs:1108.
