@@ -37,9 +37,9 @@ A new dep-injected, focus-aware `MentionAlertService` subscribes to incoming cha
 
 ### Data flow
 
-`ChannelMessageService` already receives `channel-message-received` (payload `ChannelMessageReceivedPayload { communityId, channelId, message }`) and fans it into `ingest(...)`. We add a `onChannelMessage(communityId, channelId, message)` callback hook on that service (mirroring its existing `onBackfillProgress`) — a **single** event source, no parallel `adapter.listen`. `MentionAlertService.onMessage(communityId, channelId, message)` runs:
+`ChannelMessageService.ingest` already invokes a **global `onMessage(communityId, channelId, message)` callback** (`channel-message-service.ts:451`, try/caught), currently assigned in `App.svelte:1736` (the roster-refetch path, which ignores `channelId`). We **extend that existing handler** to also drive the alert service — no `ChannelMessageService` change, single event source. `MentionAlertService.onMessage(communityId, channelId, message)` runs:
 
-1. If `!bodyMentionsOwner(message.body, myOwnerId)` → return (not a self-mention).
+1. If `!messageMentionsOwner(message, selfOwnerId)` (i.e. `selfOwnerId ∉ message.mentions`) → return. Detection reuses the DTO **`mentions` field** (ZEB-534: owner-ids the message addresses, populated by the Rust IPC boundary) — the same signal the existing row-highlight uses (`ChannelMessageFeed.svelte:919`). No body parsing (`body` is `number[]`).
 2. If `channelId === getActiveChannel() && isFocused()` → treat as seen; return (the viewer is looking at it).
 3. `action = resolve('loud', message.author, communityId)`. If `action === 'silent'` → return.
 4. Always (i.e. `dot_only` and above): `nav.incMention(channelId)` (increments the channel node and bubbles a count to its community node).
@@ -53,19 +53,18 @@ There is intentionally no separate step for `sound`/`break_dnd`: with no in-app 
 
 | File | Change |
 |---|---|
-| `src/lib/mention-detect.ts` | **New.** `bodyMentionsOwner(body: string, myOwnerIdHex: string): boolean` — reuses the `<@hex>` tokenizer (extract a shared matcher from `mention-render.ts` to avoid a second regex). Pure, no deps. |
-| `src/lib/mention-alert.ts` | **New.** `MentionAlertService` — the classify → gate → deliver logic above, all capabilities injected. Pure logic + injected effects. |
+| `src/lib/mention-detect.ts` | **New.** `messageMentionsOwner(message: { mentions?: string[] }, selfOwnerIdHex: string): boolean` — `message.mentions?.includes(selfOwnerIdHex) ?? false`. Pure, no deps. |
+| `src/lib/mention-alert.ts` | **New.** `MentionAlertService` (classify → gate → deliver, all capabilities injected) + `createDefaultMentionAlerter()` factory building the Tauri `isFocused`/`sendNotification` deps behind an `isTauri()` guard (mirrors `createDefaultIncomingCallAlerter`). |
 | `src/lib/notification-service.ts` | Add `serialize(): string` and `load(raw: string): void` (round-trips `global` + the four `Map`s); call a save hook from every setter. |
 | `src/lib/notification-settings-persistence.ts` | **New (small).** Owner-scoped localStorage load/save: key `harmony:notif-settings:<ownerIdHex>`; load-on-boot, save-on-change. Mirrors the ZEB-586 owner-scoping. |
 | `src/lib/types.ts` | `NavNode.mentionCount: number` (distinct from `unreadCount`). |
 | `src/lib/nav-service.ts` | Initialize `mentionCount: 0`; preserve across rebuilds (like `unreadCount` at lines 214/238/307/327); add `incMention(channelId)` (bubbles to community) + `clearMention(channelId)`. |
-| `src/lib/channel-message-service.ts` | Add an `onChannelMessage?(communityId, channelId, message)` callback (mirroring `onBackfillProgress`), invoked from the existing `channel-message-received` handler after `ingest`. Single event source for the alert service. |
 | `src/lib/components/NavPanel.svelte` (+ channel/community row markup) | Render a mention badge/dot when `mentionCount > 0` (Commons idiom: `CountChip` where a count fits, dot where space is tight). |
-| `src/App.svelte` | Instantiate `MentionAlertService` wired to `channelMessageService.onChannelMessage`, `activeChannel`, the focus deps (same source `incoming-call-alert` uses), `notificationService`, and the nav mention mutators; load notification settings on boot; call `clearMention` in `handleNodeSelect`. |
+| `src/App.svelte` | **Extend the existing `channelMessageService.onMessage` handler (`:1736`)** to also call `mentionAlerter.onMessage(communityId, channelId, message)` (un-underscore `channelId`); instantiate `MentionAlertService` with an `activeChannel` getter, focus deps (`createDefaultMentionAlerter`), `notificationService`, `selfOwnerId`, toast push, and the nav mutators; load notification settings on boot; call `clearMention` in `handleNodeSelect`. No `ChannelMessageService` change (the `onMessage` hook already exists). |
 
 ### Error handling
 
-- **Missing owner identity** (pre-login / race): `bodyMentionsOwner` returns `false` for an empty/absent `myOwnerId` → no misfires.
+- **Missing owner identity** (pre-login / race): `messageMentionsOwner` returns `false` for an empty/absent `selfOwnerId` (not in `mentions`) → no misfires.
 - **OS-notification unavailable / permission denied**: `sendNotification` is wrapped in try/catch (as in `incoming-call-alert.ts:116`); a failure degrades to the nav dot + (if focused) toast, never throws into the message pipeline.
 - **Corrupt persisted settings**: `load(raw)` is defensive — a parse/shape failure logs and falls back to `DEFAULT_POLICY`, never wedging boot.
 - **Focus query failure**: mirror `isFocusedSafe()` — default to treating the window as focused (safe: prefer an in-app toast over an OS push on uncertainty).
@@ -74,7 +73,7 @@ There is intentionally no separate step for `sound`/`break_dnd`: with no in-app 
 
 Vitest units (frontend-only slice; Rust untouched):
 
-- `mention-detect.test.ts` — mentions me / mentions someone else / no tokens / empty body / empty ownerId / multiple tokens incl. me.
+- `mention-detect.test.ts` — `mentions` includes me / includes someone else / absent (undefined) / empty array / empty selfOwnerId / multiple incl. me.
 - `mention-alert.test.ts` — the full matrix: not-a-mention → no-op; active+focused channel → suppressed; each resolved action (`silent` → nothing; `dot_only` → nav inc only; `notify`/`sound`/`break_dnd` → nav inc + (toast when focused / OS-notif when unfocused)) → asserts exactly which of {nav inc, toast, OS-notif} fire; per-peer/community override beats global; OS-notif throw is swallowed.
 - `notification-service` persistence — `serialize()`/`load()` round-trip incl. all four Maps; corrupt input → defaults.
 - `notification-settings-persistence.test.ts` — owner-scoped key; load-on-boot; save-on-setter; owner switch does not leak the other owner's settings.
