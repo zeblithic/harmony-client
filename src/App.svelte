@@ -2151,6 +2151,44 @@
         console.warn('[harmony-client] community rehydration failed:', msg);
       }
 
+      // ── ZEB-665: per-channel unread counts. Constructed BEFORE
+      // channelNavSync.start() so the very first setChannels materialization
+      // seeds deterministically (Qodo PR #430: the optional-chained hook is a
+      // silent no-op while channelUnread is null, and nothing replays it).
+      // Seeds via list_channel_messages directly (NOT
+      // channelMessageService.listMessages — that would ingest into the feed
+      // cache and re-fire onMessage). Self-gates on cursor, author, and
+      // focused-active; NavService renders the badges.
+      try {
+        const { ChannelUnreadService } = await import('./lib/channel-unread-service');
+        const { LocalStorageUnreadCursorStore } = await import('./lib/unread-cursor-store');
+        channelUnread = new ChannelUnreadService({
+          listMessagesSince: (communityId, channelId, since, limit) =>
+            invoke('list_channel_messages', { communityId, channelId, since, limit }) as Promise<
+              import('./lib/channel-message-service').ChannelMessageDto[]
+            >,
+          setUnread: (channelId, count) => navService.setUnread(channelId, count),
+          // Same "looking right at it" contract as the mention alerter below.
+          isActiveChannel: (communityId, channelId) =>
+            appMode === 'messages' &&
+            selectedCommunityId === communityId &&
+            communityActiveView === 'channels' &&
+            communityService.getSelectedChannel(communityId) === channelId,
+          isFocused: () => document.hasFocus(),
+          selfOwnerId: () => selfOwnerId ?? null,
+          storage: new LocalStorageUnreadCursorStore(),
+          now: () => Date.now(),
+        });
+        // Owner may already be known (the $effect only re-fires on change).
+        if (selfOwnerId) channelUnread.connectOwner(selfOwnerId);
+        fileManagerService.addUnlisten(() => { channelUnread = null; });
+      } catch (e) {
+        console.warn(
+          '[harmony-client] channel-unread init failed:',
+          e instanceof Error ? e.message : String(e),
+        );
+      }
+
       // ZEB-663: now that nav communities are hydrated, populate their
       // channels as nav nodes. Fire-and-forget; per-community failures are
       // isolated inside ChannelNavSync and never block boot.
@@ -2377,40 +2415,6 @@
         fileManagerService.addUnlisten(() => { mentionAlerter = null; });
       } catch (e) {
         console.warn('[harmony-client] mention alerter init failed:', e);
-      }
-
-      // ── ZEB-665: per-channel unread counts. Seeds via list_channel_messages
-      // directly (NOT channelMessageService.listMessages — that would ingest
-      // into the feed cache and re-fire onMessage). Self-gates on cursor,
-      // author, and focused-active; NavService renders the badges.
-      try {
-        const { ChannelUnreadService } = await import('./lib/channel-unread-service');
-        const { LocalStorageUnreadCursorStore } = await import('./lib/unread-cursor-store');
-        channelUnread = new ChannelUnreadService({
-          listMessagesSince: (communityId, channelId, since, limit) =>
-            invoke('list_channel_messages', { communityId, channelId, since, limit }) as Promise<
-              import('./lib/channel-message-service').ChannelMessageDto[]
-            >,
-          setUnread: (channelId, count) => navService.setUnread(channelId, count),
-          // Same "looking right at it" contract as the mention alerter above.
-          isActiveChannel: (communityId, channelId) =>
-            appMode === 'messages' &&
-            selectedCommunityId === communityId &&
-            communityActiveView === 'channels' &&
-            communityService.getSelectedChannel(communityId) === channelId,
-          isFocused: () => document.hasFocus(),
-          selfOwnerId: () => selfOwnerId ?? null,
-          storage: new LocalStorageUnreadCursorStore(),
-          now: () => Date.now(),
-        });
-        // Owner may already be known (the $effect only re-fires on change).
-        if (selfOwnerId) channelUnread.connectOwner(selfOwnerId);
-        fileManagerService.addUnlisten(() => { channelUnread = null; });
-      } catch (e) {
-        console.warn(
-          '[harmony-client] channel-unread init failed:',
-          e instanceof Error ? e.message : String(e),
-        );
       }
 
       // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
@@ -3491,6 +3495,9 @@
               members: [],
               parentId: null,
             });
+            // ZEB-665: drop unread session state so a same-session rejoin
+            // re-seeds instead of reusing stale seeded marks/counts.
+            channelUnread?.onCommunityRemoved(leavingId);
             // ZEB-334 (Cursor PR #180): after leaving, fall back to the private
             // Notes default rather than the legacy #general void — clearing the
             // community alone would drop through to TextFeed on 'general'.

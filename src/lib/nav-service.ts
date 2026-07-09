@@ -548,10 +548,20 @@ export class NavService {
     const next = Math.max(0, count);
     const nextLevel: NavNode['unreadLevel'] = next > 0 ? 'standard' : 'none';
     if (node.unreadCount === next && node.unreadLevel === nextLevel) return;
+    const delta = next - node.unreadCount;
     node.unreadCount = next;
     node.unreadLevel = nextLevel;
+    // Incremental community rollup (the applyMentionDelta idiom) — setUnread
+    // sits on the per-message hot path, so no full-node scan here. setChannels
+    // still full-recomputes via rollUpCommunityUnread when structure changes.
     const cid = this.communityIdOf(node);
-    if (cid) this.rollUpCommunityUnread(cid);
+    if (cid) {
+      const comm = this.nodes.find((n) => n.id === cid);
+      if (comm) {
+        comm.unreadCount = Math.max(0, comm.unreadCount + delta);
+        comm.unreadLevel = comm.unreadCount > 0 ? 'quiet' : 'none';
+      }
+    }
     this.onChange?.();
   }
 

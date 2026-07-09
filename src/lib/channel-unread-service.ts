@@ -103,12 +103,15 @@ export class ChannelUnreadService {
     // channel; counting here would violate the start-clean decision.
     if (cursor === null) return;
     if (this.deps.isFocused() && this.deps.isActiveChannel(communityId, channelId)) {
-      // Looking right at it → the message is read the moment it lands.
+      // Looking right at it → THIS message is read the moment it lands. Do NOT
+      // wipe the whole set: an unfocused-but-open backlog stays badged until
+      // markChannelRead (spec §6; Qodo PR #430). Remove only this message's ID
+      // (it can be present via re-emission of a previously-counted message).
       if (hlcNewer(message.at, cursor)) {
         this.deps.storage.set(communityId, channelId, message.at);
       }
-      this.sets.get(this.key(communityId, channelId))?.clear();
-      this.push(communityId, channelId);
+      const set = this.sets.get(this.key(communityId, channelId));
+      if (set?.delete(message.messageId)) this.push(communityId, channelId);
       return;
     }
     if (!hlcNewer(message.at, cursor)) return; // history replay / backfill of read messages

@@ -10,7 +10,7 @@
 
 **Spec:** `docs/specs/2026-07-09-zeb-665-per-channel-unread-design.md` (approved 2026-07-09). Two deviations discovered during planning, both narrowing:
 1. The spec's "three existing clearMention call sites" is TWO for community channels — `App.svelte:1147` (selection-resolution effect) and `App.svelte:1229` (`openCommunityChannel`). The third (`App.svelte:2977`) is the DM/legacy-node path, out of scope per §2.
-2. `onCommunityRemoved` ships on the service (unit-tested) but has no App wiring: no community-removal hook exists in App today; stale session sets are bounded memory and badges vanish with the nav nodes. Noted for the cross-device follow-up.
+2. `onCommunityRemoved` ships on the service (unit-tested); wired at App's `onLeave` handler beside the local nav-space removal mirror (found during PR #430 converge — CodeRabbit correctly noted a same-session rejoin would otherwise skip re-seeding).
 
 ## Global Constraints
 

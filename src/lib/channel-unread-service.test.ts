@@ -125,6 +125,40 @@ describe('ChannelUnreadService (ZEB-665)', () => {
     expect(lastCount(pushes, 'ch1')).toBe(1);
   });
 
+  it('a focused arrival does NOT wipe the unfocused backlog (spec §6)', async () => {
+    let focused = false;
+    const { svc, store, pushes } = harness({
+      isActiveChannel: () => true,
+      isFocused: () => focused,
+    });
+    store.set('c1', 'ch1', hlc(100));
+    await svc.onChannelsMaterialized('c1', [ch('ch1')]);
+    svc.onMessage('c1', 'ch1', msg('m1', hlc(200))); // unfocused → counts
+    expect(lastCount(pushes, 'ch1')).toBe(1);
+    focused = true;
+    svc.onMessage('c1', 'ch1', msg('m2', hlc(300))); // focused → read on landing
+    expect(lastCount(pushes, 'ch1')).toBe(1); // backlog badge survives
+    expect(store.get('c1', 'ch1')).toEqual(hlc(300)); // cursor still advances
+    svc.markChannelRead('c1', 'ch1'); // only an explicit open clears
+    expect(lastCount(pushes, 'ch1')).toBe(0);
+  });
+
+  it('a focused re-emission of a previously-counted message uncounts just that one', async () => {
+    let focused = false;
+    const { svc, store, pushes } = harness({
+      isActiveChannel: () => true,
+      isFocused: () => focused,
+    });
+    store.set('c1', 'ch1', hlc(100));
+    await svc.onChannelsMaterialized('c1', [ch('ch1')]);
+    svc.onMessage('c1', 'ch1', msg('m1', hlc(200)));
+    svc.onMessage('c1', 'ch1', msg('m2', hlc(250)));
+    expect(lastCount(pushes, 'ch1')).toBe(2);
+    focused = true;
+    svc.onMessage('c1', 'ch1', msg('m1', hlc(200))); // re-emitted while viewing
+    expect(lastCount(pushes, 'ch1')).toBe(1); // m1 uncounted, m2 remains
+  });
+
   it('markChannelRead wipes the set, pushes 0, and stamps past maxSeen', async () => {
     const { svc, store, pushes } = harness();
     store.set('c1', 'ch1', hlc(100));

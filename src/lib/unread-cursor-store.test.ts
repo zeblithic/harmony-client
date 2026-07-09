@@ -46,4 +46,37 @@ describe('LocalStorageUnreadCursorStore (ZEB-665)', () => {
     s.set('c1', 'ch1', HLC); // and recovers on next write
     expect(s.get('c1', 'ch1')).toEqual(HLC);
   });
+
+  it('drops mis-shaped entries (valid JSON, wrong cursor shape) but keeps valid ones', () => {
+    localStorage.setItem(
+      'harmony-unread:owner-owner-a',
+      JSON.stringify({
+        'c1:bad-string': 'not-an-hlc',
+        'c1:bad-partial': { wallMs: 5 }, // missing logical/deviceId
+        'c1:bad-types': { wallMs: '5', logical: 0, deviceId: 'd' }, // wallMs not a number
+        'c1:good': HLC,
+      }),
+    );
+    const s = new LocalStorageUnreadCursorStore();
+    s.connectOwner('owner-a');
+    expect(s.get('c1', 'bad-string')).toBeNull();
+    expect(s.get('c1', 'bad-partial')).toBeNull();
+    expect(s.get('c1', 'bad-types')).toBeNull();
+    expect(s.get('c1', 'good')).toEqual(HLC);
+  });
+
+  it('does not throw when localStorage.setItem fails (e.g. quota exceeded)', () => {
+    const s = new LocalStorageUnreadCursorStore();
+    s.connectOwner('owner-a');
+    const original = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = () => {
+      throw new Error('quota exceeded');
+    };
+    try {
+      expect(() => s.set('c1', 'ch1', HLC)).not.toThrow();
+      expect(s.get('c1', 'ch1')).toEqual(HLC); // in-memory map still updated
+    } finally {
+      localStorage.setItem = original;
+    }
+  });
 });
