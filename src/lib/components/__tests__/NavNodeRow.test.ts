@@ -275,3 +275,190 @@ describe('NavNodeRow — channel context menu (ZEB-663)', () => {
     expect(container.querySelector('.channel-context-menu')).toBeNull();
   });
 });
+
+describe('NavNodeRow — keyboard-accessible ⋯ trigger (ZEB-664)', () => {
+  const channel = () =>
+    makeNode({ id: 'ch1', parentId: 'c1', type: 'channel', name: 'general' });
+
+  function renderRow(over: Record<string, unknown> = {}) {
+    return render(NavNodeRow, {
+      props: {
+        node: channel(),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+        canManageChannel: () => true,
+        onRenameChannel: vi.fn(),
+        onDeleteChannel: vi.fn(),
+        ...over,
+      },
+    });
+  }
+
+  it('renders the trigger only when the viewer can manage the channel', () => {
+    const { getByTestId } = renderRow();
+    expect(getByTestId('channel-menu-trigger-ch1')).toBeTruthy();
+  });
+
+  it('hides the trigger when the viewer cannot manage', () => {
+    const { queryByTestId } = renderRow({ canManageChannel: () => false });
+    expect(queryByTestId('channel-menu-trigger-ch1')).toBeNull();
+  });
+
+  it('hides the trigger when no canManageChannel resolver is provided', () => {
+    const { queryByTestId } = render(NavNodeRow, {
+      props: {
+        node: channel(),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    expect(queryByTestId('channel-menu-trigger-ch1')).toBeNull();
+  });
+
+  it('announces popup state: aria-haspopup="menu" + aria-expanded tracks the menu', async () => {
+    const { container, getByTestId } = renderRow();
+    const trigger = getByTestId('channel-menu-trigger-ch1');
+    expect(trigger.getAttribute('aria-haspopup')).toBe('menu');
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    await fireEvent.click(trigger);
+    expect(container.querySelector('.channel-context-menu')).toBeTruthy();
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('clicking the trigger toggles the menu (second click closes, not reopens)', async () => {
+    const { container, getByTestId } = renderRow();
+    const trigger = getByTestId('channel-menu-trigger-ch1');
+    await fireEvent.click(trigger);
+    expect(container.querySelector('.channel-context-menu')).toBeTruthy();
+    // The document-level dismiss listener runs capture-phase; the trigger is
+    // whitelisted there so this click reaches the toggle handler and closes.
+    await fireEvent.click(trigger);
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+  });
+
+  it('clicking the trigger does not select the channel row', async () => {
+    const onClick = vi.fn();
+    const { getByTestId } = renderRow({ onClick });
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it('Enter/Space keydown on the trigger does not bubble into row selection', async () => {
+    const onClick = vi.fn();
+    const { getByTestId } = renderRow({ onClick });
+    const trigger = getByTestId('channel-menu-trigger-ch1');
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+    await fireEvent.keyDown(trigger, { key: ' ' });
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it('moves focus to the first menu item when the menu opens', async () => {
+    const { getByTestId, getByRole } = renderRow();
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    expect(document.activeElement).toBe(getByRole('menuitem', { name: /Rename/i }));
+  });
+
+  it('Escape closes the menu and returns focus to the trigger', async () => {
+    const { container, getByTestId } = renderRow();
+    const trigger = getByTestId('channel-menu-trigger-ch1');
+    await fireEvent.click(trigger);
+    const menu = container.querySelector('.channel-context-menu') as HTMLElement;
+    await fireEvent.keyDown(menu, { key: 'Escape' });
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('ArrowDown/ArrowUp cycle focus through the menu items', async () => {
+    const { container, getByTestId, getByRole } = renderRow();
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    const menu = container.querySelector('.channel-context-menu') as HTMLElement;
+    const rename = getByRole('menuitem', { name: /Rename/i });
+    const del = getByRole('menuitem', { name: /Delete/i });
+    expect(document.activeElement).toBe(rename);
+    await fireEvent.keyDown(menu, { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(del);
+    await fireEvent.keyDown(menu, { key: 'ArrowDown' }); // wraps
+    expect(document.activeElement).toBe(rename);
+    await fireEvent.keyDown(menu, { key: 'ArrowUp' }); // wraps back
+    expect(document.activeElement).toBe(del);
+  });
+
+  it('Rename via the trigger path dispatches onRenameChannel with (communityId, channelId)', async () => {
+    const onRenameChannel = vi.fn();
+    const { getByTestId, getByRole } = renderRow({ onRenameChannel });
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    await fireEvent.click(getByRole('menuitem', { name: /Rename/i }));
+    expect(onRenameChannel).toHaveBeenCalledWith('c1', 'ch1');
+  });
+
+  it('demotion removes the trigger and closes an open menu (§6.8)', async () => {
+    const { container, getByTestId, queryByTestId, rerender } = renderRow();
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    expect(container.querySelector('.channel-context-menu')).toBeTruthy();
+    await rerender({
+      node: channel(),
+      colorAncestry: [],
+      displayMode: 'text',
+      isLastChild: false,
+      canManageChannel: () => false,
+      onRenameChannel: vi.fn(),
+      onDeleteChannel: vi.fn(),
+    });
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+    expect(queryByTestId('channel-menu-trigger-ch1')).toBeNull();
+  });
+
+  it('right-click open + Escape still returns focus to the trigger (shared menu)', async () => {
+    const { container, getByTestId } = renderRow();
+    await fireEvent.contextMenu(container.querySelector('.nav-row') as HTMLElement);
+    const menu = container.querySelector('.channel-context-menu') as HTMLElement;
+    expect(menu).toBeTruthy();
+    await fireEvent.keyDown(menu, { key: 'Escape' });
+    expect(document.activeElement).toBe(getByTestId('channel-menu-trigger-ch1'));
+  });
+
+  it('Tab closes the menu (focus moves on, popup must not linger)', async () => {
+    const { container, getByTestId } = renderRow();
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    const menu = container.querySelector('.channel-context-menu') as HTMLElement;
+    await fireEvent.keyDown(menu, { key: 'Tab' });
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+  });
+
+  it('demotion while the menu is focused parks focus on the row, not body', async () => {
+    const { container, getByTestId, rerender } = renderRow();
+    await fireEvent.click(getByTestId('channel-menu-trigger-ch1'));
+    // Menu is open and its first item holds focus (auto-focused on open).
+    expect((document.activeElement as HTMLElement).getAttribute('role')).toBe('menuitem');
+    await rerender({
+      node: channel(),
+      colorAncestry: [],
+      displayMode: 'text',
+      isLastChild: false,
+      canManageChannel: () => false,
+      onRenameChannel: vi.fn(),
+      onDeleteChannel: vi.fn(),
+    });
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+    expect(document.activeElement).toBe(getByTestId('nav-row-ch1'));
+  });
+
+  it('demotion while the trigger is focused (menu closed) parks focus on the row', async () => {
+    const { getByTestId, rerender } = renderRow();
+    const trigger = getByTestId('channel-menu-trigger-ch1');
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+    await rerender({
+      node: channel(),
+      colorAncestry: [],
+      displayMode: 'text',
+      isLastChild: false,
+      canManageChannel: () => false,
+      onRenameChannel: vi.fn(),
+      onDeleteChannel: vi.fn(),
+    });
+    expect(document.activeElement).toBe(getByTestId('nav-row-ch1'));
+  });
+});

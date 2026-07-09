@@ -68,10 +68,27 @@
   let canManage = $derived(node.type === 'channel' && (canManageChannel?.(node) ?? false));
   let channelMenu = $state<{ x: number; y: number } | null>(null);
   let channelMenuEl: HTMLElement | undefined = $state();
+  // ZEB-664: visible, tabbable menu trigger (⋯) — the keyboard entry point.
+  let channelTriggerEl: HTMLButtonElement | undefined = $state();
+  let rowEl: HTMLElement | undefined = $state();
+  // Event-maintained: by the time the demotion $effect runs, the trigger is
+  // already unmounted (unmount fires no blur), so containment checks against
+  // document.activeElement can't see it — this flag can.
+  let triggerFocused = false;
 
-  // §6.8: close a stale moderation menu when the viewer is demoted.
+  // §6.8: close a stale moderation menu when the viewer is demoted. If focus
+  // was inside the menu (auto-focused on open) or on the trigger, both of
+  // which unmount here, park it on the row instead of letting it fall to body.
   $effect(() => {
-    if (!canManage) channelMenu = null;
+    if (!canManage) {
+      const active = document.activeElement;
+      const inMenu = !!(channelMenu && channelMenuEl && active && channelMenuEl.contains(active));
+      if (inMenu || triggerFocused) {
+        rowEl?.focus();
+        triggerFocused = false;
+      }
+      channelMenu = null;
+    }
   });
 
   $effect(() => {
@@ -79,10 +96,21 @@
     function onDocClick(e: MouseEvent) {
       const target = e.target as Node | null;
       if (channelMenuEl && target && channelMenuEl.contains(target)) return;
+      // The trigger's own click must reach its toggle handler (this listener
+      // is capture-phase, so a plain close here would race a bubble reopen).
+      if (channelTriggerEl && target && channelTriggerEl.contains(target)) return;
       channelMenu = null;
     }
     document.addEventListener('click', onDocClick, true);
     return () => document.removeEventListener('click', onDocClick, true);
+  });
+
+  // ZEB-664: menu-pattern focus management — focus lands on the first item
+  // when the menu opens (right-click and trigger paths behave alike).
+  $effect(() => {
+    if (channelMenu && channelMenuEl) {
+      channelMenuEl.querySelector('button')?.focus();
+    }
   });
 
   function onChannelContextMenu(e: MouseEvent) {
@@ -90,6 +118,39 @@
     e.preventDefault();
     e.stopPropagation();
     channelMenu = { x: e.clientX, y: e.clientY };
+  }
+
+  function toggleChannelMenuFromTrigger(e: MouseEvent) {
+    e.stopPropagation();
+    if (channelMenu) {
+      channelMenu = null;
+      return;
+    }
+    const rect = channelTriggerEl?.getBoundingClientRect();
+    channelMenu = rect ? { x: rect.left, y: rect.bottom + 2 } : { x: 0, y: 0 };
+  }
+
+  function onMenuKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      channelMenu = null;
+      channelTriggerEl?.focus();
+      return;
+    }
+    if (e.key === 'Tab') {
+      // Menu-button pattern: Tab moves on, so the popup must not linger.
+      // No preventDefault — focus proceeds to the next tabbable naturally.
+      channelMenu = null;
+      return;
+    }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const items = Array.from(channelMenuEl?.querySelectorAll('button') ?? []);
+      if (items.length === 0) return;
+      const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+      const delta = e.key === 'ArrowDown' ? 1 : -1;
+      items[(idx + delta + items.length) % items.length]?.focus();
+    }
   }
 
   function channelRename() {
@@ -156,6 +217,7 @@
 </script>
 
 <div
+  bind:this={rowEl}
   class="nav-row"
   class:active
   class:pending={node.pending}
@@ -175,7 +237,9 @@
   {/each}
 
   <!-- Row content -->
-  <span class="row-content" style="padding-left: {paddingLeft}px">
+  <!-- managed: reserve a right gutter so the ⋯ trigger never overlays the
+       mention/unread badges (constant, so nothing shifts on hover). -->
+  <span class="row-content" class:managed={canManage} style="padding-left: {paddingLeft}px">
     {#if displayMode === 'icon'}
       {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
         <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={32} />
@@ -252,6 +316,29 @@
     {/if}
   </span>
 
+  <!-- ZEB-664: keyboard-accessible channel-moderation trigger. Revealed on
+       row hover AND keyboard focus (focus-within); opens the same menu as
+       right-click. -->
+  {#if canManage}
+    <button
+      bind:this={channelTriggerEl}
+      class="channel-menu-trigger"
+      data-testid="channel-menu-trigger-{node.id}"
+      aria-haspopup="menu"
+      aria-expanded={channelMenu !== null}
+      aria-label="Channel options for {node.name}"
+      title="Channel options"
+      onclick={toggleChannelMenuFromTrigger}
+      onfocus={() => (triggerFocused = true)}
+      onblur={() => (triggerFocused = false)}
+      onkeydown={(e) => {
+        // Enter/Space activate the button natively (click); without this
+        // stop they'd also bubble to the row's keydown and select the channel.
+        if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+      }}
+    >⋯</button>
+  {/if}
+
   <!-- Folder controls -->
   {#if node.type === 'folder'}
     <button class="sort-trigger" onclick={toggleSortMenu}>{'\u2195'}</button>
@@ -282,7 +369,9 @@
     bind:this={channelMenuEl}
     class="channel-context-menu"
     role="menu"
+    tabindex="-1"
     style="left: {channelMenu.x}px; top: {channelMenu.y}px"
+    onkeydown={onMenuKeydown}
   >
     <button type="button" role="menuitem" onclick={channelRename}>Rename</button>
     <button type="button" role="menuitem" class="destructive" onclick={channelDelete}>Delete</button>
@@ -366,6 +455,10 @@
     gap: 6px;
     flex: 1;
     min-width: 0;
+  }
+
+  .row-content.managed {
+    padding-right: 22px;
   }
 
   .type-icon {
@@ -572,6 +665,40 @@
 
   .sort-option.active {
     color: var(--accent);
+  }
+
+  /* ZEB-664: channel-moderation trigger — mirrors .mode-toggle's hover reveal,
+     but must ALSO reveal on keyboard focus (focus-within covers both the row
+     and the trigger itself) or keyboard users can't find it. */
+  .channel-menu-trigger {
+    position: absolute;
+    right: 8px;
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    padding: 2px 4px;
+  }
+
+  .nav-row:hover .channel-menu-trigger,
+  .nav-row:focus-within .channel-menu-trigger,
+  .channel-menu-trigger[aria-expanded='true'] {
+    opacity: 1;
+  }
+
+  .channel-menu-trigger:hover {
+    color: var(--text-primary);
+  }
+
+  .channel-menu-trigger:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: 2px;
+    opacity: 1;
   }
 
   /* ZEB-663: channel-row moderation context menu (mirrors ChannelSubSidebar). */
