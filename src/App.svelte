@@ -1083,8 +1083,18 @@
   // ZEB-663: hoisted channel-management dialog state (was CommunityView's).
   // Scoped to the selected community; power-gated by myCommunityPower.
   let showCreateChannelDialog = $state(false);
-  let modifyChannelTarget = $state<import('./lib/community-service').ChannelInfo | null>(null);
-  let deleteChannelTarget = $state<import('./lib/community-service').ChannelInfo | null>(null);
+  // ZEB-663: rename/delete targets capture the community they were opened for,
+  // so the op binds to the channel's OWN community — not the mutable
+  // `selectedCommunityId`, which can change (user switches communities) while
+  // the dialog is open and would otherwise send the op to the wrong community.
+  let modifyChannelTarget = $state<{
+    channel: import('./lib/community-service').ChannelInfo;
+    communityId: string;
+  } | null>(null);
+  let deleteChannelTarget = $state<{
+    channel: import('./lib/community-service').ChannelInfo;
+    communityId: string;
+  } | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
   // ZEB-553 item 11: true while an *initial* roster load is in flight after a
   // community switch (i.e. the roster is still empty). Owned entirely by
@@ -1232,7 +1242,7 @@
     try {
       const list = await communityService.listChannels(communityId);
       const ch = list.find((c) => c.channelId === channelId);
-      if (ch) modifyChannelTarget = ch;
+      if (ch) modifyChannelTarget = { channel: ch, communityId };
     } catch (e) {
       console.warn('openRenameChannel: listChannels failed:', e instanceof Error ? e.message : String(e));
     }
@@ -1242,7 +1252,7 @@
     try {
       const list = await communityService.listChannels(communityId);
       const ch = list.find((c) => c.channelId === channelId);
-      if (ch) deleteChannelTarget = ch;
+      if (ch) deleteChannelTarget = { channel: ch, communityId };
     } catch (e) {
       console.warn('openDeleteChannel: listChannels failed:', e instanceof Error ? e.message : String(e));
     }
@@ -1251,9 +1261,10 @@
   async function confirmDeleteChannel() {
     const target = deleteChannelTarget;
     deleteChannelTarget = null;
-    if (!target || !selectedCommunityId) return;
+    if (!target) return;
     try {
-      await communityService.deleteChannel(selectedCommunityId, target.channelId);
+      // Bind to the captured community, not the mutable selectedCommunityId.
+      await communityService.deleteChannel(target.communityId, target.channel.channelId);
       // The channel-config-updated event drives the nav reconcile + the App
       // resolution effect's fallback re-select if the active channel went away.
     } catch (e) {
@@ -3903,8 +3914,8 @@
   />
   {#if modifyChannelTarget}
     <ModifyChannelDialog
-      communityId={selectedCommunityId}
-      channel={modifyChannelTarget}
+      communityId={modifyChannelTarget.communityId}
+      channel={modifyChannelTarget.channel}
       {communityService}
       open={true}
       myPower={myCommunityPower}
@@ -3913,9 +3924,9 @@
   {/if}
   {#if deleteChannelTarget}
     <TypedConfirmationModal
-      title={`Delete #${deleteChannelTarget.name}?`}
+      title={`Delete #${deleteChannelTarget.channel.name}?`}
       description="Channel deletion is permanent. The message log persists on existing devices, but no new messages can be posted and the channel will disappear from the sidebar for everyone."
-      requiredText={deleteChannelTarget.name}
+      requiredText={deleteChannelTarget.channel.name}
       confirmLabel="Delete channel"
       onConfirm={confirmDeleteChannel}
       onCancel={() => { deleteChannelTarget = null; }}
