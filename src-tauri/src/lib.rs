@@ -32883,75 +32883,15 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
     >::new();
 
     for (channel_id, events) in &snapshot.channel_log.per_channel {
-        use crate::community_channel_log::SignedChannelEvent;
+        // ZEB-538: route through the canonical projection. The embedded
+        // variant uses the event's own (community_id, channel_id) — the
+        // original community's engine may not exist locally post-fork.
+        // Non-Post events project to None.
         let mut dtos: Vec<crate::community_channel_log_engine::ChannelMessageDto> = events
             .iter()
-            .filter_map(|ev| {
-                // Pattern match on Post only — forward-compatible when
-                // SignedChannelEvent gains new variants (Edit, Delete, etc.).
-                // The `_ => None` arm is unreachable today but will be
-                // load-bearing once additional variants land.
-                #[allow(unreachable_patterns)]
-                match ev {
-                    SignedChannelEvent::Post {
-                        id,
-                        author,
-                        at,
-                        body,
-                        mentions,
-                        attachments,
-                        reply_to,
-                        community_id: ev_community_id,
-                        channel_id: ev_channel_id,
-                        ..
-                    } => {
-                        let body_bytes = body.as_bytes().to_vec();
-                        let (kind, poll_id) =
-                            crate::community_channel_log_engine::detect_poll_kind(&body_bytes);
-                        Some(crate::community_channel_log_engine::ChannelMessageDto {
-                            message_id: hex::encode(id.0),
-                            community_id: hex::encode(ev_community_id.0),
-                            channel_id: hex::encode(ev_channel_id.0),
-                            author: hex::encode(author.0),
-                            at: crate::community_channel_log_engine::HlcDto {
-                                wall_ms: at.wall_ms,
-                                logical: at.logical,
-                                device_id: at.device_id.clone(),
-                            },
-                            body: body_bytes,
-                            reply_to: reply_to.map(|m| hex::encode(m.0)),
-                            mentions: mentions
-                                .as_ref()
-                                .map(|v| v.iter().map(|a| hex::encode(a.0)).collect()),
-                            // ZEB-535: project attachments identically to
-                            // message_dto_for_event (hex cid + derived encrypted
-                            // flag); empty list -> None.
-                            attachments: attachments.as_ref().filter(|v| !v.is_empty()).map(|v| {
-                                v.iter()
-                                    .map(|a| {
-                                        crate::community_channel_log_engine::ChannelAttachmentDto {
-                                            cid: hex::encode(a.cid),
-                                            mime: a.mime.clone(),
-                                            name: a.name.clone(),
-                                            size: a.size,
-                                            encrypted: harmony_content::cid::ContentId::from_bytes(
-                                                a.cid,
-                                            )
-                                            .flags()
-                                            .encrypted,
-                                        }
-                                    })
-                                    .collect()
-                            }),
-                            kind,
-                            poll_id,
-                            // ZEB-538: pre-fork snapshots are reaction-free for v1.
-                            reactions: Vec::new(),
-                        })
-                    }
-                    _ => None,
-                }
-            })
+            .filter_map(
+                crate::community_channel_log_engine::ChannelLogEngine::event_to_dto_embedded,
+            )
             .collect();
 
         // Sort HLC ascending: wall_ms → logical → device_id.
