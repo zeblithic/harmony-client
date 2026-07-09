@@ -193,6 +193,8 @@ struct ListChannelMessagesArgs {
     channel_id: String,
     since: Option<crate::community_channel_log_engine::HlcDto>,
     limit: u32,
+    /// ZEB-602: `"asc"` (default) or `"desc"` for newest-first.
+    order: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -564,8 +566,15 @@ pub fn build_registry() -> RpcRegistry {
         "list_channel_messages",
         ListChannelMessagesArgs,
         |state, _sink, a| async move {
-            crate::list_channel_messages_impl(state, a.community_id, a.channel_id, a.since, a.limit)
-                .await
+            crate::list_channel_messages_impl(
+                state,
+                a.community_id,
+                a.channel_id,
+                a.since,
+                a.limit,
+                a.order,
+            )
+            .await
         }
     );
     rpc!(
