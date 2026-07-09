@@ -827,7 +827,10 @@ describe('mention counts (ZEB-662)', () => {
     s.incMention('c1', 'ch-a'); // ch-a / ch-b aren't nav nodes in prod
     s.incMention('c1', 'ch-b');
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // aggregate on community
-    s.clearMention('c1'); // opening the community clears its aggregate
+    // clearMention on a community node still zeroes its aggregate (method-level);
+    // the ZEB-662 community-open *call* was removed in ZEB-663 (clearing is
+    // per-channel now), but the boot-race fallback still lands on the community.
+    s.clearMention('c1');
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
   });
 

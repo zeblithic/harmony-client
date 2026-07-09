@@ -2926,10 +2926,10 @@
     if (node.type === 'community') {
       changeSelectedCommunity(id);
       void refreshCommunityMembers(id);
-      // ZEB-662: opening a community clears its aggregate unseen-mention badge
-      // (production carries the count on the community node, since its channels
-      // aren't nav nodes — see NavService.incMention).
-      navService.clearMention(id);
+      // ZEB-663: clearing is per-channel now (openCommunityChannel + the
+      // selection-resolution effect clear the channel you land on). The
+      // community rollup decrements naturally as its channels clear — zeroing
+      // the community node directly here would break the sum invariant.
       if (appMode !== 'messages') {
         switchMode('messages');
       }
