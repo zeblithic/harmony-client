@@ -9,15 +9,19 @@
    * persistence + card re-seed + network publish.
    */
   import { trapFocus } from '../focus-trap';
+  import Avatar from './Avatar.svelte';
 
   interface Props {
     open: boolean;
+    /** ZEB-650: owner id hex for the identicon chip; null pre-resolution. */
+    ownerIdHex?: string | null;
     onSave: (name: string) => void | Promise<void>;
     onSkip: () => void;
   }
-  const { open, onSave, onSkip }: Props = $props();
+  const { open, ownerIdHex = null, onSave, onSkip }: Props = $props();
 
   let name = $state('');
+  const chipName = $derived(name.trim() || 'Anonymous');
   let modalEl = $state<HTMLElement | null>(null);
 
   // Mirror WelcomeModal's focus trap so keyboard users stay within the dialog.
@@ -72,6 +76,15 @@
         aria-label="Display name"
         onkeydown={handleInputKeydown}
       />
+      {#if ownerIdHex}
+        <div class="profile-chip" data-testid="name-prompt-chip">
+          <Avatar address={ownerIdHex} displayName={chipName} size={40} />
+          <div class="chip-text">
+            <span class="chip-name">{chipName}</span>
+            <span class="chip-badge">● self-sovereign</span>
+          </div>
+        </div>
+      {/if}
       <div class="actions">
         <button
           class="primary"
@@ -136,6 +149,28 @@
     outline: 2px solid transparent;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  /* ZEB-650: live identicon preview — the identity data really exists here
+     (post-mint), so the chip is data-backed, not decorative. */
+  .profile-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--border-default);
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    background: var(--bg-primary);
+  }
+  .chip-text { display: flex; flex-direction: column; gap: 0.1rem; }
+  .chip-name { font-weight: 600; font-size: 0.95rem; }
+  .chip-badge {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.6rem;
+    color: var(--text-secondary);
   }
   .actions { display: flex; gap: 0.5rem; }
   .actions button {

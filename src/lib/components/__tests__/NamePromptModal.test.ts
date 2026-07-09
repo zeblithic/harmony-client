@@ -71,3 +71,27 @@ describe('NamePromptModal — ZEB-336 first-run name', () => {
     expect(onSave).not.toHaveBeenCalled();
   });
 });
+
+describe('NamePromptModal identicon chip (ZEB-650 slice 1)', () => {
+  const OWNER = 'aaaa0000aaaa0000aaaa0000aaaa0000';
+
+  it('renders the chip with identicon + typed name when ownerIdHex is set', async () => {
+    render(NamePromptModal, { props: { open: true, ownerIdHex: OWNER, onSave: vi.fn(), onSkip: vi.fn() } });
+    const chip = screen.getByTestId('name-prompt-chip');
+    expect(chip.querySelector('svg')).toBeTruthy(); // identicon renders inline SVG
+    expect(chip.textContent).toContain('Anonymous'); // empty input falls back
+    await fireEvent.input(screen.getByTestId('name-prompt-input'), { target: { value: 'Jake' } });
+    expect(screen.getByTestId('name-prompt-chip').textContent).toContain('Jake');
+    expect(screen.getByTestId('name-prompt-chip').textContent).toContain('self-sovereign');
+  });
+
+  it('renders no chip when ownerIdHex is null', () => {
+    render(NamePromptModal, { props: { open: true, ownerIdHex: null, onSave: vi.fn(), onSkip: vi.fn() } });
+    expect(screen.queryByTestId('name-prompt-chip')).toBeNull();
+  });
+
+  it('renders no chip when the prop is omitted (default)', () => {
+    render(NamePromptModal, { props: { open: true, onSave: vi.fn(), onSkip: vi.fn() } });
+    expect(screen.queryByTestId('name-prompt-chip')).toBeNull();
+  });
+});

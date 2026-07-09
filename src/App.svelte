@@ -4262,6 +4262,7 @@
 <WelcomeModal open={showWelcomeModal} {onMinted} />
 <NamePromptModal
   open={showNamePrompt}
+  ownerIdHex={selfOwnerId}
   onSave={handleNamePromptSave}
   onSkip={() => { showNamePrompt = false; }}
 />
