@@ -173,11 +173,19 @@ export class ChannelUnreadService {
       cursor,
       UNREAD_TRACK_CAP,
     );
+    // Re-read the cursor: it may have advanced during the await —
+    // markChannelRead from a user click, or a focused+active live arrival —
+    // and the server filtered against the pre-await snapshot, which would
+    // resurrect just-read messages (ZEB-667; sibling of the DM fix on
+    // PR #432). Cursors only move forward, so the fresh read is always the
+    // stricter filter.
+    const fresh = this.deps.storage.get(communityId, channelId) ?? cursor;
     const self = this.deps.selfOwnerId();
     const set = this.setFor(communityId, channelId); // union with event-race arrivals
     for (const m of msgs) {
       this.bumpMaxSeen(communityId, channelId, m.at);
       if (m.author === self) continue;
+      if (!hlcNewer(m.at, fresh)) continue; // server filtered against the stale cursor
       if (set.size < UNREAD_TRACK_CAP || set.has(m.messageId)) {
         set.add(m.messageId);
       }

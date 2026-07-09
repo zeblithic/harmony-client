@@ -1233,7 +1233,7 @@ impl ChannelLogEngine {
     // ── Internal helpers ────────────────────────────────────────────────
 
     fn emit_message_received(&self, event: &SignedChannelEvent) {
-        let dto = self.message_dto_for_event(event);
+        let dto = Self::message_dto_for_event(self.community_id, self.channel_id, event);
         let payload = ChannelMessageReceivedPayload {
             community_id: hex::encode(self.community_id.0),
             channel_id: hex::encode(self.channel_id.0),
@@ -1423,7 +1423,7 @@ impl ChannelLogEngine {
             if !matches!(ev, SignedChannelEvent::Post { .. }) {
                 return false;
             }
-            let mut dto = self.message_dto_for_event(ev);
+            let mut dto = Self::message_dto_for_event(self.community_id, self.channel_id, ev);
             dto.reactions = log.reactions_for(ev.id(), &self.self_owner);
             out.push(dto);
             true
@@ -1491,12 +1491,42 @@ impl ChannelLogEngine {
     /// change both.
     pub fn event_to_dto(&self, event: &SignedChannelEvent) -> Option<ChannelMessageDto> {
         match event {
-            SignedChannelEvent::Post { .. } => Some(self.message_dto_for_event(event)),
+            SignedChannelEvent::Post { .. } => Some(Self::message_dto_for_event(
+                self.community_id,
+                self.channel_id,
+                event,
+            )),
             _ => None,
         }
     }
 
-    fn message_dto_for_event(&self, event: &SignedChannelEvent) -> ChannelMessageDto {
+    /// Engine-free projection for contexts holding bare persisted events
+    /// with no live engine — the pre-fork snapshot IPC (`get_pre_fork_snapshot`,
+    /// ZEB-538), where the original community's engine may not exist locally.
+    /// Uses the event's own embedded `(community_id, channel_id)` (which the
+    /// snapshot's carried history is keyed by), where `event_to_dto` stamps
+    /// the engine's context. Both delegate to `message_dto_for_event`: there
+    /// is exactly one `ChannelMessageDto` projection.
+    pub fn event_to_dto_embedded(event: &SignedChannelEvent) -> Option<ChannelMessageDto> {
+        match event {
+            SignedChannelEvent::Post {
+                community_id,
+                channel_id,
+                ..
+            } => Some(Self::message_dto_for_event(
+                *community_id,
+                *channel_id,
+                event,
+            )),
+            _ => None,
+        }
+    }
+
+    fn message_dto_for_event(
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        event: &SignedChannelEvent,
+    ) -> ChannelMessageDto {
         // Phase 2's SignedChannelEvent::Post stores body as `String`
         // directly — encrypt_channel_packet wraps the canonical-CBOR
         // event (including the String body) under ChannelKey. By the
@@ -1520,8 +1550,8 @@ impl ChannelLogEngine {
         let (kind, poll_id) = detect_poll_kind(&body_bytes);
         ChannelMessageDto {
             message_id: hex::encode(id.0),
-            community_id: hex::encode(self.community_id.0),
-            channel_id: hex::encode(self.channel_id.0),
+            community_id: hex::encode(community_id.0),
+            channel_id: hex::encode(channel_id.0),
             author: hex::encode(author.0),
             at: HlcDto {
                 wall_ms: at.wall_ms,
@@ -4047,6 +4077,45 @@ mod tests {
             .expect("Post projects to a DTO")
             .mentions
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn event_to_dto_embedded_uses_event_ids_and_omits_empty_mentions() {
+        // Engine-free projection (ZEB-538): `get_pre_fork_snapshot` holds
+        // bare persisted events with no live engine, so the projection takes
+        // (community, channel) from the event's own embedded fields — and
+        // must normalize `Some(vec![])` mentions to None exactly like the
+        // engine path (the hand-rolled literal it replaced did not, so a
+        // snapshot DTO could surface `mentions: []` where the canonical
+        // path surfaces None).
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let other_community = SpaceId([0x5a; 16]);
+        let other_channel = ChannelId([0x6b; 16]);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: other_community,
+            channel_id: other_channel,
+            author: fix.self_owner,
+            at: Hlc {
+                wall_ms: 7_000,
+                logical: 0,
+                device_id: "device-x".to_string(),
+            },
+            content_kind: 0,
+            body: "carried history",
+            reply_to: None,
+            mentions: Some(vec![]),
+            attachments: None,
+        };
+        let ev = sign_channel_event(&payload, &fix.signing_key).expect("sign");
+        let dto = ChannelLogEngine::event_to_dto_embedded(&ev).expect("Post projects to Some");
+        // IDs come from the event, not any engine context.
+        assert_eq!(dto.community_id, hex::encode(other_community.0));
+        assert_eq!(dto.channel_id, hex::encode(other_channel.0));
+        assert!(
+            dto.mentions.is_none(),
+            "Some(vec![]) must normalize to None on the snapshot path"
+        );
     }
 
     #[tokio::test]
