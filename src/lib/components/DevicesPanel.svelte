@@ -4,6 +4,8 @@
   import { loadProfile } from '../profile-service';
   import { loadDeviceLabel, saveDeviceLabel, resolveDefaultDeviceLabel } from '../device-label-service';
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
+  import { fetchCommunitiesCount } from '../owner-meta';
+  import { markRecoveryBackedUp, recoveryBackedUpAtMs } from '../onboarding-backup-flags';
   import {
     MAX_RECOVERY_COMMENT_BYTES,
     MIN_RECOVERY_PASSPHRASE_LEN,
@@ -21,6 +23,17 @@
   let mintInFlight = $state(false);
   let mintError = $state<string | null>(null);
   let recoveryToken = $state<string | null>(null);
+
+  // ZEB-650 meta facts. communitiesCount/lastBackedUpMs are plain $state (not
+  // $derived) because localStorage and the IPC aren't reactive — they're set on
+  // mount and updated at the exact mutation points below.
+  let communitiesCount = $state<number | null>(null);
+  let lastBackedUpMs = $state<number | null>(null);
+  const firstEnrolledMs = $derived(
+    state !== null && state.devices.length > 0
+      ? Math.min(...state.devices.map((d) => d.enrolledAt)) * 1000
+      : null,
+  );
 
   // Per-device label (owner-private). Seeded from the store; defaulted to the
   // OS hostname on first run in onMount.
@@ -73,6 +86,13 @@
       } catch {
         // Non-fatal: keep the backend device label until the user sets one.
       }
+    }
+    // ZEB-650 meta facts — after refresh so the owner id is known. Both reads
+    // are non-fatal: null just omits the fact from the meta row.
+    if (svc.state !== null) {
+      lastBackedUpMs = recoveryBackedUpAtMs(svc.state.ownerId);
+      const n = await fetchCommunitiesCount();
+      communitiesCount = typeof n === 'number' ? n : null;
     }
   });
 
@@ -190,6 +210,9 @@
     // `disabled` to the DOM. Symmetric with IdentityPanel's
     // advanceFromFileEntry guard. (CodeRabbit, PR #66 review.)
     if (backupDialogInFlight || backupInFlight) return;
+    // Capture before the awaits — `state` could change underneath us, and the
+    // backed-up flag must name the identity actually exported (ZEB-587 pattern).
+    const backupOwnerId = state?.ownerId ?? null;
     // Clear any error from a prior commit attempt in this same modal session
     // BEFORE re-validating. Without this, a stale error string from the
     // previous click can render alongside (or instead of) the current
@@ -266,6 +289,12 @@
       backupPassphrase = '';
       backupPassphraseConfirm = '';
       backupSavedPath = info.path;
+      // ZEB-650 gap fix: a Devices-panel backup now clears the reminder banner,
+      // exactly like BackupReminderBanner's own save path.
+      if (backupOwnerId) {
+        markRecoveryBackedUp(backupOwnerId);
+        lastBackedUpMs = recoveryBackedUpAtMs(backupOwnerId);
+      }
     } catch (e) {
       backupError = extractError(e);
     } finally {
@@ -367,6 +396,18 @@
               <span class="ss-badge">● self-sovereign</span>
             </div>
             <div class="owner-fingerprint">{formatOwnerFingerprint(state.ownerId)}</div>
+            <div class="owner-meta" data-testid="devices-meta">
+              <span class="meta-key" data-testid="devices-meta-keytype">ed25519</span>
+              {#if firstEnrolledMs !== null}
+                <span data-testid="devices-meta-enrolled">First device enrolled {new Date(firstEnrolledMs).toLocaleDateString()}</span>
+              {/if}
+              {#if communitiesCount !== null}
+                <span data-testid="devices-meta-communities">{communitiesCount} {communitiesCount === 1 ? 'community' : 'communities'}</span>
+              {/if}
+            </div>
+            {#if lastBackedUpMs !== null}
+              <div class="owner-meta" data-testid="devices-last-backed-up">Last backed up {new Date(lastBackedUpMs).toLocaleDateString()}</div>
+            {/if}
           </div>
           <button
             class="primary"
@@ -727,6 +768,30 @@
     color: var(--text-muted);
     font-family: var(--font-mono);
     margin-top: 2px;
+  }
+  /* ZEB-650: derivable meta facts under the fingerprint. */
+  .owner-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    flex-wrap: wrap;
+  }
+  .owner-meta .meta-key {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 10px;
+    line-height: 1.4;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 20px;
+    white-space: nowrap;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
   }
   .restore-link {
     margin-top: 12px;
