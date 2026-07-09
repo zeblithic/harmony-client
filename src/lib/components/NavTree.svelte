@@ -4,6 +4,7 @@
   import NavNodeRow from './NavNodeRow.svelte';
   import NavTree from './NavTree.svelte';
   import ProposalsNavRow from './ProposalsNavRow.svelte';
+  import AddChannelNavRow from './AddChannelNavRow.svelte';
 
   let {
     nodes,
@@ -19,6 +20,10 @@
     proposalCount,
     onSelectProposals,
     proposalsActiveFor,
+    canManageChannels,
+    onAddChannel,
+    onRenameChannel,
+    onDeleteChannel,
   }: {
     nodes: NavNode[];
     parentId: string | null;
@@ -40,6 +45,14 @@
     onSelectProposals?: (communityId: string) => void;
     /** ZEB-606: community id whose Proposals view is currently open. */
     proposalsActiveFor?: string | null;
+    /** ZEB-663: may the viewer manage the given community's channels? */
+    canManageChannels?: (communityId: string) => boolean;
+    /** ZEB-663: open the create-channel dialog for a community. */
+    onAddChannel?: (communityId: string) => void;
+    /** ZEB-663: open rename dialog for a channel node. */
+    onRenameChannel?: (communityId: string, channelId: string) => void;
+    /** ZEB-663: open delete-confirm for a channel node. */
+    onDeleteChannel?: (communityId: string, channelId: string) => void;
   } = $props();
 
   let sortedChildren = $derived.by(() => {
@@ -69,10 +82,13 @@
     {onDisplayModeChange}
     {onSortOrderChange}
     {presenceOnline}
+    canManageChannel={(n) => (canManageChannels && n.parentId ? canManageChannels(n.parentId) : false)}
+    {onRenameChannel}
+    {onDeleteChannel}
   />
 
   {#if (child.type === 'folder' || child.type === 'community') && child.expanded}
-    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} {presenceOnline} {proposalCount} {onSelectProposals} {proposalsActiveFor} />
+    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} {presenceOnline} {proposalCount} {onSelectProposals} {proposalsActiveFor} {canManageChannels} {onAddChannel} {onRenameChannel} {onDeleteChannel} />
     {#if child.type === 'community' && proposalCount && onSelectProposals}
       <ProposalsNavRow
         communityId={child.id}
@@ -81,6 +97,9 @@
         active={proposalsActiveFor === child.id}
         onSelect={() => onSelectProposals(child.id)}
       />
+    {/if}
+    {#if child.type === 'community' && canManageChannels && canManageChannels(child.id)}
+      <AddChannelNavRow communityId={child.id} indent={ancestry.length} onAdd={onAddChannel} />
     {/if}
   {/if}
 {/each}

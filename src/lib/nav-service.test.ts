@@ -822,13 +822,28 @@ describe('mention counts (ZEB-662)', () => {
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1); // only ch2 remains
   });
 
-  it('production: channel is not a nav node → the community node carries the badge', () => {
+  it('boot race: a mention for a not-yet-materialized channel queues off the community bubble (ZEB-663)', () => {
     const s = prodSvc();
-    s.incMention('c1', 'ch-a'); // ch-a / ch-b aren't nav nodes in prod
+    const HLC = { wallMs: 0, logical: 0, deviceId: 'd' };
+    const info = (channelId: string, name: string) => ({
+      channelId,
+      name,
+      writePower: 0,
+      kind: 'text' as const,
+      createdAt: HLC,
+    });
+    // Channels aren't nav nodes yet (the boot gap before ChannelNavSync.start).
+    // incMention queues by channelId rather than parking an unattributable
+    // aggregate on the community node, so the community bubble stays clean.
+    s.incMention('c1', 'ch-a');
     s.incMention('c1', 'ch-b');
-    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // aggregate on community
-    s.clearMention('c1'); // opening the community clears its aggregate
     expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
+    // The queued mentions replay onto their channels once setChannels runs, so
+    // a real unseen-mention badge is preserved (not lost, not stranded).
+    s.setChannels('c1', [info('ch-a', 'general'), info('ch-b', 'random')]);
+    expect(s.nodes.find((n) => n.id === 'ch-a')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'ch-b')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // bubbled sum
   });
 
   it('incMention with an unknown community and channel is a no-op', () => {
@@ -845,5 +860,138 @@ describe('mention counts (ZEB-662)', () => {
     };
     s.clearMention('ch1');
     expect(changed).toBe(0);
+  });
+});
+
+describe('NavService.setChannels reconcile (ZEB-663)', () => {
+  const HLC = { wallMs: 0, logical: 0, deviceId: 'd' };
+  const ch = (channelId: string, name: string, kind: 'text' | 'voice' = 'text') => ({
+    channelId,
+    name,
+    writePower: 0,
+    kind,
+    createdAt: HLC,
+  });
+
+  function withCommunity(): NavService {
+    const s = new NavService({ seedMockData: false });
+    s.nodes = [
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    return s;
+  }
+
+  it('adds channel children in listChannels order with channelKind', () => {
+    const s = withCommunity();
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'voice-room', 'voice')]);
+    const kids = s.nodes.filter((n) => n.parentId === 'c1' && n.type === 'channel');
+    expect(kids.map((n) => n.id)).toEqual(['a', 'b']);
+    expect(kids.map((n) => n.name)).toEqual(['general', 'voice-room']);
+    expect(kids.map((n) => n.channelKind)).toEqual(['text', 'voice']);
+  });
+
+  it('updates name and kind on survivors', () => {
+    const s = withCommunity();
+    s.setChannels('c1', [ch('a', 'general')]);
+    s.setChannels('c1', [ch('a', 'lobby', 'voice')]);
+    const a = s.nodes.find((n) => n.id === 'a')!;
+    expect(a.name).toBe('lobby');
+    expect(a.channelKind).toBe('voice');
+  });
+
+  it('preserves mentionCount + expanded on survivors across a reconcile', () => {
+    const s = withCommunity();
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'random')]);
+    s.incMention('c1', 'a');
+    s.incMention('c1', 'a');
+    s.nodes.find((n) => n.id === 'a')!.expanded = true;
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'random')]); // idempotent re-sync
+    const a = s.nodes.find((n) => n.id === 'a')!;
+    expect(a.mentionCount).toBe(2);
+    expect(a.expanded).toBe(true);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // bubble intact
+  });
+
+  it('removes absent channels and subtracts their mentions from the community bubble', () => {
+    const s = withCommunity();
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'random')]);
+    s.incMention('c1', 'a'); // community bubble = 1
+    s.incMention('c1', 'b'); // community bubble = 2
+    s.setChannels('c1', [ch('a', 'general')]); // b deleted
+    expect(s.nodes.some((n) => n.id === 'b')).toBe(false);
+    expect(s.nodes.find((n) => n.id === 'a')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1); // b's 1 subtracted
+  });
+
+  it('replays a boot-race mention onto its channel when channels materialize (ZEB-663)', () => {
+    const s = withCommunity();
+    // Boot race: a mention arrives for channel 'a' before its nav node exists.
+    // incMention queues it by channelId (no unattributable parking on the
+    // community), so the community bubble stays 0 until channels materialize.
+    s.incMention('c1', 'a');
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(0);
+    // Channels populate → the queued mention migrates onto 'a' and bubbles up.
+    // The real unseen-mention badge is preserved, not wiped (was the
+    // "mentions vanish after sync" regression) and not stranded on the community.
+    s.setChannels('c1', [ch('a', 'general')]);
+    expect(s.nodes.find((n) => n.id === 'a')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1);
+  });
+
+  it('a queued boot-race mention drains exactly once (survives a later idempotent resync)', () => {
+    const s = withCommunity();
+    s.incMention('c1', 'a');
+    s.setChannels('c1', [ch('a', 'general')]); // materialize → replay onto 'a'
+    s.setChannels('c1', [ch('a', 'general')]); // idempotent re-sync must not re-add
+    expect(s.nodes.find((n) => n.id === 'a')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1);
+  });
+
+  it('reorders channel children (and re-renders) when only the order changes', () => {
+    const s = withCommunity();
+    let changed = 0;
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'random')]);
+    s.onChange = () => { changed++; };
+    // Same id/name/kind set, different order → must rebuild + fire onChange,
+    // because sibling render order follows array order among same-parent nodes.
+    s.setChannels('c1', [ch('b', 'random'), ch('a', 'general')]);
+    const kids = s.nodes.filter((n) => n.parentId === 'c1' && n.type === 'channel');
+    expect(kids.map((n) => n.id)).toEqual(['b', 'a']);
+    expect(changed).toBe(1);
+  });
+
+  it('fires onChange only when the reconcile changes the tree', () => {
+    const s = withCommunity();
+    let changed = 0;
+    s.onChange = () => { changed++; };
+    s.setChannels('c1', [ch('a', 'general')]); // add → 1
+    s.setChannels('c1', [ch('a', 'general')]); // no-op → still 1
+    expect(changed).toBe(1);
+  });
+
+  it('is a no-op when the community node is absent', () => {
+    const s = new NavService({ seedMockData: false });
+    s.nodes = [];
+    let changed = 0;
+    s.onChange = () => { changed++; };
+    s.setChannels('nope', [ch('a', 'general')]);
+    expect(s.nodes.length).toBe(0);
+    expect(changed).toBe(0);
+  });
+});
+
+describe('NavService community removal drops channel children (ZEB-663)', () => {
+  it('removing a community also removes its channel nodes', () => {
+    const s = new NavService({ seedMockData: false });
+    s.nodes = [
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    s.setChannels('c1', [
+      { channelId: 'a', name: 'general', writePower: 0, kind: 'text', createdAt: { wallMs: 0, logical: 0, deviceId: 'd' } },
+    ]);
+    expect(s.nodes.some((n) => n.id === 'a')).toBe(true);
+    s.addOrUpdateNavSpace({ action: 'removed', spaceId: 'c1', kind: 'community', name: 'C' });
+    expect(s.nodes.some((n) => n.id === 'c1')).toBe(false);
+    expect(s.nodes.some((n) => n.id === 'a')).toBe(false); // child dropped too
   });
 });

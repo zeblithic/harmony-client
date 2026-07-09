@@ -36,6 +36,9 @@
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import CreateCommunityDialog from './lib/components/CreateCommunityDialog.svelte';
   import RedeemInviteDialog from './lib/components/RedeemInviteDialog.svelte';
+  import CreateChannelDialog from './lib/components/CreateChannelDialog.svelte';
+  import ModifyChannelDialog from './lib/components/ModifyChannelDialog.svelte';
+  import TypedConfirmationModal from './lib/components/TypedConfirmationModal.svelte';
   import CommunityView from './lib/components/CommunityView.svelte';
   import LibraryDirectoryBrowser from './lib/components/LibraryDirectoryBrowser.svelte';
   import ToastHost from './lib/components/ToastHost.svelte';
@@ -60,6 +63,7 @@
   import { DmInviteService, type PendingDmInviteDto } from './lib/dm-invite-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
+  import { POWER_THRESHOLDS } from './lib/types';
   import { NotificationService } from './lib/notification-service';
   import {
     loadNotificationSettings,
@@ -78,11 +82,12 @@
   import { VineService } from './lib/vine-service';
   import { resolveOriginalCreator } from './lib/vine-utils';
   import { NavService } from './lib/nav-service';
+  import { ChannelNavSyncService } from './lib/channel-nav-sync';
   import { AvatarResolver } from './lib/avatar-resolver';
   import { ProfilePageResolver } from './lib/profile-page-resolver';
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
-  import { findNode, findNearestFolder } from './lib/nav-utils';
+  import { findNode, findNearestFolder, resolveChannelSelection } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
   import { onMount } from 'svelte';
   import type { Update } from '@tauri-apps/plugin-updater';
@@ -1070,6 +1075,26 @@
   // "on / public"). The settings panel rolls back on toggle failure.
   let sharedInProfileByCommunity = $state<Map<string, boolean>>(new Map());
   let selectedCommunityId = $state<string | null>(null);
+  // ZEB-663: the reactive selected channel for the currently-selected
+  // community (single source of truth for channel selection; persistence
+  // mirrors into communityService.setSelectedChannel). Null = none resolved
+  // yet (the resolution effect below picks a default from the nav children).
+  let selectedChannelId = $state<string | null>(null);
+  // ZEB-663: hoisted channel-management dialog state (was CommunityView's).
+  // Scoped to the selected community; power-gated by myCommunityPower.
+  let showCreateChannelDialog = $state(false);
+  // ZEB-663: rename/delete targets capture the community they were opened for,
+  // so the op binds to the channel's OWN community — not the mutable
+  // `selectedCommunityId`, which can change (user switches communities) while
+  // the dialog is open and would otherwise send the op to the wrong community.
+  let modifyChannelTarget = $state<{
+    channel: import('./lib/community-service').ChannelInfo;
+    communityId: string;
+  } | null>(null);
+  let deleteChannelTarget = $state<{
+    channel: import('./lib/community-service').ChannelInfo;
+    communityId: string;
+  } | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
   // ZEB-553 item 11: true while an *initial* roster load is in flight after a
   // community switch (i.e. the roster is still empty). Owned entirely by
@@ -1099,6 +1124,28 @@
   // (owner_id), NOT myAddress (the node/transport address from get_node_addr).
   // The $derived recomputes when selfOwnerId resolves after start_node.
   let myCommunityPower = $derived(selfCommunityPower(communityMembers, selfOwnerId));
+  // ZEB-663: resolve which channel is selected for the current community when
+  // the current selection isn't a live channel of it (community switch,
+  // first visit, or the active channel was just deleted). Restores the
+  // persisted last-viewed channel, else #general, else the first channel.
+  // Only runs on the Channels view so governance views don't force a channel
+  // selection. Gated on populated nav children so the just-joined async
+  // window resolves once ChannelNavSync fills them in.
+  $effect(() => {
+    const cid = selectedCommunityId;
+    if (!cid || communityActiveView !== 'channels') return;
+    const kids = navNodes.filter((n) => n.parentId === cid && n.type === 'channel');
+    if (kids.length === 0) return; // not populated yet
+    const target = resolveChannelSelection(
+      kids.map((k) => ({ id: k.id, name: k.name })),
+      selectedChannelId,
+      communityService.getSelectedChannel(cid),
+    );
+    if (target === null || target === selectedChannelId) return;
+    selectedChannelId = target;
+    communityService.setSelectedChannel(cid, target);
+    navService.clearMention(target); // landing on it marks its mentions seen
+  });
   // Count only currently-joined members so the overview matches the
   // "X joined" line in CommunitySettingsPanel — invited/banned/left
   // entries shouldn't be counted as members in either place.
@@ -1116,6 +1163,11 @@
       // ZEB-606: a community switch always lands on Channels unless a
       // deep-link (openCommunityProposals) overrides it afterwards.
       communityActiveView = 'channels';
+      // ZEB-663: drop the prior community's selected channel so the active-row
+      // highlight falls back to the community row (not a stale cross-community
+      // channel) until the resolution effect re-picks this community's channel.
+      // openCommunityChannel sets the concrete channel right after this call.
+      selectedChannelId = null;
       communityMembers = [];
       // ZEB-404: new community session → reset the refetch throttle.
       lastMessageRosterRefetchAt = 0;
@@ -1147,6 +1199,10 @@
     if (id !== null) notesSelected = false;
     selectedCommunityId = id;
     isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
+    // ZEB-663: ensure this community's channels are populated in the nav tree
+    // (covers communities joined after boot, which start()'s snapshot missed).
+    // Idempotent + cache-hit for already-synced communities.
+    if (id != null) void channelNavSync.resync(id);
   }
 
   /** ZEB-606: nav proposals-row / Assembly-rail deep link — select the
@@ -1157,6 +1213,63 @@
     void refreshCommunityMembers(communityId);
     showSettings = false;
     communityActiveView = 'proposals';
+  }
+
+  /** ZEB-663: nav channel-row click — select the community + channel and land
+   *  on its Channels feed. Mirrors openCommunityProposals. */
+  function openCommunityChannel(communityId: string, channelId: string) {
+    if (appMode !== 'messages') switchMode('messages');
+    changeSelectedCommunity(communityId);
+    void refreshCommunityMembers(communityId);
+    showSettings = false;
+    communityService.setSelectedChannel(communityId, channelId);
+    selectedChannelId = channelId;
+    communityActiveView = 'channels';
+    // ZEB-663: viewing a channel clears its unseen-mention indicator.
+    navService.clearMention(channelId);
+  }
+
+  // ZEB-663: nav channel management — gated to the selected community at power
+  // ≥ kick (App resolves power for the selected community only).
+  function canManageSelectedCommunityChannels(communityId: string): boolean {
+    return communityId === selectedCommunityId && myCommunityPower >= POWER_THRESHOLDS.kick;
+  }
+
+  // Wired as fire-and-forget nav-row callbacks (onRenameChannel/onDeleteChannel
+  // aren't awaited), so an unguarded listChannels rejection would surface as an
+  // unhandled promise rejection and the menu action would silently do nothing.
+  async function openRenameChannel(communityId: string, channelId: string) {
+    try {
+      const list = await communityService.listChannels(communityId);
+      const ch = list.find((c) => c.channelId === channelId);
+      if (ch) modifyChannelTarget = { channel: ch, communityId };
+    } catch (e) {
+      console.warn('openRenameChannel: listChannels failed:', e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function openDeleteChannel(communityId: string, channelId: string) {
+    try {
+      const list = await communityService.listChannels(communityId);
+      const ch = list.find((c) => c.channelId === channelId);
+      if (ch) deleteChannelTarget = { channel: ch, communityId };
+    } catch (e) {
+      console.warn('openDeleteChannel: listChannels failed:', e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function confirmDeleteChannel() {
+    const target = deleteChannelTarget;
+    deleteChannelTarget = null;
+    if (!target) return;
+    try {
+      // Bind to the captured community, not the mutable selectedCommunityId.
+      await communityService.deleteChannel(target.communityId, target.channel.channelId);
+      // The channel-config-updated event drives the nav reconcile + the App
+      // resolution effect's fallback re-select if the active channel went away.
+    } catch (e) {
+      console.warn('deleteChannel failed:', e instanceof Error ? e.message : String(e));
+    }
   }
 
   async function refreshCommunityMembers(id: string) {
@@ -1323,6 +1436,16 @@
   // unmount via $effect cleanup.
   const communityService = new CommunityService();
   $effect(() => () => communityService.destroy());
+  // ── ZEB-663: channel→nav bridge ────────────────────────────────────
+  // Populates each community's channel children as first-class NavNodes so
+  // the unified nav tree renders channels inline. Pure dep-injection — no
+  // direct service refs beyond the three lambdas below.
+  const channelNavSync = new ChannelNavSyncService({
+    listChannels: (id) => communityService.listChannels(id),
+    setChannels: (id, channels) => navService.setChannels(id, channels),
+    listCommunityIds: () =>
+      navService.nodes.filter((n) => n.type === 'community').map((n) => n.id),
+  });
   // ── Friend service (ZEB-370) ───────────────────────────────────────
   // Same eager-construct / adapter-wired-in-IIFE / destroy-on-unmount
   // pattern as CommunityService. Surfaced in the Settings panel via
@@ -1961,6 +2084,13 @@
       await tryConnect('vine.loadFollowed', vineService.loadFollowed());
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
+      // ZEB-663: base channel-config handler — keep the nav tree's channel
+      // children fresh on create/rename/delete. CommunityView (when mounted)
+      // chains its own feed-list refresh on top of this via the existing
+      // prev-handler chain.
+      communityService.onChannelConfigChanged = (cid) => {
+        void channelNavSync.resync(cid);
+      };
       await tryConnect('friend', friendService.connectAdapter(adapter));
       // ZEB-431: hydrate the DM contact picker from the friend graph.
       // Fire-and-forget: pre-owner-load failure is recovered by the
@@ -1999,6 +2129,11 @@
         const msg = err instanceof Error ? err.message : String(err);
         console.warn('[harmony-client] community rehydration failed:', msg);
       }
+
+      // ZEB-663: now that nav communities are hydrated, populate their
+      // channels as nav nodes. Fire-and-forget; per-community failures are
+      // isolated inside ChannelNavSync and never block boot.
+      void channelNavSync.start();
 
       // ZEB-600: subscribe presence for ALL joined communities (not just the
       // active one) so the sidebar + DM dots reflect every community. A shared
@@ -2775,7 +2910,13 @@
   // node is active — the Notes row carries its own active state — so don't let
   // navActiveNodeId keep highlighting the last channel/community.
   let navActiveNodeId = $derived(
-    notesSelected ? null : (selectedCommunityId ?? activeChannel),
+    notesSelected
+      ? null
+      : selectedCommunityId
+        // ZEB-663: on the Channels view, highlight the active channel row;
+        // otherwise (proposals/charter/tier3, or no channel yet) the community.
+        ? (communityActiveView === 'channels' ? (selectedChannelId ?? selectedCommunityId) : selectedCommunityId)
+        : activeChannel,
   );
 
   function switchMode(mode: AppMode) {
@@ -2800,6 +2941,17 @@
   function handleNodeClick(id: string) {
     const node = findNode(navNodes, id);
     if (!node || node.type === 'folder') return;
+    // ZEB-663: a channel row routes to its community + channel feed.
+    if (node.type === 'channel') {
+      if (node.parentId) {
+        openCommunityChannel(node.parentId, node.id);
+      } else {
+        // Unreachable: setChannels always assigns parentId. A warning makes a
+        // future regression (a click that visibly no-ops) discoverable.
+        console.warn(`handleNodeClick: channel node ${node.id} has no parentId; ignoring click`);
+      }
+      return;
+    }
     // ZEB-334: selecting any real space leaves the self-notes view.
     notesSelected = false;
     // ZEB-263: community nodes route to the right-pane overview placeholder
@@ -2807,10 +2959,10 @@
     if (node.type === 'community') {
       changeSelectedCommunity(id);
       void refreshCommunityMembers(id);
-      // ZEB-662: opening a community clears its aggregate unseen-mention badge
-      // (production carries the count on the community node, since its channels
-      // aren't nav nodes — see NavService.incMention).
-      navService.clearMention(id);
+      // ZEB-663: clearing is per-channel now (openCommunityChannel + the
+      // selection-resolution effect clear the channel you land on). The
+      // community rollup decrements naturally as its channels clear — zeroing
+      // the community node directly here would break the sum invariant.
       if (appMode !== 'messages') {
         switchMode('messages');
       }
@@ -3172,6 +3324,10 @@
         }}
         onSelectProposals={openCommunityProposals}
         proposalsActiveFor={communityActiveView === 'proposals' ? selectedCommunityId : null}
+        canManageChannels={canManageSelectedCommunityChannels}
+        onAddChannel={() => { showCreateChannelDialog = true; }}
+        onRenameChannel={openRenameChannel}
+        onDeleteChannel={openDeleteChannel}
         identity={identityChipInfo}
         showConnectionStatus={true}
         onModeChange={switchMode}
@@ -3232,6 +3388,7 @@
         {trustService}
         {navService}
         {votingAdapter}
+        {selectedChannelId}
         bind:activeView={communityActiveView}
         onForkSuccess={(forkSpaceId) => {
           // ZEB-285: navigate to the newly created fork community and
@@ -3739,6 +3896,42 @@
       createError = null;
     }}
   />
+{/if}
+
+{#if selectedCommunityId}
+  <!-- ZEB-663: hoisted channel-management dialogs (were CommunityView's).
+       Scoped to the selected community; power-gated by myCommunityPower. -->
+  <CreateChannelDialog
+    communityId={selectedCommunityId}
+    {communityService}
+    open={showCreateChannelDialog}
+    myPower={myCommunityPower}
+    onClose={() => { showCreateChannelDialog = false; }}
+    onCreated={(channelId) => {
+      showCreateChannelDialog = false;
+      if (selectedCommunityId) openCommunityChannel(selectedCommunityId, channelId);
+    }}
+  />
+  {#if modifyChannelTarget}
+    <ModifyChannelDialog
+      communityId={modifyChannelTarget.communityId}
+      channel={modifyChannelTarget.channel}
+      {communityService}
+      open={true}
+      myPower={myCommunityPower}
+      onClose={() => { modifyChannelTarget = null; }}
+    />
+  {/if}
+  {#if deleteChannelTarget}
+    <TypedConfirmationModal
+      title={`Delete #${deleteChannelTarget.channel.name}?`}
+      description="Channel deletion is permanent. The message log persists on existing devices, but no new messages can be posted and the channel will disappear from the sidebar for everyone."
+      requiredText={deleteChannelTarget.channel.name}
+      confirmLabel="Delete channel"
+      onConfirm={confirmDeleteChannel}
+      onCancel={() => { deleteChannelTarget = null; }}
+    />
+  {/if}
 {/if}
 
 {#if showRedeemInvite}

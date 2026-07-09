@@ -44,6 +44,10 @@
     proposalCount,
     onSelectProposals,
     proposalsActiveFor = null,
+    canManageChannels,
+    onAddChannel,
+    onRenameChannel,
+    onDeleteChannel,
     identity,
     showConnectionStatus = false,
   }: {
@@ -91,6 +95,14 @@
     onSelectProposals?: (communityId: string) => void;
     /** ZEB-606: community id whose Proposals view is open (row active state). */
     proposalsActiveFor?: string | null;
+    /** ZEB-663: may the viewer manage the given community's channels? */
+    canManageChannels?: (communityId: string) => boolean;
+    /** ZEB-663: open the create-channel dialog for a community. */
+    onAddChannel?: (communityId: string) => void;
+    /** ZEB-663: open rename dialog for a channel node. */
+    onRenameChannel?: (communityId: string, channelId: string) => void;
+    /** ZEB-663: open delete-confirm for a channel node. */
+    onDeleteChannel?: (communityId: string, channelId: string) => void;
     /** ZEB-606: identity-chip signals (App-computed). Chip renders only when
      *  provided, so bare test construction stays chip-free. */
     identity?: { displayName: string; ownerIdHex: string | null; selfOnline: boolean; selfSovereign: boolean };
@@ -342,6 +354,10 @@
             {proposalCount}
             {onSelectProposals}
             {proposalsActiveFor}
+            {canManageChannels}
+            {onAddChannel}
+            {onRenameChannel}
+            {onDeleteChannel}
           />
         {/if}
         {#if hasCommunitiesTop}
@@ -360,6 +376,10 @@
             {proposalCount}
             {onSelectProposals}
             {proposalsActiveFor}
+            {canManageChannels}
+            {onAddChannel}
+            {onRenameChannel}
+            {onDeleteChannel}
           />
         {/if}
         {#if hasDmsTop}
@@ -378,6 +398,10 @@
             {proposalCount}
             {onSelectProposals}
             {proposalsActiveFor}
+            {canManageChannels}
+            {onAddChannel}
+            {onRenameChannel}
+            {onDeleteChannel}
           />
         {/if}
         <!-- ZEB-553 item 13: zero-community empty-state CTA. Suppressed while a
