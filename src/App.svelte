@@ -36,6 +36,9 @@
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import CreateCommunityDialog from './lib/components/CreateCommunityDialog.svelte';
   import RedeemInviteDialog from './lib/components/RedeemInviteDialog.svelte';
+  import CreateChannelDialog from './lib/components/CreateChannelDialog.svelte';
+  import ModifyChannelDialog from './lib/components/ModifyChannelDialog.svelte';
+  import TypedConfirmationModal from './lib/components/TypedConfirmationModal.svelte';
   import CommunityView from './lib/components/CommunityView.svelte';
   import LibraryDirectoryBrowser from './lib/components/LibraryDirectoryBrowser.svelte';
   import ToastHost from './lib/components/ToastHost.svelte';
@@ -60,6 +63,7 @@
   import { DmInviteService, type PendingDmInviteDto } from './lib/dm-invite-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
+  import { POWER_THRESHOLDS } from './lib/types';
   import { NotificationService } from './lib/notification-service';
   import {
     loadNotificationSettings,
@@ -1076,6 +1080,11 @@
   // mirrors into communityService.setSelectedChannel). Null = none resolved
   // yet (the resolution effect below picks a default from the nav children).
   let selectedChannelId = $state<string | null>(null);
+  // ZEB-663: hoisted channel-management dialog state (was CommunityView's).
+  // Scoped to the selected community; power-gated by myCommunityPower.
+  let showCreateChannelDialog = $state(false);
+  let modifyChannelTarget = $state<import('./lib/community-service').ChannelInfo | null>(null);
+  let deleteChannelTarget = $state<import('./lib/community-service').ChannelInfo | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
   // ZEB-553 item 11: true while an *initial* roster load is in flight after a
   // community switch (i.e. the roster is still empty). Owned entirely by
@@ -1203,6 +1212,37 @@
     communityActiveView = 'channels';
     // ZEB-663: viewing a channel clears its unseen-mention indicator.
     navService.clearMention(channelId);
+  }
+
+  // ZEB-663: nav channel management — gated to the selected community at power
+  // ≥ kick (App resolves power for the selected community only).
+  function canManageSelectedCommunityChannels(communityId: string): boolean {
+    return communityId === selectedCommunityId && myCommunityPower >= POWER_THRESHOLDS.kick;
+  }
+
+  async function openRenameChannel(communityId: string, channelId: string) {
+    const list = await communityService.listChannels(communityId);
+    const ch = list.find((c) => c.channelId === channelId);
+    if (ch) modifyChannelTarget = ch;
+  }
+
+  async function openDeleteChannel(communityId: string, channelId: string) {
+    const list = await communityService.listChannels(communityId);
+    const ch = list.find((c) => c.channelId === channelId);
+    if (ch) deleteChannelTarget = ch;
+  }
+
+  async function confirmDeleteChannel() {
+    const target = deleteChannelTarget;
+    deleteChannelTarget = null;
+    if (!target || !selectedCommunityId) return;
+    try {
+      await communityService.deleteChannel(selectedCommunityId, target.channelId);
+      // The channel-config-updated event drives the nav reconcile + the App
+      // resolution effect's fallback re-select if the active channel went away.
+    } catch (e) {
+      console.warn('deleteChannel failed:', e instanceof Error ? e.message : String(e));
+    }
   }
 
   async function refreshCommunityMembers(id: string) {
@@ -3251,6 +3291,10 @@
         }}
         onSelectProposals={openCommunityProposals}
         proposalsActiveFor={communityActiveView === 'proposals' ? selectedCommunityId : null}
+        canManageChannels={canManageSelectedCommunityChannels}
+        onAddChannel={() => { showCreateChannelDialog = true; }}
+        onRenameChannel={openRenameChannel}
+        onDeleteChannel={openDeleteChannel}
         identity={identityChipInfo}
         showConnectionStatus={true}
         onModeChange={switchMode}
@@ -3312,7 +3356,6 @@
         {navService}
         {votingAdapter}
         {selectedChannelId}
-        onSelectChannel={(channelId) => openCommunityChannel(selectedCommunityNode.id, channelId)}
         bind:activeView={communityActiveView}
         onForkSuccess={(forkSpaceId) => {
           // ZEB-285: navigate to the newly created fork community and
@@ -3820,6 +3863,42 @@
       createError = null;
     }}
   />
+{/if}
+
+{#if selectedCommunityId}
+  <!-- ZEB-663: hoisted channel-management dialogs (were CommunityView's).
+       Scoped to the selected community; power-gated by myCommunityPower. -->
+  <CreateChannelDialog
+    communityId={selectedCommunityId}
+    {communityService}
+    open={showCreateChannelDialog}
+    myPower={myCommunityPower}
+    onClose={() => { showCreateChannelDialog = false; }}
+    onCreated={(channelId) => {
+      showCreateChannelDialog = false;
+      if (selectedCommunityId) openCommunityChannel(selectedCommunityId, channelId);
+    }}
+  />
+  {#if modifyChannelTarget}
+    <ModifyChannelDialog
+      communityId={selectedCommunityId}
+      channel={modifyChannelTarget}
+      {communityService}
+      open={true}
+      myPower={myCommunityPower}
+      onClose={() => { modifyChannelTarget = null; }}
+    />
+  {/if}
+  {#if deleteChannelTarget}
+    <TypedConfirmationModal
+      title={`Delete #${deleteChannelTarget.name}?`}
+      description="Channel deletion is permanent. The message log persists on existing devices, but no new messages can be posted and the channel will disappear from the sidebar for everyone."
+      requiredText={deleteChannelTarget.name}
+      confirmLabel="Delete channel"
+      onConfirm={confirmDeleteChannel}
+      onCancel={() => { deleteChannelTarget = null; }}
+    />
+  {/if}
 {/if}
 
 {#if showRedeemInvite}

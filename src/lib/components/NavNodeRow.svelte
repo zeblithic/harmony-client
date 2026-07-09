@@ -30,6 +30,9 @@
     statusText,
     forkParentName,
     presenceOnline,
+    canManageChannel,
+    onRenameChannel,
+    onDeleteChannel,
   }: {
     node: NavNode;
     colorAncestry: number[];
@@ -50,9 +53,53 @@
      *  counterparty is online in some shared community. App-provided so the
      *  nav stays agnostic of the presence service. */
     presenceOnline?: (node: NavNode) => boolean;
+    /** ZEB-663: may the viewer manage THIS channel node (rename/delete)?
+     *  Resolves true only for the selected community's channels at power ≥ kick. */
+    canManageChannel?: (node: NavNode) => boolean;
+    /** ZEB-663: open rename dialog for a channel node. */
+    onRenameChannel?: (communityId: string, channelId: string) => void;
+    /** ZEB-663: open delete-confirm for a channel node. */
+    onDeleteChannel?: (communityId: string, channelId: string) => void;
   } = $props();
 
   let showSortMenu = $state(false);
+
+  // ZEB-663: channel-row moderation context menu (rename/delete).
+  let canManage = $derived(node.type === 'channel' && (canManageChannel?.(node) ?? false));
+  let channelMenu = $state<{ x: number; y: number } | null>(null);
+  let channelMenuEl: HTMLElement | undefined = $state();
+
+  // §6.8: close a stale moderation menu when the viewer is demoted.
+  $effect(() => {
+    if (!canManage) channelMenu = null;
+  });
+
+  $effect(() => {
+    if (!channelMenu) return;
+    function onDocClick(e: MouseEvent) {
+      const target = e.target as Node | null;
+      if (channelMenuEl && target && channelMenuEl.contains(target)) return;
+      channelMenu = null;
+    }
+    document.addEventListener('click', onDocClick, true);
+    return () => document.removeEventListener('click', onDocClick, true);
+  });
+
+  function onChannelContextMenu(e: MouseEvent) {
+    if (!canManage) return;
+    e.preventDefault();
+    e.stopPropagation();
+    channelMenu = { x: e.clientX, y: e.clientY };
+  }
+
+  function channelRename() {
+    channelMenu = null;
+    if (node.parentId) onRenameChannel?.(node.parentId, node.id);
+  }
+  function channelDelete() {
+    channelMenu = null;
+    if (node.parentId) onDeleteChannel?.(node.parentId, node.id);
+  }
 
   let paddingLeft = $derived(colorAncestry.length * 4 + 8);
   // Color-band hex per ancestry index, theme-reactive (ZEB-645): void
@@ -117,6 +164,7 @@
   data-testid="nav-row-{node.id}"
   onclick={handleClick}
   onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleClick(e); }}
+  oncontextmenu={onChannelContextMenu}
 >
   <!-- Color bands -->
   {#each bandColors as bandColor, i}
@@ -228,6 +276,18 @@
     <span class="bracket bracket-close">{'\u2518'}</span>
   {/if}
 </div>
+
+{#if channelMenu}
+  <div
+    bind:this={channelMenuEl}
+    class="channel-context-menu"
+    role="menu"
+    style="left: {channelMenu.x}px; top: {channelMenu.y}px"
+  >
+    <button type="button" role="menuitem" onclick={channelRename}>Rename</button>
+    <button type="button" role="menuitem" class="destructive" onclick={channelDelete}>Delete</button>
+  </div>
+{/if}
 
 <style>
   /* ZEB-600: nav presence dot — solid var(--presence-online) when the resolver reports online. */
@@ -513,4 +573,29 @@
   .sort-option.active {
     color: var(--accent);
   }
+
+  /* ZEB-663: channel-row moderation context menu (mirrors ChannelSubSidebar). */
+  .channel-context-menu {
+    position: fixed;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 0 2px 8px var(--shadow-mid);
+    z-index: 1000;
+    min-width: 140px;
+    padding: 4px 0;
+  }
+  .channel-context-menu button {
+    display: block;
+    width: 100%;
+    background: none;
+    border: none;
+    text-align: left;
+    padding: 6px 12px;
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .channel-context-menu button:hover { background: var(--bg-tertiary); }
+  .channel-context-menu button.destructive { color: var(--danger-muted); }
 </style>

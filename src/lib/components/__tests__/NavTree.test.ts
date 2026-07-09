@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/svelte';
-import { describe, it, expect } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/svelte';
+import { describe, it, expect, vi } from 'vitest';
 import NavTree from '../NavTree.svelte';
 import type { NavNode } from '../../types';
 
@@ -89,5 +89,63 @@ describe('NavTree', () => {
     const cryptoPos = allText.indexOf('crypto');
     const generalPos = allText.indexOf('general');
     expect(cryptoPos).toBeLessThan(generalPos);
+  });
+});
+
+describe('NavTree — AddChannelNavRow gating (ZEB-663)', () => {
+  const commNodes: NavNode[] = [
+    {
+      id: 'c1', parentId: null, type: 'community', name: 'Crew',
+      expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none',
+    },
+    {
+      id: 'ch1', parentId: 'c1', type: 'channel', name: 'general', channelKind: 'text',
+      expanded: false, unreadCount: 0, mentionCount: 0, unreadLevel: 'none',
+    },
+  ];
+
+  it('renders the ＋ add-channel row when the viewer can manage the community', () => {
+    const { getByTestId } = render(NavTree, {
+      props: {
+        nodes: commNodes,
+        parentId: null,
+        canManageChannels: () => true,
+        onAddChannel: () => {},
+      },
+    });
+    expect(getByTestId('add-channel-row-c1')).toBeTruthy();
+  });
+
+  it('hides the ＋ add-channel row when the viewer cannot manage', () => {
+    const { queryByTestId } = render(NavTree, {
+      props: {
+        nodes: commNodes,
+        parentId: null,
+        canManageChannels: () => false,
+        onAddChannel: () => {},
+      },
+    });
+    expect(queryByTestId('add-channel-row-c1')).toBeNull();
+  });
+
+  it('hides the ＋ add-channel row when no canManageChannels resolver is provided', () => {
+    const { queryByTestId } = render(NavTree, {
+      props: { nodes: commNodes, parentId: null },
+    });
+    expect(queryByTestId('add-channel-row-c1')).toBeNull();
+  });
+
+  it('clicking the ＋ row dispatches onAddChannel with the community id', async () => {
+    const onAddChannel = vi.fn();
+    const { getByTestId } = render(NavTree, {
+      props: {
+        nodes: commNodes,
+        parentId: null,
+        canManageChannels: () => true,
+        onAddChannel,
+      },
+    });
+    await fireEvent.click(getByTestId('add-channel-row-c1'));
+    expect(onAddChannel).toHaveBeenCalledWith('c1');
   });
 });

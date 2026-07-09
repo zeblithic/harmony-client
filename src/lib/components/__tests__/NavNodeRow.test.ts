@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/svelte';
-import { describe, it, expect } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/svelte';
+import { describe, it, expect, vi } from 'vitest';
 import NavNodeRow from '../NavNodeRow.svelte';
 import type { NavNode } from '../../types';
 
@@ -173,5 +173,105 @@ describe('NavNodeRow', () => {
       },
     });
     expect(container.querySelector('.nav-presence-dot')).toBeNull();
+  });
+});
+
+describe('NavNodeRow — channel kind glyph (ZEB-663)', () => {
+  it('renders 🔊 for a voice channel and NOT #', () => {
+    const { container } = render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'channel', name: 'lounge', channelKind: 'voice' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    const icon = container.querySelector('.type-icon');
+    expect(icon?.textContent).toContain('🔊');
+    expect(icon?.textContent).not.toContain('#');
+  });
+
+  it('renders # for a text channel', () => {
+    render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'channel', name: 'general', channelKind: 'text' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    expect(screen.getByText('#')).toBeTruthy();
+  });
+});
+
+describe('NavNodeRow — channel context menu (ZEB-663)', () => {
+  const channel = () =>
+    makeNode({ id: 'ch1', parentId: 'c1', type: 'channel', name: 'general' });
+
+  function renderRow(over: Record<string, unknown> = {}) {
+    return render(NavNodeRow, {
+      props: {
+        node: channel(),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+        canManageChannel: () => true,
+        onRenameChannel: vi.fn(),
+        onDeleteChannel: vi.fn(),
+        ...over,
+      },
+    });
+  }
+
+  it('right-click opens the rename/delete menu when the viewer can manage', async () => {
+    const { container } = renderRow();
+    await fireEvent.contextMenu(container.querySelector('.nav-row') as HTMLElement);
+    expect(container.querySelector('.channel-context-menu')).toBeTruthy();
+  });
+
+  it('right-click does NOT open the menu when the viewer cannot manage', async () => {
+    const { container } = renderRow({ canManageChannel: () => false });
+    await fireEvent.contextMenu(container.querySelector('.nav-row') as HTMLElement);
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+  });
+
+  it('Rename dispatches onRenameChannel with (communityId, channelId)', async () => {
+    const onRenameChannel = vi.fn();
+    const { container, getByRole } = renderRow({ onRenameChannel });
+    await fireEvent.contextMenu(container.querySelector('.nav-row') as HTMLElement);
+    await fireEvent.click(getByRole('menuitem', { name: /Rename/i }));
+    expect(onRenameChannel).toHaveBeenCalledWith('c1', 'ch1');
+  });
+
+  it('Delete dispatches onDeleteChannel with (communityId, channelId)', async () => {
+    const onDeleteChannel = vi.fn();
+    const { container, getByRole } = renderRow({ onDeleteChannel });
+    await fireEvent.contextMenu(container.querySelector('.nav-row') as HTMLElement);
+    await fireEvent.click(getByRole('menuitem', { name: /Delete/i }));
+    expect(onDeleteChannel).toHaveBeenCalledWith('c1', 'ch1');
+  });
+
+  it('clicking outside dismisses the menu', async () => {
+    const { container } = renderRow();
+    await fireEvent.contextMenu(container.querySelector('.nav-row') as HTMLElement);
+    expect(container.querySelector('.channel-context-menu')).toBeTruthy();
+    await fireEvent.click(document.body);
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
+  });
+
+  it('demotion (canManageChannel → false) closes an open menu (§6.8)', async () => {
+    const { container, rerender } = renderRow();
+    await fireEvent.contextMenu(container.querySelector('.nav-row') as HTMLElement);
+    expect(container.querySelector('.channel-context-menu')).toBeTruthy();
+    await rerender({
+      node: channel(),
+      colorAncestry: [],
+      displayMode: 'text',
+      isLastChild: false,
+      canManageChannel: () => false,
+      onRenameChannel: vi.fn(),
+      onDeleteChannel: vi.fn(),
+    });
+    expect(container.querySelector('.channel-context-menu')).toBeNull();
   });
 });

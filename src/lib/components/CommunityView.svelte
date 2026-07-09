@@ -7,14 +7,10 @@
   import { resolveMentionLabel } from '../mention-render';
   import type { TrustService } from '../trust-service';
   import type { NavService } from '../nav-service';
-  import ChannelSubSidebar from './ChannelSubSidebar.svelte';
   import ChannelMessageFeed from './ChannelMessageFeed.svelte';
   import VoiceChannelView from './VoiceChannelView.svelte';
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
   import CommunityMembersPanel from './CommunityMembersPanel.svelte';
-  import CreateChannelDialog from './CreateChannelDialog.svelte';
-  import ModifyChannelDialog from './ModifyChannelDialog.svelte';
-  import TypedConfirmationModal from './TypedConfirmationModal.svelte';
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
   import CommunityProposalsPanel from './CommunityProposalsPanel.svelte';
   import Tier3ProposalPanel from './Tier3ProposalPanel.svelte';
@@ -55,7 +51,6 @@
     voiceSession,
     onBeforeVoiceJoin,
     selectedChannelId,
-    onSelectChannel,
     activeView = $bindable('channels'),
   }: {
     communityId: string;
@@ -126,12 +121,9 @@
      *  active DM call before this community channel's voice join proceeds. */
     onBeforeVoiceJoin?: () => Promise<void>;
     /** ZEB-663: the App-owned selected channel id (single source of truth).
-     *  Drives which channel's feed renders. */
+     *  Drives which channel's feed renders. Selection is driven by the nav
+     *  channel rows (App.openCommunityChannel). */
     selectedChannelId: string | null;
-    /** ZEB-663: select a channel (App routes through openCommunityChannel).
-     *  Temporary — the ChannelSubSidebar select path; the nav rows are the
-     *  real selector. Removed with ChannelSubSidebar (Task 5). */
-    onSelectChannel: (channelId: string) => void;
     /** ZEB-606: which middle-column view is active. Bindable so App can
      *  deep-link (nav proposals row / Assembly rail "View all"). Default
      *  'channels' preserves the ZEB-291 behavior for non-binding parents.
@@ -142,9 +134,6 @@
   let channels = $state<ChannelInfo[]>([]);
   let settingsModalOpen = $state(false);
   let communityMembersPanelOpen = $state(false);
-  let showCreateDialog = $state(false);
-  let modifyDialogChannel = $state<ChannelInfo | null>(null);
-  let deleteConfirmChannel = $state<ChannelInfo | null>(null);
   let membersPanelCollapsed = $state(false);
   let prevOnChannelConfigChanged: typeof communityService.onChannelConfigChanged;
   // ZEB-285: fork lineage — loaded lazily when the settings modal first opens.
@@ -207,23 +196,6 @@
   async function refreshChannels() {
     const list = await communityService.listChannels(communityId);
     channels = list.filter((c) => c.deletedAt === undefined);
-  }
-
-  async function handleConfirmDelete() {
-    if (!deleteConfirmChannel) return;
-    const target = deleteConfirmChannel;
-    deleteConfirmChannel = null;
-    try {
-      await communityService.deleteChannel(communityId, target.channelId);
-      // The channel-config-updated event arrives shortly; the cascade
-      // happens there. We don't optimistically remove from the local
-      // `channels` list — keeps state-of-truth as the materialized
-      // CRDT response.
-    } catch (e) {
-      // Could surface a toast here; for now log + leave channel in place
-      // so user can retry.
-      console.warn('deleteChannel failed', e);
-    }
   }
 
   onMount(() => {
@@ -349,13 +321,6 @@
         <button
           type="button"
           class="view-tab"
-          class:active={activeView === 'channels'}
-          aria-pressed={activeView === 'channels'}
-          onclick={() => { activeView = 'channels'; }}
-        >Channels</button>
-        <button
-          type="button"
-          class="view-tab"
           class:active={activeView === 'proposals'}
           aria-pressed={activeView === 'proposals'}
           onclick={() => { activeView = 'proposals'; }}
@@ -434,16 +399,7 @@
     </div>
   </header>
 
-  <div class="three-cols">
-    <ChannelSubSidebar
-      {channels}
-      activeChannelId={selectedChannelId}
-      {myPower}
-      onSelect={onSelectChannel}
-      onCreateClick={() => { showCreateDialog = true; }}
-      onModifyClick={(c) => { modifyDialogChannel = c; }}
-      onDeleteClick={(c) => { deleteConfirmChannel = c; }}
-    />
+  <div class="two-cols">
     {#if activeView === 'charter' && votingAdapter}
       <CharterView
         {communityId}
@@ -614,40 +570,6 @@
   </div>
 {/if}
 
-<CreateChannelDialog
-  {communityId}
-  {communityService}
-  open={showCreateDialog}
-  {myPower}
-  onClose={() => { showCreateDialog = false; }}
-  onCreated={(channelId) => {
-    showCreateDialog = false;
-    onSelectChannel(channelId);
-  }}
-/>
-
-{#if modifyDialogChannel}
-  <ModifyChannelDialog
-    {communityId}
-    channel={modifyDialogChannel}
-    {communityService}
-    open={true}
-    {myPower}
-    onClose={() => { modifyDialogChannel = null; }}
-  />
-{/if}
-
-{#if deleteConfirmChannel}
-  <TypedConfirmationModal
-    title={`Delete #${deleteConfirmChannel.name}?`}
-    description="Channel deletion is permanent. The message log persists on existing devices, but no new messages can be posted and the channel will disappear from the sidebar for everyone."
-    requiredText={deleteConfirmChannel.name}
-    confirmLabel="Delete channel"
-    onConfirm={handleConfirmDelete}
-    onCancel={() => { deleteConfirmChannel = null; }}
-  />
-{/if}
-
 <style>
   .community-view {
     display: flex;
@@ -712,7 +634,7 @@
   }
   .members-toggle-btn:hover { background: var(--bg-tertiary); }
   .members-toggle-btn[aria-pressed="false"] { opacity: 0.5; }
-  .three-cols {
+  .two-cols {
     display: flex;
     flex: 1;
     min-height: 0;
