@@ -2670,9 +2670,6 @@
     }
   }
 
-  // Mock per-peer override to demonstrate settings
-  notificationService.setPeerPolicy('q7r8s9t0', { quiet: 'silent' });
-
   // Thread state
   let openThreadId = $state<string | null>(null);
   let threadModes = $state<Map<string, ThreadDisplayMode>>(new Map());

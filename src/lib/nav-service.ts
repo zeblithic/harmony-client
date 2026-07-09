@@ -371,36 +371,35 @@ export class NavService {
     return null;
   }
 
-  /** ZEB-662: recompute a community node's mentionCount = sum of descendant
-   *  channels' counts (channels whose ancestor community is this one). */
-  private recomputeCommunityMentions(communityId: string): void {
-    const comm = this.nodes.find((n) => n.id === communityId);
-    if (!comm) return;
-    let sum = 0;
-    for (const n of this.nodes) {
-      if (n.type === 'channel' && this.communityIdOf(n) === communityId) sum += n.mentionCount;
+  /** ZEB-662: apply a signed delta to a channel's mentionCount and mirror it on
+   *  the owning community node (incremental — O(tree depth), not a full scan).
+   *  The community node's count stays == the sum of its channels' counts because
+   *  inc/clear are the only mutators and each applies the same delta to both. */
+  private applyMentionDelta(channelId: string, delta: number): void {
+    const node = this.nodes.find((n) => n.id === channelId);
+    if (!node) return;
+    const next = Math.max(0, node.mentionCount + delta);
+    const applied = next - node.mentionCount;
+    if (applied === 0) return;
+    node.mentionCount = next;
+    const cid = this.communityIdOf(node);
+    if (cid && cid !== node.id) {
+      const comm = this.nodes.find((n) => n.id === cid);
+      if (comm) comm.mentionCount = Math.max(0, comm.mentionCount + applied);
     }
-    comm.mentionCount = sum;
+    this.onChange?.();
   }
 
   /** ZEB-662: increment a channel's unseen-mention count and bubble to its community. */
   incMention(channelId: string): void {
-    const node = this.nodes.find((n) => n.id === channelId);
-    if (!node) return;
-    node.mentionCount += 1;
-    const cid = this.communityIdOf(node);
-    if (cid) this.recomputeCommunityMentions(cid);
-    this.onChange?.();
+    this.applyMentionDelta(channelId, 1);
   }
 
   /** ZEB-662: clear a channel's mention count (channel opened) and re-bubble. */
   clearMention(channelId: string): void {
     const node = this.nodes.find((n) => n.id === channelId);
     if (!node || node.mentionCount === 0) return;
-    node.mentionCount = 0;
-    const cid = this.communityIdOf(node);
-    if (cid) this.recomputeCommunityMentions(cid);
-    this.onChange?.();
+    this.applyMentionDelta(channelId, -node.mentionCount);
   }
 
   /**
