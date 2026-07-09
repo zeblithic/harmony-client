@@ -28696,15 +28696,9 @@ where
                 crate::community_invite::apply_lineage_cap(&mut capped_lineage);
                 state_g.parent_lineage = capped_lineage;
                 // ZEB-649: mirror the fork's why (None for pre-ZEB-649
-                // snapshots). Bound it like verify_event does — the
-                // snapshot bypasses the membership-event verify path, so
-                // an oversized value is truncated at the codepoint cap
-                // rather than trusted verbatim.
-                state_g.fork_reason = snapshot.fork_reason.as_ref().map(|r| {
-                    r.chars()
-                        .take(crate::community_membership::MAX_MODERATION_REASON_CHARS)
-                        .collect()
-                });
+                // snapshots), bounded at the codepoint cap — the snapshot
+                // bypasses the membership-event verify path.
+                state_g.fork_reason = bound_fork_reason(snapshot.fork_reason.as_ref());
             }
         } else {
             tracing::warn!(
@@ -32741,6 +32735,18 @@ mod library_directory_lww_tests {
 /// — suitable for the settings panel (opened rarely) but callers should
 /// not call this in a hot path. The full snapshot body (channel events) is
 /// decoded then dropped; only the lightweight header fields are returned.
+/// ZEB-649 (CodeRabbit PR #434): bound a snapshot-supplied fork reason to
+/// the codepoint cap. Snapshot files/payloads bypass `verify_event`, so
+/// truncate rather than trust verbatim — one helper so the cap semantics
+/// can't drift between the redeem mirror and the two snapshot DTOs.
+fn bound_fork_reason(reason: Option<&String>) -> Option<String> {
+    reason.map(|r| {
+        r.chars()
+            .take(crate::community_membership::MAX_MODERATION_REASON_CHARS)
+            .collect()
+    })
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkSnapshotMetadataDto {
@@ -32803,13 +32809,7 @@ async fn get_fork_snapshot_metadata(
         original_community_name: snapshot.original_community_name,
         forked_at_ms: snapshot.forked_at.wall_ms,
         snapshot_message_count,
-        // Bound like the redeem mirror: the snapshot file bypasses
-        // verify_event, so truncate rather than trust verbatim.
-        fork_reason: snapshot.fork_reason.as_ref().map(|r| {
-            r.chars()
-                .take(crate::community_membership::MAX_MODERATION_REASON_CHARS)
-                .collect()
-        }),
+        fork_reason: bound_fork_reason(snapshot.fork_reason.as_ref()),
     }))
 }
 
@@ -32968,13 +32968,7 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
     Ok(Some(PreForkSnapshotDto {
         original_community_name: snapshot.original_community_name,
         forked_at_ms: snapshot.forked_at.wall_ms,
-        // Bound like the redeem mirror: the snapshot file bypasses
-        // verify_event, so truncate rather than trust verbatim.
-        fork_reason: snapshot.fork_reason.as_ref().map(|r| {
-            r.chars()
-                .take(crate::community_membership::MAX_MODERATION_REASON_CHARS)
-                .collect()
-        }),
+        fork_reason: bound_fork_reason(snapshot.fork_reason.as_ref()),
         channel_log,
     }))
 }

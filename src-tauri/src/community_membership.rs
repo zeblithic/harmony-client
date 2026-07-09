@@ -678,6 +678,11 @@ pub enum VerifyError {
     /// bypass the UI textarea `maxlength` and persist an oversized reason
     /// to every replica. Applies to both Kick and Unban events.
     ReasonTooLong,
+    /// ZEB-649 (Qodo PR #434): a Fork event carried `reason: Some("")` (or
+    /// whitespace-only). The fork reason is mandatory-when-present — a
+    /// modified client must not be able to satisfy the wire shape with a
+    /// meaningless empty string. Absent (`None`, pre-ZEB-649) stays valid.
+    ReasonEmpty,
     /// SetPower assigned a level above POWER_THRESHOLDS.max. Even an
     /// authorized actor cannot grant a power higher than the cap, since
     /// that would create a member admin can no longer kick (admin's own
@@ -966,6 +971,9 @@ impl std::fmt::Display for VerifyError {
                     f,
                     "moderation reason exceeds {MAX_MODERATION_REASON_CHARS} characters"
                 )
+            }
+            VerifyError::ReasonEmpty => {
+                write!(f, "fork reason is present but empty")
             }
             VerifyError::PowerLevelOutOfRange => {
                 write!(f, "power level exceeds POWER_THRESHOLDS.max")
@@ -3409,6 +3417,13 @@ pub fn verify_event(
             if let Some(r) = reason {
                 if r.chars().count() > MAX_MODERATION_REASON_CHARS {
                     return Err(VerifyError::ReasonTooLong);
+                }
+                // ZEB-649 (Qodo PR #434): the mandatory-why invariant — a
+                // modified client sending Some("") / whitespace must not
+                // satisfy the wire shape with a meaningless reason. Absent
+                // (None, pre-ZEB-649) remains valid.
+                if r.trim().is_empty() {
+                    return Err(VerifyError::ReasonEmpty);
                 }
             }
         }
@@ -6375,6 +6390,34 @@ mod tests {
             &regular_priv,
         );
         assert_eq!(verify_event(&ok_event, &prior, &ctx), Ok(()));
+
+        // ZEB-649 (Qodo PR #434): Some("") / whitespace-only must be
+        // rejected — the mandatory-why invariant holds at the CRDT layer,
+        // not just the IPC gate a modified client can skip.
+        for empty in ["", "   \n\t "] {
+            let empty_event = sign_with_identity(
+                EventPayload {
+                    id: [0x05; 16],
+                    community_id,
+                    kind: MembershipEventKind::Fork {
+                        fork_space_id: SpaceId([0xfe; 16]),
+                        reason: Some(empty.to_string()),
+                    },
+                    actor: regular_addr,
+                    at: Hlc {
+                        wall_ms: 5,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                },
+                &regular_priv,
+            );
+            assert_eq!(
+                verify_event(&empty_event, &prior, &ctx),
+                Err(VerifyError::ReasonEmpty),
+                "reason {empty:?} must be rejected"
+            );
+        }
     }
 
     /// ZEB-285 Step 6/9: verify_event allows a Fork from any joined member

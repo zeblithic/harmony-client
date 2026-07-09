@@ -95,6 +95,10 @@
 
 ## Finish
 
-- [ ] Full gates: fmt + clippy --all-targets + `scripts/test-select --full`
-  spot-check OR targeted sweep + tsc + full vitest. PR + `@coderabbitai
-  review` once + converge (all three buckets, one commit/push per round).
+- [ ] Local iterative gates before the PR: fmt + clippy --all-targets +
+  targeted nextest sweeps + tsc + full vitest. `scripts/test-select` is a
+  LOCAL ITERATIVE aid only — final validation is CI's full
+  `cargo nextest run --locked --workspace --all-targets --features
+  test-fixtures` (the rust-test job), never test-select.
+- [ ] PR + `@coderabbitai review` once + converge (all three buckets, one
+  commit/push per round).

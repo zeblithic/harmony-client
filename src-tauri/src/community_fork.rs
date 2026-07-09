@@ -184,6 +184,12 @@ pub fn mint_fork_event(
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
 
+    // ZEB-649 (CodeRabbit PR #434): validate at the function boundary, not
+    // just the IPC gate — mint_fork_event is pub, and a future caller must
+    // not be able to mint an empty/oversize reason that verify_event on
+    // every replica would then reject.
+    let reason = validate_fork_reason(&reason)?;
+
     let mut rng = rand::thread_rng();
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
@@ -1111,6 +1117,29 @@ mod tests {
             }
             other => panic!("expected Fork, got {other:?}"),
         }
+    }
+
+    /// ZEB-649 (CodeRabbit PR #434): mint_fork_event validates at its own
+    /// boundary — a pub-fn caller skipping the IPC gate cannot mint an
+    /// event every replica's verify_event would reject.
+    #[test]
+    fn mint_fork_event_rejects_empty_reason() {
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let result = mint_fork_event(
+            crate::owner_state_types::SpaceId([0xc0; 16]),
+            crate::owner_state_types::OwnerAddr([0xaa; 16]),
+            crate::owner_state_types::SpaceId([0xfa; 16]),
+            "   ".to_string(),
+            &signing_key,
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]
