@@ -25,6 +25,11 @@
 const SKIPPED = 'harmony.onboarding.backupSkipped';
 const BACKED_UP = 'harmony.onboarding.recoveryArtifactBackedUp';
 const DISMISSED = 'harmony.onboarding.backupBannerDismissed';
+// ZEB-650 slice 1: additive timestamps beside the booleans. Legacy owners
+// (boolean set, stamp absent) read as null — callers degrade to the
+// pre-timestamp copy rather than fabricating a figure.
+const SKIPPED_AT = 'harmony.onboarding.backupSkippedAt';
+const BACKED_UP_AT = 'harmony.onboarding.recoveryBackedUpAt';
 
 type StoreKind = 'local' | 'session';
 
@@ -55,14 +60,51 @@ function writeFlag(kind: StoreKind, base: string, ownerId: string): void {
   }
 }
 
+function writeStamp(base: string, ownerId: string, nowMs: number): void {
+  try {
+    localStorage.setItem(ownerKey(base, ownerId), String(nowMs));
+  } catch (e) {
+    console.debug('[zeb-650] onboarding stamp write failed:', e instanceof Error ? e.message : String(e));
+  }
+}
+
+function readStamp(base: string, ownerId: string): number | null {
+  try {
+    const raw = localStorage.getItem(ownerKey(base, ownerId));
+    if (raw === null) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Record that this owner skipped the onboarding backup (durable). */
 export function markBackupSkipped(ownerId: string): void {
   writeFlag('local', SKIPPED, ownerId);
+  writeStamp(SKIPPED_AT, ownerId, Date.now());
 }
 
 /** Record that this owner exported a recovery artifact (durable). */
 export function markRecoveryBackedUp(ownerId: string): void {
   writeFlag('local', BACKED_UP, ownerId);
+  writeStamp(BACKED_UP_AT, ownerId, Date.now());
+}
+
+export function backupSkippedAtMs(ownerId: string): number | null {
+  return readStamp(SKIPPED_AT, ownerId);
+}
+
+export function recoveryBackedUpAtMs(ownerId: string): number | null {
+  return readStamp(BACKED_UP_AT, ownerId);
+}
+
+/** Whole days (floored) since this owner skipped backup; null when no stamp
+ *  exists (legacy owner or never skipped). Clamped at 0 under clock skew. */
+export function daysSinceBackupSkipped(ownerId: string, nowMs: number = Date.now()): number | null {
+  const at = backupSkippedAtMs(ownerId);
+  if (at === null) return null;
+  return Math.max(0, Math.floor((nowMs - at) / 86_400_000));
 }
 
 /** Snooze the reminder banner for this owner for the current session only. */
