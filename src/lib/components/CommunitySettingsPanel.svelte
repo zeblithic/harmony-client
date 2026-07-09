@@ -14,6 +14,8 @@
   import InviteLinkManager from './InviteLinkManager.svelte';
   import ForkConfirmDialog from './ForkConfirmDialog.svelte';
   import ForkLineageTree from './ForkLineageTree.svelte';
+  import ForkGenealogyGraph from './ForkGenealogyGraph.svelte';
+  import Modal from './Modal.svelte';
   import PendingJoinsPanel from './PendingJoinsPanel.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import PendingAdminProposalsPanel from './PendingAdminProposalsPanel.svelte';
@@ -104,6 +106,9 @@
   let showChangeQuorumDialog = $state(false);
   // ZEB-285: fork dialog state
   let forkDialogOpen = $state(false);
+  // ZEB-649: the 2D genealogy graph modal (design Frame A / Frame D's
+  // deferred "View full lineage tree" button).
+  let genealogyOpen = $state(false);
   let forkError = $state<string | null>(null);
   // Holds an admin-threshold-crossing power change pending tier-2
   // confirmation. Populated by SetPowerDialog onSubmit when the new
@@ -562,6 +567,11 @@
           resolveLocalName={resolveLocalCommunityName}
           onNavigate={(spaceId) => onForkLineageNavigate?.(spaceId)}
         />
+        {#if phase2Lineage.forkedFrom || descendants.length > 0}
+          <button class="view-genealogy-btn" onclick={() => (genealogyOpen = true)}>
+            View genealogy <span aria-hidden="true">→</span>
+          </button>
+        {/if}
       {/if}
 
       {#if onFork}
@@ -666,6 +676,26 @@
     }}
     onCancel={() => { forkDialogOpen = false; forkError = null; }}
   />
+{/if}
+
+{#if genealogyOpen && phase2Lineage}
+  <Modal onCancel={() => (genealogyOpen = false)} ariaLabelledby="genealogy-modal-title" canDismissOnBackdrop={true} wide={true}>
+    <div class="genealogy-modal">
+      <h3 class="genealogy-modal-title" id="genealogy-modal-title">
+        <span aria-hidden="true">⑂</span> Lineage — {communityName}
+      </h3>
+      <ForkGenealogyGraph
+        lineage={phase2Lineage}
+        {descendants}
+        {localNavIds}
+        resolveLocalName={resolveLocalCommunityName}
+        onNavigate={(spaceId) => {
+          genealogyOpen = false;
+          onForkLineageNavigate?.(spaceId);
+        }}
+      />
+    </div>
+  </Modal>
 {/if}
 
 <style>
@@ -906,6 +936,35 @@
     padding: 4px 10px;
     font-size: 0.75rem;
     cursor: pointer;
+  }
+  .view-genealogy-btn {
+    /* ZEB-649: Frame D's deferred "View full lineage tree" affordance. */
+    align-self: flex-start;
+    background: var(--surface-raised);
+    color: var(--gov-clay-deep);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 30%, transparent);
+    border-radius: 7px;
+    padding: 6px 12px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    margin-top: 8px;
+  }
+  .view-genealogy-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .genealogy-modal {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    /* The graph needs more room than Modal's 480px default. */
+    width: min(860px, 90vw);
+  }
+  .genealogy-modal-title {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+    color: var(--text-primary);
   }
   .fork-btn {
     background: var(--gov-clay-soft);

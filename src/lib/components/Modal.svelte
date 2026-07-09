@@ -7,6 +7,7 @@
     canCancel = true,
     canDismissOnBackdrop = false,
     ariaLabelledby,
+    wide = false,
     children,
   }: {
     onCancel: () => void;
@@ -20,6 +21,9 @@
      */
     canDismissOnBackdrop?: boolean;
     ariaLabelledby: string;
+    /** ZEB-649: opt-in wide layout (genealogy graph); default keeps the
+     *  480px dialog every existing consumer expects. */
+    wide?: boolean;
     children?: Snippet;
   } = $props();
 
@@ -38,6 +42,7 @@
 <div class="modal-overlay" onclick={handleOverlayClick}>
   <div
     class="modal"
+    class:modal-wide={wide}
     role="dialog"
     aria-modal="true"
     aria-labelledby={ariaLabelledby}
@@ -67,5 +72,8 @@
     max-width: 480px;
     border: 1px solid var(--border);
     box-shadow: var(--shadow-e2);
+  }
+  .modal-wide {
+    max-width: min(920px, 94vw);
   }
 </style>

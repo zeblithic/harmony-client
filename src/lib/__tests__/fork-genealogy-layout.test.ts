@@ -104,15 +104,13 @@ describe('layoutGenealogy', () => {
   });
 
   it('deterministic: same input yields identical output', () => {
-    const args = [
-      lineage({
-        forkedFrom: '11'.repeat(16),
-        parentLineage: [
-          { spaceId: '11'.repeat(16), name: 'Root', forkedAtWallMs: null, reason: null },
-        ],
-      }),
-      [desc('33'), desc('44')],
-    ] as const;
-    expect(layoutGenealogy(...args)).toEqual(layoutGenealogy(...args));
+    const l = lineage({
+      forkedFrom: '11'.repeat(16),
+      parentLineage: [
+        { spaceId: '11'.repeat(16), name: 'Root', forkedAtWallMs: null, reason: null },
+      ],
+    });
+    const ds = [desc('33'), desc('44')];
+    expect(layoutGenealogy(l, ds)).toEqual(layoutGenealogy(l, ds));
   });
 });

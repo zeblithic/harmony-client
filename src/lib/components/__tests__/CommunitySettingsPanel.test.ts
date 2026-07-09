@@ -338,6 +338,41 @@ describe('CommunitySettingsPanel', () => {
     expect(container.querySelector('.fork-of-callout')).toBeNull();
   });
 
+  it('ZEB-649: "View genealogy" opens the graph modal for a fork; hidden for a fork-less root', async () => {
+    const parentHex = '22'.repeat(16);
+    const lineage: CommunityLineageDto = {
+      forkedFrom: parentHex,
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [{ spaceId: parentHex, name: 'Origin Community', forkedAtWallMs: null, reason: null }],
+      selfSpaceId: '33'.repeat(16),
+      selfName: 'The Fork',
+      forkReason: 'Treasury split',
+    };
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, phase2Lineage: lineage },
+    });
+    const btn = container.querySelector('.view-genealogy-btn') as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(document.body.querySelector('[data-testid="fork-genealogy"]')).toBeNull();
+    await fireEvent.click(btn);
+    const graph = document.body.querySelector('[data-testid="fork-genealogy"]');
+    expect(graph).toBeTruthy();
+    expect(graph!.textContent).toContain('“Treasury split”');
+
+    // Root community with no descendants: no genealogy affordance.
+    const { container: rootContainer } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        phase2Lineage: {
+          forkedFrom: null, forkedAtWallMs: null, parentLineage: [],
+          selfSpaceId: '11'.repeat(16), selfName: 'Root',
+          forkReason: null,
+        },
+      },
+    });
+    expect(rootContainer.querySelector('.view-genealogy-btn')).toBeNull();
+  });
+
   it('shows the callout without an "Open" button when the parent is not locally known', () => {
     const parentHex = '22'.repeat(16);
     const lineage: CommunityLineageDto = {
