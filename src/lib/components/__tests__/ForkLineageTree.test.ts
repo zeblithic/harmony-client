@@ -10,6 +10,7 @@ function emptyLineage(selfName = 'My Community'): CommunityLineageDto {
     parentLineage: [],
     selfSpaceId: '00'.repeat(16),
     selfName,
+    forkReason: null,
   };
 }
 
@@ -34,8 +35,8 @@ describe('ForkLineageTree', () => {
       forkedFrom: 'aa'.repeat(16),
       forkedAtWallMs: 1_700_000_000_000,
       parentLineage: [
-        { spaceId: '11'.repeat(16), name: 'Root C', forkedAtWallMs: null },
-        { spaceId: '22'.repeat(16), name: 'Middle B', forkedAtWallMs: 1_650_000_000_000 },
+        { spaceId: '11'.repeat(16), name: 'Root C', forkedAtWallMs: null, reason: null },
+        { spaceId: '22'.repeat(16), name: 'Middle B', forkedAtWallMs: 1_650_000_000_000, reason: null },
       ],
     };
 
@@ -55,7 +56,7 @@ describe('ForkLineageTree', () => {
       ...emptyLineage('Leaf'),
       forkedFrom: 'ab'.repeat(16),
       forkedAtWallMs: 1_700_000_000_000,
-      parentLineage: [{ spaceId: 'ab'.repeat(16), name: '', forkedAtWallMs: null }],
+      parentLineage: [{ spaceId: 'ab'.repeat(16), name: '', forkedAtWallMs: null, reason: null }],
     };
     const { getByText, container } = render(ForkLineageTree, {
       props: { lineage, descendants: [], localNavIds: new Set() },
@@ -77,6 +78,7 @@ describe('ForkLineageTree', () => {
         forkerDisplayName: 'Maya',
         forkedAtWallMs: 1_715_000_000_000,
         locallyKnown: true,
+        reason: null,
       },
       {
         forkSpaceId: '44'.repeat(16),
@@ -84,6 +86,7 @@ describe('ForkLineageTree', () => {
         forkerDisplayName: null,
         forkedAtWallMs: 1_716_000_000_000,
         locallyKnown: false,
+        reason: null,
       },
     ];
 
@@ -101,11 +104,12 @@ describe('ForkLineageTree', () => {
       forkedFrom: '22'.repeat(16),
       forkedAtWallMs: 1_700_000_000_000,
       parentLineage: [
-        { spaceId: '11'.repeat(16), name: 'C', forkedAtWallMs: null },
-        { spaceId: '22'.repeat(16), name: 'B', forkedAtWallMs: 1_650_000_000_000 },
+        { spaceId: '11'.repeat(16), name: 'C', forkedAtWallMs: null, reason: null },
+        { spaceId: '22'.repeat(16), name: 'B', forkedAtWallMs: 1_650_000_000_000, reason: null },
       ],
       selfSpaceId: '33'.repeat(16),
       selfName: 'A',
+      forkReason: null,
     };
     const descendants: ForkDescendantDto[] = [
       {
@@ -114,6 +118,7 @@ describe('ForkLineageTree', () => {
         forkerDisplayName: 'Maya',
         forkedAtWallMs: 1_715_000_000_000,
         locallyKnown: true,
+        reason: null,
       },
       {
         forkSpaceId: '55'.repeat(16),
@@ -121,6 +126,7 @@ describe('ForkLineageTree', () => {
         forkerDisplayName: 'Sam',
         forkedAtWallMs: 1_716_000_000_000,
         locallyKnown: true,
+        reason: null,
       },
     ];
 
@@ -147,6 +153,7 @@ describe('ForkLineageTree', () => {
       spaceId: i.toString(16).padStart(2, '0').repeat(16),
       name: `ancestor_${i}`,
       forkedAtWallMs: i === 0 ? null : i,
+      reason: null,
     }));
 
     const lineage: CommunityLineageDto = {
@@ -170,7 +177,7 @@ describe('ForkLineageTree', () => {
       forkedFrom: '22'.repeat(16),
       forkedAtWallMs: 1_700_000_000_000,
       parentLineage: [
-        { spaceId: '11'.repeat(16), name: 'Cool C', forkedAtWallMs: null },
+        { spaceId: '11'.repeat(16), name: 'Cool C', forkedAtWallMs: null, reason: null },
       ],
     };
 
@@ -193,7 +200,7 @@ describe('ForkLineageTree', () => {
       forkedFrom: '22'.repeat(16),
       forkedAtWallMs: 1_700_000_000_000,
       parentLineage: [
-        { spaceId: '11'.repeat(16), name: 'Cool C', forkedAtWallMs: null },
+        { spaceId: '11'.repeat(16), name: 'Cool C', forkedAtWallMs: null, reason: null },
       ],
     };
 
@@ -228,10 +235,12 @@ describe('ForkLineageTree', () => {
           spaceId: 'aa'.repeat(16),
           name: 'Parent',
           forkedAtWallMs: null,
+          reason: null,
         },
       ],
       selfSpaceId: '33'.repeat(16),
       selfName: 'Phase 1 Leaf',
+      forkReason: null,
     };
 
     const { getByText, queryByText } = render(ForkLineageTree, {
@@ -255,6 +264,7 @@ describe('ForkLineageTree', () => {
         forkerDisplayName: 'Maya',
         forkedAtWallMs: 1_715_000_000_000,
         locallyKnown: true,
+        reason: null,
       },
       {
         forkSpaceId: '44'.repeat(16),
@@ -262,6 +272,7 @@ describe('ForkLineageTree', () => {
         forkerDisplayName: 'Sam',
         forkedAtWallMs: 1_716_000_000_000,
         locallyKnown: false, // not locally known — should stay as truncated hex
+        reason: null,
       },
     ];
     const resolver = vi.fn((hex: string) =>
@@ -302,6 +313,7 @@ describe('ForkLineageTree', () => {
         forkerDisplayName: 'Ari',
         forkedAtWallMs: 1_717_000_000_000,
         locallyKnown: true,
+        reason: null,
       },
     ];
 
@@ -343,8 +355,8 @@ describe('ForkLineageTree', () => {
 
   it('badges a locally-known descendant "Member" and an unknown one "not joined"', () => {
     const descendants: ForkDescendantDto[] = [
-      { forkSpaceId: '33'.repeat(16), forkerAddr: 'ab'.repeat(16), forkerDisplayName: 'Maya', forkedAtWallMs: 1_715_000_000_000, locallyKnown: true },
-      { forkSpaceId: '44'.repeat(16), forkerAddr: 'cd'.repeat(16), forkerDisplayName: null, forkedAtWallMs: 1_716_000_000_000, locallyKnown: false },
+      { forkSpaceId: '33'.repeat(16), forkerAddr: 'ab'.repeat(16), forkerDisplayName: 'Maya', forkedAtWallMs: 1_715_000_000_000, locallyKnown: true, reason: null },
+      { forkSpaceId: '44'.repeat(16), forkerAddr: 'cd'.repeat(16), forkerDisplayName: null, forkedAtWallMs: 1_716_000_000_000, locallyKnown: false, reason: null },
     ];
     const { container } = render(ForkLineageTree, {
       props: {
@@ -362,5 +374,51 @@ describe('ForkLineageTree', () => {
     // Unknown → muted "not joined", and zero buttons.
     expect(rows[1].querySelector('.lineage-badge.not-joined')?.textContent).toMatch(/not joined/);
     expect(rows[1].querySelector('button')).toBeNull();
+  });
+
+  it('ZEB-649: renders quoted reasons on self, ancestor, and descendant cards; omits when null', () => {
+    const lineage: CommunityLineageDto = {
+      forkedFrom: 'aa'.repeat(16),
+      forkedAtWallMs: 1_715_000_000_000,
+      parentLineage: [
+        { spaceId: '11'.repeat(16), name: 'Root', forkedAtWallMs: null, reason: null },
+        {
+          spaceId: '22'.repeat(16),
+          name: 'Mid',
+          forkedAtWallMs: 1_650_000_000_000,
+          reason: 'Mid split from Root',
+        },
+      ],
+      selfSpaceId: '00'.repeat(16),
+      selfName: 'The Fork',
+      forkReason: 'Treasury split',
+    };
+    const descendants: ForkDescendantDto[] = [
+      {
+        forkSpaceId: '33'.repeat(16),
+        forkerAddr: 'ab'.repeat(16),
+        forkerDisplayName: null,
+        forkedAtWallMs: 1_716_000_000_000,
+        locallyKnown: false,
+        reason: 'Child wanted its own charter',
+      },
+      {
+        forkSpaceId: '44'.repeat(16),
+        forkerAddr: 'cd'.repeat(16),
+        forkerDisplayName: null,
+        forkedAtWallMs: 1_717_000_000_000,
+        locallyKnown: false,
+        reason: null, // pre-ZEB-649 event — no quote line
+      },
+    ];
+    const { container, getByText } = render(ForkLineageTree, {
+      props: { lineage, descendants, localNavIds: new Set<string>() },
+    });
+
+    expect(getByText('\u201CTreasury split\u201D')).toBeTruthy();
+    expect(getByText('\u201CMid split from Root\u201D')).toBeTruthy();
+    expect(getByText('\u201CChild wanted its own charter\u201D')).toBeTruthy();
+    // Exactly 3 reason lines: root ancestor + null-reason descendant render none.
+    expect(container.querySelectorAll('.node-reason')).toHaveLength(3);
   });
 });

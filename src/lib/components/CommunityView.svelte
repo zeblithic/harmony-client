@@ -457,6 +457,7 @@
           snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
           originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
           forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
+          forkReason={preForkSnapshot?.forkReason ?? null}
           {resolveCard}
           {resolveNickname}
           {onOpenCard}

@@ -137,8 +137,17 @@ fn hlc_cmp(
 pub struct ForkCommunityOpts {
     /// Display name for the new fork community.
     pub name: String,
+    /// ZEB-649: the forker's stated why — mandatory at this layer (no serde
+    /// default; the dialog always sends it). Validated non-empty and
+    /// ≤ MAX_MODERATION_REASON_CHARS before any state change. The wire
+    /// event carries it as `Option` purely for decode-compat with
+    /// pre-ZEB-649 events.
+    pub reason: String,
     /// If `true`, do NOT mint/publish a Fork event in the original.
     /// The fork is "silent" — original members won't see a fork annotation.
+    /// The reason is still required and still lands on the fork's own
+    /// lineage state: silent means "don't notify the parent", not
+    /// "the fork has no why".
     #[serde(default)]
     pub silent: bool,
     /// If `true`, additionally mint/publish a Leave event in the original
@@ -168,11 +177,18 @@ pub fn mint_fork_event(
     original_community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     fork_space_id: crate::owner_state_types::SpaceId,
+    reason: String,
     signing_key: &ed25519_dalek::SigningKey,
     hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
+
+    // ZEB-649 (CodeRabbit PR #434): validate at the function boundary, not
+    // just the IPC gate — mint_fork_event is pub, and a future caller must
+    // not be able to mint an empty/oversize reason that verify_event on
+    // every replica would then reject.
+    let reason = validate_fork_reason(&reason)?;
 
     let mut rng = rand::thread_rng();
     let mut event_id_bytes = [0u8; 16];
@@ -181,11 +197,33 @@ pub fn mint_fork_event(
     let payload = EventPayload {
         id: event_id_bytes,
         community_id: original_community_id,
-        kind: MembershipEventKind::Fork { fork_space_id },
+        kind: MembershipEventKind::Fork {
+            fork_space_id,
+            // ZEB-649: always Some for newly minted events; the Option is a
+            // decode-compat shape, not an invitation to mint without one.
+            reason: Some(reason),
+        },
         actor: self_owner,
         at: hlc,
     };
     sign_event(&payload, signing_key).map_err(|e| format!("sign fork: {e}"))
+}
+
+/// ZEB-649: pure validation for the mandatory fork reason. Trims, rejects
+/// empty, and enforces the same codepoint cap `verify_event` applies on
+/// inbound events (defense-in-depth twin). Returns the trimmed reason.
+pub fn validate_fork_reason(raw: &str) -> Result<String, String> {
+    let reason = raw.trim().to_string();
+    if reason.is_empty() {
+        return Err("fork reason must not be empty".to_string());
+    }
+    if reason.chars().count() > crate::community_membership::MAX_MODERATION_REASON_CHARS {
+        return Err(format!(
+            "fork reason exceeds {} characters",
+            crate::community_membership::MAX_MODERATION_REASON_CHARS
+        ));
+    }
+    Ok(reason)
 }
 
 /// Tauri IPC: fork a community the local node is currently Joined in.
@@ -212,6 +250,10 @@ pub async fn fork_community(
         .try_into()
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let original_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    // ZEB-649: reason is mandatory — validate before ANY state change so a
+    // rejected fork leaves nothing behind.
+    let reason = validate_fork_reason(&opts.reason)?;
 
     // Snapshot all needed handles from NodeState under a single std lock scope.
     let (
@@ -279,6 +321,7 @@ pub async fn fork_community(
         materialized,
         original_parent_lineage,
         original_forked_at_wall_ms,
+        original_fork_reason,
     ) = {
         let state_arc = original_engine.state();
         let state_g = state_arc.lock().await;
@@ -303,6 +346,10 @@ pub async fn fork_community(
         // can extend the chain into the new fork's PreForkSnapshot.
         let forker_parent_lineage = state_g.parent_lineage.clone();
         let forker_forked_at_wall_ms = state_g.forked_at_wall_ms;
+        // ZEB-649: the original's OWN fork_reason rides on its lineage
+        // entry (why IT split from its parent), keeping reasons stacked
+        // down the chain.
+        let forker_fork_reason = state_g.fork_reason.clone();
         // Derive original community name from owner-state crdt.
         let name = {
             let crdt_g = crdt_state.lock().await;
@@ -318,6 +365,7 @@ pub async fn fork_community(
             mat,
             forker_parent_lineage,
             forker_forked_at_wall_ms,
+            forker_fork_reason,
         )
     };
 
@@ -482,6 +530,7 @@ pub async fn fork_community(
         original_id,
         &original_name,
         original_forked_at_wall_ms,
+        original_fork_reason,
     );
 
     // Step 5: Build PreForkSnapshot (with correct fork_space_id already known).
@@ -495,6 +544,9 @@ pub async fn fork_community(
         // R1-1b: clone — we also mutate the new fork's CommunityState
         // below with this same chain.
         parent_lineage: new_parent_lineage.clone(),
+        // ZEB-649: THIS fork's why — joiners mirror it into their
+        // CommunityState.fork_reason at redeem-time.
+        fork_reason: Some(reason.clone()),
     };
 
     // Step 6 (pre-spawn): write pre_fork_snapshot.bin to the fork's data dir.
@@ -674,6 +726,9 @@ pub async fn fork_community(
         state_g.forked_from = Some(original_id);
         state_g.forked_at_wall_ms = Some(fork_hlc.wall_ms);
         state_g.parent_lineage = new_parent_lineage;
+        // ZEB-649: the fork's own why, for its lineage/divider UI and for
+        // the lineage entry it hands to ITS future forks.
+        state_g.fork_reason = Some(reason.clone());
     }
 
     // Generation fence (mirrors create_community_inner).
@@ -751,6 +806,7 @@ pub async fn fork_community(
                 original_id,
                 self_owner,
                 fork_space_id,
+                reason.clone(),
                 outbox_g.community_signing_key.as_ref(),
                 fork_event_hlc,
             ) {
@@ -1003,6 +1059,87 @@ mod tests {
             reply_to: None,
             sig: [0u8; 64],
         }
+    }
+
+    // ── ZEB-649: fork reason validation + mint threading ─────────────────
+
+    #[test]
+    fn validate_fork_reason_trims_and_accepts() {
+        assert_eq!(
+            validate_fork_reason("  Treasury split  "),
+            Ok("Treasury split".to_string())
+        );
+        let at_cap = "a".repeat(crate::community_membership::MAX_MODERATION_REASON_CHARS);
+        assert_eq!(validate_fork_reason(&at_cap), Ok(at_cap.clone()));
+    }
+
+    #[test]
+    fn validate_fork_reason_rejects_empty_and_oversize() {
+        assert!(validate_fork_reason("").is_err());
+        assert!(
+            validate_fork_reason("   \n\t ").is_err(),
+            "whitespace-only is empty"
+        );
+        let oversized = "a".repeat(crate::community_membership::MAX_MODERATION_REASON_CHARS + 1);
+        assert!(validate_fork_reason(&oversized).is_err());
+    }
+
+    #[test]
+    fn mint_fork_event_carries_reason_as_some() {
+        use crate::community_membership::MembershipEventKind;
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let event = mint_fork_event(
+            crate::owner_state_types::SpaceId([0xc0; 16]),
+            crate::owner_state_types::OwnerAddr([0xaa; 16]),
+            crate::owner_state_types::SpaceId([0xfa; 16]),
+            "Treasury split".to_string(),
+            &signing_key,
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        )
+        .expect("mint");
+
+        match &event.kind {
+            MembershipEventKind::Fork {
+                fork_space_id,
+                reason,
+            } => {
+                assert_eq!(
+                    *fork_space_id,
+                    crate::owner_state_types::SpaceId([0xfa; 16])
+                );
+                assert_eq!(reason.as_deref(), Some("Treasury split"));
+            }
+            other => panic!("expected Fork, got {other:?}"),
+        }
+    }
+
+    /// ZEB-649 (CodeRabbit PR #434): mint_fork_event validates at its own
+    /// boundary — a pub-fn caller skipping the IPC gate cannot mint an
+    /// event every replica's verify_event would reject.
+    #[test]
+    fn mint_fork_event_rejects_empty_reason() {
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let result = mint_fork_event(
+            crate::owner_state_types::SpaceId([0xc0; 16]),
+            crate::owner_state_types::OwnerAddr([0xaa; 16]),
+            crate::owner_state_types::SpaceId([0xfa; 16]),
+            "   ".to_string(),
+            &signing_key,
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]

@@ -20071,6 +20071,9 @@ pub struct ForkDescendantDto {
     /// Whether the descendant community is locally known
     /// (in the joiner's OwnerState). UI uses this to gate clickability.
     pub locally_known: bool,
+    /// ZEB-649: the forker's stated why, straight off the Fork event.
+    /// None for pre-ZEB-649 events (minted before the field existed).
+    pub reason: Option<String>,
 }
 
 /// Pure-helper for `list_community_forks` IPC: takes the engine state's
@@ -20118,10 +20121,11 @@ pub fn build_fork_descendants(
     let dtos: Vec<ForkDescendantDto> = fork_events
         .into_iter()
         .map(|signed| {
-            let fork_space_id = match &signed.kind {
-                crate::community_membership::MembershipEventKind::Fork { fork_space_id } => {
-                    fork_space_id
-                }
+            let (fork_space_id, reason) = match &signed.kind {
+                crate::community_membership::MembershipEventKind::Fork {
+                    fork_space_id,
+                    reason,
+                } => (fork_space_id, reason.clone()),
                 // Unreachable: filtered above.
                 _ => unreachable!("non-Fork event survived filter"),
             };
@@ -20141,6 +20145,7 @@ pub fn build_fork_descendants(
                 forker_display_name,
                 forked_at_wall_ms: signed.at.wall_ms,
                 locally_known: locally_known.contains(fork_space_id),
+                reason,
             }
         })
         .collect();
@@ -20257,6 +20262,10 @@ pub struct ParentLineageDto {
     /// wall_ms of this ancestor's fork-from-parent event; None for the
     /// root of the chain.
     pub forked_at_wall_ms: Option<u64>,
+    /// ZEB-649: the stated reason this ancestor forked from its
+    /// predecessor. None for the root, pre-ZEB-649 hops, and Phase 1
+    /// synthesized entries.
+    pub reason: Option<String>,
 }
 
 /// ZEB-287 Phase 2: lineage metadata returned by `get_community_lineage`
@@ -20296,6 +20305,10 @@ pub struct PhaseTwoCommunityLineageDto {
     pub self_space_id: String,
     /// This community's own display name.
     pub self_name: String,
+    /// ZEB-649: THIS community's own fork reason (why it split from
+    /// `forked_from`). None for top-level communities and pre-ZEB-649
+    /// forks. Drives the divider quote + self-card sub-line.
+    pub fork_reason: Option<String>,
 }
 
 /// Pure helper: project Phase 2 `CommunityState` lineage data into the
@@ -20307,6 +20320,7 @@ pub fn build_community_lineage_dto(
     forked_from: Option<crate::owner_state_types::SpaceId>,
     forked_at_wall_ms: Option<u64>,
     parent_lineage: &[crate::community_invite::ParentLineageEntry],
+    fork_reason: Option<String>,
 ) -> PhaseTwoCommunityLineageDto {
     PhaseTwoCommunityLineageDto {
         forked_from: forked_from.map(|s| hex::encode(s.0)),
@@ -20317,10 +20331,12 @@ pub fn build_community_lineage_dto(
                 space_id: hex::encode(e.space_id.0),
                 name: e.name.clone(),
                 forked_at_wall_ms: e.forked_at_wall_ms,
+                reason: e.reason.clone(),
             })
             .collect(),
         self_space_id: hex::encode(self_space_id.0),
         self_name,
+        fork_reason,
     }
 }
 
@@ -20390,13 +20406,14 @@ async fn get_community_lineage(
         )
     })?;
 
-    let (forked_from, forked_at_wall_ms, parent_lineage_clone, materialized) = {
+    let (forked_from, forked_at_wall_ms, parent_lineage_clone, fork_reason, materialized) = {
         let g = engine_state.lock().await;
         let mat = g.materialize_now(admin_addr);
         (
             g.forked_from,
             g.forked_at_wall_ms,
             g.parent_lineage.clone(),
+            g.fork_reason.clone(),
             mat,
         )
     };
@@ -20439,6 +20456,7 @@ async fn get_community_lineage(
                     // wall_ms of how THIS-parent-was-forked-from-its-parent
                     // is unknown for Phase 1 / single-hop synthesis; None.
                     forked_at_wall_ms: None,
+                    reason: None,
                 }]
             } else {
                 parent_lineage_clone
@@ -20453,6 +20471,7 @@ async fn get_community_lineage(
         forked_from,
         forked_at_wall_ms,
         &lineage_for_dto,
+        fork_reason,
     ))
 }
 
@@ -20474,6 +20493,7 @@ mod get_community_lineage_tests {
             Some(parent_id),
             None,
             &[], // empty parent_lineage = Phase 1 shape
+            None,
         );
 
         assert_eq!(dto.self_space_id, hex::encode(self_id.0));
@@ -20481,6 +20501,7 @@ mod get_community_lineage_tests {
         assert_eq!(dto.forked_from, Some(hex::encode(parent_id.0)));
         assert_eq!(dto.forked_at_wall_ms, None);
         assert!(dto.parent_lineage.is_empty());
+        assert_eq!(dto.fork_reason, None);
     }
 
     #[test]
@@ -20493,11 +20514,13 @@ mod get_community_lineage_tests {
                 space_id: SpaceId([0x11; 16]),
                 name: "Root".into(),
                 forked_at_wall_ms: None,
+                reason: None,
             },
             ParentLineageEntry {
                 space_id: SpaceId([0x22; 16]),
                 name: "Middle".into(),
                 forked_at_wall_ms: Some(1_700_000_000_000),
+                reason: Some("Middle split from Root".into()),
             },
         ];
 
@@ -20507,6 +20530,7 @@ mod get_community_lineage_tests {
             Some(parent_id),
             Some(1_710_000_000_000),
             &lineage,
+            Some("MyFork split from parent".into()),
         );
 
         assert_eq!(dto.self_space_id, hex::encode(self_id.0));
@@ -20520,12 +20544,19 @@ mod get_community_lineage_tests {
             dto.parent_lineage[1].forked_at_wall_ms,
             Some(1_700_000_000_000)
         );
+        // ZEB-649: reasons project through — per-hop and self.
+        assert_eq!(dto.parent_lineage[0].reason, None);
+        assert_eq!(
+            dto.parent_lineage[1].reason.as_deref(),
+            Some("Middle split from Root")
+        );
+        assert_eq!(dto.fork_reason.as_deref(), Some("MyFork split from parent"));
     }
 
     #[test]
     fn build_community_lineage_dto_top_level_community() {
         let self_id = SpaceId([0x88; 16]);
-        let dto = build_community_lineage_dto(self_id, "Top".into(), None, None, &[]);
+        let dto = build_community_lineage_dto(self_id, "Top".into(), None, None, &[], None);
 
         assert_eq!(dto.forked_from, None);
         assert_eq!(dto.forked_at_wall_ms, None);
@@ -20607,6 +20638,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 caller,
                 200,
@@ -20639,6 +20671,56 @@ mod list_community_forks_tests {
         assert_eq!(result[0].forker_addr, hex::encode(caller.0));
         assert_eq!(result[0].forked_at_wall_ms, 200);
         assert!(result[0].locally_known);
+        assert_eq!(
+            result[0].reason, None,
+            "pre-ZEB-649 event (no rs) projects reason: None"
+        );
+    }
+
+    /// ZEB-649: a Fork event carrying a reason projects it onto the DTO
+    /// verbatim; a reason-less (pre-ZEB-649) event projects None. Both
+    /// shapes coexist in one log.
+    #[test]
+    fn list_community_forks_projects_reason() {
+        let cid = SpaceId([0xac; 16]);
+        let caller = OwnerAddr([0xc2; 16]);
+
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            synth_signed(
+                0x01,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xf3; 16]),
+                    reason: Some("Treasury split".to_string()),
+                },
+                caller,
+                100,
+            ),
+        );
+        events.insert(
+            [0x02; 16],
+            synth_signed(
+                0x02,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xf4; 16]),
+                    reason: None,
+                },
+                caller,
+                200,
+            ),
+        );
+
+        let materialized = materialized_with_join(caller, MemberStatus::Joined);
+        let locally_known: BTreeSet<SpaceId> = BTreeSet::new();
+
+        let result = build_fork_descendants(&events, &materialized, &locally_known, caller)
+            .expect("Joined caller must succeed");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].reason.as_deref(), Some("Treasury split"));
+        assert_eq!(result[1].reason, None);
     }
 
     #[test]
@@ -20657,6 +20739,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 caller,
                 200,
@@ -20686,6 +20769,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 forker,
                 200,
@@ -20723,6 +20807,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 caller,
                 200,
@@ -20751,6 +20836,7 @@ mod list_community_forks_tests {
                 cid,
                 MembershipEventKind::Fork {
                     fork_space_id: fork_dest,
+                    reason: None,
                 },
                 caller,
                 200,
@@ -20783,7 +20869,10 @@ mod list_community_forks_tests {
             synth_signed(
                 0x01,
                 cid,
-                MembershipEventKind::Fork { fork_space_id: f_a },
+                MembershipEventKind::Fork {
+                    fork_space_id: f_a,
+                    reason: None,
+                },
                 caller,
                 200,
             ),
@@ -20793,7 +20882,10 @@ mod list_community_forks_tests {
             synth_signed(
                 0x02,
                 cid,
-                MembershipEventKind::Fork { fork_space_id: f_b },
+                MembershipEventKind::Fork {
+                    fork_space_id: f_b,
+                    reason: None,
+                },
                 caller,
                 100,
             ),
@@ -20803,7 +20895,10 @@ mod list_community_forks_tests {
             synth_signed(
                 0x03,
                 cid,
-                MembershipEventKind::Fork { fork_space_id: f_c },
+                MembershipEventKind::Fork {
+                    fork_space_id: f_c,
+                    reason: None,
+                },
                 caller,
                 300,
             ),
@@ -20843,6 +20938,7 @@ mod list_community_forks_tests {
                 community_id: cid,
                 kind: MembershipEventKind::Fork {
                     fork_space_id: f_high,
+                    reason: None,
                 },
                 actor: caller,
                 at: Hlc {
@@ -20862,6 +20958,7 @@ mod list_community_forks_tests {
                 community_id: cid,
                 kind: MembershipEventKind::Fork {
                     fork_space_id: f_low,
+                    reason: None,
                 },
                 actor: caller,
                 at: Hlc {
@@ -28598,6 +28695,10 @@ where
                 let mut capped_lineage = snapshot.parent_lineage.clone();
                 crate::community_invite::apply_lineage_cap(&mut capped_lineage);
                 state_g.parent_lineage = capped_lineage;
+                // ZEB-649: mirror the fork's why (None for pre-ZEB-649
+                // snapshots), bounded at the codepoint cap — the snapshot
+                // bypasses the membership-event verify path.
+                state_g.fork_reason = bound_fork_reason(snapshot.fork_reason.as_ref());
             }
         } else {
             tracing::warn!(
@@ -29699,6 +29800,7 @@ mod redeem_invite_inner_tests {
                 device_id: "fork-dev".into(),
             },
             parent_lineage: Vec::new(),
+            fork_reason: None,
         };
 
         let invite_payload = CommunityInvitePayload {
@@ -29804,11 +29906,14 @@ mod redeem_invite_inner_tests {
             space_id: SpaceId([0xc0; 16]),
             name: "Grandparent C".into(),
             forked_at_wall_ms: None, // C is root of the chain
+            reason: None,
         };
         let b_entry = crate::community_invite::ParentLineageEntry {
             space_id: SpaceId([0xb0; 16]),
             name: "Parent-of-parent B".into(),
             forked_at_wall_ms: Some(1_650_000_000_000),
+            // ZEB-649: per-hop reason must mirror through verbatim.
+            reason: Some("B split from C over governance".into()),
         };
 
         let snapshot = crate::community_invite::PreForkSnapshot {
@@ -29825,6 +29930,9 @@ mod redeem_invite_inner_tests {
                 device_id: "fork-dev".into(),
             },
             parent_lineage: vec![c_entry.clone(), b_entry.clone()],
+            // ZEB-649: the fork's own why must mirror into
+            // CommunityState.fork_reason at redeem.
+            fork_reason: Some("Treasury split".into()),
         };
 
         let invite_payload = CommunityInvitePayload {
@@ -29895,7 +30003,13 @@ mod redeem_invite_inner_tests {
         assert_eq!(
             state_g.parent_lineage,
             vec![c_entry, b_entry],
-            "ZEB-287: parent_lineage must mirror snapshot.parent_lineage"
+            "ZEB-287: parent_lineage must mirror snapshot.parent_lineage \
+             (ZEB-649: including per-hop reasons)"
+        );
+        assert_eq!(
+            state_g.fork_reason.as_deref(),
+            Some("Treasury split"),
+            "ZEB-649: fork_reason must mirror snapshot.fork_reason"
         );
     }
 
@@ -29932,6 +30046,7 @@ mod redeem_invite_inner_tests {
                 device_id: "phase1-dev".into(),
             },
             parent_lineage: Vec::new(), // Phase 1 default
+            fork_reason: None,
         };
 
         let invite_payload = CommunityInvitePayload {
@@ -32620,6 +32735,18 @@ mod library_directory_lww_tests {
 /// — suitable for the settings panel (opened rarely) but callers should
 /// not call this in a hot path. The full snapshot body (channel events) is
 /// decoded then dropped; only the lightweight header fields are returned.
+/// ZEB-649 (CodeRabbit PR #434): bound a snapshot-supplied fork reason to
+/// the codepoint cap. Snapshot files/payloads bypass `verify_event`, so
+/// truncate rather than trust verbatim — one helper so the cap semantics
+/// can't drift between the redeem mirror and the two snapshot DTOs.
+fn bound_fork_reason(reason: Option<&String>) -> Option<String> {
+    reason.map(|r| {
+        r.chars()
+            .take(crate::community_membership::MAX_MODERATION_REASON_CHARS)
+            .collect()
+    })
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkSnapshotMetadataDto {
@@ -32629,6 +32756,9 @@ pub struct ForkSnapshotMetadataDto {
     pub forked_at_ms: u64,
     /// Total message count captured in the snapshot (after §4.2 trim).
     pub snapshot_message_count: usize,
+    /// ZEB-649: the forker's stated why — drives the divider quote.
+    /// None for pre-ZEB-649 snapshots.
+    pub fork_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -32679,6 +32809,7 @@ async fn get_fork_snapshot_metadata(
         original_community_name: snapshot.original_community_name,
         forked_at_ms: snapshot.forked_at.wall_ms,
         snapshot_message_count,
+        fork_reason: bound_fork_reason(snapshot.fork_reason.as_ref()),
     }))
 }
 
@@ -32697,6 +32828,9 @@ async fn get_fork_snapshot_metadata(
 pub struct PreForkSnapshotDto {
     pub original_community_name: String,
     pub forked_at_ms: u64,
+    /// ZEB-649: the forker's stated why — divider quote. None for
+    /// pre-ZEB-649 snapshots.
+    pub fork_reason: Option<String>,
     /// Per-channel snapshot messages. Key = channel-id hex (32 chars),
     /// value = messages sorted HLC ascending.
     pub channel_log: std::collections::BTreeMap<
@@ -32834,6 +32968,7 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
     Ok(Some(PreForkSnapshotDto {
         original_community_name: snapshot.original_community_name,
         forked_at_ms: snapshot.forked_at.wall_ms,
+        fork_reason: bound_fork_reason(snapshot.fork_reason.as_ref()),
         channel_log,
     }))
 }
@@ -54914,6 +55049,7 @@ mod generate_invite_helper_tests {
                 device_id: "fork-dev".into(),
             },
             parent_lineage: Vec::new(),
+            fork_reason: None,
         };
 
         let payload = CommunityInvitePayload {

@@ -103,4 +103,17 @@ describe('buildUnifiedTimeline', () => {
     expect(msgs[2].msg.at).toMatchObject({ wallMs: 100, logical: 1, deviceId: 'aaa' });
     expect(msgs[3].msg.at).toMatchObject({ wallMs: 200, logical: 0, deviceId: 'aaa' });
   });
+
+  it('ZEB-649: divider carries forkReason when provided, null by default', () => {
+    const pre = [makeMsg(100)];
+    const live = [makeMsg(200)];
+    const withReason = buildUnifiedTimeline(pre, live, 'Origin', 150, 'Treasury split');
+    const divider = withReason.find((r) => 'kind' in r);
+    expect(divider && 'forkReason' in divider ? divider.forkReason : undefined).toBe(
+      'Treasury split',
+    );
+    const without = buildUnifiedTimeline(pre, live, 'Origin', 150);
+    const divider2 = without.find((r) => 'kind' in r);
+    expect(divider2 && 'forkReason' in divider2 ? divider2.forkReason : undefined).toBeNull();
+  });
 });

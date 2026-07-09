@@ -239,6 +239,7 @@ async fn run_fork_inner(
             original_community_id,
             "test-community",
             state_g.forked_at_wall_ms,
+            state_g.fork_reason.clone(),
         )
     };
     {
@@ -275,6 +276,7 @@ async fn run_fork_inner(
         // subsequent fork of THIS fork reads correct ancestry through
         // the invite path too.
         parent_lineage: new_parent_lineage,
+        fork_reason: None,
     };
 
     // Write snapshot to disk atomically.
@@ -295,6 +297,7 @@ async fn run_fork_inner(
             original_community_id,
             forker_addr,
             fork_space_id,
+            "integration-test fork reason".to_string(),
             signing_key.as_ref(),
             test_hlc(
                 std::time::SystemTime::now()
@@ -571,7 +574,7 @@ async fn visible_fork_announces_in_original_log() {
     let engine_a = engines.registry_a.engine_arc(&community_id).await.unwrap();
     let state_a = engine_a.state().lock().await.clone();
     let has_fork = state_a.events.values().any(|e| {
-        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid } if *fid == fork_space_id)
+        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. } if *fid == fork_space_id)
     });
     assert!(
         has_fork,
@@ -603,7 +606,7 @@ async fn visible_fork_announces_in_original_log() {
 
     let state_b = engine_b.state().lock().await.clone();
     let b_has_fork = state_b.events.values().any(|e| {
-        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid } if *fid == fork_space_id)
+        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. } if *fid == fork_space_id)
     });
     assert!(
         b_has_fork,
@@ -905,7 +908,7 @@ async fn also_leave_emits_fork_and_leave_events() {
     let state = engine_a.state().lock().await.clone();
 
     let has_fork = state.events.values().any(|e| {
-        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid }
+        matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. }
             if *fid == result.fork_space_id)
     });
     let has_leave = state
@@ -1033,6 +1036,7 @@ fn dual_keyset_verify_snapshot_events() {
         identity_pubs,
         forked_at: test_hlc(1_700_000_002_000, 0, "a-dev"),
         parent_lineage: Vec::new(),
+        fork_reason: None,
     };
 
     // Each event must verify against the snapshot's identity_pubs.
@@ -1096,7 +1100,8 @@ fn three_deep_fork_chain_preserves_lineage_through_snapshot() {
     let b_id = SpaceId([0x22; 16]);
     let b_name = "B";
     let b_forked_at = Some(1_700_000_000_000u64);
-    let b_lineage: Vec<ParentLineageEntry> = build_parent_lineage(&[], c_id, c_name, c_forked_at);
+    let b_lineage: Vec<ParentLineageEntry> =
+        build_parent_lineage(&[], c_id, c_name, c_forked_at, None);
     assert_eq!(b_lineage.len(), 1);
     assert_eq!(b_lineage[0].space_id, c_id);
     assert_eq!(b_lineage[0].forked_at_wall_ms, None);
@@ -1106,7 +1111,7 @@ fn three_deep_fork_chain_preserves_lineage_through_snapshot() {
     //                              B.id, B.name, B.forked_at_wall_ms)
     //                         = [C-entry, B-entry]
     let a_fork_id = SpaceId([0x33; 16]);
-    let a_fork_lineage = build_parent_lineage(&b_lineage, b_id, b_name, b_forked_at);
+    let a_fork_lineage = build_parent_lineage(&b_lineage, b_id, b_name, b_forked_at, None);
     assert_eq!(a_fork_lineage.len(), 2);
     assert_eq!(a_fork_lineage[0].space_id, c_id);
     assert_eq!(a_fork_lineage[0].name, "C");
@@ -1119,7 +1124,7 @@ fn three_deep_fork_chain_preserves_lineage_through_snapshot() {
     //   A_fork_2.parent_lineage = [C-entry, B-entry, A_fork-entry]
     let a_fork_forked_at = Some(1_710_000_000_000u64);
     let a_fork_2_lineage =
-        build_parent_lineage(&a_fork_lineage, a_fork_id, "A_fork", a_fork_forked_at);
+        build_parent_lineage(&a_fork_lineage, a_fork_id, "A_fork", a_fork_forked_at, None);
     assert_eq!(a_fork_2_lineage.len(), 3);
     assert_eq!(a_fork_2_lineage[0].name, "C");
     assert_eq!(a_fork_2_lineage[1].name, "B");
@@ -1143,6 +1148,7 @@ fn lineage_depth_cap_truncates_root_side_through_fork_path() {
             space_id: SpaceId([i; 16]),
             name: format!("ancestor_{i}"),
             forked_at_wall_ms: if i == 0 { None } else { Some(i as u64) },
+            reason: None,
         })
         .collect();
     assert_eq!(forker_lineage.len(), 16);
@@ -1154,8 +1160,13 @@ fn lineage_depth_cap_truncates_root_side_through_fork_path() {
     let forker_forked_at = Some(1_800_000_000_000u64);
 
     // Drive the SHARED helper — same code path as production.
-    let new_lineage =
-        build_parent_lineage(&forker_lineage, forker_id, forker_name, forker_forked_at);
+    let new_lineage = build_parent_lineage(
+        &forker_lineage,
+        forker_id,
+        forker_name,
+        forker_forked_at,
+        None,
+    );
 
     assert_eq!(new_lineage.len(), 16);
     // After cap: ancestor_0 dropped; first entry is ancestor_1.
@@ -1181,6 +1192,7 @@ fn phase1_snapshot_redeems_with_default_lineage() {
         identity_pubs: std::collections::BTreeMap::new(),
         forked_at: test_hlc(1_710_000_000_000, 0, "phase1-dev"),
         parent_lineage: Vec::new(), // Phase 1 default — empty
+        fork_reason: None,
     };
 
     // Encode as Phase 1 would (because skip-if-empty drops the `pl` key).

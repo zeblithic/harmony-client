@@ -107,6 +107,7 @@
           <span class="node-body">
             <span class="node-name">&#x21B3; {nameOrId(entry.name, entry.spaceId)}</span>
             {#if entry.forkedAtWallMs != null}<span class="node-sub">forked {formatDate(entry.forkedAtWallMs)}</span>{/if}
+            {#if entry.reason}<span class="node-reason">“{entry.reason}”</span>{/if}
           </span>
         </button>
       {:else}
@@ -115,6 +116,7 @@
           <span class="node-body">
             <span class="node-name">&#x21B3; {nameOrId(entry.name, entry.spaceId)}</span>
             {#if entry.forkedAtWallMs != null}<span class="node-sub">forked {formatDate(entry.forkedAtWallMs)}</span>{/if}
+            {#if entry.reason}<span class="node-reason">“{entry.reason}”</span>{/if}
           </span>
         </span>
       {/if}
@@ -134,6 +136,7 @@
       <span class="node-body">
         <span class="node-name">{nameOrId(lineage.selfName, lineage.selfSpaceId)}</span>
         <span class="node-sub">{selfSub}</span>
+        {#if lineage.forkReason}<span class="node-reason">“{lineage.forkReason}”</span>{/if}
       </span>
       <span class="lineage-badge you-here"><span aria-hidden="true">&#x25CF;</span> You are here</span>
     </span>
@@ -157,6 +160,7 @@
           <span class="node-body">
             <span class="node-name">&#x21B3; {display}</span>
             <span class="node-sub">forked {formatDate(desc.forkedAtWallMs)} · by {forker}</span>
+            {#if desc.reason}<span class="node-reason">“{desc.reason}”</span>{/if}
           </span>
           <span class="lineage-badge member"><span aria-hidden="true">&#x2713;</span> Member</span>
         </button>
@@ -166,6 +170,7 @@
           <span class="node-body">
             <span class="node-name">&#x21B3; {display}</span>
             <span class="node-sub">forked {formatDate(desc.forkedAtWallMs)} · by {forker}</span>
+            {#if desc.reason}<span class="node-reason">“{desc.reason}”</span>{/if}
           </span>
           <span class="lineage-badge not-joined">not joined</span>
         </span>
@@ -254,6 +259,13 @@
     font-family: var(--font-mono);
     font-size: 0.68rem;
     color: var(--faint);
+  }
+  .node-reason {
+    /* ZEB-649: the quoted fork "why" — clay lead per the Commons fork
+       accent (structural, never a dispute signal). */
+    font-size: 0.75rem;
+    font-style: italic;
+    color: var(--gov-clay-deep);
   }
   .lineage-badge {
     margin-left: auto;

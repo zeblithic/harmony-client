@@ -68,6 +68,14 @@ pub struct CommunityState {
     #[serde(rename = "fl", skip_serializing_if = "Vec::is_empty", default)]
     pub parent_lineage: Vec<crate::community_invite::ParentLineageEntry>,
 
+    /// ZEB-649: the forker's stated reason for creating THIS community
+    /// (why it split from `forked_from`). Set once at fork creation
+    /// (local-fork path) or mirrored from `PreForkSnapshot.fork_reason`
+    /// at redeem-time (joiner path). `None` for top-level communities and
+    /// for forks minted before ZEB-649. Byte-compatible (omitted when None).
+    #[serde(rename = "fr", skip_serializing_if = "Option::is_none", default)]
+    pub fork_reason: Option<String>,
+
     /// ZEB-250: M-of-N admin quorum. Number of admin-tier signatures
     /// required for admin-affecting actions (SetPower to/from 100,
     /// Kick of an admin, change of admin_quorum itself).
@@ -147,6 +155,7 @@ impl Clone for CommunityState {
             forked_from: self.forked_from,
             forked_at_wall_ms: self.forked_at_wall_ms,
             parent_lineage: self.parent_lineage.clone(),
+            fork_reason: self.fork_reason.clone(),
             admin_quorum: self.admin_quorum,
             events: self.events.clone(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
@@ -163,6 +172,7 @@ impl PartialEq for CommunityState {
             && self.forked_from == other.forked_from
             && self.forked_at_wall_ms == other.forked_at_wall_ms
             && self.parent_lineage == other.parent_lineage
+            && self.fork_reason == other.fork_reason
             && self.admin_quorum == other.admin_quorum
             && self.events == other.events
     }
@@ -195,6 +205,7 @@ impl CommunityState {
             forked_from: None,
             forked_at_wall_ms: None,
             parent_lineage: Vec::new(),
+            fork_reason: None,
             admin_quorum: 1,
             events: BTreeMap::new(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),

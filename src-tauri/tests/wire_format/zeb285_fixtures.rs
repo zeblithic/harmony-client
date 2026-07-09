@@ -89,7 +89,10 @@ fn fixture_signed_event_zeb285(kind: MembershipEventKind) -> SignedMembershipEve
 #[test]
 fn fork_event_canonical_cbor_pinned() {
     let fork_space_id = SpaceId([0xfa; 16]);
-    let signed = fixture_signed_event_zeb285(MembershipEventKind::Fork { fork_space_id });
+    let signed = fixture_signed_event_zeb285(MembershipEventKind::Fork {
+        fork_space_id,
+        reason: None,
+    });
 
     let bytes = canonical_cbor_encode(&signed).expect("encode");
     let hex = hex::encode(&bytes);
@@ -97,6 +100,107 @@ fn fork_event_canonical_cbor_pinned() {
 
     let expected_hex = "a6626964504242424242424242424242424242424262636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626b6ea2627467617862766ca162667350fafafafafafafafafafafafafafafafa62616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa626174a361771b0000018bcfe56800616c0061646b746573742d6465766963656273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     assert_eq!(hex, expected_hex, "Fork event wire format changed");
+}
+
+/// ZEB-649 compat proof: the pre-ZEB-649 pinned Fork bytes (Fixture 1's
+/// hex, minted before `reason` existed) must decode with `reason: None`
+/// and re-encode BYTE-IDENTICALLY. This is exactly the round-trip
+/// `verify_signature` performs (decode → re-encode → verify_strict), so
+/// this test failing means every pre-ZEB-649 Fork event's signature would
+/// break. Do not "fix" this test by re-pinning — fix the serde shape.
+#[test]
+fn fork_event_pre_zeb649_bytes_decode_reason_none_and_reencode_identical() {
+    let pre_zeb649_hex = "a6626964504242424242424242424242424242424262636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626b6ea2627467617862766ca162667350fafafafafafafafafafafafafafafafa62616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa626174a361771b0000018bcfe56800616c0061646b746573742d6465766963656273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let bytes = hex::decode(pre_zeb649_hex).expect("hex");
+
+    let decoded: SignedMembershipEvent =
+        canonical_cbor_decode(&bytes).expect("pre-ZEB-649 Fork event must still decode");
+    match &decoded.kind {
+        MembershipEventKind::Fork {
+            fork_space_id,
+            reason,
+        } => {
+            assert_eq!(*fork_space_id, SpaceId([0xfa; 16]));
+            assert_eq!(*reason, None, "absent rs key must decode to None");
+        }
+        other => panic!("expected Fork, got {other:?}"),
+    }
+
+    let reencoded = canonical_cbor_encode(&decoded).expect("re-encode");
+    assert_eq!(
+        hex::encode(&reencoded),
+        pre_zeb649_hex,
+        "re-encode of a pre-ZEB-649 Fork event must be byte-identical \
+         (signature re-verification depends on it)"
+    );
+}
+
+/// ZEB-649 Fixture 1b: pins the canonical-CBOR bytes of a signed Fork
+/// event WITH a reason (`rs` key present inside `vl`).
+#[test]
+fn fork_event_with_reason_canonical_cbor_pinned() {
+    let signed = fixture_signed_event_zeb285(MembershipEventKind::Fork {
+        fork_space_id: SpaceId([0xfa; 16]),
+        reason: Some("Treasury split".to_string()),
+    });
+
+    let bytes = canonical_cbor_encode(&signed).expect("encode");
+    let hex = hex::encode(&bytes);
+    eprintln!("fork_event_with_reason_canonical_cbor_pinned hex: {hex}");
+
+    let expected_hex = "a6626964504242424242424242424242424242424262636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626b6ea2627467617862766ca262667350fafafafafafafafafafafafafafafafa6272736e54726561737572792073706c697462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa626174a361771b0000018bcfe56800616c0061646b746573742d6465766963656273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    assert_eq!(hex, expected_hex, "Fork-with-reason wire format changed");
+}
+
+/// ZEB-649: structural pins for the reason fields — `fr` on PreForkSnapshot
+/// (top-level), `rs` on ParentLineageEntry, `fr` on CommunityState — present
+/// when Some, ABSENT when None (the absence is the wire-compat guarantee;
+/// the untouched pre-ZEB-649 pinned fixtures in this file prove the None
+/// case byte-exactly).
+#[test]
+fn zeb649_reason_fields_present_when_some_absent_when_none() {
+    // PreForkSnapshot.fork_reason → top-level "fr".
+    let mut snapshot = PreForkSnapshot {
+        original_community_id: SpaceId([0xa0; 16]),
+        original_community_name: "Pinned".to_string(),
+        membership_events: vec![],
+        channel_log: BoundedChannelLogSnapshot::default(),
+        identity_pubs: BTreeMap::new(),
+        forked_at: fixture_hlc(),
+        parent_lineage: Vec::new(),
+        fork_reason: Some("Treasury split".to_string()),
+    };
+    let bytes = canonical_cbor_encode(&snapshot).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &["fr"], &[], "snapshot with fork_reason");
+    snapshot.fork_reason = None;
+    let bytes = canonical_cbor_encode(&snapshot).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &[], &["fr"], "snapshot without fork_reason");
+
+    // ParentLineageEntry.reason → "rs".
+    let mut entry = ParentLineageEntry {
+        space_id: SpaceId([0x11; 16]),
+        name: "Root".to_string(),
+        forked_at_wall_ms: Some(1),
+        reason: Some("split over governance".to_string()),
+    };
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &["rs"], &[], "entry with reason");
+    let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, entry);
+    entry.reason = None;
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &[], &["rs"], "entry without reason");
+
+    // CommunityState.fork_reason → "fr", roundtrips.
+    let mut state = CommunityState::new(SpaceId([0xcc; 16]));
+    state.fork_reason = Some("Treasury split".to_string());
+    let bytes = canonical_cbor_encode(&state).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &["fr"], &[], "state with fork_reason");
+    let decoded: CommunityState = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded.fork_reason.as_deref(), Some("Treasury split"));
+    state.fork_reason = None;
+    let bytes = canonical_cbor_encode(&state).expect("encode");
+    assert_cbor_top_level_keys(&bytes, &[], &["fr"], "state without fork_reason");
 }
 
 /// Fixture 2: pins the canonical-CBOR bytes of a minimal PreForkSnapshot.
@@ -115,6 +219,7 @@ fn pre_fork_snapshot_canonical_cbor_pinned() {
         // ZEB-287 Phase 2: empty lineage → skip-if-empty drops `pl` key,
         // preserving Phase 1 byte-identity for this fixture.
         parent_lineage: Vec::new(),
+        fork_reason: None,
     };
 
     let bytes = canonical_cbor_encode(&snapshot).expect("encode");
@@ -143,6 +248,7 @@ fn community_invite_with_fork_fields_pinned() {
         // ZEB-287 Phase 2: empty lineage → skip-if-empty preserves Phase 1
         // byte-identity for this fixture.
         parent_lineage: Vec::new(),
+        fork_reason: None,
     };
 
     let payload = CommunityInvitePayload {
@@ -196,6 +302,7 @@ fn parent_lineage_entry_canonical_cbor() {
         space_id: SpaceId([0x42; 16]),
         name: "Cool Community".to_string(),
         forked_at_wall_ms: Some(1_715_811_234_567),
+        reason: None,
     };
     let bytes = canonical_cbor_encode(&entry).expect("encode");
     let hex = hex::encode(&bytes);
@@ -213,6 +320,7 @@ fn parent_lineage_entry_root_omits_at_canonical_cbor() {
         space_id: SpaceId([0x11; 16]),
         name: "Root".to_string(),
         forked_at_wall_ms: None,
+        reason: None,
     };
     let bytes = canonical_cbor_encode(&entry).expect("encode");
     let hex = hex::encode(&bytes);
@@ -240,13 +348,16 @@ fn pre_fork_snapshot_with_parent_lineage_canonical_cbor() {
                 space_id: SpaceId([0x11; 16]),
                 name: "Root".to_string(),
                 forked_at_wall_ms: None,
+                reason: None,
             },
             ParentLineageEntry {
                 space_id: SpaceId([0x22; 16]),
                 name: "Mid".to_string(),
                 forked_at_wall_ms: Some(1_650_000_000_000),
+                reason: None,
             },
         ],
+        fork_reason: None,
     };
 
     let bytes = canonical_cbor_encode(&snapshot).expect("encode");
@@ -276,6 +387,7 @@ fn community_state_with_parent_lineage_canonical_cbor() {
         space_id: SpaceId([0x11; 16]),
         name: "Root".to_string(),
         forked_at_wall_ms: None,
+        reason: None,
     }];
 
     let bytes = canonical_cbor_encode(&state).expect("encode");

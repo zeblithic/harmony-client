@@ -256,6 +256,7 @@ mod zeb287_lineage_fields {
             space_id: SpaceId([0x11; 16]),
             name: "Project Cool".to_string(),
             forked_at_wall_ms: None,
+            reason: None,
         }];
 
         let bytes = canonical_cbor_encode(&state).expect("encode");
@@ -272,11 +273,13 @@ mod zeb287_lineage_fields {
                 space_id: SpaceId([0x11; 16]),
                 name: "C".to_string(),
                 forked_at_wall_ms: None,
+                reason: None,
             },
             ParentLineageEntry {
                 space_id: SpaceId([0x22; 16]),
                 name: "B".to_string(),
                 forked_at_wall_ms: Some(123_456),
+                reason: None,
             },
         ];
         state.forked_at_wall_ms = Some(789_012);

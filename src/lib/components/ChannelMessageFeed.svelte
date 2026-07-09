@@ -42,6 +42,8 @@
     originalCommunityName = '',
     /** ZEB-285 Task 11: wall-clock ms of the fork point (for the divider label). */
     forkedAtMs = 0,
+    /** ZEB-649: the forker's stated why, quoted on the divider band. */
+    forkReason = null,
     /**
      * ZEB-291 Phase 1.5 chat dispatch — optional voting adapter. When
      * provided, poll-kind messages (`msg.kind === 'poll'`) render an
@@ -75,6 +77,7 @@
     snapshotMessages?: ChannelMessageDto[];
     originalCommunityName?: string;
     forkedAtMs?: number;
+    forkReason?: string | null;
     votingAdapter?: VotingAdapter;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
     resolveNickname?: (ownerIdHex: string) => string | undefined;
@@ -98,7 +101,7 @@
   // Unified timeline: snapshot (pre-fork) + live messages merged HLC-ascending.
   // Re-derived whenever messages or snapshotMessages change.
   let timeline = $derived<TimelineRow[]>(
-    buildUnifiedTimeline(snapshotMessages, messages, originalCommunityName, forkedAtMs),
+    buildUnifiedTimeline(snapshotMessages, messages, originalCommunityName, forkedAtMs, forkReason),
   );
   let scrollAtBottom = $state(true);
   let scrollAtTop = $state(false);
@@ -907,6 +910,9 @@
           <span class="fork-divider-glyph" aria-hidden="true">⑂</span>
           <span class="fork-divider-text">
             <span class="fork-divider-title">Forked from {row.originalCommunityName}</span>
+            {#if row.forkReason}
+              <span class="fork-divider-reason">“{row.forkReason}”</span>
+            {/if}
             <span class="fork-divider-meta">{new Date(row.forkedAtMs).toLocaleDateString()} · {snapshotMessages.length} message{snapshotMessages.length === 1 ? '' : 's'} carried</span>
           </span>
         </div>
@@ -1516,6 +1522,15 @@
     font-family: var(--font-mono);
     font-size: 0.7rem;
     color: var(--text-muted);
+  }
+  .fork-divider-reason {
+    /* ZEB-649: the forker's quoted why — clay lead, per the Commons
+       fork-accent convention (structural, not a dispute signal). */
+    display: block;
+    font-size: 0.8rem;
+    font-style: italic;
+    color: var(--gov-clay-deep);
+    margin: 2px 0;
   }
   /* Pre-fork messages rendered with muted opacity to visually distinguish
    * them from live post-fork messages per spec §6.4. */
