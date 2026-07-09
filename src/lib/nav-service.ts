@@ -1,5 +1,6 @@
 import type { TauriAdapter, ProfilePayload } from './zenoh-service';
 import type { NavNode, NavNodeType, Profile } from './types';
+import type { ChannelInfo } from './community-service';
 import type { AvatarResolver } from './avatar-resolver';
 import { navNodes as mockNavNodes, profileStore as mockProfileStore } from './mock-data';
 
@@ -200,7 +201,8 @@ export class NavService {
     if (kind === 'community') {
       if (action === 'removed') {
         const before = this.nodes.length;
-        this.nodes = this.nodes.filter((n) => n.id !== spaceId);
+        // ZEB-663: a community's channel children are removed with it.
+        this.nodes = this.nodes.filter((n) => n.id !== spaceId && n.parentId !== spaceId);
         if (this.nodes.length !== before) this.onChange?.();
         return;
       }
@@ -356,6 +358,84 @@ export class NavService {
         this.nodes = [...this.nodes, newNode];
       }
     }
+    this.onChange?.();
+  }
+
+  /**
+   * ZEB-663: reconcile a community's channel children against a live
+   * (deleted-filtered) `ChannelInfo[]`. Rebuilds the child block in
+   * `listChannels` order (backend sorts created_at asc, general-first),
+   * preserving each survivor's `mentionCount`/`expanded`. Removed channels'
+   * mentions are subtracted from the community bubble so the sum invariant
+   * holds. Fires `onChange()` once iff the tree actually changed (an
+   * idempotent re-sync is silent, so a community switch doesn't re-render).
+   */
+  setChannels(communityId: string, channels: ChannelInfo[]): void {
+    const community = this.nodes.find(
+      (n) => n.id === communityId && n.type === 'community',
+    );
+    if (!community) return; // no community node to attach to → nothing to do
+
+    const prev = new Map(
+      this.nodes
+        .filter((n) => n.parentId === communityId && n.type === 'channel')
+        .map((n) => [n.id, n] as const),
+    );
+
+    // Detect structural change (id set, names, or kinds differ).
+    let changed = prev.size !== channels.length;
+    if (!changed) {
+      for (const info of channels) {
+        const old = prev.get(info.channelId);
+        if (!old || old.name !== info.name || old.channelKind !== info.kind) {
+          changed = true;
+          break;
+        }
+      }
+    }
+
+    // Mentions on channels absent from the incoming set must leave the bubble.
+    const nextIds = new Set(channels.map((c) => c.channelId));
+    let removedMentions = 0;
+    for (const [id, node] of prev) {
+      if (!nextIds.has(id)) removedMentions += node.mentionCount;
+    }
+
+    if (!changed) return; // idempotent re-sync — stay silent
+
+    // Rebuild the child block in listChannels order, preserving live state.
+    const nextChildren: NavNode[] = channels.map((info) => {
+      const old = prev.get(info.channelId);
+      return {
+        id: info.channelId,
+        parentId: communityId,
+        type: 'channel',
+        channelKind: info.kind,
+        name: info.name,
+        expanded: old?.expanded ?? false,
+        unreadCount: old?.unreadCount ?? 0,
+        mentionCount: old?.mentionCount ?? 0,
+        unreadLevel: old?.unreadLevel ?? 'none',
+      };
+    });
+
+    // Replace only this community's channel children; keep every other node's
+    // order. Insert the block right after the community node so children stay
+    // grouped (sibling render order is by array order among same-parent nodes).
+    const others = this.nodes.filter(
+      (n) => !(n.parentId === communityId && n.type === 'channel'),
+    );
+    const communityIdx = others.findIndex((n) => n.id === communityId);
+    this.nodes = [
+      ...others.slice(0, communityIdx + 1),
+      ...nextChildren,
+      ...others.slice(communityIdx + 1),
+    ];
+
+    if (removedMentions > 0) {
+      community.mentionCount = Math.max(0, community.mentionCount - removedMentions);
+    }
+
     this.onChange?.();
   }
 

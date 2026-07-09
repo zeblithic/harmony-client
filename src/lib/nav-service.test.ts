@@ -847,3 +847,99 @@ describe('mention counts (ZEB-662)', () => {
     expect(changed).toBe(0);
   });
 });
+
+describe('NavService.setChannels reconcile (ZEB-663)', () => {
+  const HLC = { wallMs: 0, logical: 0, deviceId: 'd' };
+  const ch = (channelId: string, name: string, kind: 'text' | 'voice' = 'text') => ({
+    channelId,
+    name,
+    writePower: 0,
+    kind,
+    createdAt: HLC,
+  });
+
+  function withCommunity(): NavService {
+    const s = new NavService({ seedMockData: false });
+    s.nodes = [
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    return s;
+  }
+
+  it('adds channel children in listChannels order with channelKind', () => {
+    const s = withCommunity();
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'voice-room', 'voice')]);
+    const kids = s.nodes.filter((n) => n.parentId === 'c1' && n.type === 'channel');
+    expect(kids.map((n) => n.id)).toEqual(['a', 'b']);
+    expect(kids.map((n) => n.name)).toEqual(['general', 'voice-room']);
+    expect(kids.map((n) => n.channelKind)).toEqual(['text', 'voice']);
+  });
+
+  it('updates name and kind on survivors', () => {
+    const s = withCommunity();
+    s.setChannels('c1', [ch('a', 'general')]);
+    s.setChannels('c1', [ch('a', 'lobby', 'voice')]);
+    const a = s.nodes.find((n) => n.id === 'a')!;
+    expect(a.name).toBe('lobby');
+    expect(a.channelKind).toBe('voice');
+  });
+
+  it('preserves mentionCount + expanded on survivors across a reconcile', () => {
+    const s = withCommunity();
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'random')]);
+    s.incMention('c1', 'a');
+    s.incMention('c1', 'a');
+    s.nodes.find((n) => n.id === 'a')!.expanded = true;
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'random')]); // idempotent re-sync
+    const a = s.nodes.find((n) => n.id === 'a')!;
+    expect(a.mentionCount).toBe(2);
+    expect(a.expanded).toBe(true);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(2); // bubble intact
+  });
+
+  it('removes absent channels and subtracts their mentions from the community bubble', () => {
+    const s = withCommunity();
+    s.setChannels('c1', [ch('a', 'general'), ch('b', 'random')]);
+    s.incMention('c1', 'a'); // community bubble = 1
+    s.incMention('c1', 'b'); // community bubble = 2
+    s.setChannels('c1', [ch('a', 'general')]); // b deleted
+    expect(s.nodes.some((n) => n.id === 'b')).toBe(false);
+    expect(s.nodes.find((n) => n.id === 'a')!.mentionCount).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'c1')!.mentionCount).toBe(1); // b's 1 subtracted
+  });
+
+  it('fires onChange only when the reconcile changes the tree', () => {
+    const s = withCommunity();
+    let changed = 0;
+    s.onChange = () => { changed++; };
+    s.setChannels('c1', [ch('a', 'general')]); // add → 1
+    s.setChannels('c1', [ch('a', 'general')]); // no-op → still 1
+    expect(changed).toBe(1);
+  });
+
+  it('is a no-op when the community node is absent', () => {
+    const s = new NavService({ seedMockData: false });
+    s.nodes = [];
+    let changed = 0;
+    s.onChange = () => { changed++; };
+    s.setChannels('nope', [ch('a', 'general')]);
+    expect(s.nodes.length).toBe(0);
+    expect(changed).toBe(0);
+  });
+});
+
+describe('NavService community removal drops channel children (ZEB-663)', () => {
+  it('removing a community also removes its channel nodes', () => {
+    const s = new NavService({ seedMockData: false });
+    s.nodes = [
+      { id: 'c1', parentId: null, type: 'community', name: 'C', expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    s.setChannels('c1', [
+      { channelId: 'a', name: 'general', writePower: 0, kind: 'text', createdAt: { wallMs: 0, logical: 0, deviceId: 'd' } },
+    ]);
+    expect(s.nodes.some((n) => n.id === 'a')).toBe(true);
+    s.addOrUpdateNavSpace({ action: 'removed', spaceId: 'c1', kind: 'community', name: 'C' });
+    expect(s.nodes.some((n) => n.id === 'c1')).toBe(false);
+    expect(s.nodes.some((n) => n.id === 'a')).toBe(false); // child dropped too
+  });
+});
