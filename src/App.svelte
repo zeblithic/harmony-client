@@ -83,7 +83,7 @@
   import { ProfilePageResolver } from './lib/profile-page-resolver';
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
-  import { findNode, findNearestFolder } from './lib/nav-utils';
+  import { findNode, findNearestFolder, resolveChannelSelection } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
   import { onMount } from 'svelte';
   import type { Update } from '@tauri-apps/plugin-updater';
@@ -1071,6 +1071,11 @@
   // "on / public"). The settings panel rolls back on toggle failure.
   let sharedInProfileByCommunity = $state<Map<string, boolean>>(new Map());
   let selectedCommunityId = $state<string | null>(null);
+  // ZEB-663: the reactive selected channel for the currently-selected
+  // community (single source of truth for channel selection; persistence
+  // mirrors into communityService.setSelectedChannel). Null = none resolved
+  // yet (the resolution effect below picks a default from the nav children).
+  let selectedChannelId = $state<string | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
   // ZEB-553 item 11: true while an *initial* roster load is in flight after a
   // community switch (i.e. the roster is still empty). Owned entirely by
@@ -1100,6 +1105,28 @@
   // (owner_id), NOT myAddress (the node/transport address from get_node_addr).
   // The $derived recomputes when selfOwnerId resolves after start_node.
   let myCommunityPower = $derived(selfCommunityPower(communityMembers, selfOwnerId));
+  // ZEB-663: resolve which channel is selected for the current community when
+  // the current selection isn't a live channel of it (community switch,
+  // first visit, or the active channel was just deleted). Restores the
+  // persisted last-viewed channel, else #general, else the first channel.
+  // Only runs on the Channels view so governance views don't force a channel
+  // selection. Gated on populated nav children so the just-joined async
+  // window resolves once ChannelNavSync fills them in.
+  $effect(() => {
+    const cid = selectedCommunityId;
+    if (!cid || communityActiveView !== 'channels') return;
+    const kids = navNodes.filter((n) => n.parentId === cid && n.type === 'channel');
+    if (kids.length === 0) return; // not populated yet
+    const target = resolveChannelSelection(
+      kids.map((k) => ({ id: k.id, name: k.name })),
+      selectedChannelId,
+      communityService.getSelectedChannel(cid),
+    );
+    if (target === null || target === selectedChannelId) return;
+    selectedChannelId = target;
+    communityService.setSelectedChannel(cid, target);
+    navService.clearMention(target); // landing on it marks its mentions seen
+  });
   // Count only currently-joined members so the overview matches the
   // "X joined" line in CommunitySettingsPanel — invited/banned/left
   // entries shouldn't be counted as members in either place.
@@ -1162,6 +1189,20 @@
     void refreshCommunityMembers(communityId);
     showSettings = false;
     communityActiveView = 'proposals';
+  }
+
+  /** ZEB-663: nav channel-row click — select the community + channel and land
+   *  on its Channels feed. Mirrors openCommunityProposals. */
+  function openCommunityChannel(communityId: string, channelId: string) {
+    if (appMode !== 'messages') switchMode('messages');
+    changeSelectedCommunity(communityId);
+    void refreshCommunityMembers(communityId);
+    showSettings = false;
+    communityService.setSelectedChannel(communityId, channelId);
+    selectedChannelId = channelId;
+    communityActiveView = 'channels';
+    // ZEB-663: viewing a channel clears its unseen-mention indicator.
+    navService.clearMention(channelId);
   }
 
   async function refreshCommunityMembers(id: string) {
@@ -2802,7 +2843,13 @@
   // node is active — the Notes row carries its own active state — so don't let
   // navActiveNodeId keep highlighting the last channel/community.
   let navActiveNodeId = $derived(
-    notesSelected ? null : (selectedCommunityId ?? activeChannel),
+    notesSelected
+      ? null
+      : selectedCommunityId
+        // ZEB-663: on the Channels view, highlight the active channel row;
+        // otherwise (proposals/charter/tier3, or no channel yet) the community.
+        ? (communityActiveView === 'channels' ? (selectedChannelId ?? selectedCommunityId) : selectedCommunityId)
+        : activeChannel,
   );
 
   function switchMode(mode: AppMode) {
@@ -2827,6 +2874,11 @@
   function handleNodeClick(id: string) {
     const node = findNode(navNodes, id);
     if (!node || node.type === 'folder') return;
+    // ZEB-663: a channel row routes to its community + channel feed.
+    if (node.type === 'channel') {
+      if (node.parentId) openCommunityChannel(node.parentId, node.id);
+      return;
+    }
     // ZEB-334: selecting any real space leaves the self-notes view.
     notesSelected = false;
     // ZEB-263: community nodes route to the right-pane overview placeholder
@@ -3259,6 +3311,8 @@
         {trustService}
         {navService}
         {votingAdapter}
+        {selectedChannelId}
+        onSelectChannel={(channelId) => openCommunityChannel(selectedCommunityNode.id, channelId)}
         bind:activeView={communityActiveView}
         onForkSuccess={(forkSpaceId) => {
           // ZEB-285: navigate to the newly created fork community and

@@ -14,6 +14,30 @@ export function getChildNodes(nodes: NavNode[], parentId: string | null): NavNod
   return nodes.filter((n) => n.parentId === parentId);
 }
 
+/**
+ * ZEB-663: resolve which channel should be selected for a community, given the
+ * community's live channels (in listChannels order), the current selection, and
+ * the persisted last-viewed channel. Precedence:
+ *   1. keep `current` if it is still a live channel;
+ *   2. else restore `persisted` if it is still a live channel;
+ *   3. else prefer a channel named `general`;
+ *   4. else the first channel;
+ *   5. else null (no channels).
+ * Pure — App's selection effect is a thin wrapper over this (was CommunityView's
+ * internal default-select + delete-cascade logic before the nav-unification).
+ */
+export function resolveChannelSelection(
+  channels: { id: string; name: string }[],
+  current: string | null,
+  persisted: string | null | undefined,
+): string | null {
+  if (channels.length === 0) return null;
+  if (current !== null && channels.some((c) => c.id === current)) return current;
+  if (persisted && channels.some((c) => c.id === persisted)) return persisted;
+  const general = channels.find((c) => c.name === 'general');
+  return (general ?? channels[0]).id;
+}
+
 /** Find a node by ID, or undefined. */
 export function findNode(nodes: NavNode[], id: string): NavNode | undefined {
   return nodes.find((n) => n.id === id);

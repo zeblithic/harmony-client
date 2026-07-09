@@ -10,6 +10,7 @@ import {
   findNearestFolder,
   getNodeDepth,
   getColorAncestry,
+  resolveChannelSelection,
 } from './nav-utils';
 
 /** Helper to build a minimal NavNode. */
@@ -192,5 +193,41 @@ describe('findNearestFolder', () => {
 
   it('returns the parent folder for a nested folder', () => {
     expect(findNearestFolder(TREE, 'f3')).toBe('f1');
+  });
+});
+
+describe('resolveChannelSelection (ZEB-663)', () => {
+  const gen = { id: '01', name: 'general' };
+  const ann = { id: '02', name: 'announcements' };
+  const rand = { id: '03', name: 'random' };
+
+  it('returns null when there are no channels', () => {
+    expect(resolveChannelSelection([], '01', '02')).toBeNull();
+  });
+
+  it('keeps the current selection when it is still live', () => {
+    expect(resolveChannelSelection([gen, ann], '02', '01')).toBe('02');
+  });
+
+  it('restores the persisted channel when current is null/invalid', () => {
+    expect(resolveChannelSelection([gen, ann], null, '02')).toBe('02');
+    expect(resolveChannelSelection([gen, ann], 'gone', '02')).toBe('02');
+  });
+
+  it('prefers #general when neither current nor persisted is live', () => {
+    expect(resolveChannelSelection([ann, gen, rand], 'gone', 'also-gone')).toBe('01');
+  });
+
+  it('falls back to the first channel when there is no #general', () => {
+    expect(resolveChannelSelection([ann, rand], null, null)).toBe('02');
+  });
+
+  it('cascades off a just-deleted active channel to #general (delete-fallback)', () => {
+    // #general survived; the deleted channel (current) is no longer in the list.
+    expect(resolveChannelSelection([gen], '02', '02')).toBe('01');
+  });
+
+  it('cascades to the next channel when the deleted one was #general', () => {
+    expect(resolveChannelSelection([ann, rand], '01', '01')).toBe('02');
   });
 });

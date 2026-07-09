@@ -130,6 +130,11 @@ async function setup(
     // VoiceChannelView. Tests can override with null to exercise the
     // pre-ready (IPC not yet resolved) guard.
     voiceSession: makeVoiceSessionStub(),
+    // ZEB-663: selection is App-owned; the default mirrors what App's
+    // resolution effect would pick (first/only channel). Tests override to
+    // point the feed at a specific channel.
+    selectedChannelId: channelList[0]?.channelId ?? null,
+    onSelectChannel: vi.fn(),
     ...propOverrides,
   };
   const renderResult = render(CommunityView, { props });
@@ -146,11 +151,18 @@ describe('CommunityView', () => {
     });
   });
 
-  it('selects #general by default on first visit', async () => {
-    const { container } = await setup();
+  // ZEB-663: default #general selection + delete-fallback cascade moved to App
+  // (its resolution effect) and are unit-covered by resolveChannelSelection in
+  // nav-utils.test.ts. CommunityView is now purely prop-driven off
+  // `selectedChannelId`, so those cases live with the helper, not here.
+
+  it('renders the selected channel (prop-driven) as the active sidebar item', async () => {
+    const { container } = await setup([general, announcements], {
+      selectedChannelId: announcements.channelId,
+    });
     await waitFor(() => {
       const active = container.querySelector('.channel-item.active');
-      expect(active?.querySelector('.channel-name')?.textContent?.trim()).toBe('general');
+      expect(active?.querySelector('.channel-name')?.textContent?.trim()).toBe('announcements');
     });
   });
 
@@ -241,34 +253,10 @@ describe('CommunityView', () => {
     });
   });
 
-  it('channel-config-updated Deleted on active channel cascades to next-newest (or empty if last)', async () => {
-    const { adapter, container } = await setup();
-    await waitFor(() => {
-      expect(container.querySelector('.channel-item.active .channel-name')?.textContent?.trim()).toBe('general');
-    });
-
-    // After delete, list_channels returns only announcements.
-    (adapter.invoke as any).mockImplementation((cmd: string) => {
-      if (cmd === 'list_channels') return Promise.resolve([announcements]);
-      if (cmd === 'list_channel_messages') return Promise.resolve([]);
-      return Promise.resolve(undefined);
-    });
-
-    const handler = adapter.listeners.get('channel-config-updated')!;
-    handler({
-      payload: {
-        communityId: 'aa'.repeat(16),
-        channelId: general.channelId,
-        action: 'deleted',
-        atWallMs: 300,
-      },
-    });
-
-    await waitFor(() => {
-      // #general gone → cascade picks next channel (announcements).
-      expect(container.querySelector('.channel-item.active .channel-name')?.textContent?.trim()).toBe('announcements');
-    });
-  });
+  // ZEB-663: delete-active cascade to next-newest is App's resolution effect
+  // now — see resolveChannelSelection in nav-utils.test.ts
+  // ('cascades off a just-deleted active channel'). The empty-state path below
+  // is CommunityView's own render responsibility and stays here.
 
   it('channel-config-updated Deleted on last remaining channel renders empty-state', async () => {
     const { adapter, container } = await setup([general]);
@@ -304,17 +292,18 @@ describe('CommunityView', () => {
     expect(container.querySelector('.create-channel-btn')).toBeNull();
   });
 
-  it('clicking a channel updates active selection and persists via communityService.setSelectedChannel', async () => {
-    const { container, communityService } = await setup();
+  it('clicking a channel calls onSelectChannel (App owns selection + persistence)', async () => {
+    // ZEB-663: CommunityView no longer mutates/persists selection itself — it
+    // routes the click up to App via onSelectChannel (App's
+    // openCommunityChannel sets communityService.setSelectedChannel).
+    const onSelectChannel = vi.fn();
+    const { container } = await setup([general, announcements], { onSelectChannel });
     await waitFor(() => {
       expect(container.querySelectorAll('.channel-item').length).toBeGreaterThan(1);
     });
     const items = container.querySelectorAll('.channel-item');
     await fireEvent.click(items[1] as HTMLElement);
-    await waitFor(() => {
-      expect(container.querySelector('.channel-item.active .channel-name')?.textContent?.trim()).toBe('announcements');
-    });
-    expect(communityService.getSelectedChannel('aa'.repeat(16))).toBe(announcements.channelId);
+    expect(onSelectChannel).toHaveBeenCalledWith(announcements.channelId);
   });
 
   it('Constitutional tab mounts Tier3ProposalPanel when votingAdapter is provided', async () => {

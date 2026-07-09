@@ -54,6 +54,8 @@
     onOpenCard,
     voiceSession,
     onBeforeVoiceJoin,
+    selectedChannelId,
+    onSelectChannel,
     activeView = $bindable('channels'),
   }: {
     communityId: string;
@@ -123,6 +125,13 @@
     /** ZEB-352 D12: forwarded to VoiceChannelView — the app tears down any
      *  active DM call before this community channel's voice join proceeds. */
     onBeforeVoiceJoin?: () => Promise<void>;
+    /** ZEB-663: the App-owned selected channel id (single source of truth).
+     *  Drives which channel's feed renders. */
+    selectedChannelId: string | null;
+    /** ZEB-663: select a channel (App routes through openCommunityChannel).
+     *  Temporary — the ChannelSubSidebar select path; the nav rows are the
+     *  real selector. Removed with ChannelSubSidebar (Task 5). */
+    onSelectChannel: (channelId: string) => void;
     /** ZEB-606: which middle-column view is active. Bindable so App can
      *  deep-link (nav proposals row / Assembly rail "View all"). Default
      *  'channels' preserves the ZEB-291 behavior for non-binding parents.
@@ -131,7 +140,6 @@
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
-  let activeChannelId = $state<string | null>(null);
   let settingsModalOpen = $state(false);
   let communityMembersPanelOpen = $state(false);
   let showCreateDialog = $state(false);
@@ -193,29 +201,12 @@
     };
   });
 
-  let activeChannel = $derived(channels.find((c) => c.channelId === activeChannelId) ?? null);
+  // ZEB-663: the active channel is derived from the App-owned selection.
+  let activeChannel = $derived(channels.find((c) => c.channelId === selectedChannelId) ?? null);
 
   async function refreshChannels() {
     const list = await communityService.listChannels(communityId);
     channels = list.filter((c) => c.deletedAt === undefined);
-  }
-
-  /** Per spec §6.4: when active channel disappears, cascade to fallback.
-   *  1. #general if it exists and is not the just-deleted channel.
-   *  2. Next-oldest by created_at HLC.
-   *  3. null (empty-state).
-   *  Backend already sorts list_channels by created_at ascending so we
-   *  just pick the first non-deleted entry. */
-  function pickFallbackChannel(deletedChannelId: string): string | null {
-    const general = channels.find((c) => c.name === 'general' && c.channelId !== deletedChannelId);
-    if (general) return general.channelId;
-    const next = channels.find((c) => c.channelId !== deletedChannelId);
-    return next?.channelId ?? null;
-  }
-
-  function handleSelect(channelId: string) {
-    activeChannelId = channelId;
-    communityService.setSelectedChannel(communityId, channelId);
   }
 
   async function handleConfirmDelete() {
@@ -242,19 +233,12 @@
     communityService.onChannelConfigChanged = (cid, action, channelId, name, writePower) => {
       prevOnChannelConfigChanged?.(cid, action, channelId, name, writePower);
       if (cid !== communityId) return;
-      void (async () => {
-        try {
-          await refreshChannels();
-          if (action === 'deleted' && channelId === activeChannelId) {
-            activeChannelId = pickFallbackChannel(channelId);
-            if (activeChannelId) {
-              communityService.setSelectedChannel(communityId, activeChannelId);
-            }
-          }
-        } catch (e) {
-          console.warn('CommunityView: refreshChannels failed in onChannelConfigChanged:', e);
-        }
-      })();
+      // ZEB-663: keep only the feed-list refresh here — App owns the
+      // selected-channel fallback (its resolution effect re-picks when the
+      // active channel is removed from the nav children).
+      void refreshChannels().catch((e) => {
+        console.warn('CommunityView: refreshChannels failed in onChannelConfigChanged:', e);
+      });
     };
   });
 
@@ -265,11 +249,6 @@
   $effect(() => {
     const cid = communityId;
     let cancelled = false;
-    // Reset activeChannelId so the persisted-channel logic re-runs for the
-    // new community. The prior community's `setSelectedChannel` already
-    // captured its last-viewed channel into the service map, so switching
-    // back will restore from there.
-    activeChannelId = null;
     // Reset snapshot and lineage state on community switch so stale data from
     // the previous community never briefly shows for the new one.
     // (Fix: PR #122 round-4, CodeRabbit inline — lineage was not cleared.)
@@ -289,25 +268,9 @@
           if (!cancelled) preForkSnapshot = null;
         });
 
-        // Capture persisted before refresh so the post-refresh validation
-        // sees the most recent stored value.
-        const persisted = communityService.getSelectedChannel(cid);
-        if (cancelled) return;
-        if (persisted) activeChannelId = persisted;
+        // ZEB-663: refresh the feed channel list (selection is App-owned —
+        // its resolution effect picks the persisted/default channel).
         await refreshChannels();
-        if (cancelled) return;
-        // Validate the persisted activeChannelId still resolves to a
-        // non-deleted channel; if not (e.g., the channel was deleted while
-        // user was elsewhere), default-select per §6.4.
-        const stillExists = activeChannelId !== null
-          && channels.some((c) => c.channelId === activeChannelId);
-        if (!stillExists) {
-          const general = channels.find((c) => c.name === 'general');
-          activeChannelId = general?.channelId ?? channels[0]?.channelId ?? null;
-          if (activeChannelId) {
-            communityService.setSelectedChannel(cid, activeChannelId);
-          }
-        }
       } catch (e) {
         console.warn('CommunityView: refreshChannels failed in community $effect:', e);
       }
@@ -350,13 +313,13 @@
   // channel) — or switching communities — must tear down the live mic/transport.
   // We compare the newly-active channel against the session's CONNECTED channel
   // (read from its state store); if they differ while connected, leave.
-  // Reading `activeChannelId` registers the reactive dependency so this re-runs
+  // Reading `selectedChannelId` registers the reactive dependency so this re-runs
   // on every channel switch. We deliberately do NOT depend on the store value
   // reactively (it isn't a rune) — a one-shot `get()` at switch time is the
   // intent: "on navigation, if we're parked on a now-unselected voice channel,
   // disconnect."
   $effect(() => {
-    const nowActive = activeChannelId;
+    const nowActive = selectedChannelId;
     if (!voiceSession) return;
     const vs = get(voiceSession.state);
     if (vs.phase !== 'idle' && vs.channel !== null && vs.channel !== nowActive) {
@@ -474,9 +437,9 @@
   <div class="three-cols">
     <ChannelSubSidebar
       {channels}
-      {activeChannelId}
+      activeChannelId={selectedChannelId}
       {myPower}
-      onSelect={handleSelect}
+      onSelect={onSelectChannel}
       onCreateClick={() => { showCreateDialog = true; }}
       onModifyClick={(c) => { modifyDialogChannel = c; }}
       onDeleteClick={(c) => { deleteConfirmChannel = c; }}
@@ -659,7 +622,7 @@
   onClose={() => { showCreateDialog = false; }}
   onCreated={(channelId) => {
     showCreateDialog = false;
-    handleSelect(channelId);
+    onSelectChannel(channelId);
   }}
 />
 
