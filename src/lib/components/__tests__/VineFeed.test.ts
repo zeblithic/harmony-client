@@ -1,5 +1,5 @@
-import { render, screen, fireEvent, within } from '@testing-library/svelte';
-import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import VineFeed from '../VineFeed.svelte';
 import type { VineVideo } from '../../types';
 
@@ -68,38 +68,19 @@ describe('VineFeed', () => {
   });
 
   it('sorts vines newest first', () => {
-    render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set() } });
+    const { container } = render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set() } });
     const items = screen.getAllByRole('listitem');
     expect(items.length).toBe(3);
     // Carol's vine (createdAt=200) should be first
     expect(items[0].textContent).toContain('Carol');
-  });
-
-  it('opens player when a card is clicked', async () => {
-    render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set() } });
-    // Carol's vine is newest → first card
-    await fireEvent.click(screen.getByLabelText('Third vine by Carol'));
-    expect(screen.getByRole('dialog')).toBeTruthy();
-  });
-
-  it('closes player when close button is clicked', async () => {
-    render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set() } });
-    await fireEvent.click(screen.getByLabelText('Third vine by Carol'));
-    expect(screen.getByRole('dialog')).toBeTruthy();
-    const closeBtn = screen.getByLabelText('Close player');
-    await fireEvent.click(closeBtn);
-    expect(screen.queryByRole('dialog')).toBeNull();
-  });
-
-  it('calls onMarkViewed when a vine is opened', async () => {
-    const onMarkViewed = vi.fn();
-    render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set(), onMarkViewed } });
-    await fireEvent.click(screen.getByLabelText('Third vine by Carol'));
-    expect(onMarkViewed).toHaveBeenCalledWith('vine-03');
+    const order = Array.from(container.querySelectorAll('[data-vine-id]')).map(
+      el => (el as HTMLElement).dataset.vineId,
+    );
+    expect(order).toEqual(['vine-03', 'vine-02', 'vine-01']);
   });
 
   it('filters to unviewed when filter tab is clicked', async () => {
-    render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set() } });
+    render(VineFeed, { props: { followedVines: vines, viewedIds: makeViewedIds(), activeTab: 'following', followedAddresses: new Set(), onMarkViewed: vi.fn() } });
     const unviewedTab = screen.getByText(/Unviewed/);
     await fireEvent.click(unviewedTab);
     const items = screen.getAllByRole('listitem');
@@ -111,7 +92,7 @@ describe('VineFeed', () => {
 
   it('shows all-caught-up message when filtering unviewed with none left', async () => {
     const allViewed = vines.map(v => ({ ...v, viewed: true }));
-    render(VineFeed, { props: { followedVines: allViewed, viewedIds: makeViewedIds(allViewed), activeTab: 'following', followedAddresses: new Set() } });
+    render(VineFeed, { props: { followedVines: allViewed, viewedIds: makeViewedIds(allViewed), activeTab: 'following', followedAddresses: new Set(), onMarkViewed: vi.fn() } });
     const unviewedTab = screen.getByText('Unviewed');
     await fireEvent.click(unviewedTab);
     expect(screen.getByText(/All caught up/)).toBeTruthy();
@@ -173,7 +154,7 @@ describe('VineFeed', () => {
       const onPublish = vi.fn();
       render(VineFeed, { props: {
         followedVines: allViewed, viewedIds: makeViewedIds(allViewed),
-        activeTab: 'following', followedAddresses: new Set(), onPublish,
+        activeTab: 'following', followedAddresses: new Set(), onPublish, onMarkViewed: vi.fn(),
       } });
       await fireEvent.click(screen.getByText('Unviewed'));
       expect(screen.getByText(/All caught up/)).toBeTruthy();
@@ -344,41 +325,189 @@ describe('VineFeed', () => {
       followedAddresses: new Set(),
       onViewOriginal,
     } });
-    const link = screen.getByRole('button', { name: /originally by OrigName/i });
+    const link = screen.getByRole('button', { name: /view original by OrigName/i });
     await fireEvent.click(link);
     expect(onViewOriginal).toHaveBeenCalledWith('orig-1');
   });
 
-  it('forwards onViewOriginal to VinePlayer attribution link', async () => {
-    const onViewOriginal = vi.fn();
-    const reshared: VineVideo = {
-      id: 'vine-r2',
-      creatorAddress: 'a1b2c3d4',
-      creatorName: 'Alice',
-      createdAt: 1700003000,
-      videoCid: 'cid-r2',
-      reshareOf: 'orig-2',
-      originalCreatorName: 'PlayerOrig',
-      viewed: false,
-    };
-    render(VineFeed, { props: {
-      followedVines: [],
-      discoverVines: [reshared],
-      viewedIds: new Set(),
-      activeTab: 'discover',
-      followedAddresses: new Set(),
-      onViewOriginal,
-    } });
-    // Open the player by clicking the card
-    await fireEvent.click(screen.getByLabelText(/Untitled vine by Alice/));
-    // Player exposes its own attribution button — there will be two matches now
-    // (one on the card behind, one in the dialog). Scope to the dialog with
-    // `within` so the lookup throws on absence rather than returning null.
-    const dialog = screen.getByRole('dialog', { name: 'Vine player' });
-    const playerLink = within(dialog).getByRole('button', {
-      name: /originally by PlayerOrig/i,
+  describe('center-detection autoplay (ZEB-612 S2)', () => {
+    it('the first (newest) card plays on mount and is marked viewed', async () => {
+      const onMarkViewed = vi.fn();
+      const { container } = render(VineFeed, { props: {
+        followedVines: vines, viewedIds: makeViewedIds(), onMarkViewed,
+      } });
+      await waitFor(() => expect(onMarkViewed).toHaveBeenCalledWith('vine-03'));
+      const playing = container.querySelectorAll('.vine-card.playing');
+      expect(playing.length).toBe(1);
     });
-    await fireEvent.click(playerLink);
-    expect(onViewOriginal).toHaveBeenCalledWith('orig-2');
+
+    it('clicking a card moves the single playing slot to it', async () => {
+      const onMarkViewed = vi.fn();
+      const { container } = render(VineFeed, { props: {
+        followedVines: vines, viewedIds: makeViewedIds(), onMarkViewed,
+      } });
+      await fireEvent.click(screen.getByRole('button', { name: /First vine by Alice/ }));
+      expect(onMarkViewed).toHaveBeenCalledWith('vine-01');
+      const row = container.querySelector('[data-vine-id="vine-01"]');
+      expect(row?.querySelector('.vine-card.playing')).toBeTruthy();
+      expect(container.querySelectorAll('.vine-card.playing').length).toBe(1);
+    });
+  });
+
+  describe('lazy video window (ZEB-612 S2)', () => {
+    // lib.dom types URL.revokeObjectURL, but jsdom doesn't implement it —
+    // install a spy and restore whatever was (or wasn't) there afterwards.
+    const revoke = vi.fn();
+    const urlGlobal = URL as unknown as { revokeObjectURL?: (url: string) => void };
+    const hadRevoke = 'revokeObjectURL' in URL;
+    const origRevoke = urlGlobal.revokeObjectURL;
+
+    beforeEach(() => {
+      revoke.mockClear();
+      urlGlobal.revokeObjectURL = revoke;
+    });
+
+    afterEach(() => {
+      if (hadRevoke) {
+        urlGlobal.revokeObjectURL = origRevoke;
+      } else {
+        delete urlGlobal.revokeObjectURL;
+      }
+    });
+
+    const five: VineVideo[] = [1, 2, 3, 4, 5].map(n => ({
+      id: `vine-0${n}`, creatorAddress: `addr-${n}`, creatorName: `C${n}`,
+      createdAt: 1700000000 + n * 100, videoCid: `cid-${n}`, viewed: false,
+    }));
+
+    it('mounts <video> only for the playing card and its neighbors', async () => {
+      const resolveVideo = vi.fn(async (cid: string) => `blob:fake-${cid}`);
+      const { container } = render(VineFeed, { props: {
+        followedVines: five, viewedIds: new Set<string>(), resolveVideo, onMarkViewed: vi.fn(),
+      } });
+      // Newest-first order: vine-05 plays (index 0); window = vine-05 + vine-04.
+      await waitFor(() => expect(container.querySelectorAll('[data-testid="stage-video"]').length).toBe(2));
+      expect(resolveVideo).toHaveBeenCalledWith('cid-5');
+      expect(resolveVideo).toHaveBeenCalledWith('cid-4');
+      expect(resolveVideo).not.toHaveBeenCalledWith('cid-1');
+    });
+
+    it('revokes blob URLs when cards leave the window', async () => {
+      const resolveVideo = vi.fn(async (cid: string) => `blob:fake-${cid}`);
+      const { container } = render(VineFeed, { props: {
+        followedVines: five, viewedIds: new Set<string>(), resolveVideo, onMarkViewed: vi.fn(),
+      } });
+      await waitFor(() => expect(container.querySelectorAll('[data-testid="stage-video"]').length).toBe(2));
+      // Jump to the oldest card: window becomes vine-01 + vine-02 → cid-5/cid-4 evicted.
+      await fireEvent.click(screen.getByRole('button', { name: /Untitled vine by C1/ }));
+      await waitFor(() => expect(revoke).toHaveBeenCalledWith('blob:fake-cid-5'));
+      expect(revoke).toHaveBeenCalledWith('blob:fake-cid-4');
+    });
+  });
+
+  describe('unviewed filter pin (ZEB-612 S2)', () => {
+    it('keeps the card that became viewed BY playing under the active Unviewed filter', async () => {
+      const onMarkViewed = vi.fn();
+      const baseProps = {
+        followedVines: vines, activeTab: 'following' as const,
+        followedAddresses: new Set<string>(), onMarkViewed,
+      };
+      const { rerender } = render(VineFeed, { props: { ...baseProps, viewedIds: makeViewedIds() } });
+      await fireEvent.click(screen.getByText(/Unviewed/));
+      // vine-01 is unviewed → still listed; activate it under the filter.
+      await fireEvent.click(screen.getByRole('button', { name: /First vine by Alice/ }));
+      expect(onMarkViewed).toHaveBeenCalledWith('vine-01');
+      // Parent marks it viewed and pushes the updated set down (as App.svelte
+      // would) — the pinned card must NOT vanish from under the user.
+      await rerender({ ...baseProps, viewedIds: new Set([...makeViewedIds(), 'vine-01']) });
+      expect(screen.getByRole('button', { name: /First vine by Alice/ })).toBeTruthy();
+    });
+
+    it('still reaches the all-caught-up state when every vine is viewed', async () => {
+      const allViewed = vines.map(v => ({ ...v, viewed: true }));
+      render(VineFeed, { props: {
+        followedVines: allViewed,
+        viewedIds: new Set(allViewed.map(v => v.id)),
+        onMarkViewed: vi.fn(),
+        onPublish: vi.fn(),
+      } });
+      await fireEvent.click(screen.getByText(/Unviewed/));
+      expect(screen.getByText('All caught up — no unviewed vines.')).toBeTruthy();
+    });
+  });
+
+  describe('playTarget navigation (ZEB-612 S2 — feed is the player)', () => {
+    it('consumes the target, plays it, and marks it viewed', async () => {
+      const onMarkViewed = vi.fn();
+      const onPlayTargetConsumed = vi.fn();
+      const baseProps = {
+        followedVines: vines, viewedIds: makeViewedIds(),
+        onMarkViewed, onPlayTargetConsumed,
+      };
+      const { container, rerender } = render(VineFeed, { props: { ...baseProps, playTarget: null } });
+      await rerender({ ...baseProps, playTarget: vines[0] });
+      await waitFor(() => expect(onPlayTargetConsumed).toHaveBeenCalled());
+      expect(onMarkViewed).toHaveBeenCalledWith('vine-01');
+      const row = container.querySelector('[data-vine-id="vine-01"]');
+      expect(row?.querySelector('.vine-card.playing')).toBeTruthy();
+    });
+
+    it('switches to the tab that owns the target', async () => {
+      const onTabChange = vi.fn();
+      const discoverOnly = [{ ...vines[0], id: 'disc-1' }];
+      const baseProps = {
+        followedVines: vines, discoverVines: discoverOnly, viewedIds: makeViewedIds(),
+        activeTab: 'following' as const, onTabChange,
+        onMarkViewed: vi.fn(), onPlayTargetConsumed: vi.fn(),
+      };
+      const { rerender } = render(VineFeed, { props: { ...baseProps, playTarget: null } });
+      await rerender({ ...baseProps, playTarget: discoverOnly[0] });
+      await waitFor(() => expect(onTabChange).toHaveBeenCalledWith('discover'));
+    });
+  });
+
+  describe('feed-level reshare (ZEB-612 S2 — replaces the player flow)', () => {
+    it('card verb → confirm dialog → onReshare', async () => {
+      const onReshare = vi.fn().mockResolvedValue(undefined);
+      render(VineFeed, { props: {
+        followedVines: [vines[0]], viewedIds: new Set<string>(),
+        onReshare, onMarkViewed: vi.fn(),
+      } });
+      await fireEvent.click(screen.getByRole('button', { name: 'Reshare vine' }));
+      // ReshareConfirmDialog is up — confirm it.
+      await fireEvent.click(screen.getByRole('button', { name: /^Reshare$/ }));
+      await waitFor(() => expect(onReshare).toHaveBeenCalledWith(expect.objectContaining({ id: 'vine-01' })));
+    });
+
+    it('cancel closes the dialog without resharing', async () => {
+      const onReshare = vi.fn();
+      render(VineFeed, { props: {
+        followedVines: [vines[0]], viewedIds: new Set<string>(),
+        onReshare, onMarkViewed: vi.fn(),
+      } });
+      await fireEvent.click(screen.getByRole('button', { name: 'Reshare vine' }));
+      await fireEvent.click(screen.getByRole('button', { name: /Cancel/ }));
+      expect(onReshare).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a reshare failure as a feed-level alert', async () => {
+      const onReshare = vi.fn().mockRejectedValue(new Error('publish failed: not connected'));
+      render(VineFeed, { props: {
+        followedVines: [vines[0]], viewedIds: new Set<string>(),
+        onReshare, onMarkViewed: vi.fn(),
+      } });
+      await fireEvent.click(screen.getByRole('button', { name: 'Reshare vine' }));
+      await fireEvent.click(screen.getByRole('button', { name: /^Reshare$/ }));
+      await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/publish failed/));
+    });
+
+    it('suppresses the verb on own originals (isOwnOriginalVine guard)', () => {
+      const own: VineVideo = { ...vines[0], id: 'own-1', creatorAddress: 'self' };
+      render(VineFeed, { props: {
+        followedVines: [own], viewedIds: new Set<string>(),
+        onReshare: vi.fn(), onMarkViewed: vi.fn(),
+      } });
+      expect(screen.queryByRole('button', { name: 'Reshare vine' })).toBeNull();
+    });
   });
 });
