@@ -70,13 +70,14 @@ describe('File manager types', () => {
     expect(detail.origin).toBe('self-created');
   });
 
-  it('QuotaStatus has usage fields', () => {
+  it('QuotaStatus has usage fields (ZEB-612 S3: no invented total)', () => {
     const quota: QuotaStatus = {
       usedBytes: 5_000_000_000,
-      totalBytes: 10_000_000_000,
       byCategory: { image: 2_000_000_000, video: 3_000_000_000 },
+      pinnedUsedBytes: 1_000_000,
+      pinnedBudgetBytes: 50_000_000,
     };
-    expect(quota.usedBytes).toBeLessThan(quota.totalBytes);
+    expect(quota.pinnedUsedBytes).toBeLessThan(quota.pinnedBudgetBytes!);
   });
 
   it('CleanupRecommendation has action-relevant fields', () => {

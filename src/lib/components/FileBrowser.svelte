@@ -1102,7 +1102,8 @@
 
       <QuotaBar
         usedBytes={quota.usedBytes}
-        totalBytes={quota.totalBytes}
+        pinnedUsedBytes={quota.pinnedUsedBytes}
+        pinnedBudgetBytes={quota.pinnedBudgetBytes}
         {onCleanupClick}
       />
     {/if}

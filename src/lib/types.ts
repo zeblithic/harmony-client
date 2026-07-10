@@ -260,10 +260,18 @@ export interface ContentDetail extends ContentItem {
   origin: ContentOrigin;
 }
 
+/** ZEB-612 S3: honest quota — real local usage plus the real (enforced)
+ *  pinned-content budget from `get_storage_budget`. There is NO overall
+ *  storage quota in the system, so there is no `totalBytes`: the UI
+ *  shows used bytes without an invented denominator. */
 export interface QuotaStatus {
   usedBytes: number;
-  totalBytes: number;
   byCategory: Partial<Record<ContentCategory, number>>;
+  /** Bytes of pinned content (deduped by CID) — the budget's consumer. */
+  pinnedUsedBytes: number;
+  /** `maxPinnedBytes` from the backend; null when unknown (demo mode or
+   *  IPC failure) — render used-only in that case. */
+  pinnedBudgetBytes: number | null;
 }
 
 export interface CleanupRecommendation {
@@ -309,7 +317,6 @@ export interface UploadCandidate {
 
 export interface FileManagerSettings {
   defaultReplicationTier: ReplicationTier;
-  quotaBytes: number;
   defaultViewMode: FileViewMode;
   confirmationOverrides: Partial<Record<ContentSensitivity, number>>;
 }

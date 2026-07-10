@@ -583,7 +583,8 @@ describe('File Manager Integration', () => {
       const buttons = screen.getAllByRole('button');
       const quotaBtn = buttons.find(b => b.getAttribute('aria-label')?.includes('Storage:'));
       expect(quotaBtn).toBeTruthy();
-      expect(quotaBtn!.getAttribute('aria-label')).toMatch(/\d+.*used.*\d+%/);
+      // ZEB-612 S3: no invented total — the label reports real usage only.
+      expect(quotaBtn!.getAttribute('aria-label')).toMatch(/\d+.*stored locally/);
     });
 
     it('section toggle buttons have aria-pressed', () => {

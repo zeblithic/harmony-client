@@ -6,13 +6,11 @@ describe('FileManagerService', () => {
   it('constructs with default settings', () => {
     const svc = new FileManagerService();
     expect(svc.settings.defaultReplicationTier).toBe('default');
-    expect(svc.settings.quotaBytes).toBe(10_000_000_000);
   });
 
   it('constructs with custom settings', () => {
-    const svc = new FileManagerService({ defaultReplicationTier: 'high', quotaBytes: 5_000_000_000 });
+    const svc = new FileManagerService({ defaultReplicationTier: 'high' });
     expect(svc.settings.defaultReplicationTier).toBe('high');
-    expect(svc.settings.quotaBytes).toBe(5_000_000_000);
   });
 
   it('returns private content', () => {
@@ -50,14 +48,104 @@ describe('FileManagerService', () => {
     expect(children).toEqual([]);
   });
 
-  it('returns quota status with correct totals', () => {
+  it('returns quota status with real used bytes and no invented total (ZEB-612 S3)', () => {
     const svc = new FileManagerService();
     const quota = svc.getQuotaStatus();
-    expect(quota.totalBytes).toBe(10_000_000_000);
     expect(quota.usedBytes).toBeGreaterThan(0);
-    expect(quota.usedBytes).toBeLessThan(quota.totalBytes);
     // byCategory should have entries
     expect(Object.keys(quota.byCategory).length).toBeGreaterThan(0);
+    // Demo mode (no adapter): the real pinned budget is unknown.
+    expect(quota.pinnedBudgetBytes).toBeNull();
+    expect('totalBytes' in quota).toBe(false);
+  });
+
+  // ── ZEB-612 S3: real replicaCount + pinned budget ──────────────────
+
+  const wireItem = (over: Record<string, unknown> = {}) => ({
+    sidecarId: 'sc-1',
+    cid: 'cid-real-1',
+    name: 'real.txt',
+    sizeBytes: 1000,
+    storedAt: 1_700_000_000_000,
+    sensitivity: 'private',
+    replicationTier: 'default',
+    pinned: false,
+    licensed: false,
+    archived: false,
+    kind: 'leaf',
+    replicaCount: 1,
+    ...over,
+  });
+
+  function adapterWith(routes: Record<string, unknown | (() => Promise<unknown>)>) {
+    const { adapter, emit } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd in routes) {
+        const r = routes[cmd];
+        return typeof r === 'function' ? (r as () => Promise<unknown>)() : Promise.resolve(r);
+      }
+      return Promise.resolve(undefined);
+    });
+    return { adapter, emit };
+  }
+
+  it('maps wire replicaCount instead of fabricating 1', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({ list_content: [wireItem({ replicaCount: 4 })] });
+    await svc.connectAdapter(adapter);
+    expect(svc.getContents()[0].replicaCount).toBe(4);
+  });
+
+  it('fetches the pinned budget on connect and exposes it in quota status', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      get_storage_budget: { cacheCapacity: 512, maxPinnedBytes: 50_000_000 },
+    });
+    await svc.connectAdapter(adapter);
+    expect(adapter.invoke).toHaveBeenCalledWith('get_storage_budget');
+    expect(svc.getQuotaStatus().pinnedBudgetBytes).toBe(50_000_000);
+  });
+
+  it('computes pinned usage from pinned items only, deduped by cid', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [
+        wireItem({ sidecarId: 'a', cid: 'c-pin', sizeBytes: 1000, pinned: true }),
+        // Symlink-style second sidecar on the same CID — counts once.
+        wireItem({ sidecarId: 'b', cid: 'c-pin', sizeBytes: 1000, pinned: true }),
+        wireItem({ sidecarId: 'c', cid: 'c-loose', sizeBytes: 2000 }),
+      ],
+      get_storage_budget: { cacheCapacity: 512, maxPinnedBytes: 50_000_000 },
+    });
+    await svc.connectAdapter(adapter);
+    const quota = svc.getQuotaStatus();
+    expect(quota.usedBytes).toBe(3000);
+    expect(quota.pinnedUsedBytes).toBe(1000);
+  });
+
+  it('counts a CID as pinned when ANY sidecar pins it (is_cid_pinned_by_any mirror)', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [
+        // First-seen entry unpinned; symlink sibling pins the same CID.
+        wireItem({ sidecarId: 'a', cid: 'c-shared', sizeBytes: 700, pinned: false }),
+        wireItem({ sidecarId: 'b', cid: 'c-shared', sizeBytes: 700, pinned: true }),
+      ],
+      get_storage_budget: { cacheCapacity: 512, maxPinnedBytes: 50_000_000 },
+    });
+    await svc.connectAdapter(adapter);
+    expect(svc.getQuotaStatus().pinnedUsedBytes).toBe(700);
+  });
+
+  it('budget fetch failure degrades to null budget (used-only display)', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      get_storage_budget: () => Promise.reject(new Error('runtime unavailable')),
+    });
+    await svc.connectAdapter(adapter);
+    expect(svc.getQuotaStatus().pinnedBudgetBytes).toBeNull();
   });
 
   it('returns cleanup recommendations sorted by confidence descending', () => {
