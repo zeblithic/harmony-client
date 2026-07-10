@@ -22,6 +22,12 @@ vi.mock('../../owner-service', () => ({
   extractError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 
+// ZEB-650 slice 2: OwnerPhraseReveal (mounted in the backup stage) calls the
+// export_owner_mnemonic_words command via direct invoke — mock the core module
+// so the reveal flow can be driven without Tauri. The mock stays unused (and
+// asserted unused) in every test that doesn't explicitly click the reveal.
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
+
 // ZEB-494: WelcomeModal now renders PairingJoiner in the 'joining' stage. Mock
 // PairingService so the joiner mounts cleanly in its idle state (no Tauri).
 vi.mock('../../pairing-service', () => ({
@@ -38,10 +44,14 @@ vi.mock('../../pairing-service', () => ({
   extractError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 
+import { invoke } from '@tauri-apps/api/core';
+const mockCoreInvoke = vi.mocked(invoke);
+
 beforeEach(() => {
   mintMock.mockReset();
   requestExportSavePathMock.mockReset();
   exportRecoveryFileMock.mockReset();
+  mockCoreInvoke.mockReset();
   localStorage.clear();
   sessionStorage.clear();
 });
@@ -271,6 +281,52 @@ describe('Commons chrome (ZEB-610)', () => {
   // Redaction invariant still holds after restyle.
   it('never leaks a 32+ hex run in the DOM after restyle', async () => {
     const { container } = await advanceToBackupStage();
+    expect(container.innerHTML).not.toMatch(/[0-9a-f]{32,}/i);
+  });
+});
+
+describe('WelcomeModal owner phrase reveal (ZEB-650 slice 2)', () => {
+  const OWNER = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+  const WORDS = [
+    'abandon', 'ability', 'able', 'about', 'above', 'absent',
+    'absorb', 'abstract', 'absurd', 'abuse', 'access', 'accident',
+    'account', 'accuse', 'achieve', 'acid', 'acoustic', 'acquire',
+    'across', 'act', 'action', 'actor', 'actress', 'actual',
+  ];
+
+  async function advanceToBackupStage() {
+    mintMock.mockResolvedValue({
+      state: {
+        ownerId: OWNER,
+        ownerDisplayName: 'x',
+        devices: [],
+        canBackUp: true,
+      },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
+    });
+    const utils = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    await fireEvent.click(utils.getByTestId('welcome-create-identity'));
+    await Promise.resolve();
+    await Promise.resolve();
+    return utils;
+  }
+
+  it('backup stage offers the write-it-down alternative without firing IPC', async () => {
+    const { getByTestId } = await advanceToBackupStage();
+    expect(getByTestId('phrase-reveal-open')).toBeTruthy();
+    expect(mockCoreInvoke).not.toHaveBeenCalled();
+  });
+
+  it('full reveal inside the modal keeps the hex-redaction invariant', async () => {
+    mockCoreInvoke.mockResolvedValue({ words: WORDS, ownerId: OWNER });
+    const { getByTestId, container } = await advanceToBackupStage();
+    await fireEvent.click(getByTestId('phrase-reveal-open'));
+    await fireEvent.click(getByTestId('phrase-reveal-confirm'));
+    await Promise.resolve();
+    await Promise.resolve();
+    await fireEvent.click(getByTestId('phrase-reveal-unblur'));
+    expect(getByTestId('phrase-grid').querySelectorAll('li').length).toBe(24);
+    // dto.ownerId (32 hex chars) must never reach the DOM.
     expect(container.innerHTML).not.toMatch(/[0-9a-f]{32,}/i);
   });
 });

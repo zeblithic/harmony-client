@@ -20,6 +20,7 @@
   import { trapFocus } from '../focus-trap';
   import PairingJoiner from './PairingJoiner.svelte';
   import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
+  import OwnerPhraseReveal from './OwnerPhraseReveal.svelte';
   import HarmonyMark from './HarmonyMark.svelte';
   import WizardProgress from './WizardProgress.svelte';
 
@@ -332,6 +333,11 @@
             Skip for now
           </button>
         </div>
+        {#if mintResult !== null}
+          <div class="phrase-alternative">
+            <OwnerPhraseReveal ownerId={mintResult.state.ownerId} />
+          </div>
+        {/if}
         <div class="wizard-rail">
           <WizardProgress
             steps={WIZARD_STEPS}
@@ -504,6 +510,11 @@
     font-size: 0.78rem;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .phrase-alternative {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
   }
   .wizard-rail {
     display: flex;
