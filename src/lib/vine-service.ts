@@ -500,16 +500,22 @@ export class VineService {
     // Count math is guarded on set membership so the toggle is idempotent
     // against state that already tracks us — e.g. a hydrated own-like row
     // (ZEB-672): liking again must not double-count, unliking must find
-    // the row to remove.
+    // the row to remove. `setMutated` records whether THIS toggle changed
+    // the set, so the rollback below undoes exactly what we did — rolling
+    // back a set the optimistic step never touched would corrupt hydrated
+    // state (Qodo PR #444).
     entry.likedByMe = newLiked;
+    let setMutated = false;
     if (newLiked) {
       if (!entry.reactors.has(selfKey)) {
         entry.reactors.add(selfKey);
         entry.count += 1;
+        setMutated = true;
       }
     } else if (entry.reactors.has(selfKey)) {
       entry.reactors.delete(selfKey);
       entry.count = Math.max(0, entry.count - 1);
+      setMutated = true;
     }
     this.reactionMap.set(vine.id, entry);
     this.onChange?.();
@@ -532,17 +538,19 @@ export class VineService {
           },
         });
       } catch {
-        // Rollback on failure — same set-guarded math as the optimistic
-        // step, so a rollback over unexpected state stays consistent.
+        // Rollback on failure — the exact inverse of the optimistic step:
+        // only touch the set/count if the optimistic step actually did.
+        // A no-op optimistic step over hydrated state (reactors already
+        // tracked us) must roll back to a no-op (Qodo PR #444).
         entry.likedByMe = wasLiked;
-        if (wasLiked) {
-          if (!entry.reactors.has(selfKey)) {
+        if (setMutated) {
+          if (newLiked) {
+            entry.reactors.delete(selfKey);
+            entry.count = Math.max(0, entry.count - 1);
+          } else {
             entry.reactors.add(selfKey);
             entry.count += 1;
           }
-        } else if (entry.reactors.has(selfKey)) {
-          entry.reactors.delete(selfKey);
-          entry.count = Math.max(0, entry.count - 1);
         }
         this.reactionMap.set(vine.id, entry);
         this.onChange?.();

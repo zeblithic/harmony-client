@@ -15,7 +15,7 @@
 - Tauri IPC: Rust params snake_case, JS callers camelCase; DTOs `#[serde(rename_all = "camelCase")]`.
 - Wire row shape (pinned by tests): `{ vineId, reactorAddress, reactorName, liked, timestamp }`.
 - Error extraction: `e instanceof Error ? e.message : String(e)`.
-- Gates: `npx tsc --noEmit`, `npx vitest run`, `cd src-tauri && cargo fmt --all`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; iterative Rust tests via `scripts/test-select --context task`; final pre-PR full sweep `cargo nextest run --locked --workspace --all-targets --features test-fixtures`.
+- Gates: `npx tsc --noEmit`, `npx vitest run`, `cd src-tauri && cargo fmt --all`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; iterative Rust tests via `scripts/test-select --context task` (paste the emitted `round=… bucket=…` summary line into the task report so the selection is auditable, per CLAUDE.md); final pre-PR full sweep `cargo nextest run --locked --workspace --all-targets --features test-fixtures`.
 - One commit per task; trailers per session convention.
 
 ---

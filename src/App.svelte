@@ -2377,7 +2377,15 @@
         const tasks = [
           ['mail.refreshCounts', mailService.refreshCounts()],
           ['mail.loadFolder', mailService.loadFolder(mailService.activeFolder)],
-          ['vine.loadFollowed', vineService.loadFollowed()],
+          // ZEB-672: hydrate is chained after loadFollowed (classification
+          // needs the follow set) and replayed on reconnect so persisted own
+          // reactions recalculate likedByMe when boot-time get_node_addr
+          // raced (the handler awaits fetchOwnAddress before this). hydrate
+          // is idempotent: seenIds / reactors-set / viewed-set all dedupe.
+          [
+            'vine.loadFollowed+hydrate',
+            vineService.loadFollowed().then(() => vineService.hydrate()),
+          ],
         ] as const;
         const results = await Promise.allSettled(tasks.map(([, p]) => p));
         for (const [i, result] of results.entries()) {

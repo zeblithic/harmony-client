@@ -1094,6 +1094,48 @@ describe('hydrate (ZEB-612 S2 — restart survival for the Rust-persisted cache)
       reaction: expect.objectContaining({ liked: false }),
     }));
   });
+
+  it('hydrate with ownAddress unset restores counts but not likedByMe; a replay heals it', async () => {
+    // The App boot race (CodeRabbit #444): get_node_addr can fail before
+    // hydrate runs, so own rows merge as anonymous reactors. The
+    // zenoh-status reconnect path replays hydrate after fetchOwnAddress —
+    // the replay must heal likedByMe WITHOUT double-counting.
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    mockHydrateInvoke(adapter, [dto({ id: 'h1' })], [
+      { vineId: 'h1', reactorAddress: 'me-hex', reactorName: 'You', liked: true, timestamp: 10 },
+    ]);
+    await svc2.hydrate();
+    expect(svc2.getReaction('h1')).toEqual({ count: 1, likedByMe: false });
+    svc2.ownAddress = 'me-hex';
+    await svc2.hydrate();
+    expect(svc2.getReaction('h1')).toEqual({ count: 1, likedByMe: true });
+  });
+
+  it('a failed publish after a no-op optimistic like rolls back to a no-op (Qodo #444)', async () => {
+    // Hydrated-as-anonymous own row (boot race above) + like + publish
+    // failure: the optimistic step finds us already in the reactors set
+    // (no-op), so the rollback must not delete the hydrated row or
+    // decrement the count.
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    mockHydrateInvoke(adapter, [dto({ id: 'h1' })], [
+      { vineId: 'h1', reactorAddress: 'me-hex', reactorName: 'You', liked: true, timestamp: 10 },
+    ]);
+    await svc2.hydrate();
+    svc2.ownAddress = 'me-hex';
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
+      cmd === 'publish_vine_reaction'
+        ? Promise.reject(new Error('engine gone'))
+        : Promise.resolve(null));
+    const vine = svc2.findVine('h1');
+    expect(vine).toBeDefined();
+    await svc2.toggleLike(vine!);
+    // Rollback restored likedByMe and left the hydrated reaction intact.
+    expect(svc2.getReaction('h1')).toEqual({ count: 1, likedByMe: false });
+  });
 });
 
 describe('live vine-received viewed flag (ZEB-612 S2)', () => {

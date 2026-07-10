@@ -1532,7 +1532,12 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+        match err {
+            RpcError::Command(msg) => {
+                assert!(msg.contains("not connected"), "got {msg:?}")
+            }
+            other => panic!("expected Command(\"not connected\"), got {other:?}"),
+        }
     }
 
     #[tokio::test]
