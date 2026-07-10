@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { resolveOriginalCreator, vineCreatorLabel, vineOriginalCreatorLabel } from './vine-utils';
+import {
+  resolveOriginalCreator,
+  vineCreatorLabel,
+  vineOriginalCreatorLabel,
+  pickCenterIndex,
+  formatVineDuration,
+  isOwnOriginalVine,
+} from './vine-utils';
 import type { VineVideo } from './types';
 
 function vine(overrides: Partial<VineVideo> = {}): VineVideo {
@@ -169,5 +176,60 @@ describe('vineOriginalCreatorLabel', () => {
       // no originalCreator* → resolver returns the (blank) source creator pair
     });
     expect(vineOriginalCreatorLabel(v)).toBe('685e4ba7');
+  });
+});
+
+describe('pickCenterIndex (ZEB-612 S2)', () => {
+  it('returns -1 for an empty list', () => {
+    expect(pickCenterIndex([], 300)).toBe(-1);
+  });
+
+  it('returns 0 for a single card', () => {
+    expect(pickCenterIndex([120], 300)).toBe(0);
+  });
+
+  it('picks the center nearest the viewport center', () => {
+    expect(pickCenterIndex([100, 290, 500], 300)).toBe(1);
+  });
+
+  it('breaks ties toward the earlier card (stable under all-zero jsdom rects)', () => {
+    expect(pickCenterIndex([250, 350], 300)).toBe(0);
+    expect(pickCenterIndex([0, 0, 0], 0)).toBe(0);
+  });
+});
+
+describe('formatVineDuration (ZEB-612 S2)', () => {
+  it('formats sub-minute durations as m:ss', () => {
+    expect(formatVineDuration(6)).toBe('0:06');
+    expect(formatVineDuration(5.96)).toBe('0:06');
+    expect(formatVineDuration(5.4)).toBe('0:05');
+  });
+
+  it('formats minute-plus durations', () => {
+    expect(formatVineDuration(65)).toBe('1:05');
+  });
+
+  it('floors non-finite and negative inputs to 0:00', () => {
+    expect(formatVineDuration(Number.NaN)).toBe('0:00');
+    expect(formatVineDuration(Number.POSITIVE_INFINITY)).toBe('0:00');
+    expect(formatVineDuration(-3)).toBe('0:00');
+  });
+});
+
+describe('isOwnOriginalVine (ZEB-612 S2 — extracted from VinePlayer)', () => {
+  it('true for a self-magic original', () => {
+    expect(isOwnOriginalVine(vine({ creatorAddress: 'self' }))).toBe(true);
+  });
+
+  it('true for a hex-keyed own original when ownAddress matches (FIX 2, PR #120)', () => {
+    expect(isOwnOriginalVine(vine({ creatorAddress: 'aabb' }), 'aabb')).toBe(true);
+  });
+
+  it("false for someone else's original", () => {
+    expect(isOwnOriginalVine(vine({ creatorAddress: 'ccdd' }), 'aabb')).toBe(false);
+  });
+
+  it('false for own RESHARE (reshares of own content are re-resharable)', () => {
+    expect(isOwnOriginalVine(vine({ creatorAddress: 'self', reshareOf: 'orig' }))).toBe(false);
   });
 });

@@ -97,3 +97,46 @@ export function vineOriginalCreatorLabel(vine: VineVideo): string {
   const name = vine.originalCreatorName?.trim() || vine.creatorName;
   return vineCreatorLabel(name, vine.originalCreatorAddress ?? vine.creatorAddress);
 }
+
+/**
+ * Index of the card center nearest the viewport center (ZEB-612 S2 feed
+ * autoplay). Ties break toward the earlier card, which also makes jsdom's
+ * all-zero rects deterministically pick index 0 (first card plays on mount).
+ * Returns -1 for an empty list.
+ */
+export function pickCenterIndex(centers: number[], viewportCenter: number): number {
+  let best = -1;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < centers.length; i++) {
+    const d = Math.abs(centers[i] - viewportCenter);
+    if (d < bestDist) {
+      bestDist = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/** "m:ss" badge text for the honest duration pill ("↻ 0:06"). */
+export function formatVineDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const total = Math.round(seconds);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/**
+ * Whether `vine` is the local user's own ORIGINAL (not a reshare) — the
+ * only case where the Reshare verb is suppressed. Extracted verbatim from
+ * VinePlayer's `isOwnOriginal` (FIX 2, PR #120 round 1): hex-keyed
+ * self-authored vines that arrived before `ownAddress` was set weren't
+ * remapped to the magic 'self' value, so both signals are checked.
+ */
+export function isOwnOriginalVine(vine: VineVideo, ownAddress?: string): boolean {
+  return (
+    !vine.reshareOf
+    && (vine.creatorAddress === 'self'
+      || (ownAddress != null && vine.creatorAddress === ownAddress))
+  );
+}
