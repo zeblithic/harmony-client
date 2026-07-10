@@ -3,6 +3,7 @@
   import type { VineVideo } from '../types';
   import VineCard from './VineCard.svelte';
   import ReshareConfirmDialog from './ReshareConfirmDialog.svelte';
+  import ConfirmDialog from './ConfirmDialog.svelte';
   import { pickCenterIndex, isOwnOriginalVine } from '../vine-utils';
 
   type FeedFilter = 'all' | 'unviewed';
@@ -18,6 +19,7 @@
     onMarkViewed,
     onPublish,
     onReshare,
+    onDelete,
     onFollow,
     onUnfollow,
     resolveVideo,
@@ -38,6 +40,8 @@
     onMarkViewed?: (id: string) => void;
     onPublish?: () => void;
     onReshare?: (vine: VineVideo) => Promise<void> | void;
+    /** ZEB-670: delete an own vine (creator tombstone). Confirm is feed-owned. */
+    onDelete?: (vine: VineVideo) => Promise<void> | void;
     onFollow?: (address: string, name: string) => void;
     onUnfollow?: (address: string) => void;
     resolveVideo?: (cid: string) => Promise<string>;
@@ -73,6 +77,10 @@
   let reshareTarget = $state<VineVideo | null>(null);
   let resharingId = $state<string | null>(null);
   let reshareError = $state('');
+  /** ZEB-670: delete-confirmation trio, mirroring the reshare trio above. */
+  let deleteTarget = $state<VineVideo | null>(null);
+  let deletingId = $state<string | null>(null);
+  let deleteError = $state('');
   let feedListEl = $state<HTMLDivElement | null>(null);
   /** Card id to scroll to once it exists in the rendered list. */
   let pendingScrollId = $state<string | null>(null);
@@ -313,6 +321,37 @@
       resharingId = null;
     }
   }
+
+  // ── ZEB-670: feed-level delete (creator tombstone) ───────────────────
+
+  function requestDelete(vine: VineVideo) {
+    if (deletingId) return;
+    deleteError = '';
+    deleteTarget = vine;
+  }
+
+  async function confirmDelete() {
+    const vine = deleteTarget;
+    deleteTarget = null;
+    if (!vine || !onDelete) return;
+    deletingId = vine.id;
+    try {
+      await onDelete(vine);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      deleteError = msg || 'Delete failed';
+    } finally {
+      deletingId = null;
+    }
+  }
+
+  /** Own vines only: local rows are remapped to 'self'; a live row may
+   *  still carry our hex address before remap (same duality canReshare's
+   *  isOwnOriginalVine handles). */
+  function isOwnVine(vine: VineVideo): boolean {
+    return vine.creatorAddress === 'self'
+      || (ownAddress != null && vine.creatorAddress === ownAddress);
+  }
 </script>
 
 <div class="vine-feed">
@@ -346,6 +385,10 @@
 
   {#if reshareError}
     <p class="reshare-error" role="alert">{reshareError}</p>
+  {/if}
+
+  {#if deleteError}
+    <p class="reshare-error" role="alert">{deleteError}</p>
   {/if}
 
   {#if filteredVines.length === 0}
@@ -398,6 +441,9 @@
             canReshare={!!onReshare && !isOwnOriginalVine(vine, ownAddress)}
             resharing={resharingId === vine.id}
             onReshare={requestReshare}
+            canDelete={!!onDelete && isOwnVine(vine)}
+            deleting={deletingId === vine.id}
+            onDelete={requestDelete}
             {onViewOriginal}
           />
         </div>
@@ -411,6 +457,17 @@
     vine={reshareTarget}
     onConfirm={confirmReshare}
     onCancel={() => { reshareTarget = null; }}
+  />
+{/if}
+
+{#if deleteTarget}
+  <ConfirmDialog
+    title="Delete vine?"
+    message={`This deletes "${deleteTarget.title ?? 'this vine'}" from your feed and asks peers to drop their copies. Peers that are offline may keep it until they reconnect.`}
+    confirmLabel="Delete"
+    destructive={true}
+    onConfirm={confirmDelete}
+    onCancel={() => { deleteTarget = null; }}
   />
 {/if}
 

@@ -390,7 +390,7 @@ struct SetIdentityDiscoverableArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (68 commands). Every handler calls
+/// Build the curated v1 RPC surface (69 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -704,6 +704,10 @@ pub fn build_registry() -> RpcRegistry {
         crate::ReshareVineArgs,
         |state, _sink, a| async move { crate::reshare_vine_impl(state, a).await }
     );
+    // ZEB-670: creator-signed delete verb (tombstone publish).
+    rpc!(m, "delete_vine", VineIdArgs, |state, _sink, a| async move {
+        crate::delete_vine_impl(state, a.vine_id).await
+    });
     // ZEB-562: vine-follow verbs for the agent-driven e2e harness — parity with
     // the GUI follow surface, mirroring the ZEB-552 vine RPC pattern.
     rpc!(
@@ -1541,6 +1545,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_vine_errs_not_connected_pre_node() {
+        // ZEB-670: pins the registration + the "not connected" contract.
+        // (The signer / ownership checks are covered by delete_vine_impl's
+        // own tests in lib.rs and the cache's tombstone tests.)
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "delete_vine",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "vineId": "vine-1" }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            RpcError::Command(msg) => {
+                assert!(msg.contains("not connected"), "got {msg:?}")
+            }
+            other => panic!("expected Command(\"not connected\"), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -1590,6 +1617,7 @@ mod tests {
             "list_vine_reactions",
             "mark_vine_viewed",
             "reshare_vine",
+            "delete_vine",
             // vine follows (ZEB-562)
             "follow_vine_creator",
             "unfollow_vine_creator",

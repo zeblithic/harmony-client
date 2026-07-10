@@ -183,10 +183,10 @@ describe('Commons copy (ZEB-612 S2)', () => {
     render(VinePublishDialog, props());
     expect(screen.getByRole('dialog', { name: 'Share a vine' })).toBeTruthy();
     expect(screen.getByText('≤ 6 seconds · loops forever')).toBeTruthy();
+    // ZEB-670 shipped the delete verb (signed creator tombstone), so the
+    // drawn "only you can delete it" claim is true again and restored.
     expect(screen.getByText(
-      "Publishes to your sovereign identity and replicates peer-to-peer. There's no central server to take it down.")).toBeTruthy();
-    // The delete claim stays out until ZEB-670 ships the verb.
-    expect(screen.queryByText(/only you can delete it/)).toBeNull();
+      "Publishes to your sovereign identity and replicates peer-to-peer. There's no central server to take it down — only you can delete it.")).toBeTruthy();
   });
 
   it('labels the text field Caption', () => {

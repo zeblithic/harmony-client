@@ -259,6 +259,7 @@ pub mod state_snapshot;
 pub mod tunnel_manager;
 pub mod tunnel_task;
 pub mod vine_feed_cache;
+pub mod vine_tombstone;
 pub mod voice;
 pub mod voice_crypto;
 pub mod voice_moderation;
@@ -755,6 +756,10 @@ pub struct NodeState {
     /// receive; read by list_vine_videos / mark_vine_viewed IPCs.
     /// Disk persistence deferred to ZEB-147.
     vine_feed_cache: Option<std::sync::Arc<std::sync::Mutex<vine_feed_cache::VineFeedCache>>>,
+    /// ZEB-670: Arc clone of `start_node`'s `private_identity_arc` (the
+    /// owner Ed25519 identity). Command-path signer for vine tombstones
+    /// (`delete_vine`). Cleared on stop alongside `dm_identity_pub_64`.
+    owner_private_identity: Option<std::sync::Arc<harmony_identity::PrivateIdentity>>,
     /// Shared mail manager (read/written by event loop on receive, by commands for queries).
     mail_mgr: Option<std::sync::Arc<std::sync::Mutex<mail::MailManager>>>,
     /// Shared mail sync (walker + lazy body fetch). Stored here so Tauri
@@ -1607,6 +1612,7 @@ impl Default for NodeState {
             follow_mgr: None,
             followed_set: None,
             vine_feed_cache: None,
+            owner_private_identity: None,
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
@@ -2106,6 +2112,9 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // identity's invites. `[u8; 64]` is Copy, so just `take()` and
         // discard — no extra cleanup needed beyond the assignment.
         let _ = guard.dm_identity_pub_64.take();
+        // ZEB-670: drop the tombstone-signing identity with the node —
+        // delete_vine must not sign with a stale identity after stop.
+        let _ = guard.owner_private_identity.take();
         // ZEB-461: clear the local PQ pubkeys alongside the identity pub so a
         // stale identity's keys never leak into a new identity's handshakes.
         let _ = guard.dm_local_dsa_pubkey.take();
@@ -9554,6 +9563,9 @@ pub async fn start_node_inner(
                         guard.follow_mgr = Some(follow_mgr);
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
+                        // ZEB-670: tombstone signer for delete_vine.
+                        guard.owner_private_identity =
+                            Some(std::sync::Arc::clone(&private_identity_arc));
                         guard.mail_mgr = Some(mail_mgr);
                         guard.mail_sync = Some(mail_sync);
                         guard.node_addr = node_addr_for_state;
@@ -12786,6 +12798,9 @@ pub struct VineVideoDto {
     pub original_creator_address: Option<String>,
     /// See VineDescriptorPayload::original_creator_name.
     pub original_creator_name: Option<String>,
+    /// ZEB-670: true when this row is a reshare whose original was
+    /// tombstoned by its creator — render as a "Removed by creator" stub.
+    pub original_removed: bool,
 }
 
 /// Response returned by list_followed — one entry per followed address.
@@ -13140,6 +13155,224 @@ async fn publish_vine_reaction(
     reply_rx
         .await
         .map_err(|_| "event loop dropped publish request".to_string())?
+}
+
+/// Result of `delete_vine` — mirrors PublishVineResult's shape posture.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteVineResult {
+    pub published: bool,
+}
+
+/// ZEB-670: shared seam for `delete_vine` (GUI command + headless RPC).
+///
+/// Signs a `VineTombstonePayload` with the owner identity and publishes it
+/// on `harmony/vines/{addr}/tombstones/{vine_id}`. Only the creator can
+/// delete: the cached descriptor's `creator_address` must equal our
+/// `node_addr` (receivers independently enforce the same rule against the
+/// signature — see `vine_tombstone::verify_tombstone`).
+///
+/// Local cache application is NOT done here: our own subscriber receives
+/// the loopback echo of the publish and applies it through the same
+/// `on_tombstone_sample` path as every remote peer (mirrors how
+/// `publish_vine` relies on the `vine-received` echo).
+pub(crate) async fn delete_vine_impl(
+    state: &Mutex<NodeState>,
+    vine_id: String,
+) -> Result<DeleteVineResult, String> {
+    let (publish_tx, node_addr, identity, cache) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard
+                .publish_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.node_addr.clone(),
+            guard
+                .owner_private_identity
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard
+                .vine_feed_cache
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+        )
+    };
+
+    let video_cid = {
+        let cache = cache
+            .lock()
+            .map_err(|e| format!("vine_feed_cache lock: {e}"))?;
+        let row = cache
+            .list_descriptors()
+            .into_iter()
+            .find(|v| v.id == vine_id)
+            .ok_or_else(|| "vine not found".to_string())?;
+        if row.creator_address != node_addr {
+            return Err("not your vine: only the creator can delete a vine".to_string());
+        }
+        row.video_cid
+    };
+
+    let deleted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tombstone = vine_tombstone::sign_tombstone(
+        &identity,
+        vine_id.clone(),
+        video_cid,
+        node_addr.clone(),
+        deleted_at,
+    );
+    let key_expr = vine_tombstone::tombstone_key_expr(&node_addr, &vine_id);
+    let payload = serde_json::to_vec(&tombstone).map_err(|e| format!("serialize: {e}"))?;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    publish_tx
+        .send(event_loop::PublishRequest {
+            key_expr,
+            payload,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped publish request".to_string())??;
+
+    Ok(DeleteVineResult { published: true })
+}
+
+/// ZEB-670: GUI command for the delete verb.
+#[tauri::command]
+async fn delete_vine(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    vine_id: String,
+) -> Result<DeleteVineResult, String> {
+    delete_vine_impl(state.inner(), vine_id).await
+}
+
+#[cfg(test)]
+mod delete_vine_tests {
+    use super::*;
+
+    /// NodeState with everything delete_vine_impl extracts: a publish
+    /// channel (rx returned so the test can echo the event loop's reply),
+    /// the signer identity, and a cache holding `vine-1` by `creator`.
+    fn fixture(
+        creator: &str,
+    ) -> (
+        Mutex<NodeState>,
+        tokio::sync::mpsc::Receiver<event_loop::PublishRequest>,
+        String,
+    ) {
+        let identity = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let node_addr = hex::encode(identity.public_identity().address_hash);
+        let mut cache = vine_feed_cache::VineFeedCache::new();
+        let descriptor = VineDescriptorPayload {
+            id: "vine-1".into(),
+            creator_address: creator.into(),
+            creator_name: "Creator".into(),
+            created_at: 1_700_000_000,
+            video_cid: "aa".repeat(32),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+        };
+        let outcome = cache.on_descriptor_sample(
+            &format!("harmony/vines/{creator}"),
+            &serde_json::to_vec(&descriptor).unwrap(),
+            &std::collections::HashSet::new(),
+            1_000,
+        );
+        assert!(matches!(
+            outcome,
+            Some(vine_feed_cache::DescriptorOutcome::Inserted { .. })
+        ));
+        let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(4);
+        let state = Mutex::new(NodeState {
+            publish_tx: Some(publish_tx),
+            node_addr: node_addr.clone(),
+            owner_private_identity: Some(std::sync::Arc::new(identity)),
+            vine_feed_cache: Some(std::sync::Arc::new(std::sync::Mutex::new(cache))),
+            ..NodeState::default()
+        });
+        (state, publish_rx, node_addr)
+    }
+
+    #[tokio::test]
+    async fn delete_vine_rejects_unknown_vine() {
+        let (state, _rx, _addr) = fixture("someone-else");
+        let err = delete_vine_impl(&state, "vine-missing".into())
+            .await
+            .unwrap_err();
+        assert!(err.contains("vine not found"), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_vine_rejects_non_creator() {
+        let (state, _rx, _addr) = fixture("someone-else");
+        let err = delete_vine_impl(&state, "vine-1".into()).await.unwrap_err();
+        assert!(err.contains("not your vine"), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_vine_publishes_verified_tombstone_on_creator_topic() {
+        // Fixture quirk: the cache is keyed by the descriptor's
+        // self-declared creator, so seed it with OUR address by building
+        // the fixture in two steps — generate first, then seed.
+        let identity = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let node_addr = hex::encode(identity.public_identity().address_hash);
+        let mut cache = vine_feed_cache::VineFeedCache::new();
+        let descriptor = VineDescriptorPayload {
+            id: "vine-1".into(),
+            creator_address: node_addr.clone(),
+            creator_name: "Me".into(),
+            created_at: 1_700_000_000,
+            video_cid: "aa".repeat(32),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+        };
+        cache.on_descriptor_sample(
+            &format!("harmony/vines/{node_addr}"),
+            &serde_json::to_vec(&descriptor).unwrap(),
+            &std::collections::HashSet::new(),
+            1_000,
+        );
+        let (publish_tx, mut publish_rx) = tokio::sync::mpsc::channel(4);
+        let state = Mutex::new(NodeState {
+            publish_tx: Some(publish_tx),
+            node_addr: node_addr.clone(),
+            owner_private_identity: Some(std::sync::Arc::new(identity)),
+            vine_feed_cache: Some(std::sync::Arc::new(std::sync::Mutex::new(cache))),
+            ..NodeState::default()
+        });
+
+        // Echo the event loop's publish ack.
+        let echo = tokio::spawn(async move {
+            let req = publish_rx.recv().await.expect("publish request");
+            let _ = req.reply.send(Ok(()));
+            (req.key_expr, req.payload)
+        });
+
+        let result = delete_vine_impl(&state, "vine-1".into()).await.unwrap();
+        assert!(result.published);
+
+        let (key_expr, payload) = echo.await.unwrap();
+        assert_eq!(
+            key_expr,
+            vine_tombstone::tombstone_key_expr(&node_addr, "vine-1")
+        );
+        let t: vine_tombstone::VineTombstonePayload = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(t.vine_id, "vine-1");
+        assert_eq!(t.video_cid, "aa".repeat(32));
+        assert_eq!(t.creator_address, node_addr);
+        vine_tombstone::verify_tombstone(&t).expect("published tombstone must verify");
+    }
 }
 
 /// Shared seam for `list_vine_videos` (GUI command + headless RPC): return all
@@ -53335,6 +53568,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_vine_videos,
             list_vine_reactions,
+            delete_vine,
             follow_vine_creator,
             unfollow_vine_creator,
             list_followed,
@@ -58486,6 +58720,7 @@ mod start_node_race_tests {
             follow_mgr: None,
             followed_set: None,
             vine_feed_cache: None,
+            owner_private_identity: None,
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
