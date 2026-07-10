@@ -130,7 +130,7 @@
   {#if $voiceState.channelFull}
     <!-- Soft-cap bounce (ZEB-353): the join was reactively refused because the
          channel was full. Session is back at idle; this explains why. -->
-    <div class="voice-error" role="alert">Voice channel full — try again later.</div>
+    <div class="voice-full-note" role="alert">Voice channel full — try again later.</div>
   {:else if error}
     <div class="voice-error" role="alert">{error}</div>
   {/if}
@@ -147,6 +147,8 @@
 
   {#if $voiceState.phase === 'idle'}
     <div class="voice-join-pane">
+      <span class="join-glyph" data-testid="join-glyph" aria-hidden="true">🔊</span>
+      <span class="join-name">{channelName}</span>
       <button class="btn-primary" onclick={onJoin} disabled={joining}>
         {joining ? 'Joining…' : 'Join Voice'}
       </button>
@@ -227,7 +229,7 @@
 
     {#if $voiceState.selfModMuted}
       <div class="voice-mod-note" role="status" data-testid="self-mod-muted">
-        🛡️ You've been muted by a moderator.
+        🛡 You've been muted by a moderator. Your talk controls are disabled until they unmute you.
       </div>
     {/if}
     {#if $voiceState.selfKicked}
@@ -326,7 +328,8 @@
     white-space: nowrap;
   }
   .voice-count {
-    font-size: 0.85rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
     color: var(--text-secondary);
     white-space: nowrap;
   }
@@ -335,8 +338,20 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--danger);
     color: var(--danger);
-    padding: 8px 14px;
-    border-radius: 4px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin: 8px 16px;
+    font-size: 0.85rem;
+  }
+
+  /* Soft-cap bounce: a chosen-limit refusal, not a failure — gov-clay soft
+     surface per TH frame C, distinct from the danger .voice-error. */
+  .voice-full-note {
+    background: var(--gov-clay-soft);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 45%, transparent);
+    color: var(--gov-clay-deep);
+    padding: 8px 12px;
+    border-radius: 8px;
     margin: 8px 16px;
     font-size: 0.85rem;
   }
@@ -348,8 +363,8 @@
     background: color-mix(in srgb, var(--warning) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
     color: var(--warning);
-    padding: 8px 14px;
-    border-radius: 4px;
+    padding: 8px 12px;
+    border-radius: 8px;
     margin: 8px 16px;
     font-size: 0.85rem;
   }
@@ -360,13 +375,23 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 0.75rem;
+    gap: 8px;
     color: var(--text-secondary);
+  }
+  .join-glyph {
+    font-size: 2rem;
+    line-height: 1;
+  }
+  .join-name {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 4px;
   }
   .btn-primary {
     border: none;
     padding: 8px 22px;
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--accent);
     color: var(--on-accent);
     font-size: 0.9rem;
@@ -556,7 +581,13 @@
   .mod-btn:hover { color: var(--text-primary); }
   .mod-btn.danger { color: var(--danger); border-color: var(--danger); }
   .mod-badge { position: absolute; top: 6px; left: 6px; font-size: 0.7rem; line-height: 1; }
-  .voice-mod-note { background: color-mix(in srgb, var(--warning) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
-    color: var(--warning); padding: 6px 14px; border-radius: 4px; margin: 0 16px 8px; font-size: 0.85rem; }
+  .voice-mod-note {
+    background: var(--status-recalled-bg);
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin: 0 16px 8px;
+    font-size: 0.85rem;
+  }
 </style>

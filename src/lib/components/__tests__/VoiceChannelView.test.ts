@@ -272,3 +272,42 @@ describe('VoiceChannelView (ZEB-358): moderation', () => {
     expect(muteBtn).toBeDisabled();
   });
 });
+
+describe('VoiceChannelView (ZEB-612 slice 1): Commons restyle — banners + join pane', () => {
+  it('channel-full banner is its own clay note (not the danger error class), still an alert', () => {
+    const session = fakeSession({ phase: 'idle', channelFull: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent(/voice channel full — try again later/i);
+    expect(alert.className).toMatch(/voice-full-note/);
+    expect(alert.className).not.toMatch(/voice-error/);
+  });
+
+  it('join errors still use the danger error class', async () => {
+    // Pin that only channel-full moved off .voice-error — real errors keep it.
+    const session = fakeSession({ phase: 'idle' });
+    (session.join as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('boom'));
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    await fireEvent.click(screen.getByRole('button', { name: /join/i }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/boom/);
+    expect(alert.className).toMatch(/voice-error/);
+  });
+
+  it('mod-silenced note carries the full Commons copy', () => {
+    const session = fakeSession({ phase: 'connected', selfModMuted: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    const note = screen.getByTestId('self-mod-muted');
+    expect(note).toHaveTextContent(/You've been muted by a moderator/);
+    expect(note).toHaveTextContent(/talk controls are disabled until they unmute you/i);
+  });
+
+  it('join pane shows the room glyph and keeps the join-muted hint verbatim', () => {
+    const session = fakeSession({ phase: 'idle' });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('join-glyph')).toBeInTheDocument();
+    expect(
+      screen.getByText("You'll join muted — unmute when you're ready.")
+    ).toBeInTheDocument();
+  });
+});
