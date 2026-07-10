@@ -13314,20 +13314,23 @@ mod delete_vine_tests {
 
     /// NodeState with everything delete_vine_impl extracts: a publish
     /// channel (rx returned so the test can echo the event loop's reply),
-    /// the signer identity, and a cache holding `vine-1` by `creator`.
-    fn fixture(
-        creator: &str,
-    ) -> (
+    /// the signer identity, and a cache holding `vine-1` owned by a
+    /// freshly-generated OTHER creator (ZEB-673: cache admission is
+    /// strict, so the seed must be a real signed record — a free-form
+    /// creator string can no longer be seeded).
+    fn fixture() -> (
         Mutex<NodeState>,
         tokio::sync::mpsc::Receiver<event_loop::PublishRequest>,
         String,
     ) {
         let identity = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
         let node_addr = hex::encode(identity.public_identity().address_hash);
+        let creator_identity = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let creator = hex::encode(creator_identity.public_identity().address_hash);
         let mut cache = vine_feed_cache::VineFeedCache::new();
-        let descriptor = VineDescriptorPayload {
+        let mut descriptor = VineDescriptorPayload {
             id: "vine-1".into(),
-            creator_address: creator.into(),
+            creator_address: creator.clone(),
             creator_name: "Creator".into(),
             created_at: 1_700_000_000,
             video_cid: "aa".repeat(32),
@@ -13338,6 +13341,7 @@ mod delete_vine_tests {
             identity_pub: None,
             sig: None,
         };
+        vine_signing::sign_descriptor(&creator_identity, &mut descriptor);
         let outcome = cache.on_descriptor_sample(
             &format!("harmony/vines/{creator}"),
             &serde_json::to_vec(&descriptor).unwrap(),
@@ -13361,7 +13365,7 @@ mod delete_vine_tests {
 
     #[tokio::test]
     async fn delete_vine_rejects_unknown_vine() {
-        let (state, _rx, _addr) = fixture("someone-else");
+        let (state, _rx, _addr) = fixture();
         let err = delete_vine_impl(&state, "vine-missing".into())
             .await
             .unwrap_err();
@@ -13370,7 +13374,7 @@ mod delete_vine_tests {
 
     #[tokio::test]
     async fn delete_vine_rejects_non_creator() {
-        let (state, _rx, _addr) = fixture("someone-else");
+        let (state, _rx, _addr) = fixture();
         let err = delete_vine_impl(&state, "vine-1".into()).await.unwrap_err();
         assert!(err.contains("not your vine"), "got {err:?}");
     }
@@ -13383,7 +13387,7 @@ mod delete_vine_tests {
         let identity = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
         let node_addr = hex::encode(identity.public_identity().address_hash);
         let mut cache = vine_feed_cache::VineFeedCache::new();
-        let descriptor = VineDescriptorPayload {
+        let mut descriptor = VineDescriptorPayload {
             id: "vine-1".into(),
             creator_address: node_addr.clone(),
             creator_name: "Me".into(),
@@ -13396,6 +13400,7 @@ mod delete_vine_tests {
             identity_pub: None,
             sig: None,
         };
+        vine_signing::sign_descriptor(&identity, &mut descriptor);
         cache.on_descriptor_sample(
             &format!("harmony/vines/{node_addr}"),
             &serde_json::to_vec(&descriptor).unwrap(),

@@ -116,13 +116,14 @@ pub enum DescriptorOutcome {
 
 /// Outcome of `on_reaction_sample`. The receive path re-emits to the
 /// frontend only on `Inserted` or `UpdatedNewer` (idempotent re-arrivals
-/// and stale samples are absorbed silently).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// and stale samples are absorbed silently). `Rejected` carries the
+/// reason (parse / signature / topic-binding failure — ZEB-673).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReactionOutcome {
     Inserted,
     UpdatedNewer,
     Stale,
-    Rejected,
+    Rejected(String),
 }
 
 /// ZEB-670: in-memory applied tombstone, keyed by `vine_id` in
@@ -453,6 +454,24 @@ impl VineFeedCache {
             }
         };
 
+        // ZEB-673: strict wire admission, before any state effect. The
+        // record must be creator-signed (pubkey→address binding +
+        // verify_strict) and published on the creator's own topic — the
+        // key is not authoritative, so both directions matter: a valid
+        // record replayed onto another topic AND a forged record on the
+        // right topic are rejected. Disk loads bypass this path
+        // (populate_from_disk) and stay tolerant of pre-ZEB-673 rows.
+        if let Err(e) = crate::vine_signing::verify_descriptor(&descriptor) {
+            return Some(DescriptorOutcome::Rejected(e));
+        }
+        let topic_creator = key_expr.strip_prefix("harmony/vines/").unwrap_or("");
+        if topic_creator != descriptor.creator_address {
+            return Some(DescriptorOutcome::Rejected(format!(
+                "descriptor topic creator '{topic_creator}' does not match payload creator '{}'",
+                descriptor.creator_address
+            )));
+        }
+
         if self.descriptors.contains_key(&descriptor.id) {
             return Some(DescriptorOutcome::AlreadyPresent);
         }
@@ -587,19 +606,14 @@ impl VineFeedCache {
         }
     }
 
-    /// Parse + insert/LWW-update a reaction.
+    /// Parse + verify + insert/LWW-update a reaction.
     ///
     /// Returns `None` if `key_expr` is not a vine-reaction topic.
-    /// LWW per (vine_id, reactor_addr) by `timestamp`. Stale samples
-    /// (timestamp older than existing entry) return `Stale` and do
-    /// NOT mutate the cache.
-    ///
-    /// `ReactionOutcome::Rejected` is a unit variant — the underlying
-    /// `serde_json` parse error is discarded for now. Callers (currently
-    /// `event_loop::emit_frontend_event`, Task 5) are responsible for
-    /// any observability around malformed reaction payloads. If a future
-    /// telemetry need surfaces, this can be lifted to `Rejected(String)`
-    /// to match `DescriptorOutcome::Rejected`.
+    /// ZEB-673: the record must be REACTOR-signed and the topic's
+    /// `{vine_id}`/`{reactor}` segments must match the (verified)
+    /// payload. LWW per (vine_id, reactor_addr) by `timestamp`. Stale
+    /// samples (timestamp older than existing entry) return `Stale` and
+    /// do NOT mutate the cache.
     pub fn on_reaction_sample(
         &mut self,
         key_expr: &str,
@@ -611,8 +625,37 @@ impl VineFeedCache {
 
         let reaction: VineReactionPayload = match serde_json::from_slice(payload) {
             Ok(r) => r,
-            Err(_) => return Some(ReactionOutcome::Rejected),
+            Err(e) => {
+                return Some(ReactionOutcome::Rejected(format!(
+                    "reaction parse failed: {e}"
+                )))
+            }
         };
+
+        // ZEB-673: strict wire admission — reactor signature first (no
+        // state effects on failure), then bind the topic's trailing
+        // `{vine_id}/{reactor}` segments to the verified payload so a
+        // valid record can't be replayed under another vine's key. The
+        // leading `{creator}` segment names the topic OWNER, which the
+        // payload doesn't carry — cross-creator replay of the same
+        // (vine_id, reactor) tuple is idempotent by construction.
+        if let Err(e) = crate::vine_signing::verify_reaction(&reaction) {
+            return Some(ReactionOutcome::Rejected(e));
+        }
+        let mut tail = key_expr
+            .split("/reactions/")
+            .nth(1)
+            .unwrap_or("")
+            .split('/');
+        let topic_vine = tail.next().unwrap_or("");
+        let topic_reactor = tail.next().unwrap_or("");
+        if topic_vine != reaction.vine_id || topic_reactor != reaction.reactor_address {
+            return Some(ReactionOutcome::Rejected(format!(
+                "reaction topic segments '{topic_vine}/{topic_reactor}' do not match payload \
+                 '{}/{}'",
+                reaction.vine_id, reaction.reactor_address
+            )));
+        }
 
         let key = (reaction.vine_id.clone(), reaction.reactor_address.clone());
         match self.reactions.get(&key) {
@@ -1022,40 +1065,213 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// Build a canonical descriptor JSON payload for `creator_address` + `vine_id`.
+    /// ZEB-673: strict wire admission requires real signer identities,
+    /// but the tests' readable creator names ("alice-addr") are worth
+    /// keeping. This registry lazily mints one identity per name;
+    /// `addr()` translates a name to its signer's derived hex address.
+    /// Process-global so every mention of a name agrees on the identity.
+    /// Identities minted by `tombstone_identity()` self-register under
+    /// their DERIVED address, so a derived address passed back in as a
+    /// "name" maps to itself.
+    type SignerRegistry =
+        std::collections::HashMap<String, std::sync::Arc<harmony_identity::PrivateIdentity>>;
+
+    fn signers() -> &'static std::sync::Mutex<SignerRegistry> {
+        static SIGNERS: std::sync::OnceLock<std::sync::Mutex<SignerRegistry>> =
+            std::sync::OnceLock::new();
+        SIGNERS.get_or_init(Default::default)
+    }
+
+    fn signer_for(name: &str) -> std::sync::Arc<harmony_identity::PrivateIdentity> {
+        let mut guard = signers().lock().unwrap();
+        guard
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(harmony_identity::PrivateIdentity::generate(
+                    &mut rand::rngs::OsRng,
+                ))
+            })
+            .clone()
+    }
+
+    /// Derived hex address for a named test signer.
+    fn addr(name: &str) -> String {
+        hex::encode(signer_for(name).public_identity().address_hash)
+    }
+
+    /// Descriptor topic for a named test signer.
+    fn topic(name: &str) -> String {
+        format!("harmony/vines/{}", addr(name))
+    }
+
+    /// Build a canonical descriptor JSON payload for `creator` + `vine_id`.
     ///
-    /// Mirrors the bytes that production `publish_vine` produces (the same
-    /// `VineDescriptorPayload` serde::Serialize shape).
+    /// Mirrors the bytes that production `publish_vine` produces: the
+    /// payload carries the DERIVED address of the named signer (see
+    /// `addr`) and is creator-signed (ZEB-673). `original_creator` is
+    /// also a signer NAME, translated the same way.
     #[allow(clippy::too_many_arguments)] // test helper — readable named-positional args beat a struct here
     fn canonical_descriptor_bytes(
         vine_id: &str,
-        creator_address: &str,
+        creator: &str,
         creator_name: &str,
         video_cid: &str,
         title: Option<&str>,
         reshare_of: Option<&str>,
         created_at: u64,
-        original_creator_address: Option<&str>,
+        original_creator: Option<&str>,
         original_creator_name: Option<&str>,
     ) -> Vec<u8> {
-        let v = crate::VineDescriptorPayload {
+        let signer = signer_for(creator);
+        let mut v = crate::VineDescriptorPayload {
             id: vine_id.to_string(),
-            creator_address: creator_address.to_string(),
+            creator_address: addr(creator),
             creator_name: creator_name.to_string(),
             created_at,
             video_cid: video_cid.to_string(),
             title: title.map(String::from),
             reshare_of: reshare_of.map(String::from),
-            original_creator_address: original_creator_address.map(String::from),
+            original_creator_address: original_creator.map(addr),
             original_creator_name: original_creator_name.map(String::from),
             identity_pub: None,
             sig: None,
         };
+        crate::vine_signing::sign_descriptor(&signer, &mut v);
         serde_json::to_vec(&v).unwrap()
     }
 
-    fn followed_set_with(addrs: &[&str]) -> HashSet<String> {
-        addrs.iter().map(|s| s.to_string()).collect()
+    /// Followed-set of named test signers (translated to derived addresses).
+    fn followed_set_with(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| addr(s)).collect()
+    }
+
+    // ── ZEB-673: strict wire admission ───────────────────────────────
+
+    #[test]
+    fn unsigned_wire_descriptor_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let v = crate::VineDescriptorPayload {
+            id: "vine-unsigned-1".into(),
+            creator_address: addr("alice-addr"),
+            creator_name: "Alice".into(),
+            created_at: 1_700_000_000,
+            video_cid: "cid-aaa".into(),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+            identity_pub: None,
+            sig: None,
+        };
+        let out = cache.on_descriptor_sample(
+            &topic("alice-addr"),
+            &serde_json::to_vec(&v).unwrap(),
+            &HashSet::new(),
+            1_000,
+        );
+        assert!(
+            matches!(out, Some(DescriptorOutcome::Rejected(ref r)) if r.contains("unsigned")),
+            "got {out:?}"
+        );
+        assert!(cache.list_descriptors().is_empty());
+    }
+
+    #[test]
+    fn tampered_descriptor_signature_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let bytes = canonical_descriptor_bytes(
+            "vine-tamper-1",
+            "alice-addr",
+            "Alice",
+            "cid-aaa",
+            Some("original title"),
+            None,
+            1_700_000_000,
+            None,
+            None,
+        );
+        let mut v: crate::VineDescriptorPayload = serde_json::from_slice(&bytes).unwrap();
+        v.title = Some("attacker title".into());
+        let out = cache.on_descriptor_sample(
+            &topic("alice-addr"),
+            &serde_json::to_vec(&v).unwrap(),
+            &HashSet::new(),
+            1_000,
+        );
+        assert!(
+            matches!(out, Some(DescriptorOutcome::Rejected(ref r)) if r.contains("signature invalid")),
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn descriptor_replayed_on_foreign_topic_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let bytes = canonical_descriptor_bytes(
+            "vine-replay-1",
+            "alice-addr",
+            "Alice",
+            "cid-aaa",
+            None,
+            None,
+            1_700_000_000,
+            None,
+            None,
+        );
+        // Valid signature, wrong topic: republished under Bob's key.
+        let out = cache.on_descriptor_sample(&topic("bob-addr"), &bytes, &HashSet::new(), 1_000);
+        assert!(
+            matches!(out, Some(DescriptorOutcome::Rejected(ref r)) if r.contains("does not match payload creator")),
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn unsigned_wire_reaction_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let r = crate::VineReactionPayload {
+            vine_id: "vine-1".into(),
+            reactor_address: addr("bob-addr"),
+            reactor_name: "Bob".into(),
+            liked: true,
+            timestamp: 100,
+            identity_pub: None,
+            sig: None,
+        };
+        let out = cache.on_reaction_sample(
+            &reaction_topic("alice-addr", "vine-1", "bob-addr"),
+            &serde_json::to_vec(&r).unwrap(),
+        );
+        assert!(
+            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("unsigned")),
+            "got {out:?}"
+        );
+        assert_eq!(cache.len_reactions(), 0);
+    }
+
+    #[test]
+    fn reaction_replayed_under_other_vine_or_reactor_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let bytes = canonical_reaction_bytes("vine-1", "bob-addr", "Bob", true, 100);
+        // Valid signature, topic vine segment differs from payload.
+        let out = cache.on_reaction_sample(
+            &reaction_topic("alice-addr", "vine-OTHER", "bob-addr"),
+            &bytes,
+        );
+        assert!(
+            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("do not match payload")),
+            "got {out:?}"
+        );
+        // Valid signature, topic reactor segment names someone else.
+        let out = cache.on_reaction_sample(
+            &reaction_topic("alice-addr", "vine-1", "carol-addr"),
+            &bytes,
+        );
+        assert!(
+            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("do not match payload")),
+            "got {out:?}"
+        );
+        assert_eq!(cache.len_reactions(), 0);
     }
 
     #[test]
@@ -1074,13 +1290,12 @@ mod tests {
         );
         let followed = followed_set_with(&["alice-addr"]);
 
-        let outcome =
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 1_000);
+        let outcome = cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 1_000);
 
         match outcome {
             Some(DescriptorOutcome::Inserted { dto }) => {
                 assert_eq!(dto.id, "vine-1");
-                assert_eq!(dto.creator_address, "alice-addr");
+                assert_eq!(dto.creator_address, addr("alice-addr"));
                 assert_eq!(dto.source, VineSource::Followed);
                 assert!(!dto.viewed);
             }
@@ -1097,8 +1312,7 @@ mod tests {
         );
         let followed = followed_set_with(&["someone-else"]);
 
-        let outcome =
-            cache.on_descriptor_sample("harmony/vines/bob-addr", &payload, &followed, 2_000);
+        let outcome = cache.on_descriptor_sample(&topic("bob-addr"), &payload, &followed, 2_000);
 
         match outcome {
             Some(DescriptorOutcome::Inserted { dto }) => {
@@ -1125,14 +1339,12 @@ mod tests {
         let followed = followed_set_with(&["alice-addr"]);
 
         // First arrival
-        let first =
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 3_000);
+        let first = cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 3_000);
         assert!(matches!(first, Some(DescriptorOutcome::Inserted { .. })));
 
         // Same vine_id arrives again — even if followed_set changed
         let followed2 = followed_set_with(&[]); // empty
-        let second =
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed2, 4_000);
+        let second = cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed2, 4_000);
         assert_eq!(second, Some(DescriptorOutcome::AlreadyPresent));
         assert_eq!(cache.len_descriptors(), 1);
 
@@ -1143,8 +1355,7 @@ mod tests {
         // to re-insert based on a "now followed" signal, this third call
         // would return Inserted{Followed}.
         let followed3 = followed_set_with(&["alice-addr"]);
-        let third =
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed3, 5_000);
+        let third = cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed3, 5_000);
         assert_eq!(third, Some(DescriptorOutcome::AlreadyPresent));
         assert_eq!(cache.len_descriptors(), 1);
     }
@@ -1155,7 +1366,7 @@ mod tests {
         let bad = b"not valid json {{{";
         let followed = followed_set_with(&[]);
 
-        let outcome = cache.on_descriptor_sample("harmony/vines/alice-addr", bad, &followed, 5_000);
+        let outcome = cache.on_descriptor_sample(&topic("alice-addr"), bad, &followed, 5_000);
 
         match outcome {
             Some(DescriptorOutcome::Rejected(_)) => {}
@@ -1183,7 +1394,7 @@ mod tests {
         // The descriptor branch must NOT match reaction topics (they
         // contain `/reactions/`).
         let outcome = cache.on_descriptor_sample(
-            "harmony/vines/alice-addr/reactions/vine-9/bob-addr",
+            &reaction_topic("alice-addr", "vine-9", "bob-addr"),
             &payload,
             &followed,
             6_000,
@@ -1215,7 +1426,7 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 1_000);
+            cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 1_000);
         }
 
         let dtos = cache.list_descriptors();
@@ -1226,23 +1437,36 @@ mod tests {
         assert_eq!(dtos[2].id, "v-100");
     }
 
+    /// Reactor-signed reaction bytes; `reactor` is a signer NAME
+    /// (translated to its derived address — see `addr`).
     fn canonical_reaction_bytes(
         vine_id: &str,
-        reactor_address: &str,
+        reactor: &str,
         reactor_name: &str,
         liked: bool,
         timestamp: u64,
     ) -> Vec<u8> {
-        let v = crate::VineReactionPayload {
+        let signer = signer_for(reactor);
+        let mut v = crate::VineReactionPayload {
             vine_id: vine_id.to_string(),
-            reactor_address: reactor_address.to_string(),
+            reactor_address: addr(reactor),
             reactor_name: reactor_name.to_string(),
             liked,
             timestamp,
             identity_pub: None,
             sig: None,
         };
+        crate::vine_signing::sign_reaction(&signer, &mut v);
         serde_json::to_vec(&v).unwrap()
+    }
+
+    /// Reaction topic for a vine by named creator, reacted by named reactor.
+    fn reaction_topic(creator: &str, vine_id: &str, reactor: &str) -> String {
+        format!(
+            "harmony/vines/{}/reactions/{vine_id}/{}",
+            addr(creator),
+            addr(reactor)
+        )
     }
 
     #[test]
@@ -1252,18 +1476,18 @@ mod tests {
         let bob_likes = canonical_reaction_bytes("vine-1", "bob-addr", "Bob", true, 110);
 
         let r1 = cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_likes,
         );
         let r2 = cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/bob-addr",
+            &reaction_topic("creator-addr", "vine-1", "bob-addr"),
             &bob_likes,
         );
 
         assert_eq!(r1, Some(ReactionOutcome::Inserted));
         assert_eq!(r2, Some(ReactionOutcome::Inserted));
 
-        let summary = cache.get_reaction("vine-1", "anyone-addr");
+        let summary = cache.get_reaction("vine-1", &addr("anyone-addr"));
         assert_eq!(summary.count, 2);
         assert!(!summary.liked_by_me);
     }
@@ -1277,16 +1501,16 @@ mod tests {
         let alice_likes = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 200);
 
         cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_unlikes,
         );
         let r2 = cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_likes,
         );
         assert_eq!(r2, Some(ReactionOutcome::UpdatedNewer));
 
-        let summary = cache.get_reaction("vine-1", "alice-addr");
+        let summary = cache.get_reaction("vine-1", &addr("alice-addr"));
         assert_eq!(summary.count, 1);
         assert!(summary.liked_by_me);
     }
@@ -1297,20 +1521,20 @@ mod tests {
         // First: like at t=200
         let alice_likes = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 200);
         cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_likes,
         );
 
         // Stale unlike at t=100 (lower timestamp, must be rejected)
         let stale_unlike = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", false, 100);
         let outcome = cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &stale_unlike,
         );
         assert_eq!(outcome, Some(ReactionOutcome::Stale));
 
         // Newer like still wins
-        let summary = cache.get_reaction("vine-1", "alice-addr");
+        let summary = cache.get_reaction("vine-1", &addr("alice-addr"));
         assert_eq!(summary.count, 1);
         assert!(summary.liked_by_me);
     }
@@ -1322,21 +1546,21 @@ mod tests {
         let bob_likes = canonical_reaction_bytes("vine-1", "bob-addr", "Bob", true, 110);
 
         cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_likes,
         );
         cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/bob-addr",
+            &reaction_topic("creator-addr", "vine-1", "bob-addr"),
             &bob_likes,
         );
 
         // From Alice's perspective: liked_by_me=true (she liked it)
-        let a = cache.get_reaction("vine-1", "alice-addr");
+        let a = cache.get_reaction("vine-1", &addr("alice-addr"));
         assert_eq!(a.count, 2);
         assert!(a.liked_by_me);
 
         // From Carol's perspective: she did not react
-        let c = cache.get_reaction("vine-1", "carol-addr");
+        let c = cache.get_reaction("vine-1", &addr("carol-addr"));
         assert_eq!(c.count, 2);
         assert!(!c.liked_by_me);
     }
@@ -1347,7 +1571,7 @@ mod tests {
         let payload = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 100);
 
         // Descriptor topic — must NOT match the reaction branch
-        let outcome = cache.on_reaction_sample("harmony/vines/creator-addr", &payload);
+        let outcome = cache.on_reaction_sample(&topic("creator-addr"), &payload);
         assert_eq!(outcome, None);
 
         // Unrelated topic
@@ -1360,18 +1584,19 @@ mod tests {
         let mut cache = VineFeedCache::new();
         let bad = b"{{{not json";
 
-        let outcome = cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
-            bad,
+        let outcome =
+            cache.on_reaction_sample(&reaction_topic("creator-addr", "vine-1", "alice-addr"), bad);
+        assert!(
+            matches!(outcome, Some(ReactionOutcome::Rejected(ref e)) if e.contains("parse failed")),
+            "got {outcome:?}"
         );
-        assert_eq!(outcome, Some(ReactionOutcome::Rejected));
         assert_eq!(cache.len_reactions(), 0);
     }
 
     #[test]
     fn get_reaction_for_unknown_vine_id_returns_zero() {
         let cache = VineFeedCache::new();
-        let summary = cache.get_reaction("nonexistent-vine", "anyone-addr");
+        let summary = cache.get_reaction("nonexistent-vine", &addr("anyone-addr"));
         assert_eq!(summary.count, 0);
         assert!(!summary.liked_by_me);
     }
@@ -1390,18 +1615,18 @@ mod tests {
         // Alice unlikes
         let alice_unlike = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", false, 100);
         cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_unlike,
         );
 
         // Bob likes (so count > 0, isolating the liked_by_me=false invariant)
         let bob_like = canonical_reaction_bytes("vine-1", "bob-addr", "Bob", true, 110);
         cache.on_reaction_sample(
-            "harmony/vines/creator-addr/reactions/vine-1/bob-addr",
+            &reaction_topic("creator-addr", "vine-1", "bob-addr"),
             &bob_like,
         );
 
-        let summary = cache.get_reaction("vine-1", "alice-addr");
+        let summary = cache.get_reaction("vine-1", &addr("alice-addr"));
         assert_eq!(summary.count, 1);
         assert!(!summary.liked_by_me);
     }
@@ -1421,7 +1646,7 @@ mod tests {
             None,
         );
         let followed = followed_set_with(&["alice-addr"]);
-        cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+        cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
         assert_eq!(cache.len_descriptors(), 1);
 
         // First mark — newly added
@@ -1464,7 +1689,7 @@ mod tests {
             None,
             None,
         );
-        cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+        cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
 
         // list_descriptors must show viewed=true even though the mark
         // happened before insert
@@ -1603,16 +1828,13 @@ mod tests {
                 None,
                 None,
             );
-            let out =
-                cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            let out = cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
             assert!(matches!(out, Some(DescriptorOutcome::Inserted { .. })));
 
             let react =
                 canonical_reaction_bytes("vine-rt", "bob-addr", "Bob", true, recent_created_at + 1);
-            let out2 = cache.on_reaction_sample(
-                "harmony/vines/alice-addr/reactions/vine-rt/bob-addr",
-                &react,
-            );
+            let out2 = cache
+                .on_reaction_sample(&reaction_topic("alice-addr", "vine-rt", "bob-addr"), &react);
             assert_eq!(out2, Some(ReactionOutcome::Inserted));
 
             assert!(cache.mark_viewed("vine-rt".to_string()));
@@ -1628,12 +1850,12 @@ mod tests {
         let dtos = cache2.list_descriptors();
         assert_eq!(dtos.len(), 1);
         assert_eq!(dtos[0].id, "vine-rt");
-        assert_eq!(dtos[0].creator_address, "alice-addr");
+        assert_eq!(dtos[0].creator_address, addr("alice-addr"));
         assert_eq!(dtos[0].title.as_deref(), Some("title-x"));
         assert!(dtos[0].viewed);
 
         // Verify reaction is correctly reconstructed (count + liked_by_me)
-        let summary = cache2.get_reaction("vine-rt", "bob-addr");
+        let summary = cache2.get_reaction("vine-rt", &addr("bob-addr"));
         assert_eq!(summary.count, 1);
         assert!(summary.liked_by_me);
     }
@@ -1740,7 +1962,7 @@ mod tests {
         // The orphan reaction for vine-old must be gone; vine-new's
         // reaction must survive.
         assert_eq!(cache.len_reactions(), 1);
-        let summary = cache.get_reaction("vine-new", "bob-addr");
+        let summary = cache.get_reaction("vine-new", &addr("bob-addr"));
         assert_eq!(summary.count, 1);
     }
 
@@ -1765,8 +1987,7 @@ mod tests {
                 None,
                 None,
             );
-            let out =
-                cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            let out = cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
             assert!(matches!(out, Some(DescriptorOutcome::Inserted { .. })));
             // No explicit save_for_test() call — Task 4 wires save() into
             // on_descriptor_sample, so the disk must already reflect this.
@@ -1800,20 +2021,18 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
 
             // Insert reaction
             let react = canonical_reaction_bytes("vine-r1", "bob-addr", "Bob", true, recent + 10);
-            let out = cache.on_reaction_sample(
-                "harmony/vines/alice-addr/reactions/vine-r1/bob-addr",
-                &react,
-            );
+            let out = cache
+                .on_reaction_sample(&reaction_topic("alice-addr", "vine-r1", "bob-addr"), &react);
             assert_eq!(out, Some(ReactionOutcome::Inserted));
 
             // Update reaction (LWW newer timestamp)
             let react2 = canonical_reaction_bytes("vine-r1", "bob-addr", "Bob", false, recent + 20);
             let out2 = cache.on_reaction_sample(
-                "harmony/vines/alice-addr/reactions/vine-r1/bob-addr",
+                &reaction_topic("alice-addr", "vine-r1", "bob-addr"),
                 &react2,
             );
             assert_eq!(out2, Some(ReactionOutcome::UpdatedNewer));
@@ -1822,7 +2041,7 @@ mod tests {
         let cache2 = VineFeedCache::load(dir.path());
         assert_eq!(cache2.len_reactions(), 1);
         // The final reaction value should be liked=false at recent+20
-        let summary = cache2.get_reaction("vine-r1", "bob-addr");
+        let summary = cache2.get_reaction("vine-r1", &addr("bob-addr"));
         assert_eq!(summary.count, 0); // liked=false → not counted
     }
 
@@ -1852,18 +2071,16 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
             let react = canonical_reaction_bytes("vine-ri", "bob-addr", "Bob", true, recent + 10);
-            let out = cache.on_reaction_sample(
-                "harmony/vines/alice-addr/reactions/vine-ri/bob-addr",
-                &react,
-            );
+            let out = cache
+                .on_reaction_sample(&reaction_topic("alice-addr", "vine-ri", "bob-addr"), &react);
             assert_eq!(out, Some(ReactionOutcome::Inserted));
             // No further mutations — the Inserted save must be sufficient.
         }
         let cache2 = VineFeedCache::load(dir.path());
         assert_eq!(cache2.len_reactions(), 1);
-        let summary = cache2.get_reaction("vine-ri", "bob-addr");
+        let summary = cache2.get_reaction("vine-ri", &addr("bob-addr"));
         assert_eq!(summary.count, 1);
         assert!(summary.liked_by_me);
     }
@@ -1894,29 +2111,38 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
             let r1 = canonical_reaction_bytes("vine-lr", "bob-addr", "Bob", true, recent + 10);
-            cache.on_reaction_sample("harmony/vines/alice-addr/reactions/vine-lr/bob-addr", &r1);
+            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-lr", "bob-addr"), &r1);
             let r2 = canonical_reaction_bytes("vine-lr", "ann-addr", "Ann", false, recent + 11);
-            cache.on_reaction_sample("harmony/vines/alice-addr/reactions/vine-lr/ann-addr", &r2);
+            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-lr", "ann-addr"), &r2);
         }
         let cache2 = VineFeedCache::load(dir.path());
         let rows = cache2.list_reactions();
         assert_eq!(rows.len(), 2);
-        // Sorted by (vine_id, reactor_address): ann-addr before bob-addr.
+        // Rows sort by (vine_id, reactor_address); derived signer
+        // addresses (ZEB-673) make the relative order arbitrary, so look
+        // each row up by reactor instead of by index.
+        let ann = rows
+            .iter()
+            .find(|r| r.reactor_address == addr("ann-addr"))
+            .expect("ann row");
         assert_eq!(
-            rows[0],
+            *ann,
             VineReactionRow {
                 vine_id: "vine-lr".to_string(),
-                reactor_address: "ann-addr".to_string(),
+                reactor_address: addr("ann-addr"),
                 reactor_name: "Ann".to_string(),
                 liked: false,
                 timestamp: recent + 11,
             }
         );
-        assert_eq!(rows[1].reactor_address, "bob-addr");
-        assert!(rows[1].liked);
-        assert_eq!(rows[1].timestamp, recent + 10);
+        let bob = rows
+            .iter()
+            .find(|r| r.reactor_address == addr("bob-addr"))
+            .expect("bob row");
+        assert!(bob.liked);
+        assert_eq!(bob.timestamp, recent + 10);
     }
 
     #[test]
@@ -1984,12 +2210,8 @@ mod tests {
                 Some("Original"),
             );
             let followed = followed_set_with(&["addr-resharer"]);
-            let outcome = cache.on_descriptor_sample(
-                "harmony/vines/addr-resharer",
-                &payload,
-                &followed,
-                1_000,
-            );
+            let outcome =
+                cache.on_descriptor_sample(&topic("addr-resharer"), &payload, &followed, 1_000);
             assert!(
                 matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
                 "expected Inserted, got {outcome:?}"
@@ -2006,7 +2228,7 @@ mod tests {
                 .expect("reshare should survive reload");
             assert_eq!(
                 dto.original_creator_address.as_deref(),
-                Some("addr-original")
+                Some(addr("addr-original").as_str())
             );
             assert_eq!(dto.original_creator_name.as_deref(), Some("Original"));
         }
@@ -2041,8 +2263,8 @@ mod tests {
         );
         let followed = followed_set_with(&["alice-addr"]);
 
-        cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
-        cache.on_descriptor_sample("harmony/vines/alice-addr", &payload2, &followed, 0);
+        cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
+        cache.on_descriptor_sample(&topic("alice-addr"), &payload2, &followed, 0);
         cache.mark_viewed("vine-1".to_string());
 
         let dtos = cache.list_descriptors();
@@ -2079,7 +2301,7 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+            cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
         }
         assert_eq!(cache.len_descriptors(), MAX_DESCRIPTORS);
 
@@ -2127,7 +2349,7 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+            cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
         }
         assert_eq!(cache.len_descriptors(), MAX_DESCRIPTORS);
 
@@ -2143,8 +2365,7 @@ mod tests {
             None,
             None,
         );
-        let outcome =
-            cache.on_descriptor_sample("harmony/vines/alice-addr", &old_payload, &followed, 0);
+        let outcome = cache.on_descriptor_sample(&topic("alice-addr"), &old_payload, &followed, 0);
 
         // Must NOT be Inserted — the vine was trimmed away before
         // persistence. Must be Rejected so the event loop does not emit.
@@ -2273,7 +2494,7 @@ mod tests {
                 None,
                 None,
             );
-            runtime_cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+            runtime_cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
         }
         // The runtime trim should have dropped exactly one descriptor.
         assert_eq!(runtime_cache.len_descriptors(), MAX_DESCRIPTORS);
@@ -2340,13 +2561,17 @@ mod tests {
 
     // ── ZEB-670: tombstone tests ─────────────────────────────────────
 
-    /// Generate a real identity and return (identity, hex address) — the
-    /// tombstone address binding requires creator addresses that are
-    /// actual `hex(address_hash)` values, unlike the free-form addresses
-    /// the descriptor tests use.
-    fn tombstone_identity() -> (harmony_identity::PrivateIdentity, String) {
-        let id = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+    /// Generate a real identity and return (identity, hex address). The
+    /// identity self-registers in the signer registry under its DERIVED
+    /// address, so passing the returned address into name-translating
+    /// helpers (`insert_descriptor`, `canonical_descriptor_bytes`, …)
+    /// signs with THIS identity and maps the address to itself (ZEB-673).
+    fn tombstone_identity() -> (std::sync::Arc<harmony_identity::PrivateIdentity>, String) {
+        let id = std::sync::Arc::new(harmony_identity::PrivateIdentity::generate(
+            &mut rand::rngs::OsRng,
+        ));
         let addr = hex::encode(id.public_identity().address_hash);
+        signers().lock().unwrap().insert(addr.clone(), id.clone());
         (id, addr)
     }
 
@@ -2385,12 +2610,8 @@ mod tests {
             None,
             None,
         );
-        let outcome = cache.on_descriptor_sample(
-            &format!("harmony/vines/{addr}"),
-            &payload,
-            &followed_set_with(&[]),
-            1_000,
-        );
+        let outcome =
+            cache.on_descriptor_sample(&topic(addr), &payload, &followed_set_with(&[]), 1_000);
         assert!(
             matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
             "fixture insert failed: {outcome:?}"
@@ -2416,12 +2637,8 @@ mod tests {
             Some(origin_addr),
             Some("Creator"),
         );
-        let outcome = cache.on_descriptor_sample(
-            &format!("harmony/vines/{resharer}"),
-            &payload,
-            &followed_set_with(&[]),
-            1_000,
-        );
+        let outcome =
+            cache.on_descriptor_sample(&topic(resharer), &payload, &followed_set_with(&[]), 1_000);
         assert!(
             matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
             "fixture reshare insert failed: {outcome:?}"
@@ -2555,12 +2772,8 @@ mod tests {
             None,
             None,
         );
-        let outcome = cache.on_descriptor_sample(
-            &format!("harmony/vines/{addr}"),
-            &payload,
-            &followed_set_with(&[]),
-            1_000,
-        );
+        let outcome =
+            cache.on_descriptor_sample(&topic(&addr), &payload, &followed_set_with(&[]), 1_000);
         assert!(
             matches!(outcome, Some(DescriptorOutcome::Rejected(ref r)) if r.contains("tombstoned")),
             "expected tombstone rejection, got {outcome:?}"
@@ -2749,7 +2962,7 @@ mod tests {
             None,
         );
         let outcome = cache.on_descriptor_sample(
-            "harmony/vines/victim-addr",
+            &topic("victim-addr"),
             &payload,
             &followed_set_with(&[]),
             1_000,
@@ -2777,7 +2990,7 @@ mod tests {
             "vine-old", "a-addr", "A", "cid-old", None, None, ancient, None, None,
         );
         let outcome = cache.on_descriptor_sample(
-            "harmony/vines/a-addr",
+            &topic("a-addr"),
             &payload,
             &followed_set_with(&[]),
             now_secs * 1000,
@@ -2816,12 +3029,8 @@ mod tests {
             None,
             None,
         );
-        let outcome = cache.on_descriptor_sample(
-            &format!("harmony/vines/{addr}"),
-            &payload,
-            &followed_set_with(&[]),
-            1_000,
-        );
+        let outcome =
+            cache.on_descriptor_sample(&topic(&addr), &payload, &followed_set_with(&[]), 1_000);
         assert!(matches!(outcome, Some(DescriptorOutcome::Rejected(_))));
     }
 
@@ -2901,12 +3110,8 @@ mod tests {
             None,
             None,
         );
-        let outcome = reloaded.on_descriptor_sample(
-            &format!("harmony/vines/{addr}"),
-            &payload,
-            &followed_set_with(&[]),
-            1_000,
-        );
+        let outcome =
+            reloaded.on_descriptor_sample(&topic(&addr), &payload, &followed_set_with(&[]), 1_000);
         assert!(
             matches!(outcome, Some(DescriptorOutcome::Rejected(ref r)) if r.contains("tombstoned")),
             "reloaded tombstone must still block, got {outcome:?}"
