@@ -140,3 +140,48 @@ describe('VineCard (ZEB-612 S2 full-bleed)', () => {
     expect(onActivate).not.toHaveBeenCalled();
   });
 });
+
+describe('VineCard delete verb + removed stub (ZEB-670)', () => {
+  it('offers Delete only when canDelete && onDelete, with in-flight state', async () => {
+    const onDelete = vi.fn();
+    const onActivate = vi.fn();
+    const { rerender } = render(VineCard, props({ canDelete: true, onDelete, onActivate }));
+    const btn = screen.getByRole('button', { name: 'Delete vine' });
+    await fireEvent.click(btn);
+    expect(onDelete).toHaveBeenCalledWith(expect.objectContaining({ id: 'vine-01' }));
+    expect(onActivate).not.toHaveBeenCalled(); // stopPropagation
+
+    await rerender(props({ canDelete: true, onDelete, deleting: true }));
+    const busy = screen.getByRole('button', { name: 'Delete vine' }) as HTMLButtonElement;
+    expect(busy.disabled).toBe(true);
+    expect(busy.textContent).toContain('Deleting…');
+  });
+
+  it('hides Delete without canDelete (not our vine)', () => {
+    render(VineCard, props({ canDelete: false, onDelete: vi.fn() }));
+    expect(screen.queryByRole('button', { name: 'Delete vine' })).toBeNull();
+  });
+
+  it('renders originalRemoved reshares as a stub — no video, no like/reshare', () => {
+    const stub: VineVideo = {
+      ...vine,
+      id: 'vine-stub',
+      reshareOf: 'vine-gone',
+      originalCreatorAddress: 'gone-addr',
+      originalRemoved: true,
+    };
+    render(VineCard, {
+      vine: stub,
+      videoUrl: 'blob:fake-1', // resolved before the tombstone landed — must be ignored
+      onToggleLike: vi.fn(),
+      canReshare: true,
+      onReshare: vi.fn(),
+    });
+    expect(screen.getByTestId('removed-stub').textContent).toContain('Removed by creator');
+    expect(screen.queryByTestId('stage-video')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Like|Unlike/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Reshare vine' })).toBeNull();
+    // Attribution context stays (whose reshare this was).
+    expect(screen.getByText(/reshared/)).toBeTruthy();
+  });
+});

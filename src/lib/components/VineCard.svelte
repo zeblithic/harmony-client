@@ -10,6 +10,7 @@
     showFollowButton = false, isFollowed = false, onFollow, onUnfollow,
     reactionCount = 0, likedByMe = false, onToggleLike,
     reshareCount = 0, canReshare = false, resharing = false, onReshare,
+    canDelete = false, deleting = false, onDelete,
     onViewOriginal,
   }: {
     vine: VineVideo;
@@ -38,6 +39,12 @@
     resharing?: boolean;
     /** Ask the feed to open the reshare confirmation for this vine. */
     onReshare?: (vine: VineVideo) => void;
+    /** ZEB-670: whether the Delete verb is offered (feed applies the own-vine guard). */
+    canDelete?: boolean;
+    /** True while the feed's confirm→delete is in flight for THIS vine. */
+    deleting?: boolean;
+    /** Ask the feed to open the delete confirmation for this vine. */
+    onDelete?: (vine: VineVideo) => void;
     onViewOriginal?: (vineId: string) => void;
   } = $props();
 
@@ -98,6 +105,11 @@
     onReshare?.(vine);
   }
 
+  function handleDeleteClick(e: MouseEvent) {
+    e.stopPropagation();
+    onDelete?.(vine);
+  }
+
   function handleViewOriginal(e: MouseEvent) {
     e.stopPropagation();
     if (vine.reshareOf) onViewOriginal?.(vine.reshareOf);
@@ -115,7 +127,13 @@
   onkeydown={handleKeyDown}
 >
   <div class="stage">
-    {#if videoUrl}
+    {#if vine.originalRemoved}
+      <!-- ZEB-670: the original was deleted by its creator — never play,
+           even if a blob URL was resolved before the tombstone landed. -->
+      <div class="removed-stub" role="note" data-testid="removed-stub">
+        <span aria-hidden="true">🚫</span> Removed by creator
+      </div>
+    {:else if videoUrl}
       <!-- svelte-ignore a11y_media_has_caption -->
       <video
         class="stage-video"
@@ -131,7 +149,7 @@
     {:else}
       <span class="stage-placeholder" aria-hidden="true">▶</span>
     {/if}
-    {#if videoUrl && !isPlaying}
+    {#if !vine.originalRemoved && videoUrl && !isPlaying}
       <!-- Only over a loaded video — off-window cards show ▶, and stacking
            both centered glyphs would overlap (CodeRabbit PR #440). -->
       <span class="paused-glyph" aria-hidden="true">❚❚</span>
@@ -180,7 +198,7 @@
       </span>
     {/if}
     <div class="action-rail">
-      {#if onToggleLike}
+      {#if onToggleLike && !vine.originalRemoved}
         <button
           type="button"
           class="rail-btn"
@@ -193,7 +211,7 @@
       {:else if reactionCount > 0}
         <span class="rail-chip">🤍 <span class="rail-count">{reactionCount}</span></span>
       {/if}
-      {#if canReshare && onReshare}
+      {#if canReshare && onReshare && !vine.originalRemoved}
         <button
           type="button"
           class="rail-btn"
@@ -207,6 +225,17 @@
         <span class="rail-chip" aria-label="reshare count {reshareCount}">
           <span aria-hidden="true">↻</span> <span class="rail-count">{reshareCount}</span>
         </span>
+      {/if}
+      {#if canDelete && onDelete}
+        <button
+          type="button"
+          class="rail-btn rail-btn-danger"
+          onclick={handleDeleteClick}
+          disabled={deleting}
+          aria-label="Delete vine"
+        >
+          <span aria-hidden="true">🗑</span> {deleting ? 'Deleting…' : 'Delete'}
+        </button>
       {/if}
     </div>
   </div>
@@ -413,6 +442,26 @@
   .rail-btn:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+
+  /* ZEB-670: destructive verb — same silhouette, danger accents. */
+  .rail-btn-danger {
+    border-color: color-mix(in srgb, var(--danger-vivid) 45%, transparent);
+    color: color-mix(in srgb, var(--danger-vivid) 70%, var(--on-media-stage));
+  }
+
+  .rail-btn-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger-vivid) 16%, transparent);
+  }
+
+  /* ZEB-670: "Removed by creator" stub fills the stage where the video
+     would render. Muted on the media ground — informational, not alarming. */
+  .removed-stub {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: color-mix(in srgb, var(--on-media-stage) 60%, transparent);
+    font-size: 0.9rem;
   }
 
   .rail-btn.liked {

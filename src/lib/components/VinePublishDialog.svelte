@@ -231,7 +231,7 @@
 
       <div class="sovereign-note">
         <span aria-hidden="true">🔑</span>
-        <p>Publishes to your sovereign identity and replicates peer-to-peer. There's no central server to take it down.</p>
+        <p>Publishes to your sovereign identity and replicates peer-to-peer. There's no central server to take it down — only you can delete it.</p>
       </div>
 
       <div class="dialog-actions">

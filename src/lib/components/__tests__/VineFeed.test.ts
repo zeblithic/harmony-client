@@ -543,3 +543,50 @@ describe('VineFeed', () => {
     });
   });
 });
+
+describe('feed-level delete (ZEB-670 creator tombstone)', () => {
+  const own: VineVideo = { ...vines[0], id: 'own-1', creatorAddress: 'self', title: 'Mine' };
+
+  it('offers the verb only on own vines', () => {
+    render(VineFeed, { props: {
+      followedVines: [own, vines[1]], viewedIds: new Set<string>(),
+      onDelete: vi.fn(), onMarkViewed: vi.fn(),
+    } });
+    expect(screen.getAllByRole('button', { name: 'Delete vine' })).toHaveLength(1);
+  });
+
+  it('card verb → ConfirmDialog → onDelete; dialog copy is honest about reach', async () => {
+    const onDelete = vi.fn().mockResolvedValue(undefined);
+    render(VineFeed, { props: {
+      followedVines: [own], viewedIds: new Set<string>(),
+      onDelete, onMarkViewed: vi.fn(),
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete vine' }));
+    expect(screen.getByText('Delete vine?')).toBeTruthy();
+    expect(screen.getByText(/offline may keep it/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: /^Delete$/ }));
+    await waitFor(() => expect(onDelete).toHaveBeenCalledWith(expect.objectContaining({ id: 'own-1' })));
+  });
+
+  it('cancel closes the dialog without deleting', async () => {
+    const onDelete = vi.fn();
+    render(VineFeed, { props: {
+      followedVines: [own], viewedIds: new Set<string>(),
+      onDelete, onMarkViewed: vi.fn(),
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete vine' }));
+    await fireEvent.click(screen.getByRole('button', { name: /Cancel/ }));
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a delete failure as a feed-level alert', async () => {
+    const onDelete = vi.fn().mockRejectedValue(new Error('not your vine: only the creator can delete a vine'));
+    render(VineFeed, { props: {
+      followedVines: [own], viewedIds: new Set<string>(),
+      onDelete, onMarkViewed: vi.fn(),
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete vine' }));
+    await fireEvent.click(screen.getByRole('button', { name: /^Delete$/ }));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/not your vine/));
+  });
+});

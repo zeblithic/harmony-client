@@ -3762,6 +3762,7 @@
       onMarkViewed={handleMarkVineViewed}
       onPublish={() => showVinePublish = true}
       onReshare={handleVineReshare}
+      onDelete={(vine) => vineService.deleteVine(vine)}
       onFollow={handleVineFollow}
       onUnfollow={handleVineUnfollow}
       getReaction={vineGetReaction}
