@@ -41,6 +41,12 @@
   --vote-against: #b1402f;
   --vote-abstain: #cdc6b4;
   --tally-track: #eadfc8;
+  /* ZEB-612 S2: Vines full-bleed media stage. The video letterbox is
+     near-black in BOTH themes (per the drawn VFI reference — video sits on
+     a dark stage regardless of app theme); values are warm-tinted to match
+     the palette. --on-media-stage is the text/glyph color on that stage. */
+  --media-stage: #14120d;
+  --on-media-stage: #f4f1ea;
   --status-drafting-fg: #5a5345;
   --status-drafting-bg: #e6e0d0;
   --status-open-fg: #5a4321;
@@ -209,6 +215,9 @@
   --vote-against: #d98377;
   --vote-abstain: #4a4639;
   --tally-track: #322a1f;
+  /* ZEB-612 S2: theme-invariant media stage — see :root. */
+  --media-stage: #14120d;
+  --on-media-stage: #f4f1ea;
   --status-drafting-fg: #c4bdab;
   --status-drafting-bg: #322e27;
   --status-open-fg: #e2b888;

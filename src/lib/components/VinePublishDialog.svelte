@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { probeVideoDuration } from '../video-metadata';
 
-  let { onPublish, onClose, onPickVideo }: {
+  let { onPublish, onClose, onPickVideo, resolveVideo, probeDuration = probeVideoDuration }: {
     onPublish: (videoCid: string, title?: string) => Promise<void> | void;
     onClose: () => void;
     /**
@@ -12,7 +13,14 @@
      * the Advanced "paste a CID" path still works when no picker is wired.
      */
     onPickVideo?: () => Promise<{ cid: string; fileName: string } | null>;
+    /** Resolve a CID to a blob URL — enables the honest ≤6s duration gate. */
+    resolveVideo?: (cid: string) => Promise<string>;
+    /** Injectable metadata probe (tests stub it; jsdom fires no media events). */
+    probeDuration?: (url: string) => Promise<number>;
   } = $props();
+
+  /** Honest-client cap (spec §3): vines loop at six seconds or less. */
+  const MAX_VINE_SECONDS = 6;
 
   let videoCid = $state('');
   let title = $state('');
@@ -21,11 +29,41 @@
   let ingesting = $state(false);
   /** Name of the chosen file, shown once a video has been picked + ingested. */
   let pickedFileName = $state('');
+  /** Measured metadata duration of the current CID; null = unmeasured. */
+  let pickedDuration = $state<number | null>(null);
   let showAdvanced = $state(false);
   let chooseBtn = $state<HTMLButtonElement | null>(null);
 
+  let overLimit = $derived(pickedDuration != null && pickedDuration > MAX_VINE_SECONDS);
+
   // Focus the primary action (Choose video) on open so keyboard users land on it.
   onMount(() => chooseBtn?.focus());
+
+  function overLimitCopy(seconds: number): string {
+    return `This clip is ${seconds.toFixed(1)}s — vines are 6 seconds or less. Trim it and re-ingest.`;
+  }
+
+  /**
+   * Honest ≤6s gate (ZEB-612 S2): resolve the CID to a blob and read the
+   * container's metadata duration. Same honest-client posture as voice
+   * moderation — the network never enforces this; our client refuses to
+   * publish dishonest data. Fail-OPEN on measurement failure (no resolver
+   * wired, fetch failed, undecodable container): the gate is an honesty
+   * courtesy, not security, and blocking legitimate publishes over a probe
+   * failure would make nothing truer. Unmeasured clips show no ✓/duration.
+   */
+  async function measureDuration(cid: string): Promise<number | null> {
+    if (!resolveVideo) return null;
+    let url: string | null = null;
+    try {
+      url = await resolveVideo(cid);
+      return await probeDuration(url);
+    } catch {
+      return null;
+    } finally {
+      if (url) URL.revokeObjectURL?.(url);
+    }
+  }
 
   async function handleChooseVideo() {
     if (!onPickVideo || ingesting || publishing) return;
@@ -36,6 +74,15 @@
       if (!result) return; // user cancelled the picker — leave state as-is
       videoCid = result.cid;
       pickedFileName = result.fileName;
+      // Clear the previous clip's measurement before the await — the picked
+      // block stays rendered while ingesting, and a stale duration would
+      // show the new filename with the old clip's (possibly over-limit)
+      // state (CodeRabbit PR #440).
+      pickedDuration = null;
+      pickedDuration = await measureDuration(result.cid);
+      if (pickedDuration != null && pickedDuration > MAX_VINE_SECONDS) {
+        error = overLimitCopy(pickedDuration);
+      }
     } catch (err) {
       // Production Tauri rejections are strings (e.g. "video too large: …");
       // preserve them rather than collapsing to a generic message.
@@ -51,14 +98,23 @@
       error = 'Choose a video first (or paste a Video CID under Advanced)';
       return;
     }
-    if (publishing) return;
+    if (publishing || ingesting) return;
     error = '';
     publishing = true;
     try {
+      // Pasted/Advanced CIDs haven't been measured yet — gate at submit.
+      if (pickedDuration == null) {
+        pickedDuration = await measureDuration(cid);
+      }
+      if (pickedDuration != null && pickedDuration > MAX_VINE_SECONDS) {
+        error = overLimitCopy(pickedDuration);
+        return;
+      }
       await onPublish(cid, title.trim() || undefined);
       videoCid = '';
       title = '';
       pickedFileName = '';
+      pickedDuration = null;
       onClose();
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
@@ -79,9 +135,13 @@
 <svelte:window onkeydown={handleKeyDown} />
 
 <div class="dialog-overlay" role="presentation" onclick={handleOverlayClick}>
-  <div class="dialog-card" role="dialog" aria-label="Publish vine" aria-modal="true">
+  <div class="dialog-card" role="dialog" aria-label="Share a vine" aria-modal="true">
     <header class="dialog-header">
-      <h3>Publish a Vine</h3>
+      <span class="header-glyph" aria-hidden="true">🎞</span>
+      <div class="header-text">
+        <h3>Share a vine</h3>
+        <p class="header-sub">≤ 6 seconds · loops forever</p>
+      </div>
       <button type="button" class="close-btn" onclick={onClose} aria-label="Close">✕</button>
     </header>
 
@@ -90,15 +150,22 @@
         <span class="field-label">Video</span>
         {#if onPickVideo}
           {#if pickedFileName}
-            <div class="picked-file" data-testid="picked-file">
-              <span class="picked-check" aria-hidden="true">✓</span>
-              <span class="picked-name" title={pickedFileName}>{pickedFileName}</span>
+            <div class="picked-file" class:over-limit={overLimit} data-testid="picked-file">
+              <span class="picked-name" title={pickedFileName}>
+                {#if pickedDuration != null && !overLimit}
+                  {pickedFileName} · {pickedDuration.toFixed(1)}s ✓ · ingested to content store
+                {:else if overLimit}
+                  {pickedFileName} · {pickedDuration?.toFixed(1)}s
+                {:else}
+                  {pickedFileName} · ingested to content store
+                {/if}
+              </span>
               <button
                 type="button"
                 class="link-btn"
                 onclick={handleChooseVideo}
                 disabled={ingesting || publishing}
-              >Change</button>
+              >Replace clip</button>
             </div>
           {:else}
             <button
@@ -123,6 +190,7 @@
           <input
             type="text"
             bind:value={videoCid}
+            oninput={() => { pickedFileName = ''; pickedDuration = null; }}
             placeholder="Hex-encoded content ID"
             class="field-input"
             aria-label="Video CID"
@@ -135,7 +203,7 @@
       </div>
 
       <label class="field">
-        <span class="field-label">Title <span class="optional">(optional)</span></span>
+        <span class="field-label">Caption <span class="optional">(optional)</span></span>
         <input
           type="text"
           bind:value={title}
@@ -152,7 +220,7 @@
           <input
             type="text"
             bind:value={videoCid}
-            oninput={() => { pickedFileName = ''; }}
+            oninput={() => { pickedFileName = ''; pickedDuration = null; }}
             placeholder="Hex-encoded content ID"
             class="field-input advanced-input"
             aria-label="Video CID"
@@ -161,13 +229,18 @@
         </details>
       {/if}
 
+      <div class="sovereign-note">
+        <span aria-hidden="true">🔑</span>
+        <p>Publishes to your sovereign identity and replicates peer-to-peer. There's no central server to take it down.</p>
+      </div>
+
       <div class="dialog-actions">
         <button type="button" class="btn btn-secondary" onclick={onClose}>Cancel</button>
         <button
           type="submit"
           class="btn btn-primary"
-          disabled={publishing || ingesting || !videoCid.trim()}
-        >{publishing ? 'Publishing…' : 'Publish'}</button>
+          disabled={publishing || ingesting || !videoCid.trim() || overLimit}
+        >{publishing ? 'Publishing…' : 'Publish vine'}</button>
       </div>
     </form>
   </div>
@@ -178,7 +251,7 @@
     position: fixed;
     inset: 0;
     z-index: 100;
-    background: rgba(0, 0, 0, 0.7);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -186,7 +259,7 @@
 
   .dialog-card {
     background: var(--bg-secondary);
-    border-radius: 12px;
+    border-radius: 8px;
     width: 100%;
     max-width: 420px;
     box-shadow: 0 8px 32px var(--shadow-strong);
@@ -194,10 +267,28 @@
 
   .dialog-header {
     display: flex;
-    justify-content: space-between;
     align-items: center;
+    gap: 11px;
     padding: 16px 20px 12px;
     border-bottom: 1px solid var(--bg-tertiary);
+  }
+
+  .header-glyph {
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--primary-soft);
+    border-radius: 8px;
+    font-size: 1rem;
+    flex-shrink: 0;
+  }
+
+  .header-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .dialog-header h3 {
@@ -207,7 +298,15 @@
     margin: 0;
   }
 
+  .header-sub {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-weight: 400;
+    margin: 0;
+  }
+
   .close-btn {
+    margin-left: auto;
     background: none;
     border: none;
     color: var(--text-muted);
@@ -254,7 +353,7 @@
   .field-input {
     background: var(--bg-primary);
     border: 1px solid var(--bg-tertiary);
-    border-radius: 6px;
+    border-radius: 5px;
     color: var(--text-primary);
     font-size: 0.85rem;
     padding: 8px 10px;
@@ -266,15 +365,15 @@
     border-color: var(--accent);
   }
 
-  /* ── ZEB-559 file picker ─────────────────────────────────────────── */
+  /* ── ZEB-559 file picker (ZEB-612 S2: Commons drop-zone treatment) ── */
   .choose-video-btn {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 8px;
-    background: var(--bg-primary);
-    border: 1px dashed var(--accent);
-    border-radius: 6px;
+    background: var(--primary-soft);
+    border: 1.5px dashed var(--primary-border);
+    border-radius: 8px;
     color: var(--text-primary);
     font-size: 0.85rem;
     font-weight: 500;
@@ -298,13 +397,12 @@
     gap: 8px;
     background: var(--bg-primary);
     border: 1px solid var(--bg-tertiary);
-    border-radius: 6px;
+    border-radius: 5px;
     padding: 8px 10px;
   }
 
-  .picked-check {
-    color: var(--presence-online);
-    font-weight: 700;
+  .picked-file.over-limit {
+    border-color: var(--danger);
   }
 
   .picked-name {
@@ -363,6 +461,24 @@
     margin-top: 4px;
   }
 
+  /* ── ZEB-612 S2: true-claims-only sovereign note ─────────────────── */
+  .sovereign-note {
+    display: flex;
+    gap: 9px;
+    align-items: flex-start;
+    background: var(--primary-soft);
+    border: 1px solid var(--primary-border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+
+  .sovereign-note p {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    line-height: 1.5;
+  }
+
   .error-text {
     color: var(--text-danger);
     font-size: 0.75rem;
@@ -383,7 +499,7 @@
 
   .btn {
     border: none;
-    border-radius: 6px;
+    border-radius: 5px;
     font-size: 0.85rem;
     font-weight: 500;
     padding: 8px 18px;

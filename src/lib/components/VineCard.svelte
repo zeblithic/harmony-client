@@ -2,12 +2,28 @@
   import type { VineVideo } from '../types';
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
-  import { vineCreatorLabel, vineOriginalCreatorLabel } from '../vine-utils';
+  import { vineCreatorLabel, vineOriginalCreatorLabel, formatVineDuration } from '../vine-utils';
 
-  let { vine, onPlay, isViewed, showFollowButton = false, isFollowed = false, onFollow, onUnfollow, reactionCount = 0, likedByMe = false, onToggleLike, reshareCount = 0, onViewOriginal }: {
+  let {
+    vine, isPlaying = false, isViewed, videoUrl = null, duration = null,
+    onActivate, onDuration,
+    showFollowButton = false, isFollowed = false, onFollow, onUnfollow,
+    reactionCount = 0, likedByMe = false, onToggleLike,
+    reshareCount = 0, canReshare = false, resharing = false, onReshare,
+    onViewOriginal,
+  }: {
     vine: VineVideo;
-    onPlay: (vine: VineVideo) => void;
+    /** True when this card is the feed's single playing card. */
+    isPlaying?: boolean;
     isViewed?: boolean;
+    /** Blob URL — present only while the card is inside the feed's lazy window. */
+    videoUrl?: string | null;
+    /** Known duration in seconds (feed caches per CID once metadata loads). */
+    duration?: number | null;
+    /** Bring this card to center + play (click / Enter / Space). */
+    onActivate?: (vine: VineVideo) => void;
+    /** Reports the mounted video's metadata duration (honest badge source). */
+    onDuration?: (cid: string, seconds: number) => void;
     showFollowButton?: boolean;
     isFollowed?: boolean;
     onFollow?: (address: string, name: string) => void;
@@ -16,33 +32,50 @@
     likedByMe?: boolean;
     onToggleLike?: (vine: VineVideo) => void;
     reshareCount?: number;
+    /** Whether the Reshare verb is offered (feed applies the own-original guard). */
+    canReshare?: boolean;
+    /** True while the feed's confirm→publish is in flight for THIS vine. */
+    resharing?: boolean;
+    /** Ask the feed to open the reshare confirmation for this vine. */
+    onReshare?: (vine: VineVideo) => void;
     onViewOriginal?: (vineId: string) => void;
   } = $props();
 
+  let videoEl = $state<HTMLVideoElement | null>(null);
+
   let viewed = $derived(isViewed ?? vine.viewed);
   let showReshareCount = $derived(!vine.reshareOf && reshareCount > 0);
-
   let timeStr = $derived(relativeTime(vine.createdAt * 1000));
-
-  // ZEB-561: never render a blank creator/resharer — a descriptor published via
-  // the headless RPC with `creatorName` omitted carries "", so fall back to a
-  // truncated owner-hex.
+  // ZEB-561: never render a blank creator/resharer.
   let creatorLabel = $derived(vineCreatorLabel(vine.creatorName, vine.creatorAddress));
-  // Reuse the shared origin resolver (falls back to the source creator's
-  // name/address pair) before the blank-guard, so "originally by" never shows
-  // hex when a creator name is available (Qodo PR #337).
   let originalLabel = $derived(vineOriginalCreatorLabel(vine));
 
-  function handleClick() {
-    onPlay(vine);
+  // Imperative play/pause on playing-state transitions. The `autoplay`
+  // attribute only acts at element load, so a paused neighbor promoted to
+  // the playing card needs an explicit play(). jsdom implements neither —
+  // guard both (play may return undefined instead of a promise).
+  $effect(() => {
+    const el = videoEl;
+    if (!el) return;
+    try {
+      if (isPlaying) void el.play()?.catch(() => {});
+      else el.pause();
+    } catch {
+      // jsdom: HTMLMediaElement.play/pause are not implemented.
+    }
+  });
+
+  function handleLoadedMetadata(e: Event) {
+    const el = e.currentTarget as HTMLVideoElement;
+    if (Number.isFinite(el.duration)) onDuration?.(vine.videoCid, el.duration);
   }
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Enter' || e.key === ' ') {
-      // Don't intercept keyboard events from child buttons (e.g. follow button)
+      // Don't intercept keyboard events from child buttons (follow/like/…).
       if (e.target instanceof HTMLButtonElement) return;
       e.preventDefault();
-      onPlay(vine);
+      onActivate?.(vine);
     }
   }
 
@@ -59,160 +92,249 @@
     e.stopPropagation();
     onToggleLike?.(vine);
   }
+
+  function handleReshareClick(e: MouseEvent) {
+    e.stopPropagation();
+    onReshare?.(vine);
+  }
+
+  function handleViewOriginal(e: MouseEvent) {
+    e.stopPropagation();
+    if (vine.reshareOf) onViewOriginal?.(vine.reshareOf);
+  }
 </script>
 
 <div
   class="vine-card"
+  class:playing={isPlaying}
   class:viewed={viewed}
   role="button"
   tabindex="0"
   aria-label="{vine.title ?? 'Untitled vine'} by {creatorLabel}"
-  onclick={handleClick}
+  onclick={() => onActivate?.(vine)}
   onkeydown={handleKeyDown}
 >
-  <div class="thumbnail">
-    <span class="play-icon" aria-hidden="true">▶</span>
+  <div class="stage">
+    {#if videoUrl}
+      <!-- svelte-ignore a11y_media_has_caption -->
+      <video
+        class="stage-video"
+        src={videoUrl}
+        muted
+        loop
+        playsinline
+        bind:this={videoEl}
+        onloadedmetadata={handleLoadedMetadata}
+        aria-label="Vine video"
+        data-testid="stage-video"
+      ></video>
+    {:else}
+      <span class="stage-placeholder" aria-hidden="true">▶</span>
+    {/if}
+    {#if videoUrl && !isPlaying}
+      <!-- Only over a loaded video — off-window cards show ▶, and stacking
+           both centered glyphs would overlap (CodeRabbit PR #440). -->
+      <span class="paused-glyph" aria-hidden="true">❚❚</span>
+    {/if}
+    {#if duration != null}
+      <span class="duration-pill" data-testid="duration-pill">↻ {formatVineDuration(duration)}</span>
+    {/if}
     {#if !viewed}
       <span class="unviewed-dot" aria-label="Unviewed"></span>
     {/if}
   </div>
-  <div class="card-info">
+
+  <div class="meta">
     <div class="creator-row">
-      <Avatar address={vine.creatorAddress} size={18} displayName={creatorLabel} />
+      <Avatar address={vine.creatorAddress} size={26} displayName={creatorLabel} />
       <span class="creator-name">{creatorLabel}</span>
       <span class="timestamp">{timeStr}</span>
+      {#if showFollowButton}
+        <button
+          type="button"
+          class="follow-btn"
+          class:following={isFollowed}
+          aria-label={isFollowed ? `Unfollow ${creatorLabel}` : `Follow ${creatorLabel}`}
+          onclick={handleFollowClick}
+        >
+          {isFollowed ? 'Following' : 'Follow'}
+        </button>
+      {/if}
     </div>
     {#if vine.title}
       <p class="vine-title">{vine.title}</p>
     {/if}
     {#if vine.reshareOf}
-      {#if onViewOriginal}
-        <button
-          type="button"
-          class="attribution-link"
-          onclick={(e) => { e.stopPropagation(); onViewOriginal?.(vine.reshareOf!); }}
-          aria-label="originally by {originalLabel}"
-        >
-          <span aria-hidden="true">↗</span> originally by {originalLabel}
-        </button>
-      {:else}
-        <span class="attribution-row">
-          <span aria-hidden="true">↗</span> originally by {originalLabel}
-        </span>
-      {/if}
-    {/if}
-    {#if showFollowButton}
-      <button
-        type="button"
-        class="follow-btn"
-        class:following={isFollowed}
-        aria-label={isFollowed ? `Unfollow ${vine.creatorName}` : `Follow ${vine.creatorName}`}
-        onclick={handleFollowClick}
-      >
-        {isFollowed ? 'Following' : 'Follow'}
-      </button>
-    {/if}
-    {#if reactionCount > 0 || likedByMe || showReshareCount}
-      <div class="card-like-row">
-        {#if reactionCount > 0 || likedByMe}
+      <span class="attribution-row">
+        <span aria-hidden="true">↻</span> {creatorLabel} reshared ·
+        {#if onViewOriginal}
           <button
             type="button"
-            class="card-heart"
-            onclick={handleLikeClick}
-            aria-label={likedByMe ? `Unlike ${vine.title ?? 'vine'}` : `Like ${vine.title ?? 'vine'}`}
-          >
-            {likedByMe ? '❤️' : '🤍'}
-          </button>
-          <span class="card-like-count">{reactionCount}</span>
+            class="attribution-link"
+            onclick={handleViewOriginal}
+            aria-label="view original by {originalLabel}"
+          >view original by {originalLabel}</button>
+        {:else}
+          view original by {originalLabel}
         {/if}
-        {#if showReshareCount}
-          <span class="reshare-count" aria-label="reshare count {reshareCount}">
-            <span aria-hidden="true">↗</span> {reshareCount}
-          </span>
-        {/if}
-      </div>
+      </span>
     {/if}
+    <div class="action-rail">
+      {#if onToggleLike}
+        <button
+          type="button"
+          class="rail-btn"
+          class:liked={likedByMe}
+          onclick={handleLikeClick}
+          aria-label={likedByMe ? `Unlike ${vine.title ?? 'vine'}` : `Like ${vine.title ?? 'vine'}`}
+        >
+          {likedByMe ? '❤️' : '🤍'}{#if reactionCount > 0}<span class="rail-count">{reactionCount}</span>{/if}
+        </button>
+      {:else if reactionCount > 0}
+        <span class="rail-chip">🤍 <span class="rail-count">{reactionCount}</span></span>
+      {/if}
+      {#if canReshare && onReshare}
+        <button
+          type="button"
+          class="rail-btn"
+          onclick={handleReshareClick}
+          disabled={resharing}
+          aria-label="Reshare vine"
+        >
+          <span aria-hidden="true">↻</span> {resharing ? 'Resharing…' : 'Reshare'}{#if showReshareCount}<span class="rail-count">{reshareCount}</span>{/if}
+        </button>
+      {:else if showReshareCount}
+        <span class="rail-chip" aria-label="reshare count {reshareCount}">
+          <span aria-hidden="true">↻</span> <span class="rail-count">{reshareCount}</span>
+        </span>
+      {/if}
+    </div>
   </div>
 </div>
 
 <style>
   .vine-card {
+    position: relative;
+    height: 100%;
     display: flex;
-    gap: 10px;
-    padding: 10px;
+    flex-direction: column;
+    justify-content: flex-end;
+    background: var(--media-stage);
     border-radius: 8px;
+    overflow: hidden;
     cursor: pointer;
-    transition: background 0.15s;
   }
 
-  .vine-card:hover,
   .vine-card:focus-visible {
-    background: var(--bg-tertiary);
-    outline: none;
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
-  .vine-card.viewed {
-    opacity: 0.7;
-  }
-
-  .thumbnail {
-    width: 56px;
-    height: 72px;
-    flex-shrink: 0;
-    background: var(--bg-tertiary);
-    border-radius: 6px;
+  .stage {
+    position: absolute;
+    inset: 0;
     display: flex;
     align-items: center;
     justify-content: center;
-    position: relative;
+    transition: filter 0.2s ease;
   }
 
-  .play-icon {
-    color: var(--text-muted);
-    font-size: 1.2rem;
+  /* Paused cards dim; viewed cards dim further while paused (spec §3). */
+  .vine-card:not(.playing) .stage {
+    filter: brightness(0.82);
+  }
+
+  .vine-card.viewed:not(.playing) .stage {
+    filter: brightness(0.6);
+  }
+
+  .stage-video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  .stage-placeholder {
+    color: color-mix(in srgb, var(--on-media-stage) 45%, transparent);
+    font-size: 3rem;
+  }
+
+  .paused-glyph {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 2rem;
+    color: var(--on-media-stage);
+    opacity: 0.85;
+    pointer-events: none;
+  }
+
+  .duration-pill {
+    position: absolute;
+    top: 10px;
+    left: 12px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--on-media-stage);
+    background: color-mix(in srgb, var(--media-stage) 72%, transparent);
+    padding: 2px 10px;
+    border-radius: 999px;
   }
 
   .unviewed-dot {
     position: absolute;
-    top: 4px;
-    right: 4px;
-    width: 8px;
-    height: 8px;
-    background: var(--accent);
+    top: 12px;
+    right: 12px;
+    width: 10px;
+    height: 10px;
+    background: var(--gov-clay);
     border-radius: 50%;
   }
 
-  .card-info {
+  .meta {
+    position: relative;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    min-width: 0;
+    gap: 4px;
+    padding: 14px 16px;
+    background: linear-gradient(
+      transparent,
+      color-mix(in srgb, var(--media-stage) 88%, transparent)
+    );
+    color: var(--on-media-stage);
   }
 
   .creator-row {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
   }
 
   .creator-name {
-    color: var(--text-primary);
+    color: var(--on-media-stage);
     font-weight: 600;
     font-size: 0.85rem;
   }
 
   .timestamp {
-    color: var(--text-muted);
-    font-size: 0.75rem;
+    color: color-mix(in srgb, var(--on-media-stage) 62%, transparent);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
   }
 
   .vine-title {
-    color: var(--text-secondary);
-    font-size: 0.8rem;
+    color: color-mix(in srgb, var(--on-media-stage) 88%, transparent);
+    font-size: 0.85rem;
     margin: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .attribution-row {
+    color: color-mix(in srgb, var(--on-media-stage) 75%, transparent);
+    font-size: 0.75rem;
   }
 
   .attribution-link {
@@ -220,12 +342,10 @@
     border: none;
     padding: 0;
     margin: 0;
-    color: var(--accent);
+    color: var(--on-media-stage);
     font-size: 0.75rem;
     cursor: pointer;
     text-decoration: underline;
-    text-align: left;
-    width: fit-content;
   }
 
   .attribution-link:hover {
@@ -237,25 +357,13 @@
     outline-offset: 2px;
   }
 
-  .attribution-row {
-    color: var(--text-secondary);
-    font-size: 0.75rem;
-  }
-
-  .reshare-count {
-    font-size: 0.7rem;
-    color: var(--text-muted);
-    font-weight: 500;
-  }
-
   .follow-btn {
-    display: inline-block;
+    margin-left: auto;
     font-size: 0.7rem;
     font-weight: 600;
-    padding: 2px 10px;
-    border-radius: 12px;
+    padding: 2px 12px;
+    border-radius: 999px;
     cursor: pointer;
-    width: fit-content;
     transition: background 0.15s, color 0.15s;
     background: var(--accent);
     color: var(--on-accent);
@@ -268,8 +376,8 @@
 
   .follow-btn.following {
     background: transparent;
-    color: var(--text-muted);
-    border-color: var(--text-muted);
+    color: color-mix(in srgb, var(--on-media-stage) 70%, transparent);
+    border-color: color-mix(in srgb, var(--on-media-stage) 45%, transparent);
   }
 
   .follow-btn.following:hover {
@@ -277,30 +385,50 @@
     color: var(--danger-vivid);
   }
 
-  .card-like-row {
+  .action-rail {
     display: flex;
     align-items: center;
-    gap: 4px;
-    margin-top: 2px;
+    gap: 8px;
+    margin-top: 4px;
   }
 
-  .card-heart {
-    background: none;
-    border: none;
+  .rail-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: 1px solid color-mix(in srgb, var(--on-media-stage) 28%, transparent);
+    color: var(--on-media-stage);
+    font-size: 0.78rem;
+    padding: 4px 12px;
+    border-radius: 999px;
     cursor: pointer;
-    font-size: 0.8rem;
-    padding: 0;
-    line-height: 1;
-    transition: transform 0.15s;
+    transition: background 0.15s;
   }
 
-  .card-heart:hover {
-    transform: scale(1.2);
+  .rail-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--on-media-stage) 12%, transparent);
   }
 
-  .card-like-count {
-    font-size: 0.7rem;
-    color: var(--text-muted);
-    font-weight: 500;
+  .rail-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .rail-btn.liked {
+    border-color: color-mix(in srgb, var(--danger-vivid) 45%, transparent);
+  }
+
+  .rail-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: color-mix(in srgb, var(--on-media-stage) 70%, transparent);
+    font-size: 0.75rem;
+  }
+
+  .rail-count {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
   }
 </style>

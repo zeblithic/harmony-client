@@ -883,3 +883,104 @@ describe('VineService publish does not over-block self-attributed reshares', () 
     }));
   });
 });
+
+describe('hydrate (ZEB-612 S2 — restart survival for the Rust-persisted cache)', () => {
+  const dto = (over: Partial<VineDescriptorEvent & { viewed: boolean }> = {}) => ({
+    id: 'h1', creatorAddress: 'peer-a', creatorName: 'A', createdAt: 100,
+    videoCid: 'cid-h1', viewed: false, ...over,
+  });
+
+  it('is a no-op without an adapter', async () => {
+    const fresh = new VineService({ seedMockData: false });
+    await expect(fresh.hydrate()).resolves.toBeUndefined();
+  });
+
+  it('populates feeds from list_vine_videos, classified by the follow set', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    svc2.followedAddresses.add('peer-followed');
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
+      cmd === 'list_vine_videos'
+        ? Promise.resolve([
+            dto({ id: 'h1', creatorAddress: 'peer-followed' }),
+            dto({ id: 'h2', creatorAddress: 'peer-stranger', videoCid: 'cid-h2' }),
+          ])
+        : Promise.resolve(null));
+    await svc2.hydrate();
+    expect(svc2.followedVines.map(v => v.id)).toEqual(['h1']);
+    expect(svc2.discoverVines.map(v => v.id)).toEqual(['h2']);
+  });
+
+  it('restores the persisted viewed-set (the ZEB-612 gap-fix)', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
+      cmd === 'list_vine_videos'
+        ? Promise.resolve([dto({ id: 'h1', viewed: true }), dto({ id: 'h2', videoCid: 'c2' })])
+        : Promise.resolve(null));
+    await svc2.hydrate();
+    expect(svc2.viewedIds.has('h1')).toBe(true);
+    expect(svc2.viewedIds.has('h2')).toBe(false);
+  });
+
+  it('merges viewed-state for ids already received live, without duplicating them', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter, emit } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    emit('vine-received', {
+      id: 'live-1', creatorAddress: 'p', creatorName: 'P',
+      createdAt: 5, videoCid: 'c', source: 'discover',
+    });
+    expect(svc2.viewedIds.has('live-1')).toBe(false);
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
+      cmd === 'list_vine_videos'
+        ? Promise.resolve([dto({ id: 'live-1', creatorAddress: 'p', viewed: true })])
+        : Promise.resolve(null));
+    await svc2.hydrate();
+    expect(svc2.vines.filter(v => v.id === 'live-1').length).toBe(1);
+    expect(svc2.viewedIds.has('live-1')).toBe(true);
+  });
+
+  it('remaps own-address rows to self (discover, viewed), matching the live path', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    svc2.ownAddress = 'me-hex';
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
+      cmd === 'list_vine_videos'
+        ? Promise.resolve([dto({ id: 'mine', creatorAddress: 'me-hex' })])
+        : Promise.resolve(null));
+    await svc2.hydrate();
+    expect(svc2.discoverVines[0]?.creatorAddress).toBe('self');
+    expect(svc2.viewedIds.has('mine')).toBe(true);
+  });
+
+  it('fires onChange exactly once for a batch', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    const onChange = vi.fn();
+    svc2.onChange = onChange;
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
+      cmd === 'list_vine_videos'
+        ? Promise.resolve([dto({ id: 'h1' }), dto({ id: 'h2', videoCid: 'c2' })])
+        : Promise.resolve(null));
+    await svc2.hydrate();
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('live vine-received viewed flag (ZEB-612 S2)', () => {
+  it('honors viewed:true on the wire (previously dropped)', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter, emit } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    emit('vine-received', {
+      id: 'w1', creatorAddress: 'p', creatorName: 'P',
+      createdAt: 5, videoCid: 'c', source: 'discover', viewed: true,
+    });
+    expect(svc2.viewedIds.has('w1')).toBe(true);
+  });
+});

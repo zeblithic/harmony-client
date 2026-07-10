@@ -1,7 +1,9 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import type { VineVideo } from '../types';
   import VineCard from './VineCard.svelte';
-  import VinePlayer from './VinePlayer.svelte';
+  import ReshareConfirmDialog from './ReshareConfirmDialog.svelte';
+  import { pickCenterIndex, isOwnOriginalVine } from '../vine-utils';
 
   type FeedFilter = 'all' | 'unviewed';
   type FeedTab = 'following' | 'discover';
@@ -32,6 +34,7 @@
     activeTab?: FeedTab;
     followedAddresses?: Set<string>;
     onTabChange?: (tab: FeedTab) => void;
+    /** Fires when a card BECOMES the playing card (autoplay-on-view = viewed). */
     onMarkViewed?: (id: string) => void;
     onPublish?: () => void;
     onReshare?: (vine: VineVideo) => Promise<void> | void;
@@ -42,51 +45,40 @@
     onToggleLike?: (vine: VineVideo) => void;
     onViewOriginal?: (vineId: string) => void;
     /**
-     * Parent-controlled "open this vine in the player" request.
-     *
-     * Used by App.svelte's `handleViewOriginal` to drive the player
-     * from outside the feed (e.g., when the user clicks an attribution
-     * link and we resolve the original via `vineService.findVine`).
-     * VineFeed watches this via `$effect`, calls its internal
-     * `openPlayer` when it transitions to non-null, and notifies the
-     * parent via `onPlayTargetConsumed` so the parent can null it back
-     * out for the next click. The deliberate clear+microtask dance in
-     * App keeps two clicks in a row from being a no-op.
+     * Parent-controlled "navigate to this vine" request (attribution links,
+     * App.svelte handleViewOriginal). The feed IS the player now: consuming
+     * a target scrolls its card to the snap position and plays it, switching
+     * tab / clearing the unviewed filter when they would hide it. Consumed →
+     * onPlayTargetConsumed nulls the slot for the next click.
      */
     playTarget?: VineVideo | null;
     onPlayTargetConsumed?: () => void;
-    /**
-     * Local node's hex address. Forwarded to VinePlayer so it can
-     * suppress the Reshare button on self-authored vines that arrived
-     * before `vineService.ownAddress` was set (and so weren't remapped
-     * to the magic `'self'` value by `wireToVine`). See FIX 2 in
-     * PR #120 round 1.
-     */
+    /** Local node's hex address — own-original reshare suppression (FIX 2, PR #120). */
     ownAddress?: string;
   } = $props();
 
-  let activeVine = $state<VineVideo | null>(null);
   let feedFilter = $state<FeedFilter>('all');
-  let playerList = $state<VineVideo[]>([]);
-  let activeIndex = $state(-1);
-
-  // Parent-driven open: when `playTarget` transitions to a vine, open
-  // it in the player. The seed playerList is the entire concat'd feed
-  // because the original might live in either followedVines or
-  // discoverVines (and the user may currently be on the other tab).
-  // After consuming, we notify the parent so it can null the slot —
-  // we never read `playTarget` for navigation, only for triggering the
-  // open.
-  $effect(() => {
-    if (playTarget) {
-      const target = playTarget;
-      playerList = [...followedVines, ...discoverVines];
-      activeIndex = playerList.findIndex(v => v.id === target.id);
-      activeVine = target;
-      onMarkViewed?.(target.id);
-      onPlayTargetConsumed?.();
-    }
-  });
+  let playingId = $state<string | null>(null);
+  /**
+   * Card kept visible under the Unviewed filter even after becoming viewed —
+   * set when a card starts playing WHILE the filter is active, so the list
+   * doesn't yank it away mid-playback. Cleared on filter/tab switches so the
+   * strict unviewed view (and its all-caught-up state) stays reachable.
+   */
+  let unviewedPin = $state<string | null>(null);
+  /** cid → blob URL, bounded to the lazy window (playing ± 1). */
+  let videoUrls = $state(new Map<string, string>());
+  /** cid → seconds; sticky once any mounted video reports metadata. */
+  let durations = $state(new Map<string, number>());
+  let reshareTarget = $state<VineVideo | null>(null);
+  let resharingId = $state<string | null>(null);
+  let reshareError = $state('');
+  let feedListEl = $state<HTMLDivElement | null>(null);
+  /** Card id to scroll to once it exists in the rendered list. */
+  let pendingScrollId = $state<string | null>(null);
+  let scrollScheduled = false;
+  /** cids with an in-flight resolveVideo call (non-reactive bookkeeping). */
+  const pendingCids = new Set<string>();
 
   let activeVines = $derived(
     activeTab === 'following' ? followedVines : discoverVines
@@ -98,7 +90,7 @@
 
   let filteredVines = $derived(
     activeTab === 'following' && feedFilter === 'unviewed'
-      ? sortedVines.filter(v => !viewedIds.has(v.id))
+      ? sortedVines.filter(v => !viewedIds.has(v.id) || v.id === unviewedPin)
       : sortedVines
   );
 
@@ -130,36 +122,195 @@
     return map;
   });
 
-  function openPlayer(vine: VineVideo) {
-    if (!activeVine) {
-      playerList = [...filteredVines];
+  // ── Center-detection autoplay ───────────────────────────────────────
+
+  function setPlaying(id: string) {
+    if (playingId === id) return;
+    playingId = id;
+    // Playing under the active Unviewed filter pins the card (it's about to
+    // become viewed); anywhere else the pin is stale — drop it.
+    unviewedPin =
+      activeTab === 'following' && feedFilter === 'unviewed' ? id : null;
+    onMarkViewed?.(id);
+  }
+
+  function recomputePlaying() {
+    const list = feedListEl;
+    if (!list) return;
+    const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-vine-id]'));
+    if (rows.length === 0) {
+      playingId = null;
+      return;
     }
-    activeIndex = playerList.findIndex(v => v.id === vine.id);
-    activeVine = vine;
-    onMarkViewed?.(vine.id);
+    const listRect = list.getBoundingClientRect();
+    const viewportCenter = listRect.top + listRect.height / 2;
+    const centers = rows.map(r => {
+      const rect = r.getBoundingClientRect();
+      return rect.top + rect.height / 2;
+    });
+    const idx = pickCenterIndex(centers, viewportCenter);
+    if (idx >= 0) setPlaying(rows[idx].dataset.vineId!);
   }
 
-  function closePlayer() {
-    activeVine = null;
-    playerList = [];
-    activeIndex = -1;
+  function onFeedScroll() {
+    if (scrollScheduled) return;
+    scrollScheduled = true;
+    requestAnimationFrame(() => {
+      scrollScheduled = false;
+      recomputePlaying();
+    });
   }
 
-  function nextVine() {
-    if (activeIndex >= 0 && activeIndex < playerList.length - 1) {
-      const next = playerList[activeIndex + 1];
-      activeIndex = activeIndex + 1;
-      activeVine = next;
-      onMarkViewed?.(next.id);
+  // Re-detect on mount and when the playing card LEAVES the rendered list
+  // (filter/tab switch, feed emptied). List mutations that keep the playing
+  // card (new arrivals, viewed-set updates) must NOT move playback — only
+  // scroll events and explicit activation do. Effects run post-render, so
+  // the [data-vine-id] rows are queryable; jsdom rects are all zeros →
+  // index 0 wins the tie → the first (newest) card plays on mount.
+  $effect(() => {
+    const list = filteredVines;
+    if (!feedListEl) return;
+    const stillListed = playingId != null && list.some(v => v.id === playingId);
+    if (!stillListed) untrack(recomputePlaying);
+  });
+
+  function activateCard(vine: VineVideo) {
+    setPlaying(vine.id);
+    pendingScrollId = vine.id;
+  }
+
+  // Parent-driven navigation: the feed is the player now.
+  $effect(() => {
+    if (!playTarget) return;
+    const target = playTarget;
+    untrack(() => {
+      onPlayTargetConsumed?.();
+      const inFollowed = followedVines.some(v => v.id === target.id);
+      const inDiscover = discoverVines.some(v => v.id === target.id);
+      // Not in the local feed (e.g. original never surfaced): the click is
+      // silently ignored — same posture as the old player seed path.
+      if (!inFollowed && !inDiscover) return;
+      const wantTab: FeedTab = inFollowed ? 'following' : 'discover';
+      if (activeTab !== wantTab) onTabChange?.(wantTab);
+      if (wantTab === 'following' && feedFilter === 'unviewed' && viewedIds.has(target.id)) {
+        feedFilter = 'all';
+      }
+      setPlaying(target.id);
+      pendingScrollId = target.id;
+    });
+  });
+
+  // Scroll the pending card into the snap position once it's rendered
+  // (after a tab switch the row appears a tick later; re-run on list change).
+  $effect(() => {
+    void filteredVines;
+    const id = pendingScrollId;
+    if (!id || !feedListEl) return;
+    const el = feedListEl.querySelector<HTMLElement>(`[data-vine-id="${CSS.escape(id)}"]`);
+    if (el) {
+      el.scrollIntoView?.({ block: 'start' });
+      pendingScrollId = null;
     }
+  });
+
+  // ── Lazy blob window (playing ± 1) ──────────────────────────────────
+
+  // Windowed by CARD (vine id), not by CID: reshares carry the original's
+  // videoCid, so a cid-keyed window would hand a blob URL to every far-away
+  // reshare of the playing clip and mount videos outside the window
+  // (Qodo PR #440). The blob map itself stays cid-keyed so windowed cards
+  // sharing a CID still share one fetch + one URL.
+  let windowIds = $derived.by(() => {
+    const idx = filteredVines.findIndex(v => v.id === playingId);
+    const around = idx === -1 ? [0, 1] : [idx - 1, idx, idx + 1];
+    const set = new Set<string>();
+    for (const i of around) {
+      const v = filteredVines[i];
+      if (v) set.add(v.id);
+    }
+    return set;
+  });
+
+  let windowCids = $derived.by(() => {
+    const set = new Set<string>();
+    for (const v of filteredVines) {
+      if (windowIds.has(v.id)) set.add(v.videoCid);
+    }
+    return set;
+  });
+
+  $effect(() => {
+    const want = windowCids;
+    // Revoke and drop URLs whose cards left the window.
+    let next: Map<string, string> | null = null;
+    for (const [cid, url] of videoUrls) {
+      if (!want.has(cid)) {
+        URL.revokeObjectURL?.(url);
+        (next ??= new Map(videoUrls)).delete(cid);
+      }
+    }
+    if (next) videoUrls = next;
+    const resolver = resolveVideo;
+    if (!resolver) return;
+    for (const cid of want) {
+      if (videoUrls.has(cid) || pendingCids.has(cid)) continue;
+      pendingCids.add(cid);
+      resolver(cid)
+        .then(url => {
+          pendingCids.delete(cid);
+          // The component may have unmounted, or the window may have moved,
+          // while the fetch was in flight — either way this URL must be
+          // revoked here or it leaks (the destroy cleanup already ran /
+          // will never see it). Qodo PR #440.
+          if (destroyed || !windowCids.has(cid)) {
+            URL.revokeObjectURL?.(url);
+            return;
+          }
+          videoUrls = new Map(videoUrls).set(cid, url);
+        })
+        .catch(() => {
+          pendingCids.delete(cid);
+        });
+    }
+  });
+
+  /** Flipped at destroy so late-resolving fetches revoke instead of keep. */
+  let destroyed = false;
+
+  // Revoke everything on unmount (body reads nothing reactive → runs once,
+  // so the returned cleanup fires only at destroy).
+  $effect(() => () => {
+    destroyed = true;
+    for (const url of videoUrls.values()) URL.revokeObjectURL?.(url);
+  });
+
+  function reportDuration(cid: string, seconds: number) {
+    if (durations.get(cid) === seconds) return;
+    durations = new Map(durations).set(cid, seconds);
   }
 
-  function previousVine() {
-    if (activeIndex > 0) {
-      const prev = playerList[activeIndex - 1];
-      activeIndex = activeIndex - 1;
-      activeVine = prev;
-      onMarkViewed?.(prev.id);
+  // ── Feed-level reshare (moved from the retired VinePlayer) ──────────
+
+  function requestReshare(vine: VineVideo) {
+    if (resharingId) return;
+    reshareError = '';
+    reshareTarget = vine;
+  }
+
+  async function confirmReshare() {
+    const vine = reshareTarget;
+    reshareTarget = null;
+    if (!vine || !onReshare) return;
+    resharingId = vine.id;
+    try {
+      await onReshare(vine);
+    } catch (err) {
+      // Tauri IPC rejections are strings in production — preserve them
+      // (codebase-wide extraction idiom), falling back only when empty.
+      const msg = err instanceof Error ? err.message : String(err);
+      reshareError = msg || 'Reshare failed';
+    } finally {
+      resharingId = null;
     }
   }
 </script>
@@ -180,17 +331,21 @@
   </header>
 
   <div class="tab-bar">
-    <button type="button" class="tab" class:active={activeTab === 'following'} onclick={() => onTabChange?.('following')}>Following</button>
-    <button type="button" class="tab" class:active={activeTab === 'discover'} onclick={() => onTabChange?.('discover')}>Discover</button>
+    <button type="button" class="tab" class:active={activeTab === 'following'} onclick={() => { unviewedPin = null; onTabChange?.('following'); }}>Following</button>
+    <button type="button" class="tab" class:active={activeTab === 'discover'} onclick={() => { unviewedPin = null; onTabChange?.('discover'); }}>Discover</button>
   </div>
 
   {#if activeTab === 'following'}
     <div class="filter-bar">
-      <button type="button" class="filter-tab" class:active={feedFilter === 'all'} onclick={() => feedFilter = 'all'}>All</button>
-      <button type="button" class="filter-tab" class:active={feedFilter === 'unviewed'} onclick={() => feedFilter = 'unviewed'}>
+      <button type="button" class="filter-tab" class:active={feedFilter === 'all'} onclick={() => { feedFilter = 'all'; unviewedPin = null; }}>All</button>
+      <button type="button" class="filter-tab" class:active={feedFilter === 'unviewed'} onclick={() => { feedFilter = 'unviewed'; unviewedPin = null; }}>
         Unviewed{#if unviewedCount > 0}&nbsp;({unviewedCount}){/if}
       </button>
     </div>
+  {/if}
+
+  {#if reshareError}
+    <p class="reshare-error" role="alert">{reshareError}</p>
   {/if}
 
   {#if filteredVines.length === 0}
@@ -214,14 +369,24 @@
       {/if}
     </div>
   {:else}
-    <div class="feed-list" role="list" aria-label="Vine feed">
+    <div
+      class="feed-list"
+      role="list"
+      aria-label="Vine feed"
+      bind:this={feedListEl}
+      onscroll={onFeedScroll}
+    >
       {#each filteredVines as vine (vine.id)}
         {@const reaction = getReaction?.(vine.id)}
-        <div role="listitem">
+        <div class="feed-item" role="listitem" data-vine-id={vine.id}>
           <VineCard
             {vine}
-            onPlay={openPlayer}
+            isPlaying={playingId === vine.id}
             isViewed={viewedIds.has(vine.id)}
+            videoUrl={windowIds.has(vine.id) ? (videoUrls.get(vine.videoCid) ?? null) : null}
+            duration={durations.get(vine.videoCid) ?? null}
+            onActivate={activateCard}
+            onDuration={reportDuration}
             showFollowButton={vine.creatorAddress !== 'self'}
             isFollowed={followedAddresses.has(vine.creatorAddress)}
             {onFollow}
@@ -230,6 +395,9 @@
             likedByMe={reaction?.likedByMe ?? false}
             {onToggleLike}
             reshareCount={reshareCountMap.get(vine.id) ?? 0}
+            canReshare={!!onReshare && !isOwnOriginalVine(vine, ownAddress)}
+            resharing={resharingId === vine.id}
+            onReshare={requestReshare}
             {onViewOriginal}
           />
         </div>
@@ -238,19 +406,11 @@
   {/if}
 </div>
 
-{#if activeVine}
-  <VinePlayer
-    vine={activeVine}
-    onClose={closePlayer}
-    onNext={activeIndex >= 0 && activeIndex < playerList.length - 1 ? nextVine : undefined}
-    onPrevious={activeIndex > 0 ? previousVine : undefined}
-    {onReshare}
-    {resolveVideo}
-    reactionCount={getReaction?.(activeVine.id)?.count ?? 0}
-    likedByMe={getReaction?.(activeVine.id)?.likedByMe ?? false}
-    {onToggleLike}
-    {onViewOriginal}
-    {ownAddress}
+{#if reshareTarget}
+  <ReshareConfirmDialog
+    vine={reshareTarget}
+    onConfirm={confirmReshare}
+    onCancel={() => { reshareTarget = null; }}
   />
 {/if}
 
@@ -276,12 +436,13 @@
   }
 
   .unviewed-count {
-    color: var(--accent);
+    color: var(--gov-clay-deep);
     font-size: 0.75rem;
     font-weight: 600;
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    padding: 2px 8px;
-    border-radius: 10px;
+    font-family: var(--font-mono);
+    background: var(--gov-clay-soft);
+    padding: 2px 10px;
+    border-radius: 999px;
   }
 
   .header-spacer {
@@ -296,7 +457,7 @@
     color: var(--on-accent);
     border: none;
     padding: 6px 12px;
-    border-radius: 6px;
+    border-radius: 5px;
     font-size: 0.8rem;
     font-weight: 600;
     cursor: pointer;
@@ -354,7 +515,7 @@
     font-size: 0.75rem;
     font-weight: 500;
     padding: 4px 10px;
-    border-radius: 12px;
+    border-radius: 999px;
     cursor: pointer;
     transition: background 0.15s, color 0.15s;
   }
@@ -367,6 +528,13 @@
     background: var(--bg-tertiary);
     color: var(--text-primary);
     font-weight: 600;
+  }
+
+  .reshare-error {
+    color: var(--danger);
+    font-size: 0.78rem;
+    margin: 0;
+    padding: 4px 16px;
   }
 
   .empty-state {
@@ -393,7 +561,7 @@
     color: var(--on-accent);
     border: none;
     padding: 8px 16px;
-    border-radius: 6px;
+    border-radius: 5px;
     font-size: 0.85rem;
     font-weight: 600;
     cursor: pointer;
@@ -407,6 +575,24 @@
   .feed-list {
     flex: 1;
     overflow-y: auto;
-    padding: 0 6px 16px;
+    scroll-snap-type: y mandatory;
+    scroll-behavior: smooth;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 0 16px 16px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .feed-list {
+      scroll-behavior: auto;
+    }
+  }
+
+  .feed-item {
+    flex: 0 0 auto;
+    height: 100%;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
   }
 </style>
