@@ -19,6 +19,8 @@
   import { OwnerService, extractError } from '../owner-service';
   import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
   import {
+    BACKUP_FLAGS_CHANGED_EVENT,
+    daysSinceBackupSkipped,
     isBackupReminderVisible,
     markBannerDismissed,
     markRecoveryBackedUp,
@@ -44,12 +46,32 @@
 
   const svc = new OwnerService();
 
+  // ZEB-650: localStorage isn't reactive, so another surface completing a
+  // backup (DevicesPanel's modal) can't invalidate our $derived on its own.
+  // The flags module fires BACKUP_FLAGS_CHANGED_EVENT on every marker write;
+  // bumping this tick re-derives visibility/day-count without a remount
+  // (CodeRabbit, PR #436).
+  let flagsTick = $state(0);
+  $effect(() => {
+    const bump = () => { flagsTick++; };
+    window.addEventListener(BACKUP_FLAGS_CHANGED_EVENT, bump);
+    return () => window.removeEventListener(BACKUP_FLAGS_CHANGED_EVENT, bump);
+  });
+
   // $derived (not $effect) so visibility is available synchronously on first
   // render and recomputes when the owner identity resolves (null → id). Reads
   // the owner-scoped skip/backed-up/dismissed flags for THIS owner (ZEB-587).
-  const visible = $derived(
-    isBackupReminderVisible(ownerId) && !dismissedThisSession && !backedUpThisSession,
-  );
+  const visible = $derived.by(() => {
+    void flagsTick; // re-derive when the flags module signals a write
+    return isBackupReminderVisible(ownerId) && !dismissedThisSession && !backedUpThisSession;
+  });
+
+  // ZEB-650: day count derives from the owner-scoped skippedAt stamp; null
+  // (legacy owner) or 0 (skipped today) keeps the base copy unchanged.
+  const skippedDays = $derived.by(() => {
+    void flagsTick;
+    return ownerId ? daysSinceBackupSkipped(ownerId) : null;
+  });
 
   // Tie the per-session overrides to the owner that set them. If the owner prop
   // changes while this component stays mounted (e.g. the owner resolves after
@@ -112,7 +134,7 @@
 
 {#if visible}
   <div class="backup-banner" data-testid="backup-reminder-banner" role="status">
-    <span class="warn"><span class="icon" aria-hidden="true">🔑</span> Your identity hasn't been backed up.</span>
+    <span class="warn"><span class="icon" aria-hidden="true">🔑</span> Your identity hasn't been backed up{#if skippedDays !== null && skippedDays >= 1}<span data-testid="backup-reminder-days"> — you skipped backup {skippedDays} {skippedDays === 1 ? 'day' : 'days'} ago</span>{/if}.</span>
     {#if !showPassphrase}
       <button data-testid="backup-reminder-backup-now" onclick={startBackup}>Back up now</button>
       <button

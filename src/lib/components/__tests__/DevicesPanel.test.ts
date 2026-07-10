@@ -27,6 +27,17 @@ vi.mock('../../device-label-service', () => ({
   resolveDefaultDeviceLabel: vi.fn(),
 }));
 
+import { fetchCommunitiesCount } from '../../owner-meta';
+
+// ZEB-650: mocked as a unit so the count fetch never consumes this file's
+// ordered invoke stubs. resetAllMocks leaves it returning undefined for the
+// pre-existing tests — the component treats that as "omit the fact".
+vi.mock('../../owner-meta', () => ({
+  fetchCommunitiesCount: vi.fn(),
+}));
+
+const mockedCommunitiesCount = fetchCommunitiesCount as unknown as ReturnType<typeof vi.fn>;
+
 const mockedInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
 // File-level beforeEach: runs before EVERY test in this file, including those
@@ -1053,5 +1064,148 @@ describe('DevicesPanel — butler pin toggle ID form (ZEB-418 P2 round-2)', () =
     expect(mockedInvoke).not.toHaveBeenCalledWith('set_butler_pin', {
       deviceId: identityHashHex,
     });
+  });
+});
+
+describe('DevicesPanel meta row + backup stamps (ZEB-650 slice 1)', () => {
+  const metaView = {
+    ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+    ownerDisplayName: 'zeblith',
+    devices: [
+      {
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this device',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+      },
+      {
+        deviceId: 'bb22cc33dd44ee55ff667788990011aa',
+        displayName: 'other device',
+        isThisDevice: false,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_600_000_000,
+        fingerprint: 'bb22·cc33',
+      },
+    ],
+    canBackUp: true,
+  };
+  const backedUpKey = `harmony.onboarding.recoveryArtifactBackedUp:owner-${metaView.ownerId}`;
+  const backedUpAtKey = `harmony.onboarding.recoveryBackedUpAt:owner-${metaView.ownerId}`;
+
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  it('renders keytype, earliest enrollment date, and communities count', async () => {
+    mockedInvoke.mockResolvedValueOnce(metaView); // get_owner_state
+    mockedCommunitiesCount.mockResolvedValue(4);
+    render(DevicesPanel);
+    const keytype = await screen.findByTestId('devices-meta-keytype');
+    expect(keytype.textContent).toBe('ed25519');
+    // MIN of the two enrolledAt values (Unix seconds → ms).
+    expect(screen.getByTestId('devices-meta-enrolled').textContent).toContain(
+      new Date(1_600_000_000 * 1000).toLocaleDateString(),
+    );
+    const communities = await screen.findByTestId('devices-meta-communities');
+    expect(communities.textContent).toContain('4');
+    expect(communities.textContent).toContain('communities');
+  });
+
+  it('uses singular copy for exactly one community', async () => {
+    mockedInvoke.mockResolvedValueOnce(metaView);
+    mockedCommunitiesCount.mockResolvedValue(1);
+    render(DevicesPanel);
+    const communities = await screen.findByTestId('devices-meta-communities');
+    expect(communities.textContent).toContain('1 community');
+    expect(communities.textContent).not.toContain('communities');
+  });
+
+  it('omits the communities fact when the count is unavailable', async () => {
+    mockedInvoke.mockResolvedValueOnce(metaView);
+    mockedCommunitiesCount.mockResolvedValue(null);
+    render(DevicesPanel);
+    await screen.findByTestId('devices-meta-keytype');
+    expect(screen.queryByTestId('devices-meta-communities')).toBeNull();
+  });
+
+  it('shows last-backed-up only when a stamp exists', async () => {
+    const stamp = Date.UTC(2026, 0, 15);
+    localStorage.setItem(backedUpAtKey, String(stamp));
+    mockedInvoke.mockResolvedValueOnce(metaView);
+    render(DevicesPanel);
+    const line = await screen.findByTestId('devices-last-backed-up');
+    expect(line.textContent).toContain(new Date(stamp).toLocaleDateString());
+  });
+
+  it('omits last-backed-up for a legacy owner without a stamp', async () => {
+    mockedInvoke.mockResolvedValueOnce(metaView);
+    render(DevicesPanel);
+    await screen.findByTestId('devices-meta-keytype');
+    expect(screen.queryByTestId('devices-last-backed-up')).toBeNull();
+  });
+
+  it('commitBackup marks the owner backed up (gap fix)', async () => {
+    mockedInvoke.mockResolvedValueOnce(metaView); // get_owner_state (mount)
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    mockedInvoke.mockResolvedValueOnce('token-1'); // issue_owner_recovery_token
+    await fireEvent.click(backupBtn);
+    const pass = await screen.findByLabelText('Passphrase');
+    await fireEvent.input(pass, { target: { value: 'a'.repeat(12) } });
+    await fireEvent.input(screen.getByLabelText('Confirm passphrase'), {
+      target: { value: 'a'.repeat(12) },
+    });
+    mockedInvoke.mockResolvedValueOnce('path-token'); // request_export_save_path
+    mockedInvoke.mockResolvedValueOnce({ identityHash: 'h', byteLen: 1, path: '/tmp/x.bin' }); // export
+    await fireEvent.click(screen.getByRole('button', { name: /save backup/i }));
+    await screen.findByText(/recovery file written to/i);
+    expect(localStorage.getItem(backedUpKey)).toBe('true');
+    expect(localStorage.getItem(backedUpAtKey)).not.toBeNull();
+    // The last-backed-up line appears immediately (state updated at the
+    // mutation point, not just on next mount).
+    expect(screen.getByTestId('devices-last-backed-up')).toBeTruthy();
+  });
+});
+
+describe('DevicesPanel meta facts are keyed to the owner (Qodo PR #436)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  it('populates the meta row after an in-panel mint (owner appears post-mount)', async () => {
+    mockedInvoke.mockResolvedValueOnce(null); // get_owner_state → empty state
+    mockedCommunitiesCount.mockResolvedValue(2);
+    render(DevicesPanel);
+    const bindBtn = await screen.findByRole('button', { name: /bind this device/i });
+    await fireEvent.click(bindBtn);
+    mockedInvoke.mockResolvedValueOnce({
+      state: {
+        ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+        ownerDisplayName: 'zeblith',
+        devices: [{
+          deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+          displayName: 'this device',
+          isThisDevice: true,
+          trustDecision: { kind: 'full', reason: null },
+          enrolledAt: 1_700_000_000,
+          fingerprint: 'aa11·bb22',
+        }],
+        canBackUp: true,
+      },
+      recoveryToken: 'tok-1',
+    }); // mint_owner_identity
+    const confirmBtn = await screen.findByRole('button', { name: /^create owner identity/i });
+    await fireEvent.click(confirmBtn);
+    await screen.findByText(/my devices/i);
+    // The $effect keys the meta facts to the NEW ownerId — a run-once onMount
+    // would leave this row unpopulated (or, worse, stale on an owner swap).
+    const keytype = await screen.findByTestId('devices-meta-keytype');
+    expect(keytype.textContent).toBe('ed25519');
+    const communities = await screen.findByTestId('devices-meta-communities');
+    expect(communities.textContent).toContain('2');
   });
 });

@@ -25,6 +25,11 @@
 const SKIPPED = 'harmony.onboarding.backupSkipped';
 const BACKED_UP = 'harmony.onboarding.recoveryArtifactBackedUp';
 const DISMISSED = 'harmony.onboarding.backupBannerDismissed';
+// ZEB-650 slice 1: additive timestamps beside the booleans. Legacy owners
+// (boolean set, stamp absent) read as null — callers degrade to the
+// pre-timestamp copy rather than fabricating a figure.
+const SKIPPED_AT = 'harmony.onboarding.backupSkippedAt';
+const BACKED_UP_AT = 'harmony.onboarding.recoveryBackedUpAt';
 
 type StoreKind = 'local' | 'session';
 
@@ -55,19 +60,81 @@ function writeFlag(kind: StoreKind, base: string, ownerId: string): void {
   }
 }
 
+function writeStamp(base: string, ownerId: string, nowMs: number): void {
+  try {
+    localStorage.setItem(ownerKey(base, ownerId), String(nowMs));
+  } catch (e) {
+    console.debug('[zeb-650] onboarding stamp write failed:', e instanceof Error ? e.message : String(e));
+  }
+}
+
+function readStamp(base: string, ownerId: string): number | null {
+  try {
+    const raw = localStorage.getItem(ownerKey(base, ownerId));
+    if (raw === null) return null;
+    // Strict decimal-integer parse: Number('') / Number('   ') are 0, which
+    // would read corrupted storage as the Unix epoch and render absurd
+    // day counts / a 1970 backup date (Qodo + CodeRabbit, PR #436). A real
+    // stamp is a positive Date.now(), so 0 is also rejected.
+    const value = raw.trim();
+    if (!/^\d+$/.test(value)) return null;
+    const n = Number(value);
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fired on `window` whenever a marker below writes. localStorage is not
+ * reactive, so an already-mounted reader (e.g. BackupReminderBanner while a
+ * DevicesPanel backup completes) must be told to re-derive — otherwise it
+ * shows stale flag state until remount (CodeRabbit, PR #436).
+ */
+export const BACKUP_FLAGS_CHANGED_EVENT = 'harmony:onboarding-backup-flags-changed';
+
+function signalFlagsChanged(): void {
+  try {
+    window.dispatchEvent(new Event(BACKUP_FLAGS_CHANGED_EVENT));
+  } catch {
+    // Non-DOM environment — persistence still happened; readers re-derive on mount.
+  }
+}
+
 /** Record that this owner skipped the onboarding backup (durable). */
 export function markBackupSkipped(ownerId: string): void {
   writeFlag('local', SKIPPED, ownerId);
+  writeStamp(SKIPPED_AT, ownerId, Date.now());
+  signalFlagsChanged();
 }
 
 /** Record that this owner exported a recovery artifact (durable). */
 export function markRecoveryBackedUp(ownerId: string): void {
   writeFlag('local', BACKED_UP, ownerId);
+  writeStamp(BACKED_UP_AT, ownerId, Date.now());
+  signalFlagsChanged();
+}
+
+export function backupSkippedAtMs(ownerId: string): number | null {
+  return readStamp(SKIPPED_AT, ownerId);
+}
+
+export function recoveryBackedUpAtMs(ownerId: string): number | null {
+  return readStamp(BACKED_UP_AT, ownerId);
+}
+
+/** Whole days (floored) since this owner skipped backup; null when no stamp
+ *  exists (legacy owner or never skipped). Clamped at 0 under clock skew. */
+export function daysSinceBackupSkipped(ownerId: string, nowMs: number = Date.now()): number | null {
+  const at = backupSkippedAtMs(ownerId);
+  if (at === null) return null;
+  return Math.max(0, Math.floor((nowMs - at) / 86_400_000));
 }
 
 /** Snooze the reminder banner for this owner for the current session only. */
 export function markBannerDismissed(ownerId: string): void {
   writeFlag('session', DISMISSED, ownerId);
+  signalFlagsChanged();
 }
 
 export function isBackupSkipped(ownerId: string): boolean {

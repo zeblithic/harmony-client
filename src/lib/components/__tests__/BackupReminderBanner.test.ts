@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import BackupReminderBanner from '../BackupReminderBanner.svelte';
+import { markRecoveryBackedUp } from '../../onboarding-backup-flags';
 
 // vi.hoisted ensures these are available at mock-factory call time
 // (vi.mock is hoisted to the top of the file by Vitest, so module-level
@@ -127,6 +129,52 @@ describe('BackupReminderBanner visibility (owner-scoped, ZEB-587)', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(localStorage.getItem(backedUpKey(OWNER))).toBe('true');
+    expect(queryByTestId('backup-reminder-banner')).toBeNull();
+  });
+});
+
+describe('BackupReminderBanner day count (ZEB-650 slice 1)', () => {
+  const skippedAtKey = (id: string) => `harmony.onboarding.backupSkippedAt:owner-${id}`;
+
+  it('shows "skipped N days ago" when the stamp is old enough', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    localStorage.setItem(skippedAtKey(OWNER), String(Date.now() - 3 * 86_400_000 - 60_000));
+    const { getByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(getByTestId('backup-reminder-days').textContent).toContain('3 days ago');
+  });
+
+  it('uses singular copy for exactly 1 day', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    localStorage.setItem(skippedAtKey(OWNER), String(Date.now() - 86_400_000 - 60_000));
+    const { getByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(getByTestId('backup-reminder-days').textContent).toContain('1 day ago');
+    expect(getByTestId('backup-reminder-days').textContent).not.toContain('1 days');
+  });
+
+  it('renders no day count on the skip day (0 days)', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    localStorage.setItem(skippedAtKey(OWNER), String(Date.now()));
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(queryByTestId('backup-reminder-days')).toBeNull();
+  });
+
+  it('renders no day count for a legacy owner without a stamp', () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    const { queryByTestId, getByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(queryByTestId('backup-reminder-days')).toBeNull();
+    expect(getByTestId('backup-reminder-banner').textContent).toContain("hasn't been backed up");
+  });
+});
+
+describe('cross-surface backup completion (CodeRabbit PR #436)', () => {
+  it('hides an already-mounted banner when another surface marks backed up', async () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(queryByTestId('backup-reminder-banner')).toBeTruthy();
+    // e.g. the user completes a backup from DevicesPanel's modal while the
+    // banner is on screen — the flags-changed event must re-derive visibility.
+    markRecoveryBackedUp(OWNER);
+    await tick();
     expect(queryByTestId('backup-reminder-banner')).toBeNull();
   });
 });

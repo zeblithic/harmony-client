@@ -50,6 +50,9 @@
     onDeleteChannel,
     identity,
     showConnectionStatus = false,
+    // ZEB-659: the network-viz window renders MockNetworkDataService's
+    // fabricated topology — dev tool only until it has real data.
+    showNetworkViz = import.meta.env.DEV,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
@@ -109,6 +112,7 @@
     /** ZEB-606: mount the connection-status strip (fires network-health IPC
      *  on mount — default off so bare construction makes no IPC calls). */
     showConnectionStatus?: boolean;
+    showNetworkViz?: boolean;
   } = $props();
 
   // ZEB-544: resolve the nav-rail gate map once per mount (a single localStorage
@@ -204,6 +208,7 @@
 
   /** Open the network visualization in a second Tauri window. */
   async function openNetworkWindow() {
+    if (!showNetworkViz) return; // ZEB-659: dev-gated (belt-and-braces with the hidden button)
     const existing = await WebviewWindow.getByLabel('network-viz');
     if (existing) {
       await existing.setFocus();
@@ -451,14 +456,16 @@
         {onShowAbout}
         {onOpenDocs}
       />
-      <button
-        type="button"
-        class="nav-action-btn"
-        aria-label="Open network visualization"
-        onclick={openNetworkWindow}
-      >
-        Network Viz
-      </button>
+      {#if showNetworkViz}
+        <button
+          type="button"
+          class="nav-action-btn"
+          aria-label="Open network visualization"
+          onclick={openNetworkWindow}
+        >
+          Network Viz
+        </button>
+      {/if}
       {#if identity}
         <IdentityChip
           displayName={identity.displayName}

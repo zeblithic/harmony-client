@@ -625,3 +625,15 @@ describe('NavPanel', () => {
     });
   });
 });
+
+describe('Network Viz dev-flag gate (ZEB-659)', () => {
+  it('hides the Network Viz button when showNetworkViz is false', () => {
+    render(NavPanel, { props: { nodes: testNodes, collapsed: false, showNetworkViz: false } });
+    expect(screen.queryByRole('button', { name: /open network visualization/i })).toBeNull();
+  });
+
+  it('shows the Network Viz button when showNetworkViz is true', () => {
+    render(NavPanel, { props: { nodes: testNodes, collapsed: false, showNetworkViz: true } });
+    expect(screen.getByRole('button', { name: /open network visualization/i })).toBeTruthy();
+  });
+});
