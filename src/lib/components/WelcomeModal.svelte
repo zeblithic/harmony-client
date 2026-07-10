@@ -20,6 +20,7 @@
   import { trapFocus } from '../focus-trap';
   import PairingJoiner from './PairingJoiner.svelte';
   import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
+  import OwnerPhraseReveal from './OwnerPhraseReveal.svelte';
   import HarmonyMark from './HarmonyMark.svelte';
   import WizardProgress from './WizardProgress.svelte';
 
@@ -121,6 +122,16 @@
     } finally {
       backupInFlight = false;
     }
+  }
+
+  // ZEB-650 slice 2 (CodeRabbit PR #437): a phrase backup needs its own exit —
+  // without one, the only way past this stage after writing the words down is
+  // "Skip for now", which would record a successful backup as a skip.
+  let phraseBackedUp = $state(false);
+
+  async function handlePhraseContinue() {
+    if (mintResult === null) return;
+    await onMinted(mintResult);
   }
 
   function handleSkipRequest() {
@@ -332,6 +343,28 @@
             Skip for now
           </button>
         </div>
+        {#if mintResult !== null}
+          <div class="phrase-alternative">
+            <OwnerPhraseReveal
+              ownerId={mintResult.state.ownerId}
+              onBackedUp={() => {
+                phraseBackedUp = true;
+              }}
+            />
+            {#if phraseBackedUp}
+              <div class="actions">
+                <button
+                  class="primary"
+                  data-testid="welcome-phrase-continue"
+                  onclick={handlePhraseContinue}
+                  disabled={backupInFlight}
+                >
+                  Continue
+                </button>
+              </div>
+            {/if}
+          </div>
+        {/if}
         <div class="wizard-rail">
           <WizardProgress
             steps={WIZARD_STEPS}
@@ -504,6 +537,11 @@
     font-size: 0.78rem;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .phrase-alternative {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
   }
   .wizard-rail {
     display: flex;

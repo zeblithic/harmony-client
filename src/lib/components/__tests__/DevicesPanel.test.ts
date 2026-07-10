@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import DevicesPanel from '../DevicesPanel.svelte';
 
 vi.mock('@tauri-apps/api/core', () => ({
@@ -1207,5 +1208,71 @@ describe('DevicesPanel meta facts are keyed to the owner (Qodo PR #436)', () => 
     expect(keytype.textContent).toBe('ed25519');
     const communities = await screen.findByTestId('devices-meta-communities');
     expect(communities.textContent).toContain('2');
+  });
+});
+
+describe('DevicesPanel owner phrase reveal (ZEB-650 slice 2)', () => {
+  const phraseView = {
+    ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+    ownerDisplayName: 'zeblith',
+    devices: [
+      {
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this device',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+      },
+    ],
+    canBackUp: true,
+  };
+  const WORDS = [
+    'abandon', 'ability', 'able', 'about', 'above', 'absent',
+    'absorb', 'abstract', 'absurd', 'abuse', 'access', 'accident',
+    'account', 'accuse', 'achieve', 'acid', 'acoustic', 'acquire',
+    'across', 'act', 'action', 'actor', 'actress', 'actual',
+  ];
+
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  it('renders the view-phrase button beside back-up, enabled when canBackUp', async () => {
+    mockedInvoke.mockResolvedValueOnce(phraseView); // get_owner_state
+    const { findByTestId } = render(DevicesPanel);
+    const btn = await findByTestId('devices-view-phrase');
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('disables the view-phrase button when the seed is wiped (canBackUp false)', async () => {
+    mockedInvoke.mockResolvedValueOnce({ ...phraseView, canBackUp: false });
+    const { findByTestId } = render(DevicesPanel);
+    const btn = await findByTestId('devices-view-phrase');
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('opens the phrase modal, reveals via ordered stub, and checkbox updates last-backed-up', async () => {
+    mockedInvoke
+      .mockResolvedValueOnce(phraseView) // get_owner_state on mount
+      .mockResolvedValueOnce({ words: WORDS, ownerId: phraseView.ownerId }); // export_owner_mnemonic_words
+    const { findByTestId, getByTestId, queryByTestId } = render(DevicesPanel);
+    await fireEvent.click(await findByTestId('devices-view-phrase'));
+    // Modal open, still collapsed — the export stub is not yet consumed.
+    expect(getByTestId('phrase-reveal-open')).toBeTruthy();
+    await fireEvent.click(getByTestId('phrase-reveal-open'));
+    await fireEvent.click(getByTestId('phrase-reveal-confirm'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(getByTestId('phrase-grid').querySelectorAll('li').length).toBe(24);
+    await fireEvent.click(getByTestId('phrase-reveal-unblur'));
+    // Before the checkbox: no last-backed-up line for this owner.
+    expect(queryByTestId('devices-last-backed-up')).toBeNull();
+    await fireEvent.click(getByTestId('phrase-written-down'));
+    await tick();
+    // markRecoveryBackedUp dispatched the flags-changed event → the panel's
+    // listener refreshed lastBackedUpMs without a remount.
+    expect(await findByTestId('devices-last-backed-up')).toBeTruthy();
   });
 });
