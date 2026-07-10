@@ -12856,21 +12856,31 @@ pub struct PublishReactionPayload {
 /// Build + publish a vine descriptor on `harmony/vines/{creator_address}`.
 ///
 /// Shared core for the GUI `publish_vine` command and the headless
-/// `publish_vine` / `reshare_vine` RPC seams: serialize the descriptor and
-/// route it through the event loop's `publish_tx`. The descriptor's
-/// `creator_address` selects the topic, so callers must set it to this node's
-/// own address before calling.
+/// `publish_vine` / `reshare_vine` RPC seams: sign the descriptor with the
+/// owner identity (ZEB-673 — receivers reject unsigned wire records at
+/// cache admission), serialize, and route it through the event loop's
+/// `publish_tx`. The descriptor's `creator_address` selects the topic AND
+/// is bound to the signature, so callers must set it to this node's own
+/// address before calling.
 pub(crate) async fn publish_vine_descriptor(
     state: &Mutex<NodeState>,
-    descriptor: VineDescriptorPayload,
+    mut descriptor: VineDescriptorPayload,
 ) -> Result<(), String> {
-    let publish_tx = {
+    let (publish_tx, identity) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .publish_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?
+        (
+            guard
+                .publish_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard
+                .owner_private_identity
+                .clone()
+                .ok_or_else(|| "identity unavailable: cannot sign vine publish".to_string())?,
+        )
     };
+
+    vine_signing::sign_descriptor(&identity, &mut descriptor);
 
     let key_expr = format!("harmony/vines/{}", descriptor.creator_address);
     let payload = serde_json::to_vec(&descriptor).map_err(|e| format!("serialize: {e}"))?;
@@ -13126,11 +13136,15 @@ pub(crate) async fn reshare_vine_impl(
 
 /// Publish a vine reaction (like/unlike) to the mesh network via Zenoh pub/sub.
 ///
-/// Publishes JSON to `harmony/vines/{vine_creator_address}/reactions/{vine_id}/{own_addr}`.
-#[tauri::command]
-async fn publish_vine_reaction(
+/// Shared seam for `publish_vine_reaction` (GUI command + testable core).
+///
+/// Builds the wire record with our own address as the reactor, signs it
+/// with the owner identity (ZEB-673 — the signer is the REACTOR, not the
+/// vine creator whose topic carries it), and publishes JSON to
+/// `harmony/vines/{vine_creator_address}/reactions/{vine_id}/{own_addr}`.
+pub(crate) async fn publish_vine_reaction_impl(
+    state: &Mutex<NodeState>,
     reaction: PublishReactionPayload,
-    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     if reaction.vine_id.trim().is_empty() {
         return Err("vine_id is required".to_string());
@@ -13139,13 +13153,17 @@ async fn publish_vine_reaction(
         return Err("vine_creator_address is required".to_string());
     }
 
-    let (publish_tx, node_addr) = {
+    let (publish_tx, node_addr, identity) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .publish_tx
             .clone()
             .ok_or_else(|| "not connected".to_string())?;
-        (tx, guard.node_addr.clone())
+        let identity = guard
+            .owner_private_identity
+            .clone()
+            .ok_or_else(|| "identity unavailable: cannot sign vine reaction".to_string())?;
+        (tx, guard.node_addr.clone(), identity)
     };
 
     let now_secs = std::time::SystemTime::now()
@@ -13153,7 +13171,7 @@ async fn publish_vine_reaction(
         .unwrap_or_default()
         .as_secs();
 
-    let wire = VineReactionPayload {
+    let mut wire = VineReactionPayload {
         vine_id: reaction.vine_id.clone(),
         reactor_address: node_addr.clone(),
         reactor_name: reaction.reactor_name,
@@ -13162,6 +13180,7 @@ async fn publish_vine_reaction(
         identity_pub: None,
         sig: None,
     };
+    vine_signing::sign_reaction(&identity, &mut wire);
 
     let key_expr = format!(
         "harmony/vines/{}/reactions/{}/{}",
@@ -13182,6 +13201,15 @@ async fn publish_vine_reaction(
     reply_rx
         .await
         .map_err(|_| "event loop dropped publish request".to_string())?
+}
+
+/// GUI command for reacting to a vine — see `publish_vine_reaction_impl`.
+#[tauri::command]
+async fn publish_vine_reaction(
+    reaction: PublishReactionPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    publish_vine_reaction_impl(state.inner(), reaction).await
 }
 
 /// Result of `delete_vine` — mirrors PublishVineResult's shape posture.
@@ -13403,6 +13431,134 @@ mod delete_vine_tests {
         assert_eq!(t.video_cid, "aa".repeat(32));
         assert_eq!(t.creator_address, node_addr);
         vine_tombstone::verify_tombstone(&t).expect("published tombstone must verify");
+    }
+}
+
+#[cfg(test)]
+mod vine_publish_signing_tests {
+    use super::*;
+
+    /// NodeState with a publish channel + owner identity — the two seams
+    /// the ZEB-673 signing publish paths extract. `identity: false`
+    /// leaves `owner_private_identity` unset to exercise the
+    /// cannot-sign error path.
+    fn fixture(
+        identity: bool,
+    ) -> (
+        Mutex<NodeState>,
+        tokio::sync::mpsc::Receiver<event_loop::PublishRequest>,
+        String,
+    ) {
+        let private = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let node_addr = hex::encode(private.public_identity().address_hash);
+        let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(4);
+        let state = Mutex::new(NodeState {
+            publish_tx: Some(publish_tx),
+            node_addr: node_addr.clone(),
+            owner_private_identity: identity.then(|| std::sync::Arc::new(private)),
+            ..NodeState::default()
+        });
+        (state, publish_rx, node_addr)
+    }
+
+    /// Spawn the event-loop side of the publish handshake: ack the
+    /// request and hand back (key_expr, payload) for inspection.
+    fn echo_publish(
+        mut publish_rx: tokio::sync::mpsc::Receiver<event_loop::PublishRequest>,
+    ) -> tokio::task::JoinHandle<(String, Vec<u8>)> {
+        tokio::spawn(async move {
+            let req = publish_rx.recv().await.expect("publish request");
+            let _ = req.reply.send(Ok(()));
+            (req.key_expr, req.payload)
+        })
+    }
+
+    fn descriptor_owned_by(node_addr: &str) -> VineDescriptorPayload {
+        VineDescriptorPayload {
+            id: "vine-signed-1".into(),
+            creator_address: node_addr.into(),
+            creator_name: "Me".into(),
+            created_at: 1_700_000_000,
+            video_cid: "aa".repeat(32),
+            title: Some("signed".into()),
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+            identity_pub: None,
+            sig: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn published_descriptor_is_signed_and_verifies() {
+        let (state, publish_rx, node_addr) = fixture(true);
+        let echo = echo_publish(publish_rx);
+
+        publish_vine_descriptor(&state, descriptor_owned_by(&node_addr))
+            .await
+            .unwrap();
+
+        let (key_expr, payload) = echo.await.unwrap();
+        assert_eq!(key_expr, format!("harmony/vines/{node_addr}"));
+        let d: VineDescriptorPayload = serde_json::from_slice(&payload).unwrap();
+        assert!(d.identity_pub.is_some() && d.sig.is_some());
+        vine_signing::verify_descriptor(&d).expect("published descriptor must verify");
+    }
+
+    #[tokio::test]
+    async fn published_reaction_is_signed_by_reactor_and_verifies() {
+        let (state, publish_rx, node_addr) = fixture(true);
+        let echo = echo_publish(publish_rx);
+
+        publish_vine_reaction_impl(
+            &state,
+            PublishReactionPayload {
+                vine_id: "vine-other-1".into(),
+                vine_creator_address: "bb".repeat(16),
+                liked: true,
+                reactor_name: "Me".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (key_expr, payload) = echo.await.unwrap();
+        assert_eq!(
+            key_expr,
+            format!(
+                "harmony/vines/{}/reactions/vine-other-1/{node_addr}",
+                "bb".repeat(16)
+            )
+        );
+        let r: VineReactionPayload = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(r.reactor_address, node_addr, "signer is the REACTOR");
+        vine_signing::verify_reaction(&r).expect("published reaction must verify");
+    }
+
+    #[tokio::test]
+    async fn publish_descriptor_errs_without_identity() {
+        let (state, _rx, node_addr) = fixture(false);
+        let err = publish_vine_descriptor(&state, descriptor_owned_by(&node_addr))
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot sign"), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn publish_reaction_errs_without_identity() {
+        let (state, _rx, _addr) = fixture(false);
+        let err = publish_vine_reaction_impl(
+            &state,
+            PublishReactionPayload {
+                vine_id: "vine-other-1".into(),
+                vine_creator_address: "bb".repeat(16),
+                liked: true,
+                reactor_name: "Me".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("cannot sign"), "got {err:?}");
     }
 }
 
