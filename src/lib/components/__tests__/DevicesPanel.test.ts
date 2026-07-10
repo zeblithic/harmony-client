@@ -1169,3 +1169,43 @@ describe('DevicesPanel meta row + backup stamps (ZEB-650 slice 1)', () => {
     expect(screen.getByTestId('devices-last-backed-up')).toBeTruthy();
   });
 });
+
+describe('DevicesPanel meta facts are keyed to the owner (Qodo PR #436)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  it('populates the meta row after an in-panel mint (owner appears post-mount)', async () => {
+    mockedInvoke.mockResolvedValueOnce(null); // get_owner_state → empty state
+    mockedCommunitiesCount.mockResolvedValue(2);
+    render(DevicesPanel);
+    const bindBtn = await screen.findByRole('button', { name: /bind this device/i });
+    await fireEvent.click(bindBtn);
+    mockedInvoke.mockResolvedValueOnce({
+      state: {
+        ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+        ownerDisplayName: 'zeblith',
+        devices: [{
+          deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+          displayName: 'this device',
+          isThisDevice: true,
+          trustDecision: { kind: 'full', reason: null },
+          enrolledAt: 1_700_000_000,
+          fingerprint: 'aa11·bb22',
+        }],
+        canBackUp: true,
+      },
+      recoveryToken: 'tok-1',
+    }); // mint_owner_identity
+    const confirmBtn = await screen.findByRole('button', { name: /^create owner identity/i });
+    await fireEvent.click(confirmBtn);
+    await screen.findByText(/my devices/i);
+    // The $effect keys the meta facts to the NEW ownerId — a run-once onMount
+    // would leave this row unpopulated (or, worse, stale on an owner swap).
+    const keytype = await screen.findByTestId('devices-meta-keytype');
+    expect(keytype.textContent).toBe('ed25519');
+    const communities = await screen.findByTestId('devices-meta-communities');
+    expect(communities.textContent).toContain('2');
+  });
+});

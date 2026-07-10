@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import BackupReminderBanner from '../BackupReminderBanner.svelte';
+import { markRecoveryBackedUp } from '../../onboarding-backup-flags';
 
 // vi.hoisted ensures these are available at mock-factory call time
 // (vi.mock is hoisted to the top of the file by Vitest, so module-level
@@ -161,5 +163,18 @@ describe('BackupReminderBanner day count (ZEB-650 slice 1)', () => {
     const { queryByTestId, getByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
     expect(queryByTestId('backup-reminder-days')).toBeNull();
     expect(getByTestId('backup-reminder-banner').textContent).toContain("hasn't been backed up");
+  });
+});
+
+describe('cross-surface backup completion (CodeRabbit PR #436)', () => {
+  it('hides an already-mounted banner when another surface marks backed up', async () => {
+    localStorage.setItem(skippedKey(OWNER), 'true');
+    const { queryByTestId } = render(BackupReminderBanner, { props: { ownerId: OWNER } });
+    expect(queryByTestId('backup-reminder-banner')).toBeTruthy();
+    // e.g. the user completes a backup from DevicesPanel's modal while the
+    // banner is on screen — the flags-changed event must re-derive visibility.
+    markRecoveryBackedUp(OWNER);
+    await tick();
+    expect(queryByTestId('backup-reminder-banner')).toBeNull();
   });
 });

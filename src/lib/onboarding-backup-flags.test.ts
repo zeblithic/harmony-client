@@ -137,3 +137,20 @@ describe('backup timestamps (ZEB-650 slice 1)', () => {
     expect(recoveryBackedUpAtMs(A)!).toBeGreaterThan(5);
   });
 });
+
+describe('readStamp strictness (Qodo/CodeRabbit PR #436)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  const atKey = `harmony.onboarding.backupSkippedAt:owner-${A}`;
+
+  it.each([['empty', ''], ['whitespace', '   '], ['zero', '0'], ['float', '1.5'], ['negative', '-5'], ['exponent', '1e10']])(
+    'rejects %s stamp values as null',
+    (_label, value) => {
+      localStorage.setItem(atKey, value);
+      expect(backupSkippedAtMs(A)).toBeNull();
+      expect(daysSinceBackupSkipped(A)).toBeNull();
+    },
+  );
+});

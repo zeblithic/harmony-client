@@ -72,10 +72,32 @@ function readStamp(base: string, ownerId: string): number | null {
   try {
     const raw = localStorage.getItem(ownerKey(base, ownerId));
     if (raw === null) return null;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? n : null;
+    // Strict decimal-integer parse: Number('') / Number('   ') are 0, which
+    // would read corrupted storage as the Unix epoch and render absurd
+    // day counts / a 1970 backup date (Qodo + CodeRabbit, PR #436). A real
+    // stamp is a positive Date.now(), so 0 is also rejected.
+    const value = raw.trim();
+    if (!/^\d+$/.test(value)) return null;
+    const n = Number(value);
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Fired on `window` whenever a marker below writes. localStorage is not
+ * reactive, so an already-mounted reader (e.g. BackupReminderBanner while a
+ * DevicesPanel backup completes) must be told to re-derive — otherwise it
+ * shows stale flag state until remount (CodeRabbit, PR #436).
+ */
+export const BACKUP_FLAGS_CHANGED_EVENT = 'harmony:onboarding-backup-flags-changed';
+
+function signalFlagsChanged(): void {
+  try {
+    window.dispatchEvent(new Event(BACKUP_FLAGS_CHANGED_EVENT));
+  } catch {
+    // Non-DOM environment — persistence still happened; readers re-derive on mount.
   }
 }
 
@@ -83,12 +105,14 @@ function readStamp(base: string, ownerId: string): number | null {
 export function markBackupSkipped(ownerId: string): void {
   writeFlag('local', SKIPPED, ownerId);
   writeStamp(SKIPPED_AT, ownerId, Date.now());
+  signalFlagsChanged();
 }
 
 /** Record that this owner exported a recovery artifact (durable). */
 export function markRecoveryBackedUp(ownerId: string): void {
   writeFlag('local', BACKED_UP, ownerId);
   writeStamp(BACKED_UP_AT, ownerId, Date.now());
+  signalFlagsChanged();
 }
 
 export function backupSkippedAtMs(ownerId: string): number | null {
@@ -110,6 +134,7 @@ export function daysSinceBackupSkipped(ownerId: string, nowMs: number = Date.now
 /** Snooze the reminder banner for this owner for the current session only. */
 export function markBannerDismissed(ownerId: string): void {
   writeFlag('session', DISMISSED, ownerId);
+  signalFlagsChanged();
 }
 
 export function isBackupSkipped(ownerId: string): boolean {

@@ -25,8 +25,9 @@
   let recoveryToken = $state<string | null>(null);
 
   // ZEB-650 meta facts. communitiesCount/lastBackedUpMs are plain $state (not
-  // $derived) because localStorage and the IPC aren't reactive — they're set on
-  // mount and updated at the exact mutation points below.
+  // $derived) because localStorage and the IPC aren't reactive — they're keyed
+  // to the owner identity by the $effect below and updated at the exact
+  // mutation points (commitBackup).
   let communitiesCount = $state<number | null>(null);
   let lastBackedUpMs = $state<number | null>(null);
   const firstEnrolledMs = $derived(
@@ -34,6 +35,29 @@
       ? Math.min(...state.devices.map((d) => d.enrolledAt)) * 1000
       : null,
   );
+
+  // Keyed to state.ownerId — NOT run-once on mount — so an in-panel mint
+  // (empty → populated) or any later owner swap re-derives both facts for the
+  // NEW owner instead of showing the previous identity's (Qodo, PR #436).
+  let metaOwnerId: string | null = null;
+  $effect(() => {
+    const ownerId = state?.ownerId ?? null;
+    if (ownerId === metaOwnerId) return;
+    metaOwnerId = ownerId;
+    lastBackedUpMs = ownerId ? recoveryBackedUpAtMs(ownerId) : null;
+    communitiesCount = null;
+    if (ownerId) {
+      // async/await (not .then) so a unit-mocked seam returning undefined
+      // can't throw; await tolerates non-promise values.
+      void (async () => {
+        const n = await fetchCommunitiesCount();
+        // Late-async guard: publish only if this owner is still current.
+        if (metaOwnerId === ownerId) {
+          communitiesCount = typeof n === 'number' ? n : null;
+        }
+      })();
+    }
+  });
 
   // Per-device label (owner-private). Seeded from the store; defaulted to the
   // OS hostname on first run in onMount.
@@ -86,13 +110,6 @@
       } catch {
         // Non-fatal: keep the backend device label until the user sets one.
       }
-    }
-    // ZEB-650 meta facts — after refresh so the owner id is known. Both reads
-    // are non-fatal: null just omits the fact from the meta row.
-    if (svc.state !== null) {
-      lastBackedUpMs = recoveryBackedUpAtMs(svc.state.ownerId);
-      const n = await fetchCommunitiesCount();
-      communitiesCount = typeof n === 'number' ? n : null;
     }
   });
 

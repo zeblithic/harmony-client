@@ -106,8 +106,8 @@ Surfaces:
 
 ### 2.3 NamePromptModal identicon chip (item 5)
 
-New prop `ownerIdHex: string | null` (App.svelte passes the resolved owner id it
-already holds). When non-null, render a preview chip between the input and
+New optional prop `ownerIdHex?: string | null` (default `null`; App.svelte
+passes the resolved owner id it already holds — existing callers unchanged). When non-null, render a preview chip between the input and
 actions: `Avatar` (`address=ownerIdHex`, `displayName=name.trim() || 'Anonymous'`,
 `size=40`) + the live-typed name (falling back to "Anonymous") + a
 `● self-sovereign` sub-line reusing the DevicesPanel ss-badge grammar. Pure
@@ -117,7 +117,8 @@ nullable) → no chip.
 
 ### 2.4 ZEB-659 — Network Viz dev-flag gate
 
-`NavPanel.svelte`: new prop `showNetworkViz: boolean = import.meta.env.DEV`.
+`NavPanel.svelte`: new optional prop `showNetworkViz?: boolean` defaulting to
+`import.meta.env.DEV` (existing callers unchanged).
 The "Network Viz" button (`:454-461`) renders only when `showNetworkViz`;
 `openNetworkWindow` (`:206`) gets a matching early-return guard. Prod builds
 (`DEV === false`) hide the mock-topology window entirely; `tauri dev` keeps it.
