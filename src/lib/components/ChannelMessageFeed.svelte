@@ -65,6 +65,7 @@
      *  the label pre-resolved via the shared ladder by the parent. Empty/absent
      *  → the autocomplete never opens (feature degrades to plain text). */
     mentionCandidates = [],
+    composerPlaceholder,
   }: {
     communityId: string;
     channelId: string;
@@ -93,6 +94,9 @@
       ev: MouseEvent,
     ) => void;
     mentionCandidates?: MentionCandidate[];
+    /** ZEB-612 S5: override for the composer placeholder (TownHallView passes
+     *  "Message the room…"). Absent → the long-standing `Message #name`. */
+    composerPlaceholder?: string;
   } = $props();
 
   // Local mirror of service.byChannel cache for this channel.
@@ -1167,7 +1171,7 @@
         onkeyup={refreshTrigger}
         onclick={refreshTrigger}
         class="compose-input"
-        placeholder={ingesting ? 'Finishing upload…' : `Message #${channelName}`}
+        placeholder={ingesting ? 'Finishing upload…' : (composerPlaceholder ?? `Message #${channelName}`)}
         rows="2"
         aria-label="Channel message"
         disabled={posting}

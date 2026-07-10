@@ -29,6 +29,7 @@
 
   import {
     pollIdEqual,
+    pollIdToHex,
     type PollIdHex,
     type PollStateExport,
     type PollMeta,
@@ -83,6 +84,10 @@
   $effect(() => {
     let cancelled = false;
     const id = pollId;
+    // The IPC boundary takes hex strings while the prop is the IPC-returned
+    // byte array — convert once here. Passing the raw array made every
+    // getPoll/castTier1Ballot reject at arg deserialization (Greptile #443).
+    const idHex = pollIdToHex(id);
     state = null;
     loadError = null;
     castError = null;
@@ -90,7 +95,7 @@
 
     void (async () => {
       try {
-        const next = await adapter.getPoll(id);
+        const next = await adapter.getPoll(idHex);
         if (cancelled) return;
         state = next;
         loadError = null;
@@ -108,12 +113,15 @@
     // unsubscribe closure splices our handler out of the list in O(n)
     // regardless of mount/unmount order.
     const unsubBallotCast = adapter.subscribeBallotCast((payload) => {
-      // pollId is a byte-array over Tauri JSON IPC (see PollIdHex JSDoc),
-      // so `!==` would reference-compare and always be true. Value-equal.
-      if (cancelled || !pollIdEqual(payload.pollId, id)) return;
+      // The EVENT payload carries the poll id as a hex string (the Rust
+      // payload structs emit String) — compare against our hex form, not
+      // the byte array (Greptile #443: the old pollIdEqual(payload, id)
+      // compared string-vs-array and never matched, so the live-refresh
+      // path was dead).
+      if (cancelled || payload.pollId !== idHex) return;
       void (async () => {
         try {
-          const next = await adapter.getPoll(id);
+          const next = await adapter.getPoll(idHex);
           if (cancelled) return;
           state = next;
           myApproved = new Set(next.your_ballot ?? []);
@@ -153,7 +161,8 @@
     const indices = Array.from(next).sort((a, b) => a - b);
     casting = true;
     try {
-      await adapter.castTier1Ballot(id, indices);
+      // Hex at the IPC boundary (see the fetch effect above).
+      await adapter.castTier1Ballot(pollIdToHex(id), indices);
       // pollId is a byte-array (JSON IPC), so `!==` would reference-compare
       // and always be true. Value-equal via pollIdEqual.
       if (!pollIdEqual(pollId, id)) return;

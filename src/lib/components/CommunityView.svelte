@@ -9,6 +9,7 @@
   import type { NavService } from '../nav-service';
   import ChannelMessageFeed from './ChannelMessageFeed.svelte';
   import VoiceChannelView from './VoiceChannelView.svelte';
+  import TownHallView from './TownHallView.svelte';
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
   import CommunityMembersPanel from './CommunityMembersPanel.svelte';
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
@@ -152,6 +153,18 @@
   // of ancestor + descendant rows. Recomputes when navService.nodes changes.
   let localCommunityIds = $derived(
     new Set<string>(navService.nodes.filter((n) => n.type === 'community').map((n) => n.id)),
+  );
+
+  // ZEB-612 S5 (CodeRabbit #443): memoized mention-candidate list shared by
+  // the text feed and the townhall backchannel — recomputes only when the
+  // member roster (or a resolver) changes, not on every re-render.
+  let joinedMentionCandidates = $derived(
+    members
+      .filter((m) => m.status === 'joined')
+      .map((m) => ({
+        ownerId: m.address,
+        label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
+      })),
   );
 
   // ZEB-285 Task 11: pre-fork snapshot for unified timeline rendering.
@@ -435,10 +448,32 @@
         <p>It’ll appear here once the connection is ready.</p>
       </div>
     {:else if activeChannel}
-      <!-- ZEB-612 S4 interim: a townhall channel renders the plain voice view
-           (a joinable voice room — the spec's own degradation) until S5 swaps
-           in TownHallView for kind === 'townhall'. -->
-      {#if activeChannel.kind === 'voice' || activeChannel.kind === 'townhall'}
+      {#if activeChannel.kind === 'townhall'}
+        <!-- ZEB-612 S5: townhall channels render the assembly view. -->
+        {#if voiceSession}
+          <TownHallView
+            session={voiceSession}
+            channelName={activeChannel.name}
+            {communityId}
+            channelId={activeChannel.channelId}
+            onBeforeJoin={onBeforeVoiceJoin}
+            {ownAddress}
+            {myPower}
+            adminQuorum={governance?.adminQuorum ?? null}
+            {votingAdapter}
+            {channelMessageService}
+            {resolveCard}
+            {resolveNickname}
+            {onOpenCard}
+            snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
+            originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
+            forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
+            forkReason={preForkSnapshot?.forkReason ?? null}
+            mentionCandidates={joinedMentionCandidates}
+            onOpenProposals={() => { activeView = 'proposals'; }}
+          />
+        {/if}
+      {:else if activeChannel.kind === 'voice'}
         {#if voiceSession}
           <VoiceChannelView
             session={voiceSession}
@@ -464,12 +499,7 @@
           {resolveCard}
           {resolveNickname}
           {onOpenCard}
-          mentionCandidates={members
-            .filter((m) => m.status === 'joined')
-            .map((m) => ({
-              ownerId: m.address,
-              label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
-            }))}
+          mentionCandidates={joinedMentionCandidates}
         />
       {/if}
     {:else}
