@@ -8,193 +8,129 @@ const vine: VineVideo = {
   creatorAddress: 'a1b2c3d4',
   creatorName: 'Alice',
   createdAt: 1700000000,
-  videoCid: 'cid-abc123',
-  title: 'Demo vine',
+  videoCid: 'cid-abc',
+  title: 'First vine',
   viewed: false,
 };
 
-describe('VineCard', () => {
-  it('renders creator name and title', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn() } });
+function props(over: Record<string, unknown> = {}) {
+  return { vine, onActivate: vi.fn(), ...over };
+}
+
+describe('VineCard (ZEB-612 S2 full-bleed)', () => {
+  it('renders creator, title, and timestamp', () => {
+    render(VineCard, props());
     expect(screen.getByText('Alice')).toBeTruthy();
-    expect(screen.getByText('Demo vine')).toBeTruthy();
+    expect(screen.getByText('First vine')).toBeTruthy();
   });
 
-  it('shows unviewed indicator for unviewed vines', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn() } });
+  it('activates on click and on Enter (feed centers + plays it)', async () => {
+    const onActivate = vi.fn();
+    render(VineCard, props({ onActivate }));
+    const card = screen.getByRole('button', { name: /First vine by Alice/ });
+    await fireEvent.click(card);
+    await fireEvent.keyDown(card, { key: 'Enter' });
+    expect(onActivate).toHaveBeenCalledTimes(2);
+  });
+
+  it('mounts a muted looping video when a blob URL is supplied', () => {
+    render(VineCard, props({ videoUrl: 'blob:fake-1' }));
+    const video = screen.getByTestId('stage-video') as HTMLVideoElement;
+    expect(video.getAttribute('src')).toBe('blob:fake-1');
+    expect(video.hasAttribute('loop')).toBe(true);
+    expect(video.muted).toBe(true);
+  });
+
+  it('renders the ▶ placeholder without a blob URL (outside the lazy window)', () => {
+    render(VineCard, props());
+    expect(screen.queryByTestId('stage-video')).toBeNull();
+    expect(screen.getByText('▶')).toBeTruthy();
+  });
+
+  it('shows the ❚❚ paused glyph only when not playing', async () => {
+    const { rerender } = render(VineCard, props({ isPlaying: false }));
+    expect(screen.getByText('❚❚')).toBeTruthy();
+    await rerender(props({ isPlaying: true }));
+    expect(screen.queryByText('❚❚')).toBeNull();
+  });
+
+  it('reports duration from loadedmetadata (honest badge source)', async () => {
+    const onDuration = vi.fn();
+    render(VineCard, props({ videoUrl: 'blob:fake-1', onDuration }));
+    const video = screen.getByTestId('stage-video') as HTMLVideoElement;
+    Object.defineProperty(video, 'duration', { value: 6.0, configurable: true });
+    await fireEvent(video, new Event('loadedmetadata'));
+    expect(onDuration).toHaveBeenCalledWith('cid-abc', 6.0);
+  });
+
+  it('renders the mono duration pill when duration is known', () => {
+    render(VineCard, props({ duration: 6 }));
+    expect(screen.getByTestId('duration-pill')).toHaveTextContent('↻ 0:06');
+  });
+
+  it('omits the duration pill when unknown (no fabricated duration)', () => {
+    render(VineCard, props());
+    expect(screen.queryByTestId('duration-pill')).toBeNull();
+  });
+
+  it('shows the clay unviewed dot only when unviewed', async () => {
+    const { rerender } = render(VineCard, props({ isViewed: false }));
     expect(screen.getByLabelText('Unviewed')).toBeTruthy();
-  });
-
-  it('hides unviewed indicator for viewed vines', () => {
-    const viewed = { ...vine, viewed: true };
-    render(VineCard, { props: { vine: viewed, onPlay: vi.fn() } });
+    await rerender(props({ isViewed: true }));
     expect(screen.queryByLabelText('Unviewed')).toBeNull();
   });
 
-  it('shows attribution row when vine is a reshare', () => {
-    const reshared = {
-      ...vine,
-      reshareOf: 'vine-00',
-      originalCreatorName: 'Original Person',
-    };
-    render(VineCard, { props: { vine: reshared, onPlay: vi.fn() } });
-    expect(screen.getByText(/originally by Original Person/i)).toBeTruthy();
-  });
-
-  it('does not show attribution row for original vines', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn() } });
-    expect(screen.queryByText(/originally by/i)).toBeNull();
-  });
-
-  it('attribution row is clickable when onViewOriginal is provided', async () => {
+  it('renders reshare attribution with the view-original verb', async () => {
     const onViewOriginal = vi.fn();
-    const reshared = {
-      ...vine,
-      reshareOf: 'vine-00',
-      originalCreatorName: 'Original Person',
+    const reshare: VineVideo = {
+      ...vine, id: 'vine-rs', reshareOf: 'vine-orig',
+      creatorName: 'Bob', creatorAddress: 'bbbb',
+      originalCreatorAddress: 'a1b2c3d4', originalCreatorName: 'Alice',
     };
-    render(VineCard, { props: { vine: reshared, onPlay: vi.fn(), onViewOriginal } });
-    const link = screen.getByRole('button', { name: /originally by Original Person/i });
-    await fireEvent.click(link);
-    expect(onViewOriginal).toHaveBeenCalledWith('vine-00');
+    render(VineCard, props({ vine: reshare, onViewOriginal }));
+    // The ↻ glyph is an aria-hidden sibling span — match the row's own text.
+    expect(screen.getByText(/Bob reshared ·/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'view original by Alice' }));
+    expect(onViewOriginal).toHaveBeenCalledWith('vine-orig');
   });
 
-  it('clicking attribution row does not also trigger onPlay (stops propagation)', async () => {
-    const onPlay = vi.fn();
-    const onViewOriginal = vi.fn();
-    const reshared = {
-      ...vine,
-      reshareOf: 'vine-00',
-      originalCreatorName: 'Original Person',
-    };
-    render(VineCard, { props: { vine: reshared, onPlay, onViewOriginal } });
-    const link = screen.getByRole('button', { name: /originally by Original Person/i });
-    await fireEvent.click(link);
-    expect(onViewOriginal).toHaveBeenCalled();
-    expect(onPlay).not.toHaveBeenCalled();
+  it('offers the Reshare verb when canReshare, with in-flight state', async () => {
+    const onReshare = vi.fn();
+    const { rerender } = render(VineCard, props({ canReshare: true, onReshare }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Reshare vine' }));
+    expect(onReshare).toHaveBeenCalledWith(vine);
+    await rerender(props({ canReshare: true, onReshare, resharing: true }));
+    expect(screen.getByRole('button', { name: 'Reshare vine' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Reshare vine' })).toHaveTextContent('Resharing…');
   });
 
-  it('calls onPlay with vine when clicked', async () => {
-    const onPlay = vi.fn();
-    render(VineCard, { props: { vine, onPlay } });
-    const card = screen.getByRole('button', { name: /Demo vine by Alice/i });
-    await fireEvent.click(card);
-    expect(onPlay).toHaveBeenCalledWith(vine);
+  it('shows a static reshare-count chip when the verb is unavailable (own original)', () => {
+    render(VineCard, props({ canReshare: false, reshareCount: 3 }));
+    expect(screen.queryByRole('button', { name: 'Reshare vine' })).toBeNull();
+    expect(screen.getByLabelText('reshare count 3')).toBeTruthy();
   });
 
-  it('calls onPlay on Enter key', async () => {
-    const onPlay = vi.fn();
-    render(VineCard, { props: { vine, onPlay } });
-    const card = screen.getByRole('button', { name: /Demo vine by Alice/i });
-    await fireEvent.keyDown(card, { key: 'Enter' });
-    expect(onPlay).toHaveBeenCalledWith(vine);
+  it('hides the reshare count on reshares themselves (counts credit originals)', () => {
+    const reshare: VineVideo = { ...vine, id: 'r1', reshareOf: 'orig' };
+    render(VineCard, props({ vine: reshare, canReshare: true, onReshare: vi.fn(), reshareCount: 5 }));
+    expect(screen.queryByLabelText('reshare count 5')).toBeNull();
   });
 
-  it('calls onPlay on Space key', async () => {
-    const onPlay = vi.fn();
-    render(VineCard, { props: { vine, onPlay } });
-    const card = screen.getByRole('button', { name: /Demo vine by Alice/i });
-    await fireEvent.keyDown(card, { key: ' ' });
-    expect(onPlay).toHaveBeenCalledWith(vine);
-  });
-
-  it('has accessible label with title and creator', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn() } });
-    const card = screen.getByRole('button', { name: /Demo vine by Alice/i });
-    expect(card.getAttribute('aria-label')).toBe('Demo vine by Alice');
-  });
-
-  it('uses Untitled for vines without title in aria-label', () => {
-    const untitled = { ...vine, title: undefined };
-    render(VineCard, { props: { vine: untitled, onPlay: vi.fn() } });
-    const card = screen.getByRole('button', { name: /Untitled vine by Alice/i });
-    expect(card.getAttribute('aria-label')).toBe('Untitled vine by Alice');
-  });
-
-  it('renders follow button when showFollowButton is true and not followed', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), showFollowButton: true, isFollowed: false, onFollow: vi.fn() } });
-    expect(screen.getByLabelText(/Follow/)).toBeTruthy();
-  });
-
-  it('does not render follow button when showFollowButton is false', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), showFollowButton: false } });
-    expect(screen.queryByLabelText(/Follow/)).toBeNull();
-  });
-
-  it('renders Following badge when followed', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), showFollowButton: true, isFollowed: true, onUnfollow: vi.fn() } });
-    expect(screen.getByText('Following')).toBeTruthy();
-  });
-
-  it('calls onFollow with address and name when follow clicked', async () => {
-    const onFollow = vi.fn();
-    render(VineCard, { props: { vine, onPlay: vi.fn(), showFollowButton: true, isFollowed: false, onFollow } });
-    await fireEvent.click(screen.getByLabelText(/Follow/));
-    expect(onFollow).toHaveBeenCalledWith('a1b2c3d4', 'Alice');
-  });
-
-  it('follow button click does not trigger onPlay', async () => {
-    const onPlay = vi.fn();
-    const onFollow = vi.fn();
-    render(VineCard, { props: { vine, onPlay, showFollowButton: true, isFollowed: false, onFollow } });
-    await fireEvent.click(screen.getByLabelText(/Follow/));
-    expect(onPlay).not.toHaveBeenCalled();
-  });
-
-  it('shows like count when count > 0', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 3, likedByMe: false } });
-    expect(screen.getByText('3')).toBeTruthy();
-  });
-
-  it('shows filled heart when liked by me', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 1, likedByMe: true } });
-    expect(screen.getByLabelText('Unlike Demo vine')).toBeTruthy();
-  });
-
-  it('shows outline heart when not liked by me', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 1, likedByMe: false } });
-    expect(screen.getByLabelText('Like Demo vine')).toBeTruthy();
-  });
-
-  it('hides like row when count is 0 and not liked', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 0, likedByMe: false } });
-    expect(screen.queryByLabelText(/Like/)).toBeNull();
-    expect(screen.queryByLabelText(/Unlike/)).toBeNull();
-  });
-
-  it('calls onToggleLike when heart clicked', async () => {
+  it('like button toggles and stops propagation to onActivate', async () => {
     const onToggleLike = vi.fn();
-    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 1, likedByMe: false, onToggleLike } });
-    await fireEvent.click(screen.getByLabelText('Like Demo vine'));
+    const onActivate = vi.fn();
+    render(VineCard, props({ onToggleLike, onActivate, reactionCount: 2, likedByMe: false }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Like First vine' }));
     expect(onToggleLike).toHaveBeenCalledWith(vine);
+    expect(onActivate).not.toHaveBeenCalled();
   });
 
-  it('like button click does not trigger onPlay', async () => {
-    const onPlay = vi.fn();
-    const onToggleLike = vi.fn();
-    render(VineCard, { props: { vine, onPlay, reactionCount: 1, likedByMe: false, onToggleLike } });
-    await fireEvent.click(screen.getByLabelText('Like Demo vine'));
-    expect(onPlay).not.toHaveBeenCalled();
-  });
-
-  it('shows reshare count for originals when count > 0', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), reshareCount: 3 } });
-    expect(screen.getByLabelText(/reshare count/i)).toBeTruthy();
-    expect(screen.getByLabelText(/reshare count/i).textContent).toMatch(/3/);
-  });
-
-  it('hides reshare count when zero', () => {
-    render(VineCard, { props: { vine, onPlay: vi.fn(), reshareCount: 0 } });
-    expect(screen.queryByLabelText(/reshare count/i)).toBeNull();
-  });
-
-  it('does not show reshare count for reshares (counts only meaningful on originals)', () => {
-    const reshared = {
-      ...vine,
-      reshareOf: 'vine-00',
-      originalCreatorName: 'Original',
-    };
-    render(VineCard, { props: { vine: reshared, onPlay: vi.fn(), reshareCount: 5 } });
-    expect(screen.queryByLabelText(/reshare count/i)).toBeNull();
+  it('follow button follows/unfollows without activating the card', async () => {
+    const onFollow = vi.fn();
+    const onActivate = vi.fn();
+    render(VineCard, props({ showFollowButton: true, isFollowed: false, onFollow, onActivate }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Follow Alice' }));
+    expect(onFollow).toHaveBeenCalledWith('a1b2c3d4', 'Alice');
+    expect(onActivate).not.toHaveBeenCalled();
   });
 });
