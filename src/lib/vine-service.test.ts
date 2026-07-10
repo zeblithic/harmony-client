@@ -1271,3 +1271,61 @@ describe('delete_vine / vine-removed (ZEB-670 creator tombstone)', () => {
     expect(row?.originalRemoved).toBe(true);
   });
 });
+
+describe('ZEB-670 round-1 fixes (PR #445)', () => {
+  const wire = (over: Partial<VineDescriptorEvent> = {}): VineDescriptorEvent => ({
+    id: 'v-orig', creatorAddress: 'alice-addr', creatorName: 'Alice',
+    createdAt: 100, videoCid: 'cid-aaa', source: 'discover', ...over,
+  });
+
+  it('offline delete of an own vine stubs reshares via the hex address, not "self" (Qodo)', async () => {
+    const svc = new VineService({ seedMockData: false });
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    svc.ownAddress = 'my-hex-addr';
+    // Own vine echoes back and is remapped to 'self' by wireToVine.
+    emit('vine-received', wire({ id: 'v-mine', creatorAddress: 'my-hex-addr' }));
+    // Bob's reshare carries the hex origin.
+    emit('vine-received', wire({
+      id: 'v-bob', creatorAddress: 'bob-addr', reshareOf: 'v-mine',
+      originalCreatorAddress: 'my-hex-addr',
+    }));
+    expect(svc.vines.find((v) => v.id === 'v-mine')!.creatorAddress).toBe('self');
+
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('not connected'),
+    );
+    await svc.deleteVine(svc.vines.find((v) => v.id === 'v-mine')!);
+
+    expect(svc.vines.find((v) => v.id === 'v-mine')).toBeUndefined();
+    expect(svc.vines.find((v) => v.id === 'v-bob')!.originalRemoved).toBe(true);
+  });
+
+  it('content-match stubbing is suppressed while a live re-published original exists (CodeRabbit)', async () => {
+    const svc = new VineService({ seedMockData: false });
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    // Old original + Alice's re-publish of the same content (new id).
+    emit('vine-received', wire({ id: 'v-old' }));
+    emit('vine-received', wire({ id: 'v-new' }));
+    // Dave reshared the NEW original.
+    emit('vine-received', wire({
+      id: 'v-dave', creatorAddress: 'dave-addr', reshareOf: 'v-new',
+      originalCreatorAddress: 'alice-addr',
+    }));
+    // Bob reshared the OLD one (direct id match — must still stub).
+    emit('vine-received', wire({
+      id: 'v-bob', creatorAddress: 'bob-addr', reshareOf: 'v-old',
+      originalCreatorAddress: 'alice-addr',
+    }));
+
+    emit('vine-removed', {
+      vineId: 'v-old', videoCid: 'cid-aaa', creatorAddress: 'alice-addr',
+    });
+
+    const byId = (id: string) => svc.vines.find((v) => v.id === id)!;
+    expect(byId('v-bob').originalRemoved).toBe(true);
+    expect(byId('v-dave').originalRemoved ?? false).toBe(false);
+    expect(byId('v-new').originalRemoved ?? false).toBe(false);
+  });
+});

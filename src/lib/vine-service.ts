@@ -305,11 +305,17 @@ export class VineService {
       }
     }
 
-    // Offline/mock fallback: local removal only.
+    // Offline/mock fallback: local removal only. Own rows carry the
+    // literal 'self' (wireToVine remap) — un-remap to the hex address so
+    // stub content-matching against reshares' originalCreatorAddress
+    // (always hex) works (Qodo PR #445 round 1).
+    const creatorAddress = vine.creatorAddress === 'self' && this.ownAddress != null
+      ? this.ownAddress
+      : vine.creatorAddress;
     this.applyRemoval({
       vineId: vine.id,
       videoCid: vine.videoCid,
-      creatorAddress: vine.creatorAddress,
+      creatorAddress,
     });
   }
 
@@ -318,9 +324,9 @@ export class VineService {
    * state) and mark surviving reshares of the removed content as
    * "Removed by creator" stubs. Stub rule mirrors the Rust cache
    * (`VineFeedCache::original_removed`): direct `reshareOf` id match, or
-   * origin-creator + videoCid content match for chain reshares. (The
-   * cache's re-publish exception is not replayed here — `list_vine_videos`
-   * rows carry the authoritative flag on the next hydrate.)
+   * origin-creator + videoCid content match for chain reshares —
+   * suppressed while a live original by that creator with that CID exists
+   * (re-publish case; CodeRabbit + Qodo PR #445 round 1).
    */
   private applyRemoval(removed: VineRemovedEvent): void {
     const { vineId, videoCid, creatorAddress } = removed;
@@ -328,13 +334,24 @@ export class VineService {
       || this.followedVines.some((v) => v.id === vineId)
       || this.discoverVines.some((v) => v.id === vineId);
 
+    // Re-publish exception: a surviving original with the same creator +
+    // CID (excluding the vine being removed) keeps content-match stubs
+    // off. Own rows carry 'self' — compare through ownAddress.
+    const matchesCreator = (rowCreator: string): boolean =>
+      rowCreator === creatorAddress
+      || (rowCreator === 'self' && this.ownAddress === creatorAddress);
+    const liveOriginalExists = [...this.followedVines, ...this.discoverVines].some(
+      (v) => v.id !== vineId && !v.reshareOf
+        && v.videoCid === videoCid && matchesCreator(v.creatorAddress),
+    );
+
     let changed = false;
     const markStubs = (list: VineVideo[]): VineVideo[] =>
       list.map((v) => {
         if (!v.reshareOf || v.originalRemoved) return v;
         const origin = v.originalCreatorAddress ?? v.creatorAddress;
         const isStub = v.reshareOf === vineId
-          || (origin === creatorAddress && v.videoCid === videoCid);
+          || (!liveOriginalExists && origin === creatorAddress && v.videoCid === videoCid);
         if (!isStub) return v;
         changed = true;
         return { ...v, originalRemoved: true };

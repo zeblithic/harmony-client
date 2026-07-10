@@ -83,6 +83,13 @@ pub fn sign_tombstone(
 /// `community_membership::verify_signature` (`verify_strict` rejects
 /// non-canonical S values / small-order R points — RFC 8032 strict subset).
 pub fn verify_tombstone(t: &VineTombstonePayload) -> Result<(), String> {
+    // The canonical encoding joins fields with `|`; a field containing the
+    // separator could make two distinct payloads share signed bytes. Legit
+    // records never contain it (ids are `vine-{hex}-{secs}-{hex}`, CIDs and
+    // addresses are hex) — reject rather than trust. (CodeRabbit PR #445)
+    if t.vine_id.contains('|') || t.video_cid.contains('|') || t.creator_address.contains('|') {
+        return Err("tombstone field contains the canonical separator '|'".into());
+    }
     let pub_vec = hex::decode(&t.creator_identity_pub)
         .map_err(|e| format!("tombstone identity pub is not hex: {e}"))?;
     let identity = harmony_identity::Identity::from_public_bytes(&pub_vec)
@@ -179,6 +186,26 @@ mod tests {
         };
         let err = verify_tombstone(&forged).unwrap_err();
         assert!(err.contains("signature invalid"), "got {err:?}");
+    }
+
+    #[test]
+    fn verify_rejects_separator_injection() {
+        // vine_id="a|cid" / video_cid="b" and vine_id="a" / video_cid="cid|b"
+        // would share canonical bytes — the verifier refuses any field
+        // carrying the separator instead of disambiguating.
+        let id = test_identity();
+        let addr = addr_of(&id);
+        let bytes = canonical_bytes("vine-a|x", "cafe01", &addr, 1_700_000_000);
+        let t = VineTombstonePayload {
+            vine_id: "vine-a|x".into(),
+            video_cid: "cafe01".into(),
+            creator_address: addr,
+            deleted_at: 1_700_000_000,
+            creator_identity_pub: hex::encode(id.public_identity().to_public_bytes()),
+            sig: hex::encode(id.sign(&bytes)),
+        };
+        let err = verify_tombstone(&t).unwrap_err();
+        assert!(err.contains("separator"), "got {err:?}");
     }
 
     #[test]

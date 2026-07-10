@@ -7743,9 +7743,10 @@ fn handle_vine_tombstone_sample(
     };
     match outcome {
         Some(crate::vine_feed_cache::TombstoneOutcome::Applied { removed, evict_cid }) => {
-            if let Some(removed) = removed {
-                crate::node_event_sink::emit_ser(app.as_ref(), "vine-removed", &removed);
-            }
+            // Emitted for every fresh apply — a subscriber holding only
+            // reshares (no original cached) still needs the event to mark
+            // its stubs (CodeRabbit PR #445 round 1).
+            crate::node_event_sink::emit_ser(app.as_ref(), "vine-removed", &removed);
             evict_cid
         }
         Some(crate::vine_feed_cache::TombstoneOutcome::Rejected(reason)) => {
@@ -7888,7 +7889,7 @@ mod vine_tombstone_routing_tests {
     }
 
     #[test]
-    fn pre_arrival_tombstone_applies_without_emit() {
+    fn pre_arrival_tombstone_emits_removal_and_evict_but_only_once() {
         let Fixture {
             recording,
             sink,
@@ -7904,10 +7905,17 @@ mod vine_tombstone_routing_tests {
             &cache,
         );
 
-        // Nothing was cached: no removal event, nothing to evict — but
-        // the tombstone must have been recorded (idempotence check).
-        assert_eq!(evict, None);
-        assert!(recording.frames().is_empty());
+        // No descriptor was cached, but the event still fires (a
+        // reshare-only subscriber needs it for stub-marking) and the
+        // evict candidate is reported (evicting never-held bytes is a
+        // no-op). CodeRabbit PR #445 round 1.
+        assert_eq!(evict.as_deref(), Some("cid-zzz"));
+        let frames = recording.frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, "vine-removed");
+        assert_eq!(frames[0].1["vineId"], "vine-9");
+
+        // Idempotence: re-delivery neither re-emits nor re-evicts.
         let again = handle_vine_tombstone_sample(
             &sink,
             &format!("harmony/vines/{addr}/tombstones/vine-9"),
@@ -7915,6 +7923,7 @@ mod vine_tombstone_routing_tests {
             &cache,
         );
         assert_eq!(again, None);
+        assert_eq!(recording.frames().len(), 1);
     }
 }
 

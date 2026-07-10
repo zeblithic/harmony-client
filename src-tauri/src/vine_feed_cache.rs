@@ -134,8 +134,10 @@ struct TombstoneRecord {
     deleted_at: u64,
 }
 
-/// ZEB-670: `vine-removed` frontend event payload, produced when a
-/// tombstone removes a descriptor that was actually cached.
+/// ZEB-670: `vine-removed` frontend event payload, produced for every
+/// newly applied tombstone — even when no original descriptor was cached
+/// (a subscriber may hold only reshares, which still need stub-marking;
+/// CodeRabbit PR #445 round 1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemovedVine {
@@ -146,20 +148,29 @@ pub struct RemovedVine {
 
 /// Outcome of `on_tombstone_sample`.
 ///
-/// `Applied.removed` is `Some` only when a cached descriptor was actually
-/// removed (pre-arrival tombstones apply with `removed: None` and still
-/// block the descriptor's later insert). `Applied.evict_cid` is `Some`
-/// only when no remaining live descriptor references the removed vine's
-/// `video_cid` — the caller (event loop) may then evict the blob.
+/// `Applied.removed` is always present (built from the verified tombstone,
+/// with the cached descriptor's CID as the canonical `video_cid` when one
+/// was cached). `Applied.evict_cid` is `Some` only when no remaining live
+/// (non-stub) descriptor references that CID — the caller (event loop)
+/// may then evict the blob; eviction of never-held bytes is a no-op.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TombstoneOutcome {
     Applied {
-        removed: Option<RemovedVine>,
+        removed: RemovedVine,
         evict_cid: Option<String>,
     },
     AlreadyApplied,
     Rejected(String),
 }
+
+/// ZEB-670: cap on retained tombstones (CodeRabbit PR #445 round 1 —
+/// unbounded growth was a disk/scan DoS path: every valid-signed tombstone
+/// persisted forever, `save()` rewrites the file per insert). Generous
+/// relative to MAX_DESCRIPTORS because rows are tiny and every legit
+/// delete needs its guard; oldest-by-`deleted_at` trims first. Adversarial
+/// far-future timestamps can push out honest guards — that spam vector is
+/// inherent to the unsigned vine wire (ZEB-673), which can spoof far worse.
+pub const MAX_TOMBSTONES: usize = 10_000;
 
 /// Aggregated reaction view for a vine from the local viewer's
 /// perspective. `count` is the number of `liked == true` reactions
@@ -441,11 +452,33 @@ impl VineFeedCache {
             return Some(DescriptorOutcome::AlreadyPresent);
         }
 
-        // ZEB-670: a tombstoned vine id can never (re-)insert — this is
-        // the pre-arrival / re-arrival resurrection guard.
-        if self.tombstones.contains_key(&descriptor.id) {
+        // ZEB-670: a tombstoned vine id can never (re-)insert — the
+        // pre-arrival / re-arrival resurrection guard. CREATOR-BOUND
+        // (CodeRabbit PR #445 round 1, Critical): the tombstone's signer
+        // must match the descriptor's creator, otherwise an attacker who
+        // observed a victim's vine id could pre-publish a tombstone
+        // validly signed under the ATTACKER's own address and censor the
+        // victim's descriptor. A mismatched tombstone simply doesn't
+        // apply to this descriptor.
+        if let Some(t) = self.tombstones.get(&descriptor.id) {
+            if t.creator_address == descriptor.creator_address {
+                return Some(DescriptorOutcome::Rejected(format!(
+                    "descriptor {} is tombstoned",
+                    descriptor.id
+                )));
+            }
+        }
+
+        // ZEB-670: runtime age gate, mirroring the load-time prune (which
+        // previously ran only in populate_from_disk — a live re-delivery
+        // of an ancient descriptor could outlive its tombstone's 90-day
+        // window and resurrect; CodeRabbit PR #445 round 1). Invariant:
+        // `deleted_at >= created_at`, so by the time a tombstone
+        // age-prunes, every descriptor it guarded is rejected here anyway.
+        let now_secs = now_ms / 1000;
+        if descriptor.created_at < now_secs.saturating_sub(MAX_AGE_SECS) {
             return Some(DescriptorOutcome::Rejected(format!(
-                "descriptor {} is tombstoned",
+                "descriptor {} is older than the retention window",
                 descriptor.id
             )));
         }
@@ -650,17 +683,26 @@ impl VineFeedCache {
             return Some(TombstoneOutcome::Rejected(e));
         }
 
-        // The topic segment must match the (verified) creator address —
-        // a valid tombstone re-published under someone else's topic is
-        // dropped rather than trusted on payload content alone.
-        let topic_creator = key_expr
+        // Both topic segments must match the (verified) payload — the key
+        // is not authoritative, so a tombstone re-published under someone
+        // else's topic (or a mismatched vine-id segment) is dropped rather
+        // than trusted on payload content alone (Qodo PR #445 round 1).
+        let mut segments = key_expr
             .strip_prefix("harmony/vines/")
-            .and_then(|rest| rest.split('/').next())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .split('/');
+        let topic_creator = segments.next().unwrap_or_default();
+        let topic_vine_id = segments.nth(1).unwrap_or_default(); // skip "tombstones"
         if topic_creator != t.creator_address {
             return Some(TombstoneOutcome::Rejected(format!(
                 "tombstone topic creator {topic_creator} != payload creator {}",
                 t.creator_address
+            )));
+        }
+        if topic_vine_id != t.vine_id {
+            return Some(TombstoneOutcome::Rejected(format!(
+                "tombstone topic vine id {topic_vine_id} != payload vine id {}",
+                t.vine_id
             )));
         }
 
@@ -681,19 +723,48 @@ impl VineFeedCache {
             }
         }
 
+        // Canonical CID: prefer the cached descriptor's — that's what our
+        // local rows (chain-stub matching) and blob state actually
+        // reference; the unsigned-descriptor world means the two can
+        // disagree (Qodo PR #445 round 1). Falls back to the signed
+        // payload's CID for pre-arrival tombstones.
+        let removed_descriptor = self.descriptors.remove(&t.vine_id);
+        let canonical_cid = removed_descriptor
+            .as_ref()
+            .map(|cv| cv.descriptor.video_cid.clone())
+            .unwrap_or_else(|| t.video_cid.clone());
+
         self.tombstones.insert(
             t.vine_id.clone(),
             TombstoneRecord {
-                video_cid: t.video_cid.clone(),
+                video_cid: canonical_cid.clone(),
                 creator_address: t.creator_address.clone(),
                 deleted_at: t.deleted_at,
             },
         );
-        let removed = self.descriptors.remove(&t.vine_id).map(|cv| RemovedVine {
+        // Cap enforcement — oldest-by-deleted_at trims first (ties by
+        // vine_id for determinism), mirroring the descriptor cap.
+        if self.tombstones.len() > MAX_TOMBSTONES {
+            let mut entries: Vec<(u64, String)> = self
+                .tombstones
+                .iter()
+                .map(|(id, rec)| (rec.deleted_at, id.clone()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let drop_count = self.tombstones.len() - MAX_TOMBSTONES;
+            for (_, id) in entries.into_iter().take(drop_count) {
+                self.tombstones.remove(&id);
+            }
+        }
+
+        // Emitted for EVERY newly applied tombstone — a subscriber holding
+        // only reshares still needs the event to mark stubs (CodeRabbit
+        // PR #445 round 1).
+        let removed = RemovedVine {
             vine_id: t.vine_id.clone(),
-            video_cid: cv.descriptor.video_cid,
-            creator_address: cv.descriptor.creator_address,
-        });
+            video_cid: canonical_cid.clone(),
+            creator_address: t.creator_address.clone(),
+        };
         self.reactions.retain(|(vid, _), _| vid != &t.vine_id);
         self.viewed.remove(&t.vine_id);
 
@@ -702,13 +773,13 @@ impl VineFeedCache {
         // don't need the bytes; what blocks eviction is any LIVE
         // reference — an unrelated original with the same content, the
         // still-live original when a user deletes their own reshare, or
-        // a re-published original (same creator + CID, new id).
-        let evict_cid = removed.as_ref().and_then(|r| {
-            let live_ref = self.descriptors.values().any(|cv| {
-                cv.descriptor.video_cid == r.video_cid && !self.original_removed(&cv.descriptor)
-            });
-            (!live_ref).then(|| r.video_cid.clone())
+        // a re-published original (same creator + CID, new id). Computed
+        // even for pre-arrival tombstones: reshares may hold the bytes,
+        // and evicting never-held bytes is a no-op.
+        let live_ref = self.descriptors.values().any(|cv| {
+            cv.descriptor.video_cid == canonical_cid && !self.original_removed(&cv.descriptor)
         });
+        let evict_cid = (!live_ref).then_some(canonical_cid);
 
         self.save();
         Some(TombstoneOutcome::Applied { removed, evict_cid })
@@ -900,6 +971,26 @@ impl VineFeedCache {
     #[cfg(test)]
     pub fn save_for_test(&self) {
         self.save();
+    }
+
+    /// Test-only bulk tombstone seeding (bypasses crypto) so the
+    /// MAX_TOMBSTONES trim can be exercised without 10k Ed25519 ops.
+    #[cfg(test)]
+    pub fn seed_tombstone_for_test(&mut self, vine_id: &str, deleted_at: u64) {
+        self.tombstones.insert(
+            vine_id.to_string(),
+            TombstoneRecord {
+                video_cid: format!("cid-{vine_id}"),
+                creator_address: "seeded".into(),
+                deleted_at,
+            },
+        );
+    }
+
+    /// Test-only tombstone-count probe.
+    #[cfg(test)]
+    pub fn len_tombstones(&self) -> usize {
+        self.tombstones.len()
     }
 
     /// Number of cached descriptors. Test helper.
@@ -2350,7 +2441,6 @@ mod tests {
 
         match outcome {
             Some(TombstoneOutcome::Applied { removed, evict_cid }) => {
-                let removed = removed.expect("descriptor was cached — must report removal");
                 assert_eq!(removed.vine_id, "vine-1");
                 assert_eq!(removed.video_cid, "cid-aaa");
                 assert_eq!(removed.creator_address, addr);
@@ -2378,7 +2468,7 @@ mod tests {
 
         match outcome {
             Some(TombstoneOutcome::Applied { removed, evict_cid }) => {
-                assert!(removed.is_some());
+                assert_eq!(removed.vine_id, "vine-1");
                 assert_eq!(evict_cid, None, "live unrelated reference must block evict");
             }
             other => panic!("expected Applied, got {other:?}"),
@@ -2409,7 +2499,7 @@ mod tests {
 
         match outcome {
             Some(TombstoneOutcome::Applied { removed, evict_cid }) => {
-                assert_eq!(removed.unwrap().vine_id, "vine-reshare");
+                assert_eq!(removed.vine_id, "vine-reshare");
                 assert_eq!(evict_cid, None, "original still references the blob");
             }
             other => panic!("expected Applied, got {other:?}"),
@@ -2432,8 +2522,14 @@ mod tests {
         assert_eq!(
             outcome,
             Some(TombstoneOutcome::Applied {
-                removed: None,
-                evict_cid: None
+                // Emitted even pre-arrival (reshare-only subscribers need
+                // it); nothing live references the content, so evict too.
+                removed: RemovedVine {
+                    vine_id: "vine-1".into(),
+                    video_cid: "cid-aaa".into(),
+                    creator_address: addr.clone(),
+                },
+                evict_cid: Some("cid-aaa".into()),
             })
         );
 
@@ -2558,7 +2654,7 @@ mod tests {
         );
         match outcome {
             Some(TombstoneOutcome::Applied { removed, evict_cid }) => {
-                assert!(removed.is_some());
+                assert_eq!(removed.vine_id, "vine-orig");
                 // Both survivors are stubs — nothing live references the
                 // blob, so it evicts.
                 assert_eq!(evict_cid.as_deref(), Some("cid-aaa"));
@@ -2613,6 +2709,160 @@ mod tests {
             "reshare of the re-published original must not be stubbed"
         );
         assert!(!by_id("vine-new").original_removed);
+    }
+
+    #[test]
+    fn attackers_pre_arrival_tombstone_does_not_censor_victims_descriptor() {
+        // CodeRabbit PR #445 round 1 (Critical): an attacker who observes
+        // a victim's vine id publishes a tombstone validly signed under
+        // the ATTACKER's own address before the victim's descriptor
+        // arrives. The guard is creator-bound, so the descriptor must
+        // still insert.
+        let (attacker_id, attacker_addr) = tombstone_identity();
+        let mut cache = VineFeedCache::new();
+
+        let outcome = cache.on_tombstone_sample(
+            &format!("harmony/vines/{attacker_addr}/tombstones/vine-victim"),
+            &signed_tombstone_bytes(&attacker_id, "vine-victim", "cid-aaa", &attacker_addr),
+        );
+        assert!(matches!(outcome, Some(TombstoneOutcome::Applied { .. })));
+
+        // Victim's descriptor arrives — different creator, must insert.
+        let payload = canonical_descriptor_bytes(
+            "vine-victim",
+            "victim-addr",
+            "Victim",
+            "cid-aaa",
+            None,
+            None,
+            1_700_000_000,
+            None,
+            None,
+        );
+        let outcome = cache.on_descriptor_sample(
+            "harmony/vines/victim-addr",
+            &payload,
+            &followed_set_with(&[]),
+            1_000,
+        );
+        assert!(
+            matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
+            "attacker tombstone must not block the victim, got {outcome:?}"
+        );
+        // A tombstone from the vine's REAL creator still applies normally
+        // (ownership check compares against the now-cached descriptor).
+        assert_eq!(cache.len_descriptors(), 1);
+    }
+
+    #[test]
+    fn runtime_descriptor_insert_rejects_ancient_created_at() {
+        // CodeRabbit PR #445 round 1: the age prune ran only on load, so a
+        // live re-delivery of an ancient descriptor could outlive its
+        // tombstone's retention window and resurrect. Runtime now mirrors
+        // the load gate; with `deleted_at >= created_at`, a pruned
+        // tombstone's descriptor is always rejected here too.
+        let mut cache = VineFeedCache::new();
+        let now_secs: u64 = 2_000_000_000;
+        let ancient = now_secs - MAX_AGE_SECS - 10;
+        let payload = canonical_descriptor_bytes(
+            "vine-old", "a-addr", "A", "cid-old", None, None, ancient, None, None,
+        );
+        let outcome = cache.on_descriptor_sample(
+            "harmony/vines/a-addr",
+            &payload,
+            &followed_set_with(&[]),
+            now_secs * 1000,
+        );
+        assert!(
+            matches!(outcome, Some(DescriptorOutcome::Rejected(ref r)) if r.contains("retention")),
+            "ancient descriptor must reject at runtime, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn tombstone_cap_trims_oldest() {
+        let (id, addr) = tombstone_identity();
+        let mut cache = VineFeedCache::new();
+        for i in 0..MAX_TOMBSTONES {
+            cache.seed_tombstone_for_test(&format!("seed-{i:05}"), 1_000 + i as u64);
+        }
+        // One real apply pushes past the cap; the oldest seeded entry
+        // (deleted_at = 1000) trims, the fresh one stays.
+        let outcome = cache.on_tombstone_sample(
+            &format!("harmony/vines/{addr}/tombstones/vine-new"),
+            &signed_tombstone_bytes(&id, "vine-new", "cid-new", &addr),
+        );
+        assert!(matches!(outcome, Some(TombstoneOutcome::Applied { .. })));
+        assert_eq!(cache.len_tombstones(), MAX_TOMBSTONES);
+
+        // The freshly applied tombstone survived the trim (its guard works).
+        let payload = canonical_descriptor_bytes(
+            "vine-new",
+            &addr,
+            "Creator",
+            "cid-new",
+            None,
+            None,
+            1_700_000_000,
+            None,
+            None,
+        );
+        let outcome = cache.on_descriptor_sample(
+            &format!("harmony/vines/{addr}"),
+            &payload,
+            &followed_set_with(&[]),
+            1_000,
+        );
+        assert!(matches!(outcome, Some(DescriptorOutcome::Rejected(_))));
+    }
+
+    #[test]
+    fn tombstone_rejects_topic_vine_id_mismatch() {
+        // Qodo PR #445 round 1: the key's vine-id segment is bound to the
+        // signed payload — a misrouted publish must not apply.
+        let (id, addr) = tombstone_identity();
+        let mut cache = VineFeedCache::new();
+        insert_descriptor(&mut cache, "vine-1", &addr, "cid-aaa");
+
+        let outcome = cache.on_tombstone_sample(
+            &format!("harmony/vines/{addr}/tombstones/vine-OTHER"),
+            &signed_tombstone_bytes(&id, "vine-1", "cid-aaa", &addr),
+        );
+        assert!(
+            matches!(outcome, Some(TombstoneOutcome::Rejected(ref r)) if r.contains("topic vine id")),
+            "got {outcome:?}"
+        );
+        assert_eq!(cache.len_descriptors(), 1);
+    }
+
+    #[test]
+    fn tombstone_canonicalizes_cid_from_cached_descriptor() {
+        // Qodo PR #445 round 1: when the payload's CID disagrees with the
+        // cached descriptor's (unsigned-descriptor world), the CACHED CID
+        // is what local rows and blob state reference — persist that one
+        // for stub matching and evict decisions.
+        let (id, addr) = tombstone_identity();
+        let mut cache = VineFeedCache::new();
+        insert_descriptor(&mut cache, "vine-1", &addr, "cid-real");
+        insert_reshare(
+            &mut cache, "vine-b", "bob-addr", "vine-1", &addr, "cid-real",
+        );
+
+        let outcome = cache.on_tombstone_sample(
+            &format!("harmony/vines/{addr}/tombstones/vine-1"),
+            &signed_tombstone_bytes(&id, "vine-1", "cid-DIFFERENT", &addr),
+        );
+        match outcome {
+            Some(TombstoneOutcome::Applied { removed, evict_cid }) => {
+                assert_eq!(removed.video_cid, "cid-real");
+                // Bob's reshare is a stub (direct id match) — nothing live
+                // references cid-real, so the canonical CID evicts.
+                assert_eq!(evict_cid.as_deref(), Some("cid-real"));
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let rows = cache.list_descriptors();
+        assert!(rows[0].original_removed, "direct reshare must stub");
     }
 
     #[test]

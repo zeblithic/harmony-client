@@ -352,3 +352,18 @@ fn original_removed(&self, d: &VineDescriptorPayload) -> bool {
 - [ ] `cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` && `cargo fmt --all -- --check`.
 - [ ] Full sweep: `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures` (background, ~20 min, with wall-clock supervision).
 - [ ] Open PR (body: premise correction, reshare-semantics decision, eviction posture, honesty framing, ZEB-673 link); fire `@coderabbitai review` once; converge.
+
+---
+
+## Post-review amendments (PR #445 round 1)
+
+The code blocks above are the plan as written; round 1 of bot review (CodeRabbit + Qodo) changed the following in the implementation — the shipped code in `vine_tombstone.rs` / `vine_feed_cache.rs` / `event_loop.rs` / `vine-service.ts` is authoritative:
+
+1. **Pre-arrival guard is creator-bound** (CodeRabbit Critical): `on_descriptor_sample` rejects a descriptor only when the pending tombstone's `creator_address` matches the descriptor's — an attacker's self-signed tombstone for a victim's vine id cannot censor the victim.
+2. **Evict predicate excludes stubs**: the blob evicts when every remaining reference is an `original_removed` stub (the stub rule and the evict rule are the same helper). The Task-2 code block above predates this.
+3. **`vine-removed` emits for every fresh apply** — `Applied.removed` is always present (canonical fields from the tombstone; cached descriptor's CID preferred) so reshare-only subscribers stub correctly, and `evict_cid` is computed even pre-arrival.
+4. **Runtime age gate**: `on_descriptor_sample` rejects descriptors older than `MAX_AGE_SECS`, mirroring the load prune — with `deleted_at ≥ created_at` this makes the tombstone 90-day prune sound (no resurrection window).
+5. **Both topic segments bound**: creator AND vine-id segments must match the signed payload.
+6. **`MAX_TOMBSTONES = 10_000`** cap, oldest-by-`deleted_at` trim (DoS bound).
+7. **`verify_tombstone` rejects `|` in fields** (canonical-encoding ambiguity).
+8. **Frontend**: `applyRemoval` implements the re-publish suppression (live original by creator+CID keeps content-match stubs off, `'self'`-aware), and offline `deleteVine` un-remaps `'self'` to the hex address before stub matching.
