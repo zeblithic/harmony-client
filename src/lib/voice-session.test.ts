@@ -308,6 +308,18 @@ describe('speakerQueue (ZEB-612 derived queue)', () => {
     expect(q.map((m) => m.ownerHex)).toEqual(['11'.repeat(16), 'ff'.repeat(16)]);
   });
 
+  it('is a total order: same owner + same raise time falls to device hex', () => {
+    // The roster is device-keyed, so one owner can hold two rows. The
+    // comparator must return 0/-1/1 consistently (sort contract), with the
+    // device leg making the order total and stable across clients.
+    const a = { ...member('aa'.repeat(16), 100), deviceHex: 'ff'.repeat(32) };
+    const b = { ...member('aa'.repeat(16), 100), deviceHex: '11'.repeat(32) };
+    expect(speakerQueue([a, b]).map((m) => m.deviceHex))
+      .toEqual(['11'.repeat(32), 'ff'.repeat(32)]);
+    expect(speakerQueue([b, a]).map((m) => m.deviceHex))
+      .toEqual(['11'.repeat(32), 'ff'.repeat(32)]);
+  });
+
   it('returns empty for a roster with no raised hands', () => {
     expect(speakerQueue([member('aa'.repeat(16), null)])).toEqual([]);
   });

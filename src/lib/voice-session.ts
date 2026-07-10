@@ -38,13 +38,22 @@ export interface RosterMember {
 
 /**
  * ZEB-612: the derived speaker queue — raised hands ordered by raise time
- * (oldest first), owner-hex tiebreak. Deterministic on every client; no store,
- * no sync protocol (spec §5). Exported for TownHallView (S5).
+ * (oldest first), owner-hex tiebreak, device-hex final tiebreak (the roster is
+ * device-keyed, so two rows CAN share an owner — the device leg makes the
+ * comparator total, satisfying the sort contract; Qodo PR #442). Deterministic
+ * on every client; no store, no sync protocol (spec §5). Exported for
+ * TownHallView (S5).
  */
 export function speakerQueue(roster: RosterMember[]): RosterMember[] {
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
   return roster
     .filter((m) => m.handRaisedAt !== null)
-    .sort((a, b) => a.handRaisedAt! - b.handRaisedAt! || (a.ownerHex < b.ownerHex ? -1 : 1));
+    .sort(
+      (a, b) =>
+        a.handRaisedAt! - b.handRaisedAt! ||
+        cmp(a.ownerHex, b.ownerHex) ||
+        cmp(a.deviceHex, b.deviceHex),
+    );
 }
 
 export interface VoiceSessionState {

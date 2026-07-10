@@ -4996,10 +4996,16 @@ pub async fn run(
                                 "channel": hex::encode(channel_id.0),
                                 "mutedOwners": Vec::<String>::new(),
                                 "kickedOwners": Vec::<String>::new(),
+                                // ZEB-612: keep the reset payload's shape in
+                                // lockstep with emit_moderation_changed so a
+                                // uniform consumer never sees the invite keys
+                                // vanish (CodeRabbit Major, PR #442).
+                                "invitedOwners": Vec::<String>::new(),
                                 "powers": serde_json::Map::new(),
                                 "selfPower": 0,
                                 "selfModMuted": false,
                                 "selfKicked": false,
+                                "selfInvited": false,
                             }));
                     }
                     crate::voice::VoiceChannelRequest::SetMuted { community_id, channel_id, muted } => {

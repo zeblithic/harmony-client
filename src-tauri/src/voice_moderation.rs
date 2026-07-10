@@ -488,14 +488,20 @@ impl ActiveModeration {
         changed
     }
 
-    /// True iff any target in any channel is currently enforced & unexpired. The
-    /// event loop caches this in an `AtomicBool` so the audio hot path can skip
-    /// the per-frame presence+moderation `Mutex` locks when no moderation is
-    /// active (the common case) — Qodo perf.
+    /// True iff any AUDIO-RELEVANT target (mute/kick class) in any channel is
+    /// currently enforced & unexpired. The event loop caches this in an
+    /// `AtomicBool` so the audio hot path can skip the per-frame
+    /// presence+moderation `Mutex` locks when no moderation is active (the
+    /// common case) — Qodo perf.
     pub fn any_enforced(&self, now_ms: u64) -> bool {
         self.inner.values().any(|targets| {
             targets.values().any(|t| {
-                [&t.mute, &t.kick, &t.invite]
+                // ZEB-612: the invite class is deliberately EXCLUDED — this
+                // flag gates the audio hot path's per-frame moderation checks,
+                // and invites never participate in the is_muted/is_kicked drop
+                // decisions. Counting them would force per-frame map locks
+                // while a benign invite is pending (Qodo perf, PR #442).
+                [&t.mute, &t.kick]
                     .into_iter()
                     .flatten()
                     .any(|s| s.enforced && now_ms < s.enforce_until_ms)
@@ -699,6 +705,23 @@ mod tests {
         applied(&mut am, ModAction::Unkick, 200, 2, 1_100);
         assert!(!am.is_kicked(&C, &CH, &[0xBB; 16], 1_100));
         assert!(am.is_invited(&C, &CH, &[0xBB; 16], 1_100));
+    }
+
+    /// ZEB-612 (Qodo perf, PR #442): a pending invite must NOT flip the
+    /// audio-hot-path flag — invites never gate audio, so `any_enforced`
+    /// counts only the mute/kick classes.
+    #[test]
+    fn invite_alone_does_not_enable_hot_path_checks() {
+        let mut am = ActiveModeration::default();
+        assert!(applied(&mut am, ModAction::InviteToSpeak, 100, 1, 1_000));
+        assert!(am.is_invited(&C, &CH, &[0xBB; 16], 1_000));
+        assert!(
+            !am.any_enforced(1_000),
+            "invite-only state must not force per-frame moderation locks"
+        );
+        // A mute alongside it flips the flag as before.
+        applied(&mut am, ModAction::Mute, 100, 1, 1_000);
+        assert!(am.any_enforced(1_000));
     }
 
     /// ZEB-612: an invite lapses via the sweep like any enforced class (the
