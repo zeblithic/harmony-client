@@ -159,6 +159,12 @@ export interface VineVideo {
   originalCreatorName?: string;
   /** Whether the current user has viewed this vine. */
   viewed: boolean;
+  /**
+   * ZEB-670: true when this vine is a reshare whose original was deleted
+   * by its creator (tombstone). Rendered as a "Removed by creator" stub —
+   * no playback, no like/reshare.
+   */
+  originalRemoved?: boolean;
 }
 
 export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook' | 'mail' | 'mint' | 'network';

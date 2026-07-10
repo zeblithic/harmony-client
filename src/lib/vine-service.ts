@@ -22,6 +22,15 @@ export interface VineDescriptorEvent {
    * rows; older frontends ignored it (ZEB-612 S2 gap-fix).
    */
   viewed?: boolean;
+  /** See VineVideo.originalRemoved (ZEB-670). */
+  originalRemoved?: boolean;
+}
+
+/** Wire format for the `vine-removed` event (ZEB-670 tombstone applied). */
+export interface VineRemovedEvent {
+  vineId: string;
+  videoCid: string;
+  creatorAddress: string;
 }
 
 /**
@@ -178,6 +187,16 @@ export class VineService {
           this.onChange?.();
         },
       ));
+
+      localUnlisteners.push(await adapter.listen(
+        'vine-removed',
+        (event) => {
+          // ZEB-670: creator tombstone applied by the backend cache
+          // (covers both our own delete's loopback echo and remote
+          // deletes — one path, mirroring vine-received).
+          this.applyRemoval(event.payload as VineRemovedEvent);
+        },
+      ));
     } catch (err) {
       for (const fn of localUnlisteners) fn();
       // Note: mocks are already cleared and user-created entries preserved.
@@ -261,6 +280,76 @@ export class VineService {
     };
     this.discoverVines = [...this.discoverVines, vine];
     this.onChange?.();
+  }
+
+  /**
+   * ZEB-670: delete one of our own vines (creator tombstone).
+   *
+   * Connected: invokes `delete_vine`; the backend signs + publishes the
+   * tombstone and the removal lands via the loopback `vine-removed` echo —
+   * same path as remote deletes (mirrors `publish` → `vine-received`).
+   * Disconnected/mock mode: applies the removal locally so the UI stays
+   * responsive; real errors re-throw for the caller's error strip.
+   */
+  async deleteVine(vine: VineVideo): Promise<void> {
+    if (this.adapter) {
+      try {
+        await this.adapter.invoke('delete_vine', { vineId: vine.id });
+        return; // Backend echoes via subscription → vine-removed event
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Only fall back locally when genuinely disconnected; re-throw real errors.
+        if (!msg.includes('not connected') && !msg.includes('event loop')) {
+          throw err;
+        }
+      }
+    }
+
+    // Offline/mock fallback: local removal only.
+    this.applyRemoval({
+      vineId: vine.id,
+      videoCid: vine.videoCid,
+      creatorAddress: vine.creatorAddress,
+    });
+  }
+
+  /**
+   * Apply a vine removal: drop the vine (feeds, seen/viewed/reaction
+   * state) and mark surviving reshares of the removed content as
+   * "Removed by creator" stubs. Stub rule mirrors the Rust cache
+   * (`VineFeedCache::original_removed`): direct `reshareOf` id match, or
+   * origin-creator + videoCid content match for chain reshares. (The
+   * cache's re-publish exception is not replayed here — `list_vine_videos`
+   * rows carry the authoritative flag on the next hydrate.)
+   */
+  private applyRemoval(removed: VineRemovedEvent): void {
+    const { vineId, videoCid, creatorAddress } = removed;
+    const hadVine = this.seenIds.has(vineId)
+      || this.followedVines.some((v) => v.id === vineId)
+      || this.discoverVines.some((v) => v.id === vineId);
+
+    let changed = false;
+    const markStubs = (list: VineVideo[]): VineVideo[] =>
+      list.map((v) => {
+        if (!v.reshareOf || v.originalRemoved) return v;
+        const origin = v.originalCreatorAddress ?? v.creatorAddress;
+        const isStub = v.reshareOf === vineId
+          || (origin === creatorAddress && v.videoCid === videoCid);
+        if (!isStub) return v;
+        changed = true;
+        return { ...v, originalRemoved: true };
+      });
+
+    this.followedVines = markStubs(this.followedVines.filter((v) => v.id !== vineId));
+    this.discoverVines = markStubs(this.discoverVines.filter((v) => v.id !== vineId));
+    this.seenIds.delete(vineId);
+    this.reactionMap.delete(vineId);
+    if (this.viewedIds.has(vineId)) {
+      const next = new Set(this.viewedIds);
+      next.delete(vineId);
+      this.viewedIds = next;
+    }
+    if (hadVine || changed) this.onChange?.();
   }
 
   /**
@@ -576,6 +665,7 @@ export class VineService {
       originalCreatorAddress: wire.originalCreatorAddress,
       originalCreatorName: wire.originalCreatorName,
       viewed: wire.viewed === true || isSelf,
+      originalRemoved: wire.originalRemoved === true,
     };
   }
 
