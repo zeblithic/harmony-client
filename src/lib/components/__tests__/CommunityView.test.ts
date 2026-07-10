@@ -91,6 +91,14 @@ const voiceLounge = {
   createdAt: { wallMs: 400, logical: 0, deviceId: 'd' },
 };
 
+const townhallFloor = {
+  channelId: '05'.repeat(16),
+  name: 'assembly',
+  writePower: 0,
+  kind: 'townhall',
+  createdAt: { wallMs: 500, logical: 0, deviceId: 'd' },
+};
+
 async function setup(
   channelList: any[] = [general, announcements],
   propOverrides: Record<string, unknown> = {},
@@ -189,6 +197,17 @@ describe('CommunityView', () => {
     });
     expect(container.querySelector('.voice-view')).toBeNull();
     expect(container.querySelector('.channel-message-feed')).toBeNull();
+  });
+
+  it('routes a townhall channel to TownHallView (ZEB-612 S5)', async () => {
+    const { container, getByText } = await setup([townhallFloor], {
+      votingAdapter: makeVotingAdapterStub(),
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.townhall-view')).toBeTruthy();
+    });
+    expect(container.querySelector('.voice-view')).toBeNull();
+    expect(getByText("Join the assembly — you'll join muted.")).toBeTruthy();
   });
 
   it('keeps a text channel on ChannelMessageFeed', async () => {

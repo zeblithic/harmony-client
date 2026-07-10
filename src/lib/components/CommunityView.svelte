@@ -9,6 +9,7 @@
   import type { NavService } from '../nav-service';
   import ChannelMessageFeed from './ChannelMessageFeed.svelte';
   import VoiceChannelView from './VoiceChannelView.svelte';
+  import TownHallView from './TownHallView.svelte';
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
   import CommunityMembersPanel from './CommunityMembersPanel.svelte';
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
@@ -435,10 +436,37 @@
         <p>It’ll appear here once the connection is ready.</p>
       </div>
     {:else if activeChannel}
-      <!-- ZEB-612 S4 interim: a townhall channel renders the plain voice view
-           (a joinable voice room — the spec's own degradation) until S5 swaps
-           in TownHallView for kind === 'townhall'. -->
-      {#if activeChannel.kind === 'voice' || activeChannel.kind === 'townhall'}
+      {#if activeChannel.kind === 'townhall'}
+        <!-- ZEB-612 S5: townhall channels render the assembly view. -->
+        {#if voiceSession}
+          <TownHallView
+            session={voiceSession}
+            channelName={activeChannel.name}
+            {communityId}
+            channelId={activeChannel.channelId}
+            onBeforeJoin={onBeforeVoiceJoin}
+            {ownAddress}
+            {myPower}
+            adminQuorum={governance?.adminQuorum ?? null}
+            {votingAdapter}
+            {channelMessageService}
+            {resolveCard}
+            {resolveNickname}
+            {onOpenCard}
+            snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
+            originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
+            forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
+            forkReason={preForkSnapshot?.forkReason ?? null}
+            mentionCandidates={members
+              .filter((m) => m.status === 'joined')
+              .map((m) => ({
+                ownerId: m.address,
+                label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
+              }))}
+            onOpenProposals={() => { activeView = 'proposals'; }}
+          />
+        {/if}
+      {:else if activeChannel.kind === 'voice'}
         {#if voiceSession}
           <VoiceChannelView
             session={voiceSession}
