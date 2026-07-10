@@ -47,10 +47,16 @@ describe('VineCard (ZEB-612 S2 full-bleed)', () => {
     expect(screen.getByText('▶')).toBeTruthy();
   });
 
-  it('shows the ❚❚ paused glyph only when not playing', async () => {
-    const { rerender } = render(VineCard, props({ isPlaying: false }));
+  it('shows the ❚❚ paused glyph only over a loaded video when not playing', async () => {
+    const { rerender } = render(VineCard, props({ videoUrl: 'blob:fake-1', isPlaying: false }));
     expect(screen.getByText('❚❚')).toBeTruthy();
-    await rerender(props({ isPlaying: true }));
+    await rerender(props({ videoUrl: 'blob:fake-1', isPlaying: true }));
+    expect(screen.queryByText('❚❚')).toBeNull();
+  });
+
+  it('omits the paused glyph on cards outside the lazy window (no stacked glyphs)', () => {
+    render(VineCard, props({ videoUrl: null, isPlaying: false }));
+    expect(screen.getByText('▶')).toBeTruthy();
     expect(screen.queryByText('❚❚')).toBeNull();
   });
 

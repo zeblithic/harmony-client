@@ -403,6 +403,38 @@ describe('VineFeed', () => {
       await waitFor(() => expect(revoke).toHaveBeenCalledWith('blob:fake-cid-5'));
       expect(revoke).toHaveBeenCalledWith('blob:fake-cid-4');
     });
+
+    it('windows by card, not by CID — a far reshare sharing the playing CID stays video-less (Qodo #440)', async () => {
+      const resolveVideo = vi.fn(async (cid: string) => `blob:fake-${cid}`);
+      const shared: VineVideo[] = [
+        { id: 'vine-05', creatorAddress: 'a5', creatorName: 'C5', createdAt: 1700000500, videoCid: 'cid-shared', viewed: false },
+        { id: 'vine-04', creatorAddress: 'a4', creatorName: 'C4', createdAt: 1700000400, videoCid: 'cid-4', viewed: false },
+        { id: 'vine-03', creatorAddress: 'a3', creatorName: 'C3', createdAt: 1700000300, videoCid: 'cid-3', viewed: false },
+        { id: 'vine-02', creatorAddress: 'a2', creatorName: 'C2', createdAt: 1700000200, videoCid: 'cid-2', viewed: false },
+        // Reshare of vine-05's clip: same videoCid, far outside the window.
+        { id: 'vine-01', creatorAddress: 'a1', creatorName: 'C1', createdAt: 1700000100, videoCid: 'cid-shared', reshareOf: 'vine-05', originalCreatorAddress: 'a5', originalCreatorName: 'C5', viewed: false },
+      ];
+      const { container } = render(VineFeed, { props: {
+        followedVines: shared, viewedIds: new Set<string>(), resolveVideo, onMarkViewed: vi.fn(),
+      } });
+      // Window = playing (vine-05) + neighbor (vine-04): exactly two videos,
+      // even though vine-01 shares the playing card's CID.
+      await waitFor(() => expect(container.querySelectorAll('[data-testid="stage-video"]').length).toBe(2));
+      expect(container.querySelector('[data-vine-id="vine-05"] [data-testid="stage-video"]')).toBeTruthy();
+      expect(container.querySelector('[data-vine-id="vine-01"] [data-testid="stage-video"]')).toBeNull();
+    });
+
+    it('revokes a blob that resolves after unmount (no leak — Qodo #440)', async () => {
+      let resolveFetch!: (url: string) => void;
+      const resolveVideo = vi.fn(() => new Promise<string>(res => { resolveFetch = res; }));
+      const { unmount } = render(VineFeed, { props: {
+        followedVines: [vines[0]], viewedIds: new Set<string>(), resolveVideo, onMarkViewed: vi.fn(),
+      } });
+      await waitFor(() => expect(resolveVideo).toHaveBeenCalled());
+      unmount();
+      resolveFetch('blob:late');
+      await waitFor(() => expect(revoke).toHaveBeenCalledWith('blob:late'));
+    });
   });
 
   describe('unviewed filter pin (ZEB-612 S2)', () => {

@@ -37,4 +37,33 @@ describe('probeVideoDuration (ZEB-612 S2)', () => {
     el.onerror!();
     await expect(p).rejects.toThrow('could not read video metadata');
   });
+
+  it('rejects a non-finite duration (WebM/MediaRecorder missing-duration case)', async () => {
+    // Infinity/NaN is "no metadata", not a measurement — resolving it would
+    // let the publish gate render "Infinitys" and NaN-compare past the ≤6s
+    // check. Rejection routes callers into their documented fail-open path.
+    const el = fakeVideoElement();
+    vi.spyOn(document, 'createElement').mockReturnValue(el as unknown as HTMLElement);
+    const p = probeVideoDuration('blob:webm-stream');
+    el.duration = Number.POSITIVE_INFINITY;
+    el.onloadedmetadata!();
+    await expect(p).rejects.toThrow('no finite duration');
+  });
+
+  it('rejects when metadata never arrives (timeout guard — callers must not hang)', async () => {
+    vi.useFakeTimers();
+    try {
+      const el = fakeVideoElement();
+      vi.spyOn(document, 'createElement').mockReturnValue(el as unknown as HTMLElement);
+      const p = probeVideoDuration('blob:stalled');
+      // Attach the rejection expectation BEFORE advancing time so the
+      // rejection is handled the moment it fires.
+      const assertion = expect(p).rejects.toThrow('timed out reading video metadata');
+      vi.advanceTimersByTime(5000);
+      await assertion;
+      expect(el.removeAttribute).toHaveBeenCalledWith('src');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

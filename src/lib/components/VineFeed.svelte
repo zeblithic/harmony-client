@@ -215,13 +215,26 @@
 
   // ── Lazy blob window (playing ± 1) ──────────────────────────────────
 
-  let windowCids = $derived.by(() => {
+  // Windowed by CARD (vine id), not by CID: reshares carry the original's
+  // videoCid, so a cid-keyed window would hand a blob URL to every far-away
+  // reshare of the playing clip and mount videos outside the window
+  // (Qodo PR #440). The blob map itself stays cid-keyed so windowed cards
+  // sharing a CID still share one fetch + one URL.
+  let windowIds = $derived.by(() => {
     const idx = filteredVines.findIndex(v => v.id === playingId);
     const around = idx === -1 ? [0, 1] : [idx - 1, idx, idx + 1];
     const set = new Set<string>();
     for (const i of around) {
       const v = filteredVines[i];
-      if (v) set.add(v.videoCid);
+      if (v) set.add(v.id);
+    }
+    return set;
+  });
+
+  let windowCids = $derived.by(() => {
+    const set = new Set<string>();
+    for (const v of filteredVines) {
+      if (windowIds.has(v.id)) set.add(v.videoCid);
     }
     return set;
   });
@@ -245,8 +258,11 @@
       resolver(cid)
         .then(url => {
           pendingCids.delete(cid);
-          // The window may have moved while the fetch was in flight.
-          if (!windowCids.has(cid)) {
+          // The component may have unmounted, or the window may have moved,
+          // while the fetch was in flight — either way this URL must be
+          // revoked here or it leaks (the destroy cleanup already ran /
+          // will never see it). Qodo PR #440.
+          if (destroyed || !windowCids.has(cid)) {
             URL.revokeObjectURL?.(url);
             return;
           }
@@ -258,9 +274,13 @@
     }
   });
 
+  /** Flipped at destroy so late-resolving fetches revoke instead of keep. */
+  let destroyed = false;
+
   // Revoke everything on unmount (body reads nothing reactive → runs once,
   // so the returned cleanup fires only at destroy).
   $effect(() => () => {
+    destroyed = true;
     for (const url of videoUrls.values()) URL.revokeObjectURL?.(url);
   });
 
@@ -285,7 +305,10 @@
     try {
       await onReshare(vine);
     } catch (err) {
-      reshareError = err instanceof Error ? err.message : 'Reshare failed';
+      // Tauri IPC rejections are strings in production — preserve them
+      // (codebase-wide extraction idiom), falling back only when empty.
+      const msg = err instanceof Error ? err.message : String(err);
+      reshareError = msg || 'Reshare failed';
     } finally {
       resharingId = null;
     }
@@ -360,7 +383,7 @@
             {vine}
             isPlaying={playingId === vine.id}
             isViewed={viewedIds.has(vine.id)}
-            videoUrl={videoUrls.get(vine.videoCid) ?? null}
+            videoUrl={windowIds.has(vine.id) ? (videoUrls.get(vine.videoCid) ?? null) : null}
             duration={durations.get(vine.videoCid) ?? null}
             onActivate={activateCard}
             onDuration={reportDuration}

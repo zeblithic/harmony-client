@@ -2058,3 +2058,18 @@ git diff src/style-token-allowlist.json   # expect: VinePublishDialog entry remo
 - **Spec coverage:** §3 feed (snap ✓, autoplay/playingId ✓, dim+❚❚ ✓, lazy window + revocation ✓, no endless-cycling — real feed ends in existing empty states ✓, tabs/filter/N-new ✓, attribution ✓, hearts ✓, reshare counts ✓, viewed-on-play ✓, duration badge ✓, playTarget scroll ✓, VinePlayer retired ✓, hydrate gap-fix ✓); §3 publish (header/subtitle ✓, caption ≤140 ✓, 100MB hint ✓, advanced CID ✓, ≤6s gate ✓, no trim chrome ✓, sovereign rewording ✓).
 - **Type consistency:** `onDuration(cid, seconds)` (Task 4) ↔ `reportDuration(cid, seconds)` (Task 5); `onActivate(vine)` ↔ `activateCard(vine)`; `canReshare`/`resharing`/`onReshare(vine)` card props ↔ feed's `requestReshare`; `hydrate()` (Task 3) ↔ App wiring (Task 7); `probeDuration` prop default ↔ Task 2 export.
 - **Known intentional behaviors (pre-empt bot findings):** fail-open gate (documented rationale); `unviewedPin` (playing card survives the filter it just violated); classification-by-current-follow-set in hydrate (matches follow()/unfollow() move semantics, not the cache's first-arrival tag); mount marks the newest card viewed (autoplay-on-view IS viewing); `URL.revokeObjectURL?.()` optional-call (jsdom).
+
+---
+
+## Round-1 amendments (bot converge, PR #440)
+
+All eight round-1 findings were accepted — each is a real defect or a mandated idiom. Shipped in one commit:
+
+1. **Blob URL leak after unmount** (Qodo, Action-required): an in-flight `resolveVideo` settling post-destroy kept a URL the destroy cleanup never saw. Fix: `destroyed` flag flipped in the teardown effect; the `.then` revokes-and-returns when `destroyed || !windowCids.has(cid)`. Pinned by a deferred-promise test (`revokes a blob that resolves after unmount`).
+2. **Shared CID defeats windowing** (Qodo): reshares carry the original's `videoCid`, so the cid-keyed window handed URLs to far-away reshares. Fix: window keyed by **card id** (`windowIds`); `windowCids` derived from it (blob map stays cid-keyed so windowed cards sharing a CID share one fetch); the render site gates on `windowIds.has(vine.id)`. Pinned by the shared-CID test — the plan's original `windowCids` snippet is superseded.
+3. **Non-finite duration treated valid** (Qodo + CodeRabbit's Infinity-test nit): WebM/MediaRecorder blobs report `Infinity`/`NaN`; NaN comparisons are false → silent gate bypass + `toFixed(NaN)` garbage. Fix: `probeVideoDuration` rejects non-finite durations → `measureDuration`'s catch routes into the documented fail-open path. Test added.
+4. **Probe timeout** (CodeRabbit): neither media event firing would hang the awaiting dialog forever. Fix: 5 s timeout (`PROBE_TIMEOUT_MS`) → reject through `cleanup()`. Fake-timer test added.
+5. **Stacked ▶/❚❚ glyphs** (CodeRabbit): paused glyph now requires `videoUrl && !isPlaying`; off-window cards show only ▶. Tests updated + off-window assertion added.
+6. **Reshare error extraction** (CodeRabbit, coding guideline): `err instanceof Error ? err.message : String(err)` with `|| 'Reshare failed'` fallback — production Tauri rejections are strings and must be preserved.
+7. **Stale duration during Replace** (CodeRabbit, outside-diff): `pickedDuration = null` before the re-measure await so the new filename never renders the old clip's over-limit state. Covered by the existing replace-clip test's final-state assertions (asserting the mid-await frame would need a deferred probe stub for a one-line reset — not worth the harness).
+8. Plan-code drift note: the Task 2/Task 5 snippets above predate amendments 1–4; the component/test files are authoritative.

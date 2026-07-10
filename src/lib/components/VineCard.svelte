@@ -131,7 +131,9 @@
     {:else}
       <span class="stage-placeholder" aria-hidden="true">▶</span>
     {/if}
-    {#if !isPlaying}
+    {#if videoUrl && !isPlaying}
+      <!-- Only over a loaded video — off-window cards show ▶, and stacking
+           both centered glyphs would overlap (CodeRabbit PR #440). -->
       <span class="paused-glyph" aria-hidden="true">❚❚</span>
     {/if}
     {#if duration != null}

@@ -74,6 +74,11 @@
       if (!result) return; // user cancelled the picker — leave state as-is
       videoCid = result.cid;
       pickedFileName = result.fileName;
+      // Clear the previous clip's measurement before the await — the picked
+      // block stays rendered while ingesting, and a stale duration would
+      // show the new filename with the old clip's (possibly over-limit)
+      // state (CodeRabbit PR #440).
+      pickedDuration = null;
       pickedDuration = await measureDuration(result.cid);
       if (pickedDuration != null && pickedDuration > MAX_VINE_SECONDS) {
         error = overLimitCopy(pickedDuration);
