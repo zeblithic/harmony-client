@@ -329,6 +329,38 @@ describe('WelcomeModal owner phrase reveal (ZEB-650 slice 2)', () => {
     // dto.ownerId (32 hex chars) must never reach the DOM.
     expect(container.innerHTML).not.toMatch(/[0-9a-f]{32,}/i);
   });
+
+  // A phrase backup needs its own exit: Continue must complete the modal via
+  // onMinted WITHOUT recording a skip (CodeRabbit PR #437).
+  it('written-down checkbox surfaces Continue, which completes without skipping', async () => {
+    mockCoreInvoke.mockResolvedValue({ words: WORDS, ownerId: OWNER });
+    mintMock.mockResolvedValue({
+      state: { ownerId: OWNER, ownerDisplayName: 'x', devices: [], canBackUp: true },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
+    });
+    const onMinted = vi.fn();
+    const { getByTestId, queryByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted },
+    });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve();
+    await Promise.resolve();
+    await fireEvent.click(getByTestId('phrase-reveal-open'));
+    await fireEvent.click(getByTestId('phrase-reveal-confirm'));
+    await Promise.resolve();
+    await Promise.resolve();
+    await fireEvent.click(getByTestId('phrase-reveal-unblur'));
+    // No exit for this path until the words are confirmed written down.
+    expect(queryByTestId('welcome-phrase-continue')).toBeNull();
+    await fireEvent.click(getByTestId('phrase-written-down'));
+    await fireEvent.click(getByTestId('welcome-phrase-continue'));
+    expect(onMinted).toHaveBeenCalledTimes(1);
+    // Completed as a BACKUP, not a skip.
+    expect(localStorage.getItem(`harmony.onboarding.backupSkipped:owner-${OWNER}`)).toBeNull();
+    expect(
+      localStorage.getItem(`harmony.onboarding.recoveryArtifactBackedUp:owner-${OWNER}`),
+    ).toBe('true');
+  });
 });
 
 describe('WelcomeModal ZEB-494 — join an existing device', () => {

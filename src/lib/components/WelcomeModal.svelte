@@ -124,6 +124,16 @@
     }
   }
 
+  // ZEB-650 slice 2 (CodeRabbit PR #437): a phrase backup needs its own exit —
+  // without one, the only way past this stage after writing the words down is
+  // "Skip for now", which would record a successful backup as a skip.
+  let phraseBackedUp = $state(false);
+
+  async function handlePhraseContinue() {
+    if (mintResult === null) return;
+    await onMinted(mintResult);
+  }
+
   function handleSkipRequest() {
     stage = 'skip-confirm';
   }
@@ -335,7 +345,24 @@
         </div>
         {#if mintResult !== null}
           <div class="phrase-alternative">
-            <OwnerPhraseReveal ownerId={mintResult.state.ownerId} />
+            <OwnerPhraseReveal
+              ownerId={mintResult.state.ownerId}
+              onBackedUp={() => {
+                phraseBackedUp = true;
+              }}
+            />
+            {#if phraseBackedUp}
+              <div class="actions">
+                <button
+                  class="primary"
+                  data-testid="welcome-phrase-continue"
+                  onclick={handlePhraseContinue}
+                  disabled={backupInFlight}
+                >
+                  Continue
+                </button>
+              </div>
+            {/if}
           </div>
         {/if}
         <div class="wizard-rail">

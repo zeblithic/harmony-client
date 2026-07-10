@@ -501,13 +501,16 @@ Expected: FAIL — cannot resolve `../OwnerPhraseReveal.svelte`.
   </div>
 {:else}
   <div class="phrase-revealed">
+    <!-- Masked placeholders until the explicit Reveal: blur alone is only
+         visual — screen readers, find-in-page, and DOM inspection would
+         still see the words (round-1 amendment, CodeRabbit PR #437). -->
     <ol
       data-testid="phrase-grid"
       class="mnemonic-grid"
       class:blurred={!phase.unblurred}
     >
       {#each phase.words as w, i (i)}
-        <li class="word">{w}</li>
+        <li class="word">{phase.unblurred ? w : '••••••'}</li>
       {/each}
     </ol>
     {#if !phase.unblurred}
@@ -910,7 +913,9 @@ Expected: clean, all tests pass.
 - [ ] **Step 2: Rust sweep** (lib changed → full clippy; full test sweep in background with a supervision net — macOS has no `timeout(1)`, use the Bash tool's timeout parameter / background mode):
 
 Run: `cd src-tauri && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
-Then: `scripts/test-select --full` (CI-parity `--workspace --all-targets` sweep; run in background, supervise, expect ~relink cost since the lib changed).
+Then the full workspace sweep (final validation uses the explicit full command, never the selector script — compliance rule 1601744):
+`cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures`
+(run in background, supervise, expect ~relink cost since the lib changed).
 Expected: clean.
 
 - [ ] **Step 3: Push + PR**
@@ -932,3 +937,14 @@ Then fire `@coderabbitai review` ONCE, update Linear, arm the converge wakeup.
 - **Deviations from spec text, deliberate:** (a) §3.2 says "blurred until hover/hold per the IdentityPanel idiom" — the actual IdentityPanel idiom (verified in code) is a class-toggle blur cleared by an explicit Reveal button; the plan mirrors the real idiom, which is also the stronger posture. (b) §3.2's "click-confirm tier" is satisfied by the two-step confirm→unblur sequence.
 - **Placeholders:** none — every step carries complete code; the two NOTEs to the implementer are verification instructions (check real token names; copy the exact `from_mnemonic` API from the named recovery_cli test), not deferred design.
 - **Type consistency:** `OwnerMnemonicDto { words, ownerId }` identical across Rust serde output, TS interface, and all test fixtures; testids match between component and every consumer test.
+
+## Round-1 amendments (bot converge, PR #437)
+
+Applied after review; the task bodies above are otherwise historical:
+
+1. **Masked grid** (CodeRabbit, Major): words render as `••••••` placeholders until the explicit Reveal — blur alone leaks to screen readers / find-in-page / DOM inspection. (Snippet above updated.)
+2. **Error redaction** (Qodo, Bug): backend errors can embed 32-hex owner ids (seed↔owner-state mismatch); `sanitizeError()` strips `/[0-9a-f]{32,}/gi` before any message reaches the DOM.
+3. **Post-await teardown guard** (Qodo, Bug): `alive` flag via `onDestroy` + phase re-check after the IPC await, so an Escape-dismissed modal discards a late resolution instead of storing words.
+4. **WelcomeModal completion** (CodeRabbit, Major): new optional `onBackedUp` prop; WelcomeModal surfaces a `welcome-phrase-continue` button once the words are confirmed written down, completing via `onMinted` without recording a skip.
+5. **DevicesPanel dedup** (CodeRabbit, Trivial): shared `refreshLastBackedUp()` helper for the owner-keyed effect + flags-changed listener.
+6. Final-gate command spelled explicitly (Qodo compliance rule 1601744) — see Task 5 Step 2.

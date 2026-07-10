@@ -60,6 +60,19 @@ describe('OwnerPhraseReveal (ZEB-650 slice 2, Option A)', () => {
     expect(grid.classList.contains('blurred')).toBe(true);
   });
 
+  // Blur is only visual — the DOM itself must hold masked placeholders until
+  // the explicit Reveal, or screen readers / find-in-page / DOM inspection
+  // see the words early (CodeRabbit PR #437).
+  it('words are absent from the DOM until the explicit unblur', async () => {
+    mockInvoke.mockResolvedValue({ words: WORDS, ownerId: OWNER });
+    const utils = render(OwnerPhraseReveal, { props: { ownerId: OWNER } });
+    await revealWords(utils);
+    expect(utils.container.textContent).not.toContain('abandon');
+    expect(utils.getByTestId('phrase-grid').textContent).toContain('••••••');
+    await fireEvent.click(utils.getByTestId('phrase-reveal-unblur'));
+    expect(utils.container.textContent).toContain('abandon');
+  });
+
   it('unblur reveals the grid; copy + checkbox appear only then', async () => {
     mockInvoke.mockResolvedValue({ words: WORDS, ownerId: OWNER });
     const utils = render(OwnerPhraseReveal, { props: { ownerId: OWNER } });
@@ -91,6 +104,24 @@ describe('OwnerPhraseReveal (ZEB-650 slice 2, Option A)', () => {
     await revealWords(utils);
     expect(utils.getByTestId('phrase-reveal-error').textContent).toContain('wiped');
     expect(utils.queryByTestId('phrase-grid')).toBeNull();
+  });
+
+  // The seed↔owner-state mismatch backend error embeds two 32-hex owner ids —
+  // they must be redacted before the message reaches the DOM (Qodo PR #437).
+  it('redacts 32+ hex runs embedded in backend error messages', async () => {
+    const seedId = 'ab12'.repeat(8);
+    const stateId = 'cd34'.repeat(8);
+    mockInvoke.mockRejectedValue(
+      new Error(
+        `master seed / owner-state mismatch: seed derives owner-id ${seedId} but owner_state.cbor records ${stateId} — refusing to export`,
+      ),
+    );
+    const utils = render(OwnerPhraseReveal, { props: { ownerId: OWNER } });
+    await revealWords(utils);
+    const err = utils.getByTestId('phrase-reveal-error').textContent ?? '';
+    expect(err).toContain('mismatch');
+    expect(err).toContain('[redacted]');
+    expect(utils.container.innerHTML).not.toMatch(/[0-9a-f]{32,}/i);
   });
 
   it("'I've written these words down' marks the owner-scoped backed-up flag", async () => {
@@ -131,5 +162,36 @@ describe('OwnerPhraseReveal (ZEB-650 slice 2, Option A)', () => {
     expect(utils.container.innerHTML).not.toMatch(/[0-9a-f]{32,}/i);
     await fireEvent.click(utils.getByTestId('phrase-reveal-unblur'));
     expect(utils.container.innerHTML).not.toMatch(/[0-9a-f]{32,}/i);
+  });
+
+  // The other half of the lifetime invariant: unmount (not just Hide) must
+  // leave no words behind (CodeRabbit PR #437).
+  it('unmount removes the revealed words from the document', async () => {
+    mockInvoke.mockResolvedValue({ words: WORDS, ownerId: OWNER });
+    const utils = render(OwnerPhraseReveal, { props: { ownerId: OWNER } });
+    await revealWords(utils);
+    await fireEvent.click(utils.getByTestId('phrase-reveal-unblur'));
+    expect(document.body.textContent).toContain('abandon');
+    utils.unmount();
+    expect(document.body.textContent).not.toContain('abandon');
+  });
+
+  // Escape can dismiss the host modal while the export IPC is in flight —
+  // the late resolution must be discarded, not stored (Qodo PR #437).
+  it('discards an IPC resolution that lands after unmount', async () => {
+    let resolveIpc!: (dto: { words: string[]; ownerId: string }) => void;
+    mockInvoke.mockReturnValue(
+      new Promise((resolve) => {
+        resolveIpc = resolve;
+      }),
+    );
+    const utils = render(OwnerPhraseReveal, { props: { ownerId: OWNER } });
+    await fireEvent.click(utils.getByTestId('phrase-reveal-open'));
+    await fireEvent.click(utils.getByTestId('phrase-reveal-confirm'));
+    utils.unmount(); // modal dismissed mid-flight
+    resolveIpc({ words: WORDS, ownerId: OWNER });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(document.body.textContent).not.toContain('abandon');
   });
 });

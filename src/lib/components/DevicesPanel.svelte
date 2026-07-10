@@ -44,12 +44,20 @@
   // Keyed to state.ownerId — NOT run-once on mount — so an in-panel mint
   // (empty → populated) or any later owner swap re-derives both facts for the
   // NEW owner instead of showing the previous identity's (Qodo, PR #436).
+  // Single source for "recompute Last-backed-up from the current owner" —
+  // shared by the owner-keyed effect and the flags-changed listener below
+  // (CodeRabbit PR #437).
+  function refreshLastBackedUp() {
+    const oid = state?.ownerId ?? null;
+    lastBackedUpMs = oid ? recoveryBackedUpAtMs(oid) : null;
+  }
+
   let metaOwnerId: string | null = null;
   $effect(() => {
     const ownerId = state?.ownerId ?? null;
     if (ownerId === metaOwnerId) return;
     metaOwnerId = ownerId;
-    lastBackedUpMs = ownerId ? recoveryBackedUpAtMs(ownerId) : null;
+    refreshLastBackedUp();
     communitiesCount = null;
     if (ownerId) {
       // async/await (not .then) so a unit-mocked seam returning undefined
@@ -68,12 +76,8 @@
   // panel is mounted — e.g. the phrase-reveal checkbox in the modal below, or
   // the reminder banner's inline backup (ZEB-650 slice 2).
   $effect(() => {
-    const refresh = () => {
-      const oid = state?.ownerId ?? null;
-      lastBackedUpMs = oid ? recoveryBackedUpAtMs(oid) : null;
-    };
-    window.addEventListener(BACKUP_FLAGS_CHANGED_EVENT, refresh);
-    return () => window.removeEventListener(BACKUP_FLAGS_CHANGED_EVENT, refresh);
+    window.addEventListener(BACKUP_FLAGS_CHANGED_EVENT, refreshLastBackedUp);
+    return () => window.removeEventListener(BACKUP_FLAGS_CHANGED_EVENT, refreshLastBackedUp);
   });
 
   // Per-device label (owner-private). Seeded from the store; defaulted to the

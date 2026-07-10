@@ -13,6 +13,7 @@
    * and must NEVER be rendered — the WelcomeModal redaction invariant
    * forbids any /[0-9a-f]{32,}/ run in innerHTML.
    */
+  import { onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { markRecoveryBackedUp } from '../onboarding-backup-flags';
 
@@ -24,8 +25,14 @@
   interface Props {
     /** Hex owner id the host surface is displaying (reveal cross-check). */
     ownerId: string;
+    /**
+     * Notified the first time the user confirms the words are written down
+     * (after markRecoveryBackedUp) — hosts with a flow to advance (e.g.
+     * WelcomeModal) surface their completion affordance here.
+     */
+    onBackedUp?: () => void;
   }
-  let { ownerId }: Props = $props();
+  let { ownerId, onBackedUp }: Props = $props();
 
   type Phase =
     | { kind: 'collapsed' }
@@ -34,6 +41,23 @@
 
   let phase = $state<Phase>({ kind: 'collapsed' });
   let copied = $state(false);
+
+  // The host modal can be dismissed (Escape) while the export IPC is in
+  // flight; the continuation must not retain words on a dead component
+  // (Qodo PR #437 — same teardown-guard idiom as FriendsPanel, PR #217).
+  let alive = true;
+  onDestroy(() => {
+    alive = false;
+  });
+
+  /**
+   * Backend errors can embed 32-hex owner ids (e.g. the seed↔owner-state
+   * mismatch message) — redact any long hex run before the message is
+   * allowed anywhere near the DOM (Qodo PR #437).
+   */
+  function sanitizeError(msg: string): string {
+    return msg.replace(/[0-9a-f]{32,}/gi, '[redacted]');
+  }
 
   function collapse() {
     // Drops the words with the state object — they leave the DOM now.
@@ -48,13 +72,14 @@
     try {
       dto = await invoke<OwnerMnemonicDto>('export_owner_mnemonic_words');
     } catch (e) {
-      phase = {
-        kind: 'confirm',
-        inFlight: false,
-        error: e instanceof Error ? e.message : String(e),
-      };
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!alive || phase.kind !== 'confirm') return;
+      phase = { kind: 'confirm', inFlight: false, error: sanitizeError(msg) };
       return;
     }
+    // Post-await guard: unmounted (modal dismissed) or no longer confirming
+    // → discard the words instead of storing them past the visible lifetime.
+    if (!alive || phase.kind !== 'confirm') return;
     if (dto.ownerId !== ownerId) {
       // Words belong to a different identity than the one on screen —
       // discard them and render nothing.
@@ -74,7 +99,10 @@
     phase = { ...phase, writtenDown: next };
     // Marking is one-way: unchecking doesn't unmark (there is no honest
     // "un-back-up" — the words were seen and may be on paper).
-    if (next) markRecoveryBackedUp(ownerId);
+    if (next) {
+      markRecoveryBackedUp(ownerId);
+      onBackedUp?.();
+    }
   }
 
   async function copyWords() {
@@ -131,9 +159,12 @@
   </div>
 {:else}
   <div class="phrase-revealed">
+    <!-- Masked placeholders until the explicit Reveal: blur alone is only
+         visual — screen readers, find-in-page, and DOM inspection would
+         still see the words (CodeRabbit PR #437). -->
     <ol data-testid="phrase-grid" class="mnemonic-grid" class:blurred={!phase.unblurred}>
       {#each phase.words as w, i (i)}
-        <li class="word">{w}</li>
+        <li class="word">{phase.unblurred ? w : '••••••'}</li>
       {/each}
     </ol>
     {#if !phase.unblurred}
