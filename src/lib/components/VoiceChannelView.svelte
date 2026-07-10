@@ -261,9 +261,10 @@
           onpointerleave={pttUp}
           onpointercancel={pttUp}
           aria-label="Hold to talk (or hold Space)"
+          title="Release to go quiet. Replaces the mute toggle while PTT mode is on."
           disabled={silenced}
         >
-          {$voiceState.pttHeld ? '🎙 Talking…' : '🎙 Hold to Talk'}
+          {$voiceState.pttHeld ? '🎙 Transmitting… (hold Space)' : '🎙 Hold to Talk'}
         </button>
       {:else}
         <button
@@ -296,7 +297,7 @@
         onclick={toggleDeafen}
         aria-label="Deafen"
       >
-        {$voiceState.deafened ? '🔕 Deafened' : '🔈 Deafen'}
+        {$voiceState.deafened ? '🔕 Deafened' : '🎧 Deafen'}
       </button>
       <button class="btn-danger" onclick={onLeave} aria-label="Leave voice">Leave</button>
     </div>
@@ -538,7 +539,7 @@
     background: var(--bg-secondary);
     color: var(--text-secondary);
     padding: 6px 14px;
-    border-radius: 4px;
+    border-radius: 5px;
     font-size: 0.85rem;
     cursor: pointer;
   }
@@ -568,18 +569,23 @@
     white-space: nowrap;
   }
   /* Hold-to-talk: suppress touch scroll/selection so a press-hold-release
-     gesture stays a clean PTT hold on touch devices. */
+     gesture stays a clean PTT hold on touch devices. Frame C: the held state
+     is a full-width accent control with a soft glow ring. */
   .ptt-hold {
     touch-action: none;
     user-select: none;
+    flex: 1;
+  }
+  .ptt-hold.active {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
   }
   .btn-danger {
     margin-left: auto;
     border: none;
     background: var(--danger);
-    color: var(--text-primary);
+    color: var(--on-accent);
     padding: 6px 16px;
-    border-radius: 4px;
+    border-radius: 5px;
     font-size: 0.85rem;
     cursor: pointer;
   }

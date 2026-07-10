@@ -342,3 +342,25 @@ describe('VoiceChannelView (ZEB-612 slice 1): Commons restyle — roster', () =>
     expect(session.moderate).toHaveBeenCalledWith('b'.repeat(32), 'mute');
   });
 });
+
+describe('VoiceChannelView (ZEB-612 slice 1): Commons restyle — control bar', () => {
+  it('held PTT shows the transmitting label with the Space hint', () => {
+    const session = fakeSession({ phase: 'connected', pttMode: true, pttHeld: true, muted: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('ptt-hold')).toHaveTextContent('🎙 Transmitting… (hold Space)');
+  });
+
+  it('unheld PTT keeps the hold-to-talk label and explains release behavior via title', () => {
+    const session = fakeSession({ phase: 'connected', pttMode: true, pttHeld: false, muted: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    const hold = screen.getByTestId('ptt-hold');
+    expect(hold).toHaveTextContent('🎙 Hold to Talk');
+    expect(hold).toHaveAttribute('title', 'Release to go quiet. Replaces the mute toggle while PTT mode is on.');
+  });
+
+  it('deafen control uses the headphones glyph when not deafened', () => {
+    const session = fakeSession({ phase: 'connected', deafened: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByRole('button', { name: 'Deafen' })).toHaveTextContent('🎧 Deafen');
+  });
+});
