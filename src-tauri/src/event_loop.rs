@@ -3169,6 +3169,20 @@ pub async fn run(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     > = std::collections::HashMap::new();
 
+    // ZEB-612 Town Hall: (community, channel) → the shared raised-hand cell
+    // handed to that channel's presence publisher. 0 = lowered; otherwise the
+    // wall-clock ms of the FIRST raise (stable queue position — see
+    // `update_hand_cell`). `set_voice_hand` → `VoiceChannelRequest::SetHand`
+    // updates it; the publisher republishes it each heartbeat. Kept in
+    // lockstep with `voice_mute_flags` on Join/Leave.
+    let mut voice_hand_flags: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    > = std::collections::HashMap::new();
+
     // ZEB-351 Voice V3: (community, channel) → the monotone presence-beacon `seq`
     // counter SHARED between that channel's heartbeat publisher and the immediate
     // mute beacon fired on `SetMuted`. Both draw strictly-increasing `seq`s from
@@ -4626,6 +4640,17 @@ pub async fn run(
                                         (community_id, channel_id),
                                         std::sync::Arc::clone(&mute_flag),
                                     );
+                                    // ZEB-612: shared raised-hand cell (0 = lowered;
+                                    // else wall-clock ms of the first raise).
+                                    // `SetHand` updates it; each heartbeat
+                                    // republishes it.
+                                    let hand_flag = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicU64::new(0),
+                                    );
+                                    voice_hand_flags.insert(
+                                        (community_id, channel_id),
+                                        std::sync::Arc::clone(&hand_flag),
+                                    );
                                     // Shared monotone beacon `seq` source for both
                                     // the publisher loop and the `SetMuted`
                                     // immediate beacon (see voice_presence_seq).
@@ -4658,6 +4683,7 @@ pub async fn run(
                                         caps.self_device,
                                         caps.joined_hlc.clone(),
                                         mute_flag,
+                                        hand_flag,
                                         std::sync::Arc::clone(&self_kicked_flag),
                                         seq_counter,
                                         Duration::from_secs(4),
@@ -4929,8 +4955,10 @@ pub async fn run(
                         voice_moderation_seq.remove(&(community_id, channel_id));
                         // ZEB-351 Voice V3: drop the shared mute flag in lockstep
                         // with the media key so a later `SetMuted` for a left
-                        // channel is a no-op.
+                        // channel is a no-op. ZEB-612: ditto the hand cell — a
+                        // rejoin starts hand-lowered.
                         voice_mute_flags.remove(&(community_id, channel_id));
+                        voice_hand_flags.remove(&(community_id, channel_id));
                         voice_presence_seq.remove(&(community_id, channel_id));
                         // Media leg: drop the cached key + abort the sub.
                         voice_keys.remove(&(community_id, channel_id));
@@ -4997,6 +5025,13 @@ pub async fn run(
                                 );
                                 let seq = seq_counter
                                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                // ZEB-612: carry the CURRENT hand state so an
+                                // immediate mute beacon never silently lowers a
+                                // raised hand (the beacon is whole-state).
+                                let hand = voice_hand_flags
+                                    .get(&(community_id, channel_id))
+                                    .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+                                    .and_then(|hr| (hr != 0).then_some(hr));
                                 if let Err(e) = crate::voice_presence::publish_presence_once(
                                     &session,
                                     &pres_topic,
@@ -5009,6 +5044,7 @@ pub async fn run(
                                     joined_hlc,
                                     seq,
                                     muted,
+                                    hand,
                                 )
                                 .await
                                 {

@@ -74,6 +74,10 @@ fn voice_packet_v2_wire_bytes_pinned() {
 
 /// Fully deterministic signed+sealed presence beacon: fixed device-#2 key
 /// `[7u8; 32]`, fixed `joined_hlc`, `seq = 1`, sealed with a zeroed nonce.
+/// `hand: None` (ZEB-612) is skipped on the wire, so this fixture's pinned
+/// bytes are the byte-identity proof that a lowered-hand beacon is unchanged
+/// from the pre-ZEB-612 wire — and its round-trip proves old bytes decode
+/// with `hand` defaulting to `None`.
 fn fixture_signed_beacon() -> SignedVoicePresenceBeacon {
     let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let beacon = VoicePresenceBeacon {
@@ -87,6 +91,7 @@ fn fixture_signed_beacon() -> SignedVoicePresenceBeacon {
         },
         seq: 1,
         left: false,
+        hand: None,
     };
     sign_presence_beacon(beacon, &sk).expect("sign")
 }
@@ -119,6 +124,55 @@ fn presence_beacon_wire_bytes_pinned() {
     let opened = open_presence_beacon(&key, &SpaceId([0xc0; 16]), &ChannelId([0xc1; 16]), &sealed)
         .expect("open pinned beacon");
     assert_eq!(opened, signed, "pinned beacon decoded to a different value");
+}
+
+/// ZEB-612: pin the sealed presence beacon WITH a raised hand. Differs from
+/// the lowered-hand fixture above by exactly the appended `hd` map entry
+/// (declaration order puts it last). Same key/nonce/identity as that fixture.
+#[test]
+fn presence_beacon_with_hand_wire_bytes_pinned() {
+    let key = derive_channel_key(
+        &EpochKey::new([0x11; 32]),
+        &SpaceId([0xc0; 16]),
+        &ChannelId([0xc1; 16]),
+    );
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let beacon = VoicePresenceBeacon {
+        owner: [0xa1; 16],
+        device: sk.verifying_key().to_bytes(),
+        muted: true,
+        joined_hlc: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "aa".repeat(32),
+        },
+        seq: 1,
+        left: false,
+        hand: Some(1_720_000_000_000),
+    };
+    let signed = sign_presence_beacon(beacon, &sk).expect("sign");
+    let sealed = seal_presence_beacon_with_nonce(
+        &key,
+        &SpaceId([0xc0; 16]),
+        &ChannelId([0xc1; 16]),
+        &signed,
+        [0u8; 12],
+    )
+    .expect("seal");
+    // GENERATE-THEN-PIN: run once with a placeholder; paste the printed hex.
+    let expected = "0000000000000000000000000e3878f4a96cc7facd295c54d9b2ead07b7da6190b227548eee70d1a3bfb1a62432a5f6b46b27fa0a1a1cf8ea5ff27cf90893c2046dcbd473b2f4a6e69cc3094336f6cd54117eb973e6c9e1c18c23fccdff02a868b284897577a96163281e6eddc67c2a47da57b2b938ef9bbbdadc266f939bf5e5a54614313b1d70941bb27261068d5070606039a01f2c5308184bddf60ea0684e9db409d7f8341bbcc3429ad189a2f6bd4aa7ab063f9fa5a4f1ad97c7ac13d6dc185b274fcc11fed8580b2eaa4abb971890317974076e8118c66d234eee54a0f0908137b8044d75a9540a2037f88e8d565a7310da1f3dfd634fe5431706b3b1e20a034";
+    assert_eq!(
+        hex::encode(&sealed),
+        expected,
+        "sealed hand-raised presence-beacon wire format drifted"
+    );
+
+    // Round-trip: the pinned bytes must open back to the same signed beacon
+    // (proves `hd` survives sign → seal → open → verify).
+    let opened = open_presence_beacon(&key, &SpaceId([0xc0; 16]), &ChannelId([0xc1; 16]), &sealed)
+        .expect("open pinned hand beacon");
+    assert_eq!(opened, signed, "pinned hand beacon decoded differently");
+    assert_eq!(opened.beacon.hand, Some(1_720_000_000_000));
 }
 
 /// ZEB-360: pin the sealed group-DM presence beacon wire format. Wrapped with a

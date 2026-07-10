@@ -347,6 +347,7 @@ async fn run_inner() {
         device_a,
         joined_hlc.clone(),
         Arc::clone(&mute_flag_a),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)), // hand: lowered (ZEB-612)
         Arc::clone(&self_kicked_a),
         Arc::clone(&seq_counter_a),
         Duration::from_secs(4),
@@ -387,6 +388,7 @@ async fn run_inner() {
         },
         seq: 0,
         left: false,
+        hand: None,
     };
     let signed_rogue = sign_presence_beacon(rogue_beacon, &signing_r).expect("sign rogue beacon");
     // Sealed under the REAL channel key + scope: opens cleanly on B's side,
@@ -483,6 +485,7 @@ async fn run_inner() {
         },
         seq: 0,
         left: false,
+        hand: None,
     };
     let signed_c = sign_presence_beacon(canary_beacon, &signing_c).expect("sign canary beacon");
     let sealed_canary =
@@ -499,6 +502,7 @@ async fn run_inner() {
         joined_hlc: joined_hlc.clone(),
         seq: 1,
         left: false,
+        hand: None,
     };
     let signed_wrong =
         sign_presence_beacon(wrong_beacon, &signing_a).expect("sign wrong-scope beacon");
@@ -685,6 +689,7 @@ async fn run_inner() {
             joined_hlc: rejoin_hlc,
             seq: 0,
             left: false,
+            hand: None,
         };
         assert!(
             g.apply(&community, &channel, &beacon, 0),

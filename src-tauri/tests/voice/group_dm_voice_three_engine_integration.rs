@@ -428,6 +428,7 @@ async fn run_inner() {
         },
         seq: 0,
         left: false,
+        hand: None,
     };
     let signed_rogue = sign_presence_beacon(rogue_beacon, &signing_r).expect("sign rogue beacon");
     let wrapped_rogue = GroupSignedPresenceBeacon {
