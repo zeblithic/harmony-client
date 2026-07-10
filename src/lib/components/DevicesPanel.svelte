@@ -5,7 +5,11 @@
   import { loadDeviceLabel, saveDeviceLabel, resolveDefaultDeviceLabel } from '../device-label-service';
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
   import { fetchCommunitiesCount } from '../owner-meta';
-  import { markRecoveryBackedUp, recoveryBackedUpAtMs } from '../onboarding-backup-flags';
+  import {
+    BACKUP_FLAGS_CHANGED_EVENT,
+    markRecoveryBackedUp,
+    recoveryBackedUpAtMs,
+  } from '../onboarding-backup-flags';
   import {
     MAX_RECOVERY_COMMENT_BYTES,
     MIN_RECOVERY_PASSPHRASE_LEN,
@@ -14,6 +18,7 @@
   import PairingJoiner from './PairingJoiner.svelte';
   import Modal from './Modal.svelte';
   import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
+  import OwnerPhraseReveal from './OwnerPhraseReveal.svelte';
 
   let svc = new OwnerService();
   let state = $state<OwnerStateView | null>(null);
@@ -57,6 +62,18 @@
         }
       })();
     }
+  });
+
+  // Keep "Last backed up" fresh when ANY surface marks backed-up while this
+  // panel is mounted — e.g. the phrase-reveal checkbox in the modal below, or
+  // the reminder banner's inline backup (ZEB-650 slice 2).
+  $effect(() => {
+    const refresh = () => {
+      const oid = state?.ownerId ?? null;
+      lastBackedUpMs = oid ? recoveryBackedUpAtMs(oid) : null;
+    };
+    window.addEventListener(BACKUP_FLAGS_CHANGED_EVENT, refresh);
+    return () => window.removeEventListener(BACKUP_FLAGS_CHANGED_EVENT, refresh);
   });
 
   // Per-device label (owner-private). Seeded from the store; defaulted to the
@@ -117,6 +134,9 @@
   let joinerOpen = $state(false);
 
   let backupOpen = $state(false);
+  // ZEB-650 slice 2: owner recovery-phrase modal open/closed. Closing
+  // unmounts OwnerPhraseReveal, which drops the word state (spec §3.2).
+  let phraseOpen = $state(false);
   // ZEB-454: owner-mnemonic restore wizard open/closed.
   let restoreOpen = $state(false);
   let backupPassphrase = $state('');
@@ -434,6 +454,15 @@
           >
             Back up owner identity →
           </button>
+          <button
+            class="secondary"
+            data-testid="devices-view-phrase"
+            disabled={!state.canBackUp}
+            title={state.canBackUp ? '' : 'Master seed not on this device — the recovery phrase can no longer be shown.'}
+            onclick={() => { phraseOpen = true; }}
+          >
+            View recovery phrase
+          </button>
         </div>
         <!-- ZEB-454: re-adopt this owner identity from its 24-word recovery
              phrase (the GUI analog of `restore owner-mnemonic`). -->
@@ -594,6 +623,13 @@
           </button>
         </div>
       {/if}
+    </Modal>
+  {/if}
+
+  {#if phraseOpen && state !== null}
+    <Modal onCancel={() => { phraseOpen = false; }} ariaLabelledby="phrase-modal-heading">
+      <h3 class="modal-title" id="phrase-modal-heading">Owner recovery phrase</h3>
+      <OwnerPhraseReveal ownerId={state.ownerId} />
     </Modal>
   {/if}
 
