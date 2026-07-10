@@ -27306,6 +27306,292 @@ pub struct RedeemInviteResultDto {
     pub status: Option<String>,
 }
 
+/// ZEB-650 slice 3 (spec §4.1): pure-local invite preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitePreviewDto {
+    pub community_name: String,
+    pub is_invite_only: bool,
+    /// True iff the payload is invite-only AND the full inviter chain
+    /// verifies (`verify_inviter_enrollment`: Master cert validity +
+    /// owner binding + token sig over canonical bytes). The ✓ is scoped
+    /// to inviter authorization — it does NOT authenticate the payload's
+    /// name/snapshot, which is why no member/channel counts are exposed.
+    pub inviter_verified: bool,
+    /// `xxxx·xxxx` short fingerprint of `token.inviter`; None when the
+    /// invite carries no token (open communities).
+    pub inviter_fingerprint: Option<String>,
+    /// Always None in this slice: local name resolution (friend
+    /// nicknames / ZEB-281 profiles) is engine-async today. Field kept so
+    /// the wire shape is stable when resolution lands; the frontend falls
+    /// back to the fingerprint.
+    pub inviter_display_name: Option<String>,
+    pub expired: bool,
+}
+
+/// Decode + verify + expiry-evaluate an invite URL. Pure local
+/// computation: mints nothing, joins nothing, no network, no NodeState —
+/// the only inputs are the pasted URL string and the clock.
+pub(crate) fn preview_invite_impl(url: &str, now_ms: u64) -> Result<InvitePreviewDto, String> {
+    let payload = crate::community_invite::decode_invite_url(url).map_err(|e| e.to_string())?;
+    // Spec §4.1: evaluate both the (in-practice unused) payload-level Hlc
+    // expiry and the token's wall-clock-ms expiry. `now >= exp` matches
+    // verify_packet_pure / orphan_dir_adoption_eligible.
+    let payload_expired = payload
+        .expires_at
+        .as_ref()
+        .is_some_and(|hlc| now_ms >= hlc.wall_ms);
+    let token_expired = payload
+        .invite_token
+        .as_ref()
+        .and_then(|t| t.expires_at)
+        .is_some_and(|exp| now_ms >= exp);
+    // verify_inviter_enrollment is Ok(()) unconditionally for open
+    // payloads, so gate on is_invite_only — open invites carry no
+    // verifiable chain and must never show the ✓.
+    let inviter_verified = payload.is_invite_only
+        && crate::community_invite::verify_inviter_enrollment(&payload, now_ms / 1000).is_ok();
+    let inviter_fingerprint = payload
+        .invite_token
+        .as_ref()
+        .map(|t| crate::owner_commands::format_fingerprint(&t.inviter.0));
+    Ok(InvitePreviewDto {
+        community_name: payload.community_name,
+        is_invite_only: payload.is_invite_only,
+        inviter_verified,
+        inviter_fingerprint,
+        inviter_display_name: None,
+        expired: payload_expired || token_expired,
+    })
+}
+
+/// ZEB-650 slice 3: preview a pasted invite URL without redeeming it.
+/// Sync on purpose — bounded CPU work (base64 + CBOR decode + one ed25519
+/// verify), no awaits, no locks.
+#[tauri::command]
+fn preview_invite(url: String) -> Result<InvitePreviewDto, String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    preview_invite_impl(&url, now_ms)
+}
+
+#[cfg(test)]
+mod preview_invite_tests {
+    use super::*;
+    use crate::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, MaterializedCommunityState,
+    };
+    use crate::community_membership::{
+        mint_test_owner, MembershipEventKind, SignedMembershipEvent, TestOwner,
+    };
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    /// Fixed "now" inside mint_test_owner's cert validity window.
+    const NOW_MS: u64 = 1_700_000_000_000;
+
+    fn open_payload() -> CommunityInvitePayload {
+        CommunityInvitePayload {
+            community_id: SpaceId([7; 16]),
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0u8; 32],
+                sealed_epoch_keys: Vec::new(),
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: OwnerAddr([0x11; 16]),
+            community_name: "DoorClub".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: None,
+            untargeted_decrypt_key: None,
+        }
+    }
+
+    /// Invite-only payload with a REAL signature chain: token signed by the
+    /// inviter's device key, inviter_enrollment = the inviter's Master cert.
+    /// Decode-guard fields (bootstrap / 92-byte key / untargeted key) are
+    /// shape-valid stubs — `verify_inviter_enrollment` doesn't check them.
+    fn invite_only_payload(token_expires_at: Option<u64>) -> (CommunityInvitePayload, TestOwner) {
+        let inviter = mint_test_owner(0x42);
+        let token = crate::invite_mint::mint_invite_token(
+            inviter.owner,
+            None,
+            Hlc {
+                wall_ms: NOW_MS - 1_000,
+                logical: 0,
+                device_id: "inv-dev".into(),
+            },
+            token_expires_at,
+            &inviter.device_key,
+        )
+        .expect("mint token");
+        let admin_bootstrap = SignedMembershipEvent {
+            id: [0u8; 16],
+            community_id: SpaceId([9; 16]),
+            kind: MembershipEventKind::Join,
+            actor: inviter.owner,
+            at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: Some(mint_test_owner(0x6E).cert),
+        };
+        let payload = CommunityInvitePayload {
+            community_id: SpaceId([9; 16]),
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0u8; 92],
+                sealed_epoch_keys: Vec::new(),
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: inviter.owner,
+            community_name: "Cascadia Commons".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(token),
+            admin_bootstrap: Some(admin_bootstrap),
+            admin_identity_pub: Some([0u8; 64]),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(inviter.cert.clone()),
+            untargeted_decrypt_key: Some([0x99; 32]),
+        };
+        (payload, inviter)
+    }
+
+    fn expected_fingerprint(owner: &TestOwner) -> String {
+        let hex = hex::encode(owner.owner.0);
+        format!("{}·{}", &hex[..4], &hex[4..8])
+    }
+
+    #[test]
+    fn open_invite_previews_unverified_and_unexpired() {
+        let url = build_open_invite_url(&open_payload()).expect("url");
+        let dto = preview_invite_impl(&url, NOW_MS).expect("preview");
+        assert_eq!(dto.community_name, "DoorClub");
+        assert!(!dto.is_invite_only);
+        assert!(!dto.inviter_verified, "open invites carry no token chain");
+        assert_eq!(dto.inviter_fingerprint, None);
+        assert_eq!(dto.inviter_display_name, None);
+        assert!(!dto.expired);
+    }
+
+    #[test]
+    fn invite_only_valid_chain_previews_verified_with_fingerprint() {
+        let (payload, inviter) = invite_only_payload(Some(NOW_MS + 60_000));
+        let url = encode_invite_url(&payload).expect("url");
+        let dto = preview_invite_impl(&url, NOW_MS).expect("preview");
+        assert_eq!(dto.community_name, "Cascadia Commons");
+        assert!(dto.is_invite_only);
+        assert!(dto.inviter_verified);
+        assert_eq!(
+            dto.inviter_fingerprint.as_deref(),
+            Some(expected_fingerprint(&inviter).as_str())
+        );
+        assert_eq!(dto.inviter_display_name, None);
+        assert!(!dto.expired);
+    }
+
+    #[test]
+    fn tampered_token_sig_previews_unverified_not_error() {
+        let (mut payload, inviter) = invite_only_payload(Some(NOW_MS + 60_000));
+        payload.invite_token.as_mut().expect("token").sig[0] ^= 0x01;
+        let url = encode_invite_url(&payload).expect("url");
+        let dto = preview_invite_impl(&url, NOW_MS).expect("preview is not an error");
+        assert!(!dto.inviter_verified, "forged sig must not verify");
+        // The card still shows name + fingerprint honestly.
+        assert_eq!(dto.community_name, "Cascadia Commons");
+        assert_eq!(
+            dto.inviter_fingerprint.as_deref(),
+            Some(expected_fingerprint(&inviter).as_str())
+        );
+        assert!(!dto.expired);
+    }
+
+    #[test]
+    fn expired_token_flags_expired() {
+        let (payload, _) = invite_only_payload(Some(NOW_MS - 1));
+        let url = encode_invite_url(&payload).expect("url");
+        let dto = preview_invite_impl(&url, NOW_MS).expect("preview");
+        assert!(dto.expired);
+        assert!(
+            dto.inviter_verified,
+            "expiry and sig validity are independent"
+        );
+    }
+
+    #[test]
+    fn boundary_now_equal_expiry_is_expired() {
+        let (payload, _) = invite_only_payload(Some(NOW_MS));
+        let url = encode_invite_url(&payload).expect("url");
+        assert!(preview_invite_impl(&url, NOW_MS).expect("preview").expired);
+    }
+
+    #[test]
+    fn payload_level_expiry_flags_expired() {
+        let mut payload = open_payload();
+        payload.expires_at = Some(Hlc {
+            wall_ms: NOW_MS - 1,
+            logical: 0,
+            device_id: "t".into(),
+        });
+        let url = build_open_invite_url(&payload).expect("url");
+        assert!(preview_invite_impl(&url, NOW_MS).expect("preview").expired);
+    }
+
+    #[test]
+    fn malformed_urls_err() {
+        assert!(preview_invite_impl("https://not-an-invite", NOW_MS).is_err());
+        assert!(preview_invite_impl("harmony://invite/%%not-base64%%", NOW_MS).is_err());
+    }
+
+    /// Purity is by-construction — `preview_invite_impl` takes only the URL
+    /// string and a clock, no NodeState/registry/paths — so "mints nothing,
+    /// mutates nothing" cannot regress without a signature change. This test
+    /// pins determinism: identical inputs, identical outputs.
+    #[test]
+    fn preview_is_deterministic() {
+        let (payload, _) = invite_only_payload(Some(NOW_MS + 60_000));
+        let url = encode_invite_url(&payload).expect("url");
+        let a = preview_invite_impl(&url, NOW_MS).expect("a");
+        let b = preview_invite_impl(&url, NOW_MS).expect("b");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dto_serializes_camel_case() {
+        let dto = InvitePreviewDto {
+            community_name: "X".into(),
+            is_invite_only: true,
+            inviter_verified: true,
+            inviter_fingerprint: Some("ab12·cd34".into()),
+            inviter_display_name: None,
+            expired: false,
+        };
+        let v = serde_json::to_value(&dto).expect("json");
+        for key in [
+            "communityName",
+            "isInviteOnly",
+            "inviterVerified",
+            "inviterFingerprint",
+            "inviterDisplayName",
+            "expired",
+        ] {
+            assert!(v.get(key).is_some(), "missing camelCase key {key}");
+        }
+    }
+}
+
 /// Wire shape of the `nav-updated` IPC event. Mirrors the frontend
 /// `NavUpdatedPayload` interface in `src/lib/nav-service.ts`. `action`
 /// values are `"added" | "removed" | "modified"`; `kind` values are
@@ -52959,6 +53245,7 @@ pub fn run() {
             generate_invite,
             create_community,
             redeem_invite,
+            preview_invite,
             join_open_community,
             leave_community,
             remove_space,

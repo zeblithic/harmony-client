@@ -371,3 +371,174 @@ describe('RedeemInviteDialog', () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZEB-650 slice 3: debounced pure-local invite preview card.
+//
+// The `preview_invite` IPC is pure local computation (decode + token-sig
+// verify + expiry) — no join, no network — so firing it on keystroke settle
+// is safe. The card must stay honest per ZEB-610 §0.4: community name and
+// inviter authorization only, never member/channel counts (the standing
+// guard above also covers this).
+// ─────────────────────────────────────────────────────────────────────────────
+describe('RedeemInviteDialog invite preview (ZEB-650 slice 3)', () => {
+  const VALID_URL = 'harmony://invite/v1?ci=abc';
+  const PREVIEW = {
+    communityName: 'Cascadia Commons',
+    isInviteOnly: true,
+    inviterVerified: true,
+    inviterFingerprint: 'ab12·cd34',
+    inviterDisplayName: null as string | null,
+    expired: false,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function mockPreview(dto: Partial<typeof PREVIEW> | Error) {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'preview_invite') {
+        return dto instanceof Error
+          ? Promise.reject(dto)
+          : Promise.resolve({ ...PREVIEW, ...dto });
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  function renderDialog() {
+    return render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+  }
+
+  async function typeUrl(
+    utils: { getByPlaceholderText: (m: RegExp) => HTMLElement },
+    value: string,
+  ) {
+    const input = utils.getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value } });
+  }
+
+  it('debounces: no preview IPC before settle, exactly one call after', async () => {
+    mockPreview({});
+    const utils = renderDialog();
+    await typeUrl(utils, 'harmony://invite/v1?ci=a');
+    await typeUrl(utils, 'harmony://invite/v1?ci=ab');
+    await typeUrl(utils, VALID_URL);
+    expect(mockInvoke).not.toHaveBeenCalledWith('preview_invite', expect.anything());
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('preview_invite', { url: VALID_URL });
+    });
+    const previewCalls = mockInvoke.mock.calls.filter(
+      (call: unknown[]) => call[0] === 'preview_invite',
+    );
+    expect(previewCalls.length).toBe(1);
+  });
+
+  it('renders the card: name, invite-only chip, verified line with fingerprint fallback', async () => {
+    mockPreview({});
+    const utils = renderDialog();
+    await typeUrl(utils, VALID_URL);
+    const card = await waitFor(() => utils.getByTestId('redeem-preview-card'));
+    expect(card.textContent).toContain('Cascadia Commons');
+    expect(utils.getByTestId('preview-invite-only-chip')).toBeTruthy();
+    const verified = utils.getByTestId('preview-verified');
+    expect(verified.textContent).toMatch(/invite signature verified/i);
+    expect(verified.textContent).toContain('ab12·cd34');
+  });
+
+  it('prefers the display name over the fingerprint when present', async () => {
+    mockPreview({ inviterDisplayName: 'Mara Okafor' });
+    const utils = renderDialog();
+    await typeUrl(utils, VALID_URL);
+    const line = await waitFor(() => utils.getByTestId('preview-verified'));
+    expect(line.textContent).toContain('Mara Okafor');
+    expect(line.textContent).not.toContain('ab12·cd34');
+  });
+
+  it('unverified invite shows the neutral line, not an error', async () => {
+    mockPreview({ inviterVerified: false, isInviteOnly: false });
+    const utils = renderDialog();
+    await typeUrl(utils, VALID_URL);
+    const line = await waitFor(() => utils.getByTestId('preview-unverified'));
+    expect(line.textContent).toMatch(/signature not verifiable/i);
+    expect(utils.queryByTestId('preview-verified')).toBeNull();
+    expect(utils.queryByTestId('preview-invite-only-chip')).toBeNull();
+  });
+
+  it('expired invite shows the notice and disables Redeem', async () => {
+    mockPreview({ expired: true });
+    const utils = renderDialog();
+    await typeUrl(utils, VALID_URL);
+    await waitFor(() => utils.getByTestId('preview-expired'));
+    const redeem = utils.getByTestId('iroh-redeem-btn') as HTMLButtonElement;
+    expect(redeem.disabled).toBe(true);
+  });
+
+  it('preview failure shows only the invalid-link line and keeps the dialog usable', async () => {
+    mockPreview(new Error('decode: bad'));
+    const utils = renderDialog();
+    await typeUrl(utils, VALID_URL);
+    const invalid = await waitFor(() => utils.getByTestId('redeem-preview-invalid'));
+    expect(invalid.textContent).toMatch(/looks invalid/i);
+    expect(utils.queryByTestId('redeem-preview-card')).toBeNull();
+    const redeem = utils.getByTestId('iroh-redeem-btn') as HTMLButtonElement;
+    expect(redeem.disabled).toBe(false);
+    const cancel = utils.getByText('Cancel') as HTMLButtonElement;
+    expect(cancel.disabled).toBe(false);
+  });
+
+  // Editing from one valid invite URL to another must not leave the previous
+  // URL's card (or its expired/verified verdicts) visible during the new
+  // URL's debounce + IPC window (Qodo/CodeRabbit PR #438).
+  it('editing to a different valid URL clears the stale card immediately', async () => {
+    const URL_A = 'harmony://invite/v1?ci=aaa';
+    const URL_B = 'harmony://invite/v1?ci=bbb';
+    mockInvoke.mockImplementation((cmd: string, args?: { url?: string }) => {
+      if (cmd === 'preview_invite') {
+        return Promise.resolve({
+          ...PREVIEW,
+          communityName: args?.url === URL_A ? 'First Commons' : 'Second Commons',
+          expired: args?.url === URL_A,
+        });
+      }
+      return Promise.resolve(null);
+    });
+    const utils = renderDialog();
+    await typeUrl(utils, URL_A);
+    const card = await waitFor(() => utils.getByTestId('redeem-preview-card'));
+    expect(card.textContent).toContain('First Commons');
+    const redeem = utils.getByTestId('iroh-redeem-btn') as HTMLButtonElement;
+    expect(redeem.disabled).toBe(true); // URL A is expired
+
+    await typeUrl(utils, URL_B);
+    // Stale card and stale expired-gate must be gone synchronously, before
+    // the new debounce resolves.
+    expect(utils.queryByTestId('redeem-preview-card')).toBeNull();
+    expect(redeem.disabled).toBe(false);
+
+    const newCard = await waitFor(() => utils.getByTestId('redeem-preview-card'));
+    expect(newCard.textContent).toContain('Second Commons');
+    expect(newCard.textContent).not.toContain('First Commons');
+  });
+
+  it('clearing to an invalid format removes the card', async () => {
+    mockPreview({});
+    const utils = renderDialog();
+    await typeUrl(utils, VALID_URL);
+    await waitFor(() => utils.getByTestId('redeem-preview-card'));
+    await typeUrl(utils, 'nonsense');
+    expect(utils.queryByTestId('redeem-preview-card')).toBeNull();
+  });
+
+  it('renders no member or channel counts on the preview card', async () => {
+    mockPreview({});
+    const utils = renderDialog();
+    await typeUrl(utils, VALID_URL);
+    await waitFor(() => utils.getByTestId('redeem-preview-card'));
+    expect(utils.queryByText(/\d+\s+members/i)).toBeNull();
+    expect(utils.queryByText(/\d+\s+channels/i)).toBeNull();
+  });
+});
