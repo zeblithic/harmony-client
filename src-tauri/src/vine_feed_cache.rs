@@ -119,6 +119,19 @@ pub struct ReactionSummary {
     pub liked_by_me: bool,
 }
 
+/// Flat reaction row for the `list_vine_reactions` IPC (ZEB-672).
+/// Mirrors the `vine-reaction-received` event payload shape so the
+/// frontend hydrate merge and the live handler share one wire model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VineReactionRow {
+    pub vine_id: String,
+    pub reactor_address: String,
+    pub reactor_name: String,
+    pub liked: bool,
+    pub timestamp: u64,
+}
+
 /// Frontend-facing DTO carrying the `source` tag. Mirrors `VineVideoDto`
 /// plus the `source` discriminator the frontend already consumes from
 /// the `vine-received` Tauri event payload.
@@ -533,6 +546,31 @@ impl VineFeedCache {
             }
         }
         ReactionSummary { count, liked_by_me }
+    }
+
+    /// All cached reaction rows (liked and unliked), sorted by
+    /// `(vine_id, reactor_address)` for deterministic output. Orphan rows
+    /// never appear: `load()` prunes reactions whose descriptor was
+    /// dropped. ZEB-672: feeds the `list_vine_reactions` IPC so a
+    /// restarted frontend can rebuild its reaction map — live
+    /// `vine-reaction-received` events never re-fire for reloaded rows.
+    pub fn list_reactions(&self) -> Vec<VineReactionRow> {
+        let mut rows: Vec<VineReactionRow> = self
+            .reactions
+            .iter()
+            .map(|((vine_id, reactor_address), r)| VineReactionRow {
+                vine_id: vine_id.clone(),
+                reactor_address: reactor_address.clone(),
+                reactor_name: r.reactor_name.clone(),
+                liked: r.liked,
+                timestamp: r.timestamp,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            (a.vine_id.as_str(), a.reactor_address.as_str())
+                .cmp(&(b.vine_id.as_str(), b.reactor_address.as_str()))
+        });
+        rows
     }
 
     /// Mark a vine viewed by this local peer. Local-only in this PR —
@@ -1499,6 +1537,81 @@ mod tests {
         let summary = cache2.get_reaction("vine-ri", "bob-addr");
         assert_eq!(summary.count, 1);
         assert!(summary.liked_by_me);
+    }
+
+    #[test]
+    fn list_reactions_returns_rows_after_reload() {
+        // ZEB-672: the frontend rebuilds its reaction map from these rows
+        // at boot — live vine-reaction-received events never re-fire for
+        // cache-reloaded reactions, so this query is the only recovery
+        // path. Unliked rows are included (the frontend merge skips them).
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let recent = now_secs.saturating_sub(60);
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let followed = followed_set_with(&["alice-addr"]);
+            let desc = canonical_descriptor_bytes(
+                "vine-lr",
+                "alice-addr",
+                "Alice",
+                "cid",
+                None,
+                None,
+                recent,
+                None,
+                None,
+            );
+            cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            let r1 = canonical_reaction_bytes("vine-lr", "bob-addr", "Bob", true, recent + 10);
+            cache.on_reaction_sample("harmony/vines/alice-addr/reactions/vine-lr/bob-addr", &r1);
+            let r2 = canonical_reaction_bytes("vine-lr", "ann-addr", "Ann", false, recent + 11);
+            cache.on_reaction_sample("harmony/vines/alice-addr/reactions/vine-lr/ann-addr", &r2);
+        }
+        let cache2 = VineFeedCache::load(dir.path());
+        let rows = cache2.list_reactions();
+        assert_eq!(rows.len(), 2);
+        // Sorted by (vine_id, reactor_address): ann-addr before bob-addr.
+        assert_eq!(
+            rows[0],
+            VineReactionRow {
+                vine_id: "vine-lr".to_string(),
+                reactor_address: "ann-addr".to_string(),
+                reactor_name: "Ann".to_string(),
+                liked: false,
+                timestamp: recent + 11,
+            }
+        );
+        assert_eq!(rows[1].reactor_address, "bob-addr");
+        assert!(rows[1].liked);
+        assert_eq!(rows[1].timestamp, recent + 10);
+    }
+
+    #[test]
+    fn vine_reaction_row_serializes_camel_case() {
+        // Pins the wire shape the frontend hydrate merge consumes —
+        // must match the vine-reaction-received event payload keys.
+        let row = VineReactionRow {
+            vine_id: "v1".to_string(),
+            reactor_address: "addr-1".to_string(),
+            reactor_name: "Nia".to_string(),
+            liked: true,
+            timestamp: 42,
+        };
+        let v = serde_json::to_value(&row).expect("serialize");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "vineId": "v1",
+                "reactorAddress": "addr-1",
+                "reactorName": "Nia",
+                "liked": true,
+                "timestamp": 42,
+            })
+        );
     }
 
     #[test]

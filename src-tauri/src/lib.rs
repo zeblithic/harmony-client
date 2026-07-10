@@ -13174,6 +13174,36 @@ fn list_vine_videos(
     list_vine_videos_impl(state.inner())
 }
 
+/// Shared seam for `list_vine_reactions` (GUI command + headless RPC):
+/// return all persisted reaction rows so a restarted frontend can rebuild
+/// its reaction map — live `vine-reaction-received` events only fire on
+/// first receipt, never for cache-reloaded rows (ZEB-672).
+///
+/// Returns `Err("not connected")` if the node is not running.
+pub(crate) fn list_vine_reactions_impl(
+    state: &Mutex<NodeState>,
+) -> Result<Vec<crate::vine_feed_cache::VineReactionRow>, String> {
+    let cache = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .vine_feed_cache
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let result = cache
+        .lock()
+        .map_err(|e| format!("vine_feed_cache lock: {e}"))?
+        .list_reactions();
+    Ok(result)
+}
+
+#[tauri::command]
+fn list_vine_reactions(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<crate::vine_feed_cache::VineReactionRow>, String> {
+    list_vine_reactions_impl(state.inner())
+}
+
 #[tauri::command]
 async fn follow_vine_creator(
     address: String,
@@ -53304,6 +53334,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_vine_videos,
+            list_vine_reactions,
             follow_vine_creator,
             unfollow_vine_creator,
             list_followed,
