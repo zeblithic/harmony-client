@@ -59,7 +59,8 @@ fn build_heartbeat_beacon_reflects_atomic_across_flip() {
     let device = [0x22; 32];
     let flag = Arc::new(AtomicBool::new(true));
 
-    let muted_beacon = build_heartbeat_beacon(owner, device, &hlc, 0, flag.load(Ordering::SeqCst), None);
+    let muted_beacon =
+        build_heartbeat_beacon(owner, device, &hlc, 0, flag.load(Ordering::SeqCst), None);
     assert!(
         muted_beacon.muted,
         "flag=true ⇒ beacon muted (start-muted join state)"

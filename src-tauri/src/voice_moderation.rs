@@ -321,6 +321,16 @@ impl TargetState {
     }
 }
 
+/// The currently-enforced targets of one `(community, channel)`, one owner
+/// list per enforcement class. Returned by [`ActiveModeration::snapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModerationSnapshot {
+    pub muted: Vec<[u8; 16]>,
+    pub kicked: Vec<[u8; 16]>,
+    /// ZEB-612: owners holding an unexpired invite-to-speak.
+    pub invited: Vec<[u8; 16]>,
+}
+
 /// In-memory enforcement state: which owners are currently muted/kicked/
 /// invited-to-speak per (community, channel). Never persisted. Three
 /// independent classes per target (mute-class {Mute,Unmute}, kick-class
@@ -498,17 +508,9 @@ impl ActiveModeration {
         self.inner.remove(&(*c, *ch));
     }
 
-    /// Enumerate currently-enforced targets in (c, ch):
-    /// (muted_owners, kicked_owners, invited_owners).
-    pub fn snapshot(
-        &self,
-        c: &SpaceId,
-        ch: &ChannelId,
-        now_ms: u64,
-    ) -> (Vec<[u8; 16]>, Vec<[u8; 16]>, Vec<[u8; 16]>) {
-        let mut muted = Vec::new();
-        let mut kicked = Vec::new();
-        let mut invited = Vec::new();
+    /// Enumerate currently-enforced targets in (c, ch), one list per class.
+    pub fn snapshot(&self, c: &SpaceId, ch: &ChannelId, now_ms: u64) -> ModerationSnapshot {
+        let mut snap = ModerationSnapshot::default();
         if let Some(targets) = self.inner.get(&(*c, *ch)) {
             for (owner, t) in targets {
                 let live = |slot: &Option<ClassState>| {
@@ -516,17 +518,17 @@ impl ActiveModeration {
                         .is_some_and(|s| s.enforced && now_ms < s.enforce_until_ms)
                 };
                 if live(&t.mute) {
-                    muted.push(*owner);
+                    snap.muted.push(*owner);
                 }
                 if live(&t.kick) {
-                    kicked.push(*owner);
+                    snap.kicked.push(*owner);
                 }
                 if live(&t.invite) {
-                    invited.push(*owner);
+                    snap.invited.push(*owner);
                 }
             }
         }
-        (muted, kicked, invited)
+        snap
     }
 
     /// Number of target rows currently retained for `(c, ch)` (enforced or not).
@@ -774,17 +776,17 @@ mod tests {
         inv.seq = 1;
         assert!(am.apply(&C, &CH, &inv, 1_000, ENFORCE_TTL_MS));
 
-        let (muted, kicked, invited) = am.snapshot(&C, &CH, 1_000);
-        assert_eq!(muted, vec![[0xBB; 16]]);
-        assert_eq!(kicked, vec![[0xDD; 16]]);
-        assert_eq!(invited, vec![[0xEE; 16]]);
+        let snap = am.snapshot(&C, &CH, 1_000);
+        assert_eq!(snap.muted, vec![[0xBB; 16]]);
+        assert_eq!(snap.kicked, vec![[0xDD; 16]]);
+        assert_eq!(snap.invited, vec![[0xEE; 16]]);
 
         // After both TTLs lapse (sweep marks them un-enforced), snapshot is empty.
         am.sweep(1_000 + ENFORCE_TTL_MS);
-        let (muted, kicked, invited) = am.snapshot(&C, &CH, 1_000 + ENFORCE_TTL_MS);
-        assert!(muted.is_empty());
-        assert!(kicked.is_empty());
-        assert!(invited.is_empty());
+        let snap = am.snapshot(&C, &CH, 1_000 + ENFORCE_TTL_MS);
+        assert!(snap.muted.is_empty());
+        assert!(snap.kicked.is_empty());
+        assert!(snap.invited.is_empty());
     }
 
     use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};

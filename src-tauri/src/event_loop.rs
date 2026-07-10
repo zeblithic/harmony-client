@@ -480,7 +480,7 @@ async fn emit_moderation_changed(
     self_owner: crate::owner_state_types::OwnerAddr,
     now_ms: u64,
 ) {
-    let (muted, kicked, invited) = {
+    let snap = {
         let g = moderation_map.lock().await;
         g.snapshot(&community, &channel, now_ms)
     };
@@ -521,16 +521,16 @@ async fn emit_moderation_changed(
         &serde_json::json!({
             "community": hex::encode(community.0),
             "channel": hex::encode(channel.0),
-            "mutedOwners": muted.iter().map(hex::encode).collect::<Vec<_>>(),
-            "kickedOwners": kicked.iter().map(hex::encode).collect::<Vec<_>>(),
+            "mutedOwners": snap.muted.iter().map(hex::encode).collect::<Vec<_>>(),
+            "kickedOwners": snap.kicked.iter().map(hex::encode).collect::<Vec<_>>(),
             // ZEB-612: owners holding an unexpired invite-to-speak, plus
             // whether WE are invited (drives the "Unmute?" banner).
-            "invitedOwners": invited.iter().map(hex::encode).collect::<Vec<_>>(),
+            "invitedOwners": snap.invited.iter().map(hex::encode).collect::<Vec<_>>(),
             "powers": powers,
             "selfPower": power_of(&self_owner.0),
-            "selfModMuted": muted.contains(&self_owner.0),
-            "selfKicked": kicked.contains(&self_owner.0),
-            "selfInvited": invited.contains(&self_owner.0),
+            "selfModMuted": snap.muted.contains(&self_owner.0),
+            "selfKicked": snap.kicked.contains(&self_owner.0),
+            "selfInvited": snap.invited.contains(&self_owner.0),
         }),
     );
 }
