@@ -1,6 +1,4 @@
 import type {
-  PeerRef,
-  StorageBuddy,
   ContentItem,
   PublishedItem,
   CleanupRecommendation,
@@ -8,32 +6,6 @@ import type {
 
 const day = 86_400_000;
 const now = Date.now();
-
-// ── Peers ───────────────────────────────────────────────────────────
-
-export const mockPeers: PeerRef[] = [
-  { address: 'a1b2c3d4e5f6a1b2', displayName: 'Alice' },
-  { address: 'b2c3d4e5f6a1b2c3', displayName: 'Bob' },
-  { address: 'c3d4e5f6a1b2c3d4', displayName: 'Carol' },
-  { address: 'd4e5f6a1b2c3d4e5', displayName: 'Dave' },
-];
-
-// ── Storage Buddies ─────────────────────────────────────────────────
-
-export const mockStorageBuddies: StorageBuddy[] = [
-  {
-    address: mockPeers[0].address,
-    displayName: mockPeers[0].displayName,
-    storageUsedBytes: 1_200_000_000,
-    online: true,
-  },
-  {
-    address: mockPeers[1].address,
-    displayName: mockPeers[1].displayName,
-    storageUsedBytes: 800_000_000,
-    online: false,
-  },
-];
 
 // ── Private Content ─────────────────────────────────────────────────
 

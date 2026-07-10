@@ -157,13 +157,6 @@ describe('FileManagerService', () => {
     }
   });
 
-  it('returns storage buddies', () => {
-    const svc = new FileManagerService();
-    const buddies = svc.getStorageBuddies();
-    expect(buddies.length).toBe(2);
-    expect(buddies[0].displayName).toBeTruthy();
-  });
-
   it('returns published content', () => {
     const svc = new FileManagerService();
     const published = svc.getPublishedContent();
@@ -254,14 +247,14 @@ describe('FileManagerService', () => {
     expect(data!.replicationTier).toBe('high');
   });
 
-  it('getContentDetail returns extended info for a known cid', () => {
+  it('getContentDetail returns only real fields (ZEB-612 S3: mock peers/origin gone)', () => {
     const svc = new FileManagerService();
     const detail = svc.getContentDetail('cid-song-favorite');
     expect(detail).toBeDefined();
     expect(detail!.cid).toBe('cid-song-favorite');
-    expect(detail!.origin).toBeDefined();
-    expect(detail!.sharedWith).toBeDefined();
-    expect(detail!.storageBuddies).toBeDefined();
+    expect('origin' in detail!).toBe(false);
+    expect('sharedWith' in detail!).toBe(false);
+    expect('storageBuddies' in detail!).toBe(false);
   });
 
   it('getContentDetail returns undefined for unknown cid', () => {

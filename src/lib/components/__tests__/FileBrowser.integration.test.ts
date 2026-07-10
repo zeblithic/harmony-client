@@ -220,8 +220,8 @@ describe('File Manager Integration', () => {
     // Sensitivity badge
     expect(screen.getByText('Public')).toBeTruthy();
 
-    // Replication info (5 of 5 for high tier)
-    expect(screen.getByText(/5 of 5/)).toBeTruthy();
+    // Replication info (5 seen vs high-tier target 5; ZEB-612 S3 copy)
+    expect(screen.getByText('×5 · copies seen across your peers')).toBeTruthy();
 
     // Action buttons
     expect(screen.getByLabelText('Publish (permanent)')).toBeTruthy();
@@ -686,16 +686,13 @@ describe('File Manager Integration', () => {
       });
     });
 
-    it('share and buddy lists have section aria-labels', () => {
+    it('mock share and buddy lists are gone from the detail panel (ZEB-612 S3 → ZEB-669)', () => {
       const service = new FileManagerService();
       const detail = service.getContentDetail('cid-song-favorite')!;
       const { container } = renderDetail(detail);
 
-      const shareSection = container.querySelector('[aria-label="Shared with (can view)"]');
-      expect(shareSection).toBeTruthy();
-
-      const buddySection = container.querySelector('[aria-label="Stored by (encrypted)"]');
-      expect(buddySection).toBeTruthy();
+      expect(container.querySelector('[aria-label="Shared with (can view)"]')).toBeNull();
+      expect(container.querySelector('[aria-label="Stored by (encrypted)"]')).toBeNull();
     });
   });
 });

@@ -6,7 +6,6 @@ import type {
   ContentDetail,
   QuotaStatus,
   CleanupRecommendation,
-  StorageBuddy,
   PublishedItem,
 } from './types';
 
@@ -41,7 +40,7 @@ describe('File manager types', () => {
     expect(item.isFolder).toBe(false);
   });
 
-  it('ContentDetail extends ContentItem with peer info', () => {
+  it('ContentDetail is an alias of ContentItem (ZEB-612 S3: mock peer fields gone)', () => {
     const detail: ContentDetail = {
       sidecarId: 'sidecar-abc',
       cid: 'abc123',
@@ -56,12 +55,8 @@ describe('File manager types', () => {
       licensed: false,
       parentCid: null,
       isFolder: false,
-      sharedWith: [{ address: 'peer1', displayName: 'Alice' }],
-      storageBuddies: [{ address: 'peer2', displayName: 'Bob' }],
-      origin: 'self-created',
     };
-    expect(detail.sharedWith).toHaveLength(1);
-    expect(detail.origin).toBe('self-created');
+    expect(detail.replicaCount).toBe(3);
   });
 
   it('QuotaStatus has usage fields (ZEB-612 S3: no invented total)', () => {
@@ -89,16 +84,6 @@ describe('File manager types', () => {
     };
     expect(rec.reason).toBe('stale');
     expect(rec.confidence).toBeGreaterThan(0.8);
-  });
-
-  it('StorageBuddy tracks storage used', () => {
-    const buddy: StorageBuddy = {
-      address: 'peer3',
-      displayName: 'Charlie',
-      storageUsedBytes: 500_000_000,
-      online: true,
-    };
-    expect(buddy.online).toBe(true);
   });
 
   it('PublishedItem includes publish mode', () => {

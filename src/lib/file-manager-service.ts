@@ -4,19 +4,15 @@ import type {
   ContentDetail,
   QuotaStatus,
   CleanupRecommendation,
-  StorageBuddy,
   PublishedItem,
   FileManagerSettings,
   ReplicationTier,
   ContentCategory,
-  PeerRef,
 } from './types';
 import {
   mockPrivateContent,
   mockPublishedContent,
   mockCleanupRecommendations,
-  mockStorageBuddies,
-  mockPeers,
 } from './mock-file-data';
 
 /** Wire format for content availability announcements from the Rust backend. */
@@ -181,7 +177,6 @@ export class FileManagerService {
   private privateContent: ContentItem[];
   private publishedContent: PublishedItem[];
   private cleanupRecommendations: CleanupRecommendation[];
-  private storageBuddies: StorageBuddy[];
 
   constructor(overrides?: Partial<FileManagerSettings>) {
     this.settings = {
@@ -195,7 +190,6 @@ export class FileManagerService {
     this.privateContent = structuredClone(mockPrivateContent);
     this.publishedContent = structuredClone(mockPublishedContent);
     this.cleanupRecommendations = structuredClone(mockCleanupRecommendations);
-    this.storageBuddies = structuredClone(mockStorageBuddies);
   }
 
   /** Connect a Tauri adapter and start listening for content announcements. */
@@ -253,17 +247,13 @@ export class FileManagerService {
     return this.privateContent.filter((item) => item.parentCid === parentCid);
   }
 
-  /** Returns extended detail for a single content item, or undefined if not found. */
+  /** Returns detail for a single content item, or undefined if not found.
+   *  ZEB-612 S3: only real fields — the mock sharedWith/storageBuddies/
+   *  origin surfaces return with real hosting accounting (ZEB-669). */
   getContentDetail(cid: string): ContentDetail | undefined {
     const item = this.privateContent.find((i) => i.cid === cid);
     if (!item) return undefined;
-
-    return {
-      ...item,
-      sharedWith: [mockPeers[0], mockPeers[1]],
-      storageBuddies: [mockPeers[0]],
-      origin: 'self-created',
-    };
+    return { ...item };
   }
 
   /** Computes quota status from current private content. */
@@ -315,19 +305,9 @@ export class FileManagerService {
       .sort((a, b) => b.confidence - a.confidence);
   }
 
-  /** Returns storage buddies. */
-  getStorageBuddies(): StorageBuddy[] {
-    return [...this.storageBuddies];
-  }
-
   /** Returns published content. */
   getPublishedContent(): PublishedItem[] {
     return [...this.publishedContent];
-  }
-
-  /** Returns available peers for sharing/buddy assignment. */
-  getAvailablePeers(): PeerRef[] {
-    return [...mockPeers];
   }
 
   /**

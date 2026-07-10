@@ -9,7 +9,7 @@ vi.mock('@tauri-apps/api/webviewWindow', () => ({
 }));
 
 import NavPanel from '../NavPanel.svelte';
-import type { NavNode, ContentItem, StorageBuddy } from '../../types';
+import type { NavNode, ContentItem } from '../../types';
 import { setNavModeOverride } from '../../feature-flags';
 
 // ZEB-544: nav gating reads localStorage overrides — reset between tests so a
@@ -130,11 +130,6 @@ describe('NavPanel', () => {
       },
     ];
 
-    const testBuddies: StorageBuddy[] = [
-      { address: 'addr1', displayName: 'Alice', storageUsedBytes: 100, online: true },
-      { address: 'addr2', displayName: 'Bob', storageUsedBytes: 200, online: false },
-    ];
-
     it('shows FolderTree and QuickFilters when appMode is files', () => {
       render(NavPanel, {
         props: {
@@ -142,7 +137,6 @@ describe('NavPanel', () => {
           collapsed: false,
           appMode: 'files',
           contentItems: testContentItems,
-          storageBuddies: testBuddies,
         },
       });
       // FolderTree root
@@ -155,21 +149,6 @@ describe('NavPanel', () => {
       expect(screen.getByText('Replication Tier')).toBeTruthy();
     });
 
-    it('shows StorageBuddySummary when appMode is files', () => {
-      render(NavPanel, {
-        props: {
-          nodes: testNodes,
-          collapsed: false,
-          appMode: 'files',
-          contentItems: testContentItems,
-          storageBuddies: testBuddies,
-        },
-      });
-      expect(screen.getByText(/2 buddies/)).toBeTruthy();
-      expect(screen.getByText(/1 online/)).toBeTruthy();
-      expect(screen.getByRole('button', { name: /Manage/ })).toBeTruthy();
-    });
-
     it('does not show NavTree when in files mode', () => {
       render(NavPanel, {
         props: {
@@ -177,7 +156,6 @@ describe('NavPanel', () => {
           collapsed: false,
           appMode: 'files',
           contentItems: testContentItems,
-          storageBuddies: testBuddies,
         },
       });
       // NavTree items should not be rendered
@@ -192,7 +170,6 @@ describe('NavPanel', () => {
           collapsed: false,
           appMode: 'messages',
           contentItems: testContentItems,
-          storageBuddies: testBuddies,
         },
       });
       // File components should not render
