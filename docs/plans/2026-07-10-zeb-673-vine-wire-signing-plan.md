@@ -28,6 +28,7 @@
 - Modify: `src-tauri/src/lib.rs` (module decl next to `mod vine_tombstone;`; `VineDescriptorPayload` + `VineReactionPayload` gain fields)
 
 **Interfaces (Produces):**
+
 ```rust
 pub fn descriptor_canonical_bytes(d: &VineDescriptorPayload) -> Vec<u8>;
 pub fn reaction_canonical_bytes(r: &VineReactionPayload) -> Vec<u8>;
@@ -38,6 +39,7 @@ pub fn verify_reaction(r: &VineReactionPayload) -> Result<(), String>;
 ```
 
 - [ ] **Step 1: Add signature fields to both payload structs** (`lib.rs:12745`, `12818`):
+
 ```rust
 /// ZEB-673: hex 64-byte identity pub (X25519‖Ed25519) of the signer.
 /// Option for disk back-compat — wire receivers reject None.
@@ -47,8 +49,9 @@ pub identity_pub: Option<String>,
 #[serde(default, skip_serializing_if = "Option::is_none")]
 pub sig: Option<String>,
 ```
+
   Fix every struct-literal construction site (`publish_vine`, `publish_vine_reaction`, tests) with `identity_pub: None, sig: None` to compile.
-- [ ] **Step 2: Write failing tests in `vine_signing.rs`** — roundtrip sign→verify (both types); tamper each semantic field → "signature invalid"; forged signer (victim's pubkey, attacker's key) → "signature invalid"; pubkey/address mismatch → "does not match"; unsigned → "unsigned"; canonical-bytes injectivity: `title: None` ≠ `title: Some("")`, and free text containing `|`, newlines, emoji roundtrips; field-shift attack (`creator_name: "ab", title: Some("c")` vs `creator_name: "a", title: Some("bc")`) produces different bytes; serde pin: None fields absent from JSON, Some fields camelCase (`identityPub`, `sig`), legacy JSON without the keys parses.
+- [ ] **Step 2: Write failing tests in `vine_signing.rs`** — roundtrip sign→verify (both types); tamper each semantic field EXCEPT the address → "signature invalid" (the address fields fail the EARLIER pubkey→address binding gate instead — a dedicated test asserts "does not match" for that case; don't fold address tampering into the signature-invalid sweep); forged signer (victim's pubkey, attacker's key) → "signature invalid"; unsigned → "unsigned"; canonical-bytes injectivity: `title: None` ≠ `title: Some("")`, and free text containing `|`, newlines, emoji roundtrips; field-shift attack (`creator_name: "ab", title: Some("c")` vs `creator_name: "a", title: Some("bc")`) produces different bytes; serde pin: None fields absent from JSON, Some fields camelCase (`identityPub`, `sig`), legacy JSON without the keys parses.
 - [ ] **Step 3: Implement** — encoding helpers (`push_str`, `push_opt_str`, `push_u64`, `push_bool`), canonical byte builders over semantic fields ONLY (never `identity_pub`/`sig`), sign/verify mirroring `vine_tombstone.rs`. Descriptor field order: `id, creator_address, creator_name, created_at, video_cid, title, reshare_of, original_creator_address, original_creator_name`. Reaction field order: `vine_id, reactor_address, reactor_name, liked, timestamp`.
 - [ ] **Step 4: Gates + commit** (`git add` new module; `feat(zeb-673): vine_signing module + optional sig fields on wire payloads`).
 
@@ -82,6 +85,14 @@ pub sig: Option<String>,
 - [ ] **Step 1:** Update the three integration files' payload builders to sign (public API: `harmony_app::vine_signing::sign_descriptor` etc. + `harmony_identity::PrivateIdentity::generate`); derived addresses replace literals; persistence test keeps one deliberately-unsigned DISK fixture proving tolerant load.
 - [ ] **Step 2:** Full final gates: `cargo fmt --all -- --check`; clippy `--all-targets`; full `cargo nextest run --locked --workspace --all-targets --features test-fixtures`; `npx tsc --noEmit`; `npx vitest run`.
 - [ ] **Step 3:** Commit (`test(zeb-673): signed fixtures for vine integration tests`), push, open PR, fire CodeRabbit once.
+
+## Post-review amendments (PR #446 round 1)
+
+Shipped code is authoritative; deltas from the plan text above:
+
+1. **Reaction topic shape is exact** (Qodo, Security): `on_reaction_sample` also rejects keys with segments AFTER `{vine_id}/{reactor}` (`tail.next().is_some()`), and the event-loop subscription narrowed from `harmony/vines/*/reactions/**` to `…/reactions/*/*` — the old `**` delivered arbitrarily deep non-canonical keys to the verify path.
+2. **Field-comment correction** (Qodo, Maintainability): the `identity_pub` doc comments no longer claim `VineFeedDiskV1` persists the wire structs verbatim; disk rows are `DescriptorOnDisk`/`ReactionOnDisk` and never retain signatures (verify-once-at-ingest, `TombstoneOnDisk` posture).
+3. **Tamper-test wording** (CodeRabbit): Step 2's original "tamper each semantic field → signature invalid" overgeneralized — address-field tampering fails the earlier binding gate ("does not match"); the shipped tests split the two, and the step text above now says so.
 
 ## Non-goals / notes
 

@@ -649,10 +649,17 @@ impl VineFeedCache {
             .split('/');
         let topic_vine = tail.next().unwrap_or("");
         let topic_reactor = tail.next().unwrap_or("");
-        if topic_vine != reaction.vine_id || topic_reactor != reaction.reactor_address {
+        // Exact shape: no segments may follow `{vine_id}/{reactor}` — a
+        // valid record replayed under a deeper non-canonical key must not
+        // pass the binding gate (Qodo PR #446 round 1; the subscription
+        // is narrowed to `*/*` too, this is defense in depth at the
+        // admission authority).
+        if topic_vine != reaction.vine_id
+            || topic_reactor != reaction.reactor_address
+            || tail.next().is_some()
+        {
             return Some(ReactionOutcome::Rejected(format!(
-                "reaction topic segments '{topic_vine}/{topic_reactor}' do not match payload \
-                 '{}/{}'",
+                "reaction topic '{key_expr}' does not match payload '{}/{}'",
                 reaction.vine_id, reaction.reactor_address
             )));
         }
@@ -1259,7 +1266,7 @@ mod tests {
             &bytes,
         );
         assert!(
-            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("do not match payload")),
+            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("does not match payload")),
             "got {out:?}"
         );
         // Valid signature, topic reactor segment names someone else.
@@ -1268,7 +1275,19 @@ mod tests {
             &bytes,
         );
         assert!(
-            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("do not match payload")),
+            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("does not match payload")),
+            "got {out:?}"
+        );
+        // Valid signature, matching first two segments, but replayed
+        // under a DEEPER non-canonical key (the old `**` subscription
+        // delivered these; Qodo PR #446 round 1).
+        let deep = format!(
+            "{}/extra",
+            reaction_topic("alice-addr", "vine-1", "bob-addr")
+        );
+        let out = cache.on_reaction_sample(&deep, &bytes);
+        assert!(
+            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("does not match payload")),
             "got {out:?}"
         );
         assert_eq!(cache.len_reactions(), 0);

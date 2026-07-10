@@ -2886,10 +2886,13 @@ pub async fn run(
     )
     .await;
 
-    // Subscribe to vine reactions (likes/unlikes).
+    // Subscribe to vine reactions (likes/unlikes). Exactly `*/*` — the
+    // canonical key is `…/reactions/{vine_id}/{reactor}`, and `**` would
+    // deliver arbitrarily deep non-canonical keys to the verify path
+    // (wasted signature work; Qodo PR #446 round 1).
     dispatch_action(
         RuntimeAction::Subscribe {
-            key_expr: "harmony/vines/*/reactions/**".to_string(),
+            key_expr: "harmony/vines/*/reactions/*/*".to_string(),
         },
         &session,
         &zenoh_tx,

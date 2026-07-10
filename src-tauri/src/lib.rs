@@ -12762,8 +12762,11 @@ pub struct VineDescriptorPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_creator_name: Option<String>,
     /// ZEB-673: hex 64-byte identity pub (X25519‖Ed25519) of the creator.
-    /// `Option` for disk back-compat (`VineFeedDiskV1` persists this
-    /// struct verbatim) — wire receivers reject `None`.
+    /// `Option` because signatures exist only on the wire: disk rows
+    /// (`vine_feed_cache::DescriptorOnDisk`) never retain them
+    /// (verify-once-at-ingest, same posture as `TombstoneOnDisk`), so
+    /// records rebuilt from disk carry `None`. Wire receivers reject
+    /// `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_pub: Option<String>,
     /// ZEB-673: hex 64-byte Ed25519 signature over
@@ -12833,7 +12836,9 @@ pub struct VineReactionPayload {
     pub timestamp: u64,
     /// ZEB-673: hex 64-byte identity pub of the REACTOR (the signer —
     /// not the vine creator whose topic carries the reaction). `Option`
-    /// for disk back-compat — wire receivers reject `None`.
+    /// because signatures exist only on the wire (disk rows —
+    /// `vine_feed_cache::ReactionOnDisk` — never retain them); wire
+    /// receivers reject `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_pub: Option<String>,
     /// ZEB-673: hex 64-byte Ed25519 signature over
