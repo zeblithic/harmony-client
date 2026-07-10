@@ -5,8 +5,9 @@
   import {
     redeemInviteIroh,
     onResolutionProgress,
+    previewInvite,
   } from '../connectivity-adapter';
-  import type { RedemptionStage } from '../types/connectivity';
+  import type { RedemptionStage, InvitePreviewDto } from '../types/connectivity';
 
   let {
     onSubmit,
@@ -30,7 +31,9 @@
   } = $props();
 
   let url = $state(untrack(() => initialUrl));
-  let canSubmit = $derived(url.trim().startsWith('harmony://invite/') && !pending && !irohPending);
+  let canSubmit = $derived(
+    url.trim().startsWith('harmony://invite/') && !pending && !irohPending && !previewExpired,
+  );
   let mapped = $derived(error ? mapRedeemInviteError(error) : null);
   const titleId = `redeem-invite-title-${Math.random().toString(36).slice(2)}`;
 
@@ -55,6 +58,48 @@
 
   let stopProgressListener: (() => void) | null = null;
 
+  // ── ZEB-650 slice 3: debounced pure-local invite preview ────────────────
+  // `preview_invite` decodes + verifies + expiry-evaluates the pasted URL
+  // locally (no join, no network), so firing it on keystroke settle is safe.
+  // The TOCTOU rule doesn't apply: preview and redeem both derive
+  // deterministically from the same immutable URL string.
+  let preview = $state<InvitePreviewDto | null>(null);
+  let previewInvalid = $state(false);
+  let previewExpired = $derived(preview?.expired === true);
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Monotonic guard: a resolution whose seq no longer matches is stale
+   *  (URL changed or dialog torn down mid-flight) and must be discarded. */
+  let previewSeq = 0;
+  const PREVIEW_DEBOUNCE_MS = 300;
+
+  $effect(() => {
+    const trimmed = url.trim();
+    if (previewTimer !== null) clearTimeout(previewTimer);
+    previewTimer = null;
+    previewSeq += 1;
+    const seq = previewSeq;
+    if (!trimmed.startsWith('harmony://invite/')) {
+      preview = null;
+      previewInvalid = false;
+      return;
+    }
+    previewTimer = setTimeout(() => {
+      previewTimer = null;
+      void (async () => {
+        try {
+          const dto = await previewInvite(trimmed);
+          if (seq !== previewSeq) return;
+          preview = dto ?? null;
+          previewInvalid = false;
+        } catch {
+          if (seq !== previewSeq) return;
+          preview = null;
+          previewInvalid = true;
+        }
+      })();
+    }, PREVIEW_DEBOUNCE_MS);
+  });
+
   onMount(() => {
     stopProgressListener = onResolutionProgress((ev) => {
       irohStage = ev.stage;
@@ -67,11 +112,17 @@
       clearTimeout(joinedDismissTimer);
       joinedDismissTimer = null;
     }
+    if (previewTimer !== null) {
+      clearTimeout(previewTimer);
+      previewTimer = null;
+    }
+    previewSeq += 1; // discard any in-flight preview resolution
   });
 
   async function handleIrohRedeem() {
     const trimmed = url.trim();
-    if (!trimmed.startsWith('harmony://invite/') || irohPending || pending) return;
+    if (!trimmed.startsWith('harmony://invite/') || irohPending || pending || previewExpired)
+      return;
     irohPending = true;
     irohStage = 'resolving';
     irohError = null;
@@ -214,13 +265,41 @@
     </div>
   {/if}
 
+  {#if preview !== null}
+    <!-- ZEB-650 slice 3: honest preview — name + inviter authorization only.
+         Never member/channel counts: the token signature doesn't commit to
+         the payload's snapshot (ZEB-610 §0.4). -->
+    <div class="preview-card" data-testid="redeem-preview-card">
+      <div class="preview-headline">
+        <span class="preview-name">{preview.communityName}</span>
+        {#if preview.isInviteOnly}
+          <span class="invite-only-chip" data-testid="preview-invite-only-chip">🔒 Invite-only</span>
+        {/if}
+      </div>
+      {#if preview.inviterVerified}
+        <div class="preview-verified" data-testid="preview-verified">
+          ✓ invite signature verified{#if preview.inviterDisplayName ?? preview.inviterFingerprint}&nbsp;— from {preview.inviterDisplayName ?? preview.inviterFingerprint}{/if}
+        </div>
+      {:else}
+        <div class="preview-unverified" data-testid="preview-unverified">signature not verifiable</div>
+      {/if}
+      {#if preview.expired}
+        <div class="preview-expired" data-testid="preview-expired">This invite has expired.</div>
+      {/if}
+    </div>
+  {:else if previewInvalid}
+    <div class="preview-card" data-testid="redeem-preview-invalid">
+      <span class="preview-unverified">This invite link looks invalid</span>
+    </div>
+  {/if}
+
   <div class="dialog-actions">
     <button class="cancel-btn" onclick={onCancel} disabled={pending || irohPending}>Cancel</button>
     {#if showFallbackButton}
       <button
         class="fallback-btn"
         onclick={handleSubmit}
-        disabled={!url.trim().startsWith('harmony://invite/') || pending}
+        disabled={!url.trim().startsWith('harmony://invite/') || pending || previewExpired}
         data-testid="fallback-lan-btn"
       >
         Try via local network
@@ -229,7 +308,10 @@
       <button
         class="iroh-btn"
         onclick={handleIrohRedeem}
-        disabled={!url.trim().startsWith('harmony://invite/') || pending || irohPending}
+        disabled={!url.trim().startsWith('harmony://invite/') ||
+          pending ||
+          irohPending ||
+          previewExpired}
         data-testid="iroh-redeem-btn"
       >
         Redeem
@@ -372,5 +454,49 @@
   .fallback-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+  /* ZEB-650 slice 3: preview card — .error-banner anatomy, neutral border. */
+  .preview-card {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .preview-headline {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .preview-name {
+    color: var(--text-primary);
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .invite-only-chip {
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: color-mix(in srgb, currentColor 16%, transparent);
+    white-space: nowrap;
+  }
+  .preview-verified {
+    color: var(--success);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+  }
+  .preview-unverified {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+  }
+  .preview-expired {
+    color: var(--danger-muted);
+    font-size: 0.8rem;
   }
 </style>

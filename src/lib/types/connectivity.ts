@@ -132,3 +132,20 @@ export interface ResolutionProgressEvent {
   stage: RedemptionStage;
   attemptN: number;
 }
+
+/**
+ * ZEB-650 slice 3: pure-local invite preview (mirror of the Rust
+ * `InvitePreviewDto`). `inviterVerified` is scoped to the inviter
+ * authorization chain — it does NOT authenticate the payload's name, which
+ * is why the preview carries no member/channel counts. `inviterDisplayName`
+ * is always null today (local name resolution is engine-async); consumers
+ * fall back to `inviterFingerprint`.
+ */
+export interface InvitePreviewDto {
+  communityName: string;
+  isInviteOnly: boolean;
+  inviterVerified: boolean;
+  inviterFingerprint: string | null;
+  inviterDisplayName: string | null;
+  expired: boolean;
+}

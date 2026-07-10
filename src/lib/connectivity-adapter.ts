@@ -22,6 +22,7 @@ import type {
   PkarrPublicationStatus,
   RedemptionOutcome,
   ResolutionProgressEvent,
+  InvitePreviewDto,
 } from './types/connectivity';
 import type { RelayHealth, IrohRelayInfo } from './types/network-health';
 import type { RedeemInviteResultDto } from './community-service';
@@ -121,6 +122,20 @@ export async function redeemInviteIroh(inviteUrl: string): Promise<RedemptionOut
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`connectivity_redeem_invite_iroh: ${msg}`);
+  }
+}
+
+/**
+ * ZEB-650 slice 3: pure-local preview of a pasted invite URL — decode +
+ * token-signature verify + expiry evaluation. Mints nothing, joins nothing,
+ * no network; safe to call on every keystroke settle.
+ */
+export async function previewInvite(url: string): Promise<InvitePreviewDto> {
+  try {
+    return await invoke<InvitePreviewDto>('preview_invite', { url });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`preview_invite: ${msg}`);
   }
 }
 
