@@ -20,11 +20,13 @@
     }
   });
 
+  // ZEB-612 S3: display labels follow the drawn Storage nav (Videos /
+  // Images / Documents); keys are unchanged — no filter-model change.
   const allCategories: { key: ContentCategory; label: string }[] = [
     { key: 'music', label: 'Music' },
-    { key: 'video', label: 'Video' },
-    { key: 'text', label: 'Text' },
-    { key: 'image', label: 'Image' },
+    { key: 'video', label: 'Videos' },
+    { key: 'text', label: 'Documents' },
+    { key: 'image', label: 'Images' },
     { key: 'software', label: 'Software' },
     { key: 'dataset', label: 'Dataset' },
     { key: 'bundle', label: 'Bundle' },
@@ -133,7 +135,7 @@
       <div class="section-body status-buttons">
         <button type="button" class="filter-btn" class:active={pinned}
           aria-pressed={pinned ? 'true' : 'false'}
-          onclick={() => toggleStatus('pinned')}>Pinned</button>
+          onclick={() => toggleStatus('pinned')}>Pinned by me</button>
         <button type="button" class="filter-btn" class:active={licensed}
           aria-pressed={licensed ? 'true' : 'false'}
           onclick={() => toggleStatus('licensed')}>Licensed</button>

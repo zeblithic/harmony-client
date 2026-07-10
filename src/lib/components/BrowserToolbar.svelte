@@ -48,7 +48,7 @@
     <input
       class="search-input"
       type="search"
-      placeholder="Search files..."
+      placeholder="Search files or paste a CID…"
       aria-label="Search files"
       value={searchQuery}
       oninput={(e) => onSearchChange(e.currentTarget.value)}
@@ -72,7 +72,7 @@
           aria-pressed={viewMode === 'grid'}
           onclick={() => onViewModeChange('grid')}
         >⊞</button>
-        <button class="action-btn" onclick={onUploadClick} aria-label="Upload">⬆ Upload</button>
+        <button class="action-btn" onclick={onUploadClick} aria-label="Add files">⤓ Add files</button>
         {#if onNewFolderClick}
           <button class="action-btn" onclick={onNewFolderClick} aria-label="New Folder">📁 New Folder</button>
         {/if}

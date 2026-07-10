@@ -111,7 +111,7 @@ describe('FolderTree', () => {
   it('fires onFolderSelect with null when root is clicked', async () => {
     const onFolderSelect = vi.fn();
     render(FolderTree, { props: { items: allItems, onFolderSelect } });
-    const rootBtn = screen.getByRole('button', { name: /All Files/ });
+    const rootBtn = screen.getByRole('button', { name: /All files/ });
     await fireEvent.click(rootBtn);
     expect(onFolderSelect).toHaveBeenCalledWith(null);
   });
@@ -131,7 +131,7 @@ describe('FolderTree', () => {
     const expandBtn = screen.getByRole('button', { name: /Projects/ });
     await fireEvent.click(expandBtn);
     const treeItems = screen.getAllByRole('treeitem');
-    expect(treeItems.length).toBeGreaterThanOrEqual(3); // All Files + Projects (expanded children)
+    expect(treeItems.length).toBeGreaterThanOrEqual(3); // All files + Projects (expanded children)
   });
 
   it('highlights selected folder', async () => {
@@ -158,7 +158,7 @@ describe('FolderTree', () => {
 
   it('renders with empty items list', () => {
     render(FolderTree, { props: { items: [] } });
-    // Should still show the "All Files" root
-    expect(screen.getByRole('button', { name: /All Files/ })).toBeTruthy();
+    // Should still show the "All files" root
+    expect(screen.getByRole('button', { name: /All files/ })).toBeTruthy();
   });
 });

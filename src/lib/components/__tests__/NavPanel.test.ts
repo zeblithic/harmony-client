@@ -140,7 +140,7 @@ describe('NavPanel', () => {
         },
       });
       // FolderTree root
-      expect(screen.getByText('All Files')).toBeTruthy();
+      expect(screen.getByText('All files')).toBeTruthy();
       // FolderTree folder
       expect(screen.getByText('Projects')).toBeTruthy();
       // QuickFilters sections
@@ -173,7 +173,7 @@ describe('NavPanel', () => {
         },
       });
       // File components should not render
-      expect(screen.queryByText('All Files')).toBeNull();
+      expect(screen.queryByText('All files')).toBeNull();
       expect(screen.queryByText('Category')).toBeNull();
       expect(screen.queryByText(/buddies/)).toBeNull();
       // NavTree should render

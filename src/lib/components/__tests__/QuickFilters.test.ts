@@ -21,9 +21,9 @@ describe('QuickFilters', () => {
   it('renders category checkboxes for each content category', () => {
     render(QuickFilters, { props: {} });
     expect(screen.getByLabelText('Music')).toBeTruthy();
-    expect(screen.getByLabelText('Video')).toBeTruthy();
-    expect(screen.getByLabelText('Text')).toBeTruthy();
-    expect(screen.getByLabelText('Image')).toBeTruthy();
+    expect(screen.getByLabelText('Videos')).toBeTruthy();
+    expect(screen.getByLabelText('Documents')).toBeTruthy();
+    expect(screen.getByLabelText('Images')).toBeTruthy();
     expect(screen.getByLabelText('Software')).toBeTruthy();
     expect(screen.getByLabelText('Dataset')).toBeTruthy();
     expect(screen.getByLabelText('Bundle')).toBeTruthy();
@@ -31,7 +31,7 @@ describe('QuickFilters', () => {
 
   it('renders status filter buttons', () => {
     render(QuickFilters, { props: {} });
-    expect(screen.getByRole('button', { name: 'Pinned' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Pinned by me' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Licensed' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Under-replicated' })).toBeTruthy();
   });
@@ -74,7 +74,7 @@ describe('QuickFilters', () => {
   it('fires onFilterChange when a status button is toggled', async () => {
     const onFilterChange = vi.fn();
     render(QuickFilters, { props: { onFilterChange } });
-    const pinnedBtn = screen.getByRole('button', { name: 'Pinned' });
+    const pinnedBtn = screen.getByRole('button', { name: 'Pinned by me' });
     await fireEvent.click(pinnedBtn);
     expect(onFilterChange).toHaveBeenCalled();
     const filters = onFilterChange.mock.calls[0][0];
@@ -84,7 +84,7 @@ describe('QuickFilters', () => {
   it('toggles status button off on second click', async () => {
     const onFilterChange = vi.fn();
     render(QuickFilters, { props: { onFilterChange } });
-    const pinnedBtn = screen.getByRole('button', { name: 'Pinned' });
+    const pinnedBtn = screen.getByRole('button', { name: 'Pinned by me' });
     await fireEvent.click(pinnedBtn);
     await fireEvent.click(pinnedBtn);
     const filters = onFilterChange.mock.calls[1][0];
@@ -119,13 +119,13 @@ describe('QuickFilters', () => {
 
   it('status buttons have aria-pressed attribute', () => {
     render(QuickFilters, { props: {} });
-    const pinnedBtn = screen.getByRole('button', { name: 'Pinned' });
+    const pinnedBtn = screen.getByRole('button', { name: 'Pinned by me' });
     expect(pinnedBtn.getAttribute('aria-pressed')).toBe('false');
   });
 
   it('sets aria-pressed to true when status button is active', async () => {
     render(QuickFilters, { props: {} });
-    const pinnedBtn = screen.getByRole('button', { name: 'Pinned' });
+    const pinnedBtn = screen.getByRole('button', { name: 'Pinned by me' });
     await fireEvent.click(pinnedBtn);
     expect(pinnedBtn.getAttribute('aria-pressed')).toBe('true');
   });

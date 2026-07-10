@@ -186,6 +186,14 @@ describe('File Manager Integration', () => {
     expect(screen.queryByText('Projects')).toBeNull();
   });
 
+  it('search matches a pasted CID (ZEB-612 S3)', () => {
+    const service = new FileManagerService();
+    renderBrowser(service, { searchQuery: 'cid-song-favorite' });
+
+    expect(screen.getByText('favorite-track.flac')).toBeTruthy();
+    expect(screen.queryByText('distributed-systems-lecture.mp4')).toBeNull();
+  });
+
   // ── 8. Section switch (private/published) ────────────────────────
 
   it('fires onSectionChange when Published tab is clicked', async () => {

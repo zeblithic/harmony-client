@@ -351,7 +351,10 @@
     contents = [...contents];
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
-      contents = contents.filter((i) => i.name.toLowerCase().includes(q));
+      // ZEB-612 S3: the toolbar invites pasting a CID — match it too.
+      contents = contents.filter(
+        (i) => i.name.toLowerCase().includes(q) || i.cid.toLowerCase().includes(q),
+      );
     }
     // Apply quick filters
     const cats = filters.categories as ContentCategory[] | undefined;

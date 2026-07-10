@@ -18,7 +18,7 @@ describe('BrowserToolbar', () => {
     render(BrowserToolbar, { props: baseProps });
     const input = screen.getByLabelText('Search files');
     expect(input).toBeTruthy();
-    expect(input.getAttribute('placeholder')).toBe('Search files...');
+    expect(input.getAttribute('placeholder')).toBe('Search files or paste a CID…');
   });
 
   it('toggles view mode on button click', async () => {
@@ -31,13 +31,13 @@ describe('BrowserToolbar', () => {
 
   it('hides upload button when section is published', () => {
     render(BrowserToolbar, { props: { ...baseProps, section: 'published' as const } });
-    expect(screen.queryByLabelText('Upload')).toBeNull();
+    expect(screen.queryByLabelText('Add files')).toBeNull();
     expect(screen.queryByLabelText('Cleanup')).toBeNull();
   });
 
   it('shows upload and cleanup buttons for private section', () => {
     render(BrowserToolbar, { props: baseProps });
-    expect(screen.getByLabelText('Upload')).toBeTruthy();
+    expect(screen.getByLabelText('Add files')).toBeTruthy();
     expect(screen.getByLabelText('Cleanup')).toBeTruthy();
   });
 
