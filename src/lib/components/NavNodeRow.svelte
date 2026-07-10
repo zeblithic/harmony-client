@@ -190,8 +190,13 @@
   }
 
   function typeIcon(n: NavNode): string {
-    // ZEB-663: voice channels get the speaker glyph (matches ChannelSubSidebar).
-    if (n.type === 'channel') return n.channelKind === 'voice' ? '\uD83D\uDD0A' : '#';
+    // ZEB-663: voice channels get the speaker glyph (matches ChannelSubSidebar);
+    // ZEB-612: town halls get the scales glyph (matches CreateChannelDialog).
+    if (n.type === 'channel') {
+      if (n.channelKind === 'voice') return '\uD83D\uDD0A';
+      if (n.channelKind === 'townhall') return '\u2696';
+      return '#';
+    }
     if (n.type === 'dm' || n.type === 'group-chat') return '@';
     if (n.type === 'folder') return n.expanded ? '\u25BE' : '\u25B8';
     return '';

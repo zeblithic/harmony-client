@@ -117,8 +117,8 @@ export interface NavNode {
   mentionCount: number;
   unreadLevel: UnreadLevel;
   /** ZEB-663: channel kind, set only on `type: 'channel'` nodes. Drives the
-   *  nav row glyph (# vs 🔊). Absent on all other node types. */
-  channelKind?: 'text' | 'voice';
+   *  nav row glyph (# vs 🔊 vs ⚖). Absent on all other node types. */
+  channelKind?: 'text' | 'voice' | 'townhall';
   lastActivity?: number;
   peer?: Peer;
   /** ZEB-285: hex SpaceId of the original community this node was forked from.

@@ -435,7 +435,10 @@
         <p>It’ll appear here once the connection is ready.</p>
       </div>
     {:else if activeChannel}
-      {#if activeChannel.kind === 'voice'}
+      <!-- ZEB-612 S4 interim: a townhall channel renders the plain voice view
+           (a joinable voice room — the spec's own degradation) until S5 swaps
+           in TownHallView for kind === 'townhall'. -->
+      {#if activeChannel.kind === 'voice' || activeChannel.kind === 'townhall'}
         {#if voiceSession}
           <VoiceChannelView
             session={voiceSession}
