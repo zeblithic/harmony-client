@@ -465,6 +465,28 @@ fn signed_event_channel_create_voice_wire_bytes_pinned() {
     );
 }
 
+#[test]
+fn signed_event_channel_create_townhall_wire_bytes_pinned() {
+    // ZEB-612: a Townhall ChannelCreate differs from the Voice fixture above
+    // by exactly the `ck` value byte: `62636b01` (b"ck" -> 0x01) becomes
+    // `62636b02` (b"ck" -> 0x02). The Text fixture's unchanged hex remains the
+    // byte-identity proof that kind stays omitted for Text.
+    let ch_id = ChannelId([0x42; 16]);
+    let event = fixture_signed_event(MembershipEventKind::ChannelCreate {
+        channel_id: ch_id,
+        name: "general".to_string(),
+        write_power: 0,
+        kind: ChannelKind::Townhall,
+    });
+    let bytes = canonical_cbor_encode(&event).expect("encode");
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    assert_eq!(
+        hex,
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616362766ca46263685042424242424242424242424242424242626e6d6767656e6572616c6277700062636b026261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "Townhall ChannelCreate wire format changed"
+    );
+}
+
 /// ZEB-349 back-compat: a pre-ZEB-349 `ChannelCreate` carries no `ck` key
 /// (the field did not exist). Such bytes MUST still decode, with `kind`
 /// defaulting to `ChannelKind::Text` (the `default` serde attr's job).
