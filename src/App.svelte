@@ -2168,6 +2168,12 @@
       tryConnect('mail', mailService.connectAdapter(adapter));
       await tryConnect('vine', vineService.connectAdapter(adapter));
       await tryConnect('vine.loadFollowed', vineService.loadFollowed());
+      // ZEB-612 S2: pull the Rust-persisted feed cache (descriptors +
+      // viewed-set) — vine-received only fires on FIRST insert, so a
+      // restarted app never re-receives what the cache already holds.
+      // Must run after loadFollowed: hydrate classifies rows by the
+      // follow set (the list DTO carries no source field).
+      await tryConnect('vine.hydrate', vineService.hydrate());
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
       // ZEB-663: base channel-config handler — keep the nav tree's channel
@@ -3755,7 +3761,7 @@
       ownAddress={myAddress || undefined}
     />
     {#if showVinePublish}
-      <VinePublishDialog onPublish={handleVinePublish} onPickVideo={isTauri() ? handlePickVineVideo : undefined} onClose={() => showVinePublish = false} />
+      <VinePublishDialog onPublish={handleVinePublish} onPickVideo={isTauri() ? handlePickVineVideo : undefined} resolveVideo={resolveVideoFn} onClose={() => showVinePublish = false} />
     {/if}
   {/snippet}
   {#snippet fileBrowser()}
