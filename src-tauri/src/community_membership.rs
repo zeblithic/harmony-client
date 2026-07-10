@@ -383,6 +383,14 @@ pub enum ChannelKind {
     #[default]
     Text = 0,
     Voice = 1,
+    /// ZEB-612 Town Hall: voice fused with assembly affordances (raise-hand
+    /// queue, invite-to-speak, motion card). Same media/presence/control
+    /// topics as Voice — the kind only routes the frontend view. Stale-client
+    /// posture on decode is the ZEB-349 Voice precedent: `serde_repr` rejects
+    /// the unknown discriminant, so a pre-ZEB-612 client rejects the
+    /// containing state blob loudly (no crash, no partial mutation;
+    /// upgrade-before-create is the fleet rule).
+    Townhall = 2,
 }
 
 impl ChannelKind {
