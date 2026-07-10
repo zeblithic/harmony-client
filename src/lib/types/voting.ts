@@ -48,6 +48,15 @@ export function pollIdEqual(a: number[], b: number[]): boolean {
   return true;
 }
 
+/** Lowercase-hex-encode a byte-array identifier for the IPC boundary.
+ *  The Rust IPC commands (`voting_get_poll`, `voting_cast_tier1_ballot`,
+ *  …) take `poll_id: String` (hex), while IPC RETURN values carry ids as
+ *  `number[]` (see PollIdHex JSDoc) — every call that feeds a returned id
+ *  back into a command must convert through this (Greptile PR #443). */
+export function pollIdToHex(id: number[]): string {
+  return id.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 /** Voting tiers. Mirrors Rust `Tier` (u8 repr — Approval=1, Conviction=2,
  *  Sortition=3); the Rust enum uses `serde_repr` so the wire form (and
  *  thus the Tauri IPC payload) is the integer discriminant. Compare
@@ -139,15 +148,22 @@ export interface PollStateExport {
 
 /** Payload for `voting-poll-created` Tauri event. */
 export interface VotingPollCreatedPayload {
-  pollId: PollIdHex;
-  channelId: ChannelIdHex;
-  communityId: CommunityIdHex;
+  /** Lowercase hex — the Rust payload structs emit `String` ids (unlike
+   *  IPC RETURN values, which carry ids as `number[]`; see PollIdHex).
+   *  These were previously mistyped as byte arrays, which made
+   *  `pollIdEqual(payload.pollId, …)` comparisons dead code
+   *  (Greptile PR #443). */
+  pollId: string;
+  channelId: string;
+  communityId: string;
 }
 
 /** Payload for `voting-ballot-cast` Tauri event. */
 export interface VotingBallotCastPayload {
-  pollId: PollIdHex;
-  voter: OwnerAddrHex;
+  /** Lowercase hex (Rust emits `String` — see VotingPollCreatedPayload). */
+  pollId: string;
+  /** Lowercase hex. */
+  voter: string;
   approvedCount: number;
 }
 
@@ -158,8 +174,9 @@ export interface VotingBallotCastPayload {
  * listener now for forward compatibility.
  */
 export interface VotingPollClosedPayload {
-  pollId: PollIdHex;
-  communityId: CommunityIdHex;
+  /** Lowercase hex (Rust emits `String` — see VotingPollCreatedPayload). */
+  pollId: string;
+  communityId: string;
 }
 
 // ─── ZEB-291 Phase 2 — Tier 2 (Conviction) frontend types ──────────────

@@ -141,13 +141,11 @@ describe('TownHallMotionCard (ZEB-612 S5)', () => {
         pollCreatedHandler = h;
         return () => {};
       }),
-      // The card passes the hex string; the embedded PollMessage passes the
-      // byte-array poll_id — normalize both to hex before dispatching.
-      getPoll: vi.fn(async (pollId: string | number[]) => {
-        const hex = Array.isArray(pollId)
-          ? pollId.map((b) => b.toString(16).padStart(2, '0')).join('')
-          : pollId;
-        return hex === '33'.repeat(32)
+      // Both the card AND the embedded PollMessage must pass the hex string
+      // at the adapter boundary (Greptile #443) — a byte array would miss
+      // both branches and pin the regression.
+      getPoll: vi.fn(async (pollId: string) =>
+        pollId === '33'.repeat(32)
           ? {
               meta: metaB,
               tally: { counts: [0, 0], ballot_count: 0 },
@@ -157,8 +155,8 @@ describe('TownHallMotionCard (ZEB-612 S5)', () => {
               meta: metaA,
               tally: { counts: [0, 0], ballot_count: 0 },
               options: ['Aye — Adopt the charter', 'Nay — Adopt the charter'],
-            };
-      }),
+            },
+      ),
     });
     render(TownHallMotionCard, { props: { ...base, adapter: adapter as never } });
     await waitFor(() => {

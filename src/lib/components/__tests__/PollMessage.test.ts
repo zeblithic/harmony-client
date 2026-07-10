@@ -9,6 +9,9 @@ import type { PollIdHex, PollMeta, PollStateExport } from '../../types/voting';
 // see PollIdHex JSDoc. Use these helpers so test fixtures match the
 // production wire shape rather than the historical hex-string shape.
 const POLL_ID: PollIdHex = new Array(32).fill(0xab);
+// The IPC boundary takes hex strings — the component must convert its
+// byte-array prop before every getPoll/castTier1Ballot call (Greptile #443).
+const POLL_ID_HEX = 'ab'.repeat(32);
 const COMMUNITY_ID: number[] = new Array(16).fill(0xbb);
 const CHANNEL_ID: number[] = new Array(16).fill(0xdd);
 const CREATOR: number[] = new Array(16).fill(0xcc);
@@ -138,7 +141,41 @@ describe('PollMessage', () => {
     await waitFor(() => {
       expect(castMock).toHaveBeenCalled();
     });
-    expect(castMock).toHaveBeenCalledWith(POLL_ID, [0]);
+    // Hex string, NOT the byte-array prop — voting_cast_tier1_ballot takes
+    // poll_id: String; the raw array fails Tauri arg deserialization.
+    expect(castMock).toHaveBeenCalledWith(POLL_ID_HEX, [0]);
+  });
+
+  it('fetches via the hex poll id and refreshes on a matching ballot-cast event (Greptile #443)', async () => {
+    // Pins the two halves of the byte-array/hex-string boundary bug: the
+    // initial fetch must hex-encode the prop, and the ballot-cast listener
+    // must match the event's hex-string pollId (the old byte-array
+    // comparison never matched, so live refresh was dead code).
+    const state = makeState();
+    getPollMock.mockResolvedValue(state);
+    let ballotHandler: ((p: { pollId: string; voter: string; approvedCount: number }) => void) | undefined;
+    adapter.subscribeBallotCast = vi.fn((h) => {
+      ballotHandler = h;
+      return () => {};
+    });
+
+    render(PollMessage, {
+      props: { pollId: POLL_ID, meta: makeMeta(), adapter },
+    });
+
+    await waitFor(() => {
+      expect(getPollMock).toHaveBeenCalledWith(POLL_ID_HEX);
+    });
+
+    getPollMock.mockClear();
+    // Non-matching poll: no refetch.
+    ballotHandler!({ pollId: 'ff'.repeat(32), voter: 'bb'.repeat(16), approvedCount: 1 });
+    expect(getPollMock).not.toHaveBeenCalled();
+    // Matching poll (hex string, as the Rust payload emits): refetch fires.
+    ballotHandler!({ pollId: POLL_ID_HEX, voter: 'bb'.repeat(16), approvedCount: 1 });
+    await waitFor(() => {
+      expect(getPollMock).toHaveBeenCalledWith(POLL_ID_HEX);
+    });
   });
 
   it('does NOT send an empty ballot when the last selected option is deselected', async () => {
