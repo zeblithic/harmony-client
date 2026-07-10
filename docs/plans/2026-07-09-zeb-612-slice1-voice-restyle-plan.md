@@ -338,8 +338,10 @@ Replace `.voice-tile.speaking`, `.voice-tile .mute-glyph`, `.mod-badge`, `.mod-c
     gap: 4px;
     margin-top: 4px;
     /* Frame B: "Hover a tile to Mute / Remove (mods)" — reveal on hover or
-       keyboard focus. Opacity keeps the buttons clickable and focusable. */
+       keyboard focus. pointer-events blocks stray clicks while hidden; the
+       buttons stay keyboard-focusable, and :focus-within re-enables them. */
     opacity: 0;
+    pointer-events: none;
     transition: opacity 0.12s ease;
   }
   .voice-tile:hover .mod-controls,
@@ -347,6 +349,7 @@ Replace `.voice-tile.speaking`, `.voice-tile .mute-glyph`, `.mod-badge`, `.mod-c
   .voice-list-row:hover .mod-controls,
   .voice-list-row:focus-within .mod-controls {
     opacity: 1;
+    pointer-events: auto;
   }
   .mod-btn { border: 1px solid var(--border); background: var(--bg-tertiary); color: var(--text-secondary);
     font-size: 0.7rem; padding: 2px 6px; border-radius: 3px; cursor: pointer; }
@@ -525,6 +528,13 @@ Claude-Session: https://claude.ai/code/session_01MsT6ZD7kqbpbKoeenyQPtc"
 ```
 
 ---
+
+## Round-1 amendments (bot converge, PR #439)
+
+1. **Accepted (CodeRabbit Major + Qodo bug, same finding):** `opacity: 0` alone leaves the hidden Mute/Remove buttons click-targetable — a stray tap/click on a tile could hit an invisible moderation control. Fix: `pointer-events: none` while hidden, `pointer-events: auto` under the same hover/`:focus-within` reveal selectors. Keyboard access is unaffected (`pointer-events` doesn't block focus; focusing a button reveals the group via `:focus-within`). Not separately unit-tested: jsdom dispatches events without hit-testing, so CSS `pointer-events` is not observable there — the existing "remain clickable" test still pins the handler path.
+2. **Declined (CodeRabbit Minor — list-row speaking ring):** the double ring is a grid-tile treatment (TH frames A/B draw rings on avatar tiles only). The >12 compact list keeps its own pre-existing speaking affordance — accent dot glow + accent name (`.voice-list-row .dot.on`, `.voice-list-row.speaking .name`) — which this slice deliberately leaves unchanged.
+3. **Declined (CodeRabbit Major — PTT `touch-action`):** `touch-action: none; user-select: none;` on `.ptt-hold` is pre-existing code (present before this PR), carried over verbatim. Zero delta — the zero-behavior-change constraint is not violated.
+4. **Accepted (CodeRabbit Minor — radius wording):** spec §2's type/idiom line clarified — badge/chip pills fully rounded (20px+/999px), buttons/inputs 5px, cards/banners 8px. The plan's 5px button radii were already consistent with that intent.
 
 ## Post-plan (session workflow, not tasks)
 

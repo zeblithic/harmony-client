@@ -43,7 +43,7 @@ Faithful Commons treatment of the shipped component; **zero behavior change**. A
 * **Channel-full bounce:** `--gov-clay-soft` surface, *"Voice channel full — try again later."*
 * **Roster tiles:** speaking ring = double box-shadow in `--accent`; 🔇 "muted" badge; 🛡 "mod-muted" badge on `--status-recalled-bg`; hover reveals mod Mute/Remove per existing power gating.
 * **Control bar:** 🎙 Live / PTT / 🎧 Deafen / Leave; Leave in `--danger`.
-* Type/idiom: uppercase `--faint` section labels, mono (`--font-mono`) for counts, pill radius 20px, card radius per `--radius-card`.
+* Type/idiom: uppercase `--faint` section labels, mono (`--font-mono`) for counts; radii — badge/chip **pills** fully rounded (20px+/999px), **buttons/inputs** 5px, **cards/banners** 8px.
 
 Existing tests pin behavior; restyle updates class/DOM assertions only where selectors move. style-token-guard budget-0 (existing `var(--*)` only).
 

@@ -598,8 +598,10 @@
     gap: 4px;
     margin-top: 4px;
     /* Frame B: "Hover a tile to Mute / Remove (mods)" — reveal on hover or
-       keyboard focus. Opacity keeps the buttons clickable and focusable. */
+       keyboard focus. pointer-events blocks stray clicks while hidden; the
+       buttons stay keyboard-focusable, and :focus-within re-enables them. */
     opacity: 0;
+    pointer-events: none;
     transition: opacity 0.12s ease;
   }
   .voice-tile:hover .mod-controls,
@@ -607,6 +609,7 @@
   .voice-list-row:hover .mod-controls,
   .voice-list-row:focus-within .mod-controls {
     opacity: 1;
+    pointer-events: auto;
   }
   .mod-btn { border: 1px solid var(--border); background: var(--bg-tertiary); color: var(--text-secondary);
     font-size: 0.7rem; padding: 2px 6px; border-radius: 3px; cursor: pointer; }
