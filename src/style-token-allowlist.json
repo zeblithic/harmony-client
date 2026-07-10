@@ -4,6 +4,5 @@
   "lib/components/LibraryDirectoryBrowser.svelte": 3,
   "lib/components/MediaCard.svelte": 1,
   "lib/components/MintLedger.svelte": 1,
-  "lib/components/VinePlayer.svelte": 3,
   "lib/components/VinePublishDialog.svelte": 1
 }

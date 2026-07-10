@@ -2,13 +2,14 @@
  * Integration test for the VineFeed subsystem.
  *
  * Tests end-to-end: render vine cards sorted by date, filter tabs,
- * open/close player, player navigation, mark viewed, reshare, create
- * button, and empty states.
+ * center-detection autoplay (the feed IS the player since ZEB-612 S2),
+ * mark viewed, on-card reshare via the confirm dialog, create button,
+ * and empty states.
  *
  * Uses real VineVideo data and real component tree (VineFeed → VineCard
- * → VinePlayer), no service stubs.
+ * → ReshareConfirmDialog), no service stubs.
  */
-import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
+import { render, screen, fireEvent, cleanup, within } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import VineFeed from '../VineFeed.svelte';
 import type { VineVideo } from '../../types';
@@ -73,6 +74,13 @@ function renderFeed(overrides: Record<string, unknown> = {}) {
   return { ...result, callbacks };
 }
 
+/** The rendered feed row for a vine id (scopes queries to one card). */
+function rowFor(container: HTMLElement, vineId: string): HTMLElement {
+  const row = container.querySelector<HTMLElement>(`[data-vine-id="${vineId}"]`);
+  if (!row) throw new Error(`no feed row for ${vineId}`);
+  return row;
+}
+
 describe('VineFeed Integration', () => {
   // ── 1. Rendering ──────────────────────────────────────────────────
 
@@ -99,9 +107,12 @@ describe('VineFeed Integration', () => {
     expect(screen.getByText('Cache explained')).toBeTruthy();
   });
 
-  it('shows attribution row for reshared vines', () => {
+  it('shows reshare attribution with the resharer and the view-original verb', () => {
     renderFeed();
-    expect(screen.getByText(/originally by/i)).toBeTruthy();
+    // v4: Alice reshared Bob's vine — "↻ Alice reshared · view original by Bob"
+    // (plain text variant: no onViewOriginal wired in this render).
+    expect(screen.getByText(/Alice reshared ·/)).toBeTruthy();
+    expect(screen.getByText(/view original by Bob/)).toBeTruthy();
   });
 
   // ── 2. Unviewed count ─────────────────────────────────────────────
@@ -139,6 +150,9 @@ describe('VineFeed Integration', () => {
   });
 
   it('shows empty state when all vines are viewed in Unviewed filter', async () => {
+    // Filter switches clear the playing-card pin, so the strict unviewed
+    // view (and its all-caught-up state) stays reachable even though the
+    // newest card auto-played (and was auto-marked viewed) on mount.
     renderFeed({ viewedIds: new Set(['v1', 'v2', 'v3', 'v4']) });
 
     const unviewedTab = screen.getByText(/^Unviewed/);
@@ -152,100 +166,47 @@ describe('VineFeed Integration', () => {
     expect(screen.getByText(/Follow creators/)).toBeTruthy();
   });
 
-  // ── 4. Player ─────────────────────────────────────────────────────
+  // ── 4. Autoplay (the feed is the player, ZEB-612 S2) ──────────────
 
-  it('opens player when a vine card is clicked', async () => {
-    renderFeed();
-    const card = screen.getByLabelText('Transport demo by Alice');
-    await fireEvent.click(card);
-
-    // Player overlay appears
-    expect(screen.getByRole('dialog', { name: 'Vine player' })).toBeTruthy();
-    // Shows vine CID in player
-    expect(screen.getByText('cid-v1')).toBeTruthy();
+  it('marks the newest vine viewed on mount (autoplay-on-view)', async () => {
+    const { callbacks, container } = renderFeed();
+    await vi.waitFor(() => {
+      expect(callbacks.onMarkViewed).toHaveBeenCalledWith('v4');
+    });
+    // Exactly one playing card, and it's the newest row.
+    expect(container.querySelectorAll('.vine-card.playing').length).toBe(1);
+    expect(rowFor(container, 'v4').querySelector('.vine-card.playing')).toBeTruthy();
   });
 
-  it('marks vine as viewed when player opens', async () => {
-    const { callbacks } = renderFeed();
+  it('clicking a card moves playback to it and marks it viewed', async () => {
+    const { callbacks, container } = renderFeed();
     const card = screen.getByLabelText('Transport demo by Alice');
     await fireEvent.click(card);
 
     expect(callbacks.onMarkViewed).toHaveBeenCalledWith('v1');
+    expect(rowFor(container, 'v1').querySelector('.vine-card.playing')).toBeTruthy();
+    expect(container.querySelectorAll('.vine-card.playing').length).toBe(1);
   });
 
-  it('closes player when close button is clicked', async () => {
+  // ── 5. Reshare (on-card verb + confirm dialog) ────────────────────
+
+  it('shows the reshare verb on every card (no own vines in this feed)', () => {
     renderFeed();
-    const card = screen.getByLabelText('Transport demo by Alice');
-    await fireEvent.click(card);
-
-    const closeBtn = screen.getByLabelText('Close player');
-    await fireEvent.click(closeBtn);
-
-    expect(screen.queryByRole('dialog', { name: 'Vine player' })).toBeNull();
-  });
-
-  it('closes player on Escape key', async () => {
-    renderFeed();
-    const card = screen.getByLabelText('Transport demo by Alice');
-    await fireEvent.click(card);
-
-    await fireEvent.keyDown(window, { key: 'Escape' });
-
-    expect(screen.queryByRole('dialog', { name: 'Vine player' })).toBeNull();
-  });
-
-  it('navigates to next vine with ArrowRight', async () => {
-    const { callbacks } = renderFeed();
-    // Open the first vine in sorted order (v4 — newest)
-    const card = screen.getByLabelText('Cache explained by Alice');
-    await fireEvent.click(card);
-
-    // Navigate next
-    await fireEvent.keyDown(window, { key: 'ArrowRight' });
-
-    // Should mark v3 (untitled) as viewed
-    expect(callbacks.onMarkViewed).toHaveBeenCalledWith('v3');
-  });
-
-  it('navigates to previous vine with ArrowLeft', async () => {
-    const { callbacks } = renderFeed();
-    // Open the second vine in sorted order (v3 — Carol's untitled)
-    const card = screen.getByLabelText('Untitled vine by Carol');
-    await fireEvent.click(card);
-    callbacks.onMarkViewed.mockClear();
-
-    // Navigate previous → should go to v4 (newest in sorted order)
-    await fireEvent.keyDown(window, { key: 'ArrowLeft' });
-
-    expect(callbacks.onMarkViewed).toHaveBeenCalledWith('v4');
-  });
-
-  // ── 5. Reshare ────────────────────────────────────────────────────
-
-  it('shows reshare button in player', async () => {
-    renderFeed();
-    const card = screen.getByLabelText('Transport demo by Alice');
-    await fireEvent.click(card);
-
-    expect(screen.getByLabelText('Reshare vine')).toBeTruthy();
+    expect(screen.getAllByLabelText('Reshare vine').length).toBe(4);
   });
 
   it('calls onReshare when reshare is confirmed via dialog', async () => {
-    const { callbacks } = renderFeed();
+    const { callbacks, container } = renderFeed();
     callbacks.onReshare.mockResolvedValue(undefined);
 
-    const card = screen.getByLabelText('Transport demo by Alice');
-    await fireEvent.click(card);
-
-    // Player's reshare button opens the confirmation dialog.
-    const reshareBtn = screen.getByLabelText('Reshare vine');
+    const reshareBtn = within(rowFor(container, 'v1')).getByLabelText('Reshare vine');
     await fireEvent.click(reshareBtn);
 
     // onReshare must not fire until the dialog is confirmed.
     expect(callbacks.onReshare).not.toHaveBeenCalled();
 
     // The dialog's confirm button has the bare label "Reshare"
-    // (the player's button uses aria-label "Reshare vine"), so
+    // (the cards' buttons use aria-label "Reshare vine"), so
     // /^reshare$/i disambiguates to the dialog's confirm button.
     const confirmBtn = screen.getByRole('button', { name: /^reshare$/i });
     await fireEvent.click(confirmBtn);
@@ -295,7 +256,7 @@ describe('VineFeed Integration', () => {
   // `vineService.publish`). A full App.svelte mount is too heavy
   // (Layout, all services, Tauri adapter, …) for this single assertion;
   // the helper extraction keeps the asserted logic pure and the
-  // VineFeed→VineCard→VinePlayer wiring real.
+  // VineFeed→VineCard→ReshareConfirmDialog wiring real.
   //
   // Two cases:
   // - Resharing a non-reshare → publish payload credits the source
@@ -328,7 +289,7 @@ describe('VineFeed Integration', () => {
 
     it('reshares an original vine: publish payload credits the source creator', async () => {
       const { publish, onReshare } = setupPublishSpy();
-      render(VineFeed, {
+      const { container } = render(VineFeed, {
         props: {
           followedVines: VINES,
           discoverVines: [],
@@ -340,11 +301,10 @@ describe('VineFeed Integration', () => {
         },
       });
 
-      // Open Bob's non-reshare original (v2) in the player.
-      const card = screen.getByLabelText('Mesh routing by Bob');
-      await fireEvent.click(card);
-
-      const reshareBtn = screen.getByLabelText('Reshare vine');
+      // Reshare Bob's non-reshare original (v2) straight from its card.
+      const row = container.querySelector<HTMLElement>('[data-vine-id="v2"]');
+      if (!row) throw new Error('no feed row for v2');
+      const reshareBtn = within(row).getByLabelText('Reshare vine');
       await fireEvent.click(reshareBtn);
 
       const confirmBtn = screen.getByRole('button', { name: /^reshare$/i });
@@ -402,6 +362,30 @@ describe('VineFeed Integration', () => {
       };
       await onReshare(ownOriginal);
       expect(publish).not.toHaveBeenCalled();
+    });
+
+    it('guard (UI layer): own original renders no Reshare verb on its card', () => {
+      const ownOriginal: VineVideo = {
+        id: 'v-mine-ui',
+        creatorAddress: 'self',
+        creatorName: 'You',
+        createdAt: vineBase + 1000,
+        videoCid: 'cid-mine-ui',
+        title: 'My original',
+        viewed: true,
+      };
+      render(VineFeed, {
+        props: {
+          followedVines: [ownOriginal],
+          discoverVines: [],
+          viewedIds: new Set<string>(['v-mine-ui']),
+          activeTab: 'following' as const,
+          followedAddresses: new Set<string>(),
+          onMarkViewed: vi.fn(),
+          onReshare: vi.fn(),
+        },
+      });
+      expect(screen.queryByLabelText('Reshare vine')).toBeNull();
     });
 
     it("guard: reshare of someone-else's reshare-of-mine → publish IS called with self attribution", async () => {
@@ -465,10 +449,7 @@ describe('VineFeed Integration', () => {
         },
       });
 
-      // Open the player on the reshare-of-reshare.
-      const card = screen.getByLabelText('Alice original by Bob');
-      await fireEvent.click(card);
-
+      // The only card in the feed carries the verb — click it directly.
       const reshareBtn = screen.getByLabelText('Reshare vine');
       await fireEvent.click(reshareBtn);
 
