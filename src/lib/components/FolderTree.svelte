@@ -73,7 +73,7 @@
         onclick={selectRoot}
         onkeydown={handleRootKeydown}
       >
-        All Files
+        All files
       </button>
     </li>
     {#each rootFolders as folder (folder.cid)}

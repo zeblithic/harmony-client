@@ -2,30 +2,58 @@ import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import QuotaBar from '../QuotaBar.svelte';
 
+// ZEB-612 S3: no overall storage quota exists — the bar shows real used
+// bytes with no invented denominator, plus the real pinned budget meter.
 describe('QuotaBar', () => {
-  it('renders usage text', () => {
-    render(QuotaBar, { props: { usedBytes: 5_000_000_000, totalBytes: 10_000_000_000, onCleanupClick: vi.fn() } });
-    expect(screen.getByText(/5\.0 GB/)).toBeTruthy();
-    expect(screen.getByText(/10\.0 GB/)).toBeTruthy();
+  const props = (over: Record<string, unknown> = {}) => ({
+    usedBytes: 5_000_000_000,
+    pinnedUsedBytes: 10_000_000,
+    pinnedBudgetBytes: 50_000_000 as number | null,
+    onCleanupClick: vi.fn(),
+    ...over,
   });
 
-  it('has descriptive aria-label on button', () => {
-    render(QuotaBar, { props: { usedBytes: 3_000_000_000, totalBytes: 10_000_000_000, onCleanupClick: vi.fn() } });
-    const btn = screen.getByRole('button');
-    expect(btn.getAttribute('aria-label')).toContain('3.0 GB');
-    expect(btn.getAttribute('aria-label')).toContain('10.0 GB');
-    expect(btn.getAttribute('aria-label')).toContain('30%');
+  it('shows used bytes with no invented total', () => {
+    render(QuotaBar, { props: props() });
+    expect(screen.getByText(/5\.0 GB stored locally/)).toBeTruthy();
+    expect(screen.queryByText(/10\.0 GB/)).toBeNull();
+  });
+
+  it('renders the pinned meter when the budget is known', () => {
+    render(QuotaBar, { props: props() });
+    expect(screen.getByText(/Pinned 10\.0 MB of 50\.0 MB/)).toBeTruthy();
+  });
+
+  it('hides the pinned meter when the budget is unknown (demo / IPC failure)', () => {
+    const { container } = render(QuotaBar, { props: props({ pinnedBudgetBytes: null }) });
+    expect(screen.queryByText(/Pinned/)).toBeNull();
+    expect(container.querySelector('.quota-track')).toBeNull();
   });
 
   it('calls onCleanupClick when clicked', async () => {
     const onClick = vi.fn();
-    render(QuotaBar, { props: { usedBytes: 5_000_000_000, totalBytes: 10_000_000_000, onCleanupClick: onClick } });
+    render(QuotaBar, { props: props({ onCleanupClick: onClick }) });
     await fireEvent.click(screen.getByRole('button'));
     expect(onClick).toHaveBeenCalledOnce();
   });
 
-  it('shows warning color when usage exceeds 85%', () => {
-    const { container } = render(QuotaBar, { props: { usedBytes: 9_000_000_000, totalBytes: 10_000_000_000, onCleanupClick: vi.fn() } });
+  it('shows warning color when pinned usage exceeds 85% of the budget', () => {
+    const { container } = render(
+      QuotaBar,
+      { props: props({ pinnedUsedBytes: 45_000_000 }) },
+    );
     expect(container.querySelector('.quota-fill.warning')).toBeTruthy();
+  });
+
+  it('treats a known zero budget with usage as fully over budget, not 0%', () => {
+    // pinnedBudgetBytes === 0 is a valid state distinct from null (unknown);
+    // rendering it as a healthy empty bar would hide an over-quota state.
+    const { container } = render(
+      QuotaBar,
+      { props: props({ pinnedBudgetBytes: 0, pinnedUsedBytes: 1_000 }) },
+    );
+    const fill = container.querySelector('.quota-fill.warning') as HTMLElement;
+    expect(fill).toBeTruthy();
+    expect(fill.style.width).toBe('100%');
   });
 });

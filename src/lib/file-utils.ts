@@ -91,3 +91,8 @@ export function relativeTime(timestamp: number): string {
   const months = Math.floor(days / 30);
   return `${months}mo ago`;
 }
+
+/** ZEB-612 S3: `3f9a2c…7e8f` — compact hex-CID display for rows. */
+export function shortCid(cid: string): string {
+  return cid.length <= 12 ? cid : `${cid.slice(0, 6)}…${cid.slice(-4)}`;
+}

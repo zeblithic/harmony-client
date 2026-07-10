@@ -207,6 +207,7 @@ pub mod node_event_sink;
 pub mod notes_commands;
 pub mod notes_crdt;
 pub mod notes_persist;
+pub mod observed_holders;
 pub mod open_join_admit;
 pub mod open_join_auth;
 pub mod open_join_dial;
@@ -761,6 +762,10 @@ pub struct NodeState {
     mail_sync: Option<std::sync::Arc<mail_sync::MailSync>>,
     /// Disk-backed content index (pin/replication metadata).
     content_index: std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    /// ZEB-612 S3: per-CID distinct announcing sessions, written by the
+    /// event loop's `harmony/announce/*` arm, read by list_content /
+    /// list_root for `replicaCount` (1 self + observed peers).
+    observed_holders: std::sync::Arc<std::sync::Mutex<observed_holders::ObservedHolders>>,
     /// Monotonic install generation. Bumped at lock-2 install site under
     /// `start_node`. Post-install checks (pairing-handle install, failure
     /// cleanup, stop_inner gating) compare against this to detect whether a
@@ -1606,6 +1611,9 @@ impl Default for NodeState {
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
                 content_index::ContentIndex::load(std::path::Path::new("")),
+            )),
+            observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
+                observed_holders::ObservedHolders::new(),
             )),
             generation: 0,
             install_seq: 0,
@@ -9071,10 +9079,9 @@ pub async fn start_node_inner(
         // moves into guard.node_addr, so we carry this out via the tuple.
         let node_addr_for_response = node_addr.clone();
         let config = NodeConfig {
-            storage_budget: StorageBudget {
-                cache_capacity: 512,
-                max_pinned_bytes: 50_000_000,
-            },
+            // ZEB-612 S3: single-sourced so get_storage_budget reports the
+            // exact budget the runtime enforces.
+            storage_budget: NODE_STORAGE_BUDGET,
             compute_budget: InstructionBudget { fuel: 100_000 },
             schedule: Default::default(),
             // ZEB-398: persist EncryptedDurable content (our communities'
@@ -9245,6 +9252,14 @@ pub async fn start_node_inner(
                     // restores for the same CID.)
                     idx.entries().filter(|e| e.pinned).map(|e| e.cid).collect()
                 };
+
+                // ZEB-612 S3: fresh holder map per node generation (holder
+                // zids are per-session; a restart invalidates them anyway).
+                let observed_holders = std::sync::Arc::new(std::sync::Mutex::new(
+                    observed_holders::ObservedHolders::new(),
+                ));
+                let observed_holders_for_loop = observed_holders.clone();
+                let content_index_for_loop = content_index.clone();
 
                 let ep_clone = endpoint.clone();
                 let app_clone = app.clone();
@@ -9496,6 +9511,10 @@ pub async fn start_node_inner(
                                 // sweep hook installed inside run once the handle
                                 // exists).
                                 addr_fanout_for_loop,
+                                // ZEB-612 S3: holder map + content index for the
+                                // announce-note arm and the re-announce tick.
+                                observed_holders_for_loop,
+                                content_index_for_loop,
                             )
                             .await;
                         });
@@ -9527,6 +9546,7 @@ pub async fn start_node_inner(
                         guard.ingest_tx = Some(ingest_tx);
                         guard.content_verb_tx = Some(content_verb_tx);
                         guard.content_index = content_index;
+                        guard.observed_holders = observed_holders;
                         guard.follow_tx = Some(follow_tx);
                         guard.voice_tx = Some(voice_tx);
                         guard.voice_channel_tx = Some(voice_channel_tx);
@@ -13338,6 +13358,32 @@ pub fn parse_content_announcement(
     })
 }
 
+/// ZEB-612 S3: build re-announcement publishes for the announceable
+/// subset of the content index — `Sensitivity::Public`, non-archived,
+/// deduped by CID (symlink-style sidecars share CIDs). This mirrors
+/// harmony-content's `should_announce` class gate: encrypted content
+/// must not leak existence on the announce topic. Payload is the 4-byte
+/// BE size `parse_content_announcement` pins; sizes over u32::MAX
+/// saturate (the announce size is advisory).
+pub fn collect_reannouncements(index: &content_index::ContentIndex) -> Vec<(String, Vec<u8>)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for entry in index.entries() {
+        if entry.sensitivity != content_index::Sensitivity::Public || entry.archived {
+            continue;
+        }
+        if !seen.insert(entry.cid) {
+            continue;
+        }
+        let size = u32::try_from(entry.size_bytes).unwrap_or(u32::MAX);
+        out.push((
+            format!("harmony/announce/{}", hex::encode(entry.cid)),
+            size.to_be_bytes().to_vec(),
+        ));
+    }
+    out
+}
+
 /// Wire format returned by `list_content` — one entry per self-ingested
 /// file the client is aware of. Joins sidecar metadata with the runtime
 /// cache's pinned state snapshot. ZEB-158 slice 1 adds `kind` to
@@ -13362,6 +13408,20 @@ pub struct ContentItemWire {
     pub licensed: bool,
     pub archived: bool,
     pub kind: String, // ZEB-158: "leaf" | "folder"
+    /// ZEB-612 S3: observed replica count — 1 (self) + distinct peer
+    /// sessions seen announcing this CID since boot (staleness-pruned).
+    /// A LOWER BOUND, not global truth: UI copy must say "copies seen".
+    pub replica_count: u32,
+}
+
+/// ZEB-612 S3: overwrite `replica_count` with 1 (self) + observed peers.
+fn apply_replica_counts(
+    items: &mut [ContentItemWire],
+    holders: &observed_holders::ObservedHolders,
+) {
+    for item in items {
+        item.replica_count = 1 + holders.peer_count(&item.cid);
+    }
 }
 
 fn sensitivity_wire(s: content_index::Sensitivity) -> &'static str {
@@ -13422,6 +13482,40 @@ pub struct CreateFolderResult {
     pub cid: String,
 }
 
+/// ZEB-612 S3: single source for the node's storage budget — also used
+/// by `NodeConfig` in `start_node`. Hardcoded pending a settings surface.
+pub const NODE_STORAGE_BUDGET: StorageBudget = StorageBudget {
+    cache_capacity: 512,
+    max_pinned_bytes: 50_000_000,
+};
+
+/// Wire shape for `get_storage_budget`. `maxPinnedBytes` is the PINNED
+/// content budget the runtime enforces via cache eviction — NOT an
+/// overall storage quota (none exists); the frontend must not render it
+/// as one.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageBudgetWire {
+    pub cache_capacity: u64,
+    pub max_pinned_bytes: u64,
+}
+
+impl From<&StorageBudget> for StorageBudgetWire {
+    fn from(b: &StorageBudget) -> Self {
+        Self {
+            cache_capacity: b.cache_capacity as u64,
+            max_pinned_bytes: b.max_pinned_bytes,
+        }
+    }
+}
+
+/// Query the node's storage budget (ZEB-612 S3). Const-backed — works
+/// before node boot.
+#[tauri::command]
+async fn get_storage_budget() -> Result<StorageBudgetWire, String> {
+    Ok(StorageBudgetWire::from(&NODE_STORAGE_BUDGET))
+}
+
 #[tauri::command]
 async fn list_content(
     folder_cid: Option<String>,
@@ -13449,7 +13543,20 @@ async fn list_content(
             let pinned_set = reply_rx
                 .await
                 .map_err(|_| "event loop dropped snapshot request".to_string())?;
-            list_folder(hex, verb_tx, &pinned_set).await
+            let mut items = list_folder(hex, verb_tx, &pinned_set).await?;
+            // ZEB-612 S3: manifest-derived rows join the holder map the
+            // same way root rows do — holders are keyed by CID.
+            let holders_arc = {
+                let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+                guard.observed_holders.clone()
+            };
+            {
+                let holders = holders_arc
+                    .lock()
+                    .map_err(|e| format!("holders lock: {e}"))?;
+                apply_replica_counts(&mut items, &holders);
+            }
+            Ok(items)
         }
     }
 }
@@ -13457,9 +13564,9 @@ async fn list_content(
 pub(crate) fn list_root(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<ContentItemWire>, String> {
-    let index = {
+    let (index, holders_arc) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
+        (guard.content_index.clone(), guard.observed_holders.clone())
     };
     let mut entries: Vec<ContentItemWire> = {
         let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
@@ -13476,9 +13583,17 @@ pub(crate) fn list_root(
                 licensed: e.licensed,
                 archived: e.archived,
                 kind: kind_wire(e.kind).to_string(),
+                replica_count: 1,
             })
             .collect()
     };
+    // ZEB-612 S3: join observed announcers — 1 (self) + distinct peers.
+    {
+        let holders = holders_arc
+            .lock()
+            .map_err(|e| format!("holders lock: {e}"))?;
+        apply_replica_counts(&mut entries, &holders);
+    }
     // HashMap iter is non-deterministic; sort newest-first for stable UI.
     // Rust 1.95's clippy::unnecessary_sort_by lint flags `sort_by` with a
     // reverse comparator — sort_by_key + Reverse expresses the same intent
@@ -13553,6 +13668,9 @@ pub async fn list_folder(
             licensed: false,
             archived: false,
             kind: kind_wire(e.kind).to_string(),
+            // Self-held baseline; list_content joins observed peers on top
+            // (direct list_folder callers — integration tests — see 1).
+            replica_count: 1,
         })
         .collect())
 }
@@ -53165,6 +53283,7 @@ pub fn run() {
             add_space,
             get_node_addr,
             list_content,
+            get_storage_budget,
             pin_content,
             unpin_content,
             burn_content,
@@ -54089,6 +54208,93 @@ mod tests {
         assert!(parse_content_announcement("harmony/announce/hello world", &payload).is_none());
     }
 
+    fn reannounce_entry(
+        cid: [u8; 32],
+        sensitivity: content_index::Sensitivity,
+        archived: bool,
+        size_bytes: u64,
+    ) -> content_index::ContentIndexEntry {
+        content_index::ContentIndexEntry {
+            sidecar_id: content_index::SidecarId::new(),
+            cid,
+            file_name: "hello.txt".into(),
+            size_bytes,
+            stored_at_ms: 1_700_000_000_000,
+            sensitivity,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived,
+            pinned: false,
+            kind: content_index::ContentKind::Leaf,
+        }
+    }
+
+    #[test]
+    fn collect_reannouncements_public_only_deduped() {
+        use content_index::Sensitivity;
+        let mut index = content_index::ContentIndex::load(std::path::Path::new(""));
+        index.insert(reannounce_entry(
+            [0xAA; 32],
+            Sensitivity::Public,
+            false,
+            1024,
+        ));
+        // Symlink-style second sidecar sharing the CID — must dedupe.
+        index.insert(reannounce_entry(
+            [0xAA; 32],
+            Sensitivity::Public,
+            false,
+            1024,
+        ));
+        index.insert(reannounce_entry(
+            [0xBB; 32],
+            Sensitivity::Private,
+            false,
+            2048,
+        ));
+        index.insert(reannounce_entry(
+            [0xCC; 32],
+            Sensitivity::Confidential,
+            false,
+            2048,
+        ));
+        index.insert(reannounce_entry(
+            [0xDD; 32],
+            Sensitivity::Public,
+            true,
+            4096,
+        ));
+
+        let out = collect_reannouncements(&index);
+        assert_eq!(
+            out.len(),
+            1,
+            "private/confidential + archived excluded, shared CID deduped"
+        );
+        let (key, payload) = &out[0];
+        assert_eq!(
+            key,
+            &format!("harmony/announce/{}", hex::encode([0xAA; 32]))
+        );
+        assert_eq!(payload.as_slice(), &1024u32.to_be_bytes());
+        // Round-trip: the re-announce payload parses with the pinned parser.
+        let parsed = parse_content_announcement(key, payload).expect("self-parseable");
+        assert_eq!(parsed.size_bytes, 1024);
+    }
+
+    #[test]
+    fn collect_reannouncements_saturates_oversized() {
+        let mut index = content_index::ContentIndex::load(std::path::Path::new(""));
+        index.insert(reannounce_entry(
+            [0xEE; 32],
+            content_index::Sensitivity::Public,
+            false,
+            u64::MAX,
+        ));
+        let out = collect_reannouncements(&index);
+        assert_eq!(out[0].1.as_slice(), &u32::MAX.to_be_bytes());
+    }
+
     #[test]
     fn list_folder_rejects_non_manifest_child_0() {
         use crate::folders::FolderManifest;
@@ -54738,6 +54944,7 @@ mod pin_persistence_tests {
             licensed: false,
             archived: false,
             kind: "folder".into(),
+            replica_count: 3,
         };
         let json = serde_json::to_string(&wire).expect("serialize");
         assert!(
@@ -54745,6 +54952,44 @@ mod pin_persistence_tests {
             "got: {json}"
         );
         assert!(json.contains("\"kind\":\"folder\""), "got: {json}");
+        // ZEB-612 S3: camelCase pin for the observed replica count.
+        assert!(json.contains("\"replicaCount\":3"), "got: {json}");
+    }
+
+    fn replica_test_item(cid_hex: &str) -> ContentItemWire {
+        ContentItemWire {
+            sidecar_id: String::new(),
+            cid: cid_hex.to_string(),
+            name: "f".into(),
+            size_bytes: 1,
+            stored_at: 0,
+            sensitivity: "private".into(),
+            replication_tier: "default".into(),
+            pinned: false,
+            licensed: false,
+            archived: false,
+            kind: "leaf".into(),
+            replica_count: 1,
+        }
+    }
+
+    #[test]
+    fn storage_budget_wire_camel_case() {
+        let json = serde_json::to_string(&StorageBudgetWire::from(&NODE_STORAGE_BUDGET))
+            .expect("serialize");
+        assert!(json.contains("\"cacheCapacity\":512"), "got: {json}");
+        assert!(json.contains("\"maxPinnedBytes\":50000000"), "got: {json}");
+    }
+
+    #[test]
+    fn apply_replica_counts_is_one_plus_observed_peers() {
+        let mut holders = crate::observed_holders::ObservedHolders::new();
+        holders.note("aa", "zid-1", 0);
+        holders.note("aa", "zid-2", 0);
+        let mut items = vec![replica_test_item("aa"), replica_test_item("bb")];
+        apply_replica_counts(&mut items, &holders);
+        assert_eq!(items[0].replica_count, 3, "self + 2 seen peers");
+        assert_eq!(items[1].replica_count, 1, "self only when nothing observed");
     }
 
     #[test]
@@ -58158,6 +58403,9 @@ mod start_node_race_tests {
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
                 content_index::ContentIndex::load(std::path::Path::new("")),
+            )),
+            observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
+                observed_holders::ObservedHolders::new(),
             )),
             generation: 0,
             install_seq: 0,

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { ContentDetail } from '../types';
-  import { categoryIcon, formatBytes, relativeTime } from '../file-utils';
+  import { categoryIcon, formatBytes } from '../file-utils';
 
   let {
     item,
@@ -11,16 +11,6 @@
   let icon = $derived(categoryIcon(item.category));
   let size = $derived(formatBytes(item.sizeBytes));
   let storedDate = $derived(new Date(item.storedAt).toLocaleDateString());
-  let lastAccessedRelative = $derived(relativeTime(item.lastAccessed));
-
-  const ORIGIN_LABELS: Record<string, string> = {
-    'self-created': 'Self-created',
-    'peer-replicated': 'Peer-replicated',
-    downloaded: 'Downloaded',
-    'cached-in-transit': 'Cached in transit',
-  };
-
-  let originLabel = $derived(ORIGIN_LABELS[item.origin] ?? item.origin);
 </script>
 
 <div class="file-metadata">
@@ -42,21 +32,6 @@
   <div class="metadata-row">
     <span class="metadata-label">Stored</span>
     <span class="metadata-value">{storedDate}</span>
-  </div>
-
-  <div class="metadata-row">
-    <span class="metadata-label">Last accessed</span>
-    <span class="metadata-value">{lastAccessedRelative}</span>
-  </div>
-
-  <div class="metadata-row">
-    <span class="metadata-label">Access count</span>
-    <span class="metadata-value">{item.accessCount}</span>
-  </div>
-
-  <div class="metadata-row">
-    <span class="metadata-label">Origin</span>
-    <span class="metadata-value">{originLabel}</span>
   </div>
 </div>
 

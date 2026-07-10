@@ -1,11 +1,10 @@
 <script lang="ts">
-  import type { AppMode, NavNode, DisplayMode, SortOrder, ContentItem, ContentSection, StorageBuddy } from '../types';
+  import type { AppMode, NavNode, DisplayMode, SortOrder, ContentItem, ContentSection } from '../types';
   import { getChildNodes, findNode } from '../nav-utils';
   import { resolveNavModeFlags } from '../feature-flags';
   import NavTree from './NavTree.svelte';
   import FolderTree from './FolderTree.svelte';
   import QuickFilters from './QuickFilters.svelte';
-  import StorageBuddySummary from './StorageBuddySummary.svelte';
   import MoreMenu from './MoreMenu.svelte';
   import IdentityChip from './IdentityChip.svelte';
   import ConnectionStatusChip from './ConnectionStatusChip.svelte';
@@ -22,13 +21,11 @@
     presenceOnline,
     appMode = 'messages',
     contentItems,
-    storageBuddies,
     fileSection,
     currentFolderCid,
     onFolderSelect,
     onFilterChange,
     filters,
-    onManageBuddies,
     onNewDm,
     onNewGroupDm,
     onNewCommunity,
@@ -65,13 +62,11 @@
     presenceOnline?: (node: NavNode) => boolean;
     appMode?: AppMode;
     contentItems?: ContentItem[];
-    storageBuddies?: StorageBuddy[];
     fileSection?: ContentSection;
     currentFolderCid?: string | null;
     onFolderSelect?: (cid: string | null) => void;
     onFilterChange?: (filters: Record<string, unknown>) => void;
     filters?: Record<string, unknown>;
-    onManageBuddies?: () => void;
     /** ZEB-263: FAB fan-out menu callbacks. */
     onNewDm?: () => void;
     onNewGroupDm?: () => void;
@@ -423,9 +418,6 @@
         {/if}
       {/if}
     </nav>
-    {#if appMode === 'files'}
-      <StorageBuddySummary buddies={storageBuddies ?? []} {onManageBuddies} />
-    {/if}
     <div class="nav-footer">
       <!-- ZEB-544: the rail surface is gated by `isNavModeEnabled` so the alpha
            shows a focused Communities-first set. `messages` is the home and is

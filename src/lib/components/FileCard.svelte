@@ -2,7 +2,6 @@
   import type { ContentItem } from '../types';
   import { categoryIcon, formatBytes, sensitivityIcon } from '../file-utils';
   import { autoFocus } from '../actions/auto-focus';
-  import StalenessIndicator from './StalenessIndicator.svelte';
 
   let {
     item,
@@ -84,9 +83,6 @@
 >
   <div class="file-card-overlay-top">
     <span class="file-card-sensitivity" aria-hidden="true">{sensIcon}</span>
-    <span class="file-card-staleness">
-      <StalenessIndicator score={item.stalenessScore} pinned={item.pinned} />
-    </span>
   </div>
   <div class="file-card-thumbnail" aria-hidden="true">
     <span class="file-card-icon">{icon}</span>
@@ -151,11 +147,6 @@
 
   .file-card-sensitivity {
     font-size: 0.75rem;
-  }
-
-  .file-card-staleness {
-    display: flex;
-    align-items: center;
   }
 
   .file-card-thumbnail {

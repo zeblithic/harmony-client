@@ -2,6 +2,9 @@
   import type { ReplicationTier } from '../types';
   import { tierTarget } from '../file-utils';
 
+  // ZEB-612 S3: replicaCount is the OBSERVED lower bound — 1 (self) +
+  // distinct peer sessions seen announcing this CID. The copy must say
+  // "copies seen", never claim global truth.
   let {
     tier,
     replicaCount,
@@ -14,7 +17,6 @@
 
   let target = $derived(tierTarget(tier));
   let met = $derived(replicaCount >= target);
-  let underReplicated = $derived(replicaCount < target);
 
   const TIERS: ReplicationTier[] = ['expendable', 'light', 'default', 'high', 'ultra'];
 
@@ -24,17 +26,11 @@
   }
 </script>
 
-<div class="replication-status">
-  <div class="replication-count">
-    <span class="replica-indicator" class:met class:under={!met}>
-      {replicaCount} of {target}
-    </span>
-    <span class="replica-label">replicas</span>
-  </div>
-
-  {#if underReplicated}
-    <p class="replication-warning">Under-replicated</p>
-  {/if}
+<div class="replication-status" class:met class:under={!met}>
+  <span class="replica-count">×{replicaCount} · copies seen (this device + peers)</span>
+  <span class="replica-target">
+    {met ? 'Above' : 'Below'} the ×{target} target for {tier}.
+  </span>
 
   <select
     class="tier-select"
@@ -53,42 +49,34 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+    background: var(--primary-soft);
+    border: 1px solid var(--primary-border);
+    border-radius: 8px;
+    padding: 10px 12px;
   }
 
-  .replication-count {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .replica-indicator {
+  .replica-count {
+    font-family: var(--font-mono);
     font-weight: 600;
-    font-size: 0.9rem;
+    font-size: 0.85rem;
+    color: var(--text-primary);
   }
 
-  .replica-indicator.met {
-    color: var(--success-deep);
+  .replica-target {
+    font-size: 0.78rem;
   }
 
-  .replica-indicator.under {
-    color: var(--text-warning);
+  .met .replica-target {
+    color: var(--accent);
   }
 
-  .replica-label {
-    font-size: 0.8rem;
-    color: var(--text-secondary);
-  }
-
-  .replication-warning {
-    margin: 0;
-    font-size: 0.8rem;
-    color: var(--text-warning);
-    font-weight: 500;
+  .under .replica-target {
+    color: var(--gov-clay);
   }
 
   .tier-select {
     padding: 4px 8px;
-    border-radius: 4px;
+    border-radius: 5px;
     border: 1px solid var(--border);
     background: var(--bg-tertiary);
     color: var(--text-primary);

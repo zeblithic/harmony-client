@@ -205,6 +205,14 @@ async fn ingest_list_pin_burn_roundtrip() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
                     None, // ZEB-621: addr_change_fanout not exercised
+                    // ZEB-612 S3: announcements not exercised in this test
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::observed_holders::ObservedHolders::new(),
+                    )),
+                    // ZEB-612 S3: re-announce not exercised (empty index)
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
                 )
                 .await;
             });
@@ -509,6 +517,14 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
                     None, // ZEB-621: addr_change_fanout not exercised
+                    // ZEB-612 S3: announcements not exercised in this test
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::observed_holders::ObservedHolders::new(),
+                    )),
+                    // ZEB-612 S3: re-announce not exercised (empty index)
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
                 )
                 .await;
             });
@@ -920,6 +936,14 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
                     None, // ZEB-621: addr_change_fanout not exercised
+                    // ZEB-612 S3: announcements not exercised in this test
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::observed_holders::ObservedHolders::new(),
+                    )),
+                    // ZEB-612 S3: re-announce not exercised (empty index)
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
                 )
                 .await;
             });
@@ -1189,6 +1213,14 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
                     None, // ZEB-621: addr_change_fanout not exercised
+                    // ZEB-612 S3: announcements not exercised in this test
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::observed_holders::ObservedHolders::new(),
+                    )),
+                    // ZEB-612 S3: re-announce not exercised (empty index)
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
                 )
                 .await;
             });
@@ -1521,6 +1553,14 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
                     None, // ZEB-621: addr_change_fanout not exercised
+                    // ZEB-612 S3: announcements not exercised in this test
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::observed_holders::ObservedHolders::new(),
+                    )),
+                    // ZEB-612 S3: re-announce not exercised (empty index)
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
                 )
                 .await;
             });

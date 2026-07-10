@@ -841,6 +841,50 @@ describe('VineService.getReshareCount', () => {
   });
 });
 
+describe('VineService.countByVideoCid (ZEB-612 S3 "Used by N vines")', () => {
+  let svc: VineService;
+
+  beforeEach(() => {
+    svc = new VineService();
+  });
+
+  it('returns 0 for an unreferenced cid', () => {
+    expect(svc.countByVideoCid('cid-none')).toBe(0);
+  });
+
+  it('counts vines across followed and discover feeds sharing the cid', () => {
+    const a: VineVideo = {
+      id: 'v1', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'cid-shared', viewed: false,
+    };
+    const b: VineVideo = {
+      id: 'v2', creatorAddress: 'b', creatorName: 'B',
+      createdAt: 1, videoCid: 'cid-shared', viewed: false,
+    };
+    const other: VineVideo = {
+      id: 'v3', creatorAddress: 'c', creatorName: 'C',
+      createdAt: 1, videoCid: 'cid-other', viewed: false,
+    };
+    svc.followedVines = [a, other];
+    svc.discoverVines = [b];
+    expect(svc.countByVideoCid('cid-shared')).toBe(2);
+  });
+
+  it('counts a reshare and its original separately (both reference the blob)', () => {
+    const orig: VineVideo = {
+      id: 'v-orig', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'cid-blob', viewed: false,
+    };
+    const reshare: VineVideo = {
+      id: 'v-rs', creatorAddress: 'b', creatorName: 'B',
+      createdAt: 2, videoCid: 'cid-blob', viewed: false, reshareOf: 'v-orig',
+    };
+    svc.followedVines = [orig];
+    svc.discoverVines = [reshare];
+    expect(svc.countByVideoCid('cid-blob')).toBe(2);
+  });
+});
+
 // ── publish: self-reshare prevention is the CALLER's job ───────────
 //
 // Earlier rounds put a self-reshare guard inside `publish()` keyed on

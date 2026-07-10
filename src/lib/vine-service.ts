@@ -418,6 +418,16 @@ export class VineService {
     );
   }
 
+  /** ZEB-612 S3: how many vines (across both feeds) reference a video blob.
+   *  Drives the Files detail panel's "Used by N vines" row — computed
+   *  client-side from real descriptors; no backend involvement. */
+  countByVideoCid(videoCid: string): number {
+    return (
+      this.followedVines.filter(v => v.videoCid === videoCid).length
+      + this.discoverVines.filter(v => v.videoCid === videoCid).length
+    );
+  }
+
   /** Get reaction state for a vine. Returns zero state if no reactions tracked. */
   getReaction(vineId: string): { count: number; likedByMe: boolean } {
     const entry = this.reactionMap.get(vineId);

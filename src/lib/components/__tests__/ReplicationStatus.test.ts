@@ -11,8 +11,9 @@ describe('ReplicationStatus', () => {
         onTierChange: vi.fn(),
       },
     });
-    // default tier target is 3
-    expect(screen.getByText(/3 of 3/)).toBeTruthy();
+    // default tier target is 3 — honest "copies seen" copy (ZEB-612 S3)
+    expect(screen.getByText('×3 · copies seen (this device + peers)')).toBeTruthy();
+    expect(screen.getByText('Above the ×3 target for default.')).toBeTruthy();
   });
 
   it('shows warning when under-replicated', () => {
@@ -23,9 +24,9 @@ describe('ReplicationStatus', () => {
         onTierChange: vi.fn(),
       },
     });
-    // high tier target is 5, only 2 replicas
-    expect(screen.getByText(/2 of 5/)).toBeTruthy();
-    expect(screen.getByText(/under-replicated/i)).toBeTruthy();
+    // high tier target is 5, only 2 copies seen (ZEB-612 S3 copy)
+    expect(screen.getByText('×2 · copies seen (this device + peers)')).toBeTruthy();
+    expect(screen.getByText('Below the ×5 target for high.')).toBeTruthy();
   });
 
   it('does not show warning when fully replicated', () => {

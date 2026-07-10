@@ -4,19 +4,15 @@ import type {
   ContentDetail,
   QuotaStatus,
   CleanupRecommendation,
-  StorageBuddy,
   PublishedItem,
   FileManagerSettings,
   ReplicationTier,
   ContentCategory,
-  PeerRef,
 } from './types';
 import {
   mockPrivateContent,
   mockPublishedContent,
   mockCleanupRecommendations,
-  mockStorageBuddies,
-  mockPeers,
 } from './mock-file-data';
 
 /** Wire format for content availability announcements from the Rust backend. */
@@ -115,6 +111,16 @@ interface ContentItemWire {
   archived: boolean;
   /** Source-of-truth node type from the backend. */
   kind: 'leaf' | 'folder';
+  /** ZEB-612 S3: observed replica count — 1 (self) + distinct peer
+   *  sessions seen announcing this CID. A lower bound ("copies seen"). */
+  replicaCount: number;
+}
+
+/** Wire shape of the `get_storage_budget` query (ZEB-612 S3). */
+interface StorageBudgetWire {
+  cacheCapacity: number;
+  /** The PINNED content budget the runtime enforces — not an overall quota. */
+  maxPinnedBytes: number;
 }
 
 const MUSIC_EXTS = ['mp3', 'flac', 'wav', 'ogg', 'aac', 'm4a', 'opus', 'wma'];
@@ -146,11 +152,8 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
     sensitivity: wire.sensitivity,
     sizeBytes: wire.sizeBytes,
     storedAt: wire.storedAt,
-    lastAccessed: wire.storedAt,
-    accessCount: 0,
-    stalenessScore: 0,
     replicationTier: wire.replicationTier,
-    replicaCount: 1,
+    replicaCount: wire.replicaCount,
     pinned: wire.pinned,
     licensed: wire.licensed,
     archived: wire.archived,
@@ -165,18 +168,19 @@ export class FileManagerService {
   onChange?: () => void;
   /** CIDs announced on the mesh (real network data). */
   announcedCids = new Map<string, { sizeBytes: number; firstSeen: number }>();
+  /** ZEB-612 S3: real pinned budget from get_storage_budget; null until
+   *  connected (demo mode) or when the query fails. */
+  private pinnedBudgetBytes: number | null = null;
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
   private privateContent: ContentItem[];
   private publishedContent: PublishedItem[];
   private cleanupRecommendations: CleanupRecommendation[];
-  private storageBuddies: StorageBuddy[];
 
   constructor(overrides?: Partial<FileManagerSettings>) {
     this.settings = {
       defaultReplicationTier: 'default',
-      quotaBytes: 10_000_000_000,
       defaultViewMode: 'list',
       confirmationOverrides: {},
       ...overrides,
@@ -186,7 +190,6 @@ export class FileManagerService {
     this.privateContent = structuredClone(mockPrivateContent);
     this.publishedContent = structuredClone(mockPublishedContent);
     this.cleanupRecommendations = structuredClone(mockCleanupRecommendations);
-    this.storageBuddies = structuredClone(mockStorageBuddies);
   }
 
   /** Connect a Tauri adapter and start listening for content announcements. */
@@ -225,6 +228,14 @@ export class FileManagerService {
       ? raw.filter((w) => !w.archived).map(wireToContentItem)
       : [];
     this.unlisteners.push(unlisten);
+    // ZEB-612 S3: fetch the real pinned budget. Non-fatal — a failure
+    // (e.g. runtime not booted) degrades to a used-only quota display.
+    try {
+      const budget = (await adapter.invoke('get_storage_budget')) as StorageBudgetWire;
+      this.pinnedBudgetBytes = budget.maxPinnedBytes;
+    } catch {
+      this.pinnedBudgetBytes = null;
+    }
     this.onChange?.();
   }
 
@@ -236,17 +247,13 @@ export class FileManagerService {
     return this.privateContent.filter((item) => item.parentCid === parentCid);
   }
 
-  /** Returns extended detail for a single content item, or undefined if not found. */
+  /** Returns detail for a single content item, or undefined if not found.
+   *  ZEB-612 S3: only real fields — the mock sharedWith/storageBuddies/
+   *  origin surfaces return with real hosting accounting (ZEB-669). */
   getContentDetail(cid: string): ContentDetail | undefined {
     const item = this.privateContent.find((i) => i.cid === cid);
     if (!item) return undefined;
-
-    return {
-      ...item,
-      sharedWith: [mockPeers[0], mockPeers[1]],
-      storageBuddies: [mockPeers[0]],
-      origin: 'self-created',
-    };
+    return { ...item };
   }
 
   /** Computes quota status from current private content. */
@@ -259,17 +266,25 @@ export class FileManagerService {
     // (HashMap iteration is non-deterministic on the wire, but
     // privateContent is locally stable for the duration of a session).
     const seenCids = new Set<string>();
+    // A CID is pinned if ANY of its sidecar entries pins it — mirror of the
+    // backend's is_cid_pinned_by_any OR-join (ZEB-164 symlink semantics).
+    const pinnedCids = new Set(
+      this.privateContent.filter((i) => i.pinned).map((i) => i.cid),
+    );
+    let pinnedUsedBytes = 0;
     for (const item of this.privateContent) {
       if (seenCids.has(item.cid)) continue;
       seenCids.add(item.cid);
       usedBytes += item.sizeBytes;
       byCategory[item.category] = (byCategory[item.category] ?? 0) + item.sizeBytes;
+      if (pinnedCids.has(item.cid)) pinnedUsedBytes += item.sizeBytes;
     }
 
     return {
       usedBytes,
-      totalBytes: this.settings.quotaBytes,
       byCategory,
+      pinnedUsedBytes,
+      pinnedBudgetBytes: this.pinnedBudgetBytes,
     };
   }
 
@@ -290,19 +305,9 @@ export class FileManagerService {
       .sort((a, b) => b.confidence - a.confidence);
   }
 
-  /** Returns storage buddies. */
-  getStorageBuddies(): StorageBuddy[] {
-    return [...this.storageBuddies];
-  }
-
   /** Returns published content. */
   getPublishedContent(): PublishedItem[] {
     return [...this.publishedContent];
-  }
-
-  /** Returns available peers for sharing/buddy assignment. */
-  getAvailablePeers(): PeerRef[] {
-    return [...mockPeers];
   }
 
   /**
@@ -439,10 +444,8 @@ export class FileManagerService {
       sensitivity: 'private',
       sizeBytes: result.sizeBytes,
       storedAt: Date.now(),
-      lastAccessed: Date.now(),
-      accessCount: 0,
-      stalenessScore: 0,
       replicationTier: this.settings.defaultReplicationTier,
+      // Fresh ingest: this node is the only holder until peers announce.
       replicaCount: 1,
       pinned: false,
       licensed: false,

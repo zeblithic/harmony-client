@@ -1,6 +1,4 @@
 import type {
-  PeerRef,
-  StorageBuddy,
   ContentItem,
   PublishedItem,
   CleanupRecommendation,
@@ -8,32 +6,6 @@ import type {
 
 const day = 86_400_000;
 const now = Date.now();
-
-// ── Peers ───────────────────────────────────────────────────────────
-
-export const mockPeers: PeerRef[] = [
-  { address: 'a1b2c3d4e5f6a1b2', displayName: 'Alice' },
-  { address: 'b2c3d4e5f6a1b2c3', displayName: 'Bob' },
-  { address: 'c3d4e5f6a1b2c3d4', displayName: 'Carol' },
-  { address: 'd4e5f6a1b2c3d4e5', displayName: 'Dave' },
-];
-
-// ── Storage Buddies ─────────────────────────────────────────────────
-
-export const mockStorageBuddies: StorageBuddy[] = [
-  {
-    address: mockPeers[0].address,
-    displayName: mockPeers[0].displayName,
-    storageUsedBytes: 1_200_000_000,
-    online: true,
-  },
-  {
-    address: mockPeers[1].address,
-    displayName: mockPeers[1].displayName,
-    storageUsedBytes: 800_000_000,
-    online: false,
-  },
-];
 
 // ── Private Content ─────────────────────────────────────────────────
 
@@ -47,9 +19,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'private',
     sizeBytes: 0,
     storedAt: now - 90 * day,
-    lastAccessed: now - 1 * day,
-    accessCount: 42,
-    stalenessScore: 0.05,
     replicationTier: 'default',
     replicaCount: 3,
     pinned: false,
@@ -66,9 +35,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'private',
     sizeBytes: 45_000,
     storedAt: now - 60 * day,
-    lastAccessed: now - 2 * day,
-    accessCount: 18,
-    stalenessScore: 0.15,
     replicationTier: 'default',
     replicaCount: 3,
     pinned: false,
@@ -85,9 +51,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'private',
     sizeBytes: 320_000,
     storedAt: now - 45 * day,
-    lastAccessed: now - 10 * day,
-    accessCount: 8,
-    stalenessScore: 0.35,
     replicationTier: 'default',
     replicaCount: 3,
     pinned: false,
@@ -104,9 +67,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'public',
     sizeBytes: 35_000_000,
     storedAt: now - 120 * day,
-    lastAccessed: now - 1 * day,
-    accessCount: 200,
-    stalenessScore: 0.02,
     replicationTier: 'high',
     replicaCount: 5,
     pinned: true,
@@ -123,9 +83,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'public',
     sizeBytes: 1_500_000_000,
     storedAt: now - 30 * day,
-    lastAccessed: now - 20 * day,
-    accessCount: 2,
-    stalenessScore: 0.7,
     replicationTier: 'default',
     replicaCount: 1,
     pinned: false,
@@ -142,9 +99,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'confidential',
     sizeBytes: 2_048,
     storedAt: now - 200 * day,
-    lastAccessed: now - 30 * day,
-    accessCount: 3,
-    stalenessScore: 0.1,
     replicationTier: 'ultra',
     replicaCount: 7,
     pinned: true,
@@ -161,9 +115,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'private',
     sizeBytes: 250_000_000,
     storedAt: now - 15 * day,
-    lastAccessed: now - 14 * day,
-    accessCount: 1,
-    stalenessScore: 0.85,
     replicationTier: 'expendable',
     replicaCount: 2,
     pinned: false,
@@ -180,9 +131,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'public',
     sizeBytes: 85_000_000,
     storedAt: now - 7 * day,
-    lastAccessed: now - 1 * day,
-    accessCount: 12,
-    stalenessScore: 0.1,
     replicationTier: 'high',
     replicaCount: 4,
     pinned: false,
@@ -199,9 +147,6 @@ export const mockPrivateContent: ContentItem[] = [
     sensitivity: 'intimate',
     sizeBytes: 8_500_000,
     storedAt: now - 180 * day,
-    lastAccessed: now - 60 * day,
-    accessCount: 5,
-    stalenessScore: 0.55,
     replicationTier: 'light',
     replicaCount: 3,
     pinned: false,

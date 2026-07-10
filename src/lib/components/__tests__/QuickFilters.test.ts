@@ -21,9 +21,9 @@ describe('QuickFilters', () => {
   it('renders category checkboxes for each content category', () => {
     render(QuickFilters, { props: {} });
     expect(screen.getByLabelText('Music')).toBeTruthy();
-    expect(screen.getByLabelText('Video')).toBeTruthy();
-    expect(screen.getByLabelText('Text')).toBeTruthy();
-    expect(screen.getByLabelText('Image')).toBeTruthy();
+    expect(screen.getByLabelText('Videos')).toBeTruthy();
+    expect(screen.getByLabelText('Documents')).toBeTruthy();
+    expect(screen.getByLabelText('Images')).toBeTruthy();
     expect(screen.getByLabelText('Software')).toBeTruthy();
     expect(screen.getByLabelText('Dataset')).toBeTruthy();
     expect(screen.getByLabelText('Bundle')).toBeTruthy();
@@ -31,8 +31,7 @@ describe('QuickFilters', () => {
 
   it('renders status filter buttons', () => {
     render(QuickFilters, { props: {} });
-    expect(screen.getByRole('button', { name: 'Stale' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Pinned' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Pinned by me' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Licensed' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Under-replicated' })).toBeTruthy();
   });
@@ -67,24 +66,29 @@ describe('QuickFilters', () => {
     expect(filters.categories).not.toContain('music');
   });
 
+  it('omits the fabrication-backed Stale toggle (ZEB-612 S3)', () => {
+    render(QuickFilters, { props: { onFilterChange: vi.fn() } });
+    expect(screen.queryByRole('button', { name: 'Stale' })).toBeNull();
+  });
+
   it('fires onFilterChange when a status button is toggled', async () => {
     const onFilterChange = vi.fn();
     render(QuickFilters, { props: { onFilterChange } });
-    const staleBtn = screen.getByRole('button', { name: 'Stale' });
-    await fireEvent.click(staleBtn);
+    const pinnedBtn = screen.getByRole('button', { name: 'Pinned by me' });
+    await fireEvent.click(pinnedBtn);
     expect(onFilterChange).toHaveBeenCalled();
     const filters = onFilterChange.mock.calls[0][0];
-    expect(filters.stale).toBe(true);
+    expect(filters.pinned).toBe(true);
   });
 
   it('toggles status button off on second click', async () => {
     const onFilterChange = vi.fn();
     render(QuickFilters, { props: { onFilterChange } });
-    const staleBtn = screen.getByRole('button', { name: 'Stale' });
-    await fireEvent.click(staleBtn);
-    await fireEvent.click(staleBtn);
+    const pinnedBtn = screen.getByRole('button', { name: 'Pinned by me' });
+    await fireEvent.click(pinnedBtn);
+    await fireEvent.click(pinnedBtn);
     const filters = onFilterChange.mock.calls[1][0];
-    expect(filters.stale).toBe(false);
+    expect(filters.pinned).toBe(false);
   });
 
   it('fires onFilterChange when a tier button is toggled', async () => {
@@ -115,15 +119,15 @@ describe('QuickFilters', () => {
 
   it('status buttons have aria-pressed attribute', () => {
     render(QuickFilters, { props: {} });
-    const staleBtn = screen.getByRole('button', { name: 'Stale' });
-    expect(staleBtn.getAttribute('aria-pressed')).toBe('false');
+    const pinnedBtn = screen.getByRole('button', { name: 'Pinned by me' });
+    expect(pinnedBtn.getAttribute('aria-pressed')).toBe('false');
   });
 
   it('sets aria-pressed to true when status button is active', async () => {
     render(QuickFilters, { props: {} });
-    const staleBtn = screen.getByRole('button', { name: 'Stale' });
-    await fireEvent.click(staleBtn);
-    expect(staleBtn.getAttribute('aria-pressed')).toBe('true');
+    const pinnedBtn = screen.getByRole('button', { name: 'Pinned by me' });
+    await fireEvent.click(pinnedBtn);
+    expect(pinnedBtn.getAttribute('aria-pressed')).toBe('true');
   });
 
   it('renders as a section with appropriate aria-label', () => {

@@ -351,7 +351,17 @@
     contents = [...contents];
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
-      contents = contents.filter((i) => i.name.toLowerCase().includes(q));
+      // ZEB-612 S3: the toolbar invites pasting a CID — match it too,
+      // including the UI's own chip format `cid:3f9a2c…7e8f`: strip the
+      // `cid:` prefix and match an elided middle as prefix + suffix.
+      const cidQ = q.startsWith('cid:') ? q.slice(4) : q;
+      const elided = cidQ.includes('…') ? cidQ.split('…', 2) : null;
+      contents = contents.filter((i) => {
+        if (i.name.toLowerCase().includes(q)) return true;
+        const cid = i.cid.toLowerCase();
+        if (cid.includes(cidQ)) return true;
+        return elided !== null && cid.startsWith(elided[0]) && cid.endsWith(elided[1]);
+      });
     }
     // Apply quick filters
     const cats = filters.categories as ContentCategory[] | undefined;
@@ -363,9 +373,6 @@
     if (tiers && tiers.length > 0) {
       const tierSet = new Set(tiers);
       contents = contents.filter((i) => i.isFolder || tierSet.has(i.replicationTier));
-    }
-    if (filters.stale) {
-      contents = contents.filter((i) => i.isFolder || i.stalenessScore >= 0.5);
     }
     if (filters.pinned) {
       contents = contents.filter((i) => i.isFolder || i.pinned);
@@ -1102,7 +1109,8 @@
 
       <QuotaBar
         usedBytes={quota.usedBytes}
-        totalBytes={quota.totalBytes}
+        pinnedUsedBytes={quota.pinnedUsedBytes}
+        pinnedBudgetBytes={quota.pinnedBudgetBytes}
         {onCleanupClick}
       />
     {/if}

@@ -13,7 +13,6 @@
   $effect(() => {
     if (Object.keys(filters).length === 0) {
       selectedCategories = new Set();
-      stale = false;
       pinned = false;
       licensed = false;
       underReplicated = false;
@@ -21,11 +20,13 @@
     }
   });
 
+  // ZEB-612 S3: display labels follow the drawn Storage nav (Videos /
+  // Images / Documents); keys are unchanged — no filter-model change.
   const allCategories: { key: ContentCategory; label: string }[] = [
     { key: 'music', label: 'Music' },
-    { key: 'video', label: 'Video' },
-    { key: 'text', label: 'Text' },
-    { key: 'image', label: 'Image' },
+    { key: 'video', label: 'Videos' },
+    { key: 'text', label: 'Documents' },
+    { key: 'image', label: 'Images' },
     { key: 'software', label: 'Software' },
     { key: 'dataset', label: 'Dataset' },
     { key: 'bundle', label: 'Bundle' },
@@ -46,7 +47,6 @@
 
   // Filter state
   let selectedCategories = $state<Set<ContentCategory>>(new Set());
-  let stale = $state(false);
   let pinned = $state(false);
   let licensed = $state(false);
   let underReplicated = $state(false);
@@ -55,7 +55,6 @@
   function emitFilters() {
     onFilterChange?.({
       categories: Array.from(selectedCategories),
-      stale,
       pinned,
       licensed,
       underReplicated,
@@ -74,9 +73,8 @@
     emitFilters();
   }
 
-  function toggleStatus(key: 'stale' | 'pinned' | 'licensed' | 'underReplicated') {
-    if (key === 'stale') stale = !stale;
-    else if (key === 'pinned') pinned = !pinned;
+  function toggleStatus(key: 'pinned' | 'licensed' | 'underReplicated') {
+    if (key === 'pinned') pinned = !pinned;
     else if (key === 'licensed') licensed = !licensed;
     else if (key === 'underReplicated') underReplicated = !underReplicated;
     emitFilters();
@@ -135,12 +133,9 @@
     </button>
     {#if statusOpen}
       <div class="section-body status-buttons">
-        <button type="button" class="filter-btn" class:active={stale}
-          aria-pressed={stale ? 'true' : 'false'}
-          onclick={() => toggleStatus('stale')}>Stale</button>
         <button type="button" class="filter-btn" class:active={pinned}
           aria-pressed={pinned ? 'true' : 'false'}
-          onclick={() => toggleStatus('pinned')}>Pinned</button>
+          onclick={() => toggleStatus('pinned')}>Pinned by me</button>
         <button type="button" class="filter-btn" class:active={licensed}
           aria-pressed={licensed ? 'true' : 'false'}
           onclick={() => toggleStatus('licensed')}>Licensed</button>

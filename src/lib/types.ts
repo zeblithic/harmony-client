@@ -212,7 +212,6 @@ export type ContentSensitivity = 'public' | 'private' | 'intimate' | 'confidenti
 export type FileViewMode = 'list' | 'grid';
 export type ContentSection = 'private' | 'published';
 export type PublishMode = 'durable' | 'ephemeral';
-export type ContentOrigin = 'self-created' | 'peer-replicated' | 'downloaded' | 'cached-in-transit';
 export type CleanupReason = 'stale' | 'duplicate-of-public' | 'over-replicated' | 'expired';
 
 /** Mirrors harmony-roxy ContentCategory. */
@@ -220,11 +219,6 @@ export type ContentCategory = 'music' | 'video' | 'text' | 'image' | 'software' 
 
 /** Mirrors harmony-roxy UsageRights bitflags as a simpler TS set. */
 export type UsageRight = 'stream' | 'download' | 'remix' | 'reshare';
-
-export interface PeerRef {
-  address: string;
-  displayName: string;
-}
 
 export interface ContentItem {
   /**
@@ -240,10 +234,12 @@ export interface ContentItem {
   sensitivity: ContentSensitivity;
   sizeBytes: number;
   storedAt: number;
-  lastAccessed: number;
-  accessCount: number;
-  stalenessScore: number;
   replicationTier: ReplicationTier;
+  /** ZEB-612 S3: observed replica count — 1 (self) + distinct peer
+   *  sessions seen announcing this CID. A lower bound ("copies seen").
+   *  The fabricated lastAccessed/accessCount/stalenessScore fields were
+   *  removed with their renderers; real signals return with real
+   *  backends. */
   replicaCount: number;
   pinned: boolean;
   licensed: boolean;
@@ -254,16 +250,23 @@ export interface ContentItem {
   isFolder: boolean;
 }
 
-export interface ContentDetail extends ContentItem {
-  sharedWith: PeerRef[];
-  storageBuddies: PeerRef[];
-  origin: ContentOrigin;
-}
+/** ZEB-612 S3: the detail view carries only real fields — the mock
+ *  sharedWith/storageBuddies/origin surfaces return with real hosting
+ *  accounting (ZEB-669). */
+export type ContentDetail = ContentItem;
 
+/** ZEB-612 S3: honest quota — real local usage plus the real (enforced)
+ *  pinned-content budget from `get_storage_budget`. There is NO overall
+ *  storage quota in the system, so there is no `totalBytes`: the UI
+ *  shows used bytes without an invented denominator. */
 export interface QuotaStatus {
   usedBytes: number;
-  totalBytes: number;
   byCategory: Partial<Record<ContentCategory, number>>;
+  /** Bytes of pinned content (deduped by CID) — the budget's consumer. */
+  pinnedUsedBytes: number;
+  /** `maxPinnedBytes` from the backend; null when unknown (demo mode or
+   *  IPC failure) — render used-only in that case. */
+  pinnedBudgetBytes: number | null;
 }
 
 export interface CleanupRecommendation {
@@ -285,13 +288,6 @@ export interface CleanupRecommendation {
   confidence: number;
 }
 
-export interface StorageBuddy {
-  address: string;
-  displayName: string;
-  storageUsedBytes: number;
-  online: boolean;
-}
-
 export interface PublishedItem {
   cid: string;
   name: string;
@@ -309,7 +305,6 @@ export interface UploadCandidate {
 
 export interface FileManagerSettings {
   defaultReplicationTier: ReplicationTier;
-  quotaBytes: number;
   defaultViewMode: FileViewMode;
   confirmationOverrides: Partial<Record<ContentSensitivity, number>>;
 }

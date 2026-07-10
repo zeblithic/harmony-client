@@ -316,6 +316,14 @@ async fn spawn_test_runtime() -> TestHarness {
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
                     None, // ZEB-621: addr_change_fanout not exercised
+                    // ZEB-612 S3: announcements not exercised in this test
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::observed_holders::ObservedHolders::new(),
+                    )),
+                    // ZEB-612 S3: re-announce not exercised (empty index)
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
                 )
                 .await;
             });

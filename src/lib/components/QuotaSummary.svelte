@@ -8,8 +8,6 @@
     quota: QuotaStatus;
   } = $props();
 
-  let percent = $derived(quota.totalBytes > 0 ? Math.min(100, Math.round((quota.usedBytes / quota.totalBytes) * 100)) : 0);
-
   const CATEGORY_COLORS: Record<ContentCategory, string> = {
     music: '#1abc9c',
     video: '#3498db',
@@ -28,7 +26,9 @@
           category: cat as ContentCategory,
           bytes,
           color: CATEGORY_COLORS[cat as ContentCategory],
-          widthPercent: quota.totalBytes > 0 ? (bytes / quota.totalBytes) * 100 : 0,
+          // ZEB-612 S3: no overall quota exists — segments show each
+          // category's share of what's actually used.
+          widthPercent: quota.usedBytes > 0 ? (bytes / quota.usedBytes) * 100 : 0,
         });
       }
     }
@@ -41,7 +41,7 @@
 <section class="quota-summary" aria-label="Storage quota summary">
   <div class="quota-header">
     <h3 class="quota-title">Storage Usage</h3>
-    <span class="quota-text">{formatBytes(quota.usedBytes)} of {formatBytes(quota.totalBytes)} ({percent}%)</span>
+    <span class="quota-text">{formatBytes(quota.usedBytes)} stored locally</span>
   </div>
 
   <div class="category-bar" role="img" aria-label="Storage breakdown by category">

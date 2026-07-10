@@ -5,7 +5,8 @@ import type { CleanupRecommendation, QuotaStatus } from '../../types';
 
 const quota: QuotaStatus = {
   usedBytes: 1_879_867_048,
-  totalBytes: 10_000_000_000,
+  pinnedUsedBytes: 35_000_000,
+  pinnedBudgetBytes: 50_000_000,
   byCategory: {
     bundle: 0,
     text: 47_048,
@@ -71,10 +72,10 @@ function baseProps() {
 describe('CleanupView', () => {
   // ── QuotaSummary integration ────────────────────────────────────
 
-  it('renders quota summary with used/total', () => {
+  it('renders quota summary with real usage (ZEB-612 S3: no invented total)', () => {
     render(CleanupView, { props: baseProps() });
-    expect(screen.getByText(/1\.9 GB/)).toBeTruthy();
-    expect(screen.getByText(/10\.0 GB/)).toBeTruthy();
+    expect(screen.getByText(/1\.9 GB stored locally/)).toBeTruthy();
+    expect(screen.queryByText(/10\.0 GB/)).toBeNull();
   });
 
   it('renders category breakdown bars', () => {

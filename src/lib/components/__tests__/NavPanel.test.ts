@@ -9,7 +9,7 @@ vi.mock('@tauri-apps/api/webviewWindow', () => ({
 }));
 
 import NavPanel from '../NavPanel.svelte';
-import type { NavNode, ContentItem, StorageBuddy } from '../../types';
+import type { NavNode, ContentItem } from '../../types';
 import { setNavModeOverride } from '../../feature-flags';
 
 // ZEB-544: nav gating reads localStorage overrides — reset between tests so a
@@ -121,9 +121,6 @@ describe('NavPanel', () => {
         sensitivity: 'private',
         sizeBytes: 0,
         storedAt: Date.now(),
-        lastAccessed: Date.now(),
-        accessCount: 1,
-        stalenessScore: 0,
         replicationTier: 'default',
         replicaCount: 3,
         pinned: false,
@@ -133,11 +130,6 @@ describe('NavPanel', () => {
       },
     ];
 
-    const testBuddies: StorageBuddy[] = [
-      { address: 'addr1', displayName: 'Alice', storageUsedBytes: 100, online: true },
-      { address: 'addr2', displayName: 'Bob', storageUsedBytes: 200, online: false },
-    ];
-
     it('shows FolderTree and QuickFilters when appMode is files', () => {
       render(NavPanel, {
         props: {
@@ -145,32 +137,16 @@ describe('NavPanel', () => {
           collapsed: false,
           appMode: 'files',
           contentItems: testContentItems,
-          storageBuddies: testBuddies,
         },
       });
       // FolderTree root
-      expect(screen.getByText('All Files')).toBeTruthy();
+      expect(screen.getByText('All files')).toBeTruthy();
       // FolderTree folder
       expect(screen.getByText('Projects')).toBeTruthy();
       // QuickFilters sections
       expect(screen.getByText('Category')).toBeTruthy();
       expect(screen.getByText('Status')).toBeTruthy();
       expect(screen.getByText('Replication Tier')).toBeTruthy();
-    });
-
-    it('shows StorageBuddySummary when appMode is files', () => {
-      render(NavPanel, {
-        props: {
-          nodes: testNodes,
-          collapsed: false,
-          appMode: 'files',
-          contentItems: testContentItems,
-          storageBuddies: testBuddies,
-        },
-      });
-      expect(screen.getByText(/2 buddies/)).toBeTruthy();
-      expect(screen.getByText(/1 online/)).toBeTruthy();
-      expect(screen.getByRole('button', { name: /Manage/ })).toBeTruthy();
     });
 
     it('does not show NavTree when in files mode', () => {
@@ -180,7 +156,6 @@ describe('NavPanel', () => {
           collapsed: false,
           appMode: 'files',
           contentItems: testContentItems,
-          storageBuddies: testBuddies,
         },
       });
       // NavTree items should not be rendered
@@ -195,11 +170,10 @@ describe('NavPanel', () => {
           collapsed: false,
           appMode: 'messages',
           contentItems: testContentItems,
-          storageBuddies: testBuddies,
         },
       });
       // File components should not render
-      expect(screen.queryByText('All Files')).toBeNull();
+      expect(screen.queryByText('All files')).toBeNull();
       expect(screen.queryByText('Category')).toBeNull();
       expect(screen.queryByText(/buddies/)).toBeNull();
       // NavTree should render

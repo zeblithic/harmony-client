@@ -2787,14 +2787,14 @@
     return fileManagerService.getContentDetail(selectedFileCid);
   });
 
-  let fileBuddies = $derived.by(() => {
-    void fileManagerVersion;
-    return fileManagerService.getStorageBuddies();
-  });
-
-  let availablePeers = $derived.by(() => {
-    void fileManagerVersion;
-    return fileManagerService.getAvailablePeers();
+  // ZEB-612 S3: "Used by N vines" — recompute when either vine feed
+  // changes (the $state mirrors are the reactive signal; the service's
+  // internal arrays are not reactive on their own).
+  let selectedFileVineCount = $derived.by(() => {
+    void followedVines;
+    void discoverVines;
+    if (!selectedFileDetail) return 0;
+    return vineService.countByVideoCid(selectedFileDetail.cid);
   });
 
   // ── File manager callbacks ──────────────────────────────────────────
@@ -3505,7 +3505,6 @@
         onModeChange={switchMode}
         {appMode}
         contentItems={allFileContents}
-        storageBuddies={fileBuddies}
         {fileSection}
         {currentFolderCid}
         onFolderSelect={handleNavigateFolder}
@@ -3795,8 +3794,7 @@
     {#if selectedFileDetail}
       <FileDetailPanel
         detail={selectedFileDetail}
-        availablePeers={availablePeers}
-        storageBuddyDetails={fileBuddies.filter(b => selectedFileDetail?.storageBuddies.some(sb => sb.address === b.address))}
+        usedByVines={selectedFileVineCount}
         confirmationOverrides={fileManagerService.settings.confirmationOverrides}
         onTierChange={handleFileTierChange}
         onPublish={handleFilePublish}

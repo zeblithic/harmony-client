@@ -186,6 +186,24 @@ describe('File Manager Integration', () => {
     expect(screen.queryByText('Projects')).toBeNull();
   });
 
+  it('search matches a pasted CID (ZEB-612 S3)', () => {
+    const service = new FileManagerService();
+    renderBrowser(service, { searchQuery: 'cid-song-favorite' });
+
+    expect(screen.getByText('favorite-track.flac')).toBeTruthy();
+    expect(screen.queryByText('distributed-systems-lecture.mp4')).toBeNull();
+  });
+
+  it("search matches the UI's own chip text `cid:{shortCid}` (Greptile round 2)", () => {
+    const service = new FileManagerService();
+    // The row chip for cid-song-favorite renders `cid:cid-so…rite` —
+    // pasting exactly that must find the file.
+    renderBrowser(service, { searchQuery: 'cid:cid-so…rite' });
+
+    expect(screen.getByText('favorite-track.flac')).toBeTruthy();
+    expect(screen.queryByText('distributed-systems-lecture.mp4')).toBeNull();
+  });
+
   // ── 8. Section switch (private/published) ────────────────────────
 
   it('fires onSectionChange when Published tab is clicked', async () => {
@@ -220,8 +238,8 @@ describe('File Manager Integration', () => {
     // Sensitivity badge
     expect(screen.getByText('Public')).toBeTruthy();
 
-    // Replication info (5 of 5 for high tier)
-    expect(screen.getByText(/5 of 5/)).toBeTruthy();
+    // Replication info (5 seen vs high-tier target 5; ZEB-612 S3 copy)
+    expect(screen.getByText('×5 · copies seen (this device + peers)')).toBeTruthy();
 
     // Action buttons
     expect(screen.getByLabelText('Publish (permanent)')).toBeTruthy();
@@ -583,7 +601,8 @@ describe('File Manager Integration', () => {
       const buttons = screen.getAllByRole('button');
       const quotaBtn = buttons.find(b => b.getAttribute('aria-label')?.includes('Storage:'));
       expect(quotaBtn).toBeTruthy();
-      expect(quotaBtn!.getAttribute('aria-label')).toMatch(/\d+.*used.*\d+%/);
+      // ZEB-612 S3: no invented total — the label reports real usage only.
+      expect(quotaBtn!.getAttribute('aria-label')).toMatch(/\d+.*stored locally/);
     });
 
     it('section toggle buttons have aria-pressed', () => {
@@ -685,16 +704,13 @@ describe('File Manager Integration', () => {
       });
     });
 
-    it('share and buddy lists have section aria-labels', () => {
+    it('mock share and buddy lists are gone from the detail panel (ZEB-612 S3 → ZEB-669)', () => {
       const service = new FileManagerService();
       const detail = service.getContentDetail('cid-song-favorite')!;
       const { container } = renderDetail(detail);
 
-      const shareSection = container.querySelector('[aria-label="Shared with (can view)"]');
-      expect(shareSection).toBeTruthy();
-
-      const buddySection = container.querySelector('[aria-label="Stored by (encrypted)"]');
-      expect(buddySection).toBeTruthy();
+      expect(container.querySelector('[aria-label="Shared with (can view)"]')).toBeNull();
+      expect(container.querySelector('[aria-label="Stored by (encrypted)"]')).toBeNull();
     });
   });
 });

@@ -6,7 +6,6 @@ import type {
   ContentDetail,
   QuotaStatus,
   CleanupRecommendation,
-  StorageBuddy,
   PublishedItem,
 } from './types';
 
@@ -30,9 +29,6 @@ describe('File manager types', () => {
       sensitivity: 'private',
       sizeBytes: 1024,
       storedAt: 1000,
-      lastAccessed: 2000,
-      accessCount: 5,
-      stalenessScore: 0.3,
       replicationTier: 'default',
       replicaCount: 3,
       pinned: false,
@@ -44,7 +40,7 @@ describe('File manager types', () => {
     expect(item.isFolder).toBe(false);
   });
 
-  it('ContentDetail extends ContentItem with peer info', () => {
+  it('ContentDetail is an alias of ContentItem (ZEB-612 S3: mock peer fields gone)', () => {
     const detail: ContentDetail = {
       sidecarId: 'sidecar-abc',
       cid: 'abc123',
@@ -53,30 +49,24 @@ describe('File manager types', () => {
       sensitivity: 'private',
       sizeBytes: 1024,
       storedAt: 1000,
-      lastAccessed: 2000,
-      accessCount: 5,
-      stalenessScore: 0.3,
       replicationTier: 'default',
       replicaCount: 3,
       pinned: false,
       licensed: false,
       parentCid: null,
       isFolder: false,
-      sharedWith: [{ address: 'peer1', displayName: 'Alice' }],
-      storageBuddies: [{ address: 'peer2', displayName: 'Bob' }],
-      origin: 'self-created',
     };
-    expect(detail.sharedWith).toHaveLength(1);
-    expect(detail.origin).toBe('self-created');
+    expect(detail.replicaCount).toBe(3);
   });
 
-  it('QuotaStatus has usage fields', () => {
+  it('QuotaStatus has usage fields (ZEB-612 S3: no invented total)', () => {
     const quota: QuotaStatus = {
       usedBytes: 5_000_000_000,
-      totalBytes: 10_000_000_000,
       byCategory: { image: 2_000_000_000, video: 3_000_000_000 },
+      pinnedUsedBytes: 1_000_000,
+      pinnedBudgetBytes: 50_000_000,
     };
-    expect(quota.usedBytes).toBeLessThan(quota.totalBytes);
+    expect(quota.pinnedUsedBytes).toBeLessThan(quota.pinnedBudgetBytes!);
   });
 
   it('CleanupRecommendation has action-relevant fields', () => {
@@ -94,16 +84,6 @@ describe('File manager types', () => {
     };
     expect(rec.reason).toBe('stale');
     expect(rec.confidence).toBeGreaterThan(0.8);
-  });
-
-  it('StorageBuddy tracks storage used', () => {
-    const buddy: StorageBuddy = {
-      address: 'peer3',
-      displayName: 'Charlie',
-      storageUsedBytes: 500_000_000,
-      online: true,
-    };
-    expect(buddy.online).toBe(true);
   });
 
   it('PublishedItem includes publish mode', () => {
