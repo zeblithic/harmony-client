@@ -12787,6 +12787,9 @@ pub struct VineVideoDto {
     pub original_creator_address: Option<String>,
     /// See VineDescriptorPayload::original_creator_name.
     pub original_creator_name: Option<String>,
+    /// ZEB-670: true when this row is a reshare whose original was
+    /// tombstoned by its creator — render as a "Removed by creator" stub.
+    pub original_removed: bool,
 }
 
 /// Response returned by list_followed — one entry per followed address.
