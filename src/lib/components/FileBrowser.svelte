@@ -351,10 +351,17 @@
     contents = [...contents];
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
-      // ZEB-612 S3: the toolbar invites pasting a CID — match it too.
-      contents = contents.filter(
-        (i) => i.name.toLowerCase().includes(q) || i.cid.toLowerCase().includes(q),
-      );
+      // ZEB-612 S3: the toolbar invites pasting a CID — match it too,
+      // including the UI's own chip format `cid:3f9a2c…7e8f`: strip the
+      // `cid:` prefix and match an elided middle as prefix + suffix.
+      const cidQ = q.startsWith('cid:') ? q.slice(4) : q;
+      const elided = cidQ.includes('…') ? cidQ.split('…', 2) : null;
+      contents = contents.filter((i) => {
+        if (i.name.toLowerCase().includes(q)) return true;
+        const cid = i.cid.toLowerCase();
+        if (cid.includes(cidQ)) return true;
+        return elided !== null && cid.startsWith(elided[0]) && cid.endsWith(elided[1]);
+      });
     }
     // Apply quick filters
     const cats = filters.categories as ContentCategory[] | undefined;

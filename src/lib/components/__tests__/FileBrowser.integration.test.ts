@@ -194,6 +194,16 @@ describe('File Manager Integration', () => {
     expect(screen.queryByText('distributed-systems-lecture.mp4')).toBeNull();
   });
 
+  it("search matches the UI's own chip text `cid:{shortCid}` (Greptile round 2)", () => {
+    const service = new FileManagerService();
+    // The row chip for cid-song-favorite renders `cid:cid-so…rite` —
+    // pasting exactly that must find the file.
+    renderBrowser(service, { searchQuery: 'cid:cid-so…rite' });
+
+    expect(screen.getByText('favorite-track.flac')).toBeTruthy();
+    expect(screen.queryByText('distributed-systems-lecture.mp4')).toBeNull();
+  });
+
   // ── 8. Section switch (private/published) ────────────────────────
 
   it('fires onSectionChange when Published tab is clicked', async () => {
