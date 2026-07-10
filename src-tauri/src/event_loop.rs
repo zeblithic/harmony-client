@@ -7803,6 +7803,8 @@ mod vine_tombstone_routing_tests {
             reshare_of: None,
             original_creator_address: None,
             original_creator_name: None,
+            identity_pub: None,
+            sig: None,
         };
         let outcome = cache.lock().unwrap().on_descriptor_sample(
             &format!("harmony/vines/{addr}"),

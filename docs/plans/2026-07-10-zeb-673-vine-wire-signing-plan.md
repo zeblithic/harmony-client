@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Signature fields are `Option<String>` + `#[serde(default, skip_serializing_if = "Option::is_none")]` — REQUIRED for disk back-compat (`VineFeedDiskV1` persists `VineDescriptorPayload` verbatim; required fields would wipe every user's cached feed on upgrade).
+- Signature fields are `Option<String>` + `#[serde(default, skip_serializing_if = "Option::is_none")]`. (Survey correction: `VineFeedDiskV1` persists separate `DescriptorOnDisk`/`ReactionOnDisk` structs, NOT the wire payloads verbatim — and `TombstoneOnDisk` already pins the posture "signature/pub are NOT retained; verification happens once at ingest; persisted records are trusted local state". So the disk format is untouched; loads reconstruct in-memory payloads with `None` sig fields, which is why the fields must be `Option`.)
 - Wire arrivals missing or failing signature/topic-binding → `Rejected` (strict). Disk records without signatures load unchanged (tolerant).
 - Domain prefixes: `harmony-vine-descriptor-v1`, `harmony-vine-reaction-v1`.
 - Canonical encoding: length-prefixed (`u32-LE len ‖ bytes` per field, fixed field order), `Option` = 1 presence byte then value, `bool` = 1 byte, `u64` = 8-byte LE. NOT pipe-separated (free-text fields), NOT `canonical_cbor_encode` (its same-length-field-name contract is violated by these structs).

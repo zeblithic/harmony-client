@@ -259,6 +259,7 @@ pub mod state_snapshot;
 pub mod tunnel_manager;
 pub mod tunnel_task;
 pub mod vine_feed_cache;
+pub mod vine_signing;
 pub mod vine_tombstone;
 pub mod voice;
 pub mod voice_crypto;
@@ -12760,6 +12761,15 @@ pub struct VineDescriptorPayload {
     /// Display name of the original creator (snapshot at reshare time). See above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_creator_name: Option<String>,
+    /// ZEB-673: hex 64-byte identity pub (X25519‖Ed25519) of the creator.
+    /// `Option` for disk back-compat (`VineFeedDiskV1` persists this
+    /// struct verbatim) — wire receivers reject `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_pub: Option<String>,
+    /// ZEB-673: hex 64-byte Ed25519 signature over
+    /// `vine_signing::descriptor_canonical_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 /// Vine descriptor sent from the frontend to publish.
@@ -12821,6 +12831,15 @@ pub struct VineReactionPayload {
     pub reactor_name: String,
     pub liked: bool,
     pub timestamp: u64,
+    /// ZEB-673: hex 64-byte identity pub of the REACTOR (the signer —
+    /// not the vine creator whose topic carries the reaction). `Option`
+    /// for disk back-compat — wire receivers reject `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_pub: Option<String>,
+    /// ZEB-673: hex 64-byte Ed25519 signature over
+    /// `vine_signing::reaction_canonical_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 /// Vine reaction sent from the frontend to publish.
@@ -12914,6 +12933,8 @@ async fn publish_vine(
         reshare_of: vine.reshare_of,
         original_creator_address: vine.original_creator_address,
         original_creator_name: vine.original_creator_name,
+        identity_pub: None,
+        sig: None,
     };
 
     publish_vine_descriptor(state.inner(), wire).await
@@ -13015,6 +13036,8 @@ pub(crate) async fn publish_vine_impl(
         reshare_of: None,
         original_creator_address: None,
         original_creator_name: None,
+        identity_pub: None,
+        sig: None,
     };
 
     publish_vine_descriptor(state, descriptor).await?;
@@ -13090,6 +13113,8 @@ pub(crate) async fn reshare_vine_impl(
         reshare_of: Some(args.vine_id.clone()),
         original_creator_address,
         original_creator_name,
+        identity_pub: None,
+        sig: None,
     };
 
     publish_vine_descriptor(state, descriptor).await?;
@@ -13134,6 +13159,8 @@ async fn publish_vine_reaction(
         reactor_name: reaction.reactor_name,
         liked: reaction.liked,
         timestamp: now_secs,
+        identity_pub: None,
+        sig: None,
     };
 
     let key_expr = format!(
@@ -13280,6 +13307,8 @@ mod delete_vine_tests {
             reshare_of: None,
             original_creator_address: None,
             original_creator_name: None,
+            identity_pub: None,
+            sig: None,
         };
         let outcome = cache.on_descriptor_sample(
             &format!("harmony/vines/{creator}"),
@@ -13336,6 +13365,8 @@ mod delete_vine_tests {
             reshare_of: None,
             original_creator_address: None,
             original_creator_name: None,
+            identity_pub: None,
+            sig: None,
         };
         cache.on_descriptor_sample(
             &format!("harmony/vines/{node_addr}"),
@@ -54230,6 +54261,8 @@ mod tests {
             reshare_of: None,
             original_creator_address: None,
             original_creator_name: None,
+            identity_pub: None,
+            sig: None,
         };
         let json = serde_json::to_vec(&vine).unwrap();
         let parsed: VineDescriptorPayload = serde_json::from_slice(&json).unwrap();
@@ -54253,6 +54286,8 @@ mod tests {
             reshare_of: Some("vine-0".to_string()),
             original_creator_address: None,
             original_creator_name: None,
+            identity_pub: None,
+            sig: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&vine).unwrap()).unwrap();
         assert!(
@@ -54286,6 +54321,8 @@ mod tests {
             reshare_of: Some("vine-0".to_string()),
             original_creator_address: Some("addr-original".to_string()),
             original_creator_name: Some("Original Creator".to_string()),
+            identity_pub: None,
+            sig: None,
         };
         let json = serde_json::to_string(&payload).expect("serialize");
         assert!(
@@ -54321,6 +54358,8 @@ mod tests {
             reshare_of: None,
             original_creator_address: None,
             original_creator_name: None,
+            identity_pub: None,
+            sig: None,
         };
         let json = serde_json::to_string(&payload).expect("serialize");
         assert!(
@@ -54383,6 +54422,8 @@ mod tests {
             reactor_name: "Alice".to_string(),
             liked: true,
             timestamp: 1711600000,
+            identity_pub: None,
+            sig: None,
         };
         let json = serde_json::to_vec(&reaction).unwrap();
         let parsed: VineReactionPayload = serde_json::from_slice(&json).unwrap();
@@ -54401,6 +54442,8 @@ mod tests {
             reactor_name: "Bob".to_string(),
             liked: false,
             timestamp: 0,
+            identity_pub: None,
+            sig: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&reaction).unwrap()).unwrap();
         assert!(json.contains("\"vineId\""), "expected camelCase: {json}");

@@ -90,6 +90,8 @@ fn make_vine_descriptor(vine_id: &str, creator_addr: &str, video_cid_hex: &str) 
         reshare_of: None,
         original_creator_address: None,
         original_creator_name: None,
+        identity_pub: None,
+        sig: None,
     };
     serde_json::to_vec(&payload).expect("descriptor serialization")
 }
@@ -536,6 +538,8 @@ async fn vine_full_round_trip_publish_feed_view_fetch_reshare() {
         reshare_of: Some(vine_id.to_string()),
         original_creator_address: Some(creator_addr.to_string()),
         original_creator_name: Some("Test Creator".to_string()),
+        identity_pub: None,
+        sig: None,
     };
     let reshare_outcome = recipient_cache.lock().unwrap().on_descriptor_sample(
         &format!("harmony/vines/{resharer_addr}"),

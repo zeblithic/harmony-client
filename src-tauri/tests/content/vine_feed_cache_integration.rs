@@ -33,6 +33,8 @@ fn make_descriptor(
         reshare_of: reshare_of.map(String::from),
         original_creator_address: None,
         original_creator_name: None,
+        identity_pub: None,
+        sig: None,
     }
 }
 
@@ -53,6 +55,8 @@ fn make_reaction(
         reactor_name: reactor_name.to_string(),
         liked,
         timestamp,
+        identity_pub: None,
+        sig: None,
     }
 }
 

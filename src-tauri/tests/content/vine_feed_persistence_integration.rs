@@ -31,6 +31,8 @@ fn canonical_descriptor_bytes(
         reshare_of: reshare_of.map(String::from),
         original_creator_address: None,
         original_creator_name: None,
+        identity_pub: None,
+        sig: None,
     };
     serde_json::to_vec(&v).unwrap()
 }
@@ -48,6 +50,8 @@ fn canonical_reaction_bytes(
         reactor_name: reactor_name.to_string(),
         liked,
         timestamp,
+        identity_pub: None,
+        sig: None,
     };
     serde_json::to_vec(&v).unwrap()
 }

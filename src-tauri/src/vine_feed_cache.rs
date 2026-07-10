@@ -384,6 +384,11 @@ impl VineFeedCache {
                 reshare_of: d.reshare_of,
                 original_creator_address: d.original_creator_address,
                 original_creator_name: d.original_creator_name,
+                // ZEB-673: signatures are not retained on disk —
+                // verification happens once at ingest; persisted rows are
+                // trusted local state (same posture as TombstoneOnDisk).
+                identity_pub: None,
+                sig: None,
             };
             cache.descriptors.insert(
                 d.id,
@@ -1043,6 +1048,8 @@ mod tests {
             reshare_of: reshare_of.map(String::from),
             original_creator_address: original_creator_address.map(String::from),
             original_creator_name: original_creator_name.map(String::from),
+            identity_pub: None,
+            sig: None,
         };
         serde_json::to_vec(&v).unwrap()
     }
@@ -1232,6 +1239,8 @@ mod tests {
             reactor_name: reactor_name.to_string(),
             liked,
             timestamp,
+            identity_pub: None,
+            sig: None,
         };
         serde_json::to_vec(&v).unwrap()
     }
