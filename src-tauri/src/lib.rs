@@ -9079,10 +9079,9 @@ pub async fn start_node_inner(
         // moves into guard.node_addr, so we carry this out via the tuple.
         let node_addr_for_response = node_addr.clone();
         let config = NodeConfig {
-            storage_budget: StorageBudget {
-                cache_capacity: 512,
-                max_pinned_bytes: 50_000_000,
-            },
+            // ZEB-612 S3: single-sourced so get_storage_budget reports the
+            // exact budget the runtime enforces.
+            storage_budget: NODE_STORAGE_BUDGET,
             compute_budget: InstructionBudget { fuel: 100_000 },
             schedule: Default::default(),
             // ZEB-398: persist EncryptedDurable content (our communities'
@@ -13481,6 +13480,40 @@ pub struct IngestResult {
 pub struct CreateFolderResult {
     pub sidecar_id: String,
     pub cid: String,
+}
+
+/// ZEB-612 S3: single source for the node's storage budget — also used
+/// by `NodeConfig` in `start_node`. Hardcoded pending a settings surface.
+pub const NODE_STORAGE_BUDGET: StorageBudget = StorageBudget {
+    cache_capacity: 512,
+    max_pinned_bytes: 50_000_000,
+};
+
+/// Wire shape for `get_storage_budget`. `maxPinnedBytes` is the PINNED
+/// content budget the runtime enforces via cache eviction — NOT an
+/// overall storage quota (none exists); the frontend must not render it
+/// as one.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageBudgetWire {
+    pub cache_capacity: u64,
+    pub max_pinned_bytes: u64,
+}
+
+impl From<&StorageBudget> for StorageBudgetWire {
+    fn from(b: &StorageBudget) -> Self {
+        Self {
+            cache_capacity: b.cache_capacity as u64,
+            max_pinned_bytes: b.max_pinned_bytes,
+        }
+    }
+}
+
+/// Query the node's storage budget (ZEB-612 S3). Const-backed — works
+/// before node boot.
+#[tauri::command]
+async fn get_storage_budget() -> Result<StorageBudgetWire, String> {
+    Ok(StorageBudgetWire::from(&NODE_STORAGE_BUDGET))
 }
 
 #[tauri::command]
@@ -53250,6 +53283,7 @@ pub fn run() {
             add_space,
             get_node_addr,
             list_content,
+            get_storage_budget,
             pin_content,
             unpin_content,
             burn_content,
@@ -54937,6 +54971,14 @@ mod pin_persistence_tests {
             kind: "leaf".into(),
             replica_count: 1,
         }
+    }
+
+    #[test]
+    fn storage_budget_wire_camel_case() {
+        let json = serde_json::to_string(&StorageBudgetWire::from(&NODE_STORAGE_BUDGET))
+            .expect("serialize");
+        assert!(json.contains("\"cacheCapacity\":512"), "got: {json}");
+        assert!(json.contains("\"maxPinnedBytes\":50000000"), "got: {json}");
     }
 
     #[test]
