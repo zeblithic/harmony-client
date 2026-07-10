@@ -15,7 +15,7 @@ use harmony_owner::lifecycle::{mint_owner, MintResult, RecoveryArtifact};
 use harmony_owner::recovery::RecoveryMetadata;
 use harmony_owner::trust;
 use secrecy::SecretString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -493,6 +493,52 @@ pub async fn issue_owner_recovery_token(
     .await
 }
 
+/// Wire DTO for the owner recovery-phrase reveal (ZEB-650 slice 2).
+///
+/// `owner_id` exists ONLY so the webview can cross-check the words against
+/// the owner it is currently displaying. It must never be rendered: it is a
+/// 32-hex-char run, which the WelcomeModal redaction invariant
+/// (`/[0-9a-f]{32,}/` never in `innerHTML`) forbids in the DOM.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerMnemonicDto {
+    pub words: Vec<String>,
+    pub owner_id: String,
+}
+
+/// Testable core of [`export_owner_mnemonic_words`] (ZEB-428 seam: tests
+/// inject `keychain: None` + `HARMONY_PASSPHRASE`; only the command wrapper
+/// constructs the real keychain).
+pub(crate) fn export_owner_mnemonic_dto(
+    identity_dir: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<OwnerMnemonicDto, String> {
+    let (words, owner_id) =
+        crate::recovery_cli::export_owner_mnemonic_words_with_keychain(identity_dir, keychain)?;
+    Ok(OwnerMnemonicDto {
+        words,
+        owner_id: hex::encode(owner_id),
+    })
+}
+
+/// Return the 24 BIP39 owner-mnemonic words + owner id for the GUI reveal
+/// (ZEB-650 slice 2). The first and only command returning owner seed
+/// material to the webview; the renderer shows the words only behind an
+/// explicit user reveal action (`OwnerPhraseReveal.svelte`), and the IPC
+/// fires only on that action — never on mount.
+///
+/// Inherits all three gates from
+/// [`crate::recovery_cli::export_owner_mnemonic_words_with_keychain`]:
+/// owner minted; master seed still on device (the `canBackUp` condition);
+/// seed↔owner-id invariant.
+#[tauri::command]
+pub async fn export_owner_mnemonic_words(
+    _app: tauri::AppHandle,
+) -> Result<OwnerMnemonicDto, String> {
+    let identity_dir = resolve_identity_dir()?;
+    run_blocking(move || export_owner_mnemonic_dto(&identity_dir, KeychainStore::new().ok())).await
+}
+
 /// Derive the owner-id (hex) that restoring the given 24-word mnemonic would
 /// re-adopt, WITHOUT writing anything. The GUI restore wizard shows this for
 /// confirmation and compares it against the device's current owner-id (ZEB-454).
@@ -557,6 +603,7 @@ mod tests {
     use crate::owner_state::{
         clear_path_token_cache, clear_token_cache, insert_path_token, take_path_token,
     };
+    use harmony_owner::state::OwnerState;
     use serial_test::serial;
 
     /// RAII guard: sets an env var on construction, removes it on drop (even on panic).
@@ -875,5 +922,74 @@ mod tests {
         // returns Ok(None), and the command errors when None.
         let result = crate::owner_state::load_owner_state(_dir.path(), None);
         assert!(matches!(result, Ok(None)), "empty dir → Ok(None)");
+    }
+
+    // ── ZEB-650 slice 2: owner-mnemonic DTO seam ──
+
+    /// Plant a minted owner (with master seed) in `dir`. Mirrors
+    /// recovery_cli.rs::plant_owner_and_export_words minus the export.
+    fn plant_owner(dir: &Path) -> (OwnerState, [u8; 32]) {
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = *recovery_artifact.as_bytes();
+        save_owner_state_atomic(dir, &state, &device_signing_key, Some(&master_seed), None)
+            .unwrap();
+        (state, master_seed)
+    }
+
+    #[test]
+    #[serial]
+    fn export_owner_mnemonic_dto_round_trips_words_and_owner_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-mnemonic-dto-test");
+        let (state, master_seed) = plant_owner(dir.path());
+
+        let dto = export_owner_mnemonic_dto(dir.path(), None).expect("export must succeed");
+        assert_eq!(dto.words.len(), 24, "owner mnemonic is 24 words");
+        assert_eq!(dto.owner_id, hex::encode(state.owner_id));
+        // Words must round-trip to the same master seed (same invariant the
+        // recovery_cli tests pin; kept here so the DTO layer cannot drift).
+        let parsed = RecoveryArtifact::from_mnemonic(&dto.words.join(" ")).expect("words parse");
+        assert_eq!(
+            *parsed.as_bytes(),
+            master_seed,
+            "DTO words must encode the owner master seed"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn export_owner_mnemonic_dto_errors_when_seed_wiped() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-mnemonic-dto-wiped");
+        let MintResult {
+            state,
+            device_signing_key,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        // Persist WITHOUT the master seed — the wiped/joiner model.
+        save_owner_state_atomic(dir.path(), &state, &device_signing_key, None, None).unwrap();
+        let err = export_owner_mnemonic_dto(dir.path(), None).unwrap_err();
+        assert!(
+            err.contains("wiped"),
+            "wiped-seed error must surface: {err}"
+        );
+    }
+
+    #[test]
+    fn owner_mnemonic_dto_serializes_camel_case() {
+        let dto = OwnerMnemonicDto {
+            words: vec!["abandon".into()],
+            owner_id: "ab".into(),
+        };
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            json.contains("\"ownerId\""),
+            "camelCase key required: {json}"
+        );
+        assert!(json.contains("\"words\""));
     }
 }
