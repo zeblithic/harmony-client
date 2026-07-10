@@ -1622,3 +1622,27 @@ describe('ChannelMessageFeed reactions — custom (CAS) emoji (ZEB-541)', () => 
     expect(ctx.queryByLabelText('Name this emoji')).toBeNull();
   });
 });
+
+describe('ChannelMessageFeed: composerPlaceholder (ZEB-612 S5)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('composerPlaceholder overrides the default composer placeholder', async () => {
+    const { container } = await setup({ composerPlaceholder: 'Message the room…' });
+    await waitFor(() => {
+      expect(container.querySelector('[placeholder="Message the room…"]')).toBeTruthy();
+    });
+    expect(container.querySelector('[placeholder="Message #general"]')).toBeNull();
+  });
+
+  it('absent composerPlaceholder keeps the long-standing Message #name default', async () => {
+    const { container } = await setup();
+    await waitFor(() => {
+      expect(container.querySelector('[placeholder="Message #general"]')).toBeTruthy();
+    });
+  });
+});
