@@ -480,7 +480,7 @@ async fn emit_moderation_changed(
     self_owner: crate::owner_state_types::OwnerAddr,
     now_ms: u64,
 ) {
-    let (muted, kicked) = {
+    let snap = {
         let g = moderation_map.lock().await;
         g.snapshot(&community, &channel, now_ms)
     };
@@ -521,12 +521,16 @@ async fn emit_moderation_changed(
         &serde_json::json!({
             "community": hex::encode(community.0),
             "channel": hex::encode(channel.0),
-            "mutedOwners": muted.iter().map(hex::encode).collect::<Vec<_>>(),
-            "kickedOwners": kicked.iter().map(hex::encode).collect::<Vec<_>>(),
+            "mutedOwners": snap.muted.iter().map(hex::encode).collect::<Vec<_>>(),
+            "kickedOwners": snap.kicked.iter().map(hex::encode).collect::<Vec<_>>(),
+            // ZEB-612: owners holding an unexpired invite-to-speak, plus
+            // whether WE are invited (drives the "Unmute?" banner).
+            "invitedOwners": snap.invited.iter().map(hex::encode).collect::<Vec<_>>(),
             "powers": powers,
             "selfPower": power_of(&self_owner.0),
-            "selfModMuted": muted.contains(&self_owner.0),
-            "selfKicked": kicked.contains(&self_owner.0),
+            "selfModMuted": snap.muted.contains(&self_owner.0),
+            "selfKicked": snap.kicked.contains(&self_owner.0),
+            "selfInvited": snap.invited.contains(&self_owner.0),
         }),
     );
 }
@@ -3169,6 +3173,20 @@ pub async fn run(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     > = std::collections::HashMap::new();
 
+    // ZEB-612 Town Hall: (community, channel) → the shared raised-hand cell
+    // handed to that channel's presence publisher. 0 = lowered; otherwise the
+    // wall-clock ms of the FIRST raise (stable queue position — see
+    // `update_hand_cell`). `set_voice_hand` → `VoiceChannelRequest::SetHand`
+    // updates it; the publisher republishes it each heartbeat. Kept in
+    // lockstep with `voice_mute_flags` on Join/Leave.
+    let mut voice_hand_flags: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    > = std::collections::HashMap::new();
+
     // ZEB-351 Voice V3: (community, channel) → the monotone presence-beacon `seq`
     // counter SHARED between that channel's heartbeat publisher and the immediate
     // mute beacon fired on `SetMuted`. Both draw strictly-increasing `seq`s from
@@ -3339,14 +3357,16 @@ pub async fn run(
     // case). Updated after every apply (control sub + Moderate) and every sweep.
     let voice_moderation_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Directives THIS node issued and is re-asserting until `stop_after_ms`.
-    // Key: (community, channel, target_owner, is_mute_class). Main-loop owned.
+    // Key: (community, channel, target_owner, class). Main-loop owned. The
+    // ModClass key keeps one live directive per enforcement class (ZEB-612:
+    // mute / kick / invite) so an invite never displaces a kick re-assert.
     #[allow(clippy::type_complexity)]
     let mut voice_issuer_directives: std::collections::HashMap<
         (
             crate::owner_state_types::SpaceId,
             crate::community_membership::ChannelId,
             [u8; 16],
-            bool,
+            crate::voice_moderation::ModClass,
         ),
         (crate::voice_moderation::SignedVoiceModerationDirective, u64),
     > = std::collections::HashMap::new();
@@ -4626,6 +4646,17 @@ pub async fn run(
                                         (community_id, channel_id),
                                         std::sync::Arc::clone(&mute_flag),
                                     );
+                                    // ZEB-612: shared raised-hand cell (0 = lowered;
+                                    // else wall-clock ms of the first raise).
+                                    // `SetHand` updates it; each heartbeat
+                                    // republishes it.
+                                    let hand_flag = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicU64::new(0),
+                                    );
+                                    voice_hand_flags.insert(
+                                        (community_id, channel_id),
+                                        std::sync::Arc::clone(&hand_flag),
+                                    );
                                     // Shared monotone beacon `seq` source for both
                                     // the publisher loop and the `SetMuted`
                                     // immediate beacon (see voice_presence_seq).
@@ -4658,6 +4689,7 @@ pub async fn run(
                                         caps.self_device,
                                         caps.joined_hlc.clone(),
                                         mute_flag,
+                                        hand_flag,
                                         std::sync::Arc::clone(&self_kicked_flag),
                                         seq_counter,
                                         Duration::from_secs(4),
@@ -4929,8 +4961,10 @@ pub async fn run(
                         voice_moderation_seq.remove(&(community_id, channel_id));
                         // ZEB-351 Voice V3: drop the shared mute flag in lockstep
                         // with the media key so a later `SetMuted` for a left
-                        // channel is a no-op.
+                        // channel is a no-op. ZEB-612: ditto the hand cell — a
+                        // rejoin starts hand-lowered.
                         voice_mute_flags.remove(&(community_id, channel_id));
+                        voice_hand_flags.remove(&(community_id, channel_id));
                         voice_presence_seq.remove(&(community_id, channel_id));
                         // Media leg: drop the cached key + abort the sub.
                         voice_keys.remove(&(community_id, channel_id));
@@ -4962,10 +4996,16 @@ pub async fn run(
                                 "channel": hex::encode(channel_id.0),
                                 "mutedOwners": Vec::<String>::new(),
                                 "kickedOwners": Vec::<String>::new(),
+                                // ZEB-612: keep the reset payload's shape in
+                                // lockstep with emit_moderation_changed so a
+                                // uniform consumer never sees the invite keys
+                                // vanish (CodeRabbit Major, PR #442).
+                                "invitedOwners": Vec::<String>::new(),
                                 "powers": serde_json::Map::new(),
                                 "selfPower": 0,
                                 "selfModMuted": false,
                                 "selfKicked": false,
+                                "selfInvited": false,
                             }));
                     }
                     crate::voice::VoiceChannelRequest::SetMuted { community_id, channel_id, muted } => {
@@ -4997,6 +5037,13 @@ pub async fn run(
                                 );
                                 let seq = seq_counter
                                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                // ZEB-612: carry the CURRENT hand state so an
+                                // immediate mute beacon never silently lowers a
+                                // raised hand (the beacon is whole-state).
+                                let hand = voice_hand_flags
+                                    .get(&(community_id, channel_id))
+                                    .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+                                    .and_then(|hr| (hr != 0).then_some(hr));
                                 if let Err(e) = crate::voice_presence::publish_presence_once(
                                     &session,
                                     &pres_topic,
@@ -5009,10 +5056,58 @@ pub async fn run(
                                     joined_hlc,
                                     seq,
                                     muted,
+                                    hand,
                                 )
                                 .await
                                 {
                                     tracing::warn!(%pres_topic, err = ?e, "immediate mute beacon publish failed");
+                                }
+                            }
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::SetHand { community_id, channel_id, raised_at } => {
+                        // ZEB-612 Town Hall: update the shared hand cell the
+                        // presence publisher reads each heartbeat. A no-op if
+                        // the channel isn't joined (cell absent). The cell
+                        // keeps the FIRST raise's stamp across repeat raises
+                        // (stable queue position); lower always resets.
+                        if let Some(flag) = voice_hand_flags.get(&(community_id, channel_id)) {
+                            let hand =
+                                crate::voice_presence::update_hand_cell(flag, raised_at);
+                            // Immediate beacon so the queue reflects the hand
+                            // without waiting out the next ≤4 s heartbeat
+                            // (mirrors the SetMuted arm; carries the CURRENT
+                            // mute state — the beacon is whole-state).
+                            if let (Some(key), Some((owner, device, joined_hlc, signing_key)), Some(seq_counter), Some(mute_flag)) = (
+                                voice_keys.get(&(community_id, channel_id)),
+                                voice_identity.get(&(community_id, channel_id)),
+                                voice_presence_seq.get(&(community_id, channel_id)),
+                                voice_mute_flags.get(&(community_id, channel_id)),
+                            ) {
+                                let pres_topic = format!(
+                                    "harmony/voice-presence/{}/{}",
+                                    hex::encode(community_id.0),
+                                    hex::encode(channel_id.0),
+                                );
+                                let seq = seq_counter
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if let Err(e) = crate::voice_presence::publish_presence_once(
+                                    &session,
+                                    &pres_topic,
+                                    key,
+                                    &community_id,
+                                    &channel_id,
+                                    signing_key,
+                                    *owner,
+                                    *device,
+                                    joined_hlc,
+                                    seq,
+                                    mute_flag.load(std::sync::atomic::Ordering::SeqCst),
+                                    hand,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(%pres_topic, err = ?e, "immediate hand beacon publish failed");
                                 }
                             }
                         }
@@ -5255,15 +5350,21 @@ pub async fn run(
                                                 tracing::warn!(%control_topic, err = %e, "moderation directive publish failed");
                                             }
                                             let now = (voice_now_ms)();
+                                        // ZEB-612: an invite's default window is
+                                        // INVITE_TTL_MS (~2 min), not the 5 min
+                                        // punitive default.
                                         let stop_after = now
-                                            + duration_ms.unwrap_or(
-                                                crate::voice_moderation::DEFAULT_MODERATION_MS,
-                                            );
+                                            + duration_ms.unwrap_or(match action {
+                                                crate::voice_moderation::ModAction::InviteToSpeak => {
+                                                    crate::voice_moderation::INVITE_TTL_MS
+                                                }
+                                                _ => crate::voice_moderation::DEFAULT_MODERATION_MS,
+                                            });
                                         let idkey = (
                                             community_id,
                                             channel_id,
                                             target_owner.0,
-                                            action.is_mute_class(),
+                                            action.class(),
                                         );
                                         if action.enforces() {
                                             voice_issuer_directives

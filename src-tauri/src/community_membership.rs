@@ -383,6 +383,14 @@ pub enum ChannelKind {
     #[default]
     Text = 0,
     Voice = 1,
+    /// ZEB-612 Town Hall: voice fused with assembly affordances (raise-hand
+    /// queue, invite-to-speak, motion card). Same media/presence/control
+    /// topics as Voice — the kind only routes the frontend view. Stale-client
+    /// posture on decode is the ZEB-349 Voice precedent: `serde_repr` rejects
+    /// the unknown discriminant, so a pre-ZEB-612 client rejects the
+    /// containing state blob loudly (no crash, no partial mutation;
+    /// upgrade-before-create is the fleet rule).
+    Townhall = 2,
 }
 
 impl ChannelKind {
@@ -4749,10 +4757,15 @@ mod tests {
 
     #[test]
     fn channel_kind_cbor_unknown_tag_is_rejected() {
-        // serde_repr rejects unknown discriminants on decode: 0x02 is neither
-        // Text (0) nor Voice (1), so it must fail rather than silently default.
-        let result: Result<ChannelKind, _> = ciborium::de::from_reader(&[0x02u8][..]);
-        assert!(result.is_err(), "tag 2 must be rejected");
+        // serde_repr rejects unknown discriminants on decode: 0x03 is not
+        // Text (0), Voice (1), or Townhall (2 — ZEB-612), so it must fail
+        // rather than silently default. This pins the stale-client posture:
+        // a future kind rejects the containing decode, never misdecodes.
+        let result: Result<ChannelKind, _> = ciborium::de::from_reader(&[0x03u8][..]);
+        assert!(result.is_err(), "tag 3 must be rejected");
+        // Townhall's own tag decodes (the flip side of the same pin).
+        let townhall: ChannelKind = ciborium::de::from_reader(&[0x02u8][..]).expect("tag 2");
+        assert_eq!(townhall, ChannelKind::Townhall);
     }
 
     fn make_kick_event(

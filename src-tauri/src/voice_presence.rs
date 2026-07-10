@@ -31,6 +31,15 @@ pub struct VoicePresenceBeacon {
     pub seq: u64,
     #[serde(rename = "lf", default, skip_serializing_if = "is_false")]
     pub left: bool,
+    /// ZEB-612 Town Hall: wall-clock ms when this member raised their hand;
+    /// absent = lowered. `skip_serializing_if` keeps a lowered-hand beacon
+    /// byte-identical to the pre-ZEB-612 wire (the `left` pattern above).
+    /// Mixed-fleet note: a pre-ZEB-612 receiver drops a hand-raised beacon at
+    /// signature verification (its lossy re-encode omits `hd`), so the raiser
+    /// vanishes from stale rosters until the hand lowers — transient (12 s
+    /// TTL), contained, and the same posture `left`'s own introduction had.
+    #[serde(rename = "hd", default, skip_serializing_if = "Option::is_none")]
+    pub hand: Option<u64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -239,6 +248,8 @@ fn ser_hex_32<S: serde::Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Erro
 pub struct PresenceEntry {
     pub owner: [u8; 16],
     pub muted: bool,
+    /// ZEB-612: wall-clock ms of the member's raised hand (None = lowered).
+    pub hand: Option<u64>,
     pub seq: u64,
     pub joined_hlc: Hlc,
     /// Monotonic-ms timestamp of the last applied beacon (injected by caller).
@@ -262,6 +273,10 @@ pub struct RosterEntry {
     #[serde(serialize_with = "ser_hex_32")]
     pub device: [u8; 32],
     pub muted: bool,
+    /// ZEB-612: JSON `handRaisedAt` — wall-clock ms of the raised hand, or
+    /// null when lowered. Drives the derived speaker queue (ordering + the ✋
+    /// badge); never stored, always the latest beacon's value.
+    pub hand_raised_at: Option<u64>,
 }
 
 /// One row returned by [`VoicePresenceMap::sweep`]: the `(community, channel)`
@@ -326,6 +341,7 @@ impl VoicePresenceMap {
                 // Live row → bury it. The roster shrinks, so report a change.
                 Some(e) => {
                     e.muted = beacon.muted;
+                    e.hand = beacon.hand;
                     e.seq = beacon.seq;
                     e.joined_hlc = beacon.joined_hlc.clone();
                     e.last_seen_ms = now_ms;
@@ -340,6 +356,7 @@ impl VoicePresenceMap {
                         PresenceEntry {
                             owner: beacon.owner,
                             muted: beacon.muted,
+                            hand: beacon.hand,
                             seq: beacon.seq,
                             joined_hlc: beacon.joined_hlc.clone(),
                             last_seen_ms: now_ms,
@@ -356,6 +373,7 @@ impl VoicePresenceMap {
                 // at 0 on rejoin) — and revives a gravestone.
                 e.owner = beacon.owner;
                 e.muted = beacon.muted;
+                e.hand = beacon.hand;
                 e.seq = beacon.seq;
                 e.joined_hlc = beacon.joined_hlc.clone();
                 e.last_seen_ms = now_ms;
@@ -367,18 +385,19 @@ impl VoicePresenceMap {
             Some(e) if beacon.seq <= e.seq => false, // same session, stale or duplicate seq
             Some(e) => {
                 // Same session, newer seq: advance liveness, but only report a
-                // roster-VISIBLE change when `muted` actually flipped. A bare
-                // seq/last_seen advance is invisible to the frontend (RosterEntry
-                // carries no seq/last_seen), so emitting on it spams
+                // roster-VISIBLE change when `muted` or `hand` actually flipped
+                // (both surface on RosterEntry). A bare seq/last_seen advance is
+                // invisible to the frontend, so emitting on it spams
                 // `voice-presence-changed` once per heartbeat per peer — including
                 // our own beacon echoed back on the shared Zenoh session.
                 // `last_seen_ms` is updated regardless so the TTL sweep still
                 // sees liveness.
-                let muted_changed = e.muted != beacon.muted;
+                let visible_changed = e.muted != beacon.muted || e.hand != beacon.hand;
                 e.muted = beacon.muted;
+                e.hand = beacon.hand;
                 e.seq = beacon.seq;
                 e.last_seen_ms = now_ms;
-                muted_changed
+                visible_changed
             }
             None => {
                 chan.insert(
@@ -386,6 +405,7 @@ impl VoicePresenceMap {
                     PresenceEntry {
                         owner: beacon.owner,
                         muted: beacon.muted,
+                        hand: beacon.hand,
                         seq: beacon.seq,
                         joined_hlc: beacon.joined_hlc.clone(),
                         last_seen_ms: now_ms,
@@ -430,6 +450,7 @@ impl VoicePresenceMap {
                         owner: e.owner,
                         device: *device,
                         muted: e.muted,
+                        hand_raised_at: e.hand,
                     })
                     .collect()
             })
@@ -606,6 +627,7 @@ pub fn build_heartbeat_beacon(
     joined_hlc: &Hlc,
     seq: u64,
     muted: bool,
+    hand: Option<u64>,
 ) -> VoicePresenceBeacon {
     VoicePresenceBeacon {
         owner: self_owner.0,
@@ -614,6 +636,7 @@ pub fn build_heartbeat_beacon(
         joined_hlc: joined_hlc.clone(),
         seq,
         left: false,
+        hand,
     }
 }
 
@@ -635,8 +658,9 @@ pub async fn publish_presence_once(
     joined_hlc: &Hlc,
     seq: u64,
     muted: bool,
+    hand: Option<u64>,
 ) -> Result<(), BeaconError> {
-    let beacon = build_heartbeat_beacon(self_owner, self_device, joined_hlc, seq, muted);
+    let beacon = build_heartbeat_beacon(self_owner, self_device, joined_hlc, seq, muted, hand);
     let signed = sign_presence_beacon(beacon, signing_key)?;
     let sealed = seal_presence_beacon(channel_key, community, channel, &signed)?;
     session
@@ -675,6 +699,7 @@ pub fn spawn_voice_presence_publisher(
     self_device: [u8; 32],
     joined_hlc: Hlc,
     muted: Arc<AtomicBool>,
+    hand_raised_at: Arc<AtomicU64>,
     self_kicked: Arc<AtomicBool>,
     seq_counter: Arc<AtomicU64>,
     interval: std::time::Duration,
@@ -699,12 +724,16 @@ pub fn spawn_voice_presence_publisher(
                 continue;
             }
             let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
+            // ZEB-612: the shared hand cell uses 0 as the "lowered" sentinel
+            // (wall-clock ms is never 0); each heartbeat republishes it.
+            let hr = hand_raised_at.load(Ordering::SeqCst);
             let beacon = build_heartbeat_beacon(
                 self_owner,
                 self_device,
                 &joined_hlc,
                 seq,
                 muted.load(Ordering::SeqCst),
+                (hr != 0).then_some(hr),
             );
             let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
                 continue;
@@ -718,6 +747,30 @@ pub fn spawn_voice_presence_publisher(
             }
         }
     })
+}
+
+/// ZEB-612: apply a raise/lower to the shared per-channel hand cell and return
+/// the value the immediate beacon should carry. Raising keeps the ORIGINAL
+/// timestamp if already raised (queue position must be stable across repeat
+/// raises); lowering always resets. 0 is the "lowered" sentinel — wall-clock
+/// ms is never 0. Pure over the cell so the stamp-once rule is unit-testable
+/// without the event loop.
+pub fn update_hand_cell(cell: &AtomicU64, raised_at: Option<u64>) -> Option<u64> {
+    match raised_at {
+        Some(ts) => {
+            let prev = cell.load(Ordering::SeqCst);
+            if prev == 0 {
+                cell.store(ts, Ordering::SeqCst);
+                Some(ts)
+            } else {
+                Some(prev)
+            }
+        }
+        None => {
+            cell.store(0, Ordering::SeqCst);
+            None
+        }
+    }
 }
 
 /// Build + sign + seal a single `left=true` tombstone for instant roster
@@ -739,6 +792,7 @@ pub fn build_presence_tombstone(
         joined_hlc,
         seq: u64::MAX,
         left: true,
+        hand: None,
     };
     let signed = sign_presence_beacon(beacon, signing_key).ok()?;
     seal_presence_beacon(channel_key, community, channel, &signed).ok()
@@ -816,12 +870,15 @@ pub fn spawn_groupdm_presence_publisher(
                 break;
             }
             let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
+            // Group-DM calls have no raise-hand semantics (ZEB-612 is
+            // community town halls only) → hand is always None here.
             let beacon = build_heartbeat_beacon(
                 self_owner,
                 self_device,
                 &joined_hlc,
                 seq,
                 muted.load(Ordering::SeqCst),
+                None,
             );
             let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
                 continue;
@@ -855,7 +912,8 @@ pub async fn publish_groupdm_leave_tombstone(
     self_device: [u8; 32],
     joined_hlc: &Hlc,
 ) {
-    let mut beacon = build_heartbeat_beacon(self_owner, self_device, joined_hlc, u64::MAX, true);
+    let mut beacon =
+        build_heartbeat_beacon(self_owner, self_device, joined_hlc, u64::MAX, true, None);
     beacon.left = true;
     let Ok(signed) = sign_presence_beacon(beacon, signing_key) else {
         return;
@@ -965,6 +1023,7 @@ mod tests {
             },
             seq,
             left: false,
+            hand: None,
         }
     }
 
@@ -976,8 +1035,41 @@ mod tests {
             device_id: "aa".repeat(32),
         };
         let owner = OwnerAddr([7u8; 16]);
-        assert!(build_heartbeat_beacon(owner, [1u8; 32], &hlc, 0, true).muted);
-        assert!(!build_heartbeat_beacon(owner, [1u8; 32], &hlc, 1, false).muted);
+        assert!(build_heartbeat_beacon(owner, [1u8; 32], &hlc, 0, true, None).muted);
+        assert!(!build_heartbeat_beacon(owner, [1u8; 32], &hlc, 1, false, None).muted);
+    }
+
+    #[test]
+    fn heartbeat_beacon_carries_hand() {
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "aa".repeat(32),
+        };
+        let owner = OwnerAddr([7u8; 16]);
+        assert_eq!(
+            build_heartbeat_beacon(owner, [1u8; 32], &hlc, 0, true, Some(42)).hand,
+            Some(42)
+        );
+        assert_eq!(
+            build_heartbeat_beacon(owner, [1u8; 32], &hlc, 1, true, None).hand,
+            None
+        );
+    }
+
+    #[test]
+    fn update_hand_cell_stamps_once_and_lower_resets() {
+        use std::sync::atomic::AtomicU64;
+        let cell = AtomicU64::new(0);
+        // First raise stamps.
+        assert_eq!(update_hand_cell(&cell, Some(500)), Some(500));
+        // Repeat raise keeps the ORIGINAL stamp (stable queue position).
+        assert_eq!(update_hand_cell(&cell, Some(900)), Some(500));
+        // Lower resets.
+        assert_eq!(update_hand_cell(&cell, None), None);
+        assert_eq!(cell.load(Ordering::SeqCst), 0);
+        // Raise after lower restamps.
+        assert_eq!(update_hand_cell(&cell, Some(900)), Some(900));
     }
 
     #[test]
@@ -1050,6 +1142,7 @@ mod map_tests {
             },
             seq,
             left,
+            hand: None,
         }
     }
     const C: SpaceId = SpaceId([0xc0; 16]);
@@ -1090,6 +1183,7 @@ mod map_tests {
             joined_hlc,
             seq,
             left,
+            hand: None,
         }
     }
 
@@ -1101,6 +1195,54 @@ mod map_tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].owner, [1; 16]);
         assert!(r[0].muted);
+        assert_eq!(r[0].hand_raised_at, None);
+    }
+
+    /// ZEB-612: a same-session heartbeat whose ONLY delta is the hand field is
+    /// a roster-visible change (the ✋ badge / queue reorder), while a bare
+    /// heartbeat with unchanged hand stays invisible (no emit spam).
+    #[test]
+    fn hand_flip_is_roster_visible_and_bare_heartbeat_is_not() {
+        let mut m = VoicePresenceMap::new();
+        assert!(m.apply(&C, &CH, &b(1, 1, 0, true, false), 0));
+        // Raise: same session, newer seq, hand Some → visible change.
+        let mut raised = b(1, 1, 1, true, false);
+        raised.hand = Some(777);
+        assert!(m.apply(&C, &CH, &raised, 100), "hand raise must be visible");
+        assert_eq!(m.roster(&C, &CH)[0].hand_raised_at, Some(777));
+        // Bare heartbeat with the SAME hand → invisible (liveness only).
+        let mut same = b(1, 1, 2, true, false);
+        same.hand = Some(777);
+        assert!(
+            !m.apply(&C, &CH, &same, 200),
+            "unchanged hand heartbeat must not emit"
+        );
+        // Lower: hand back to None → visible change.
+        assert!(
+            m.apply(&C, &CH, &b(1, 1, 3, true, false), 300),
+            "hand lower must be visible"
+        );
+        assert_eq!(m.roster(&C, &CH)[0].hand_raised_at, None);
+    }
+
+    /// ZEB-612: `RosterEntry` serializes the hand as camelCase `handRaisedAt`
+    /// (number when raised, null when lowered) for the JSON event payload.
+    #[test]
+    fn roster_entry_serializes_hand_raised_at() {
+        let raised = RosterEntry {
+            owner: [1; 16],
+            device: [2; 32],
+            muted: false,
+            hand_raised_at: Some(777),
+        };
+        let lowered = RosterEntry {
+            hand_raised_at: None,
+            ..raised.clone()
+        };
+        let jr = serde_json::to_value(&raised).expect("serialize");
+        let jl = serde_json::to_value(&lowered).expect("serialize");
+        assert_eq!(jr.get("handRaisedAt").and_then(|v| v.as_u64()), Some(777));
+        assert!(jl.get("handRaisedAt").expect("key present").is_null());
     }
 
     #[test]

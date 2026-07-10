@@ -74,6 +74,10 @@ fn voice_packet_v2_wire_bytes_pinned() {
 
 /// Fully deterministic signed+sealed presence beacon: fixed device-#2 key
 /// `[7u8; 32]`, fixed `joined_hlc`, `seq = 1`, sealed with a zeroed nonce.
+/// `hand: None` (ZEB-612) is skipped on the wire, so this fixture's pinned
+/// bytes are the byte-identity proof that a lowered-hand beacon is unchanged
+/// from the pre-ZEB-612 wire — and its round-trip proves old bytes decode
+/// with `hand` defaulting to `None`.
 fn fixture_signed_beacon() -> SignedVoicePresenceBeacon {
     let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let beacon = VoicePresenceBeacon {
@@ -87,6 +91,7 @@ fn fixture_signed_beacon() -> SignedVoicePresenceBeacon {
         },
         seq: 1,
         left: false,
+        hand: None,
     };
     sign_presence_beacon(beacon, &sk).expect("sign")
 }
@@ -119,6 +124,55 @@ fn presence_beacon_wire_bytes_pinned() {
     let opened = open_presence_beacon(&key, &SpaceId([0xc0; 16]), &ChannelId([0xc1; 16]), &sealed)
         .expect("open pinned beacon");
     assert_eq!(opened, signed, "pinned beacon decoded to a different value");
+}
+
+/// ZEB-612: pin the sealed presence beacon WITH a raised hand. Differs from
+/// the lowered-hand fixture above by exactly the appended `hd` map entry
+/// (declaration order puts it last). Same key/nonce/identity as that fixture.
+#[test]
+fn presence_beacon_with_hand_wire_bytes_pinned() {
+    let key = derive_channel_key(
+        &EpochKey::new([0x11; 32]),
+        &SpaceId([0xc0; 16]),
+        &ChannelId([0xc1; 16]),
+    );
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let beacon = VoicePresenceBeacon {
+        owner: [0xa1; 16],
+        device: sk.verifying_key().to_bytes(),
+        muted: true,
+        joined_hlc: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "aa".repeat(32),
+        },
+        seq: 1,
+        left: false,
+        hand: Some(1_720_000_000_000),
+    };
+    let signed = sign_presence_beacon(beacon, &sk).expect("sign");
+    let sealed = seal_presence_beacon_with_nonce(
+        &key,
+        &SpaceId([0xc0; 16]),
+        &ChannelId([0xc1; 16]),
+        &signed,
+        [0u8; 12],
+    )
+    .expect("seal");
+    // GENERATE-THEN-PIN: run once with a placeholder; paste the printed hex.
+    let expected = "0000000000000000000000000e3878f4a96cc7facd295c54d9b2ead07b7da6190b227548eee70d1a3bfb1a62432a5f6b46b27fa0a1a1cf8ea5ff27cf90893c2046dcbd473b2f4a6e69cc3094336f6cd54117eb973e6c9e1c18c23fccdff02a868b284897577a96163281e6eddc67c2a47da57b2b938ef9bbbdadc266f939bf5e5a54614313b1d70941bb27261068d5070606039a01f2c5308184bddf60ea0684e9db409d7f8341bbcc3429ad189a2f6bd4aa7ab063f9fa5a4f1ad97c7ac13d6dc185b274fcc11fed8580b2eaa4abb971890317974076e8118c66d234eee54a0f0908137b8044d75a9540a2037f88e8d565a7310da1f3dfd634fe5431706b3b1e20a034";
+    assert_eq!(
+        hex::encode(&sealed),
+        expected,
+        "sealed hand-raised presence-beacon wire format drifted"
+    );
+
+    // Round-trip: the pinned bytes must open back to the same signed beacon
+    // (proves `hd` survives sign → seal → open → verify).
+    let opened = open_presence_beacon(&key, &SpaceId([0xc0; 16]), &ChannelId([0xc1; 16]), &sealed)
+        .expect("open pinned hand beacon");
+    assert_eq!(opened, signed, "pinned hand beacon decoded differently");
+    assert_eq!(opened.beacon.hand, Some(1_720_000_000_000));
 }
 
 /// ZEB-360: pin the sealed group-DM presence beacon wire format. Wrapped with a
@@ -317,6 +371,51 @@ fn voice_moderation_directive_canonical_cbor_is_pinned() {
         hex::encode(&bytes),
         "a662616f50a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16261645820d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d262746f50b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b362616300626968a36177182a616c0761646b666978747572652d64657662737103",
         "VoiceModerationDirective canonical-CBOR wire format drifted"
+    );
+}
+
+/// ZEB-612: pin the canonical CBOR of an unsigned InviteToSpeak directive.
+/// Differs from the Mute pin above by exactly the `ac` value byte: `626163 00`
+/// becomes `626163 04` (discriminant 4).
+#[test]
+fn voice_moderation_invite_directive_canonical_cbor_is_pinned() {
+    let mut d = fixture_directive();
+    d.action = ModAction::InviteToSpeak;
+    let bytes = canonical_cbor_encode(&d).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "a662616f50a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16261645820d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d262746f50b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b362616304626968a36177182a616c0761646b666978747572652d64657662737103",
+        "InviteToSpeak directive canonical-CBOR wire format drifted"
+    );
+    // Round-trip: the discriminant decodes back to InviteToSpeak.
+    let back: VoiceModerationDirective = ciborium::from_reader(bytes.as_slice()).unwrap();
+    assert_eq!(back.action, ModAction::InviteToSpeak);
+}
+
+/// ZEB-612: pin the sealed (signed + ChannelKey-encrypted) InviteToSpeak
+/// directive. Same key/nonce/identity as the sealed Mute pin below; a VALID
+/// wire example (actor_device matches the signer).
+#[test]
+fn voice_moderation_sealed_invite_directive_is_pinned() {
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let mut directive = fixture_directive();
+    directive.action = ModAction::InviteToSpeak;
+    directive.actor_device = signing.verifying_key().to_bytes();
+    let signed = sign_directive(directive, &signing).expect("sign");
+    let key = derive_channel_key(
+        &EpochKey::new([0x11; 32]),
+        &SpaceId([0xc0; 16]),
+        &ChannelId([0xc1; 16]),
+    );
+    let community = SpaceId([0xc0; 16]);
+    let channel = ChannelId([0xc1; 16]);
+    let sealed =
+        seal_directive_with_nonce(&key, &community, &channel, &signed, [9u8; 12]).expect("seal");
+    // GENERATE-THEN-PIN: run once with a placeholder; paste the printed hex.
+    assert_eq!(
+        hex::encode(&sealed),
+        "090909090909090909090909f76ed9e6ed6f16b7af2d4cdeba79cd9b2b52875c6c8dd9f55e6a6d3821f4eeac9766925d2973eb0c91014bd56686fe5976fe41136c9daba59323e9d50551fa78f3b765450ad1ebcb42c289f12efb521c3095d4204765a6235672205ac88454a330218cf5e02f8710576af956a769a71b5e1b2657eb6af19dfbce62db4161adb6e394f85f56ccc79270bd491adc6bab32498c87ec41d6a96884ccaf81cba69f6694a77ed8f35464eaea3d1553a3f5edaabcb67cf658801d1f2d9cd6db13c8e10a7c284d5394a3ae36",
+        "sealed InviteToSpeak directive wire format drifted"
     );
 }
 

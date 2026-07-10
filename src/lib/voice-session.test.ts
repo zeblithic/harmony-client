@@ -1,7 +1,8 @@
 // src/lib/voice-session.test.ts
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { get } from 'svelte/store';
-import { VoiceSession, classifyMicError, getVoiceSession } from './voice-session';
+import { VoiceSession, classifyMicError, getVoiceSession, speakerQueue } from './voice-session';
+import type { RosterMember } from './voice-session';
 
 function deps() {
   const invoke = vi.fn().mockResolvedValue(undefined);
@@ -185,6 +186,142 @@ describe('VoiceSession lifecycle + gate', () => {
       { owner: 'cc'.repeat(16), device: 'dd'.repeat(16), muted: false },
     ] });
     expect(get(s.state).roster).toHaveLength(0);
+  });
+});
+
+describe('VoiceSession raise-hand + invite-to-speak (ZEB-612)', () => {
+  let d: ReturnType<typeof deps>;
+  beforeEach(() => { d = deps(); });
+
+  function newSession() {
+    return new VoiceSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      ...d.factories,
+    });
+  }
+
+  it('surfaces handRaisedAt from the presence payload (null when absent)', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-presence-changed', {
+      community: 'comm', channel: 'chan',
+      roster: [
+        { owner: 'cc'.repeat(16), device: 'dd'.repeat(16), muted: false, handRaisedAt: 1720 },
+        { owner: 'ee'.repeat(16), device: 'ff'.repeat(16), muted: true, handRaisedAt: null },
+        // Pre-ZEB-612 payload shape (key absent entirely) → null.
+        { owner: '11'.repeat(16), device: '22'.repeat(16), muted: true },
+      ],
+    });
+    const roster = get(s.state).roster;
+    expect(roster.map((m) => m.handRaisedAt)).toEqual([1720, null, null]);
+  });
+
+  it('marks invited members and selfInvited from the moderation overlay', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-presence-changed', {
+      community: 'comm', channel: 'chan',
+      roster: [
+        { owner: 'cc'.repeat(16), device: 'dd'.repeat(16), muted: false, handRaisedAt: 5 },
+        { owner: 'ee'.repeat(16), device: 'ff'.repeat(16), muted: true, handRaisedAt: null },
+      ],
+    });
+    d.emit('voice-moderation-changed', {
+      community: 'comm', channel: 'chan',
+      mutedOwners: [], kickedOwners: [],
+      invitedOwners: ['cc'.repeat(16), 'aa'.repeat(16)],
+      powers: {}, selfPower: 0, selfModMuted: false, selfKicked: false,
+      selfInvited: true,
+    });
+    const st = get(s.state);
+    expect(st.selfInvited).toBe(true);
+    expect(st.roster.find((m) => m.ownerHex === 'cc'.repeat(16))?.invited).toBe(true);
+    expect(st.roster.find((m) => m.ownerHex === 'ee'.repeat(16))?.invited).toBe(false);
+  });
+
+  it('tolerates a pre-ZEB-612 overlay payload (invite keys absent)', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-moderation-changed', {
+      community: 'comm', channel: 'chan',
+      mutedOwners: [], kickedOwners: [],
+      powers: {}, selfPower: 0, selfModMuted: false, selfKicked: false,
+    });
+    expect(get(s.state).selfInvited).toBe(false);
+  });
+
+  it('setHand invokes set_voice_hand with the camelCase payload', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    await s.setHand(true);
+    expect(d.invoke).toHaveBeenCalledWith('set_voice_hand', {
+      payload: { communityId: 'comm', channelId: 'chan', raised: true },
+    });
+    await s.setHand(false);
+    expect(d.invoke).toHaveBeenCalledWith('set_voice_hand', {
+      payload: { communityId: 'comm', channelId: 'chan', raised: false },
+    });
+  });
+
+  it('setHand is a no-op when not connected', async () => {
+    const s = newSession();
+    await s.setHand(true);
+    expect(d.invoke).not.toHaveBeenCalledWith('set_voice_hand', expect.anything());
+  });
+
+  it('inviteToSpeak issues a moderate_voice invite directive', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    await s.inviteToSpeak('cc'.repeat(16));
+    expect(d.invoke).toHaveBeenCalledWith('moderate_voice', {
+      payload: {
+        communityId: 'comm', channelId: 'chan',
+        targetOwnerHex: 'cc'.repeat(16), action: 'invite',
+      },
+    });
+  });
+});
+
+describe('speakerQueue (ZEB-612 derived queue)', () => {
+  const member = (ownerHex: string, handRaisedAt: number | null): RosterMember => ({
+    ownerHex, deviceHex: ownerHex, muted: true, speaking: false,
+    modMuted: false, power: 0, handRaisedAt, invited: false,
+  });
+
+  it('orders raised hands by raise time, oldest first', () => {
+    const q = speakerQueue([
+      member('cc'.repeat(16), 300),
+      member('aa'.repeat(16), 100),
+      member('bb'.repeat(16), null), // lowered → excluded
+      member('dd'.repeat(16), 200),
+    ]);
+    expect(q.map((m) => m.handRaisedAt)).toEqual([100, 200, 300]);
+  });
+
+  it('breaks raise-time ties by owner hex (deterministic on every client)', () => {
+    const q = speakerQueue([
+      member('ff'.repeat(16), 100),
+      member('11'.repeat(16), 100),
+    ]);
+    expect(q.map((m) => m.ownerHex)).toEqual(['11'.repeat(16), 'ff'.repeat(16)]);
+  });
+
+  it('is a total order: same owner + same raise time falls to device hex', () => {
+    // The roster is device-keyed, so one owner can hold two rows. The
+    // comparator must return 0/-1/1 consistently (sort contract), with the
+    // device leg making the order total and stable across clients.
+    const a = { ...member('aa'.repeat(16), 100), deviceHex: 'ff'.repeat(32) };
+    const b = { ...member('aa'.repeat(16), 100), deviceHex: '11'.repeat(32) };
+    expect(speakerQueue([a, b]).map((m) => m.deviceHex))
+      .toEqual(['11'.repeat(32), 'ff'.repeat(32)]);
+    expect(speakerQueue([b, a]).map((m) => m.deviceHex))
+      .toEqual(['11'.repeat(32), 'ff'.repeat(32)]);
+  });
+
+  it('returns empty for a roster with no raised hands', () => {
+    expect(speakerQueue([member('aa'.repeat(16), null)])).toEqual([]);
   });
 });
 

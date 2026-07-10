@@ -17908,7 +17908,47 @@ async fn set_voice_muted(
     .map_err(|_| "event loop not running".to_string())
 }
 
-/// ZEB-358: issue a voice-moderation directive (mute/unmute/kick/unkick) against
+/// ZEB-612 Town Hall: raise or lower this node's hand in an active voice or
+/// townhall channel. Mints the raise timestamp (wall-clock ms) at the IPC
+/// boundary; the event loop keeps the FIRST stamp across repeat raises so
+/// queue position is stable, and the presence heartbeat republishes it every
+/// ≤4 s (plus an immediate beacon on the flip). A no-op if the channel isn't
+/// joined. Modeled on `set_voice_muted`'s id-parsing + tx access.
+#[tauri::command]
+async fn set_voice_hand(
+    payload: voice::SetVoiceHandPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let community =
+        crate::owner_state_types::SpaceId(parse_voice_id_16("communityId", &payload.community_id)?);
+    let channel = crate::community_membership::ChannelId(parse_voice_id_16(
+        "channelId",
+        &payload.channel_id,
+    )?);
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let raised_at = payload.raised.then(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    });
+    tx.send(voice::VoiceChannelRequest::SetHand {
+        community_id: community,
+        channel_id: channel,
+        raised_at,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-358: issue a voice-moderation directive (mute/unmute/kick/unkick —
+/// plus ZEB-612's benign "invite" to speak) against
 /// `targetOwnerHex` in a community voice channel. Mints a fresh issue-time HLC so
 /// cross-moderator last-writer-wins orders by issue time, then hands off to the
 /// event loop, which re-verifies the moderator's power before broadcasting.
@@ -21166,22 +21206,23 @@ pub fn mint_channel_create_event(
 
 /// ZEB-349: parse the `create_channel` IPC `kind` param (`Option<String>`,
 /// camelCase boundary) into a `ChannelKind`. `None`/`"text"` → Text,
-/// `"voice"` → Voice, anything else → `Err` (mentions "kind" + the bad
-/// value). Factored out of `create_channel` so the boundary parse is
-/// unit-testable without `tauri::State`.
+/// `"voice"` → Voice, `"townhall"` → Townhall (ZEB-612), anything else →
+/// `Err` (mentions "kind" + the bad value). Factored out of `create_channel`
+/// so the boundary parse is unit-testable without `tauri::State`.
 fn parse_channel_kind(
     kind: Option<&str>,
 ) -> Result<crate::community_membership::ChannelKind, String> {
     match kind {
         None | Some("text") => Ok(crate::community_membership::ChannelKind::Text),
         Some("voice") => Ok(crate::community_membership::ChannelKind::Voice),
+        Some("townhall") => Ok(crate::community_membership::ChannelKind::Townhall),
         Some(other) => Err(format!("invalid channel kind: {other}")),
     }
 }
 
 /// ZEB-349: map a materialized `ChannelInfo` (+ its `ChannelId`) into the
 /// IPC `ChannelInfoDto`, stringifying `channel_id` to hex and `kind` to
-/// `"text"`/`"voice"`. Shared by `list_channels` and its unit test.
+/// `"text"`/`"voice"`/`"townhall"`. Shared by `list_channels` and its unit test.
 fn channel_info_dto(
     channel_id: &crate::community_membership::ChannelId,
     info: &crate::community_membership::ChannelInfo,
@@ -21193,6 +21234,7 @@ fn channel_info_dto(
         kind: match info.kind {
             crate::community_membership::ChannelKind::Text => "text".to_string(),
             crate::community_membership::ChannelKind::Voice => "voice".to_string(),
+            crate::community_membership::ChannelKind::Townhall => "townhall".to_string(),
         },
         created_at: info.created_at.clone(),
         deleted_at: info.deleted_at.clone(),
@@ -53306,6 +53348,7 @@ pub fn run() {
             join_voice_channel,
             leave_voice_channel,
             set_voice_muted,
+            set_voice_hand,
             moderate_voice,
             get_self_voice_identity,
             // ZEB-352 Voice V4: DM-call signaling + media IPCs.
@@ -55956,12 +55999,12 @@ mod create_channel_delta_tests {
     // ── ZEB-349 Task 4: create_channel `kind` IPC param + ChannelInfoDto.kind ──
 
     /// `create_channel`'s string→`ChannelKind` boundary parse:
-    /// `None`/`"text"` → Text, `"voice"` → Voice, anything else → Err
-    /// mentioning "kind". This is the load-bearing IPC-boundary slice;
-    /// the full `create_channel` command needs `tauri::State` + a running
-    /// node (covered end-to-end by the channel-config integration test),
-    /// so the parse is factored into `parse_channel_kind` and unit-tested
-    /// here.
+    /// `None`/`"text"` → Text, `"voice"` → Voice, `"townhall"` → Townhall
+    /// (ZEB-612), anything else → Err mentioning "kind". This is the
+    /// load-bearing IPC-boundary slice; the full `create_channel` command
+    /// needs `tauri::State` + a running node (covered end-to-end by the
+    /// channel-config integration test), so the parse is factored into
+    /// `parse_channel_kind` and unit-tested here.
     #[test]
     fn create_channel_parse_kind_maps_strings() {
         use crate::community_membership::ChannelKind;
@@ -55970,6 +56013,10 @@ mod create_channel_delta_tests {
         assert_eq!(
             parse_channel_kind(Some("voice")).unwrap(),
             ChannelKind::Voice
+        );
+        assert_eq!(
+            parse_channel_kind(Some("townhall")).unwrap(),
+            ChannelKind::Townhall
         );
     }
 
@@ -56016,8 +56063,8 @@ mod create_channel_delta_tests {
         }
     }
 
-    /// `ChannelInfoDto` carries a `kind: String` ("text"|"voice"), always
-    /// emitted, mapped from the materialized `ChannelInfo.kind`.
+    /// `ChannelInfoDto` carries a `kind: String` ("text"|"voice"|"townhall"),
+    /// always emitted, mapped from the materialized `ChannelInfo.kind`.
     #[test]
     fn channel_info_dto_maps_kind() {
         use crate::community_membership::{ChannelId, ChannelInfo, ChannelKind};
@@ -56039,13 +56086,22 @@ mod create_channel_delta_tests {
             name: "general".into(),
             write_power: 0,
             kind: ChannelKind::Text,
+            created_at: created_at.clone(),
+            deleted_at: None,
+        };
+        let townhall = ChannelInfo {
+            name: "assembly".into(),
+            write_power: 0,
+            kind: ChannelKind::Townhall,
             created_at,
             deleted_at: None,
         };
         let dto_voice = channel_info_dto(&ChannelId([0x42; 16]), &voice);
         let dto_text = channel_info_dto(&ChannelId([0x43; 16]), &text);
+        let dto_townhall = channel_info_dto(&ChannelId([0x44; 16]), &townhall);
         assert_eq!(dto_voice.kind, "voice");
         assert_eq!(dto_text.kind, "text");
+        assert_eq!(dto_townhall.kind, "townhall");
 
         // Always emitted (not skipped): the serialized JSON carries `kind`.
         let json = serde_json::to_value(&dto_text).expect("serialize dto");

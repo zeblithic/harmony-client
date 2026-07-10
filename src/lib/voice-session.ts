@@ -30,6 +30,30 @@ export interface RosterMember {
   avatarUrl?: string;   // resolved from member card (Task 5)
   modMuted: boolean;    // server-muted by a moderator (distinct from self-mute `muted`)
   power: number;        // moderation power level (for FE control gating)
+  /** ZEB-612: wall-clock ms of this member's raised hand; null = lowered. */
+  handRaisedAt: number | null;
+  /** ZEB-612: holds an unexpired invite-to-speak from a moderator. */
+  invited: boolean;
+}
+
+/**
+ * ZEB-612: the derived speaker queue — raised hands ordered by raise time
+ * (oldest first), owner-hex tiebreak, device-hex final tiebreak (the roster is
+ * device-keyed, so two rows CAN share an owner — the device leg makes the
+ * comparator total, satisfying the sort contract; Qodo PR #442). Deterministic
+ * on every client; no store, no sync protocol (spec §5). Exported for
+ * TownHallView (S5).
+ */
+export function speakerQueue(roster: RosterMember[]): RosterMember[] {
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  return roster
+    .filter((m) => m.handRaisedAt !== null)
+    .sort(
+      (a, b) =>
+        a.handRaisedAt! - b.handRaisedAt! ||
+        cmp(a.ownerHex, b.ownerHex) ||
+        cmp(a.deviceHex, b.deviceHex),
+    );
 }
 
 export interface VoiceSessionState {
@@ -66,6 +90,9 @@ export interface VoiceSessionState {
   selfPower: number;      // this node's moderation power in the active channel
   selfModMuted: boolean;  // this node is currently server-muted by a moderator
   selfKicked: boolean;    // this node is currently kicked from voice by a moderator
+  /** ZEB-612: this node holds an unexpired invite-to-speak (drives the
+   *  "You've been invited to speak — Unmute?" banner in TownHallView). */
+  selfInvited: boolean;
 }
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -86,7 +113,8 @@ function rostersEqual(a: RosterMember[], b: RosterMember[]): boolean {
       x.ownerHex !== y.ownerHex || x.deviceHex !== y.deviceHex ||
       x.muted !== y.muted || x.speaking !== y.speaking ||
       x.displayName !== y.displayName || x.avatarUrl !== y.avatarUrl ||
-      x.modMuted !== y.modMuted || x.power !== y.power
+      x.modMuted !== y.modMuted || x.power !== y.power ||
+      x.handRaisedAt !== y.handRaisedAt || x.invited !== y.invited
     ) {
       return false;
     }
@@ -126,7 +154,7 @@ const INITIAL: VoiceSessionState = {
   phase: 'idle', community: null, channel: null,
   muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
   channelFull: false, reconnecting: false, micBlocked: false,
-  selfPower: 0, selfModMuted: false, selfKicked: false,
+  selfPower: 0, selfModMuted: false, selfKicked: false, selfInvited: false,
 };
 
 /**
@@ -239,10 +267,13 @@ export class VoiceSession {
   }
 
   private lastSelfSpeaking = false;
-  private lastRoster: { ownerHex: string; deviceHex: string; muted: boolean }[] = [];
+  private lastRoster: {
+    ownerHex: string; deviceHex: string; muted: boolean; handRaisedAt: number | null;
+  }[] = [];
 
   private modMutedOwners = new Set<string>();
   private kickedOwners = new Set<string>();
+  private invitedOwners = new Set<string>();
   private powers: Record<string, number> = {};
   private selfModMuted = false;
   private selfKicked = false;
@@ -395,11 +426,35 @@ export class VoiceSession {
    * Issue a moderation directive against another participant (requires power).
    * Backend re-verifies the moderator's power before broadcasting.
    */
-  async moderate(targetOwnerHex: string, action: 'mute' | 'unmute' | 'kick' | 'unkick'): Promise<void> {
+  async moderate(
+    targetOwnerHex: string,
+    action: 'mute' | 'unmute' | 'kick' | 'unkick' | 'invite',
+  ): Promise<void> {
     if (!this.community || !this.channel) return;
     await this.deps.invoke('moderate_voice', {
       payload: { communityId: this.community, channelId: this.channel, targetOwnerHex, action },
     });
+  }
+
+  /**
+   * ZEB-612 Town Hall: raise/lower our hand. The backend keeps the FIRST
+   * raise's timestamp across repeat raises (stable queue position) and
+   * republishes it on every presence heartbeat. No-op unless connected.
+   */
+  async setHand(raised: boolean): Promise<void> {
+    if (!this.community || !this.channel) return;
+    await this.deps.invoke('set_voice_hand', {
+      payload: { communityId: this.community, channelId: this.channel, raised },
+    });
+  }
+
+  /**
+   * ZEB-612 Town Hall: invite `targetOwnerHex` to speak (benign directive,
+   * power-gated ≥50 backend-side; an unclaimed invite lapses in ~2 min).
+   * The TARGET's own client lowers its hand on accept/dismiss.
+   */
+  async inviteToSpeak(targetOwnerHex: string): Promise<void> {
+    await this.moderate(targetOwnerHex, 'invite');
   }
 
   /**
@@ -482,6 +537,7 @@ export class VoiceSession {
     this.community = null; this.channel = null;
     this.lastRoster = []; this.lastEmittedRoster = []; this.lastSelfSpeaking = false;
     this.modMutedOwners = new Set(); this.kickedOwners = new Set(); this.powers = {};
+    this.invitedOwners = new Set();
     this.selfModMuted = false; this.selfKicked = false;
     if (invokeLeave && community && channel) {
       await this.deps.invoke('leave_voice_channel', { communityId: community, channelId: channel }).catch(() => {});
@@ -491,10 +547,12 @@ export class VoiceSession {
   protected async subscribePresence(): Promise<void> {
     const un = await this.deps.listen('voice-presence-changed', (e) => {
       const p = e.payload as { community: string; channel: string;
-        roster: { owner: string; device: string; muted: boolean }[] };
+        roster: { owner: string; device: string; muted: boolean;
+          handRaisedAt?: number | null }[] };
       if (p.community !== this.community || p.channel !== this.channel) return;
       this.lastRoster = p.roster.map((r) => ({
         ownerHex: r.owner, deviceHex: r.device, muted: r.muted,
+        handRaisedAt: r.handRaisedAt ?? null,
       }));
       this.deps.onRosterOwners?.(this.lastRoster.map((r) => r.ownerHex));
       this.refreshRoster();
@@ -534,18 +592,24 @@ export class VoiceSession {
       const p = e.payload as {
         community: string; channel: string;
         mutedOwners: string[]; kickedOwners: string[];
+        invitedOwners?: string[];
         powers: Record<string, number>;
         selfPower: number; selfModMuted: boolean; selfKicked: boolean;
+        selfInvited?: boolean;
       };
       if (p.community !== this.community || p.channel !== this.channel) return;
       this.modMutedOwners = new Set(p.mutedOwners);
       this.kickedOwners = new Set(p.kickedOwners);
+      this.invitedOwners = new Set(p.invitedOwners ?? []);
       this.powers = p.powers ?? {};
       const wasSilenced = this.selfModMuted || this.selfKicked;
       this.selfModMuted = p.selfModMuted;
       this.selfKicked = p.selfKicked;
       const nowSilenced = this.selfModMuted || this.selfKicked;
-      this.patch({ selfPower: p.selfPower, selfModMuted: p.selfModMuted, selfKicked: p.selfKicked });
+      this.patch({
+        selfPower: p.selfPower, selfModMuted: p.selfModMuted, selfKicked: p.selfKicked,
+        selfInvited: p.selfInvited ?? false,
+      });
       // On ANY transition of the silenced state, force local self-mute. On a
       // LIFT (nowSilenced=false, wasSilenced=true) this keeps the mic muted —
       // the unattended-mic guard: a server-mute lapsing must NOT auto-resume
@@ -576,6 +640,8 @@ export class VoiceSession {
           ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking,
           modMuted: this.modMutedOwners.has(r.ownerHex),
           power: this.powers[r.ownerHex] ?? 0,
+          handRaisedAt: r.handRaisedAt,
+          invited: this.invitedOwners.has(r.ownerHex),
           ...(card?.displayName ? { displayName: card.displayName } : {}),
           ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
         } as RosterMember;

@@ -106,9 +106,10 @@ fn moderator_mute_then_observer_drops_target() {
     assert_eq!(receive(&mut am, &mm, &sealed, 1_000), Ok(true));
     assert!(am.is_muted(&C, &CH, &TARGET, 1_000));
     assert!(!am.is_kicked(&C, &CH, &TARGET, 1_000));
-    let (muted, kicked) = am.snapshot(&C, &CH, 1_000);
-    assert_eq!(muted, vec![TARGET]);
-    assert!(kicked.is_empty());
+    let snap = am.snapshot(&C, &CH, 1_000);
+    assert_eq!(snap.muted, vec![TARGET]);
+    assert!(snap.kicked.is_empty());
+    assert!(snap.invited.is_empty());
 }
 
 #[test]

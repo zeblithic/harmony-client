@@ -20,7 +20,8 @@
   } = $props();
 
   let name = $state('');
-  let kind = $state<'text' | 'voice'>('text'); // ZEB-349: Text|Voice channel kind
+  // ZEB-349 Text|Voice, ZEB-612 adds Town Hall.
+  let kind = $state<'text' | 'voice' | 'townhall'>('text');
   let writePower = $state(0); // v2 always 0; the slider+number pair below is hidden behind `// v3 unhide`
   let submitting = $state(false);
   let error = $state<string | null>(null);
@@ -102,6 +103,16 @@
           onclick={() => (kind = 'voice')}
         >
           <span aria-hidden="true">🔊</span> Voice
+        </button>
+        <button
+          type="button"
+          class="kind-option"
+          class:selected={kind === 'townhall'}
+          aria-pressed={kind === 'townhall'}
+          disabled={submitting}
+          onclick={() => (kind = 'townhall')}
+        >
+          <span aria-hidden="true">⚖</span> Town Hall
         </button>
       </div>
 

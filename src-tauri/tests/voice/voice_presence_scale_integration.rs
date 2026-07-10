@@ -306,6 +306,7 @@ async fn run_inner() {
             m.device,
             m.joined_hlc.clone(),
             mute_flag,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)), // hand: lowered (ZEB-612)
             self_kicked,
             seq_counter,
             Duration::from_secs(4),

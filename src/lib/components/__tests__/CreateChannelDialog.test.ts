@@ -104,6 +104,24 @@ describe('CreateChannelDialog', () => {
     });
   });
 
+  it('creates a townhall channel when Town Hall is selected (ZEB-612)', async () => {
+    const { getByPlaceholderText, getByRole, adapter } = await setupDialog();
+    (adapter.invoke as any).mockResolvedValue('ff'.repeat(16));
+    await fireEvent.click(getByRole('button', { name: /town hall/i }));
+    await fireEvent.input(getByPlaceholderText(/Channel name/i), {
+      target: { value: 'assembly' },
+    });
+    await fireEvent.click(getByRole('button', { name: /^Create/i }));
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('create_channel', {
+        communityId: 'aa'.repeat(16),
+        name: 'assembly',
+        writePower: 0,
+        kind: 'townhall',
+      });
+    });
+  });
+
   it('defaults to a text channel', async () => {
     const { getByPlaceholderText, getByRole, adapter } = await setupDialog();
     (adapter.invoke as any).mockResolvedValue('ee'.repeat(16));

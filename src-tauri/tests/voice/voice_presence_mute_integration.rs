@@ -59,7 +59,8 @@ fn build_heartbeat_beacon_reflects_atomic_across_flip() {
     let device = [0x22; 32];
     let flag = Arc::new(AtomicBool::new(true));
 
-    let muted_beacon = build_heartbeat_beacon(owner, device, &hlc, 0, flag.load(Ordering::SeqCst));
+    let muted_beacon =
+        build_heartbeat_beacon(owner, device, &hlc, 0, flag.load(Ordering::SeqCst), None);
     assert!(
         muted_beacon.muted,
         "flag=true ⇒ beacon muted (start-muted join state)"
@@ -67,7 +68,7 @@ fn build_heartbeat_beacon_reflects_atomic_across_flip() {
 
     flag.store(false, Ordering::SeqCst);
     let unmuted_beacon =
-        build_heartbeat_beacon(owner, device, &hlc, 1, flag.load(Ordering::SeqCst));
+        build_heartbeat_beacon(owner, device, &hlc, 1, flag.load(Ordering::SeqCst), None);
     assert!(
         !unmuted_beacon.muted,
         "after the flag flips, the next heartbeat tracks muted=false"
@@ -145,6 +146,7 @@ async fn run_inner() {
         device_a,
         joined_hlc.clone(),
         Arc::clone(&mute_flag),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)), // hand: lowered (ZEB-612)
         Arc::clone(&self_kicked),
         Arc::clone(&seq_counter),
         Duration::from_millis(200),
