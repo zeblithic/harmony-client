@@ -128,6 +128,63 @@ describe('TownHallMotionCard (ZEB-612 S5)', () => {
     });
   });
 
+  it('a newer poll on this channel supersedes the current live motion (no stale latch)', async () => {
+    // Adopt poll A at mount, then fire pollCreated for a different poll B —
+    // the card must switch to B (CodeRabbit #443 round 1: a closed motion
+    // must not block the next one).
+    const metaA = pollMeta('11'.repeat(32));
+    const metaB = pollMeta('33'.repeat(32), { created_at: { w: 2000, l: 0, d: 'd1' } });
+    let pollCreatedHandler: ((p: { pollId: string; channelId: string }) => void) | undefined;
+    const adapter = makeAdapter({
+      listActivePolls: vi.fn(async () => [metaA]),
+      subscribePollCreated: vi.fn((h: (p: { pollId: string; channelId: string }) => void) => {
+        pollCreatedHandler = h;
+        return () => {};
+      }),
+      // The card passes the hex string; the embedded PollMessage passes the
+      // byte-array poll_id — normalize both to hex before dispatching.
+      getPoll: vi.fn(async (pollId: string | number[]) => {
+        const hex = Array.isArray(pollId)
+          ? pollId.map((b) => b.toString(16).padStart(2, '0')).join('')
+          : pollId;
+        return hex === '33'.repeat(32)
+          ? {
+              meta: metaB,
+              tally: { counts: [0, 0], ballot_count: 0 },
+              options: ['Aye — Fund the library', 'Nay — Fund the library'],
+            }
+          : {
+              meta: metaA,
+              tally: { counts: [0, 0], ballot_count: 0 },
+              options: ['Aye — Adopt the charter', 'Nay — Adopt the charter'],
+            };
+      }),
+    });
+    render(TownHallMotionCard, { props: { ...base, adapter: adapter as never } });
+    await waitFor(() => {
+      expect(screen.getByText('Aye — Adopt the charter')).toBeInTheDocument();
+    });
+    pollCreatedHandler!({ pollId: '33'.repeat(32), channelId: CHID });
+    await waitFor(() => {
+      expect(screen.getByText('Aye — Fund the library')).toBeInTheDocument();
+    });
+  });
+
+  it('DRAFT async action is gated on canAct (no backend call after the session drops)', async () => {
+    const adapter = makeAdapter();
+    const { rerender } = render(TownHallMotionCard, {
+      props: { ...base, presentCount: 1, quorum: 3, adapter: adapter as never },
+    });
+    await fireEvent.input(screen.getByLabelText('Motion title'), {
+      target: { value: 'Adopt the charter' },
+    });
+    await fireEvent.click(screen.getByTestId('motion-call'));
+    // Session drops after entering DRAFT: the async action must be disabled.
+    await rerender({ ...base, presentCount: 1, quorum: 3, adapter: adapter as never, canAct: false });
+    expect(screen.getByTestId('motion-open-async')).toBeDisabled();
+    expect(adapter.createTier2Proposal).not.toHaveBeenCalled();
+  });
+
   it('surfaces a create failure in-card as an alert', async () => {
     const adapter = makeAdapter({
       createTier1Poll: vi.fn(async () => {

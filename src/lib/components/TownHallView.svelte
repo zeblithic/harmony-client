@@ -127,28 +127,54 @@
       myHandRaised = !next;
     });
   }
-  function lowerHand() {
-    myHandRaised = false;
-    swallow(session.setHand(false));
-  }
   // Leaving the room lowers the local toggle (the beacon dies with the session).
   $effect(() => {
     if ($voiceState.phase === 'idle') myHandRaised = false;
   });
 
-  // ── Invited banner (state; markup lands with the rail) ──────────────────
+  // ── Invited banner state ─────────────────────────────────────────────────
+  // Accept/dismiss only mark the invite handled AFTER the awaited IPCs
+  // succeed — a swallowed failure must not hide the banner while the backend
+  // hand/mute state is unchanged (Qodo #443 round 1). While mod-silenced the
+  // Unmute button is disabled instead (setMuted(false) is a defensive no-op
+  // there, which would otherwise hide the banner with the user still muted).
   let inviteHandled = $state(false);
+  let inviteBusy = $state(false);
+  let inviteError = $state<string | null>(null);
   $effect(() => {
-    if (!$voiceState.selfInvited) inviteHandled = false;
+    if (!$voiceState.selfInvited) {
+      inviteHandled = false;
+      inviteError = null;
+    }
   });
-  function acceptInvite() {
-    swallow(session.setMuted(false));
-    lowerHand();
-    inviteHandled = true;
+  async function acceptInvite() {
+    if (inviteBusy) return;
+    inviteBusy = true;
+    inviteError = null;
+    try {
+      await session.setMuted(false);
+      await session.setHand(false);
+      myHandRaised = false;
+      inviteHandled = true;
+    } catch (e) {
+      inviteError = e instanceof Error ? e.message : String(e);
+    } finally {
+      inviteBusy = false;
+    }
   }
-  function dismissInvite() {
-    lowerHand();
-    inviteHandled = true;
+  async function dismissInvite() {
+    if (inviteBusy) return;
+    inviteBusy = true;
+    inviteError = null;
+    try {
+      await session.setHand(false);
+      myHandRaised = false;
+      inviteHandled = true;
+    } catch (e) {
+      inviteError = e instanceof Error ? e.message : String(e);
+    } finally {
+      inviteBusy = false;
+    }
   }
 
   // ── Presence & queue ─────────────────────────────────────────────────────
@@ -451,8 +477,24 @@
     {#if $voiceState.selfInvited && !inviteHandled}
       <div class="th-invited-banner" role="status" data-testid="th-invited-banner">
         <span>You've been invited to speak — Unmute?</span>
-        <button type="button" class="btn-primary" data-testid="th-invite-accept" onclick={acceptInvite}>Unmute</button>
-        <button type="button" class="ctrl" data-testid="th-invite-dismiss" onclick={dismissInvite}>Dismiss</button>
+        <button
+          type="button"
+          class="btn-primary"
+          data-testid="th-invite-accept"
+          disabled={inviteBusy || silenced}
+          title={silenced ? 'Muted by a moderator' : ''}
+          onclick={acceptInvite}
+        >Unmute</button>
+        <button
+          type="button"
+          class="ctrl"
+          data-testid="th-invite-dismiss"
+          disabled={inviteBusy}
+          onclick={dismissInvite}
+        >Dismiss</button>
+        {#if inviteError}
+          <span class="th-invite-error" role="alert">{inviteError}</span>
+        {/if}
       </div>
     {/if}
     {#if $voiceState.selfModMuted}
@@ -994,5 +1036,10 @@
     border-radius: 8px;
     margin: 0 16px 8px;
     font-size: 0.85rem;
+    flex-wrap: wrap;
+  }
+  .th-invite-error {
+    color: var(--danger);
+    font-size: 0.8rem;
   }
 </style>

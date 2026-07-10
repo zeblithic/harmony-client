@@ -232,6 +232,26 @@ describe('TownHallView (ZEB-612 S5): invited banner', () => {
       expect(screen.queryByTestId('th-invited-banner')).not.toBeInTheDocument();
     });
   });
+
+  it('Unmute is disabled while mod-silenced (accept would be a silent no-op)', async () => {
+    await setup({
+      phase: 'connected',
+      selfInvited: true,
+      selfModMuted: true,
+      roster: [member(1)],
+    });
+    expect(screen.getByTestId('th-invite-accept')).toBeDisabled();
+    expect(screen.getByTestId('th-invite-dismiss')).toBeEnabled();
+  });
+
+  it('a failed lower-hand IPC keeps the banner up and surfaces the error', async () => {
+    const { session } = await setup({ phase: 'connected', selfInvited: true, roster: [member(1)] });
+    (session.setHand as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('engine gone'));
+    await fireEvent.click(screen.getByTestId('th-invite-dismiss'));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/engine gone/);
+    expect(screen.getByTestId('th-invited-banner')).toBeInTheDocument();
+  });
 });
 
 describe('TownHallView (ZEB-612 S5): rail — motion card + backchannel', () => {

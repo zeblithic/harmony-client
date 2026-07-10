@@ -94,11 +94,17 @@
     })();
     const unsub = a.subscribePollCreated((p) => {
       if (cancelled || p.channelId !== chid) return;
+      // A NEWER motion on this channel supersedes whatever the card shows —
+      // without this, a closed motion latches the card and later motions are
+      // never adopted (CodeRabbit #443 round 1). Only the identical poll is
+      // a no-op (our own create already adopted it).
+      const cur = untrack(() => phase);
+      if (cur.kind === 'live' && bytesToHex(cur.meta.poll_id) === p.pollId) return;
       void (async () => {
         try {
           const st = await a.getPoll(p.pollId);
           if (cancelled) return;
-          if (untrack(() => phase).kind !== 'live') phase = { kind: 'live', meta: st.meta };
+          phase = { kind: 'live', meta: st.meta };
         } catch {
           // Poll vanished between event and fetch: ignore.
         }
@@ -142,7 +148,9 @@
   }
 
   async function openAsyncProposal() {
-    if (phase.kind !== 'draft' || busy || !adapter) return;
+    // canAct re-checked here too: the user can enter DRAFT while connected
+    // and act after the session drops (Qodo #443 round 1).
+    if (phase.kind !== 'draft' || busy || !adapter || !canAct) return;
     const t = phase.title;
     busy = true;
     error = null;
@@ -194,7 +202,7 @@
           type="button"
           class="motion-btn primary"
           data-testid="motion-open-async"
-          disabled={busy}
+          disabled={busy || !canAct}
           onclick={openAsyncProposal}
         >Open as async proposal</button>
         <button

@@ -155,6 +155,18 @@
     new Set<string>(navService.nodes.filter((n) => n.type === 'community').map((n) => n.id)),
   );
 
+  // ZEB-612 S5 (CodeRabbit #443): memoized mention-candidate list shared by
+  // the text feed and the townhall backchannel — recomputes only when the
+  // member roster (or a resolver) changes, not on every re-render.
+  let joinedMentionCandidates = $derived(
+    members
+      .filter((m) => m.status === 'joined')
+      .map((m) => ({
+        ownerId: m.address,
+        label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
+      })),
+  );
+
   // ZEB-285 Task 11: pre-fork snapshot for unified timeline rendering.
   // Loaded once per community view. null = non-fork community; undefined = not yet loaded.
   let preForkSnapshot = $state<PreForkSnapshotDto | null | undefined>(undefined);
@@ -457,12 +469,7 @@
             originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
             forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
             forkReason={preForkSnapshot?.forkReason ?? null}
-            mentionCandidates={members
-              .filter((m) => m.status === 'joined')
-              .map((m) => ({
-                ownerId: m.address,
-                label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
-              }))}
+            mentionCandidates={joinedMentionCandidates}
             onOpenProposals={() => { activeView = 'proposals'; }}
           />
         {/if}
@@ -492,12 +499,7 @@
           {resolveCard}
           {resolveNickname}
           {onOpenCard}
-          mentionCandidates={members
-            .filter((m) => m.status === 'joined')
-            .map((m) => ({
-              ownerId: m.address,
-              label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
-            }))}
+          mentionCandidates={joinedMentionCandidates}
         />
       {/if}
     {:else}
