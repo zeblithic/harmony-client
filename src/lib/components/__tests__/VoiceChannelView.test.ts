@@ -311,3 +311,34 @@ describe('VoiceChannelView (ZEB-612 slice 1): Commons restyle — banners + join
     ).toBeInTheDocument();
   });
 });
+
+describe('VoiceChannelView (ZEB-612 slice 1): Commons restyle — roster', () => {
+  const modMutedRoster = [{
+    ownerHex: 'b'.repeat(32), deviceHex: 'b'.repeat(64),
+    muted: false, speaking: false, modMuted: true, power: 0,
+  }];
+
+  it('mod-muted tile shows the "mod-muted" sub-label', () => {
+    const session = fakeSession({ phase: 'connected', roster: modMutedRoster });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('mod-sub')).toHaveTextContent('mod-muted');
+  });
+
+  it('mod-muted list row also shows the sub-label past the grid cap', () => {
+    const big = [...roster(13)];
+    big[3] = { ...big[3], modMuted: true };
+    const session = fakeSession({ phase: 'connected', roster: big });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('voice-list')).toBeInTheDocument();
+    expect(screen.getByTestId('mod-sub')).toHaveTextContent('mod-muted');
+  });
+
+  it('mod controls remain clickable under the hover-reveal treatment', async () => {
+    // Reveal is CSS-only (opacity); handlers must be unaffected in jsdom.
+    const session = fakeSession({ phase: 'connected', selfPower: 60,
+      roster: [{ ownerHex: 'b'.repeat(32), deviceHex: 'b'.repeat(64), muted: false, speaking: false, modMuted: false, power: 0 }] });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    await fireEvent.click(screen.getByTestId('mod-mute'));
+    expect(session.moderate).toHaveBeenCalledWith('b'.repeat(32), 'mute');
+  });
+});

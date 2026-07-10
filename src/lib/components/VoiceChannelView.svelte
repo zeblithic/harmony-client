@@ -172,7 +172,8 @@
               <span class="name">{label(m)}</span>
               {#if m.muted && !m.modMuted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
               {#if m.modMuted}
-                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡️🔇</span>
+                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡</span>
+                <span class="mod-sub" data-testid="mod-sub">mod-muted</span>
               {/if}
               {#if canModerate(m)}
                 <div class="mod-controls">
@@ -204,7 +205,8 @@
               <span class="name">{label(m)}</span>
               {#if m.muted && !m.modMuted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
               {#if m.modMuted}
-                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡️🔇</span>
+                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡</span>
+                <span class="mod-sub" data-testid="mod-sub">mod-muted</span>
               {/if}
               {#if canModerate(m)}
                 <div class="mod-controls">
@@ -452,17 +454,27 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Speaking ring: accent-colored outline + glow. */
+  /* Speaking ring per TH frame A/B: double ring — paper gap then accent. */
   .voice-tile.speaking {
-    outline: 2px solid var(--accent);
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 30%, transparent);
+    box-shadow:
+      0 0 0 2.5px var(--bg-primary),
+      0 0 0 5px var(--accent);
   }
+  /* Muted member: badge chip on the avatar, name goes muted. */
   .voice-tile .mute-glyph {
     position: absolute;
     top: 6px;
     right: 6px;
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     line-height: 1;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 4px;
+  }
+  .voice-tile:has(.mute-glyph) .name,
+  .voice-list-row:has(.mute-glyph) .name {
+    color: var(--text-muted);
   }
 
   /* ---- Compact list (>12) ---- */
@@ -575,12 +587,41 @@
     filter: brightness(1.1);
   }
 
-  .mod-controls { display: flex; gap: 4px; margin-top: 4px; }
+  .mod-controls {
+    display: flex;
+    gap: 4px;
+    margin-top: 4px;
+    /* Frame B: "Hover a tile to Mute / Remove (mods)" — reveal on hover or
+       keyboard focus. Opacity keeps the buttons clickable and focusable. */
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+  .voice-tile:hover .mod-controls,
+  .voice-tile:focus-within .mod-controls,
+  .voice-list-row:hover .mod-controls,
+  .voice-list-row:focus-within .mod-controls {
+    opacity: 1;
+  }
   .mod-btn { border: 1px solid var(--border); background: var(--bg-tertiary); color: var(--text-secondary);
     font-size: 0.7rem; padding: 2px 6px; border-radius: 3px; cursor: pointer; }
   .mod-btn:hover { color: var(--text-primary); }
   .mod-btn.danger { color: var(--danger); border-color: var(--danger); }
-  .mod-badge { position: absolute; top: 6px; left: 6px; font-size: 0.7rem; line-height: 1; }
+  .mod-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    font-size: 0.7rem;
+    line-height: 1;
+    background: var(--status-recalled-bg);
+    border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+    border-radius: 999px;
+    padding: 2px 4px;
+  }
+  .mod-sub {
+    font-size: 0.7rem;
+    color: var(--danger);
+    line-height: 1;
+  }
   .voice-mod-note {
     background: var(--status-recalled-bg);
     border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
