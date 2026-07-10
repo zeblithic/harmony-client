@@ -130,7 +130,7 @@
   {#if $voiceState.channelFull}
     <!-- Soft-cap bounce (ZEB-353): the join was reactively refused because the
          channel was full. Session is back at idle; this explains why. -->
-    <div class="voice-error" role="alert">Voice channel full — try again later.</div>
+    <div class="voice-full-note" role="alert">Voice channel full — try again later.</div>
   {:else if error}
     <div class="voice-error" role="alert">{error}</div>
   {/if}
@@ -147,6 +147,8 @@
 
   {#if $voiceState.phase === 'idle'}
     <div class="voice-join-pane">
+      <span class="join-glyph" data-testid="join-glyph" aria-hidden="true">🔊</span>
+      <span class="join-name">{channelName}</span>
       <button class="btn-primary" onclick={onJoin} disabled={joining}>
         {joining ? 'Joining…' : 'Join Voice'}
       </button>
@@ -170,7 +172,8 @@
               <span class="name">{label(m)}</span>
               {#if m.muted && !m.modMuted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
               {#if m.modMuted}
-                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡️🔇</span>
+                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡</span>
+                <span class="mod-sub" data-testid="mod-sub">mod-muted</span>
               {/if}
               {#if canModerate(m)}
                 <div class="mod-controls">
@@ -202,7 +205,8 @@
               <span class="name">{label(m)}</span>
               {#if m.muted && !m.modMuted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
               {#if m.modMuted}
-                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡️🔇</span>
+                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡</span>
+                <span class="mod-sub" data-testid="mod-sub">mod-muted</span>
               {/if}
               {#if canModerate(m)}
                 <div class="mod-controls">
@@ -227,7 +231,7 @@
 
     {#if $voiceState.selfModMuted}
       <div class="voice-mod-note" role="status" data-testid="self-mod-muted">
-        🛡️ You've been muted by a moderator.
+        🛡 You've been muted by a moderator. Your talk controls are disabled until they unmute you.
       </div>
     {/if}
     {#if $voiceState.selfKicked}
@@ -257,9 +261,10 @@
           onpointerleave={pttUp}
           onpointercancel={pttUp}
           aria-label="Hold to talk (or hold Space)"
+          title="Release to go quiet. Replaces the mute toggle while PTT mode is on."
           disabled={silenced}
         >
-          {$voiceState.pttHeld ? '🎙 Talking…' : '🎙 Hold to Talk'}
+          {$voiceState.pttHeld ? '🎙 Transmitting… (hold Space)' : '🎙 Hold to Talk'}
         </button>
       {:else}
         <button
@@ -292,7 +297,7 @@
         onclick={toggleDeafen}
         aria-label="Deafen"
       >
-        {$voiceState.deafened ? '🔕 Deafened' : '🔈 Deafen'}
+        {$voiceState.deafened ? '🔕 Deafened' : '🎧 Deafen'}
       </button>
       <button class="btn-danger" onclick={onLeave} aria-label="Leave voice">Leave</button>
     </div>
@@ -326,7 +331,8 @@
     white-space: nowrap;
   }
   .voice-count {
-    font-size: 0.85rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
     color: var(--text-secondary);
     white-space: nowrap;
   }
@@ -335,8 +341,20 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--danger);
     color: var(--danger);
-    padding: 8px 14px;
-    border-radius: 4px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin: 8px 16px;
+    font-size: 0.85rem;
+  }
+
+  /* Soft-cap bounce: a chosen-limit refusal, not a failure — gov-clay soft
+     surface per TH frame C, distinct from the danger .voice-error. */
+  .voice-full-note {
+    background: var(--gov-clay-soft);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 45%, transparent);
+    color: var(--gov-clay-deep);
+    padding: 8px 12px;
+    border-radius: 8px;
     margin: 8px 16px;
     font-size: 0.85rem;
   }
@@ -348,8 +366,8 @@
     background: color-mix(in srgb, var(--warning) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
     color: var(--warning);
-    padding: 8px 14px;
-    border-radius: 4px;
+    padding: 8px 12px;
+    border-radius: 8px;
     margin: 8px 16px;
     font-size: 0.85rem;
   }
@@ -360,13 +378,23 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 0.75rem;
+    gap: 8px;
     color: var(--text-secondary);
+  }
+  .join-glyph {
+    font-size: 2rem;
+    line-height: 1;
+  }
+  .join-name {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 4px;
   }
   .btn-primary {
     border: none;
     padding: 8px 22px;
-    border-radius: 4px;
+    border-radius: 5px;
     background: var(--accent);
     color: var(--on-accent);
     font-size: 0.9rem;
@@ -427,17 +455,27 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Speaking ring: accent-colored outline + glow. */
+  /* Speaking ring per TH frame A/B: double ring — paper gap then accent. */
   .voice-tile.speaking {
-    outline: 2px solid var(--accent);
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 30%, transparent);
+    box-shadow:
+      0 0 0 2.5px var(--bg-primary),
+      0 0 0 5px var(--accent);
   }
+  /* Muted member: badge chip on the avatar, name goes muted. */
   .voice-tile .mute-glyph {
     position: absolute;
     top: 6px;
     right: 6px;
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     line-height: 1;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 4px;
+  }
+  .voice-tile:has(.mute-glyph) .name,
+  .voice-list-row:has(.mute-glyph) .name {
+    color: var(--text-muted);
   }
 
   /* ---- Compact list (>12) ---- */
@@ -501,7 +539,7 @@
     background: var(--bg-secondary);
     color: var(--text-secondary);
     padding: 6px 14px;
-    border-radius: 4px;
+    border-radius: 5px;
     font-size: 0.85rem;
     cursor: pointer;
   }
@@ -531,18 +569,23 @@
     white-space: nowrap;
   }
   /* Hold-to-talk: suppress touch scroll/selection so a press-hold-release
-     gesture stays a clean PTT hold on touch devices. */
+     gesture stays a clean PTT hold on touch devices. Frame C: the held state
+     is a full-width accent control with a soft glow ring. */
   .ptt-hold {
     touch-action: none;
     user-select: none;
+    flex: 1;
+  }
+  .ptt-hold.active {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
   }
   .btn-danger {
     margin-left: auto;
     border: none;
     background: var(--danger);
-    color: var(--text-primary);
+    color: var(--on-accent);
     padding: 6px 16px;
-    border-radius: 4px;
+    border-radius: 5px;
     font-size: 0.85rem;
     cursor: pointer;
   }
@@ -550,13 +593,51 @@
     filter: brightness(1.1);
   }
 
-  .mod-controls { display: flex; gap: 4px; margin-top: 4px; }
+  .mod-controls {
+    display: flex;
+    gap: 4px;
+    margin-top: 4px;
+    /* Frame B: "Hover a tile to Mute / Remove (mods)" — reveal on hover or
+       keyboard focus. pointer-events blocks stray clicks while hidden; the
+       buttons stay keyboard-focusable, and :focus-within re-enables them. */
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+  }
+  .voice-tile:hover .mod-controls,
+  .voice-tile:focus-within .mod-controls,
+  .voice-list-row:hover .mod-controls,
+  .voice-list-row:focus-within .mod-controls {
+    opacity: 1;
+    pointer-events: auto;
+  }
   .mod-btn { border: 1px solid var(--border); background: var(--bg-tertiary); color: var(--text-secondary);
     font-size: 0.7rem; padding: 2px 6px; border-radius: 3px; cursor: pointer; }
   .mod-btn:hover { color: var(--text-primary); }
   .mod-btn.danger { color: var(--danger); border-color: var(--danger); }
-  .mod-badge { position: absolute; top: 6px; left: 6px; font-size: 0.7rem; line-height: 1; }
-  .voice-mod-note { background: color-mix(in srgb, var(--warning) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
-    color: var(--warning); padding: 6px 14px; border-radius: 4px; margin: 0 16px 8px; font-size: 0.85rem; }
+  .mod-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    font-size: 0.7rem;
+    line-height: 1;
+    background: var(--status-recalled-bg);
+    border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+    border-radius: 999px;
+    padding: 2px 4px;
+  }
+  .mod-sub {
+    font-size: 0.7rem;
+    color: var(--danger);
+    line-height: 1;
+  }
+  .voice-mod-note {
+    background: var(--status-recalled-bg);
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin: 0 16px 8px;
+    font-size: 0.85rem;
+  }
 </style>
