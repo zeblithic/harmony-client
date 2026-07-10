@@ -480,7 +480,7 @@ async fn emit_moderation_changed(
     self_owner: crate::owner_state_types::OwnerAddr,
     now_ms: u64,
 ) {
-    let (muted, kicked) = {
+    let (muted, kicked, invited) = {
         let g = moderation_map.lock().await;
         g.snapshot(&community, &channel, now_ms)
     };
@@ -523,10 +523,14 @@ async fn emit_moderation_changed(
             "channel": hex::encode(channel.0),
             "mutedOwners": muted.iter().map(hex::encode).collect::<Vec<_>>(),
             "kickedOwners": kicked.iter().map(hex::encode).collect::<Vec<_>>(),
+            // ZEB-612: owners holding an unexpired invite-to-speak, plus
+            // whether WE are invited (drives the "Unmute?" banner).
+            "invitedOwners": invited.iter().map(hex::encode).collect::<Vec<_>>(),
             "powers": powers,
             "selfPower": power_of(&self_owner.0),
             "selfModMuted": muted.contains(&self_owner.0),
             "selfKicked": kicked.contains(&self_owner.0),
+            "selfInvited": invited.contains(&self_owner.0),
         }),
     );
 }
@@ -3353,14 +3357,16 @@ pub async fn run(
     // case). Updated after every apply (control sub + Moderate) and every sweep.
     let voice_moderation_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Directives THIS node issued and is re-asserting until `stop_after_ms`.
-    // Key: (community, channel, target_owner, is_mute_class). Main-loop owned.
+    // Key: (community, channel, target_owner, class). Main-loop owned. The
+    // ModClass key keeps one live directive per enforcement class (ZEB-612:
+    // mute / kick / invite) so an invite never displaces a kick re-assert.
     #[allow(clippy::type_complexity)]
     let mut voice_issuer_directives: std::collections::HashMap<
         (
             crate::owner_state_types::SpaceId,
             crate::community_membership::ChannelId,
             [u8; 16],
-            bool,
+            crate::voice_moderation::ModClass,
         ),
         (crate::voice_moderation::SignedVoiceModerationDirective, u64),
     > = std::collections::HashMap::new();
@@ -5053,6 +5059,53 @@ pub async fn run(
                             }
                         }
                     }
+                    crate::voice::VoiceChannelRequest::SetHand { community_id, channel_id, raised_at } => {
+                        // ZEB-612 Town Hall: update the shared hand cell the
+                        // presence publisher reads each heartbeat. A no-op if
+                        // the channel isn't joined (cell absent). The cell
+                        // keeps the FIRST raise's stamp across repeat raises
+                        // (stable queue position); lower always resets.
+                        if let Some(flag) = voice_hand_flags.get(&(community_id, channel_id)) {
+                            let hand =
+                                crate::voice_presence::update_hand_cell(flag, raised_at);
+                            // Immediate beacon so the queue reflects the hand
+                            // without waiting out the next ≤4 s heartbeat
+                            // (mirrors the SetMuted arm; carries the CURRENT
+                            // mute state — the beacon is whole-state).
+                            if let (Some(key), Some((owner, device, joined_hlc, signing_key)), Some(seq_counter), Some(mute_flag)) = (
+                                voice_keys.get(&(community_id, channel_id)),
+                                voice_identity.get(&(community_id, channel_id)),
+                                voice_presence_seq.get(&(community_id, channel_id)),
+                                voice_mute_flags.get(&(community_id, channel_id)),
+                            ) {
+                                let pres_topic = format!(
+                                    "harmony/voice-presence/{}/{}",
+                                    hex::encode(community_id.0),
+                                    hex::encode(channel_id.0),
+                                );
+                                let seq = seq_counter
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if let Err(e) = crate::voice_presence::publish_presence_once(
+                                    &session,
+                                    &pres_topic,
+                                    key,
+                                    &community_id,
+                                    &channel_id,
+                                    signing_key,
+                                    *owner,
+                                    *device,
+                                    joined_hlc,
+                                    seq,
+                                    mute_flag.load(std::sync::atomic::Ordering::SeqCst),
+                                    hand,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(%pres_topic, err = ?e, "immediate hand beacon publish failed");
+                                }
+                            }
+                        }
+                    }
                     // ── ZEB-352: DM call lifecycle ────────────────────────
                     crate::voice::VoiceChannelRequest::JoinDmCall { call_id, caps } => {
                         let sub_key = format!("harmony/voice/dm/{}/*", hex::encode(call_id));
@@ -5291,15 +5344,21 @@ pub async fn run(
                                                 tracing::warn!(%control_topic, err = %e, "moderation directive publish failed");
                                             }
                                             let now = (voice_now_ms)();
+                                        // ZEB-612: an invite's default window is
+                                        // INVITE_TTL_MS (~2 min), not the 5 min
+                                        // punitive default.
                                         let stop_after = now
-                                            + duration_ms.unwrap_or(
-                                                crate::voice_moderation::DEFAULT_MODERATION_MS,
-                                            );
+                                            + duration_ms.unwrap_or(match action {
+                                                crate::voice_moderation::ModAction::InviteToSpeak => {
+                                                    crate::voice_moderation::INVITE_TTL_MS
+                                                }
+                                                _ => crate::voice_moderation::DEFAULT_MODERATION_MS,
+                                            });
                                         let idkey = (
                                             community_id,
                                             channel_id,
                                             target_owner.0,
-                                            action.is_mute_class(),
+                                            action.class(),
                                         );
                                         if action.enforces() {
                                             voice_issuer_directives

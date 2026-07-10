@@ -68,6 +68,17 @@ pub enum VoiceChannelRequest {
         channel_id: ChannelId,
         muted: bool,
     },
+    /// ZEB-612 Town Hall: raise/lower our hand. `raised_at` is the wall-clock
+    /// ms minted at the IPC boundary for `Some` (raise); `None` lowers. The
+    /// event loop keeps the ORIGINAL stamp across repeat raises (stable queue
+    /// position — see `voice_presence::update_hand_cell`) and fires an
+    /// immediate beacon so the queue updates without waiting out the ≤4 s
+    /// heartbeat.
+    SetHand {
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        raised_at: Option<u64>,
+    },
     /// ZEB-352: join a 1:1 DM voice call. No presence — 2-party implicit.
     JoinDmCall {
         call_id: [u8; 16],
@@ -148,6 +159,16 @@ pub struct SetVoiceMutedPayload {
     pub muted: bool,
 }
 
+/// ZEB-612: payload for the `set_voice_hand` Tauri command. Raises/lowers the
+/// presence beacon's hand field for an active voice/townhall channel.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetVoiceHandPayload {
+    pub community_id: String,
+    pub channel_id: String,
+    pub raised: bool,
+}
+
 /// ZEB-352: payload for the `send_dm_voice_frame` Tauri command.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,7 +209,7 @@ pub struct ModerateVoicePayload {
     pub community_id: String,
     pub channel_id: String,
     pub target_owner_hex: String,
-    pub action: String, // "mute" | "unmute" | "kick" | "unkick"
+    pub action: String, // "mute" | "unmute" | "kick" | "unkick" | "invite"
     pub duration_ms: Option<u64>,
 }
 
@@ -201,6 +222,7 @@ impl ModerateVoicePayload {
             "unmute" => Ok(Unmute),
             "kick" => Ok(Kick),
             "unkick" => Ok(Unkick),
+            "invite" => Ok(InviteToSpeak), // ZEB-612 Town Hall
             other => Err(format!("unknown moderation action: {other}")),
         }
     }
@@ -249,7 +271,21 @@ mod tests {
             ModerateVoicePayload::parse_action("kick").unwrap(),
             crate::voice_moderation::ModAction::Kick
         );
+        assert_eq!(
+            ModerateVoicePayload::parse_action("invite").unwrap(),
+            crate::voice_moderation::ModAction::InviteToSpeak
+        );
         assert!(ModerateVoicePayload::parse_action("bogus").is_err());
+    }
+
+    /// ZEB-612: the `set_voice_hand` payload deserializes from camelCase.
+    #[test]
+    fn set_voice_hand_payload_parses_camel_case() {
+        let json = r#"{"communityId":"aa","channelId":"bb","raised":true}"#;
+        let p: super::SetVoiceHandPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(p.community_id, "aa");
+        assert_eq!(p.channel_id, "bb");
+        assert!(p.raised);
     }
 }
 

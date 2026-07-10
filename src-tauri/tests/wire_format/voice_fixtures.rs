@@ -374,6 +374,51 @@ fn voice_moderation_directive_canonical_cbor_is_pinned() {
     );
 }
 
+/// ZEB-612: pin the canonical CBOR of an unsigned InviteToSpeak directive.
+/// Differs from the Mute pin above by exactly the `ac` value byte: `626163 00`
+/// becomes `626163 04` (discriminant 4).
+#[test]
+fn voice_moderation_invite_directive_canonical_cbor_is_pinned() {
+    let mut d = fixture_directive();
+    d.action = ModAction::InviteToSpeak;
+    let bytes = canonical_cbor_encode(&d).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "a662616f50a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16261645820d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d262746f50b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b362616304626968a36177182a616c0761646b666978747572652d64657662737103",
+        "InviteToSpeak directive canonical-CBOR wire format drifted"
+    );
+    // Round-trip: the discriminant decodes back to InviteToSpeak.
+    let back: VoiceModerationDirective = ciborium::from_reader(bytes.as_slice()).unwrap();
+    assert_eq!(back.action, ModAction::InviteToSpeak);
+}
+
+/// ZEB-612: pin the sealed (signed + ChannelKey-encrypted) InviteToSpeak
+/// directive. Same key/nonce/identity as the sealed Mute pin below; a VALID
+/// wire example (actor_device matches the signer).
+#[test]
+fn voice_moderation_sealed_invite_directive_is_pinned() {
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let mut directive = fixture_directive();
+    directive.action = ModAction::InviteToSpeak;
+    directive.actor_device = signing.verifying_key().to_bytes();
+    let signed = sign_directive(directive, &signing).expect("sign");
+    let key = derive_channel_key(
+        &EpochKey::new([0x11; 32]),
+        &SpaceId([0xc0; 16]),
+        &ChannelId([0xc1; 16]),
+    );
+    let community = SpaceId([0xc0; 16]);
+    let channel = ChannelId([0xc1; 16]);
+    let sealed =
+        seal_directive_with_nonce(&key, &community, &channel, &signed, [9u8; 12]).expect("seal");
+    // GENERATE-THEN-PIN: run once with a placeholder; paste the printed hex.
+    assert_eq!(
+        hex::encode(&sealed),
+        "090909090909090909090909f76ed9e6ed6f16b7af2d4cdeba79cd9b2b52875c6c8dd9f55e6a6d3821f4eeac9766925d2973eb0c91014bd56686fe5976fe41136c9daba59323e9d50551fa78f3b765450ad1ebcb42c289f12efb521c3095d4204765a6235672205ac88454a330218cf5e02f8710576af956a769a71b5e1b2657eb6af19dfbce62db4161adb6e394f85f56ccc79270bd491adc6bab32498c87ec41d6a96884ccaf81cba69f6694a77ed8f35464eaea3d1553a3f5edaabcb67cf658801d1f2d9cd6db13c8e10a7c284d5394a3ae36",
+        "sealed InviteToSpeak directive wire format drifted"
+    );
+}
+
 /// Pin the sealed (signed + ChannelKey-encrypted) directive wire format.
 /// Signing key is `[7u8; 32]`, nonce is `[9u8; 12]`, channel key/community/channel
 /// match the existing presence-beacon fixture exactly.

@@ -16,12 +16,20 @@ pub const ENFORCE_TTL_MS: u64 = 12_000;
 pub const RE_ASSERT_INTERVAL_MS: u64 = 4_000;
 /// Default moderator-chosen duration (5 min), enforced issuer-side.
 pub const DEFAULT_MODERATION_MS: u64 = 300_000;
+/// ZEB-612: issuer-side re-assert window for an unclaimed invite-to-speak
+/// (~2 min; the invite's default `duration_ms`, analog of
+/// `DEFAULT_MODERATION_MS`). Receive-side liveness stays `ENFORCE_TTL_MS`
+/// refreshed by the 4 s re-asserts, so an invite dies ≤12 s after the issuer
+/// stops re-asserting (window expiry or issuer departure).
+pub const INVITE_TTL_MS: u64 = 120_000;
 /// Minimum power to moderate (reuses the existing `kick` threshold).
 pub const MOD_POWER: u8 = 50;
 
 /// What a directive asserts about the target owner. `serde_repr` encodes each
 /// variant as its bare u8 discriminant (mirrors `ChannelKind`) and rejects
-/// unknown discriminants on decode.
+/// unknown discriminants on decode — a pre-ZEB-612 client drops an
+/// `InviteToSpeak` directive at decode (contained; invites are cosmetic for
+/// it anyway).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum ModAction {
@@ -29,16 +37,39 @@ pub enum ModAction {
     Unmute = 1,
     Kick = 2,
     Unkick = 3,
+    /// ZEB-612 Town Hall: a mod invites `target_owner` to speak. Benign (no
+    /// enforcement AGAINST the target): surfaces on the overlay as
+    /// `invitedOwners`; the TARGET's own client lowers its hand on accept or
+    /// dismiss — the invite never mutates another owner's beacon. No revoke
+    /// variant: an unclaimed invite lapses via the TTL discipline.
+    InviteToSpeak = 4,
+}
+
+/// Enforcement class: each class is an independent last-writer-wins slot per
+/// target inside [`ActiveModeration`], so an invite can never clobber a
+/// mute/kick (and vice versa). Also keys the issuer's re-assert map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ModClass {
+    Mute,
+    Kick,
+    Invite,
 }
 
 impl ModAction {
-    /// True for the mute class {Mute, Unmute}; false for the kick class.
-    pub fn is_mute_class(self) -> bool {
-        matches!(self, ModAction::Mute | ModAction::Unmute)
+    /// The enforcement class this action belongs to.
+    pub fn class(self) -> ModClass {
+        match self {
+            ModAction::Mute | ModAction::Unmute => ModClass::Mute,
+            ModAction::Kick | ModAction::Unkick => ModClass::Kick,
+            ModAction::InviteToSpeak => ModClass::Invite,
+        }
     }
     /// True for the "positive" directives that turn enforcement ON.
     pub fn enforces(self) -> bool {
-        matches!(self, ModAction::Mute | ModAction::Kick)
+        matches!(
+            self,
+            ModAction::Mute | ModAction::Kick | ModAction::InviteToSpeak
+        )
     }
 }
 
@@ -172,8 +203,9 @@ pub fn open_directive(
 /// in order: the device-#2 **signature** check; the **membership** check —
 /// `actor_device ∈ actor_owner.enrolled_device_keys` AND `actor_owner` is Joined,
 /// via `device_is_enrolled`; and the **power** gate — `power(actor) ≥ MOD_POWER`
-/// AND `power(actor) > power(target)` (the `>` rejects equal-power peers and makes
-/// self-moderation impossible).
+/// AND, for the punitive actions only, `power(actor) > power(target)` (the `>`
+/// rejects equal-power peers and makes self-moderation impossible; the benign
+/// `InviteToSpeak` skips that clause — ZEB-612).
 pub fn verify_directive_authority(
     materialized: &crate::community_membership::MaterializedMembership,
     signed: &SignedVoiceModerationDirective,
@@ -197,7 +229,13 @@ pub fn verify_directive_authority(
         .get(&OwnerAddr(d.target_owner))
         .copied()
         .unwrap_or(0);
-    if actor_power < MOD_POWER || actor_power <= target_power {
+    if actor_power < MOD_POWER {
+        return Err(ModError::NotAuthorized);
+    }
+    // The `actor > target` clause is punitive-action logic (blocks equal-power
+    // retaliation and self-moderation). The benign invite-to-speak skips it: a
+    // mod may invite an equal- or higher-power member to speak (spec §5).
+    if d.action != ModAction::InviteToSpeak && actor_power <= target_power {
         return Err(ModError::NotAuthorized);
     }
     Ok(())
@@ -256,11 +294,37 @@ struct ClassState {
 struct TargetState {
     mute: Option<ClassState>,
     kick: Option<ClassState>,
+    /// ZEB-612: invite-to-speak (single positive action, lapses via TTL).
+    invite: Option<ClassState>,
 }
 
-/// In-memory enforcement state: which owners are currently muted/kicked per
-/// (community, channel). Never persisted. Two independent classes per target
-/// (mute-class {Mute,Unmute}, kick-class {Kick,Unkick}), each last-writer-wins
+impl TargetState {
+    fn slot_mut(&mut self, class: ModClass) -> &mut Option<ClassState> {
+        match class {
+            ModClass::Mute => &mut self.mute,
+            ModClass::Kick => &mut self.kick,
+            ModClass::Invite => &mut self.invite,
+        }
+    }
+    fn slot(&self, class: ModClass) -> &Option<ClassState> {
+        match class {
+            ModClass::Mute => &self.mute,
+            ModClass::Kick => &self.kick,
+            ModClass::Invite => &self.invite,
+        }
+    }
+    fn slots_mut(&mut self) -> [&mut Option<ClassState>; 3] {
+        [&mut self.mute, &mut self.kick, &mut self.invite]
+    }
+    fn is_empty(&self) -> bool {
+        self.mute.is_none() && self.kick.is_none() && self.invite.is_none()
+    }
+}
+
+/// In-memory enforcement state: which owners are currently muted/kicked/
+/// invited-to-speak per (community, channel). Never persisted. Three
+/// independent classes per target (mute-class {Mute,Unmute}, kick-class
+/// {Kick,Unkick}, invite-class {InviteToSpeak}), each last-writer-wins
 /// by `(issued_hlc, seq)`. Mirrors the freshness discipline of `VoicePresenceMap`.
 #[derive(Debug, Default)]
 pub struct ActiveModeration {
@@ -297,11 +361,7 @@ impl ActiveModeration {
             .or_default()
             .entry(d.target_owner)
             .or_default();
-        let slot = if d.action.is_mute_class() {
-            &mut target.mute
-        } else {
-            &mut target.kick
-        };
+        let slot = target.slot_mut(d.action.class());
         match slot.as_ref() {
             Some(s) => {
                 let is_same = !d.issued_hlc.is_strictly_newer_than(&s.latest_hlc)
@@ -341,28 +401,34 @@ impl ActiveModeration {
         }
     }
 
-    fn is(&self, c: &SpaceId, ch: &ChannelId, owner: &[u8; 16], now_ms: u64, mute: bool) -> bool {
+    fn is(
+        &self,
+        c: &SpaceId,
+        ch: &ChannelId,
+        owner: &[u8; 16],
+        now_ms: u64,
+        class: ModClass,
+    ) -> bool {
         self.inner
             .get(&(*c, *ch))
             .and_then(|m| m.get(owner))
-            .and_then(|t| {
-                if mute {
-                    t.mute.as_ref()
-                } else {
-                    t.kick.as_ref()
-                }
-            })
+            .and_then(|t| t.slot(class).as_ref())
             .is_some_and(|s| s.enforced && now_ms < s.enforce_until_ms)
     }
 
     /// True iff `owner` is currently server-muted in `(c, ch)`.
     pub fn is_muted(&self, c: &SpaceId, ch: &ChannelId, owner: &[u8; 16], now_ms: u64) -> bool {
-        self.is(c, ch, owner, now_ms, true)
+        self.is(c, ch, owner, now_ms, ModClass::Mute)
     }
 
     /// True iff `owner` is currently kicked from voice in `(c, ch)`.
     pub fn is_kicked(&self, c: &SpaceId, ch: &ChannelId, owner: &[u8; 16], now_ms: u64) -> bool {
-        self.is(c, ch, owner, now_ms, false)
+        self.is(c, ch, owner, now_ms, ModClass::Kick)
+    }
+
+    /// ZEB-612: true iff `owner` holds an unexpired invite-to-speak in `(c, ch)`.
+    pub fn is_invited(&self, c: &SpaceId, ch: &ChannelId, owner: &[u8; 16], now_ms: u64) -> bool {
+        self.is(c, ch, owner, now_ms, ModClass::Invite)
     }
 
     /// Lapse any enforced class whose TTL passed; return the (community, channel)
@@ -381,7 +447,7 @@ impl ActiveModeration {
         for (scope, targets) in self.inner.iter_mut() {
             let mut any = false;
             for t in targets.values_mut() {
-                for s in [&mut t.mute, &mut t.kick].into_iter().flatten() {
+                for s in t.slots_mut().into_iter().flatten() {
                     if s.enforced && now_ms >= s.enforce_until_ms {
                         s.enforced = false;
                         any = true;
@@ -395,7 +461,7 @@ impl ActiveModeration {
             // target rows. The grace keeps the LWW tombstone alive long enough to
             // reject a network-reordered stale re-apply.
             for t in targets.values_mut() {
-                for slot in [&mut t.mute, &mut t.kick] {
+                for slot in t.slots_mut() {
                     let prune = slot.as_ref().is_some_and(|s| {
                         !s.enforced && now_ms > s.enforce_until_ms.saturating_add(ENFORCE_TTL_MS)
                     });
@@ -404,7 +470,7 @@ impl ActiveModeration {
                     }
                 }
             }
-            targets.retain(|_, t| t.mute.is_some() || t.kick.is_some());
+            targets.retain(|_, t| !t.is_empty());
         }
         // Reclaim channel sub-maps emptied by pruning so they don't accumulate as
         // ghost entries every future sweep re-scans.
@@ -419,7 +485,7 @@ impl ActiveModeration {
     pub fn any_enforced(&self, now_ms: u64) -> bool {
         self.inner.values().any(|targets| {
             targets.values().any(|t| {
-                [&t.mute, &t.kick]
+                [&t.mute, &t.kick, &t.invite]
                     .into_iter()
                     .flatten()
                     .any(|s| s.enforced && now_ms < s.enforce_until_ms)
@@ -432,32 +498,35 @@ impl ActiveModeration {
         self.inner.remove(&(*c, *ch));
     }
 
-    /// Enumerate currently-enforced targets in (c, ch): (muted_owners, kicked_owners).
+    /// Enumerate currently-enforced targets in (c, ch):
+    /// (muted_owners, kicked_owners, invited_owners).
     pub fn snapshot(
         &self,
         c: &SpaceId,
         ch: &ChannelId,
         now_ms: u64,
-    ) -> (Vec<[u8; 16]>, Vec<[u8; 16]>) {
+    ) -> (Vec<[u8; 16]>, Vec<[u8; 16]>, Vec<[u8; 16]>) {
         let mut muted = Vec::new();
         let mut kicked = Vec::new();
+        let mut invited = Vec::new();
         if let Some(targets) = self.inner.get(&(*c, *ch)) {
             for (owner, t) in targets {
-                if t.mute
-                    .as_ref()
-                    .is_some_and(|s| s.enforced && now_ms < s.enforce_until_ms)
-                {
+                let live = |slot: &Option<ClassState>| {
+                    slot.as_ref()
+                        .is_some_and(|s| s.enforced && now_ms < s.enforce_until_ms)
+                };
+                if live(&t.mute) {
                     muted.push(*owner);
                 }
-                if t.kick
-                    .as_ref()
-                    .is_some_and(|s| s.enforced && now_ms < s.enforce_until_ms)
-                {
+                if live(&t.kick) {
                     kicked.push(*owner);
+                }
+                if live(&t.invite) {
+                    invited.push(*owner);
                 }
             }
         }
-        (muted, kicked)
+        (muted, kicked, invited)
     }
 
     /// Number of target rows currently retained for `(c, ch)` (enforced or not).
@@ -511,6 +580,7 @@ mod tests {
             ModAction::Unmute,
             ModAction::Kick,
             ModAction::Unkick,
+            ModAction::InviteToSpeak,
         ] {
             let b = canonical_cbor_encode(&a).unwrap();
             let back: ModAction = ciborium::from_reader(b.as_slice()).unwrap();
@@ -520,6 +590,20 @@ mod tests {
             canonical_cbor_encode(&ModAction::Kick).unwrap(),
             canonical_cbor_encode(&2u8).unwrap()
         );
+        assert_eq!(
+            canonical_cbor_encode(&ModAction::InviteToSpeak).unwrap(),
+            canonical_cbor_encode(&4u8).unwrap()
+        );
+    }
+
+    #[test]
+    fn mod_action_classes_route_independently() {
+        assert_eq!(ModAction::Mute.class(), ModClass::Mute);
+        assert_eq!(ModAction::Unmute.class(), ModClass::Mute);
+        assert_eq!(ModAction::Kick.class(), ModClass::Kick);
+        assert_eq!(ModAction::Unkick.class(), ModClass::Kick);
+        assert_eq!(ModAction::InviteToSpeak.class(), ModClass::Invite);
+        assert!(ModAction::InviteToSpeak.enforces());
     }
 
     #[test]
@@ -601,6 +685,32 @@ mod tests {
         assert!(am.is_kicked(&C, &CH, &[0xBB; 16], 1_100));
     }
 
+    /// ZEB-612: the invite class is independent of mute/kick — an invite on a
+    /// kicked target neither clears the kick nor is cleared by an unkick.
+    #[test]
+    fn invite_and_kick_are_independent_classes() {
+        let mut am = ActiveModeration::default();
+        applied(&mut am, ModAction::Kick, 100, 1, 1_000);
+        assert!(applied(&mut am, ModAction::InviteToSpeak, 100, 1, 1_000));
+        assert!(am.is_kicked(&C, &CH, &[0xBB; 16], 1_000));
+        assert!(am.is_invited(&C, &CH, &[0xBB; 16], 1_000));
+        applied(&mut am, ModAction::Unkick, 200, 2, 1_100);
+        assert!(!am.is_kicked(&C, &CH, &[0xBB; 16], 1_100));
+        assert!(am.is_invited(&C, &CH, &[0xBB; 16], 1_100));
+    }
+
+    /// ZEB-612: an invite lapses via the sweep like any enforced class (the
+    /// receive-side TTL; the ~2 min window is issuer-side re-assertion).
+    #[test]
+    fn invite_expires_via_sweep() {
+        let mut am = ActiveModeration::default();
+        assert!(applied(&mut am, ModAction::InviteToSpeak, 100, 1, 1_000));
+        assert!(am.is_invited(&C, &CH, &[0xBB; 16], 1_000 + ENFORCE_TTL_MS - 1));
+        let lapsed = am.sweep(1_000 + ENFORCE_TTL_MS);
+        assert_eq!(lapsed, vec![(C, CH)]);
+        assert!(!am.is_invited(&C, &CH, &[0xBB; 16], 1_000 + ENFORCE_TTL_MS));
+    }
+
     #[test]
     fn sweep_reports_lapsed_targets() {
         let mut am = ActiveModeration::default();
@@ -653,15 +763,28 @@ mod tests {
         kd.seq = 1;
         assert!(am.apply(&C, &CH, &kd, 1_000, ENFORCE_TTL_MS));
 
-        let (muted, kicked) = am.snapshot(&C, &CH, 1_000);
+        // ZEB-612: invite a THIRD owner so the snapshot exercises all classes.
+        let mut inv = directive(ModAction::InviteToSpeak, [0u8; 32]);
+        inv.target_owner = [0xEE; 16];
+        inv.issued_hlc = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "x".into(),
+        };
+        inv.seq = 1;
+        assert!(am.apply(&C, &CH, &inv, 1_000, ENFORCE_TTL_MS));
+
+        let (muted, kicked, invited) = am.snapshot(&C, &CH, 1_000);
         assert_eq!(muted, vec![[0xBB; 16]]);
         assert_eq!(kicked, vec![[0xDD; 16]]);
+        assert_eq!(invited, vec![[0xEE; 16]]);
 
         // After both TTLs lapse (sweep marks them un-enforced), snapshot is empty.
         am.sweep(1_000 + ENFORCE_TTL_MS);
-        let (muted, kicked) = am.snapshot(&C, &CH, 1_000 + ENFORCE_TTL_MS);
+        let (muted, kicked, invited) = am.snapshot(&C, &CH, 1_000 + ENFORCE_TTL_MS);
         assert!(muted.is_empty());
         assert!(kicked.is_empty());
+        assert!(invited.is_empty());
     }
 
     use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
@@ -738,6 +861,40 @@ mod tests {
         let mm = membership(60, 60, vk);
         assert_eq!(
             verify_directive_authority(&mm, &signed),
+            Err(ModError::NotAuthorized)
+        );
+    }
+
+    /// ZEB-612: the benign invite skips the `actor > target` clause — a mod
+    /// may invite an equal- or higher-power member to speak. The punitive
+    /// contrast (Mute with the same powers) stays rejected.
+    #[test]
+    fn authority_allows_invite_to_equal_or_higher_power_target() {
+        let signing = sk();
+        let vk = signing.verifying_key().to_bytes();
+        let invite = sign_directive(directive(ModAction::InviteToSpeak, vk), &signing).unwrap();
+        // Equal power (60 vs 60) → invite OK, mute rejected.
+        let mm = membership(60, 60, vk);
+        assert!(verify_directive_authority(&mm, &invite).is_ok());
+        let mute = sign_directive(directive(ModAction::Mute, vk), &signing).unwrap();
+        assert_eq!(
+            verify_directive_authority(&mm, &mute),
+            Err(ModError::NotAuthorized)
+        );
+        // Higher-power target (50 vs 90) → invite still OK.
+        let mm = membership(50, 90, vk);
+        assert!(verify_directive_authority(&mm, &invite).is_ok());
+    }
+
+    /// ZEB-612: the invite still requires mod-tier power.
+    #[test]
+    fn authority_rejects_invite_below_mod_power() {
+        let signing = sk();
+        let vk = signing.verifying_key().to_bytes();
+        let invite = sign_directive(directive(ModAction::InviteToSpeak, vk), &signing).unwrap();
+        let mm = membership(49, 0, vk);
+        assert_eq!(
+            verify_directive_authority(&mm, &invite),
             Err(ModError::NotAuthorized)
         );
     }

@@ -17908,7 +17908,47 @@ async fn set_voice_muted(
     .map_err(|_| "event loop not running".to_string())
 }
 
-/// ZEB-358: issue a voice-moderation directive (mute/unmute/kick/unkick) against
+/// ZEB-612 Town Hall: raise or lower this node's hand in an active voice or
+/// townhall channel. Mints the raise timestamp (wall-clock ms) at the IPC
+/// boundary; the event loop keeps the FIRST stamp across repeat raises so
+/// queue position is stable, and the presence heartbeat republishes it every
+/// ≤4 s (plus an immediate beacon on the flip). A no-op if the channel isn't
+/// joined. Modeled on `set_voice_muted`'s id-parsing + tx access.
+#[tauri::command]
+async fn set_voice_hand(
+    payload: voice::SetVoiceHandPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let community =
+        crate::owner_state_types::SpaceId(parse_voice_id_16("communityId", &payload.community_id)?);
+    let channel = crate::community_membership::ChannelId(parse_voice_id_16(
+        "channelId",
+        &payload.channel_id,
+    )?);
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let raised_at = payload.raised.then(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    });
+    tx.send(voice::VoiceChannelRequest::SetHand {
+        community_id: community,
+        channel_id: channel,
+        raised_at,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-358: issue a voice-moderation directive (mute/unmute/kick/unkick —
+/// plus ZEB-612's benign "invite" to speak) against
 /// `targetOwnerHex` in a community voice channel. Mints a fresh issue-time HLC so
 /// cross-moderator last-writer-wins orders by issue time, then hands off to the
 /// event loop, which re-verifies the moderator's power before broadcasting.
@@ -53308,6 +53348,7 @@ pub fn run() {
             join_voice_channel,
             leave_voice_channel,
             set_voice_muted,
+            set_voice_hand,
             moderate_voice,
             get_self_voice_identity,
             // ZEB-352 Voice V4: DM-call signaling + media IPCs.
