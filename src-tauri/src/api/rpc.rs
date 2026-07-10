@@ -683,6 +683,12 @@ pub fn build_registry() -> RpcRegistry {
     );
     rpc!(
         m,
+        "list_vine_reactions",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_vine_reactions_impl(state) }
+    );
+    rpc!(
+        m,
         "mark_vine_viewed",
         VineIdArgs,
         |state, _sink, a| async move {
@@ -1512,6 +1518,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_vine_reactions_errs_not_connected_pre_node() {
+        // ZEB-672: pins the registration + the "not connected" contract
+        // shared with list_vine_videos (frontend hydrate calls it only
+        // after connectAdapter succeeds).
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_vine_reactions",
+                test_state(),
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Command(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -1558,6 +1582,7 @@ mod tests {
             // vines
             "publish_vine",
             "list_vine_videos",
+            "list_vine_reactions",
             "mark_vine_viewed",
             "reshare_vine",
             // vine follows (ZEB-562)
