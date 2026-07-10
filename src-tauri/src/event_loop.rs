@@ -3740,7 +3740,13 @@ pub async fn run(
                             ) {
                                 if *zid != own_zid {
                                     let now = start.elapsed().as_millis() as u64;
-                                    observed_holders.lock().unwrap().note(&a.cid, zid, now);
+                                    // Poison-resilient: the holder map is a
+                                    // best-effort cache — keep serving it
+                                    // rather than re-panicking the loop.
+                                    observed_holders
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .note(&a.cid, zid, now);
                                 }
                             }
                         }
@@ -5549,14 +5555,19 @@ pub async fn run(
             // ── ZEB-612 S3: holder sweep + own-content re-announce ────
             _ = reannounce_tick.tick() => {
                 let now = start.elapsed().as_millis() as u64;
+                // Poison-resilient locks: both maps are best-effort caches;
+                // a panic elsewhere must not turn every later tick into a
+                // repeat panic of the central event loop.
                 observed_holders
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .sweep(now, crate::observed_holders::HOLDER_STALE_MS);
                 // Collect under the lock, publish after dropping it — a
                 // std Mutex guard must never be held across an await.
                 let announcements = {
-                    let idx = content_index.lock().unwrap();
+                    let idx = content_index
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     crate::collect_reannouncements(&idx)
                 };
                 for (key_expr, payload) in announcements {

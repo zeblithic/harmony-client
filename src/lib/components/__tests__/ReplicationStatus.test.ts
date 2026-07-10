@@ -12,7 +12,7 @@ describe('ReplicationStatus', () => {
       },
     });
     // default tier target is 3 — honest "copies seen" copy (ZEB-612 S3)
-    expect(screen.getByText('×3 · copies seen across your peers')).toBeTruthy();
+    expect(screen.getByText('×3 · copies seen (this device + peers)')).toBeTruthy();
     expect(screen.getByText('Above the ×3 target for default.')).toBeTruthy();
   });
 
@@ -25,7 +25,7 @@ describe('ReplicationStatus', () => {
       },
     });
     // high tier target is 5, only 2 copies seen (ZEB-612 S3 copy)
-    expect(screen.getByText('×2 · copies seen across your peers')).toBeTruthy();
+    expect(screen.getByText('×2 · copies seen (this device + peers)')).toBeTruthy();
     expect(screen.getByText('Below the ×5 target for high.')).toBeTruthy();
   });
 

@@ -264,21 +264,26 @@ pub fn collect_reannouncements(index: &ContentIndex) -> Vec<(String, Vec<u8>)> {
 - [ ] **Step 4: Wire `NodeState` + `start_node` + `run()`**
 
 1. `NodeState` (lib.rs, next to `content_index` at `:763`):
+
 ```rust
 /// ZEB-612 S3: per-CID distinct announcing sessions, written by the
 /// event loop, read by list_content/list_root for `replicaCount`.
 pub observed_holders: std::sync::Arc<std::sync::Mutex<crate::observed_holders::ObservedHolders>>,
 ```
+
 Initialize at every `NodeState` construction site with `Arc::new(Mutex::new(ObservedHolders::new()))` (grep `content_index:` initializers and mirror).
 
-2. `event_loop::run()` — two params appended after `mail_sync` (signature already `#[allow(clippy::too_many_arguments)]`):
+1. `event_loop::run()` — two params appended after `mail_sync` (signature already `#[allow(clippy::too_many_arguments)]`):
+
 ```rust
 observed_holders: std::sync::Arc<std::sync::Mutex<crate::observed_holders::ObservedHolders>>,
 content_index: std::sync::Arc<std::sync::Mutex<crate::content_index::ContentIndex>>,
 ```
+
 Update the `start_node` call site (pass `state.observed_holders.clone()`, `state.content_index.clone()`) and any test invocations of `run(` (grep; thread fresh Arcs).
 
-3. Subscription arm (event_loop.rs, after the pairing `continue`, before the `hop_distance` computation):
+1. Subscription arm (event_loop.rs, after the pairing `continue`, before the `hop_distance` computation):
+
 ```rust
 // ZEB-612 S3: record distinct announcing sessions per CID. Own
 // announcements loop back on the local session — exclude own_zid so
@@ -298,7 +303,8 @@ if key_expr.starts_with("harmony/announce/") {
 }
 ```
 
-4. Re-announce + sweep tick — interval next to `voice_sweep_tick` (`:3281`):
+1. Re-announce + sweep tick — interval next to `voice_sweep_tick` (`:3281`):
+
 ```rust
 // ZEB-612 S3: keep peer holder-maps fresh. No upstream re-announce
 // exists (announces fire only on store/publish), so this node refreshes
@@ -311,7 +317,9 @@ let mut reannounce_tick = tokio::time::interval(Duration::from_millis(
 ));
 reannounce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 ```
+
 Select arm (with the other ticks; NEVER hold a lock across await):
+
 ```rust
 _ = reannounce_tick.tick() => {
     let now = start.elapsed().as_millis() as u64;
@@ -332,6 +340,7 @@ _ = reannounce_tick.tick() => {
     }
 }
 ```
+
 (Match `dispatch_action`'s real argument list at the existing call sites, e.g. `:3882`.)
 
 - [ ] **Step 5: Run gates**
@@ -370,6 +379,7 @@ fn apply_replica_counts_is_one_plus_observed_peers() {
     assert_eq!(items[1].replica_count, 1, "self only when nothing observed");
 }
 ```
+
 (`test_wire_item(cid)` = local helper building a `ContentItemWire` with placeholder fields, `replica_count: 1`.)
 
 - [ ] **Step 2: Run to verify failure** — `-E 'test(/apply_replica_counts/) or test(=content_item_wire_serializes_sidecar_id_and_kind)'`, expect missing-field compile error.
@@ -377,14 +387,17 @@ fn apply_replica_counts_is_one_plus_observed_peers() {
 - [ ] **Step 3: Implement**
 
 1. Field on `ContentItemWire` (doc comment carries the honesty contract):
+
 ```rust
 /// ZEB-612 S3: observed replica count — 1 (self) + distinct peer
 /// sessions seen announcing this CID since boot (staleness-pruned).
 /// A LOWER BOUND, not global truth: UI copy must say "copies seen".
 pub replica_count: u32,
 ```
-2. Both construction sites (`list_root` map at `:13467-13479`, `list_folder` at `:13544-13556`) initialize `replica_count: 1`.
-3. Join helper + application:
+
+1. Both construction sites (`list_root` map at `:13467-13479`, `list_folder` at `:13544-13556`) initialize `replica_count: 1`.
+1. Join helper + application:
+
 ```rust
 /// Overwrite `replica_count` with 1 (self) + observed peer sessions.
 fn apply_replica_counts(
@@ -396,13 +409,16 @@ fn apply_replica_counts(
     }
 }
 ```
+
 In `list_content` (covers both branches — root and folder), after items are built:
+
 ```rust
 {
     let holders = state.observed_holders.lock().unwrap();
     apply_replica_counts(&mut items, &holders);
 }
 ```
+
 (`list_root` is also called directly — apply inside `list_root` itself and after the `list_folder` call in `list_content`, whichever matches control flow; do NOT double-apply. Follow the actual code shape: the join is idempotent-by-overwrite either way.)
 
 - [ ] **Step 4: Run to verify pass** — same filter, plus `-E 'test(/list_folder/)'` sanity.
@@ -472,6 +488,7 @@ async fn get_storage_budget() -> Result<StorageBudgetWire, String> {
     Ok(StorageBudgetWire::from(&NODE_STORAGE_BUDGET))
 }
 ```
+
 Replace `:9073-9077`'s literal with `storage_budget: NODE_STORAGE_BUDGET,` (if `StorageBudget` isn't const-constructible — non-const field types — fall back to a `fn node_storage_budget() -> StorageBudget` single source). Register `get_storage_budget` in `generate_handler!`.
 
 - [ ] **Step 4: Verify pass**, then full-file gates: `cargo fmt --all -- --check`, clippy `--all-targets`, `-E 'test(=storage_budget_wire_camel_case)'`.
@@ -511,6 +528,7 @@ it('budget fetch failure degrades to null budget (used-only display)', async () 
   // get_storage_budget rejects → pinnedBudgetBytes null, no throw from connectAdapter
 });
 ```
+
 Write them as real tests against the `createMockAdapter()` + `mockImplementation` idiom already used in this file (route on the command name; `list_content` → wire fixtures, `get_storage_budget` → budget or rejection).
 
 - [ ] **Step 2: `npx vitest run src/lib/file-manager-service.test.ts`** — new tests FAIL (plus the old 10 GB pins now obsolete: delete them in the same edit).
@@ -578,6 +596,7 @@ countByVideoCid(videoCid: string): number {
 - [ ] **Step 1: Failing tests**
 
 `file-utils.test.ts`:
+
 ```ts
 describe('shortCid', () => {
   it('truncates long hex cids to first-6…last-4', () =>
@@ -585,6 +604,7 @@ describe('shortCid', () => {
   it('passes short cids through', () => expect(shortCid('abcdef123456')).toBe('abcdef123456'));
 });
 ```
+
 `FileRow.test.ts`: mono CID chip renders `cid:{shortCid}` (`data-testid="cid-chip"`); replication chip text `×3 healthy` when replicaCount ≥ tierTarget, `×1 at risk` below; staleness dot and Last-Accessed cell GONE (`queryBy…` null).
 `FileCard.test.ts`: staleness dot gone.
 
@@ -593,12 +613,14 @@ describe('shortCid', () => {
 - [ ] **Step 3: Implement**
 
 - `file-utils.ts`:
+
 ```ts
 /** ZEB-612 S3: `3f9a2c…7e8f` — compact hex-CID display for rows. */
 export function shortCid(cid: string): string {
   return cid.length <= 12 ? cid : `${cid.slice(0, 6)}…${cid.slice(-4)}`;
 }
 ```
+
 - `types.ts` `ContentItem`: delete `stalenessScore`, `accessCount`, `lastAccessed` (comment: fabricated → removed with renderers, ZEB-612 S3; real signals return with real backends).
 - `file-manager-service.ts`: drop the three fabrications in `wireToContentItem` + `ingest()`.
 - `mock-file-data.ts`: strip the fields from mock items.
@@ -695,6 +717,7 @@ cd src-tauri && cargo fmt --all -- --check \
   && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings \
   && cargo nextest run --locked --features test-fixtures -E 'test(/observed_holders/) or test(/collect_reannouncements/) or test(/apply_replica_counts/) or test(=storage_budget_wire_camel_case) or test(/content_item_wire/) or test(/list_folder/) or test(/content_announcement/)'
 ```
+
 Expected: all green. (CI runs the full Rust workspace suite.)
 
 - [ ] **Step 5: Commit** — `"ZEB-612 S3: honest quota bar (used + pinned budget), VF toolbar copy, CID search, storage-nav labels"`
@@ -707,3 +730,17 @@ Expected: all green. (CI runs the full Rust workspace suite.)
 - [ ] PR body: lead with the two premise corrections (zid identity + client re-announce; pinned-budget quota) as "spec deviations, honesty-rule-governed" — Jake sees them at review, not buried.
 - [ ] PR body honesty ledger (S3 rows): zid ≈ session not owner; freshness 60 s/180 s; private always ×1 self (true today); no overall quota exists — used-bytes shown denominator-free; re-announce O(library)/min scale ceiling → ZEB-669.
 - [ ] Fire `@coderabbitai review` ONCE at PR-open. Never trigger Greptile. Scan all three comment buckets each round.
+
+---
+
+## Round-1 amendments (PR #441 bot converge, 2026-07-10)
+
+All findings triaged; six accepted, one declined with evidence.
+
+1. **Bounded holder state** (CodeRabbit, Major): announcements are unauthenticated — a hostile peer could flood unique CID/zid pairs inside a TTL window. `ObservedHolders` gains `MAX_TRACKED_CIDS = 4096` and `MAX_HOLDERS_PER_CID = 32`, both saturate-skip (honest for a lower bound); the sweep frees capacity. Two new tests pin the caps.
+2. **Poison-resilient event-loop locks** (Qodo, Bug): `lock().unwrap()` would re-panic the loop on every announce/tick after any panic that poisoned the lock. Both maps are best-effort caches → `unwrap_or_else(PoisonError::into_inner)` at the three loop sites.
+3. **Saturating `peer_count` cast** (Qodo, Bug): `usize as u32` → `u32::try_from(...).unwrap_or(u32::MAX)`.
+4. **Zero-pinned-budget display** (CodeRabbit, Minor): `pinnedBudgetBytes === 0` with usage now renders 100% + warning instead of a healthy-looking 0% (distinct from `null` = unknown). Test added.
+5. **Replication copy self-attribution** (CodeRabbit, Major): `replicaCount` includes this device, so "copies seen across your peers" overattributed. Copy is now `×{n} · copies seen (this device + peers)` — supersedes the Global Constraints wording above.
+6. **Plan markdownlint** (CodeRabbit, Minor): MD031 blank-lines-around-fences pass + MD029 renumbering of fence-broken step lists.
+7. **DECLINED — serial publishes in the re-announce arm** (CodeRabbit, Trivial): `dispatch_action`'s `RuntimeAction::Publish` arm `tokio::spawn`s the actual zenoh put (`event_loop.rs` Publish arm), so each awaited call costs a spawn, not a network round-trip; the loop stays responsive.

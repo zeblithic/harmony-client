@@ -44,4 +44,16 @@ describe('QuotaBar', () => {
     );
     expect(container.querySelector('.quota-fill.warning')).toBeTruthy();
   });
+
+  it('treats a known zero budget with usage as fully over budget, not 0%', () => {
+    // pinnedBudgetBytes === 0 is a valid state distinct from null (unknown);
+    // rendering it as a healthy empty bar would hide an over-quota state.
+    const { container } = render(
+      QuotaBar,
+      { props: props({ pinnedBudgetBytes: 0, pinnedUsedBytes: 1_000 }) },
+    );
+    const fill = container.querySelector('.quota-fill.warning') as HTMLElement;
+    expect(fill).toBeTruthy();
+    expect(fill.style.width).toBe('100%');
+  });
 });

@@ -27,7 +27,7 @@
 </script>
 
 <div class="replication-status" class:met class:under={!met}>
-  <span class="replica-count">×{replicaCount} · copies seen across your peers</span>
+  <span class="replica-count">×{replicaCount} · copies seen (this device + peers)</span>
   <span class="replica-target">
     {met ? 'Above' : 'Below'} the ×{target} target for {tier}.
   </span>

@@ -17,10 +17,16 @@
     onCleanupClick: () => void;
   } = $props();
 
+  // A known zero budget with non-zero usage is fully over budget — it must
+  // not render as a healthy 0% (distinct from null = budget unknown).
   let pinnedPercent = $derived(
-    pinnedBudgetBytes && pinnedBudgetBytes > 0
-      ? Math.min(100, Math.round((pinnedUsedBytes / pinnedBudgetBytes) * 100))
-      : 0,
+    pinnedBudgetBytes == null
+      ? 0
+      : pinnedBudgetBytes > 0
+        ? Math.min(100, Math.round((pinnedUsedBytes / pinnedBudgetBytes) * 100))
+        : pinnedUsedBytes > 0
+          ? 100
+          : 0,
   );
   let warning = $derived(pinnedPercent >= 85);
 </script>

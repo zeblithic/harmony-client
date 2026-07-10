@@ -229,7 +229,7 @@ describe('File Manager Integration', () => {
     expect(screen.getByText('Public')).toBeTruthy();
 
     // Replication info (5 seen vs high-tier target 5; ZEB-612 S3 copy)
-    expect(screen.getByText('×5 · copies seen across your peers')).toBeTruthy();
+    expect(screen.getByText('×5 · copies seen (this device + peers)')).toBeTruthy();
 
     // Action buttons
     expect(screen.getByLabelText('Publish (permanent)')).toBeTruthy();

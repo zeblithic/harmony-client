@@ -73,13 +73,13 @@ describe('FileDetailPanel', () => {
 
   it('replication box: healthy copy above target', () => {
     renderPanel({ replicaCount: 5 });
-    expect(screen.getByText('×5 · copies seen across your peers')).toBeTruthy();
+    expect(screen.getByText('×5 · copies seen (this device + peers)')).toBeTruthy();
     expect(screen.getByText('Above the ×3 target for default.')).toBeTruthy();
   });
 
   it('replication box: at-risk copy below target', () => {
     renderPanel({ replicaCount: 1, replicationTier: 'high' });
-    expect(screen.getByText('×1 · copies seen across your peers')).toBeTruthy();
+    expect(screen.getByText('×1 · copies seen (this device + peers)')).toBeTruthy();
     expect(screen.getByText('Below the ×5 target for high.')).toBeTruthy();
   });
 
