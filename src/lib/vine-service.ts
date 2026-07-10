@@ -16,6 +16,12 @@ export interface VineDescriptorEvent {
   /** See VineVideo.originalCreatorName. */
   originalCreatorName?: string;
   source?: 'followed' | 'discover';
+  /**
+   * Local viewed-state, joined from the Rust cache's persisted viewed-set.
+   * Present on both the live `vine-received` payload and `list_vine_videos`
+   * rows; older frontends ignored it (ZEB-612 S2 gap-fix).
+   */
+  viewed?: boolean;
 }
 
 /**
@@ -344,6 +350,45 @@ export class VineService {
   }
 
   /**
+   * ZEB-612 S2: pull the Rust-persisted feed cache (`vine_feed.json`,
+   * ZEB-147) into the frontend. The backend emits `vine-received` only on
+   * FIRST insert, so after a restart the reloaded cache never re-emits —
+   * without this pull the feed boots empty and the persisted viewed-set is
+   * invisible. Call AFTER `loadFollowed()`: the DTO carries no `source`
+   * field, so rows are classified by the live follow set (which matches
+   * the follow()/unfollow() move semantics this service already applies).
+   * Already-seen ids only merge viewed-state (live events may have raced
+   * ahead of this call). Throws on IPC failure — the App-level tryConnect
+   * wrapper logs it.
+   */
+  async hydrate(): Promise<void> {
+    if (!this.adapter) return;
+    const rows = (await this.adapter.invoke('list_vine_videos', {})) as Array<
+      VineDescriptorEvent & { viewed: boolean }
+    >;
+    const viewed = new Set(this.viewedIds);
+    const followedAdd: VineVideo[] = [];
+    const discoverAdd: VineVideo[] = [];
+    for (const wire of rows) {
+      if (wire.viewed) viewed.add(wire.id);
+      if (this.seenIds.has(wire.id)) continue;
+      this.seenIds.add(wire.id);
+      const vine = this.wireToVine(wire);
+      if (vine.viewed) viewed.add(vine.id);
+      if (this.followedAddresses.has(wire.creatorAddress)) {
+        followedAdd.push(vine);
+      } else {
+        discoverAdd.push(vine);
+      }
+    }
+    const viewedGrew = viewed.size !== this.viewedIds.size;
+    if (followedAdd.length > 0) this.followedVines = [...this.followedVines, ...followedAdd];
+    if (discoverAdd.length > 0) this.discoverVines = [...this.discoverVines, ...discoverAdd];
+    if (viewedGrew) this.viewedIds = viewed;
+    if (viewedGrew || followedAdd.length > 0 || discoverAdd.length > 0) this.onChange?.();
+  }
+
+  /**
    * Find a vine by id, searching followedVines then discoverVines.
    * Returns the first match or undefined.
    *
@@ -465,7 +510,7 @@ export class VineService {
       reshareOf: wire.reshareOf,
       originalCreatorAddress: wire.originalCreatorAddress,
       originalCreatorName: wire.originalCreatorName,
-      viewed: isSelf,
+      viewed: wire.viewed === true || isSelf,
     };
   }
 
