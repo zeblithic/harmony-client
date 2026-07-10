@@ -364,9 +364,6 @@
       const tierSet = new Set(tiers);
       contents = contents.filter((i) => i.isFolder || tierSet.has(i.replicationTier));
     }
-    if (filters.stale) {
-      contents = contents.filter((i) => i.isFolder || i.stalenessScore >= 0.5);
-    }
     if (filters.pinned) {
       contents = contents.filter((i) => i.isFolder || i.pinned);
     }

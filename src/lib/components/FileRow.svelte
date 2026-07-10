@@ -1,8 +1,7 @@
 <script lang="ts">
   import type { ContentItem } from '../types';
-  import { categoryIcon, formatBytes, relativeTime, tierTarget, sensitivityIcon } from '../file-utils';
+  import { categoryIcon, formatBytes, shortCid, tierTarget, sensitivityIcon } from '../file-utils';
   import { autoFocus } from '../actions/auto-focus';
-  import StalenessIndicator from './StalenessIndicator.svelte';
 
   let {
     item,
@@ -39,8 +38,10 @@
 
   let icon = $derived(categoryIcon(item.category));
   let size = $derived(formatBytes(item.sizeBytes));
-  let lastAccessed = $derived(relativeTime(item.lastAccessed));
-  let replication = $derived(`${item.replicaCount}/${tierTarget(item.replicationTier)}`);
+  // ZEB-612 S3: replicaCount is the observed lower bound ("copies seen");
+  // healthy = meets the tier's target copy count. Folders have no tier
+  // semantics — no chip.
+  let healthy = $derived(item.replicaCount >= tierTarget(item.replicationTier));
   let sensIcon = $derived(sensitivityIcon(item.sensitivity));
 
   // ZEB-299 slow-click detection. Per-row state — each row tracks its
@@ -112,10 +113,16 @@
       role="presentation"
     >{item.name}</span>
   {/if}
+  <span class="cid-chip" data-testid="cid-chip" title={item.cid}>cid:{shortCid(item.cid)}</span>
   <span class="file-row-size">{size}</span>
-  <span class="file-row-accessed">{lastAccessed}</span>
-  <StalenessIndicator score={item.stalenessScore} pinned={item.pinned} />
-  <span class="file-row-replication">{replication}</span>
+  {#if !item.isFolder}
+    <span class="replication-chip" class:healthy class:at-risk={!healthy}>
+      <span class="replication-dot" aria-hidden="true"></span>
+      ×{item.replicaCount} {healthy ? 'healthy' : 'at risk'}
+    </span>
+  {:else}
+    <span class="file-row-replication-empty" aria-hidden="true">—</span>
+  {/if}
   <span class="file-row-sensitivity" aria-hidden="true">{sensIcon}</span>
 </button>
 
@@ -177,13 +184,61 @@
   }
 
   .file-row-size,
-  .file-row-accessed,
-  .file-row-replication {
+  .file-row-replication-empty {
     flex-shrink: 0;
     font-size: 0.8rem;
     color: var(--text-muted);
     min-width: 60px;
     text-align: right;
+  }
+
+  .cid-chip {
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--faint);
+    background: var(--bg-tertiary);
+    border-radius: 999px;
+    padding: 1px 8px;
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .replication-chip {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    border-radius: 999px;
+    padding: 1px 8px;
+    min-width: 60px;
+  }
+
+  .replication-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .replication-chip.healthy {
+    color: var(--accent);
+  }
+
+  .replication-chip.healthy .replication-dot {
+    background: var(--accent);
+  }
+
+  .replication-chip.at-risk {
+    color: var(--gov-clay);
+  }
+
+  .replication-chip.at-risk .replication-dot {
+    background: var(--gov-clay);
   }
 
   .file-row-sensitivity {

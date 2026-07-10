@@ -11,9 +11,6 @@ const mockDetail: ContentDetail = {
   sensitivity: 'private',
   sizeBytes: 1024,
   storedAt: Date.now() - 86400000,
-  lastAccessed: Date.now() - 3600000,
-  accessCount: 5,
-  stalenessScore: 0.4,
   replicationTier: 'default',
   replicaCount: 3,
   pinned: false,
@@ -74,9 +71,10 @@ describe('FileDetailPanel', () => {
     expect(screen.getByText(/Private/)).toBeTruthy();
   });
 
-  it('shows staleness score', () => {
-    renderPanel();
-    expect(screen.getByText(/0\.40/)).toBeTruthy();
+  it('omits the fabricated staleness bar (ZEB-612 S3)', () => {
+    const { container } = renderPanel();
+    expect(container.querySelector('.staleness-bar-track')).toBeNull();
+    expect(screen.queryByText(/0\.40/)).toBeNull();
   });
 
   it('shows Pin button when item is not pinned', () => {

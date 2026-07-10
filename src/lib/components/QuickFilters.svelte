@@ -13,7 +13,6 @@
   $effect(() => {
     if (Object.keys(filters).length === 0) {
       selectedCategories = new Set();
-      stale = false;
       pinned = false;
       licensed = false;
       underReplicated = false;
@@ -46,7 +45,6 @@
 
   // Filter state
   let selectedCategories = $state<Set<ContentCategory>>(new Set());
-  let stale = $state(false);
   let pinned = $state(false);
   let licensed = $state(false);
   let underReplicated = $state(false);
@@ -55,7 +53,6 @@
   function emitFilters() {
     onFilterChange?.({
       categories: Array.from(selectedCategories),
-      stale,
       pinned,
       licensed,
       underReplicated,
@@ -74,9 +71,8 @@
     emitFilters();
   }
 
-  function toggleStatus(key: 'stale' | 'pinned' | 'licensed' | 'underReplicated') {
-    if (key === 'stale') stale = !stale;
-    else if (key === 'pinned') pinned = !pinned;
+  function toggleStatus(key: 'pinned' | 'licensed' | 'underReplicated') {
+    if (key === 'pinned') pinned = !pinned;
     else if (key === 'licensed') licensed = !licensed;
     else if (key === 'underReplicated') underReplicated = !underReplicated;
     emitFilters();
@@ -135,9 +131,6 @@
     </button>
     {#if statusOpen}
       <div class="section-body status-buttons">
-        <button type="button" class="filter-btn" class:active={stale}
-          aria-pressed={stale ? 'true' : 'false'}
-          onclick={() => toggleStatus('stale')}>Stale</button>
         <button type="button" class="filter-btn" class:active={pinned}
           aria-pressed={pinned ? 'true' : 'false'}
           onclick={() => toggleStatus('pinned')}>Pinned</button>

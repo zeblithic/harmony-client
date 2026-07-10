@@ -240,10 +240,12 @@ export interface ContentItem {
   sensitivity: ContentSensitivity;
   sizeBytes: number;
   storedAt: number;
-  lastAccessed: number;
-  accessCount: number;
-  stalenessScore: number;
   replicationTier: ReplicationTier;
+  /** ZEB-612 S3: observed replica count — 1 (self) + distinct peer
+   *  sessions seen announcing this CID. A lower bound ("copies seen").
+   *  The fabricated lastAccessed/accessCount/stalenessScore fields were
+   *  removed with their renderers; real signals return with real
+   *  backends. */
   replicaCount: number;
   pinned: boolean;
   licensed: boolean;

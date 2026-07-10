@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { categoryIcon, mimeCategoryIcon, tierTarget, formatBytes, relativeTime } from './file-utils';
+import { categoryIcon, mimeCategoryIcon, tierTarget, formatBytes, relativeTime, shortCid } from './file-utils';
 
 describe('categoryIcon', () => {
   it('returns music note for music', () => {
@@ -84,5 +84,17 @@ describe('relativeTime', () => {
   it('returns months', () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_000_000_000);
     expect(relativeTime(1_000_000_000 - 90 * 86_400_000)).toBe('3mo ago');
+  });
+});
+
+describe('shortCid (ZEB-612 S3)', () => {
+  it('truncates long hex cids to first-6…last-4', () => {
+    expect(
+      shortCid('3f9a2c81d4e5f60718293a4b5c6d7e8f3f9a2c81d4e5f60718293a4b5c6d7e8f'),
+    ).toBe('3f9a2c…7e8f');
+  });
+
+  it('passes short cids through unchanged', () => {
+    expect(shortCid('abcdef123456')).toBe('abcdef123456');
   });
 });

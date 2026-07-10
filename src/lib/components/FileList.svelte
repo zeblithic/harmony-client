@@ -59,10 +59,9 @@
   <div class="file-list-header" role="row">
     <span class="header-icon" aria-hidden="true"></span>
     <span class="header-name" role="columnheader">Name</span>
+    <span class="header-cid" role="columnheader">CID</span>
     <span class="header-size" role="columnheader">Size</span>
-    <span class="header-accessed" role="columnheader">Last Accessed</span>
-    <span class="header-staleness" role="columnheader">Staleness</span>
-    <span class="header-replicas" role="columnheader">Replicas</span>
+    <span class="header-replicas" role="columnheader">Replication</span>
     <span class="header-sensitivity" aria-hidden="true"></span>
   </div>
   {#if creatingFolder}
@@ -125,16 +124,15 @@
   }
 
   .header-size,
-  .header-accessed,
   .header-replicas {
     flex-shrink: 0;
     min-width: 60px;
     text-align: right;
   }
 
-  .header-staleness {
+  .header-cid {
     flex-shrink: 0;
-    min-width: 8px;
+    min-width: 130px;
   }
 
   .header-sensitivity {

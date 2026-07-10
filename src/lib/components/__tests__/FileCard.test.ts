@@ -11,9 +11,6 @@ const baseItem: ContentItem = {
   sensitivity: 'public',
   sizeBytes: 8_500_000,
   storedAt: Date.now() - 30 * 86_400_000,
-  lastAccessed: Date.now() - 5 * 86_400_000,
-  accessCount: 10,
-  stalenessScore: 0.15,
   replicationTier: 'default',
   replicaCount: 3,
   pinned: false,
@@ -28,10 +25,9 @@ describe('FileCard', () => {
     expect(screen.getByText('photo.jpg')).toBeTruthy();
   });
 
-  it('shows staleness badge overlay for stale content', () => {
-    const staleItem: ContentItem = { ...baseItem, stalenessScore: 0.7 };
-    const { container } = render(FileCard, { props: { item: staleItem } });
-    expect(container.querySelector('.staleness-dot')).toBeTruthy();
+  it('omits the fabricated staleness badge (ZEB-612 S3)', () => {
+    const { container } = render(FileCard, { props: { item: baseItem } });
+    expect(container.querySelector('.staleness-dot')).toBeNull();
   });
 
   it('calls onClick with ContentItem when clicked', async () => {
