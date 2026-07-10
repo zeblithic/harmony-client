@@ -259,6 +259,7 @@ pub mod state_snapshot;
 pub mod tunnel_manager;
 pub mod tunnel_task;
 pub mod vine_feed_cache;
+pub mod vine_tombstone;
 pub mod voice;
 pub mod voice_crypto;
 pub mod voice_moderation;
