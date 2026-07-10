@@ -2168,12 +2168,8 @@
       tryConnect('mail', mailService.connectAdapter(adapter));
       await tryConnect('vine', vineService.connectAdapter(adapter));
       await tryConnect('vine.loadFollowed', vineService.loadFollowed());
-      // ZEB-612 S2: pull the Rust-persisted feed cache (descriptors +
-      // viewed-set) — vine-received only fires on FIRST insert, so a
-      // restarted app never re-receives what the cache already holds.
-      // Must run after loadFollowed: hydrate classifies rows by the
-      // follow set (the list DTO carries no source field).
-      await tryConnect('vine.hydrate', vineService.hydrate());
+      // (vine.hydrate moved below fetchOwnAddress — ZEB-672: own persisted
+      // reaction rows must resolve likedByMe, which needs ownAddress.)
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
       // ZEB-663: base channel-config handler — keep the nav tree's channel
@@ -2247,6 +2243,15 @@
         }
       }
       await fetchOwnAddress();
+
+      // ZEB-612 S2: pull the Rust-persisted feed cache (descriptors +
+      // viewed-set + reactions, ZEB-672) — vine-received /
+      // vine-reaction-received only fire on FIRST receipt, so a restarted
+      // app never re-receives what the cache already holds. Must run after
+      // loadFollowed (hydrate classifies rows by the follow set; the list
+      // DTO carries no source field) and after fetchOwnAddress (own
+      // reaction rows resolve likedByMe by matching ownAddress).
+      await tryConnect('vine.hydrate', vineService.hydrate());
 
       // ZEB-666: rehydrate persisted DM / group-DM rows the same way — the
       // nav otherwise boots with NO DM rows (push-only; only runtime

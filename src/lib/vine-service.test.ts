@@ -934,6 +934,26 @@ describe('hydrate (ZEB-612 S2 — restart survival for the Rust-persisted cache)
     videoCid: 'cid-h1', viewed: false, ...over,
   });
 
+  type ReactionRow = {
+    vineId: string; reactorAddress: string; reactorName: string;
+    liked: boolean; timestamp: number;
+  };
+
+  // hydrate() now pulls both persisted stores (ZEB-672) — every mock must
+  // answer list_vine_reactions too, or the merge would iterate null.
+  const mockHydrateInvoke = (
+    adapter: { invoke: unknown },
+    rows: unknown[],
+    reactions: ReactionRow[] = [],
+  ) => {
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
+      cmd === 'list_vine_videos'
+        ? Promise.resolve(rows)
+        : cmd === 'list_vine_reactions'
+          ? Promise.resolve(reactions)
+          : Promise.resolve(null));
+  };
+
   it('is a no-op without an adapter', async () => {
     const fresh = new VineService({ seedMockData: false });
     await expect(fresh.hydrate()).resolves.toBeUndefined();
@@ -944,13 +964,10 @@ describe('hydrate (ZEB-612 S2 — restart survival for the Rust-persisted cache)
     const { adapter } = createMockAdapter();
     await svc2.connectAdapter(adapter);
     svc2.followedAddresses.add('peer-followed');
-    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
-      cmd === 'list_vine_videos'
-        ? Promise.resolve([
-            dto({ id: 'h1', creatorAddress: 'peer-followed' }),
-            dto({ id: 'h2', creatorAddress: 'peer-stranger', videoCid: 'cid-h2' }),
-          ])
-        : Promise.resolve(null));
+    mockHydrateInvoke(adapter, [
+      dto({ id: 'h1', creatorAddress: 'peer-followed' }),
+      dto({ id: 'h2', creatorAddress: 'peer-stranger', videoCid: 'cid-h2' }),
+    ]);
     await svc2.hydrate();
     expect(svc2.followedVines.map(v => v.id)).toEqual(['h1']);
     expect(svc2.discoverVines.map(v => v.id)).toEqual(['h2']);
@@ -960,10 +977,7 @@ describe('hydrate (ZEB-612 S2 — restart survival for the Rust-persisted cache)
     const svc2 = new VineService({ seedMockData: false });
     const { adapter } = createMockAdapter();
     await svc2.connectAdapter(adapter);
-    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
-      cmd === 'list_vine_videos'
-        ? Promise.resolve([dto({ id: 'h1', viewed: true }), dto({ id: 'h2', videoCid: 'c2' })])
-        : Promise.resolve(null));
+    mockHydrateInvoke(adapter, [dto({ id: 'h1', viewed: true }), dto({ id: 'h2', videoCid: 'c2' })]);
     await svc2.hydrate();
     expect(svc2.viewedIds.has('h1')).toBe(true);
     expect(svc2.viewedIds.has('h2')).toBe(false);
@@ -978,10 +992,7 @@ describe('hydrate (ZEB-612 S2 — restart survival for the Rust-persisted cache)
       createdAt: 5, videoCid: 'c', source: 'discover',
     });
     expect(svc2.viewedIds.has('live-1')).toBe(false);
-    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
-      cmd === 'list_vine_videos'
-        ? Promise.resolve([dto({ id: 'live-1', creatorAddress: 'p', viewed: true })])
-        : Promise.resolve(null));
+    mockHydrateInvoke(adapter, [dto({ id: 'live-1', creatorAddress: 'p', viewed: true })]);
     await svc2.hydrate();
     expect(svc2.vines.filter(v => v.id === 'live-1').length).toBe(1);
     expect(svc2.viewedIds.has('live-1')).toBe(true);
@@ -992,10 +1003,7 @@ describe('hydrate (ZEB-612 S2 — restart survival for the Rust-persisted cache)
     const { adapter } = createMockAdapter();
     await svc2.connectAdapter(adapter);
     svc2.ownAddress = 'me-hex';
-    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
-      cmd === 'list_vine_videos'
-        ? Promise.resolve([dto({ id: 'mine', creatorAddress: 'me-hex' })])
-        : Promise.resolve(null));
+    mockHydrateInvoke(adapter, [dto({ id: 'mine', creatorAddress: 'me-hex' })]);
     await svc2.hydrate();
     expect(svc2.discoverVines[0]?.creatorAddress).toBe('self');
     expect(svc2.viewedIds.has('mine')).toBe(true);
@@ -1007,12 +1015,84 @@ describe('hydrate (ZEB-612 S2 — restart survival for the Rust-persisted cache)
     await svc2.connectAdapter(adapter);
     const onChange = vi.fn();
     svc2.onChange = onChange;
-    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) =>
-      cmd === 'list_vine_videos'
-        ? Promise.resolve([dto({ id: 'h1' }), dto({ id: 'h2', videoCid: 'c2' })])
-        : Promise.resolve(null));
+    // Reaction rows in the same batch must not add a second onChange.
+    mockHydrateInvoke(adapter, [dto({ id: 'h1' }), dto({ id: 'h2', videoCid: 'c2' })], [
+      { vineId: 'h1', reactorAddress: 'bob', reactorName: 'Bob', liked: true, timestamp: 10 },
+    ]);
     await svc2.hydrate();
     expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Reaction rehydration (ZEB-672) ─────────────────────────────────
+
+  it('restores reaction counts and likedByMe from list_vine_reactions', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    svc2.ownAddress = 'me-hex';
+    mockHydrateInvoke(adapter, [dto({ id: 'h1' })], [
+      { vineId: 'h1', reactorAddress: 'bob', reactorName: 'Bob', liked: true, timestamp: 10 },
+      { vineId: 'h1', reactorAddress: 'me-hex', reactorName: 'You', liked: true, timestamp: 11 },
+    ]);
+    await svc2.hydrate();
+    expect(svc2.getReaction('h1')).toEqual({ count: 2, likedByMe: true });
+  });
+
+  it('dedupes hydrated rows against a live event that raced ahead', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter, emit } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    svc2.ownAddress = 'me-hex';
+    // Live traffic lands first: the vine, then bob's reaction.
+    emit('vine-received', {
+      id: 'h1', creatorAddress: 'peer-a', creatorName: 'A',
+      createdAt: 100, videoCid: 'cid-h1', source: 'discover',
+    });
+    emit('vine-reaction-received', {
+      vineId: 'h1', reactorAddress: 'bob', reactorName: 'Bob', liked: true, timestamp: 10,
+    });
+    expect(svc2.getReaction('h1').count).toBe(1);
+    // Hydrate returns the SAME reactor persisted on disk — no double-count.
+    mockHydrateInvoke(adapter, [dto({ id: 'h1' })], [
+      { vineId: 'h1', reactorAddress: 'bob', reactorName: 'Bob', liked: true, timestamp: 10 },
+    ]);
+    await svc2.hydrate();
+    expect(svc2.getReaction('h1')).toEqual({ count: 1, likedByMe: false });
+  });
+
+  it('skips liked=false rows and rows for unknown vines', async () => {
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    mockHydrateInvoke(adapter, [dto({ id: 'h1' })], [
+      { vineId: 'h1', reactorAddress: 'ann', reactorName: 'Ann', liked: false, timestamp: 9 },
+      { vineId: 'ghost', reactorAddress: 'bob', reactorName: 'Bob', liked: true, timestamp: 10 },
+    ]);
+    await svc2.hydrate();
+    expect(svc2.getReaction('h1')).toEqual({ count: 0, likedByMe: false });
+    expect(svc2.getReaction('ghost')).toEqual({ count: 0, likedByMe: false });
+  });
+
+  it('toggleLike on a hydrated own-like unlikes instead of double-counting', async () => {
+    // Regression pin for the latent count hazard: the optimistic toggle
+    // used to mutate count without consulting the reactors set, so a
+    // hydrated own-row followed by a like would have double-counted.
+    const svc2 = new VineService({ seedMockData: false });
+    const { adapter } = createMockAdapter();
+    await svc2.connectAdapter(adapter);
+    svc2.ownAddress = 'me-hex';
+    mockHydrateInvoke(adapter, [dto({ id: 'h1' })], [
+      { vineId: 'h1', reactorAddress: 'me-hex', reactorName: 'You', liked: true, timestamp: 10 },
+    ]);
+    await svc2.hydrate();
+    expect(svc2.getReaction('h1')).toEqual({ count: 1, likedByMe: true });
+    const vine = svc2.findVine('h1');
+    expect(vine).toBeDefined();
+    await svc2.toggleLike(vine!);
+    expect(svc2.getReaction('h1')).toEqual({ count: 0, likedByMe: false });
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine_reaction', expect.objectContaining({
+      reaction: expect.objectContaining({ liked: false }),
+    }));
   });
 });
 

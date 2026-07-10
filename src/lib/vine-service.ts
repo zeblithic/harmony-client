@@ -385,7 +385,43 @@ export class VineService {
     if (followedAdd.length > 0) this.followedVines = [...this.followedVines, ...followedAdd];
     if (discoverAdd.length > 0) this.discoverVines = [...this.discoverVines, ...discoverAdd];
     if (viewedGrew) this.viewedIds = viewed;
-    if (viewedGrew || followedAdd.length > 0 || discoverAdd.length > 0) this.onChange?.();
+
+    // ZEB-672: rebuild the reaction map from the Rust-persisted rows —
+    // vine-reaction-received only fires on live receipt, so reloaded
+    // reactions never re-emit. Same dedupe posture as the live handler
+    // (the reactors set); rows are orphan-pruned by the cache, so the
+    // known-vine check is belt-and-braces. Own rows resolve likedByMe,
+    // which is why App.svelte hydrates only after fetchOwnAddress.
+    const reactionRows = (await this.adapter.invoke('list_vine_reactions', {})) as Array<{
+      vineId: string;
+      reactorAddress: string;
+      reactorName: string;
+      liked: boolean;
+      timestamp: number;
+    }>;
+    let reactionsChanged = false;
+    for (const row of reactionRows) {
+      if (!row.liked) continue; // unliked rows carry no boot-time count state
+      const known = this.followedVines.some(v => v.id === row.vineId)
+        || this.discoverVines.some(v => v.id === row.vineId);
+      if (!known) continue;
+      const entry = this.reactionMap.get(row.vineId)
+        ?? { count: 0, likedByMe: false, reactors: new Set<string>() };
+      if (!entry.reactors.has(row.reactorAddress)) {
+        entry.reactors.add(row.reactorAddress);
+        entry.count += 1;
+        reactionsChanged = true;
+      }
+      if (this.ownAddress != null && row.reactorAddress === this.ownAddress && !entry.likedByMe) {
+        entry.likedByMe = true;
+        reactionsChanged = true;
+      }
+      this.reactionMap.set(row.vineId, entry);
+    }
+
+    if (viewedGrew || followedAdd.length > 0 || discoverAdd.length > 0 || reactionsChanged) {
+      this.onChange?.();
+    }
   }
 
   /**
@@ -461,12 +497,19 @@ export class VineService {
       entry.reactors.delete('self');
       entry.reactors.add(selfKey);
     }
+    // Count math is guarded on set membership so the toggle is idempotent
+    // against state that already tracks us — e.g. a hydrated own-like row
+    // (ZEB-672): liking again must not double-count, unliking must find
+    // the row to remove.
     entry.likedByMe = newLiked;
-    entry.count = Math.max(0, entry.count + (newLiked ? 1 : -1));
     if (newLiked) {
-      entry.reactors.add(selfKey);
-    } else {
+      if (!entry.reactors.has(selfKey)) {
+        entry.reactors.add(selfKey);
+        entry.count += 1;
+      }
+    } else if (entry.reactors.has(selfKey)) {
       entry.reactors.delete(selfKey);
+      entry.count = Math.max(0, entry.count - 1);
     }
     this.reactionMap.set(vine.id, entry);
     this.onChange?.();
@@ -489,13 +532,17 @@ export class VineService {
           },
         });
       } catch {
-        // Rollback on failure
+        // Rollback on failure — same set-guarded math as the optimistic
+        // step, so a rollback over unexpected state stays consistent.
         entry.likedByMe = wasLiked;
-        entry.count = Math.max(0, entry.count + (wasLiked ? 1 : -1));
         if (wasLiked) {
-          entry.reactors.add(selfKey);
-        } else {
+          if (!entry.reactors.has(selfKey)) {
+            entry.reactors.add(selfKey);
+            entry.count += 1;
+          }
+        } else if (entry.reactors.has(selfKey)) {
           entry.reactors.delete(selfKey);
+          entry.count = Math.max(0, entry.count - 1);
         }
         this.reactionMap.set(vine.id, entry);
         this.onChange?.();
