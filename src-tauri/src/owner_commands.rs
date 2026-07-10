@@ -137,7 +137,7 @@ fn derive_this_device_id(sk: &ed25519_dalek::SigningKey) -> [u8; 16] {
 /// Format the first 4 bytes of a 16-byte device_id as `xxxx·xxxx`
 /// for display. The full id is internal plumbing — see the
 /// "Two-address world" section of the design spec.
-fn format_fingerprint(id: &[u8; 16]) -> String {
+pub(crate) fn format_fingerprint(id: &[u8; 16]) -> String {
     let hex = hex::encode(id);
     format!("{}·{}", &hex[..4], &hex[4..8])
 }
