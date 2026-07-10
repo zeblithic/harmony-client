@@ -762,6 +762,10 @@ pub struct NodeState {
     mail_sync: Option<std::sync::Arc<mail_sync::MailSync>>,
     /// Disk-backed content index (pin/replication metadata).
     content_index: std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    /// ZEB-612 S3: per-CID distinct announcing sessions, written by the
+    /// event loop's `harmony/announce/*` arm, read by list_content /
+    /// list_root for `replicaCount` (1 self + observed peers).
+    observed_holders: std::sync::Arc<std::sync::Mutex<observed_holders::ObservedHolders>>,
     /// Monotonic install generation. Bumped at lock-2 install site under
     /// `start_node`. Post-install checks (pairing-handle install, failure
     /// cleanup, stop_inner gating) compare against this to detect whether a
@@ -1607,6 +1611,9 @@ impl Default for NodeState {
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
                 content_index::ContentIndex::load(std::path::Path::new("")),
+            )),
+            observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
+                observed_holders::ObservedHolders::new(),
             )),
             generation: 0,
             install_seq: 0,
@@ -9247,6 +9254,14 @@ pub async fn start_node_inner(
                     idx.entries().filter(|e| e.pinned).map(|e| e.cid).collect()
                 };
 
+                // ZEB-612 S3: fresh holder map per node generation (holder
+                // zids are per-session; a restart invalidates them anyway).
+                let observed_holders = std::sync::Arc::new(std::sync::Mutex::new(
+                    observed_holders::ObservedHolders::new(),
+                ));
+                let observed_holders_for_loop = observed_holders.clone();
+                let content_index_for_loop = content_index.clone();
+
                 let ep_clone = endpoint.clone();
                 let app_clone = app.clone();
                 let mail_mgr_clone = mail_mgr.clone();
@@ -9497,6 +9512,10 @@ pub async fn start_node_inner(
                                 // sweep hook installed inside run once the handle
                                 // exists).
                                 addr_fanout_for_loop,
+                                // ZEB-612 S3: holder map + content index for the
+                                // announce-note arm and the re-announce tick.
+                                observed_holders_for_loop,
+                                content_index_for_loop,
                             )
                             .await;
                         });
@@ -9528,6 +9547,7 @@ pub async fn start_node_inner(
                         guard.ingest_tx = Some(ingest_tx);
                         guard.content_verb_tx = Some(content_verb_tx);
                         guard.content_index = content_index;
+                        guard.observed_holders = observed_holders;
                         guard.follow_tx = Some(follow_tx);
                         guard.voice_tx = Some(voice_tx);
                         guard.voice_channel_tx = Some(voice_channel_tx);
@@ -13337,6 +13357,32 @@ pub fn parse_content_announcement(
         cid: cid_hex.to_string(),
         size_bytes,
     })
+}
+
+/// ZEB-612 S3: build re-announcement publishes for the announceable
+/// subset of the content index — `Sensitivity::Public`, non-archived,
+/// deduped by CID (symlink-style sidecars share CIDs). This mirrors
+/// harmony-content's `should_announce` class gate: encrypted content
+/// must not leak existence on the announce topic. Payload is the 4-byte
+/// BE size `parse_content_announcement` pins; sizes over u32::MAX
+/// saturate (the announce size is advisory).
+pub fn collect_reannouncements(index: &content_index::ContentIndex) -> Vec<(String, Vec<u8>)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for entry in index.entries() {
+        if entry.sensitivity != content_index::Sensitivity::Public || entry.archived {
+            continue;
+        }
+        if !seen.insert(entry.cid) {
+            continue;
+        }
+        let size = u32::try_from(entry.size_bytes).unwrap_or(u32::MAX);
+        out.push((
+            format!("harmony/announce/{}", hex::encode(entry.cid)),
+            size.to_be_bytes().to_vec(),
+        ));
+    }
+    out
 }
 
 /// Wire format returned by `list_content` — one entry per self-ingested
@@ -54090,6 +54136,93 @@ mod tests {
         assert!(parse_content_announcement("harmony/announce/hello world", &payload).is_none());
     }
 
+    fn reannounce_entry(
+        cid: [u8; 32],
+        sensitivity: content_index::Sensitivity,
+        archived: bool,
+        size_bytes: u64,
+    ) -> content_index::ContentIndexEntry {
+        content_index::ContentIndexEntry {
+            sidecar_id: content_index::SidecarId::new(),
+            cid,
+            file_name: "hello.txt".into(),
+            size_bytes,
+            stored_at_ms: 1_700_000_000_000,
+            sensitivity,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived,
+            pinned: false,
+            kind: content_index::ContentKind::Leaf,
+        }
+    }
+
+    #[test]
+    fn collect_reannouncements_public_only_deduped() {
+        use content_index::Sensitivity;
+        let mut index = content_index::ContentIndex::load(std::path::Path::new(""));
+        index.insert(reannounce_entry(
+            [0xAA; 32],
+            Sensitivity::Public,
+            false,
+            1024,
+        ));
+        // Symlink-style second sidecar sharing the CID — must dedupe.
+        index.insert(reannounce_entry(
+            [0xAA; 32],
+            Sensitivity::Public,
+            false,
+            1024,
+        ));
+        index.insert(reannounce_entry(
+            [0xBB; 32],
+            Sensitivity::Private,
+            false,
+            2048,
+        ));
+        index.insert(reannounce_entry(
+            [0xCC; 32],
+            Sensitivity::Confidential,
+            false,
+            2048,
+        ));
+        index.insert(reannounce_entry(
+            [0xDD; 32],
+            Sensitivity::Public,
+            true,
+            4096,
+        ));
+
+        let out = collect_reannouncements(&index);
+        assert_eq!(
+            out.len(),
+            1,
+            "private/confidential + archived excluded, shared CID deduped"
+        );
+        let (key, payload) = &out[0];
+        assert_eq!(
+            key,
+            &format!("harmony/announce/{}", hex::encode([0xAA; 32]))
+        );
+        assert_eq!(payload.as_slice(), &1024u32.to_be_bytes());
+        // Round-trip: the re-announce payload parses with the pinned parser.
+        let parsed = parse_content_announcement(key, payload).expect("self-parseable");
+        assert_eq!(parsed.size_bytes, 1024);
+    }
+
+    #[test]
+    fn collect_reannouncements_saturates_oversized() {
+        let mut index = content_index::ContentIndex::load(std::path::Path::new(""));
+        index.insert(reannounce_entry(
+            [0xEE; 32],
+            content_index::Sensitivity::Public,
+            false,
+            u64::MAX,
+        ));
+        let out = collect_reannouncements(&index);
+        assert_eq!(out[0].1.as_slice(), &u32::MAX.to_be_bytes());
+    }
+
     #[test]
     fn list_folder_rejects_non_manifest_child_0() {
         use crate::folders::FolderManifest;
@@ -58159,6 +58292,9 @@ mod start_node_race_tests {
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
                 content_index::ContentIndex::load(std::path::Path::new("")),
+            )),
+            observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
+                observed_holders::ObservedHolders::new(),
             )),
             generation: 0,
             install_seq: 0,

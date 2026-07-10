@@ -1078,6 +1078,16 @@ pub async fn run(
     // exists, so a real self-address change kicks a presence sweep. `None` in
     // test callers that bypass `start_node` (the fan-out simply never sweeps).
     addr_change_fanout: Option<std::sync::Arc<crate::addr_change_fanout::AddrChangeFanout>>,
+    // ZEB-612 S3: per-CID distinct announcing sessions, written by the
+    // `harmony/announce/*` subscription arm below, swept + refreshed by the
+    // re-announce tick, read by list_content/list_root for `replicaCount`.
+    // Test callers that don't exercise announcements pass a fresh Arc.
+    observed_holders: std::sync::Arc<std::sync::Mutex<crate::observed_holders::ObservedHolders>>,
+    // ZEB-612 S3: the disk-backed content index, used by the re-announce
+    // tick to rebuild this node's announceable set (Public, non-archived).
+    // Same Arc as NodeState.content_index in production; test callers that
+    // don't exercise re-announcement pass a fresh empty index.
+    content_index: std::sync::Arc<std::sync::Mutex<crate::content_index::ContentIndex>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -3286,6 +3296,19 @@ pub async fn run(
     // idle gap during which the gated branch wasn't polled.
     voice_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // ── ZEB-612 S3: content re-announce + holder sweep ────────────────
+    // No upstream re-announcement exists (announces fire only on
+    // store/publish — harmony-content storage_tier), so a staleness-pruned
+    // holder map would decay to empty. This node refreshes its own
+    // announceable content every REANNOUNCE_INTERVAL_MS; receivers sweep
+    // holders at 3× (HOLDER_STALE_MS). O(library) tiny publishes per
+    // interval — acceptable at current scale; real hosting accounting is
+    // ZEB-669.
+    let mut reannounce_tick = tokio::time::interval(Duration::from_millis(
+        crate::observed_holders::REANNOUNCE_INTERVAL_MS,
+    ));
+    reannounce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // ── ZEB-358 voice moderation ──────────────────────────────────
     // Receiver-side enforcement state shared with the per-channel control
     // subscriber tasks (apply on receipt) and the loop (issue + sweep).
@@ -3703,6 +3726,23 @@ pub async fn run(
                                 }
                             }
                             continue;
+                        }
+                        // ZEB-612 S3: record distinct announcing sessions per
+                        // CID. Own announcements loop back on the local
+                        // session — exclude own_zid so `replicaCount = 1
+                        // (self) + peers` doesn't double-count. Samples
+                        // without source info can't be attributed and are
+                        // skipped (the count is an observed lower bound).
+                        if key_expr.starts_with("harmony/announce/") {
+                            if let (Some(zid), Some(a)) = (
+                                source_zid.as_ref(),
+                                crate::parse_content_announcement(&key_expr, &payload),
+                            ) {
+                                if *zid != own_zid {
+                                    let now = start.elapsed().as_millis() as u64;
+                                    observed_holders.lock().unwrap().note(&a.cid, zid, now);
+                                }
+                            }
                         }
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
@@ -5506,6 +5546,31 @@ pub async fn run(
             // so a node with none joined never wakes here (Cursor review).
             // ZEB-360: also fires while any group-DM presence subscriber is live,
             // so a crashed group-call participant's ghost row TTL-evicts too.
+            // ── ZEB-612 S3: holder sweep + own-content re-announce ────
+            _ = reannounce_tick.tick() => {
+                let now = start.elapsed().as_millis() as u64;
+                observed_holders
+                    .lock()
+                    .unwrap()
+                    .sweep(now, crate::observed_holders::HOLDER_STALE_MS);
+                // Collect under the lock, publish after dropping it — a
+                // std Mutex guard must never be held across an await.
+                let announcements = {
+                    let idx = content_index.lock().unwrap();
+                    crate::collect_reannouncements(&idx)
+                };
+                for (key_expr, payload) in announcements {
+                    dispatch_action(
+                        RuntimeAction::Publish { key_expr, payload },
+                        &session,
+                        &zenoh_tx,
+                        &app,
+                        &closing,
+                        &own_zid,
+                    )
+                    .await;
+                }
+            }
             _ = voice_sweep_tick.tick(),
                 if !voice_keys.is_empty() || !groupdm_presence_subs.is_empty() => {
                 let now = (voice_now_ms)();
