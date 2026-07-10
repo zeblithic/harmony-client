@@ -374,9 +374,87 @@
         </section>
       </div>
 
-      <!-- RAIL (Task 4) -->
+      <aside class="th-rail" aria-label="Floor">
+        <section class="th-queue" aria-label="Speaker queue">
+          <h3 class="th-section-label">Speaker queue</h3>
+          {#if queue.length === 0}
+            <p class="th-queue-empty">No raised hands yet.</p>
+          {:else}
+            <ol class="th-queue-list">
+              {#each queue as m, i (m.deviceHex)}
+                <li class="th-queue-row" class:dimmed={m.invited} data-testid="th-queue-row">
+                  <span class="q-num" class:first={i === 0}>{i + 1}</span>
+                  {#if m.avatarUrl}
+                    <img class="q-avatar" src={m.avatarUrl} alt="" />
+                  {:else}
+                    <div class="q-avatar q-avatar-fallback" aria-hidden="true"></div>
+                  {/if}
+                  <span class="q-text">
+                    <span class="q-name">{label(m)}</span>
+                    <span class="q-wants">wants to speak ✋</span>
+                  </span>
+                  {#if m.invited}
+                    <span class="q-invited">invited</span>
+                  {:else}
+                    <button
+                      type="button"
+                      class="q-invite"
+                      class:primary={i === 0}
+                      data-testid="th-invite"
+                      disabled={$voiceState.selfPower < MOD_POWER}
+                      title={$voiceState.selfPower < MOD_POWER ? 'Moderators can invite to speak' : ''}
+                      onclick={() => swallow(session.inviteToSpeak(m.ownerHex))}
+                    >Invite</button>
+                  {/if}
+                </li>
+              {/each}
+            </ol>
+          {/if}
+        </section>
+
+        <TownHallMotionCard
+          {communityId}
+          {channelId}
+          adapter={votingAdapter}
+          {presentCount}
+          quorum={adminQuorum}
+          canAct={$voiceState.phase === 'connected'}
+          {onOpenProposals}
+        />
+
+        <section class="th-backchannel" aria-label="Backchannel">
+          <h3 class="th-section-label">Backchannel</h3>
+          <div class="th-backchannel-feed">
+            <ChannelMessageFeed
+              {communityId}
+              {channelId}
+              {channelName}
+              {channelMessageService}
+              {votingAdapter}
+              {ownAddress}
+              {myPower}
+              {snapshotMessages}
+              {originalCommunityName}
+              {forkedAtMs}
+              {forkReason}
+              {resolveCard}
+              {resolveNickname}
+              {onOpenCard}
+              {mentionCandidates}
+              composerPlaceholder="Message the room…"
+            />
+          </div>
+        </section>
+      </aside>
     </div>
 
+    {#if $voiceState.selfInvited && !inviteHandled}
+      <div class="th-invited-banner" role="status" data-testid="th-invited-banner">
+        <span>You've been invited to speak — Unmute?</span>
+        <button type="button" class="btn-primary" data-testid="th-invite-accept" onclick={acceptInvite}>Unmute</button>
+        <button type="button" class="ctrl" data-testid="th-invite-dismiss" onclick={dismissInvite}>Dismiss</button>
+      </div>
+    {/if}
     {#if $voiceState.selfModMuted}
       <div class="th-mod-note" role="status" data-testid="self-mod-muted">
         🛡 You've been muted by a moderator. Your talk controls are disabled until they unmute you.
@@ -812,4 +890,109 @@
     cursor: pointer;
   }
   .btn-danger:hover { filter: brightness(1.1); }
+
+  /* ── Right rail ── */
+  .th-rail {
+    width: 340px;
+    flex-shrink: 0;
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 1rem 0.75rem;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .th-queue-empty { margin: 0; font-size: 0.8rem; color: var(--text-muted); }
+  .th-queue-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .th-queue-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: var(--bg-secondary);
+  }
+  .th-queue-row.dimmed { opacity: 0.55; }
+  .q-num {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    width: 16px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+  .q-num.first { color: var(--gov-clay); font-weight: 700; }
+  .q-avatar {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+    flex-shrink: 0;
+  }
+  .q-avatar-fallback { background: var(--bg-tertiary); border: 1px solid var(--border); }
+  .q-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+  .q-name {
+    font-size: 0.82rem;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .q-wants { font-size: 0.7rem; color: var(--text-muted); }
+  .q-invited {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+  .q-invite {
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    padding: 3px 10px;
+    border-radius: 5px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .q-invite.primary {
+    background: var(--accent);
+    color: var(--on-accent);
+  }
+  .q-invite:hover:not(:disabled) { filter: brightness(1.08); }
+  .q-invite:disabled { opacity: 0.5; cursor: not-allowed; }
+  .th-backchannel {
+    flex: 1;
+    min-height: 220px;
+    display: flex;
+    flex-direction: column;
+  }
+  .th-backchannel-feed {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .th-invited-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--gov-clay-soft);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 45%, transparent);
+    color: var(--gov-clay-deep);
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin: 0 16px 8px;
+    font-size: 0.85rem;
+  }
 </style>
