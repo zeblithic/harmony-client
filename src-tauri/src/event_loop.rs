@@ -2899,6 +2899,21 @@ pub async fn run(
     )
     .await;
 
+    // ZEB-670: subscribe to vine tombstones (creator-signed deletes).
+    // Own key space because the descriptor subscription `harmony/vines/*`
+    // is single-segment and cannot match the deeper tombstone keys.
+    dispatch_action(
+        RuntimeAction::Subscribe {
+            key_expr: "harmony/vines/*/tombstones/*".to_string(),
+        },
+        &session,
+        &zenoh_tx,
+        &app,
+        &closing,
+        &own_zid,
+    )
+    .await;
+
     // Note: per-creator Zenoh subscriptions are not used yet because the
     // publish path (harmony/vines/{addr}) does not include /announce/.
     // Once harmony-node adopts the full keyspace protocol
@@ -3773,7 +3788,7 @@ pub async fn run(
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
-                        emit_frontend_event(
+                        let vine_evict_cid = emit_frontend_event(
                             &app,
                             &key_expr,
                             &payload,
@@ -3785,6 +3800,44 @@ pub async fn run(
                             &own_root_key,
                             mail_sync.as_ref(),
                         );
+                        // ZEB-670: a vine tombstone freed the last live
+                        // reference to its content — burn the blob like
+                        // ContentVerbRequest::Burn, EXCEPT a deliberate
+                        // local pin outlives a remote tombstone (skip
+                        // entirely; never touch pin_intent).
+                        if let Some(cid_hex) = vine_evict_cid {
+                            match hex::decode(&cid_hex)
+                                .ok()
+                                .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                            {
+                                Some(cid_bytes) if pin_intent.contains(&cid_bytes) => {
+                                    tracing::info!(
+                                        cid = %cid_hex,
+                                        "vine tombstone: content locally pinned; keeping bytes"
+                                    );
+                                }
+                                Some(cid_bytes) => {
+                                    let root = ContentId::from_bytes(cid_bytes);
+                                    let doomed =
+                                        collect_descendants(runtime.storage_tier().cache(), root);
+                                    let keep = compute_keep_set(
+                                        runtime.storage_tier().cache(),
+                                        &pin_intent,
+                                        doomed.len(),
+                                    );
+                                    for id in doomed {
+                                        if !keep.contains(&id) {
+                                            runtime.unpin_content(&id);
+                                            let _ = runtime.remove_content(&id);
+                                        }
+                                    }
+                                }
+                                None => tracing::warn!(
+                                    cid = %cid_hex,
+                                    "vine tombstone: evict CID is not 32-byte hex; skipping evict"
+                                ),
+                            }
+                        }
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
                             payload,
@@ -7536,7 +7589,7 @@ fn emit_frontend_event(
     own_mail_key: &str,
     own_root_key: &str,
     mail_sync: Option<&Arc<crate::mail_sync::MailSync>>,
-) {
+) -> Option<String> {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
             update.hop_distance = hop_distance;
@@ -7551,6 +7604,12 @@ fn emit_frontend_event(
             crate::node_event_sink::emit_ser(app.as_ref(), "message-received", &msg);
         }
     } else if key_expr.starts_with("harmony/vines/") {
+        if key_expr.contains("/tombstones/") {
+            // ZEB-670: creator-signed delete. Returns the CID to evict
+            // when the tombstone freed the last live reference — the
+            // caller owns `runtime` + `pin_intent` and performs the burn.
+            return handle_vine_tombstone_sample(app, key_expr, payload, vine_feed_cache);
+        }
         if key_expr.contains("/reactions/") {
             // ZEB-286: route reaction through the cache. Re-emit to the
             // frontend ONLY on Inserted or UpdatedNewer (stale/duplicate
@@ -7645,7 +7704,7 @@ fn emit_frontend_event(
             Ok(g) => g,
             Err(e) => {
                 tracing::error!(error = %e, "mail_mgr mutex poisoned");
-                return;
+                return None;
             }
         };
         match mgr.receive_message(payload) {
@@ -7659,6 +7718,203 @@ fn emit_frontend_event(
                 tracing::debug!(key_expr, error = %e, "mail receive skipped");
             }
         }
+    }
+    None
+}
+
+/// ZEB-670: route a vine-tombstone sample through the cache; emit
+/// `vine-removed` when a cached descriptor was actually removed.
+/// Verification (signature, topic binding, ownership) happens inside
+/// `on_tombstone_sample`. Returns the hex CID to evict when the
+/// tombstone freed the last live reference to its content — the caller
+/// owns `runtime` + `pin_intent` and performs the (pin-guarded) burn.
+fn handle_vine_tombstone_sample(
+    app: &std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    key_expr: &str,
+    payload: &[u8],
+    vine_feed_cache: &std::sync::Arc<std::sync::Mutex<crate::vine_feed_cache::VineFeedCache>>,
+) -> Option<String> {
+    let outcome = match vine_feed_cache.lock() {
+        Ok(mut cache) => cache.on_tombstone_sample(key_expr, payload),
+        Err(e) => {
+            tracing::error!(error = %e, "vine_feed_cache mutex poisoned; skipping tombstone");
+            None
+        }
+    };
+    match outcome {
+        Some(crate::vine_feed_cache::TombstoneOutcome::Applied { removed, evict_cid }) => {
+            if let Some(removed) = removed {
+                crate::node_event_sink::emit_ser(app.as_ref(), "vine-removed", &removed);
+            }
+            evict_cid
+        }
+        Some(crate::vine_feed_cache::TombstoneOutcome::Rejected(reason)) => {
+            tracing::debug!(key_expr, reason, "vine tombstone rejected");
+            None
+        }
+        Some(crate::vine_feed_cache::TombstoneOutcome::AlreadyApplied) | None => None,
+    }
+}
+
+#[cfg(test)]
+mod vine_tombstone_routing_tests {
+    use super::handle_vine_tombstone_sample;
+    use crate::node_event_sink::{NodeEventSink, RecordingSink};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    struct Fixture {
+        recording: Arc<RecordingSink>,
+        sink: Arc<dyn NodeEventSink>,
+        cache: Arc<Mutex<crate::vine_feed_cache::VineFeedCache>>,
+        id: harmony_identity::PrivateIdentity,
+        addr: String,
+    }
+
+    fn fixture() -> Fixture {
+        let recording = RecordingSink::new();
+        let sink: Arc<dyn NodeEventSink> = Arc::new(recording.clone());
+        let cache = Arc::new(Mutex::new(crate::vine_feed_cache::VineFeedCache::new()));
+        let id = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let addr = hex::encode(id.public_identity().address_hash);
+        Fixture {
+            recording,
+            sink,
+            cache,
+            id,
+            addr,
+        }
+    }
+
+    fn insert_descriptor(
+        cache: &Arc<Mutex<crate::vine_feed_cache::VineFeedCache>>,
+        vine_id: &str,
+        addr: &str,
+        cid: &str,
+    ) {
+        let d = crate::VineDescriptorPayload {
+            id: vine_id.into(),
+            creator_address: addr.into(),
+            creator_name: "Creator".into(),
+            created_at: 1_700_000_000,
+            video_cid: cid.into(),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+        };
+        let outcome = cache.lock().unwrap().on_descriptor_sample(
+            &format!("harmony/vines/{addr}"),
+            &serde_json::to_vec(&d).unwrap(),
+            &HashSet::new(),
+            1_000,
+        );
+        assert!(matches!(
+            outcome,
+            Some(crate::vine_feed_cache::DescriptorOutcome::Inserted { .. })
+        ));
+    }
+
+    fn signed_tombstone_bytes(
+        id: &harmony_identity::PrivateIdentity,
+        vine_id: &str,
+        video_cid: &str,
+        addr: &str,
+    ) -> Vec<u8> {
+        let t = crate::vine_tombstone::sign_tombstone(
+            id,
+            vine_id.into(),
+            video_cid.into(),
+            addr.into(),
+            1_900_000_000,
+        );
+        serde_json::to_vec(&t).unwrap()
+    }
+
+    #[test]
+    fn applied_tombstone_emits_vine_removed_once_and_returns_evict_cid() {
+        let Fixture {
+            recording,
+            sink,
+            cache,
+            id,
+            addr,
+        } = fixture();
+        insert_descriptor(&cache, "vine-1", &addr, "aa".repeat(32).as_str());
+
+        let evict = handle_vine_tombstone_sample(
+            &sink,
+            &format!("harmony/vines/{addr}/tombstones/vine-1"),
+            &signed_tombstone_bytes(&id, "vine-1", &"aa".repeat(32), &addr),
+            &cache,
+        );
+
+        assert_eq!(evict.as_deref(), Some("aa".repeat(32).as_str()));
+        let frames = recording.frames();
+        assert_eq!(frames.len(), 1, "exactly one emit, got {frames:?}");
+        let (event, payload) = &frames[0];
+        assert_eq!(event, "vine-removed");
+        assert_eq!(payload["vineId"], "vine-1");
+        assert_eq!(payload["videoCid"], "aa".repeat(32));
+        assert_eq!(payload["creatorAddress"], addr);
+    }
+
+    #[test]
+    fn rejected_tombstone_emits_nothing() {
+        let Fixture {
+            recording,
+            sink,
+            cache,
+            id,
+            addr,
+        } = fixture();
+        insert_descriptor(&cache, "vine-1", &addr, "cid-aaa");
+
+        let mut t: crate::vine_tombstone::VineTombstonePayload =
+            serde_json::from_slice(&signed_tombstone_bytes(&id, "vine-1", "cid-aaa", &addr))
+                .unwrap();
+        t.sig = hex::encode([0u8; 64]);
+
+        let evict = handle_vine_tombstone_sample(
+            &sink,
+            &format!("harmony/vines/{addr}/tombstones/vine-1"),
+            &serde_json::to_vec(&t).unwrap(),
+            &cache,
+        );
+
+        assert_eq!(evict, None);
+        assert!(recording.frames().is_empty());
+        assert_eq!(cache.lock().unwrap().len_descriptors(), 1);
+    }
+
+    #[test]
+    fn pre_arrival_tombstone_applies_without_emit() {
+        let Fixture {
+            recording,
+            sink,
+            cache,
+            id,
+            addr,
+        } = fixture();
+
+        let evict = handle_vine_tombstone_sample(
+            &sink,
+            &format!("harmony/vines/{addr}/tombstones/vine-9"),
+            &signed_tombstone_bytes(&id, "vine-9", "cid-zzz", &addr),
+            &cache,
+        );
+
+        // Nothing was cached: no removal event, nothing to evict — but
+        // the tombstone must have been recorded (idempotence check).
+        assert_eq!(evict, None);
+        assert!(recording.frames().is_empty());
+        let again = handle_vine_tombstone_sample(
+            &sink,
+            &format!("harmony/vines/{addr}/tombstones/vine-9"),
+            &signed_tombstone_bytes(&id, "vine-9", "cid-zzz", &addr),
+            &cache,
+        );
+        assert_eq!(again, None);
     }
 }
 
