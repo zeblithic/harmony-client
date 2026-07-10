@@ -83,6 +83,13 @@
       previewInvalid = false;
       return;
     }
+    // Invalidate the previous URL's preview immediately: the old card (and
+    // its expired/verified verdicts) must not survive into the new URL's
+    // debounce window (Qodo/CodeRabbit PR #438). The preview stays advisory —
+    // submit is not gated while the new verdict is pending; expiry is
+    // enforced authoritatively by the join handshake itself.
+    preview = null;
+    previewInvalid = false;
     previewTimer = setTimeout(() => {
       previewTimer = null;
       void (async () => {

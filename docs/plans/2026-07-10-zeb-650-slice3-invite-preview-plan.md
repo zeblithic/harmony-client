@@ -419,7 +419,7 @@ fn preview_invite(url: String) -> Result<InvitePreviewDto, String> {
 
 Register in the primary handler list (lib.rs:52961 area):
 
-```
+```text
             redeem_invite,
             preview_invite,
 ```
@@ -788,6 +788,26 @@ TrustBadge pill, verified line mirrors IdentityChip's mono status line):
   --features test-fixtures` (background with a supervision net)
 - [ ] Open PR (`Part of ZEB-650`), fire `@coderabbitai review` ONCE, update
   Linear, converge bot/CI feedback.
+
+## Round-1 amendments (bot converge, PR #438)
+
+- **Stale-preview invalidation (Qodo bug 1 / CodeRabbit 3556052247+3556052250,
+  accepted):** the debounce `$effect` now clears `preview`/`previewInvalid`
+  immediately when the URL changes to a *different* format-valid value, so the
+  previous URL's card and expired-verdict gating never survive into the new
+  URL's debounce + IPC window. New regression test: `editing to a different
+  valid URL clears the stale card immediately` (valid→valid edit; synchronous
+  card removal + gate release; new name renders after resolution).
+- **`previewPending` submit-gate (same findings, declined):** the preview is
+  advisory by design — spec §4.2 says preview failures never block and
+  redeem's own error path stays authoritative; token expiry is enforced
+  authoritatively during the join handshake (admin/beacon side), so the
+  client-side expired gate is a courtesy on *known* verdicts. Gating every
+  redeem on a pending preview would make the advisory IPC load-bearing and
+  regress the paste-and-redeem fast path (and would break the existing
+  type-then-click iroh-path tests' semantics).
+- **MD040 (CodeRabbit 3556052244, accepted):** the registration snippet fence
+  above now carries a `text` language tag.
 
 ## Self-review notes
 

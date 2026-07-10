@@ -490,6 +490,40 @@ describe('RedeemInviteDialog invite preview (ZEB-650 slice 3)', () => {
     expect(cancel.disabled).toBe(false);
   });
 
+  // Editing from one valid invite URL to another must not leave the previous
+  // URL's card (or its expired/verified verdicts) visible during the new
+  // URL's debounce + IPC window (Qodo/CodeRabbit PR #438).
+  it('editing to a different valid URL clears the stale card immediately', async () => {
+    const URL_A = 'harmony://invite/v1?ci=aaa';
+    const URL_B = 'harmony://invite/v1?ci=bbb';
+    mockInvoke.mockImplementation((cmd: string, args?: { url?: string }) => {
+      if (cmd === 'preview_invite') {
+        return Promise.resolve({
+          ...PREVIEW,
+          communityName: args?.url === URL_A ? 'First Commons' : 'Second Commons',
+          expired: args?.url === URL_A,
+        });
+      }
+      return Promise.resolve(null);
+    });
+    const utils = renderDialog();
+    await typeUrl(utils, URL_A);
+    const card = await waitFor(() => utils.getByTestId('redeem-preview-card'));
+    expect(card.textContent).toContain('First Commons');
+    const redeem = utils.getByTestId('iroh-redeem-btn') as HTMLButtonElement;
+    expect(redeem.disabled).toBe(true); // URL A is expired
+
+    await typeUrl(utils, URL_B);
+    // Stale card and stale expired-gate must be gone synchronously, before
+    // the new debounce resolves.
+    expect(utils.queryByTestId('redeem-preview-card')).toBeNull();
+    expect(redeem.disabled).toBe(false);
+
+    const newCard = await waitFor(() => utils.getByTestId('redeem-preview-card'));
+    expect(newCard.textContent).toContain('Second Commons');
+    expect(newCard.textContent).not.toContain('First Commons');
+  });
+
   it('clearing to an invalid format removes the card', async () => {
     mockPreview({});
     const utils = renderDialog();
