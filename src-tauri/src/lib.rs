@@ -207,6 +207,7 @@ pub mod node_event_sink;
 pub mod notes_commands;
 pub mod notes_crdt;
 pub mod notes_persist;
+pub mod observed_holders;
 pub mod open_join_admit;
 pub mod open_join_auth;
 pub mod open_join_dial;
