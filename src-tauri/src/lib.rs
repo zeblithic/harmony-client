@@ -13409,6 +13409,20 @@ pub struct ContentItemWire {
     pub licensed: bool,
     pub archived: bool,
     pub kind: String, // ZEB-158: "leaf" | "folder"
+    /// ZEB-612 S3: observed replica count — 1 (self) + distinct peer
+    /// sessions seen announcing this CID since boot (staleness-pruned).
+    /// A LOWER BOUND, not global truth: UI copy must say "copies seen".
+    pub replica_count: u32,
+}
+
+/// ZEB-612 S3: overwrite `replica_count` with 1 (self) + observed peers.
+fn apply_replica_counts(
+    items: &mut [ContentItemWire],
+    holders: &observed_holders::ObservedHolders,
+) {
+    for item in items {
+        item.replica_count = 1 + holders.peer_count(&item.cid);
+    }
 }
 
 fn sensitivity_wire(s: content_index::Sensitivity) -> &'static str {
@@ -13496,7 +13510,20 @@ async fn list_content(
             let pinned_set = reply_rx
                 .await
                 .map_err(|_| "event loop dropped snapshot request".to_string())?;
-            list_folder(hex, verb_tx, &pinned_set).await
+            let mut items = list_folder(hex, verb_tx, &pinned_set).await?;
+            // ZEB-612 S3: manifest-derived rows join the holder map the
+            // same way root rows do — holders are keyed by CID.
+            let holders_arc = {
+                let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+                guard.observed_holders.clone()
+            };
+            {
+                let holders = holders_arc
+                    .lock()
+                    .map_err(|e| format!("holders lock: {e}"))?;
+                apply_replica_counts(&mut items, &holders);
+            }
+            Ok(items)
         }
     }
 }
@@ -13504,9 +13531,9 @@ async fn list_content(
 pub(crate) fn list_root(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<ContentItemWire>, String> {
-    let index = {
+    let (index, holders_arc) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
+        (guard.content_index.clone(), guard.observed_holders.clone())
     };
     let mut entries: Vec<ContentItemWire> = {
         let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
@@ -13523,9 +13550,17 @@ pub(crate) fn list_root(
                 licensed: e.licensed,
                 archived: e.archived,
                 kind: kind_wire(e.kind).to_string(),
+                replica_count: 1,
             })
             .collect()
     };
+    // ZEB-612 S3: join observed announcers — 1 (self) + distinct peers.
+    {
+        let holders = holders_arc
+            .lock()
+            .map_err(|e| format!("holders lock: {e}"))?;
+        apply_replica_counts(&mut entries, &holders);
+    }
     // HashMap iter is non-deterministic; sort newest-first for stable UI.
     // Rust 1.95's clippy::unnecessary_sort_by lint flags `sort_by` with a
     // reverse comparator — sort_by_key + Reverse expresses the same intent
@@ -13600,6 +13635,9 @@ pub async fn list_folder(
             licensed: false,
             archived: false,
             kind: kind_wire(e.kind).to_string(),
+            // Self-held baseline; list_content joins observed peers on top
+            // (direct list_folder callers — integration tests — see 1).
+            replica_count: 1,
         })
         .collect())
 }
@@ -54872,6 +54910,7 @@ mod pin_persistence_tests {
             licensed: false,
             archived: false,
             kind: "folder".into(),
+            replica_count: 3,
         };
         let json = serde_json::to_string(&wire).expect("serialize");
         assert!(
@@ -54879,6 +54918,36 @@ mod pin_persistence_tests {
             "got: {json}"
         );
         assert!(json.contains("\"kind\":\"folder\""), "got: {json}");
+        // ZEB-612 S3: camelCase pin for the observed replica count.
+        assert!(json.contains("\"replicaCount\":3"), "got: {json}");
+    }
+
+    fn replica_test_item(cid_hex: &str) -> ContentItemWire {
+        ContentItemWire {
+            sidecar_id: String::new(),
+            cid: cid_hex.to_string(),
+            name: "f".into(),
+            size_bytes: 1,
+            stored_at: 0,
+            sensitivity: "private".into(),
+            replication_tier: "default".into(),
+            pinned: false,
+            licensed: false,
+            archived: false,
+            kind: "leaf".into(),
+            replica_count: 1,
+        }
+    }
+
+    #[test]
+    fn apply_replica_counts_is_one_plus_observed_peers() {
+        let mut holders = crate::observed_holders::ObservedHolders::new();
+        holders.note("aa", "zid-1", 0);
+        holders.note("aa", "zid-2", 0);
+        let mut items = vec![replica_test_item("aa"), replica_test_item("bb")];
+        apply_replica_counts(&mut items, &holders);
+        assert_eq!(items[0].replica_count, 3, "self + 2 seen peers");
+        assert_eq!(items[1].replica_count, 1, "self only when nothing observed");
     }
 
     #[test]
