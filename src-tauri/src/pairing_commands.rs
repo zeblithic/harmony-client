@@ -142,12 +142,42 @@ pub async fn get_pairing_state(state: State<'_, Mutex<NodeState>>) -> Result<Pai
 }
 
 /// async for uniformity with the other seams (the rpc! macro awaits every
-/// call); the body is synchronous.
+/// call); the body is synchronous except for the Complete-state trust
+/// resync below.
 pub(crate) async fn get_pairing_state_inner(
     state: &Mutex<NodeState>,
 ) -> Result<PairingState, String> {
     let (_cmd_tx, state_rx) = require_pairing_handle(state)?;
     let current = state_rx.borrow().clone();
+    // ZEB-668 S1: a completed pairing wrote the new enrollment to
+    // owner_state.cbor via save_owner_state_atomic — the resident trust doc
+    // doesn't see file writes. Fold disk into the resident doc here so the
+    // fresh enrollment replicates to siblings and the Devices panel (which
+    // renders from the resident doc while the node runs) shows the new
+    // device. Idempotent (monotonic merge), so repeated Complete polls are
+    // harmless; the engine is only nudged when something new was learned.
+    if matches!(current, PairingState::Complete { .. }) {
+        let resident = {
+            let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+            match (
+                guard.owner_trust_doc.clone(),
+                guard.owner_trust_sync.clone(),
+                guard.identity_dir.clone(),
+            ) {
+                (Some(doc), Some(engine), Some(dir)) => Some((doc, engine, dir)),
+                _ => None,
+            }
+        };
+        if let Some((doc, engine, dir)) = resident {
+            if let Err(e) =
+                crate::owner_trust_sync::resync_trust_from_disk(&doc, &engine, &dir).await
+            {
+                // Fail open: pairing itself succeeded and disk is correct;
+                // the next poll (or next boot) retries the fold.
+                tracing::warn!(error = %e, "pairing complete: trust resync from disk failed");
+            }
+        }
+    }
     Ok(current)
 }
 

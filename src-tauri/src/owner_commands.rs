@@ -184,8 +184,55 @@ pub(crate) async fn get_owner_state_impl(
             None => None,
         }
     };
+    // ZEB-668 S1: snapshot the resident trust handles (Some while the node
+    // runs with an owner loaded). When resident, the view renders from the
+    // replicated trust doc and a liveness refresh reaches siblings through
+    // the trust engine instead of only a silent local file write.
+    let trust_resident = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        match (g.owner_trust_doc.clone(), g.owner_trust_sync.clone()) {
+            (Some(doc), Some(engine)) => Some((doc, engine)),
+            _ => None,
+        }
+    };
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
+    if let Some((doc, engine)) = trust_resident {
+        // Keys still come from disk/keychain (they are not part of the
+        // replicated doc); the trust state itself comes from the resident
+        // doc, which was seeded from disk at start_node and is at least as
+        // new as owner_state.cbor.
+        let dir = identity_dir.clone();
+        let loaded_opt = run_blocking(move || {
+            let _guard = OWNER_STATE_WRITE_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            load_owner_state(&dir, KeychainStore::new().ok())
+        })
+        .await?;
+        let mut loaded = match loaded_opt {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        let (snapshot, refreshed) = {
+            let mut g = doc.lock().await;
+            let refreshed = refresh_self_liveness(&mut g, &loaded.device_signing_key, now_unix());
+            (g.clone(), refreshed)
+        };
+        // Only nudge the engine when the refresh actually wrote — a panel
+        // open must not cause a pointless publish round.
+        if refreshed {
+            engine.notify_dirty();
+        }
+        loaded.state = snapshot;
+        return Ok(Some(build_owner_state_view(
+            &loaded,
+            display_name,
+            pinned_device_id_hex,
+        )));
+    }
     run_blocking(move || {
         // ZEB-342: hold the write lock only across load+refresh+save, so the cbor
         // write stays serialized with mint / pairing-install (loading inside the

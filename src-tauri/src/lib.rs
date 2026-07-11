@@ -219,6 +219,7 @@ pub mod owner_state_crypto;
 pub mod owner_state_persist;
 pub mod owner_state_sync;
 pub mod owner_state_types;
+pub mod owner_trust_sync;
 pub mod pairing;
 pub mod pairing_commands;
 pub mod pending_dm_invites;
@@ -1352,6 +1353,23 @@ pub struct NodeState {
     /// as a fallback. Kept as the safety net for the (rare) case where the disk
     /// read fails.
     pub fleet_net_enrolled: Option<std::collections::BTreeSet<String>>,
+    /// ZEB-668 S1: the resident trust CRDT (harmony-owner enrollments /
+    /// vouching / revocations / liveness) and its replication engine.
+    /// `Some` while the node is running and an owner identity is loaded;
+    /// `None` before start_node wires the FleetSyncEngine or after
+    /// stop_node. When `None`, trust mutations fall back to
+    /// load-mutate-save on `owner_state.cbor`
+    /// (`owner_trust_sync::TrustStateAccess::FileOnly`).
+    pub owner_trust_doc:
+        Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+    pub owner_trust_sync: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+    >,
+    /// ZEB-668 S1: latched true when the trust doc shows THIS device
+    /// revoked (set by the on_applied detector or the boot check). Never
+    /// cleared at stop_node — revocation is permanent; boot re-derives it
+    /// from `owner_state.cbor`.
+    pub owner_trust_revoked_self: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// ZEB-491 (secondary): the resolved identity directory for this node run,
     /// stored so `set_butler_pin` can re-read the LIVE enrolled-device set from
     /// `owner_state.cbor` (via `owner_state::read_enrolled_device_vk_hex`) rather
@@ -1822,6 +1840,11 @@ impl Default for NodeState {
             fleet_net_snapshot: None,
             fleet_net_device_id: None,
             fleet_net_enrolled: None,
+            owner_trust_doc: None,
+            owner_trust_sync: None,
+            owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             identity_dir: None,
             routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
@@ -2103,6 +2126,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let fleet_net_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>,
     >;
+    // ZEB-668 S1: owner-trust engine, same ephemeral-runtime shutdown pattern.
+    let owner_trust_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+    >;
     // ZEB-458 P4 Phase B: relay-hold + relay-optin fleet-sync engines, taken
     // outside the lock for the same ephemeral-runtime shutdown pattern.
     let relay_hold_sync_for_shutdown: Option<
@@ -2351,6 +2378,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.fleet_net_snapshot = None;
         guard.fleet_net_device_id = None;
         guard.fleet_net_enrolled = None;
+        // ZEB-668 S1: trust engine handles die with the node; the
+        // revoked-self latch deliberately survives (permanent state).
+        owner_trust_sync_for_shutdown = guard.owner_trust_sync.take();
+        guard.owner_trust_doc = None;
         guard.identity_dir = None;
         // ZEB-418 P2: drop the republish trigger with the rest of the
         // fleet-net handles — it captures the pkarr publishers and the
@@ -2836,6 +2867,35 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for fleet-net \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-668 S1: shut down the owner-trust fleet-sync engine the same way,
+    // so the final debounced trust publish + owner_state.cbor persist run
+    // before the zenoh session dies.
+    if let Some(trust_engine) = owner_trust_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(trust_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "owner-trust FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for owner-trust \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -3516,11 +3576,43 @@ pub async fn start_node_inner(
         // (pre-mint), sync_handles / sync_engine are None and the rest of
         // start_node proceeds normally.
         let identity_dir = crate::owner_commands::resolve_identity_dir()?;
-        let owner_loaded = crate::owner_state::load_owner_state(
+        let mut owner_loaded = crate::owner_state::load_owner_state(
             &identity_dir,
             crate::identity::KeychainStore::new().ok(),
         )?;
         tracing::info!("BOOT-PROBE 01: owner state loaded (keychain reads done)");
+        // ZEB-668 S1 boot refusal: a device whose own enrollment is revoked
+        // in the trust CRDT must not rejoin the fleet. Dropping the loaded
+        // owner here makes every downstream owner-gated wiring block behave
+        // exactly like a no-owner boot (no fleet engines, no community
+        // participation as this owner) — start_node itself still succeeds.
+        // The identity stays on disk; the Devices panel renders the removed
+        // state from the file path, and the revoked-self latch tells the UI.
+        let self_revoked_at_boot = owner_loaded.as_ref().is_some_and(|l| {
+            l.state
+                .is_revoked(crate::owner_state::device_id_from_signing_key(
+                    &l.device_signing_key,
+                ))
+        });
+        if self_revoked_at_boot {
+            tracing::warn!(
+                "this device is revoked in the owner trust state — skipping all fleet wiring"
+            );
+            {
+                let guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard
+                    .owner_trust_revoked_self
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            crate::node_event_sink::emit_ser(
+                &*app,
+                "device-revoked-self",
+                &serde_json::Value::Null,
+            );
+            owner_loaded = None;
+        }
         // ZEB-338: snapshot before owner_loaded is moved/destructured downstream.
         let has_owner_identity = owner_loaded.is_some();
 
@@ -3659,6 +3751,16 @@ pub async fn start_node_inner(
         let mut fleet_net_device_id_opt: Option<String> = None;
         let mut fleet_net_enrolled_opt: Option<std::collections::BTreeSet<String>> = None;
         let mut p2_sync_handles_opt: Option<crate::event_loop::P2SyncHandles> = None;
+        // ZEB-668 S1: owner-trust replication engine + handles. Built in the
+        // owner-loaded block (mirrors fleet-net); lifted to outer scope so the
+        // NodeState assignment and the event_loop::run call site reach them.
+        let mut owner_trust_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>,
+        > = None;
+        let mut owner_trust_sync_engine_opt: Option<
+            std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+        > = None;
+        let mut trust_sync_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
         // ZEB-495 (ZEB-340 Part 2): community-device-intro fleet-sync engine +
         // its NodeState/run handles. Built alongside the dm-inbox engine when an
         // owner identity loads; lifted to outer scope so the NodeState
@@ -5269,6 +5371,108 @@ pub async fn start_node_inner(
                             inbound_tx: fleet_net_in_tx,
                         },
                     });
+
+                    // ── ZEB-668 S1: owner-trust replication engine ─────────
+                    // The resident trust doc is seeded from the state loaded
+                    // for this boot (`loaded.state`); disk source of truth
+                    // stays owner_state.cbor, written through TrustPersist on
+                    // every debounced engine pass. Mirrors the fleet-net
+                    // block above.
+                    let trust_replay_path =
+                        identity_dir.join(crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME);
+                    let owner_trust_doc =
+                        std::sync::Arc::new(tokio::sync::Mutex::new(loaded.state.clone()));
+                    let owner_trust_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::owner_trust_sync::load_trust_replay_or_recover(&trust_replay_path),
+                    ));
+                    let (trust_out_tx, trust_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                    let (trust_in_tx, trust_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                    let (trust_nudge_tx, trust_nudge_rx) = tokio::sync::mpsc::channel::<()>(8);
+                    let owner_trust_sync =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                kt: std::sync::Arc::clone(&kt),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&owner_trust_doc),
+                                merger: crate::owner_trust_sync::trust_merger(),
+                                replay_tracker: owner_trust_tracker,
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: trust_out_tx,
+                                subscriber_rx: trust_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::owner_trust_sync::TrustPersist {
+                                        identity_dir: identity_dir.clone(),
+                                        replay_path: trust_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                    trust_nudge_tx,
+                                )),
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    owner_trust_doc_opt = Some(std::sync::Arc::clone(&owner_trust_doc));
+                    owner_trust_sync_engine_opt = Some(std::sync::Arc::clone(&owner_trust_sync));
+                    trust_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
+                        addr_hex: owner_addr_hex.clone(),
+                        outbound_rx: trust_out_rx,
+                        inbound_tx: trust_in_tx,
+                    });
+                    // ZEB-668 S1 T4: revoked-self detector. Each applied
+                    // remote merge nudges this task → owner-devices-updated;
+                    // a merge revealing THIS device revoked latches the flag,
+                    // emits device-revoked-self once, and shuts down the
+                    // fleet engines a revoked device must stop driving
+                    // (owner-state, fleet-net, trust).
+                    {
+                        let trust_revoked_flag = {
+                            let guard = state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            std::sync::Arc::clone(&guard.owner_trust_revoked_self)
+                        };
+                        let emit_sink = std::sync::Arc::clone(&app);
+                        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                            std::sync::Arc::new(move |name: &str| {
+                                crate::node_event_sink::emit_ser(
+                                    &*emit_sink,
+                                    name,
+                                    &serde_json::Value::Null,
+                                );
+                            });
+                        let halt_owner_sync = std::sync::Arc::clone(&engine);
+                        let halt_fleet_net = std::sync::Arc::clone(&fleet_net_sync);
+                        let halt_trust = std::sync::Arc::clone(&owner_trust_sync);
+                        let halt: crate::owner_trust_sync::HaltFn = Box::new(move || {
+                            Box::pin(async move {
+                                if let Err(e) = halt_owner_sync.shutdown().await {
+                                    tracing::error!(error = %e, "revoked-self halt: owner-state engine shutdown failed");
+                                }
+                                if let Err(e) = halt_fleet_net.shutdown().await {
+                                    tracing::error!(error = %e, "revoked-self halt: fleet-net engine shutdown failed");
+                                }
+                                if let Err(e) = halt_trust.shutdown().await {
+                                    tracing::error!(error = %e, "revoked-self halt: trust engine shutdown failed");
+                                }
+                            })
+                        });
+                        crate::owner_trust_sync::spawn_trust_applied_task(
+                            trust_nudge_rx,
+                            std::sync::Arc::clone(&owner_trust_doc),
+                            crate::owner_state::device_id_from_signing_key(
+                                &loaded.device_signing_key,
+                            ),
+                            trust_revoked_flag,
+                            emit,
+                            halt,
+                        );
+                    }
+                    tracing::info!("BOOT-PROBE 08-trust: owner-trust engine constructed");
 
                     tracing::info!("BOOT-PROBE 08: fleet-net self-row staged (flush deferred), entering per-community CRDT sync");
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
@@ -9487,6 +9691,9 @@ pub async fn start_node_inner(
                 // ZEB-458 P4 Phase B: thread the relay-hold + relay-optin
                 // adapter handle bundle into event_loop::run (mirrors p2).
                 let relay_sync_handles_for_loop = relay_sync_handles_opt;
+                // ZEB-668 S1: thread the owner-trust adapter handles into
+                // event_loop::run (mirrors relay).
+                let trust_sync_handles_for_loop = trust_sync_handles_opt;
                 // ZEB-495 (ZEB-340 Part 2): thread the community-device-intro
                 // adapter handles into event_loop::run (mirrors relay).
                 let community_device_intro_sync_handles_for_loop =
@@ -9600,6 +9807,7 @@ pub async fn start_node_inner(
                                 dm_inbox_sync_handles_for_loop,
                                 p2_sync_handles_for_loop,
                                 relay_sync_handles_for_loop,
+                                trust_sync_handles_for_loop,
                                 community_device_intro_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
@@ -9909,6 +10117,10 @@ pub async fn start_node_inner(
                         guard.fleet_net_snapshot = fleet_net_snapshot_opt.clone();
                         guard.fleet_net_device_id = fleet_net_device_id_opt.clone();
                         guard.fleet_net_enrolled = fleet_net_enrolled_opt.clone();
+                        // ZEB-668 S1: resident trust doc + engine for the
+                        // IPC-side TrustStateAccess::Resident path.
+                        guard.owner_trust_doc = owner_trust_doc_opt.clone();
+                        guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();
                         // ZEB-491 (secondary): stash the identity dir so
                         // set_butler_pin can re-read the LIVE enrolled set
                         // (a device paired this session is absent from the
@@ -61109,6 +61321,12 @@ mod start_node_race_tests {
             fleet_net_snapshot: None,
             fleet_net_device_id: None,
             fleet_net_enrolled: None,
+            // ZEB-668 S1: trust replication handles unused in race tests.
+            owner_trust_doc: None,
+            owner_trust_sync: None,
+            owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             identity_dir: None,
             routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.

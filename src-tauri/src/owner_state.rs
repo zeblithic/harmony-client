@@ -623,6 +623,18 @@ pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Re
     Ok(())
 }
 
+/// Load ONLY the `OwnerState` CRDT from `owner_state.cbor` — no keys, no
+/// keychain. ZEB-668 S1: the trust-replication engine's FileOnly access
+/// mode and tests need a doc-only reader; [`load_owner_state`] insists on
+/// the device signing key being present, which CLI/file-mode trust
+/// mutations don't require.
+pub fn load_owner_state_cbor(identity_dir: &Path) -> Result<OwnerState, String> {
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    let cbor_bytes = std::fs::read(&cbor_path)
+        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))
+}
+
 /// Derive the local device's 16-byte id from its ed25519 signing key.
 ///
 /// Single source of truth for the device-id mapping, shared by the Devices-panel
