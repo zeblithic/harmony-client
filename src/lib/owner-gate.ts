@@ -17,8 +17,13 @@ import type { StartNodeResponse } from './types/onboarding';
  *               (the genuine first-run case → show WelcomeModal hard gate).
  * - `error`   — `start_node` threw; we must NOT assume "no identity" and must
  *               NOT show the mint gate. Surface a retry instead.
+ * - `revoked` — `start_node` succeeded but this device's own enrollment is
+ *               revoked (ZEB-668 S2). `hasOwnerIdentity` is false here, so
+ *               this MUST be classified before `missing` — the mint gate
+ *               refuses while owner_state.cbor exists, which would trap the
+ *               user. Renders the terminal "removed from your account" screen.
  */
-export type OwnerIdentityState = 'unknown' | 'present' | 'missing' | 'error';
+export type OwnerIdentityState = 'unknown' | 'present' | 'missing' | 'error' | 'revoked';
 
 /**
  * Classify the owner-identity gate from a `start_node` outcome.
@@ -35,5 +40,6 @@ export function classifyOwnerIdentity(
   failed: boolean,
 ): OwnerIdentityState {
   if (failed || resp == null) return 'error';
+  if (resp.selfRevoked === true) return 'revoked';
   return resp.hasOwnerIdentity === true ? 'present' : 'missing';
 }

@@ -29,6 +29,15 @@ export interface StartNodeResponse {
    * deploy → show onboarding, the safe default).
    */
   hasOwnerIdentity?: boolean;
+  /**
+   * ZEB-668 S2: true when this device's own enrollment is revoked in the
+   * owner trust state. `hasOwnerIdentity` is false in that case (boot
+   * refuses fleet wiring), so this flag MUST be checked first — otherwise
+   * the revoked device misclassifies as first-run and hits the mint gate,
+   * which refuses while owner_state.cbor exists (unrecoverable dead-end).
+   * Forward-compat: treat missing/undefined as `false`.
+   */
+  selfRevoked?: boolean;
 }
 
 /** Non-identifying environment info attached to feedback submissions. */
