@@ -108,6 +108,13 @@ struct SetSharedBudgetArgs {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetBackupFlagArgs {
+    sidecar_id: String,
+    backup: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartNodeArgs {
     endpoint: Option<String>,
 }
@@ -789,6 +796,14 @@ pub fn build_registry() -> RpcRegistry {
         "get_contribution_summary",
         EmptyArgs,
         |state, _sink, _a| async move { crate::get_contribution_summary_impl(state) }
+    );
+    rpc!(
+        m,
+        "set_backup_flag",
+        SetBackupFlagArgs,
+        |state, sink, a| async move {
+            crate::set_backup_flag_impl(state, sink.as_ref(), a.sidecar_id, a.backup)
+        }
     );
 
     // Friends.
@@ -1684,6 +1699,7 @@ mod tests {
             "remove_storage_buddy",
             "set_shared_budget",
             "get_contribution_summary",
+            "set_backup_flag",
             // friends
             "list_friends",
             "generate_friend_token",

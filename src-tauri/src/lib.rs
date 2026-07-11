@@ -14918,6 +14918,56 @@ async fn get_contribution_summary(
     get_contribution_summary_impl(state.inner())
 }
 
+/// ZEB-669 S2: toggle "back up with buddies" on a sidecar entry.
+/// Eligibility is enforced HERE (the CID header must be PublicDurable —
+/// encrypted/ephemeral classes are never announced or served without an
+/// allowlist, so flagging them would be a silent lie); the error carries
+/// a stable `ineligible:` prefix for the UI. Real flag changes republish
+/// our signed BackupSet.
+pub(crate) fn set_backup_flag_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    sidecar_id: String,
+    backup: bool,
+) -> Result<(), String> {
+    let id = parse_sidecar_id(&sidecar_id)?;
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let changed = {
+        let mut idx = guard
+            .content_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = idx
+            .get(&id)
+            .ok_or_else(|| format!("unknown sidecar_id {sidecar_id}"))?;
+        if backup {
+            let class = harmony_content::cid::ContentId::from_bytes(entry.cid).content_class();
+            if class != harmony_content::cid::ContentClass::PublicDurable {
+                return Err(
+                    "ineligible: encrypted or ephemeral content cannot be backed up by buddies"
+                        .to_string(),
+                );
+            }
+        }
+        idx.set_backup(&id, backup)
+    };
+    if changed {
+        publish_backup_set_update(&guard);
+        crate::node_event_sink::emit_ser(sink, "storage-buddies-updated", &serde_json::Value::Null);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_backup_flag(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    sidecar_id: String,
+    backup: bool,
+) -> Result<(), String> {
+    set_backup_flag_impl(state.inner(), &app, sidecar_id, backup)
+}
+
 #[cfg(test)]
 mod storage_buddy_ipc_tests {
     use super::*;
@@ -15124,6 +15174,83 @@ mod storage_buddy_ipc_tests {
             guard.storage_settings.lock().unwrap().shared_budget_bytes,
             123
         );
+    }
+
+    fn indexed_entry(state: &Mutex<NodeState>, cid: harmony_content::cid::ContentId) -> String {
+        let entry = content_index::ContentIndexEntry {
+            sidecar_id: content_index::SidecarId::new(),
+            cid: cid.to_bytes(),
+            file_name: "f".into(),
+            size_bytes: 3,
+            stored_at_ms: 1,
+            sensitivity: content_index::Sensitivity::Public,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            backup: false,
+            kind: content_index::ContentKind::Leaf,
+        };
+        let sid = entry.sidecar_id.to_string();
+        state
+            .lock()
+            .unwrap()
+            .content_index
+            .lock()
+            .unwrap()
+            .insert(entry);
+        sid
+    }
+
+    #[test]
+    fn set_backup_flag_rejects_ineligible_classes_with_stable_prefix() {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let state = state_with_me();
+        let s = sink();
+        for flags in [
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+            ContentFlags {
+                ephemeral: true,
+                ..Default::default()
+            },
+        ] {
+            let sid = indexed_entry(&state, ContentId::for_book(b"x", flags).unwrap());
+            let err = set_backup_flag_impl(&state, &s, sid.clone(), true).unwrap_err();
+            assert!(err.starts_with("ineligible:"), "{err}");
+            // Clearing an (impossible) flag on ineligible content is
+            // allowed — only SETTING is gated.
+            set_backup_flag_impl(&state, &s, sid, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn set_backup_flag_sets_persists_and_errors_on_unknown() {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let state = state_with_me();
+        let s = sink();
+        let sid = indexed_entry(
+            &state,
+            ContentId::for_book(b"public", ContentFlags::default()).unwrap(),
+        );
+        set_backup_flag_impl(&state, &s, sid.clone(), true).unwrap();
+        {
+            let guard = state.lock().unwrap();
+            let idx = guard.content_index.lock().unwrap();
+            let id = content_index::SidecarId::parse_str(&sid).unwrap();
+            assert!(idx.get(&id).unwrap().backup);
+        }
+        assert!(set_backup_flag_impl(
+            &state,
+            &s,
+            content_index::SidecarId::new().to_string(),
+            true
+        )
+        .unwrap_err()
+        .contains("unknown sidecar_id"));
+        assert!(set_backup_flag_impl(&state, &s, "garbage".into(), true).is_err());
     }
 }
 
@@ -55538,6 +55665,7 @@ pub fn run() {
             remove_storage_buddy,
             set_shared_budget,
             get_contribution_summary,
+            set_backup_flag,
             mark_vine_viewed,
             publish_vine,
             publish_vine_reaction,
