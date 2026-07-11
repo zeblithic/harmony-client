@@ -378,6 +378,14 @@ struct RevokeDeviceArgs {
     reason: String,
 }
 
+/// ZEB-668 S4: fleet-synced device petname. Empty `petname` clears.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetDevicePetnameArgs {
+    device_vk_hex: String,
+    petname: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -952,6 +960,14 @@ pub fn build_registry() -> RpcRegistry {
         RevokeDeviceArgs,
         |state, sink, a| async move {
             crate::owner_commands::revoke_device_impl(state, sink, a.device_vk_hex, a.reason).await
+        }
+    );
+    rpc!(
+        m,
+        "set_device_petname",
+        SetDevicePetnameArgs,
+        |state, sink, a| async move {
+            crate::set_device_petname_impl(state, sink, a.device_vk_hex, a.petname).await
         }
     );
 
@@ -1822,8 +1838,9 @@ mod tests {
             "set_butler_pin",
             "get_butler_pin",
             "get_butler_held",
-            // device management (ZEB-668 S2)
+            // device management (ZEB-668 S2/S4)
             "revoke_device",
+            "set_device_petname",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",
