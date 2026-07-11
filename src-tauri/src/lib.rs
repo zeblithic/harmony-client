@@ -256,6 +256,7 @@ pub mod state_snapshot;
 // ZEB-669 slice 2: storage-buddy domain — signed pledge/backup-set/
 // hosting records, bounded LWW record store, refcounted hosting ledger,
 // persisted settings, and the pure auto-pin planner.
+pub mod buddy_pin_planner;
 pub mod storage_ledger;
 pub mod storage_records;
 pub mod storage_settings;
