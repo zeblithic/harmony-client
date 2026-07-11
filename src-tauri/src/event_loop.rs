@@ -1104,6 +1104,20 @@ pub async fn run(
     // Same Arc as NodeState.content_index in production; test callers that
     // don't exercise re-announcement pass a fresh empty index.
     content_index: std::sync::Arc<std::sync::Mutex<crate::content_index::ContentIndex>>,
+    // ZEB-669 S2: verified remote buddy records, written by the
+    // `harmony/storage/*` subscription arm, read by the auto-pin engine
+    // tick and the buddy IPCs. Test callers pass a fresh store.
+    storage_records: std::sync::Arc<std::sync::Mutex<crate::storage_records::StorageRecordStore>>,
+    // ZEB-669 S2: refcounted hosting ledger (engine writes, IPCs read).
+    storage_ledger: std::sync::Arc<std::sync::Mutex<crate::storage_ledger::StorageLedger>>,
+    // ZEB-669 S2: local buddy settings (budget/pledges), read by the
+    // engine tick to derive pacts and enforce the shared budget.
+    storage_settings: std::sync::Arc<std::sync::Mutex<crate::storage_settings::StorageSettings>>,
+    // ZEB-669 S2: the local OWNER address (hex address_hash) — the
+    // planner's `me` for pact derivation. Empty when no identity is
+    // loaded; the engine tick no-ops then. Distinct from `own_zid`,
+    // which is the transport-session id (announces stay anonymous).
+    own_owner_addr: String,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -2964,6 +2978,23 @@ pub async fn run(
     )
     .await;
 
+    // ZEB-669 S2: storage-buddy record topics (signed pledge lists,
+    // backup sets, hosting reports). One subscription per record kind —
+    // `harmony/storage/*/*` would also match future non-record topics.
+    for kind in ["pledges", "backup-set", "hosting"] {
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: format!("{}*/{kind}", crate::STORAGE_RECORD_PREFIX),
+            },
+            &session,
+            &zenoh_tx,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
+    }
+
     // Subscribe to LAN pairing wire messages (ZEB-197 v2 pairing) ONLY when
     // a pairing consumer (`pairing_in_tx`) was wired into this event loop.
     // PR #63 review: an unconditional subscribe paid the Zenoh subscription
@@ -3371,6 +3402,11 @@ pub async fn run(
         crate::observed_holders::REANNOUNCE_INTERVAL_MS,
     ));
     reannounce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // ZEB-669 S2: auto-pin engine tick + fetch-completion channel.
+    let mut buddy_sync_tick = tokio::time::interval(Duration::from_millis(BUDDY_SYNC_INTERVAL_MS));
+    buddy_sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (buddy_fetch_tx, mut buddy_fetch_rx) = mpsc::channel::<BuddyFetchResult>(16);
+    let mut buddy_engine = BuddyEngineState::default();
 
     // ── ZEB-358 voice moderation ──────────────────────────────────
     // Receiver-side enforcement state shared with the per-channel control
@@ -3800,6 +3836,26 @@ pub async fn run(
                             &own_zid,
                             || start.elapsed().as_millis() as u64,
                         );
+                        // ZEB-669 S2: signed buddy records route to the
+                        // record store; nothing else consumes them.
+                        // Hosting receipt stamps use WALL-clock ms (the
+                        // IPC layer computes report ages against the same
+                        // clock — loop-relative time isn't visible there).
+                        if key_expr.starts_with(crate::STORAGE_RECORD_PREFIX) {
+                            if note_storage_record_sample(
+                                &storage_records,
+                                &key_expr,
+                                &payload,
+                                crate::wall_clock_ms,
+                            ) {
+                                crate::node_event_sink::emit_ser(
+                                    app.as_ref(),
+                                    "storage-buddies-updated",
+                                    &serde_json::Value::Null,
+                                );
+                            }
+                            continue;
+                        }
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
@@ -3825,19 +3881,27 @@ pub async fn run(
                                 .ok()
                                 .and_then(|v| <[u8; 32]>::try_from(v).ok())
                             {
-                                Some(cid_bytes) if pin_intent.contains(&cid_bytes) => {
+                                Some(cid_bytes)
+                                    if pin_intent.contains(&cid_bytes)
+                                        || buddy_engine.buddy_pins.contains(&cid_bytes) =>
+                                {
                                     tracing::info!(
                                         cid = %cid_hex,
-                                        "vine tombstone: content locally pinned; keeping bytes"
+                                        "vine tombstone: content locally or buddy-pinned; keeping bytes"
                                     );
                                 }
                                 Some(cid_bytes) => {
                                     let root = ContentId::from_bytes(cid_bytes);
                                     let doomed =
                                         collect_descendants(runtime.storage_tier().cache(), root);
+                                    let protective: std::collections::HashSet<[u8; 32]> =
+                                        pin_intent
+                                            .union(&buddy_engine.buddy_pins)
+                                            .copied()
+                                            .collect();
                                     let keep = compute_keep_set(
                                         runtime.storage_tier().cache(),
-                                        &pin_intent,
+                                        &protective,
                                         doomed.len(),
                                     );
                                     for id in doomed {
@@ -4244,24 +4308,38 @@ pub async fn run(
                     ContentVerbRequest::Unpin { cid, reply } => {
                         // ZEB-155: clear intent so a later fetch doesn't re-pin.
                         pin_intent.remove(&cid);
-                        let root = ContentId::from_bytes(cid);
-                        let doomed = collect_descendants(runtime.storage_tier().cache(), root);
+                        // ZEB-669 S2 (PR #449 review): a buddy pact may
+                        // still pin this root — clear only the USER's
+                        // intent and leave the physical pin to the
+                        // engine's ownership.
+                        if buddy_engine.buddy_pins.contains(&cid) {
+                            let _ = reply.send(Ok(true));
+                        } else {
+                            let root = ContentId::from_bytes(cid);
+                            let doomed =
+                                collect_descendants(runtime.storage_tier().cache(), root);
 
-                        // ZEB-156: any CID reachable from a still-pinned root
-                        // must stay pinned even when it sits in `doomed`. See
-                        // `compute_keep_set` for the cross-cutting rationale.
-                        let keep = compute_keep_set(
-                            runtime.storage_tier().cache(),
-                            &pin_intent,
-                            doomed.len(),
-                        );
+                            // ZEB-156: any CID reachable from a still-pinned root
+                            // must stay pinned even when it sits in `doomed`. See
+                            // `compute_keep_set` for the cross-cutting rationale.
+                            // ZEB-669 S2: buddy roots protect their subtrees too.
+                            let protective: std::collections::HashSet<[u8; 32]> = pin_intent
+                                .union(&buddy_engine.buddy_pins)
+                                .copied()
+                                .collect();
+                            let keep = compute_keep_set(
+                                runtime.storage_tier().cache(),
+                                &protective,
+                                doomed.len(),
+                            );
 
-                        for id in doomed {
-                            if !keep.contains(&id) {
-                                runtime.unpin_content(&id);
+                            for id in doomed {
+                                if !keep.contains(&id) {
+                                    runtime.unpin_content(&id);
+                                }
                             }
+                            let _ = reply.send(Ok(true));
                         }
-                        let _ = reply.send(Ok(true));
                     }
                     ContentVerbRequest::Burn { cid, reply } => {
                         // Burn on a RAM-only client cascades the runtime-side
@@ -4271,6 +4349,17 @@ pub async fn run(
                         // command removes the sidecar entry, but this keeps
                         // the in-memory set consistent if the orders diverge).
                         pin_intent.remove(&cid);
+                        // ZEB-669 S2 (PR #449 review): burn is the user
+                        // explicitly destroying local bytes — it overrides
+                        // buddy ownership. Drop the ledger claim too so
+                        // hosting reports stay honest; the engine refetches
+                        // next tick if the pact still wants it.
+                        if buddy_engine.buddy_pins.remove(&cid) {
+                            storage_ledger
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .drop_cid_everywhere(&hex::encode(cid));
+                        }
                         let root = ContentId::from_bytes(cid);
                         let doomed = collect_descendants(runtime.storage_tier().cache(), root);
 
@@ -4278,9 +4367,13 @@ pub async fn run(
                         // root must not destroy bytes another pinned root
                         // still relies on. See `compute_keep_set` for the
                         // shared-subtree case the Tauri OR-join misses.
+                        let protective: std::collections::HashSet<[u8; 32]> = pin_intent
+                            .union(&buddy_engine.buddy_pins)
+                            .copied()
+                            .collect();
                         let keep = compute_keep_set(
                             runtime.storage_tier().cache(),
-                            &pin_intent,
+                            &protective,
                             doomed.len(),
                         );
 
@@ -5771,6 +5864,400 @@ pub async fn run(
                     .await;
                 }
             }
+            // ── ZEB-669 S2: auto-pin engine tick ────────────────────
+            _ = buddy_sync_tick.tick(), if !own_owner_addr.is_empty() => {
+                let now_ms = start.elapsed().as_millis() as u64;
+                // (1) Boot honesty sweep, once: the cache is RAM-only, so
+                // ledger claims that didn't survive the restart are dropped
+                // — hosting reports must only ever claim actually-held
+                // bytes. Wanted cids re-enter via the normal fetch path.
+                if !buddy_engine.booted {
+                    buddy_engine.booted = true;
+                    let admitted: std::collections::HashSet<[u8; 32]> = runtime
+                        .storage_tier()
+                        .cache()
+                        .iter_admitted()
+                        .map(|id| id.to_bytes())
+                        .collect();
+                    let mut ledger = storage_ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for cid_hex in ledger.distinct_cids() {
+                        let cid_bytes = hex::decode(&cid_hex)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok());
+                        match cid_bytes {
+                            Some(b) if admitted.contains(&b) => {
+                                // Present (shouldn't happen on a RAM-only
+                                // cache, but stay correct if persistence
+                                // ever lands): re-establish the physical
+                                // pin + buddy ownership.
+                                buddy_engine.buddy_pins.insert(b);
+                                let root = ContentId::from_bytes(b);
+                                for id in
+                                    collect_descendants(runtime.storage_tier().cache(), root)
+                                {
+                                    runtime.pin_content(id);
+                                }
+                            }
+                            _ => {
+                                tracing::info!(
+                                    cid = %cid_hex,
+                                    "buddy ledger: cid absent from cache after restart; dropping claim (will refetch)"
+                                );
+                                ledger.drop_cid_everywhere(&cid_hex);
+                            }
+                        }
+                    }
+                }
+                // (2) Hosting-report staleness sweep (wall clock — receipt
+                // stamps are wall ms, see note_storage_record_sample).
+                storage_records
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .sweep_hosting(crate::wall_clock_ms());
+                // (3) Plan under short locks (guards dropped before any
+                // await; the plan is applied mechanically below).
+                let plan = {
+                    let records = storage_records
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let ledger = storage_ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let settings = storage_settings
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let backoff = &buddy_engine.backoff;
+                    crate::buddy_pin_planner::plan(
+                        &own_owner_addr,
+                        &settings.my_pledges,
+                        &records,
+                        &ledger,
+                        settings.shared_budget_bytes,
+                        &buddy_engine.inflight,
+                        &|cid| backoff.get(cid).is_some_and(|(_, at)| *at > now_ms),
+                    )
+                };
+                // (4) Releases + evictions + attributions (ledger first,
+                // physical unpins after the guard drops).
+                let mut contribution_changed = false;
+                let mut to_unpin: Vec<String> = Vec::new();
+                {
+                    let mut ledger = storage_ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for buddy in &plan.release_buddies {
+                        to_unpin.extend(ledger.release_buddy(buddy));
+                        contribution_changed = true;
+                    }
+                    for (buddy, cid_hex) in &plan.release {
+                        if matches!(
+                            ledger.release(buddy, cid_hex),
+                            crate::storage_ledger::ReleaseOutcome::LastReference
+                        ) {
+                            to_unpin.push(cid_hex.clone());
+                        }
+                        contribution_changed = true;
+                    }
+                    if let Some(target) = plan.evict_to {
+                        to_unpin.extend(ledger.evict_newest_first(target));
+                        contribution_changed = true;
+                    }
+                    for (buddy, cid_hex, size) in &plan.attribute_only {
+                        if ledger.record_pin(buddy, cid_hex, *size, crate::wall_clock_ms()) {
+                            contribution_changed = true;
+                        }
+                    }
+                    // PR #449 review (CodeRabbit): an attribute_only above
+                    // can re-reference a cid that a release just queued for
+                    // unpinning (release for pact A + attribution for pact
+                    // B in one plan). Physically unpin only what the FINAL
+                    // ledger state no longer claims anywhere.
+                    to_unpin.retain(|cid_hex| ledger.held_anywhere(cid_hex).is_none());
+                }
+                for cid_hex in to_unpin {
+                    let Some(cid_bytes) = hex::decode(&cid_hex)
+                        .ok()
+                        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                    else {
+                        continue;
+                    };
+                    // Release BUDDY ownership only. If the user manually
+                    // pinned the same root, the physical pin stays (PR
+                    // #449 review, CodeRabbit) — pin_intent is theirs.
+                    buddy_engine.buddy_pins.remove(&cid_bytes);
+                    if pin_intent.contains(&cid_bytes) {
+                        continue;
+                    }
+                    let root = ContentId::from_bytes(cid_bytes);
+                    let doomed = collect_descendants(runtime.storage_tier().cache(), root);
+                    let protective: std::collections::HashSet<[u8; 32]> = pin_intent
+                        .union(&buddy_engine.buddy_pins)
+                        .copied()
+                        .collect();
+                    let keep = compute_keep_set(
+                        runtime.storage_tier().cache(),
+                        &protective,
+                        doomed.len(),
+                    );
+                    for id in doomed {
+                        if !keep.contains(&id) {
+                            runtime.unpin_content(&id);
+                        }
+                    }
+                }
+                // (5) Spawn fetches, bounded; reservations are already in
+                // the plan's arithmetic and recorded here before spawn.
+                let capacity =
+                    BUDDY_FETCH_MAX_INFLIGHT.saturating_sub(buddy_engine.inflight.len());
+                if capacity > 0 && !plan.fetch.is_empty() {
+                    // Defensive per-fetch byte ceiling: global headroom at
+                    // reservation time (authoritative check happens at
+                    // completion with ACTUAL sizes).
+                    let mut headroom = {
+                        let ledger = storage_ledger
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let settings = storage_settings
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let reserved: u64 =
+                            buddy_engine.inflight.values().map(|f| f.claimed).sum();
+                        settings
+                            .shared_budget_bytes
+                            .saturating_sub(ledger.distinct_pinned_bytes())
+                            .saturating_sub(reserved)
+                    };
+                    for cand in plan.fetch.into_iter().take(capacity) {
+                        let Some(cid_bytes) = hex::decode(&cand.cid)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                        else {
+                            continue; // ingest-validated; defensive only
+                        };
+                        // PR #449 review (Qodo): cap each fetch near its
+                        // CLAIMED size (2× slack for bundle overhead /
+                        // benign drift, 64 KiB floor), still bounded by
+                        // global headroom — an under-claiming record must
+                        // not burn the whole remaining budget on one
+                        // download that gets dropped at completion.
+                        let per_fetch_cap = cand
+                            .claimed
+                            .saturating_mul(2)
+                            .max(64 * 1024)
+                            .min(headroom);
+                        let max = usize::try_from(per_fetch_cap).unwrap_or(usize::MAX);
+                        headroom = headroom.saturating_sub(cand.claimed);
+                        buddy_engine.inflight.insert(
+                            cand.cid.clone(),
+                            crate::buddy_pin_planner::InflightFetch {
+                                buddy: cand.buddy.clone(),
+                                claimed: cand.claimed,
+                            },
+                        );
+                        let session = session.clone();
+                        let cas_op_tx_for_buddy = cas_op_tx.clone();
+                        let tx = buddy_fetch_tx.clone();
+                        tokio::spawn(async move {
+                            let fetch_one = move |cid: ContentId| {
+                                let session = session.clone();
+                                async move {
+                                    let cid_hex = hex::encode(cid.to_bytes());
+                                    let prefix = cid_hex.get(1..2).unwrap_or("");
+                                    let key = format!("harmony/content/{prefix}/{cid_hex}");
+                                    fetch_via_zenoh(&session, &key, Some(max)).await
+                                }
+                            };
+                            // serveable: false — public durables serve
+                            // freely regardless (content_cid_servable
+                            // checks only the encrypted bit).
+                            let fetch = wrap_fetch_one_with_admission(
+                                fetch_one,
+                                cas_op_tx_for_buddy,
+                                false,
+                            );
+                            let result =
+                                fetch_recursive(fetch, ContentId::from_bytes(cid_bytes), Some(max))
+                                    .await
+                                    .map(|bytes| bytes.len() as u64);
+                            let _ = tx
+                                .send(BuddyFetchResult {
+                                    buddy: cand.buddy,
+                                    cid: cand.cid,
+                                    cid_bytes,
+                                    result,
+                                })
+                                .await;
+                        });
+                    }
+                }
+                if contribution_changed {
+                    crate::node_event_sink::emit_ser(
+                        app.as_ref(),
+                        "contribution-updated",
+                        &serde_json::Value::Null,
+                    );
+                }
+            }
+
+            // ── ZEB-669 S2: buddy fetch completions ─────────────────
+            Some(done) = buddy_fetch_rx.recv() => {
+                buddy_engine.inflight.remove(&done.cid);
+                let now_ms = start.elapsed().as_millis() as u64;
+                match done.result {
+                    Err(e) => {
+                        let attempts = buddy_engine
+                            .backoff
+                            .get(&done.cid)
+                            .map(|(a, _)| *a)
+                            .unwrap_or(0)
+                            + 1;
+                        let delay = BUDDY_FETCH_BACKOFF_BASE_MS
+                            .checked_shl(attempts.min(7) - 1)
+                            .unwrap_or(u64::MAX)
+                            .min(BUDDY_FETCH_BACKOFF_MAX_MS);
+                        buddy_engine
+                            .backoff
+                            .insert(done.cid.clone(), (attempts, now_ms + delay));
+                        tracing::debug!(cid = %done.cid, error = %e, attempts, "buddy fetch failed; backing off");
+                    }
+                    Ok(actual) => {
+                        // Serialized reconcile at ACTUAL size, revalidating
+                        // everything that may have moved while the fetch
+                        // ran (PR #449 review, CodeRabbit): the pact must
+                        // still be mutual, the entry still wanted, the
+                        // per-buddy slice must fit the ACTUAL (claims are
+                        // hints), and the shared budget must fit. On any
+                        // failure the content stays admitted-unpinned
+                        // (evictable) and never enters the ledger — the
+                        // honesty rule. Backoff prevents replan thrash
+                        // when claimed < actual would re-propose it.
+                        let admit_err: Option<&'static str> = {
+                            let records = storage_records
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let ledger = storage_ledger
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let settings = storage_settings
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let pledge = settings.my_pledges.get(&done.buddy).copied();
+                            let still_mutual = pledge.is_some()
+                                && records
+                                    .pledge_list(&done.buddy)
+                                    .is_some_and(|r| {
+                                        r.pledges.iter().any(|p| p.to == own_owner_addr)
+                                    });
+                            let still_wanted = records
+                                .backup_set(&done.buddy)
+                                .is_some_and(|s| s.entries.iter().any(|e| e.cid == done.cid));
+                            let slice_fits = pledge.is_some_and(|p| {
+                                ledger
+                                    .bytes_for_buddy(&done.buddy)
+                                    .saturating_add(actual)
+                                    <= p
+                            });
+                            let reserved: u64 =
+                                buddy_engine.inflight.values().map(|f| f.claimed).sum();
+                            let budget_fits = ledger
+                                .distinct_pinned_bytes()
+                                .saturating_add(reserved)
+                                .saturating_add(actual)
+                                <= settings.shared_budget_bytes;
+                            if !still_mutual {
+                                Some("pact withdrawn while fetching")
+                            } else if !still_wanted {
+                                Some("entry removed from backup set while fetching")
+                            } else if !slice_fits {
+                                Some("actual size exceeds the per-buddy pledge slice")
+                            } else if !budget_fits {
+                                Some("actual size exceeds remaining shared budget")
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(reason) = admit_err {
+                            tracing::info!(
+                                cid = %done.cid, actual, reason,
+                                "buddy fetch completed but not admitted; skipping pin"
+                            );
+                            buddy_engine.backoff.insert(
+                                done.cid.clone(),
+                                (1, now_ms + BUDDY_FETCH_BACKOFF_BASE_MS),
+                            );
+                        } else {
+                            // Mirror the ContentVerbRequest::Pin arm, but
+                            // record BUDDY ownership (never pin_intent —
+                            // that set is the user's manual intent).
+                            buddy_engine.buddy_pins.insert(done.cid_bytes);
+                            let root = ContentId::from_bytes(done.cid_bytes);
+                            let all =
+                                collect_descendants(runtime.storage_tier().cache(), root);
+                            let mut any_failed = false;
+                            for id in all {
+                                if !runtime.pin_content(id) {
+                                    any_failed = true;
+                                }
+                            }
+                            if any_failed {
+                                // Pin-count quota exhausted: undo (keep-set
+                                // protected) and back off — the pact reads
+                                // Catching up rather than half-pinning.
+                                buddy_engine.buddy_pins.remove(&done.cid_bytes);
+                                let doomed =
+                                    collect_descendants(runtime.storage_tier().cache(), root);
+                                let protective: std::collections::HashSet<[u8; 32]> =
+                                    pin_intent
+                                        .union(&buddy_engine.buddy_pins)
+                                        .copied()
+                                        .collect();
+                                let keep = compute_keep_set(
+                                    runtime.storage_tier().cache(),
+                                    &protective,
+                                    doomed.len(),
+                                );
+                                for id in doomed {
+                                    // keep-set is built from the union, so
+                                    // a manually-pinned root's subtree is
+                                    // already protected.
+                                    if !keep.contains(&id) {
+                                        runtime.unpin_content(&id);
+                                    }
+                                }
+                                buddy_engine.backoff.insert(
+                                    done.cid.clone(),
+                                    (1, now_ms + BUDDY_FETCH_BACKOFF_BASE_MS),
+                                );
+                                tracing::warn!(
+                                    cid = %done.cid,
+                                    "buddy pin failed (pin quota exhausted); backing off"
+                                );
+                            } else {
+                                buddy_engine.backoff.remove(&done.cid);
+                                let changed = storage_ledger
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .record_pin(
+                                        &done.buddy,
+                                        &done.cid,
+                                        actual,
+                                        crate::wall_clock_ms(),
+                                    );
+                                if changed {
+                                    crate::node_event_sink::emit_ser(
+                                        app.as_ref(),
+                                        "contribution-updated",
+                                        &serde_json::Value::Null,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             _ = voice_sweep_tick.tick(),
                 if !voice_keys.is_empty() || !groupdm_presence_subs.is_empty() => {
                 let now = (voice_now_ms)();
@@ -6197,6 +6684,78 @@ fn note_announce_sample(
                 .note(&a.cid, zid, now_ms());
         }
     }
+}
+
+/// ZEB-669 S2: auto-pin engine cadence (reconcile pacts every 30 s).
+pub(crate) const BUDDY_SYNC_INTERVAL_MS: u64 = 30_000;
+/// Bounded concurrent buddy fetches — network fetches are spawned, so
+/// this caps memory/bandwidth, not loop latency.
+const BUDDY_FETCH_MAX_INFLIGHT: usize = 4;
+/// Exponential fetch backoff: base × 2^attempts, capped at one hour.
+const BUDDY_FETCH_BACKOFF_BASE_MS: u64 = 60_000;
+const BUDDY_FETCH_BACKOFF_MAX_MS: u64 = 3_600_000;
+
+/// Outcome of one spawned buddy fetch task.
+struct BuddyFetchResult {
+    buddy: String,
+    cid: String,
+    cid_bytes: [u8; 32],
+    /// Ok(actual assembled bytes) — the value the ledger records.
+    result: Result<u64, String>,
+}
+
+/// Loop-local auto-pin engine state. Living inside the single-threaded
+/// select loop is what makes budget admission SERIALIZED (spec §3, PR
+/// #448 review): reservations are taken and reconciled on one thread,
+/// so concurrent fetches can never observe stale remaining-budget.
+#[derive(Default)]
+struct BuddyEngineState {
+    /// cid-hex → reservation, while a fetch task runs.
+    inflight: std::collections::HashMap<String, crate::buddy_pin_planner::InflightFetch>,
+    /// cid-hex → (attempts, loop-relative retry-at ms).
+    backoff: std::collections::HashMap<String, (u32, u64)>,
+    /// Roots pinned ON BEHALF OF BUDDIES — kept separate from the
+    /// manual `pin_intent` (PR #449 review, CodeRabbit): a buddy release
+    /// must never erase the user's own pin intent, and a manual unpin
+    /// must never physically unpin a root the ledger still claims.
+    /// Physical unpin happens only when NEITHER set holds the root.
+    buddy_pins: std::collections::HashSet<[u8; 32]>,
+    /// First-tick boot honesty sweep done?
+    booted: bool,
+}
+
+/// ZEB-669 S2: route a `harmony/storage/*` sample into the record store.
+/// Returns true when the store changed (`Inserted | UpdatedNewer`) so the
+/// caller emits `storage-buddies-updated` only on real change. Rejected
+/// records log at debug (zero state effect, like follow lists); non-store
+/// keys return false without taking the lock. `now_ms` is lazy — only a
+/// hosting sample (which stamps a receipt clock) reads it.
+fn note_storage_record_sample(
+    storage_records: &Arc<std::sync::Mutex<crate::storage_records::StorageRecordStore>>,
+    key_expr: &str,
+    payload: &[u8],
+    now_ms: impl FnOnce() -> u64,
+) -> bool {
+    use crate::storage_records::RecordOutcome;
+    let Some(rest) = key_expr.strip_prefix(crate::STORAGE_RECORD_PREFIX) else {
+        return false;
+    };
+    let Some((_owner, kind)) = rest.split_once('/') else {
+        return false;
+    };
+    let mut store = storage_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let outcome = match kind {
+        "pledges" => store.on_pledge_list_sample(key_expr, payload),
+        "backup-set" => store.on_backup_set_sample(key_expr, payload),
+        "hosting" => store.on_hosting_report_sample(key_expr, payload, now_ms()),
+        _ => return false,
+    };
+    if let RecordOutcome::Rejected(reason) = &outcome {
+        tracing::debug!(key = %key_expr, %reason, "storage record rejected");
+    }
+    outcome.changed()
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
@@ -10895,5 +11454,121 @@ mod note_announce_sample_tests {
             || 10,
         );
         assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 0);
+    }
+}
+
+#[cfg(test)]
+mod note_storage_record_sample_tests {
+    use super::*;
+    use crate::storage_records::StorageRecordStore;
+    use crate::storage_signing::{self, HostingReportEntry, PledgeEntry, PledgeListPayload};
+
+    fn store() -> Arc<std::sync::Mutex<StorageRecordStore>> {
+        Arc::new(std::sync::Mutex::new(StorageRecordStore::new(None)))
+    }
+
+    fn signer() -> harmony_identity::PrivateIdentity {
+        harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
+    }
+
+    fn signed_pledges(
+        id: &harmony_identity::PrivateIdentity,
+        updated_at: u64,
+    ) -> (String, Vec<u8>) {
+        let owner = hex::encode(id.public_identity().address_hash);
+        let mut p = PledgeListPayload {
+            owner_address: owner.clone(),
+            pledges: vec![PledgeEntry {
+                to: "someone".into(),
+                bytes: 9,
+            }],
+            updated_at,
+            identity_pub: None,
+            sig: None,
+        };
+        storage_signing::sign_pledge_list(id, &mut p);
+        (
+            format!("{}{owner}/pledges", crate::STORAGE_RECORD_PREFIX),
+            serde_json::to_vec(&p).unwrap(),
+        )
+    }
+
+    #[test]
+    fn signed_pledge_sample_routes_and_reports_change() {
+        let s = store();
+        let id = signer();
+        let (key, payload) = signed_pledges(&id, 5);
+        assert!(note_storage_record_sample(&s, &key, &payload, || 1));
+        let owner = hex::encode(id.public_identity().address_hash);
+        assert!(s.lock().unwrap().pledge_list(&owner).is_some());
+    }
+
+    #[test]
+    fn replayed_and_rejected_samples_report_no_change() {
+        let s = store();
+        let id = signer();
+        let (key, payload) = signed_pledges(&id, 5);
+        assert!(note_storage_record_sample(&s, &key, &payload, || 1));
+        // LWW replay: same updated_at ⇒ IgnoredOlder ⇒ no change.
+        assert!(!note_storage_record_sample(&s, &key, &payload, || 1));
+        // Garbage payload ⇒ Rejected ⇒ no change.
+        assert!(!note_storage_record_sample(&s, &key, b"not json", || 1));
+    }
+
+    #[test]
+    fn hosting_sample_stamps_the_lazy_receipt_clock() {
+        let s = store();
+        let id = signer();
+        let owner = hex::encode(id.public_identity().address_hash);
+        let mut h = crate::storage_signing::HostingReportPayload {
+            owner_address: owner.clone(),
+            reports: vec![HostingReportEntry {
+                beneficiary: "b".into(),
+                bytes: 1,
+                cids: 1,
+            }],
+            updated_at: 5,
+            identity_pub: None,
+            sig: None,
+        };
+        storage_signing::sign_hosting_report(&id, &mut h);
+        let key = format!("{}{owner}/hosting", crate::STORAGE_RECORD_PREFIX);
+        assert!(note_storage_record_sample(
+            &s,
+            &key,
+            &serde_json::to_vec(&h).unwrap(),
+            || 777,
+        ));
+        assert_eq!(
+            s.lock()
+                .unwrap()
+                .hosting_report(&owner)
+                .unwrap()
+                .received_at_ms,
+            777
+        );
+    }
+
+    #[test]
+    fn non_storage_and_unknown_kind_keys_are_ignored() {
+        let s = store();
+        assert!(!note_storage_record_sample(
+            &s,
+            "harmony/announce/aabb",
+            b"",
+            || 1
+        ));
+        assert!(!note_storage_record_sample(
+            &s,
+            "harmony/storage/owner/unknown-kind",
+            b"",
+            || 1
+        ));
+        assert!(!note_storage_record_sample(
+            &s,
+            "harmony/storage/owner",
+            b"",
+            || 1
+        ));
     }
 }

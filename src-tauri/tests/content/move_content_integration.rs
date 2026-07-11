@@ -205,6 +205,17 @@ async fn spawn_test_runtime() -> TestHarness {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
                     )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
+                    )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });
@@ -283,6 +294,7 @@ fn insert_top_level(
         licensed: false,
         archived: false,
         pinned,
+        backup: false,
         kind,
     });
     assert!(inserted, "fresh SidecarId must insert cleanly");

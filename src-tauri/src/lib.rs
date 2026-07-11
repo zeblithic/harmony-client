@@ -253,6 +253,14 @@ pub mod recovery_policy;
 pub mod resume_detector;
 mod save_dialog;
 pub mod state_snapshot;
+// ZEB-669 slice 2: storage-buddy domain — signed pledge/backup-set/
+// hosting records, bounded LWW record store, refcounted hosting ledger,
+// persisted settings, and the pure auto-pin planner.
+pub mod buddy_pin_planner;
+pub mod storage_ledger;
+pub mod storage_records;
+pub mod storage_settings;
+pub mod storage_signing;
 // ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map
 // (TunnelManager) + per-connection async driver (tunnel_task: responder
 // acceptor + initiator dialer over the persistent iroh endpoint).
@@ -789,6 +797,25 @@ pub struct NodeState {
     /// event loop's `harmony/announce/*` arm, read by list_content /
     /// list_root for `replicaCount` (1 self + observed peers).
     observed_holders: std::sync::Arc<std::sync::Mutex<observed_holders::ObservedHolders>>,
+    /// ZEB-669 S2: verified remote buddy records (pledges/backup-sets/
+    /// hosting), written by the event loop's `harmony/storage/*` arm,
+    /// read by the buddy IPCs and the auto-pin engine.
+    storage_records: std::sync::Arc<std::sync::Mutex<storage_records::StorageRecordStore>>,
+    /// ZEB-669 S2: refcounted hosting ledger — meter numerator + the
+    /// source for HostingReport publishes. Written by the auto-pin
+    /// engine, read by IPCs and the hosting publisher.
+    storage_ledger: std::sync::Arc<std::sync::Mutex<storage_ledger::StorageLedger>>,
+    /// ZEB-669 S2: local buddy settings (budget/pledges/dismissals/
+    /// publish floors). Arc-shared with the event loop's engine tick.
+    storage_settings: std::sync::Arc<std::sync::Mutex<storage_settings::StorageSettings>>,
+    /// ZEB-669 S2: where storage settings persist; `None` in tests.
+    storage_settings_path: Option<std::path::PathBuf>,
+    /// ZEB-669 S2: session-monotonic publish clocks, one per storage
+    /// record type — same rationale as `follow_list_clock` (two changes
+    /// within one wall second must not be LWW-equal). Atomic only for
+    /// interior mutability; writers hold the NodeState mutex.
+    pledge_clock: std::sync::atomic::AtomicU64,
+    backup_set_clock: std::sync::atomic::AtomicU64,
     /// Monotonic install generation. Bumped at lock-2 install site under
     /// `start_node`. Post-install checks (pairing-handle install, failure
     /// cleanup, stop_inner gating) compare against this to detect whether a
@@ -1642,6 +1669,18 @@ impl Default for NodeState {
             observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
                 observed_holders::ObservedHolders::new(),
             )),
+            storage_records: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_records::StorageRecordStore::new(None),
+            )),
+            storage_ledger: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_ledger::StorageLedger::new(None),
+            )),
+            storage_settings: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_settings::StorageSettings::default(),
+            )),
+            storage_settings_path: None,
+            pledge_clock: std::sync::atomic::AtomicU64::new(0),
+            backup_set_clock: std::sync::atomic::AtomicU64::new(0),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),
@@ -1942,6 +1981,21 @@ const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
 /// Publishes on this prefix attach the local zid (ZEB-669 slice 1) so
 /// receivers' `ObservedHolders` can attribute the announcing session.
 const ANNOUNCE_PREFIX: &str = "harmony/announce/";
+
+/// ZEB-669 S2: signed storage-buddy records live under
+/// `harmony/storage/{owner}/{pledges|backup-set|hosting}`.
+pub(crate) const STORAGE_RECORD_PREFIX: &str = "harmony/storage/";
+
+/// Wall-clock milliseconds since the Unix epoch. Used where a timestamp
+/// must be comparable across the event loop AND the IPC layer (e.g.
+/// hosting-report receipt stamps vs. displayed report age) — the loop's
+/// `start.elapsed()` clock is invisible outside `run()`.
+pub(crate) fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // ZEB-338: the single honest "owner identity not loaded" message. Use this at
 // owner-derived-handle guards so the phrasing can't drift between call sites.
@@ -3004,6 +3058,19 @@ pub async fn start_node_inner(
     // ZEB-671: share_follows gate for follow-list wire publication.
     let vine_settings_path = vine_settings::settings_path(&app_data_dir);
     let vine_settings_loaded = vine_settings::load_or_default(&vine_settings_path);
+    // ZEB-669 S2: storage-buddy stores. Records + ledger persist across
+    // restarts (the engine's first tick reconciles the ledger against the
+    // RAM-only cache); settings carry budget/pledges/floors.
+    let storage_settings_path = storage_settings::settings_path(&app_data_dir);
+    let storage_settings_loaded = storage_settings::load_or_default(&storage_settings_path);
+    let storage_records_arc = std::sync::Arc::new(std::sync::Mutex::new(
+        storage_records::StorageRecordStore::new(Some(app_data_dir.join("storage_records.json"))),
+    ));
+    let storage_ledger_arc = std::sync::Arc::new(std::sync::Mutex::new(
+        storage_ledger::StorageLedger::new(Some(app_data_dir.join("storage_ledger.json"))),
+    ));
+    let storage_settings_arc =
+        std::sync::Arc::new(std::sync::Mutex::new(storage_settings_loaded.clone()));
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
         follow_mgr
             .addresses()
@@ -9112,6 +9179,8 @@ pub async fn start_node_inner(
             };
 
         let node_addr_for_state = node_addr.clone();
+        // ZEB-669 S2: the engine tick's planner `me`.
+        let own_owner_addr_for_loop = node_addr.clone();
         // ZEB-331: second clone for the StartNodeResponse returned to the
         // frontend — node_addr moves into NodeConfig and node_addr_for_state
         // moves into guard.node_addr, so we carry this out via the tuple.
@@ -9298,6 +9367,10 @@ pub async fn start_node_inner(
                 ));
                 let observed_holders_for_loop = observed_holders.clone();
                 let content_index_for_loop = content_index.clone();
+                // ZEB-669 S2: buddy stores shared with the engine tick.
+                let storage_records_for_loop = storage_records_arc.clone();
+                let storage_ledger_for_loop = storage_ledger_arc.clone();
+                let storage_settings_for_loop = storage_settings_arc.clone();
 
                 let ep_clone = endpoint.clone();
                 let app_clone = app.clone();
@@ -9553,6 +9626,13 @@ pub async fn start_node_inner(
                                 // announce-note arm and the re-announce tick.
                                 observed_holders_for_loop,
                                 content_index_for_loop,
+                                // ZEB-669 S2: buddy record store + ledger +
+                                // settings for the storage-record arm and
+                                // the auto-pin engine tick.
+                                storage_records_for_loop,
+                                storage_ledger_for_loop,
+                                storage_settings_for_loop,
+                                own_owner_addr_for_loop,
                             )
                             .await;
                         });
@@ -9598,6 +9678,18 @@ pub async fn start_node_inner(
                             vine_settings_loaded.last_published_updated_at,
                         );
                         guard.vine_settings_path = Some(vine_settings_path);
+                        // ZEB-669 S2: buddy stores + restored publish-clock
+                        // floors (same backwards-wall-clock rationale as the
+                        // follow-list clock above).
+                        guard.storage_records = storage_records_arc;
+                        guard.storage_ledger = storage_ledger_arc;
+                        guard.storage_settings = storage_settings_arc;
+                        guard.storage_settings_path = Some(storage_settings_path);
+                        guard.pledge_clock =
+                            std::sync::atomic::AtomicU64::new(storage_settings_loaded.pledge_floor);
+                        guard.backup_set_clock = std::sync::atomic::AtomicU64::new(
+                            storage_settings_loaded.backup_set_floor,
+                        );
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
                         // ZEB-670: tombstone signer for delete_vine.
@@ -10565,6 +10657,31 @@ pub async fn start_node_inner(
                 let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                 if guard.generation == our_gen {
                     publish_follow_list_update(&guard);
+                    // ZEB-669 S2: same once-per-boot LWW convergence for
+                    // the storage-buddy records we own. Hosting reports
+                    // are the periodic publisher task's job (below).
+                    publish_pledge_list_update(&guard);
+                    publish_backup_set_update(&guard);
+                    if let (Some(identity), Some(tx), Some(path)) = (
+                        guard.owner_private_identity.clone(),
+                        guard.publish_tx.clone(),
+                        guard.storage_settings_path.clone(),
+                    ) {
+                        let floor = guard
+                            .storage_settings
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .hosting_floor;
+                        spawn_hosting_report_publisher(
+                            identity,
+                            guard.node_addr.clone(),
+                            guard.storage_ledger.clone(),
+                            guard.storage_settings.clone(),
+                            path,
+                            tx,
+                            floor,
+                        );
+                    }
                     // ZEB-671: seed the Discover graph inputs (consumes
                     // the guard).
                     refresh_vine_graph_inputs(guard);
@@ -14144,6 +14261,1244 @@ fn publish_follow_list_update(guard: &NodeState) {
     }
 }
 
+// ── ZEB-669 S2: storage-buddy record publishing ─────────────────────────
+//
+// Same architecture as the follow-list publish path: session-monotonic
+// updated_at floored by a persisted high-water mark, signer-authority
+// guard, best-effort choke points. Records ride the generic
+// `PublishRequest` channel (the descriptor path) rather than a dedicated
+// one — publish failures self-heal on the next trigger/boot republish.
+
+/// Strictly-increasing `updated_at` for one storage record type, floored
+/// by wall seconds AND the previous value (+1) — two changes within one
+/// wall second must not be LWW-equal, and a backwards wall clock across
+/// restarts must not publish records receivers ignore (the floors are
+/// restored from `storage_settings.json` at boot).
+fn next_storage_updated_at(clock: &std::sync::atomic::AtomicU64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prev = clock.load(Ordering::Relaxed);
+    let ts = now_secs.max(prev + 1);
+    clock.store(ts, Ordering::Relaxed);
+    ts
+}
+
+/// Refuse to sign a storage record for an owner address the local
+/// identity does not derive (the receiver-side binding would reject it
+/// everywhere while "succeeding" locally).
+fn storage_signer<'a>(
+    guard: &'a NodeState,
+    what: &str,
+) -> Result<&'a std::sync::Arc<harmony_identity::PrivateIdentity>, String> {
+    let identity = guard
+        .owner_private_identity
+        .as_ref()
+        .ok_or_else(|| format!("identity unavailable: cannot sign {what}"))?;
+    let signer = vine_signing::signer_address(identity);
+    if guard.node_addr != signer {
+        return Err(format!(
+            "refusing to sign: storage record owner {} does not match signer identity {signer}",
+            guard.node_addr
+        ));
+    }
+    Ok(identity)
+}
+
+/// Persist `settings` (floor updates included) — floor-then-publish
+/// ordering, matching the follow-list clock (a crash between the two
+/// re-publishes with a HIGHER timestamp, never a replayed one).
+fn persist_storage_settings(guard: &NodeState, settings: &storage_settings::StorageSettings) {
+    if let Some(path) = guard.storage_settings_path.as_ref() {
+        storage_settings::save(path, settings);
+    }
+}
+
+/// Build + sign the current pledge list from `my_pledges` (BTreeMap ⇒
+/// deterministic order), advancing + persisting the pledge floor.
+fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), String> {
+    let identity = storage_signer(guard, "pledge list")?;
+    let updated_at = next_storage_updated_at(&guard.pledge_clock);
+    let pledges: Vec<storage_signing::PledgeEntry> = {
+        let mut settings = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        settings.pledge_floor = updated_at;
+        persist_storage_settings(guard, &settings);
+        settings
+            .my_pledges
+            .iter()
+            .take(storage_records::MAX_PLEDGES_PER_LIST)
+            .map(|(to, bytes)| storage_signing::PledgeEntry {
+                to: to.clone(),
+                bytes: *bytes,
+            })
+            .collect()
+    };
+    let mut payload = storage_signing::PledgeListPayload {
+        owner_address: guard.node_addr.clone(),
+        pledges,
+        updated_at,
+        identity_pub: None,
+        sig: None,
+    };
+    storage_signing::sign_pledge_list(identity, &mut payload);
+    let topic = format!("{}{}/pledges", STORAGE_RECORD_PREFIX, payload.owner_address);
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("pledge list serialize failed: {e}"))?;
+    Ok((topic, bytes))
+}
+
+/// Build + sign the current backup set from flagged index entries:
+/// non-archived, public-durable class (defense in depth — the flag IPC
+/// already rejects ineligible classes), deduped by cid, ordered by
+/// `stored_at_ms` then cid (deterministic priority: oldest flagged
+/// first), truncated to the wire cap.
+fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), String> {
+    let identity = storage_signer(guard, "backup set")?;
+    let entries: Vec<storage_signing::BackupEntry> = {
+        let idx = guard
+            .content_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rows: Vec<(u64, String, u64)> = idx
+            .entries()
+            .filter(|e| e.backup && !e.archived)
+            .filter(|e| {
+                harmony_content::cid::ContentId::from_bytes(e.cid).content_class()
+                    == harmony_content::cid::ContentClass::PublicDurable
+            })
+            .map(|e| (e.stored_at_ms, hex::encode(e.cid), e.size_bytes))
+            .collect();
+        rows.sort();
+        let mut seen = std::collections::HashSet::new();
+        rows.into_iter()
+            .filter(|(_, cid, _)| seen.insert(cid.clone()))
+            .take(storage_records::MAX_BACKUP_ENTRIES)
+            .map(|(_, cid, size)| storage_signing::BackupEntry { cid, size })
+            .collect()
+    };
+    let updated_at = next_storage_updated_at(&guard.backup_set_clock);
+    {
+        let mut settings = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        settings.backup_set_floor = updated_at;
+        persist_storage_settings(guard, &settings);
+    }
+    // PR #449 review (Qodo): receivers enforce MAX_BACKUP_SET_WIRE_BYTES
+    // BEFORE parsing, so an oversize publish is deterministically dropped
+    // by every peer. Enforce the cap on the SIGNED serialization here,
+    // truncating deterministically (the list is priority-ordered, so the
+    // oldest flagged entries always survive). Each shrink re-signs — the
+    // signature covers the final entry list.
+    let mut entries = entries;
+    let (topic, bytes) = loop {
+        let mut payload = storage_signing::BackupSetPayload {
+            owner_address: guard.node_addr.clone(),
+            entries: entries.clone(),
+            updated_at,
+            identity_pub: None,
+            sig: None,
+        };
+        storage_signing::sign_backup_set(identity, &mut payload);
+        let bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("backup set serialize failed: {e}"))?;
+        if bytes.len() <= storage_records::MAX_BACKUP_SET_WIRE_BYTES {
+            let topic = format!(
+                "{}{}/backup-set",
+                STORAGE_RECORD_PREFIX, payload.owner_address
+            );
+            break (topic, bytes);
+        }
+        if entries.is_empty() {
+            return Err(format!(
+                "backup set base payload exceeds wire cap ({} bytes)",
+                bytes.len()
+            ));
+        }
+        // Overshoot-proportional shrink converges in a couple of rounds.
+        let over = bytes.len() - storage_records::MAX_BACKUP_SET_WIRE_BYTES;
+        let per_entry = (bytes.len() / entries.len()).max(1);
+        let drop_n = (over / per_entry + 1).min(entries.len());
+        let kept = entries.len() - drop_n;
+        tracing::warn!(
+            dropped = drop_n,
+            kept,
+            "backup set exceeds wire cap; truncating lowest-priority entries"
+        );
+        entries.truncate(kept);
+    };
+    Ok((topic, bytes))
+}
+
+/// The ledger aggregate a hosting report publishes: one line per
+/// beneficiary (bytes + cid count), never per-CID (spec §3). Also the
+/// publisher task's change fingerprint.
+fn hosting_report_lines(
+    ledger: &std::sync::Arc<Mutex<storage_ledger::StorageLedger>>,
+) -> Vec<storage_signing::HostingReportEntry> {
+    let ledger = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ledger
+        .buddies()
+        .into_iter()
+        .map(|b| storage_signing::HostingReportEntry {
+            bytes: ledger.bytes_for_buddy(&b),
+            cids: ledger.cid_count_for_buddy(&b),
+            beneficiary: b,
+        })
+        .filter(|r| r.cids > 0)
+        .take(storage_records::MAX_HOSTING_REPORTS)
+        .collect()
+}
+
+/// Build + sign a hosting report. Explicit deps (not `&NodeState`): the
+/// caller is the per-generation publisher TASK, which must own its
+/// handles outright to work identically under Tauri and headless serve
+/// (the `app.state::<…>()` shortcut is wry-only).
+fn build_signed_hosting_report_with(
+    identity: &harmony_identity::PrivateIdentity,
+    node_addr: &str,
+    reports: Vec<storage_signing::HostingReportEntry>,
+    settings: &std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
+    settings_path: &std::path::Path,
+    clock: &std::sync::atomic::AtomicU64,
+) -> Result<(String, Vec<u8>), String> {
+    let signer = vine_signing::signer_address(identity);
+    if node_addr != signer {
+        return Err(format!(
+            "refusing to sign: storage record owner {node_addr} does not match signer identity {signer}"
+        ));
+    }
+    let updated_at = next_storage_updated_at(clock);
+    {
+        let mut settings = settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        settings.hosting_floor = updated_at;
+        storage_settings::save(settings_path, &settings);
+    }
+    let mut payload = storage_signing::HostingReportPayload {
+        owner_address: node_addr.to_string(),
+        reports,
+        updated_at,
+        identity_pub: None,
+        sig: None,
+    };
+    storage_signing::sign_hosting_report(identity, &mut payload);
+    let topic = format!("{}{}/hosting", STORAGE_RECORD_PREFIX, payload.owner_address);
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|e| format!("hosting report serialize failed: {e}"))?;
+    Ok((topic, bytes))
+}
+
+/// Hand a signed storage record to the event loop for Zenoh publication.
+/// Fire-and-forget (the oneshot receiver is dropped): triggers and the
+/// boot republish self-heal a lost publish.
+fn send_storage_record_publish(
+    guard: &NodeState,
+    key_expr: String,
+    payload: Vec<u8>,
+) -> Result<(), String> {
+    let tx = guard.publish_tx.as_ref().ok_or("not connected")?;
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    tx.try_send(event_loop::PublishRequest {
+        key_expr,
+        payload,
+        reply: reply_tx,
+    })
+    .map_err(|_| "publish channel full — storage record publish not sent".to_string())
+}
+
+/// Best-effort choke point: every pledge-list publish path goes through
+/// here (set_buddy_pledge, remove_storage_buddy, boot republish).
+pub(crate) fn publish_pledge_list_update(guard: &NodeState) {
+    match build_signed_pledge_list(guard) {
+        Ok((topic, bytes)) => {
+            if let Err(e) = send_storage_record_publish(guard, topic, bytes) {
+                tracing::warn!(error = %e, "pledge-list publish hand-off failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "pledge-list publish skipped"),
+    }
+}
+
+/// Best-effort choke point: backup-set publishes (set_backup_flag, boot).
+pub(crate) fn publish_backup_set_update(guard: &NodeState) {
+    match build_signed_backup_set(guard) {
+        Ok((topic, bytes)) => {
+            if let Err(e) = send_storage_record_publish(guard, topic, bytes) {
+                tracing::warn!(error = %e, "backup-set publish hand-off failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "backup-set publish skipped"),
+    }
+}
+
+/// ZEB-669 S2: per-generation hosting-report publisher. Spawned from
+/// start_node (NEVER inline-awaited — the loop isn't draining publish_rx
+/// yet at spawn time; see the start_node inline-await hazard). Policy:
+/// check every 30 s, publish when the ledger aggregate changed or
+/// `HOSTING_REFRESH_INTERVAL_MS` elapsed (receivers prune at 3× the
+/// refresh interval). Exits when the event loop drops `publish_rx`
+/// (node stopped) — no generation plumbing needed.
+fn spawn_hosting_report_publisher(
+    identity: std::sync::Arc<harmony_identity::PrivateIdentity>,
+    node_addr: String,
+    ledger: std::sync::Arc<Mutex<storage_ledger::StorageLedger>>,
+    settings: std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
+    settings_path: std::path::PathBuf,
+    publish_tx: tokio::sync::mpsc::Sender<event_loop::PublishRequest>,
+    hosting_floor: u64,
+) {
+    tokio::spawn(async move {
+        let clock = std::sync::atomic::AtomicU64::new(hosting_floor);
+        // `None` = nothing published this session. The initial-empty
+        // aggregate is deliberately NOT published: a node that never
+        // buddied should not put an empty claim on the wire.
+        let mut published: Option<Vec<storage_signing::HostingReportEntry>> = None;
+        let mut last_publish = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if publish_tx.is_closed() {
+                tracing::debug!("hosting-report publisher exiting (node stopped)");
+                return;
+            }
+            let lines = hosting_report_lines(&ledger);
+            let changed = published.as_deref() != Some(&lines[..]);
+            let refresh_due = last_publish.elapsed().as_millis() as u64
+                >= storage_records::HOSTING_REFRESH_INTERVAL_MS;
+            let initial_empty = published.is_none() && lines.is_empty();
+            if initial_empty || !(changed || (refresh_due && !lines.is_empty())) {
+                continue;
+            }
+            match build_signed_hosting_report_with(
+                &identity,
+                &node_addr,
+                lines.clone(),
+                &settings,
+                &settings_path,
+                &clock,
+            ) {
+                Ok((topic, bytes)) => {
+                    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                    match publish_tx.try_send(event_loop::PublishRequest {
+                        key_expr: topic,
+                        payload: bytes,
+                        reply: reply_tx,
+                    }) {
+                        Ok(()) => {
+                            published = Some(lines);
+                            last_publish = std::time::Instant::now();
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "hosting-report publish deferred (channel full)");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "hosting-report publish skipped"),
+            }
+        }
+    });
+}
+
+// ── ZEB-669 S2: buddy-pact IPC surface ──────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BuddyStatus {
+    /// Both sides pledge (0 bytes is a valid accept — spec §0.1).
+    Active,
+    /// They pledge to me; I have not pledged back (their invite).
+    PendingIncoming,
+    /// I pledge to them; they have not pledged back (my invite).
+    PendingOutgoing,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageBuddyDto {
+    pub owner_address: String,
+    /// Purely-local pet name (`friend_nicknames.json`), never on the wire.
+    pub pet_name: Option<String>,
+    pub status: BuddyStatus,
+    /// Bytes I pledge to host for them (0 when the invite is theirs).
+    pub my_pledge_bytes: u64,
+    /// Bytes they pledge to host for me, if their list names me.
+    pub their_pledge_bytes: Option<u64>,
+    /// Ledger truth: bytes I actually pin for them right now.
+    pub hosted_for_them_bytes: u64,
+    /// Their signed HostingReport line naming me, if fresh.
+    pub they_report_holding_bytes: Option<u64>,
+    /// Age of that report (wall ms since local receipt).
+    pub report_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BuddyHealth {
+    Healthy,
+    CatchingUp,
+    OverBudget,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContributionSummaryDto {
+    /// Ledger numerator: each distinct pinned CID counted once.
+    pub hosted_bytes: u64,
+    /// The enforced shared-budget denominator.
+    pub budget_bytes: u64,
+    /// Active pacts only (invites don't count).
+    pub buddy_count: u32,
+    pub health: BuddyHealth,
+}
+
+/// Normalize + validate a buddy owner address at the IPC boundary
+/// (lowercase 32-hex, the same shape as `node_addr` /
+/// `FriendNicknames` keys).
+fn normalize_buddy_owner(owner_address: &str) -> Result<String, String> {
+    let owner = owner_address.trim().to_lowercase();
+    decode_owner_id_16(&owner)?;
+    Ok(owner)
+}
+
+/// ZEB-669 S2: pacts + pending invites, pet-names joined locally.
+pub(crate) fn get_storage_buddies_impl(
+    state: &Mutex<NodeState>,
+) -> Result<Vec<StorageBuddyDto>, String> {
+    let (records, ledger, settings, nick_path, me) = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            g.storage_records.clone(),
+            g.storage_ledger.clone(),
+            g.storage_settings.clone(),
+            g.connectivity_settings_path.clone(),
+            g.node_addr.clone(),
+        )
+    };
+    let (my_pledges, dismissed) = {
+        let s = settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (s.my_pledges.clone(), s.dismissed_invites.clone())
+    };
+    // ZEB-419 posture: nicknames live in their own purely-local file.
+    let nicknames = match &nick_path {
+        Some(p) => friend_nicknames::FriendNicknames::load_or_default(
+            &p.with_file_name("friend_nicknames.json"),
+        ),
+        None => friend_nicknames::FriendNicknames::default(),
+    };
+    let now = wall_clock_ms();
+    let records = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ledger = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pledgers: std::collections::BTreeMap<String, u64> =
+        records.owners_pledging_to(&me).into_iter().collect();
+
+    let mut owners: std::collections::BTreeSet<String> = my_pledges.keys().cloned().collect();
+    owners.extend(pledgers.keys().cloned());
+    let mut out = Vec::new();
+    for owner in owners {
+        let mine = my_pledges.get(&owner).copied();
+        let theirs = pledgers.get(&owner).copied();
+        let status = match (mine, theirs) {
+            (Some(_), Some(_)) => BuddyStatus::Active,
+            (Some(_), None) => BuddyStatus::PendingOutgoing,
+            (None, Some(_)) => {
+                // A dismissed invite stops surfacing unless re-issued
+                // with a newer updated_at (spec §4).
+                let their_updated = records
+                    .pledge_list(&owner)
+                    .map(|r| r.updated_at)
+                    .unwrap_or(0);
+                if dismissed.get(&owner).is_some_and(|d| *d >= their_updated) {
+                    continue;
+                }
+                BuddyStatus::PendingIncoming
+            }
+            (None, None) => continue,
+        };
+        let report = records.hosting_reported_for(&owner, &me);
+        out.push(StorageBuddyDto {
+            pet_name: nicknames.get(&owner).map(str::to_string),
+            status,
+            my_pledge_bytes: mine.unwrap_or(0),
+            their_pledge_bytes: theirs,
+            hosted_for_them_bytes: ledger.bytes_for_buddy(&owner),
+            they_report_holding_bytes: report.map(|(bytes, _)| bytes),
+            report_age_ms: report.map(|(_, received)| now.saturating_sub(received)),
+            owner_address: owner,
+        });
+    }
+    Ok(out)
+}
+
+/// ZEB-669 S2: create/accept/update a pledge (0 bytes is a valid
+/// accept). Pledging clears any dismissal — it IS the accept.
+pub(crate) fn set_buddy_pledge_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    owner_address: String,
+    bytes: u64,
+) -> Result<(), String> {
+    let owner = normalize_buddy_owner(&owner_address)?;
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    if owner == guard.node_addr {
+        return Err("cannot pledge storage to yourself".to_string());
+    }
+    {
+        let mut s = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !s.my_pledges.contains_key(&owner)
+            && s.my_pledges.len() >= storage_records::MAX_PLEDGES_PER_LIST
+        {
+            return Err(format!(
+                "pledge cap reached ({} buddies)",
+                storage_records::MAX_PLEDGES_PER_LIST
+            ));
+        }
+        s.my_pledges.insert(owner.clone(), bytes);
+        s.dismissed_invites.remove(&owner);
+        persist_storage_settings(&guard, &s);
+    }
+    publish_pledge_list_update(&guard);
+    crate::node_event_sink::emit_ser(sink, "storage-buddies-updated", &serde_json::Value::Null);
+    Ok(())
+}
+
+/// ZEB-669 S2: remove a buddy (or decline an invite — same verb: the
+/// inviter's record isn't ours to remove, so declining records a local
+/// dismissal at the invite's current updated_at). Ledger release and
+/// unpinning happen in the engine tick, which sees the pact gone.
+pub(crate) fn remove_storage_buddy_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    owner_address: String,
+) -> Result<(), String> {
+    let owner = normalize_buddy_owner(&owner_address)?;
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let their_updated = {
+        let records = guard
+            .storage_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        records
+            .pledge_list(&owner)
+            .filter(|r| r.pledges.iter().any(|p| p.to == guard.node_addr))
+            .map(|r| r.updated_at)
+    };
+    let had_pledge = {
+        let mut s = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let had = s.my_pledges.remove(&owner).is_some();
+        if let Some(updated_at) = their_updated {
+            s.dismissed_invites.insert(owner.clone(), updated_at);
+        }
+        persist_storage_settings(&guard, &s);
+        had
+    };
+    if had_pledge {
+        publish_pledge_list_update(&guard);
+    }
+    crate::node_event_sink::emit_ser(sink, "storage-buddies-updated", &serde_json::Value::Null);
+    Ok(())
+}
+
+/// ZEB-669 S2: set the enforced shared budget. Eviction down to a
+/// shrunken budget happens in the engine tick.
+pub(crate) fn set_shared_budget_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    bytes: u64,
+) -> Result<(), String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    {
+        let mut s = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.shared_budget_bytes == bytes {
+            return Ok(());
+        }
+        s.shared_budget_bytes = bytes;
+        persist_storage_settings(&guard, &s);
+    }
+    crate::node_event_sink::emit_ser(sink, "contribution-updated", &serde_json::Value::Null);
+    Ok(())
+}
+
+/// ZEB-669 S2: the contribution meter. Health is the spec §3 rule,
+/// verbatim: Over budget ⇒ budget shrunk below the ledger; Catching up
+/// ⇒ the dry-run planner still has work (fetches pending, truncation);
+/// else Healthy.
+pub(crate) fn get_contribution_summary_impl(
+    state: &Mutex<NodeState>,
+) -> Result<ContributionSummaryDto, String> {
+    let (records, ledger, settings, me) = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            g.storage_records.clone(),
+            g.storage_ledger.clone(),
+            g.storage_settings.clone(),
+            g.node_addr.clone(),
+        )
+    };
+    let (my_pledges, budget) = {
+        let s = settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (s.my_pledges.clone(), s.shared_budget_bytes)
+    };
+    let records = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ledger = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hosted = ledger.distinct_pinned_bytes();
+    let pledgers: std::collections::HashSet<String> = records
+        .owners_pledging_to(&me)
+        .into_iter()
+        .map(|(owner, _)| owner)
+        .collect();
+    let buddy_count = my_pledges
+        .keys()
+        .filter(|owner| pledgers.contains(*owner))
+        .count() as u32;
+    let plan = buddy_pin_planner::plan(
+        &me,
+        &my_pledges,
+        &records,
+        &ledger,
+        budget,
+        &std::collections::HashMap::new(),
+        &|_| false,
+    );
+    let health = if hosted > budget {
+        BuddyHealth::OverBudget
+    } else if plan.has_work() || plan.catching_up {
+        BuddyHealth::CatchingUp
+    } else {
+        BuddyHealth::Healthy
+    };
+    Ok(ContributionSummaryDto {
+        hosted_bytes: hosted,
+        budget_bytes: budget,
+        buddy_count,
+        health,
+    })
+}
+
+#[tauri::command]
+async fn get_storage_buddies(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<StorageBuddyDto>, String> {
+    get_storage_buddies_impl(state.inner())
+}
+
+#[tauri::command]
+async fn set_buddy_pledge(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_address: String,
+    bytes: u64,
+) -> Result<(), String> {
+    set_buddy_pledge_impl(state.inner(), &app, owner_address, bytes)
+}
+
+#[tauri::command]
+async fn remove_storage_buddy(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_address: String,
+) -> Result<(), String> {
+    remove_storage_buddy_impl(state.inner(), &app, owner_address)
+}
+
+#[tauri::command]
+async fn set_shared_budget(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    bytes: u64,
+) -> Result<(), String> {
+    set_shared_budget_impl(state.inner(), &app, bytes)
+}
+
+#[tauri::command]
+async fn get_contribution_summary(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<ContributionSummaryDto, String> {
+    get_contribution_summary_impl(state.inner())
+}
+
+/// ZEB-669 S2: toggle "back up with buddies" on a sidecar entry.
+/// Eligibility is enforced HERE (the CID header must be PublicDurable —
+/// encrypted/ephemeral classes are never announced or served without an
+/// allowlist, so flagging them would be a silent lie); the error carries
+/// a stable `ineligible:` prefix for the UI. Real flag changes republish
+/// our signed BackupSet.
+pub(crate) fn set_backup_flag_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    sidecar_id: String,
+    backup: bool,
+) -> Result<(), String> {
+    let id = parse_sidecar_id(&sidecar_id)?;
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let changed = {
+        let mut idx = guard
+            .content_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = idx
+            .get(&id)
+            .ok_or_else(|| format!("unknown sidecar_id {sidecar_id}"))?;
+        if backup {
+            let class = harmony_content::cid::ContentId::from_bytes(entry.cid).content_class();
+            if class != harmony_content::cid::ContentClass::PublicDurable {
+                return Err(
+                    "ineligible: encrypted or ephemeral content cannot be backed up by buddies"
+                        .to_string(),
+                );
+            }
+        }
+        idx.set_backup(&id, backup)
+    };
+    if changed {
+        publish_backup_set_update(&guard);
+        crate::node_event_sink::emit_ser(sink, "storage-buddies-updated", &serde_json::Value::Null);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_backup_flag(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    sidecar_id: String,
+    backup: bool,
+) -> Result<(), String> {
+    set_backup_flag_impl(state.inner(), &app, sidecar_id, backup)
+}
+
+#[cfg(test)]
+mod storage_buddy_ipc_tests {
+    use super::*;
+
+    const ME: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 32-hex
+
+    fn sink() -> std::sync::Arc<crate::node_event_sink::RecordingSink> {
+        crate::node_event_sink::RecordingSink::new()
+    }
+
+    fn state_with_me() -> Mutex<NodeState> {
+        Mutex::new(NodeState {
+            node_addr: ME.into(),
+            ..NodeState::default()
+        })
+    }
+
+    /// Ingest a signed pledge list from a fresh identity naming `to`
+    /// with `bytes`; returns the signer's owner address.
+    fn ingest_pledger(state: &Mutex<NodeState>, to: &str, bytes: u64, updated_at: u64) -> String {
+        let id = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let owner = hex::encode(id.public_identity().address_hash);
+        let mut pl = storage_signing::PledgeListPayload {
+            owner_address: owner.clone(),
+            pledges: vec![storage_signing::PledgeEntry {
+                to: to.into(),
+                bytes,
+            }],
+            updated_at,
+            identity_pub: None,
+            sig: None,
+        };
+        storage_signing::sign_pledge_list(&id, &mut pl);
+        let topic = format!("{STORAGE_RECORD_PREFIX}{owner}/pledges");
+        let guard = state.lock().unwrap();
+        let outcome = guard
+            .storage_records
+            .lock()
+            .unwrap()
+            .on_pledge_list_sample(&topic, &serde_json::to_vec(&pl).unwrap());
+        assert!(outcome.changed(), "seed ingest must land: {outcome:?}");
+        owner
+    }
+
+    #[test]
+    fn pact_and_invite_classification() {
+        let state = state_with_me();
+        let alice = ingest_pledger(&state, ME, 100, 1); // mutual → Active
+        let bob = ingest_pledger(&state, ME, 50, 1); // theirs only → PendingIncoming
+        let carol = hex::encode([0xCC; 16]); // mine only → PendingOutgoing
+        {
+            let guard = state.lock().unwrap();
+            let mut s = guard.storage_settings.lock().unwrap();
+            s.my_pledges.insert(alice.clone(), 200);
+            s.my_pledges.insert(carol.clone(), 10);
+        }
+
+        let dtos = get_storage_buddies_impl(&state).unwrap();
+        let by_owner = |o: &str| dtos.iter().find(|d| d.owner_address == o).unwrap();
+        assert_eq!(by_owner(&alice).status, BuddyStatus::Active);
+        assert_eq!(by_owner(&alice).my_pledge_bytes, 200);
+        assert_eq!(by_owner(&alice).their_pledge_bytes, Some(100));
+        assert_eq!(by_owner(&bob).status, BuddyStatus::PendingIncoming);
+        assert_eq!(by_owner(&bob).my_pledge_bytes, 0);
+        assert_eq!(by_owner(&carol).status, BuddyStatus::PendingOutgoing);
+        assert_eq!(by_owner(&carol).their_pledge_bytes, None);
+    }
+
+    #[test]
+    fn dismissed_invite_is_suppressed_until_reissued_newer() {
+        let state = state_with_me();
+        let dave = ingest_pledger(&state, ME, 10, 5);
+        {
+            let guard = state.lock().unwrap();
+            guard
+                .storage_settings
+                .lock()
+                .unwrap()
+                .dismissed_invites
+                .insert(dave.clone(), 5);
+        }
+        assert!(
+            get_storage_buddies_impl(&state).unwrap().is_empty(),
+            "dismissed at the invite's updated_at ⇒ suppressed"
+        );
+        // Simulate a re-issued invite with a newer updated_at.
+        {
+            let guard = state.lock().unwrap();
+            guard
+                .storage_settings
+                .lock()
+                .unwrap()
+                .dismissed_invites
+                .insert(dave.clone(), 4);
+        }
+        let dtos = get_storage_buddies_impl(&state).unwrap();
+        assert_eq!(dtos.len(), 1, "newer invite resurfaces");
+        assert_eq!(dtos[0].status, BuddyStatus::PendingIncoming);
+    }
+
+    #[test]
+    fn set_buddy_pledge_accepts_invite_and_clears_dismissal() {
+        let state = state_with_me();
+        let alice = ingest_pledger(&state, ME, 10, 3);
+        {
+            let guard = state.lock().unwrap();
+            guard
+                .storage_settings
+                .lock()
+                .unwrap()
+                .dismissed_invites
+                .insert(alice.clone(), 3);
+        }
+        let s = sink();
+        // 0 bytes is a VALID accept (spec §0.1) — the pact goes Active.
+        set_buddy_pledge_impl(&state, &s, alice.to_uppercase(), 0).unwrap();
+        {
+            let guard = state.lock().unwrap();
+            let settings = guard.storage_settings.lock().unwrap();
+            assert_eq!(settings.my_pledges.get(&alice), Some(&0));
+            assert!(
+                !settings.dismissed_invites.contains_key(&alice),
+                "pledging IS accepting"
+            );
+        }
+        let dtos = get_storage_buddies_impl(&state).unwrap();
+        assert_eq!(dtos[0].status, BuddyStatus::Active);
+    }
+
+    #[test]
+    fn set_buddy_pledge_rejects_self_and_garbage() {
+        let state = state_with_me();
+        let s = sink();
+        assert!(set_buddy_pledge_impl(&state, &s, ME.into(), 1)
+            .unwrap_err()
+            .contains("yourself"));
+        assert!(set_buddy_pledge_impl(&state, &s, "not-hex".into(), 1).is_err());
+        assert!(set_buddy_pledge_impl(&state, &s, "abcd".into(), 1).is_err());
+    }
+
+    #[test]
+    fn remove_storage_buddy_records_dismissal_at_current_updated_at() {
+        let state = state_with_me();
+        let alice = ingest_pledger(&state, ME, 10, 7);
+        let s = sink();
+        set_buddy_pledge_impl(&state, &s, alice.clone(), 100).unwrap();
+        remove_storage_buddy_impl(&state, &s, alice.clone()).unwrap();
+        {
+            let guard = state.lock().unwrap();
+            let settings = guard.storage_settings.lock().unwrap();
+            assert!(!settings.my_pledges.contains_key(&alice));
+            assert_eq!(
+                settings.dismissed_invites.get(&alice),
+                Some(&7),
+                "removal dismisses the residual invite at its updated_at"
+            );
+        }
+        assert!(
+            get_storage_buddies_impl(&state).unwrap().is_empty(),
+            "no pact, invite dismissed"
+        );
+    }
+
+    #[test]
+    fn contribution_summary_health_rules() {
+        let state = state_with_me();
+        // Empty world: healthy, defaults.
+        let summary = get_contribution_summary_impl(&state).unwrap();
+        assert_eq!(
+            summary.budget_bytes,
+            storage_settings::DEFAULT_SHARED_BUDGET_BYTES
+        );
+        assert_eq!(summary.health, BuddyHealth::Healthy);
+        assert_eq!(summary.buddy_count, 0);
+
+        // Ledger over budget ⇒ OverBudget beats everything.
+        {
+            let guard = state.lock().unwrap();
+            guard
+                .storage_ledger
+                .lock()
+                .unwrap()
+                .record_pin("x", "cid", 100, 1);
+            guard
+                .storage_ledger
+                .lock()
+                .unwrap()
+                .record_pin("y", "cid", 100, 2);
+            guard.storage_settings.lock().unwrap().shared_budget_bytes = 50;
+        }
+        let summary = get_contribution_summary_impl(&state).unwrap();
+        assert_eq!(summary.hosted_bytes, 100, "distinct bytes counted once");
+        assert_eq!(summary.health, BuddyHealth::OverBudget);
+    }
+
+    #[test]
+    fn set_shared_budget_persists_and_is_idempotent() {
+        let state = state_with_me();
+        let s = sink();
+        set_shared_budget_impl(&state, &s, 123).unwrap();
+        set_shared_budget_impl(&state, &s, 123).unwrap(); // no-op path
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.storage_settings.lock().unwrap().shared_budget_bytes,
+            123
+        );
+    }
+
+    fn indexed_entry(state: &Mutex<NodeState>, cid: harmony_content::cid::ContentId) -> String {
+        let entry = content_index::ContentIndexEntry {
+            sidecar_id: content_index::SidecarId::new(),
+            cid: cid.to_bytes(),
+            file_name: "f".into(),
+            size_bytes: 3,
+            stored_at_ms: 1,
+            sensitivity: content_index::Sensitivity::Public,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            backup: false,
+            kind: content_index::ContentKind::Leaf,
+        };
+        let sid = entry.sidecar_id.to_string();
+        state
+            .lock()
+            .unwrap()
+            .content_index
+            .lock()
+            .unwrap()
+            .insert(entry);
+        sid
+    }
+
+    #[test]
+    fn set_backup_flag_rejects_ineligible_classes_with_stable_prefix() {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let state = state_with_me();
+        let s = sink();
+        for flags in [
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+            ContentFlags {
+                ephemeral: true,
+                ..Default::default()
+            },
+        ] {
+            let sid = indexed_entry(&state, ContentId::for_book(b"x", flags).unwrap());
+            let err = set_backup_flag_impl(&state, &s, sid.clone(), true).unwrap_err();
+            assert!(err.starts_with("ineligible:"), "{err}");
+            // Clearing an (impossible) flag on ineligible content is
+            // allowed — only SETTING is gated.
+            set_backup_flag_impl(&state, &s, sid, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn set_backup_flag_sets_persists_and_errors_on_unknown() {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let state = state_with_me();
+        let s = sink();
+        let sid = indexed_entry(
+            &state,
+            ContentId::for_book(b"public", ContentFlags::default()).unwrap(),
+        );
+        set_backup_flag_impl(&state, &s, sid.clone(), true).unwrap();
+        {
+            let guard = state.lock().unwrap();
+            let idx = guard.content_index.lock().unwrap();
+            let id = content_index::SidecarId::parse_str(&sid).unwrap();
+            assert!(idx.get(&id).unwrap().backup);
+        }
+        assert!(set_backup_flag_impl(
+            &state,
+            &s,
+            content_index::SidecarId::new().to_string(),
+            true
+        )
+        .unwrap_err()
+        .contains("unknown sidecar_id"));
+        assert!(set_backup_flag_impl(&state, &s, "garbage".into(), true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod storage_publish_tests {
+    use super::*;
+
+    fn signed_state() -> (NodeState, String) {
+        let identity = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let node_addr = vine_signing::signer_address(&identity);
+        let state = NodeState {
+            node_addr: node_addr.clone(),
+            owner_private_identity: Some(std::sync::Arc::new(identity)),
+            ..NodeState::default()
+        };
+        (state, node_addr)
+    }
+
+    #[test]
+    fn storage_clock_is_strictly_monotonic_within_session() {
+        let (state, _) = signed_state();
+        let a = next_storage_updated_at(&state.pledge_clock);
+        let b = next_storage_updated_at(&state.pledge_clock);
+        assert!(b > a, "same-wall-second publishes must not be LWW-equal");
+    }
+
+    #[test]
+    fn pledge_build_advances_and_persists_the_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, addr) = signed_state();
+        state.storage_settings_path = Some(storage_settings::settings_path(dir.path()));
+        state
+            .storage_settings
+            .lock()
+            .unwrap()
+            .my_pledges
+            .insert("buddy-a".into(), 500);
+
+        let (topic, bytes) = build_signed_pledge_list(&state).expect("build");
+        assert_eq!(topic, format!("{STORAGE_RECORD_PREFIX}{addr}/pledges"));
+        let payload: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_pledge_list(&payload).expect("self-verifies");
+        assert_eq!(payload.pledges[0].to, "buddy-a");
+
+        let on_disk =
+            storage_settings::load_or_default(state.storage_settings_path.as_ref().unwrap());
+        assert_eq!(
+            on_disk.pledge_floor, payload.updated_at,
+            "floor persisted before publish"
+        );
+    }
+
+    #[test]
+    fn refuses_to_sign_for_foreign_owner() {
+        let (mut state, _) = signed_state();
+        state.node_addr = "somebody-else".into();
+        let err = build_signed_pledge_list(&state).unwrap_err();
+        assert!(err.contains("does not match signer identity"), "{err}");
+    }
+
+    #[test]
+    fn backup_set_build_dedupes_orders_and_filters() {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let (state, _) = signed_state();
+
+        let older = ContentId::for_book(b"older", ContentFlags::default()).unwrap();
+        let newer = ContentId::for_book(b"newer", ContentFlags::default()).unwrap();
+        let encrypted = ContentId::for_book(
+            b"secret",
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mk = |cid: ContentId, stored_at_ms: u64, backup: bool, archived: bool| {
+            content_index::ContentIndexEntry {
+                sidecar_id: content_index::SidecarId::new(),
+                cid: cid.to_bytes(),
+                file_name: "f".into(),
+                size_bytes: 3,
+                stored_at_ms,
+                sensitivity: content_index::Sensitivity::Public,
+                replication_tier: content_index::ReplicationTier::Default,
+                licensed: false,
+                archived,
+                pinned: false,
+                backup,
+                kind: content_index::ContentKind::Leaf,
+            }
+        };
+        {
+            let mut idx = state.content_index.lock().unwrap();
+            idx.insert(mk(newer, 200, true, false));
+            idx.insert(mk(older, 100, true, false));
+            idx.insert(mk(older, 150, true, false)); // duplicate cid → deduped
+            idx.insert(mk(encrypted, 50, true, false)); // ineligible class
+            idx.insert(mk(
+                ContentId::for_book(b"archived", ContentFlags::default()).unwrap(),
+                10,
+                true,
+                true, // archived → excluded
+            ));
+        }
+
+        let (_, bytes) = build_signed_backup_set(&state).expect("build");
+        let payload: storage_signing::BackupSetPayload = serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_backup_set(&payload).expect("self-verifies");
+        let cids: Vec<&str> = payload.entries.iter().map(|e| e.cid.as_str()).collect();
+        assert_eq!(
+            cids,
+            vec![
+                hex::encode(older.to_bytes()).as_str(),
+                hex::encode(newer.to_bytes()).as_str()
+            ],
+            "deduped, oldest-first, ineligible/archived excluded"
+        );
+    }
+
+    /// PR #449 review (Qodo): receivers drop over-cap payloads before
+    /// parse — the publisher must never emit one. The priority prefix
+    /// (oldest flagged first) survives truncation.
+    #[test]
+    fn backup_set_build_never_exceeds_wire_cap_and_keeps_priority_prefix() {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let (state, _) = signed_state();
+        let mut first_cid = None;
+        {
+            let mut idx = state.content_index.lock().unwrap();
+            for i in 0..storage_records::MAX_BACKUP_ENTRIES {
+                let cid = ContentId::for_book(&(i as u64).to_le_bytes(), ContentFlags::default())
+                    .unwrap();
+                if i == 0 {
+                    first_cid = Some(hex::encode(cid.to_bytes()));
+                }
+                idx.insert(content_index::ContentIndexEntry {
+                    sidecar_id: content_index::SidecarId::new(),
+                    cid: cid.to_bytes(),
+                    file_name: format!("f{i}"),
+                    size_bytes: u64::MAX - i as u64, // widest JSON digits
+                    stored_at_ms: i as u64,
+                    sensitivity: content_index::Sensitivity::Public,
+                    replication_tier: content_index::ReplicationTier::Default,
+                    licensed: false,
+                    archived: false,
+                    pinned: false,
+                    backup: true,
+                    kind: content_index::ContentKind::Leaf,
+                });
+            }
+        }
+        let (_, bytes) = build_signed_backup_set(&state).expect("build");
+        assert!(
+            bytes.len() <= storage_records::MAX_BACKUP_SET_WIRE_BYTES,
+            "published payload must fit the receivers' pre-parse cap ({} bytes)",
+            bytes.len()
+        );
+        let payload: storage_signing::BackupSetPayload = serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_backup_set(&payload).expect("re-signed after truncation");
+        assert!(
+            payload.entries.len() < storage_records::MAX_BACKUP_ENTRIES,
+            "this fixture must actually trigger truncation"
+        );
+        assert_eq!(
+            payload.entries[0].cid,
+            first_cid.unwrap(),
+            "oldest flagged entry (highest priority) survives"
+        );
+    }
+
+    #[test]
+    fn hosting_report_build_aggregates_per_beneficiary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, addr) = signed_state();
+        {
+            let mut ledger = state.storage_ledger.lock().unwrap();
+            ledger.record_pin("alice", "cid1", 100, 1);
+            ledger.record_pin("alice", "cid2", 50, 2);
+            ledger.record_pin("bob", "cid1", 100, 3);
+        }
+        let lines = hosting_report_lines(&state.storage_ledger);
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let settings_path = storage_settings::settings_path(dir.path());
+        let (topic, bytes) = build_signed_hosting_report_with(
+            state.owner_private_identity.as_ref().unwrap(),
+            &addr,
+            lines,
+            &state.storage_settings,
+            &settings_path,
+            &clock,
+        )
+        .expect("build");
+        assert_eq!(topic, format!("{STORAGE_RECORD_PREFIX}{addr}/hosting"));
+        let payload: storage_signing::HostingReportPayload =
+            serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_hosting_report(&payload).expect("self-verifies");
+        assert_eq!(payload.reports.len(), 2);
+        let alice = payload
+            .reports
+            .iter()
+            .find(|r| r.beneficiary == "alice")
+            .unwrap();
+        assert_eq!((alice.bytes, alice.cids), (150, 2));
+        let bob = payload
+            .reports
+            .iter()
+            .find(|r| r.beneficiary == "bob")
+            .unwrap();
+        assert_eq!(
+            (bob.bytes, bob.cids),
+            (100, 1),
+            "per-pact attribution counts the shared cid for bob too"
+        );
+        let on_disk = storage_settings::load_or_default(&settings_path);
+        assert_eq!(on_disk.hosting_floor, payload.updated_at, "floor persisted");
+    }
+}
+
 /// ZEB-671: refresh the Discover graph inputs on the vine cache after a
 /// local follow-set change. Extracts what it needs and DROPS the state
 /// guard before locking the cache — IPC readers (`list_vine_videos`)
@@ -15669,6 +17024,7 @@ pub(crate) async fn send_ingest_with_name(
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: content_index::ContentKind::Leaf,
         });
         if !inserted {
@@ -16444,6 +17800,7 @@ pub(crate) async fn create_folder_at_root_with_children(
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: content_index::ContentKind::Folder,
         });
         if !inserted {
@@ -17928,6 +19285,7 @@ async fn move_case_d(
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: moved_entry.kind,
         })
     };
@@ -54382,6 +55740,12 @@ pub fn run() {
             list_followed,
             get_vine_settings,
             set_vine_settings,
+            get_storage_buddies,
+            set_buddy_pledge,
+            remove_storage_buddy,
+            set_shared_budget,
+            get_contribution_summary,
+            set_backup_flag,
             mark_vine_viewed,
             publish_vine,
             publish_vine_reaction,
@@ -55355,6 +56719,7 @@ mod tests {
             licensed: false,
             archived,
             pinned: false,
+            backup: false,
             kind: content_index::ContentKind::Leaf,
         }
     }
@@ -59554,6 +60919,18 @@ mod start_node_race_tests {
             observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
                 observed_holders::ObservedHolders::new(),
             )),
+            storage_records: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_records::StorageRecordStore::new(None),
+            )),
+            storage_ledger: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_ledger::StorageLedger::new(None),
+            )),
+            storage_settings: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_settings::StorageSettings::default(),
+            )),
+            storage_settings_path: None,
+            pledge_clock: std::sync::atomic::AtomicU64::new(0),
+            backup_set_clock: std::sync::atomic::AtomicU64::new(0),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),

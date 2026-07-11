@@ -89,6 +89,32 @@ struct EmptyArgs {}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetBuddyPledgeArgs {
+    owner_address: String,
+    bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveStorageBuddyArgs {
+    owner_address: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetSharedBudgetArgs {
+    bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetBackupFlagArgs {
+    sidecar_id: String,
+    backup: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartNodeArgs {
     endpoint: Option<String>,
 }
@@ -735,6 +761,51 @@ pub fn build_registry() -> RpcRegistry {
         |state, _sink, _a| async move { crate::list_followed_impl(state) }
     );
 
+    // ZEB-669 S2: storage-buddy verbs — headless parity for the pact
+    // surface (invite/accept/remove/budget/meter).
+    rpc!(
+        m,
+        "get_storage_buddies",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::get_storage_buddies_impl(state) }
+    );
+    rpc!(
+        m,
+        "set_buddy_pledge",
+        SetBuddyPledgeArgs,
+        |state, sink, a| async move {
+            crate::set_buddy_pledge_impl(state, sink.as_ref(), a.owner_address, a.bytes)
+        }
+    );
+    rpc!(
+        m,
+        "remove_storage_buddy",
+        RemoveStorageBuddyArgs,
+        |state, sink, a| async move {
+            crate::remove_storage_buddy_impl(state, sink.as_ref(), a.owner_address)
+        }
+    );
+    rpc!(
+        m,
+        "set_shared_budget",
+        SetSharedBudgetArgs,
+        |state, sink, a| async move { crate::set_shared_budget_impl(state, sink.as_ref(), a.bytes) }
+    );
+    rpc!(
+        m,
+        "get_contribution_summary",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::get_contribution_summary_impl(state) }
+    );
+    rpc!(
+        m,
+        "set_backup_flag",
+        SetBackupFlagArgs,
+        |state, sink, a| async move {
+            crate::set_backup_flag_impl(state, sink.as_ref(), a.sidecar_id, a.backup)
+        }
+    );
+
     // Friends.
     rpc!(m, "list_friends", EmptyArgs, |state, _sink, _a| {
         async move { crate::list_friends_impl(state).await }
@@ -1138,6 +1209,49 @@ mod tests {
                 matches!(err, RpcError::Command(_)),
                 "{method}: expected Command (not connected), got {err:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_buddy_rpcs_are_registered_and_wired() {
+        // ZEB-669 S2 (PR #449 review): same proof shape as the vine-follow
+        // parity test — valid-shaped args on a default NodeState must reach
+        // the `_impl` seam (Ok or a Command error from the seam itself),
+        // never UnknownCommand (unregistered) or BadArgs (arg-struct
+        // mismatch with the Tauri wrapper's camelCase shape).
+        let reg = build_registry();
+        let owner = "ab".repeat(16); // valid 32-hex owner address
+        let cases = [
+            ("get_storage_buddies", serde_json::json!({})),
+            (
+                "set_buddy_pledge",
+                serde_json::json!({ "ownerAddress": owner, "bytes": 1024 }),
+            ),
+            (
+                "remove_storage_buddy",
+                serde_json::json!({ "ownerAddress": owner }),
+            ),
+            (
+                "set_shared_budget",
+                serde_json::json!({ "bytes": 5_000_000 }),
+            ),
+            ("get_contribution_summary", serde_json::json!({})),
+            (
+                "set_backup_flag",
+                serde_json::json!({
+                    "sidecarId": "00000000-0000-4000-8000-000000000000",
+                    "backup": true
+                }),
+            ),
+        ];
+        for (method, args) in cases {
+            match reg.dispatch(method, test_state(), test_sink(), args).await {
+                Err(RpcError::UnknownCommand) => panic!("{method} must be registered"),
+                Err(RpcError::BadArgs(msg)) => {
+                    panic!("{method}: arg struct rejected the wrapper shape: {msg}")
+                }
+                Ok(_) | Err(RpcError::Command(_)) => {}
+            }
         }
     }
 
@@ -1622,6 +1736,13 @@ mod tests {
             "follow_vine_creator",
             "unfollow_vine_creator",
             "list_followed",
+            // storage buddies (ZEB-669 S2)
+            "get_storage_buddies",
+            "set_buddy_pledge",
+            "remove_storage_buddy",
+            "set_shared_budget",
+            "get_contribution_summary",
+            "set_backup_flag",
             // friends
             "list_friends",
             "generate_friend_token",

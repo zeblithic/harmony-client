@@ -213,6 +213,17 @@ async fn ingest_list_pin_burn_roundtrip() {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
                     )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
+                    )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });
@@ -267,6 +278,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                 licensed: false,
                 archived: false,
                 pinned: false,
+                backup: false,
                 kind: ContentKind::Leaf,
             }),
             "first insert should return true"
@@ -525,6 +537,17 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
                     )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
+                    )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });
@@ -627,6 +650,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         }));
     }
@@ -725,6 +749,7 @@ fn pin_intent_survives_reload() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         });
         assert!(
@@ -944,6 +969,17 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
                     )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
+                    )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });
@@ -1221,6 +1257,17 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
                     )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
+                    )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });
@@ -1281,6 +1328,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         }));
         assert!(idx.insert(ContentIndexEntry {
@@ -1294,6 +1342,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Folder,
         }));
     }
@@ -1561,6 +1610,17 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
                     )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
+                    )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });
@@ -1606,6 +1666,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         }));
     }
