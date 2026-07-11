@@ -89,6 +89,25 @@ struct EmptyArgs {}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetBuddyPledgeArgs {
+    owner_address: String,
+    bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveStorageBuddyArgs {
+    owner_address: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetSharedBudgetArgs {
+    bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartNodeArgs {
     endpoint: Option<String>,
 }
@@ -733,6 +752,43 @@ pub fn build_registry() -> RpcRegistry {
         "list_followed",
         EmptyArgs,
         |state, _sink, _a| async move { crate::list_followed_impl(state) }
+    );
+
+    // ZEB-669 S2: storage-buddy verbs — headless parity for the pact
+    // surface (invite/accept/remove/budget/meter).
+    rpc!(
+        m,
+        "get_storage_buddies",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::get_storage_buddies_impl(state) }
+    );
+    rpc!(
+        m,
+        "set_buddy_pledge",
+        SetBuddyPledgeArgs,
+        |state, sink, a| async move {
+            crate::set_buddy_pledge_impl(state, sink.as_ref(), a.owner_address, a.bytes)
+        }
+    );
+    rpc!(
+        m,
+        "remove_storage_buddy",
+        RemoveStorageBuddyArgs,
+        |state, sink, a| async move {
+            crate::remove_storage_buddy_impl(state, sink.as_ref(), a.owner_address)
+        }
+    );
+    rpc!(
+        m,
+        "set_shared_budget",
+        SetSharedBudgetArgs,
+        |state, sink, a| async move { crate::set_shared_budget_impl(state, sink.as_ref(), a.bytes) }
+    );
+    rpc!(
+        m,
+        "get_contribution_summary",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::get_contribution_summary_impl(state) }
     );
 
     // Friends.

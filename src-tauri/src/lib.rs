@@ -14577,6 +14577,553 @@ fn spawn_hosting_report_publisher(
     });
 }
 
+// ── ZEB-669 S2: buddy-pact IPC surface ──────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BuddyStatus {
+    /// Both sides pledge (0 bytes is a valid accept — spec §0.1).
+    Active,
+    /// They pledge to me; I have not pledged back (their invite).
+    PendingIncoming,
+    /// I pledge to them; they have not pledged back (my invite).
+    PendingOutgoing,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageBuddyDto {
+    pub owner_address: String,
+    /// Purely-local pet name (`friend_nicknames.json`), never on the wire.
+    pub pet_name: Option<String>,
+    pub status: BuddyStatus,
+    /// Bytes I pledge to host for them (0 when the invite is theirs).
+    pub my_pledge_bytes: u64,
+    /// Bytes they pledge to host for me, if their list names me.
+    pub their_pledge_bytes: Option<u64>,
+    /// Ledger truth: bytes I actually pin for them right now.
+    pub hosted_for_them_bytes: u64,
+    /// Their signed HostingReport line naming me, if fresh.
+    pub they_report_holding_bytes: Option<u64>,
+    /// Age of that report (wall ms since local receipt).
+    pub report_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BuddyHealth {
+    Healthy,
+    CatchingUp,
+    OverBudget,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContributionSummaryDto {
+    /// Ledger numerator: each distinct pinned CID counted once.
+    pub hosted_bytes: u64,
+    /// The enforced shared-budget denominator.
+    pub budget_bytes: u64,
+    /// Active pacts only (invites don't count).
+    pub buddy_count: u32,
+    pub health: BuddyHealth,
+}
+
+/// Normalize + validate a buddy owner address at the IPC boundary
+/// (lowercase 32-hex, the same shape as `node_addr` /
+/// `FriendNicknames` keys).
+fn normalize_buddy_owner(owner_address: &str) -> Result<String, String> {
+    let owner = owner_address.trim().to_lowercase();
+    decode_owner_id_16(&owner)?;
+    Ok(owner)
+}
+
+/// ZEB-669 S2: pacts + pending invites, pet-names joined locally.
+pub(crate) fn get_storage_buddies_impl(
+    state: &Mutex<NodeState>,
+) -> Result<Vec<StorageBuddyDto>, String> {
+    let (records, ledger, settings, nick_path, me) = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            g.storage_records.clone(),
+            g.storage_ledger.clone(),
+            g.storage_settings.clone(),
+            g.connectivity_settings_path.clone(),
+            g.node_addr.clone(),
+        )
+    };
+    let (my_pledges, dismissed) = {
+        let s = settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (s.my_pledges.clone(), s.dismissed_invites.clone())
+    };
+    // ZEB-419 posture: nicknames live in their own purely-local file.
+    let nicknames = match &nick_path {
+        Some(p) => friend_nicknames::FriendNicknames::load_or_default(
+            &p.with_file_name("friend_nicknames.json"),
+        ),
+        None => friend_nicknames::FriendNicknames::default(),
+    };
+    let now = wall_clock_ms();
+    let records = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ledger = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pledgers: std::collections::BTreeMap<String, u64> =
+        records.owners_pledging_to(&me).into_iter().collect();
+
+    let mut owners: std::collections::BTreeSet<String> = my_pledges.keys().cloned().collect();
+    owners.extend(pledgers.keys().cloned());
+    let mut out = Vec::new();
+    for owner in owners {
+        let mine = my_pledges.get(&owner).copied();
+        let theirs = pledgers.get(&owner).copied();
+        let status = match (mine, theirs) {
+            (Some(_), Some(_)) => BuddyStatus::Active,
+            (Some(_), None) => BuddyStatus::PendingOutgoing,
+            (None, Some(_)) => {
+                // A dismissed invite stops surfacing unless re-issued
+                // with a newer updated_at (spec §4).
+                let their_updated = records
+                    .pledge_list(&owner)
+                    .map(|r| r.updated_at)
+                    .unwrap_or(0);
+                if dismissed.get(&owner).is_some_and(|d| *d >= their_updated) {
+                    continue;
+                }
+                BuddyStatus::PendingIncoming
+            }
+            (None, None) => continue,
+        };
+        let report = records.hosting_reported_for(&owner, &me);
+        out.push(StorageBuddyDto {
+            pet_name: nicknames.get(&owner).map(str::to_string),
+            status,
+            my_pledge_bytes: mine.unwrap_or(0),
+            their_pledge_bytes: theirs,
+            hosted_for_them_bytes: ledger.bytes_for_buddy(&owner),
+            they_report_holding_bytes: report.map(|(bytes, _)| bytes),
+            report_age_ms: report.map(|(_, received)| now.saturating_sub(received)),
+            owner_address: owner,
+        });
+    }
+    Ok(out)
+}
+
+/// ZEB-669 S2: create/accept/update a pledge (0 bytes is a valid
+/// accept). Pledging clears any dismissal — it IS the accept.
+pub(crate) fn set_buddy_pledge_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    owner_address: String,
+    bytes: u64,
+) -> Result<(), String> {
+    let owner = normalize_buddy_owner(&owner_address)?;
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    if owner == guard.node_addr {
+        return Err("cannot pledge storage to yourself".to_string());
+    }
+    {
+        let mut s = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !s.my_pledges.contains_key(&owner)
+            && s.my_pledges.len() >= storage_records::MAX_PLEDGES_PER_LIST
+        {
+            return Err(format!(
+                "pledge cap reached ({} buddies)",
+                storage_records::MAX_PLEDGES_PER_LIST
+            ));
+        }
+        s.my_pledges.insert(owner.clone(), bytes);
+        s.dismissed_invites.remove(&owner);
+        persist_storage_settings(&guard, &s);
+    }
+    publish_pledge_list_update(&guard);
+    crate::node_event_sink::emit_ser(sink, "storage-buddies-updated", &serde_json::Value::Null);
+    Ok(())
+}
+
+/// ZEB-669 S2: remove a buddy (or decline an invite — same verb: the
+/// inviter's record isn't ours to remove, so declining records a local
+/// dismissal at the invite's current updated_at). Ledger release and
+/// unpinning happen in the engine tick, which sees the pact gone.
+pub(crate) fn remove_storage_buddy_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    owner_address: String,
+) -> Result<(), String> {
+    let owner = normalize_buddy_owner(&owner_address)?;
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let their_updated = {
+        let records = guard
+            .storage_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        records
+            .pledge_list(&owner)
+            .filter(|r| r.pledges.iter().any(|p| p.to == guard.node_addr))
+            .map(|r| r.updated_at)
+    };
+    let had_pledge = {
+        let mut s = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let had = s.my_pledges.remove(&owner).is_some();
+        if let Some(updated_at) = their_updated {
+            s.dismissed_invites.insert(owner.clone(), updated_at);
+        }
+        persist_storage_settings(&guard, &s);
+        had
+    };
+    if had_pledge {
+        publish_pledge_list_update(&guard);
+    }
+    crate::node_event_sink::emit_ser(sink, "storage-buddies-updated", &serde_json::Value::Null);
+    Ok(())
+}
+
+/// ZEB-669 S2: set the enforced shared budget. Eviction down to a
+/// shrunken budget happens in the engine tick.
+pub(crate) fn set_shared_budget_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    bytes: u64,
+) -> Result<(), String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    {
+        let mut s = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.shared_budget_bytes == bytes {
+            return Ok(());
+        }
+        s.shared_budget_bytes = bytes;
+        persist_storage_settings(&guard, &s);
+    }
+    crate::node_event_sink::emit_ser(sink, "contribution-updated", &serde_json::Value::Null);
+    Ok(())
+}
+
+/// ZEB-669 S2: the contribution meter. Health is the spec §3 rule,
+/// verbatim: Over budget ⇒ budget shrunk below the ledger; Catching up
+/// ⇒ the dry-run planner still has work (fetches pending, truncation);
+/// else Healthy.
+pub(crate) fn get_contribution_summary_impl(
+    state: &Mutex<NodeState>,
+) -> Result<ContributionSummaryDto, String> {
+    let (records, ledger, settings, me) = {
+        let g = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            g.storage_records.clone(),
+            g.storage_ledger.clone(),
+            g.storage_settings.clone(),
+            g.node_addr.clone(),
+        )
+    };
+    let (my_pledges, budget) = {
+        let s = settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (s.my_pledges.clone(), s.shared_budget_bytes)
+    };
+    let records = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ledger = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hosted = ledger.distinct_pinned_bytes();
+    let pledgers: std::collections::HashSet<String> = records
+        .owners_pledging_to(&me)
+        .into_iter()
+        .map(|(owner, _)| owner)
+        .collect();
+    let buddy_count = my_pledges
+        .keys()
+        .filter(|owner| pledgers.contains(*owner))
+        .count() as u32;
+    let plan = buddy_pin_planner::plan(
+        &me,
+        &my_pledges,
+        &records,
+        &ledger,
+        budget,
+        &std::collections::HashMap::new(),
+        &|_| false,
+    );
+    let health = if hosted > budget {
+        BuddyHealth::OverBudget
+    } else if plan.has_work() || plan.catching_up {
+        BuddyHealth::CatchingUp
+    } else {
+        BuddyHealth::Healthy
+    };
+    Ok(ContributionSummaryDto {
+        hosted_bytes: hosted,
+        budget_bytes: budget,
+        buddy_count,
+        health,
+    })
+}
+
+#[tauri::command]
+async fn get_storage_buddies(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<StorageBuddyDto>, String> {
+    get_storage_buddies_impl(state.inner())
+}
+
+#[tauri::command]
+async fn set_buddy_pledge(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_address: String,
+    bytes: u64,
+) -> Result<(), String> {
+    set_buddy_pledge_impl(state.inner(), &app, owner_address, bytes)
+}
+
+#[tauri::command]
+async fn remove_storage_buddy(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    owner_address: String,
+) -> Result<(), String> {
+    remove_storage_buddy_impl(state.inner(), &app, owner_address)
+}
+
+#[tauri::command]
+async fn set_shared_budget(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    bytes: u64,
+) -> Result<(), String> {
+    set_shared_budget_impl(state.inner(), &app, bytes)
+}
+
+#[tauri::command]
+async fn get_contribution_summary(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<ContributionSummaryDto, String> {
+    get_contribution_summary_impl(state.inner())
+}
+
+#[cfg(test)]
+mod storage_buddy_ipc_tests {
+    use super::*;
+
+    const ME: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 32-hex
+
+    fn sink() -> std::sync::Arc<crate::node_event_sink::RecordingSink> {
+        crate::node_event_sink::RecordingSink::new()
+    }
+
+    fn state_with_me() -> Mutex<NodeState> {
+        Mutex::new(NodeState {
+            node_addr: ME.into(),
+            ..NodeState::default()
+        })
+    }
+
+    /// Ingest a signed pledge list from a fresh identity naming `to`
+    /// with `bytes`; returns the signer's owner address.
+    fn ingest_pledger(state: &Mutex<NodeState>, to: &str, bytes: u64, updated_at: u64) -> String {
+        let id = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let owner = hex::encode(id.public_identity().address_hash);
+        let mut pl = storage_signing::PledgeListPayload {
+            owner_address: owner.clone(),
+            pledges: vec![storage_signing::PledgeEntry {
+                to: to.into(),
+                bytes,
+            }],
+            updated_at,
+            identity_pub: None,
+            sig: None,
+        };
+        storage_signing::sign_pledge_list(&id, &mut pl);
+        let topic = format!("{STORAGE_RECORD_PREFIX}{owner}/pledges");
+        let guard = state.lock().unwrap();
+        let outcome = guard
+            .storage_records
+            .lock()
+            .unwrap()
+            .on_pledge_list_sample(&topic, &serde_json::to_vec(&pl).unwrap());
+        assert!(outcome.changed(), "seed ingest must land: {outcome:?}");
+        owner
+    }
+
+    #[test]
+    fn pact_and_invite_classification() {
+        let state = state_with_me();
+        let alice = ingest_pledger(&state, ME, 100, 1); // mutual → Active
+        let bob = ingest_pledger(&state, ME, 50, 1); // theirs only → PendingIncoming
+        let carol = hex::encode([0xCC; 16]); // mine only → PendingOutgoing
+        {
+            let guard = state.lock().unwrap();
+            let mut s = guard.storage_settings.lock().unwrap();
+            s.my_pledges.insert(alice.clone(), 200);
+            s.my_pledges.insert(carol.clone(), 10);
+        }
+
+        let dtos = get_storage_buddies_impl(&state).unwrap();
+        let by_owner = |o: &str| dtos.iter().find(|d| d.owner_address == o).unwrap();
+        assert_eq!(by_owner(&alice).status, BuddyStatus::Active);
+        assert_eq!(by_owner(&alice).my_pledge_bytes, 200);
+        assert_eq!(by_owner(&alice).their_pledge_bytes, Some(100));
+        assert_eq!(by_owner(&bob).status, BuddyStatus::PendingIncoming);
+        assert_eq!(by_owner(&bob).my_pledge_bytes, 0);
+        assert_eq!(by_owner(&carol).status, BuddyStatus::PendingOutgoing);
+        assert_eq!(by_owner(&carol).their_pledge_bytes, None);
+    }
+
+    #[test]
+    fn dismissed_invite_is_suppressed_until_reissued_newer() {
+        let state = state_with_me();
+        let dave = ingest_pledger(&state, ME, 10, 5);
+        {
+            let guard = state.lock().unwrap();
+            guard
+                .storage_settings
+                .lock()
+                .unwrap()
+                .dismissed_invites
+                .insert(dave.clone(), 5);
+        }
+        assert!(
+            get_storage_buddies_impl(&state).unwrap().is_empty(),
+            "dismissed at the invite's updated_at ⇒ suppressed"
+        );
+        // Simulate a re-issued invite with a newer updated_at.
+        {
+            let guard = state.lock().unwrap();
+            guard
+                .storage_settings
+                .lock()
+                .unwrap()
+                .dismissed_invites
+                .insert(dave.clone(), 4);
+        }
+        let dtos = get_storage_buddies_impl(&state).unwrap();
+        assert_eq!(dtos.len(), 1, "newer invite resurfaces");
+        assert_eq!(dtos[0].status, BuddyStatus::PendingIncoming);
+    }
+
+    #[test]
+    fn set_buddy_pledge_accepts_invite_and_clears_dismissal() {
+        let state = state_with_me();
+        let alice = ingest_pledger(&state, ME, 10, 3);
+        {
+            let guard = state.lock().unwrap();
+            guard
+                .storage_settings
+                .lock()
+                .unwrap()
+                .dismissed_invites
+                .insert(alice.clone(), 3);
+        }
+        let s = sink();
+        // 0 bytes is a VALID accept (spec §0.1) — the pact goes Active.
+        set_buddy_pledge_impl(&state, &s, alice.to_uppercase(), 0).unwrap();
+        {
+            let guard = state.lock().unwrap();
+            let settings = guard.storage_settings.lock().unwrap();
+            assert_eq!(settings.my_pledges.get(&alice), Some(&0));
+            assert!(
+                !settings.dismissed_invites.contains_key(&alice),
+                "pledging IS accepting"
+            );
+        }
+        let dtos = get_storage_buddies_impl(&state).unwrap();
+        assert_eq!(dtos[0].status, BuddyStatus::Active);
+    }
+
+    #[test]
+    fn set_buddy_pledge_rejects_self_and_garbage() {
+        let state = state_with_me();
+        let s = sink();
+        assert!(set_buddy_pledge_impl(&state, &s, ME.into(), 1)
+            .unwrap_err()
+            .contains("yourself"));
+        assert!(set_buddy_pledge_impl(&state, &s, "not-hex".into(), 1).is_err());
+        assert!(set_buddy_pledge_impl(&state, &s, "abcd".into(), 1).is_err());
+    }
+
+    #[test]
+    fn remove_storage_buddy_records_dismissal_at_current_updated_at() {
+        let state = state_with_me();
+        let alice = ingest_pledger(&state, ME, 10, 7);
+        let s = sink();
+        set_buddy_pledge_impl(&state, &s, alice.clone(), 100).unwrap();
+        remove_storage_buddy_impl(&state, &s, alice.clone()).unwrap();
+        {
+            let guard = state.lock().unwrap();
+            let settings = guard.storage_settings.lock().unwrap();
+            assert!(!settings.my_pledges.contains_key(&alice));
+            assert_eq!(
+                settings.dismissed_invites.get(&alice),
+                Some(&7),
+                "removal dismisses the residual invite at its updated_at"
+            );
+        }
+        assert!(
+            get_storage_buddies_impl(&state).unwrap().is_empty(),
+            "no pact, invite dismissed"
+        );
+    }
+
+    #[test]
+    fn contribution_summary_health_rules() {
+        let state = state_with_me();
+        // Empty world: healthy, defaults.
+        let summary = get_contribution_summary_impl(&state).unwrap();
+        assert_eq!(
+            summary.budget_bytes,
+            storage_settings::DEFAULT_SHARED_BUDGET_BYTES
+        );
+        assert_eq!(summary.health, BuddyHealth::Healthy);
+        assert_eq!(summary.buddy_count, 0);
+
+        // Ledger over budget ⇒ OverBudget beats everything.
+        {
+            let guard = state.lock().unwrap();
+            guard
+                .storage_ledger
+                .lock()
+                .unwrap()
+                .record_pin("x", "cid", 100, 1);
+            guard
+                .storage_ledger
+                .lock()
+                .unwrap()
+                .record_pin("y", "cid", 100, 2);
+            guard.storage_settings.lock().unwrap().shared_budget_bytes = 50;
+        }
+        let summary = get_contribution_summary_impl(&state).unwrap();
+        assert_eq!(summary.hosted_bytes, 100, "distinct bytes counted once");
+        assert_eq!(summary.health, BuddyHealth::OverBudget);
+    }
+
+    #[test]
+    fn set_shared_budget_persists_and_is_idempotent() {
+        let state = state_with_me();
+        let s = sink();
+        set_shared_budget_impl(&state, &s, 123).unwrap();
+        set_shared_budget_impl(&state, &s, 123).unwrap(); // no-op path
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.storage_settings.lock().unwrap().shared_budget_bytes,
+            123
+        );
+    }
+}
+
 #[cfg(test)]
 mod storage_publish_tests {
     use super::*;
@@ -54983,6 +55530,11 @@ pub fn run() {
             list_followed,
             get_vine_settings,
             set_vine_settings,
+            get_storage_buddies,
+            set_buddy_pledge,
+            remove_storage_buddy,
+            set_shared_budget,
+            get_contribution_summary,
             mark_vine_viewed,
             publish_vine,
             publish_vine_reaction,

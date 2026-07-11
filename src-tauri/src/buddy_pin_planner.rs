@@ -143,10 +143,7 @@ pub fn plan(
                 break;
             }
             if global_full
-                || distinct
-                    .saturating_add(reserved)
-                    .saturating_add(entry.size)
-                    > shared_budget
+                || distinct.saturating_add(reserved).saturating_add(entry.size) > shared_budget
             {
                 global_full = true;
                 out.catching_up = true;
@@ -209,7 +206,9 @@ mod tests {
     /// A record store seeded with signed records from `buddies`, each
     /// pledging `pledge_to_me` to ME and publishing the given backup
     /// set entries.
-    fn seeded_records(buddies: &[(&str, u64, Vec<BackupEntry>)]) -> (StorageRecordStore, Vec<String>) {
+    fn seeded_records(
+        buddies: &[(&str, u64, Vec<BackupEntry>)],
+    ) -> (StorageRecordStore, Vec<String>) {
         let mut store = StorageRecordStore::new(None);
         let mut owners = Vec::new();
         for (name, pledge_to_me, entries) in buddies {
@@ -265,9 +264,20 @@ mod tests {
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 100)].into();
         let ledger = StorageLedger::new(None);
 
-        let plan = plan(ME, &my_pledges, &records, &ledger, 1_000, &HashMap::new(), NO_BACKOFF);
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
         assert_eq!(
-            plan.fetch.iter().map(|f| f.cid.as_str()).collect::<Vec<_>>(),
+            plan.fetch
+                .iter()
+                .map(|f| f.cid.as_str())
+                .collect::<Vec<_>>(),
             vec![cid_hex(b"a"), cid_hex(b"b")],
             "third entry exceeds the 100-byte slice"
         );
@@ -280,7 +290,15 @@ mod tests {
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 0)].into();
         let ledger = StorageLedger::new(None);
 
-        let plan = plan(ME, &my_pledges, &records, &ledger, 1_000, &HashMap::new(), NO_BACKOFF);
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
         assert!(plan.fetch.is_empty(), "0-byte slice admits nothing");
         assert!(plan.release_buddies.is_empty(), "pact IS active");
     }
@@ -292,7 +310,15 @@ mod tests {
         let my_pledges: BTreeMap<String, u64> = BTreeMap::new();
         let ledger = StorageLedger::new(None);
 
-        let plan = plan(ME, &my_pledges, &records, &ledger, 1_000, &HashMap::new(), NO_BACKOFF);
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
         assert_eq!(plan, PinPlan::default(), "no pact, no work");
         let _ = owners;
     }
@@ -317,8 +343,19 @@ mod tests {
         )]
         .into();
 
-        let plan = plan(ME, &my_pledges, &records, &ledger, 100, &inflight, NO_BACKOFF);
-        assert!(plan.fetch.is_empty(), "reservations count against the budget");
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            100,
+            &inflight,
+            NO_BACKOFF,
+        );
+        assert!(
+            plan.fetch.is_empty(),
+            "reservations count against the budget"
+        );
         assert!(plan.catching_up);
     }
 
@@ -337,7 +374,15 @@ mod tests {
 
         // Budget exactly at the distinct bytes: no headroom for a
         // refetch — which is fine, none is needed.
-        let plan = plan(ME, &my_pledges, &records, &ledger, 70, &HashMap::new(), NO_BACKOFF);
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            70,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
         assert!(plan.fetch.is_empty(), "stored once, never refetched");
         assert_eq!(
             plan.attribute_only,
@@ -359,7 +404,15 @@ mod tests {
         ledger.record_pin(&owners[0], &cid_hex(b"gone"), 5, 2);
         ledger.record_pin(&owners[1], &cid_hex(b"bobs"), 7, 3);
 
-        let plan = plan(ME, &my_pledges, &records, &ledger, 1_000, &HashMap::new(), NO_BACKOFF);
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
         assert_eq!(plan.release, vec![(owners[0].clone(), cid_hex(b"gone"))]);
         assert_eq!(plan.release_buddies, vec![owners[1].clone()]);
         assert!(plan.fetch.is_empty());
@@ -372,7 +425,15 @@ mod tests {
         let mut ledger = StorageLedger::new(None);
         ledger.record_pin("anyone", "cid", 500, 1);
 
-        let plan = plan(ME, &my_pledges, &records, &ledger, 200, &HashMap::new(), NO_BACKOFF);
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            200,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
         assert_eq!(plan.evict_to, Some(200));
     }
 
@@ -380,8 +441,7 @@ mod tests {
     fn backoff_blocked_cid_is_skipped_but_later_entries_proceed() {
         let blocked = entry(b"blocked", 10);
         let ok = entry(b"ok", 10);
-        let (records, owners) =
-            seeded_records(&[("alice", 0, vec![blocked.clone(), ok.clone()])]);
+        let (records, owners) = seeded_records(&[("alice", 0, vec![blocked.clone(), ok.clone()])]);
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 100)].into();
         let ledger = StorageLedger::new(None);
         let blocked_cid = blocked.cid.clone();
@@ -396,7 +456,10 @@ mod tests {
             &|cid| cid == blocked_cid,
         );
         assert_eq!(
-            plan.fetch.iter().map(|f| f.cid.as_str()).collect::<Vec<_>>(),
+            plan.fetch
+                .iter()
+                .map(|f| f.cid.as_str())
+                .collect::<Vec<_>>(),
             vec![ok.cid.as_str()],
             "backoff skips the cid without stalling the walk"
         );
@@ -418,7 +481,15 @@ mod tests {
         )]
         .into();
 
-        let plan = plan(ME, &my_pledges, &records, &ledger, 1_000, &inflight, NO_BACKOFF);
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &inflight,
+            NO_BACKOFF,
+        );
         assert!(plan.fetch.is_empty(), "already in flight");
         assert!(plan.catching_up);
     }
@@ -433,8 +504,24 @@ mod tests {
             [(owners[0].clone(), 100), (owners[1].clone(), 100)].into();
         let ledger = StorageLedger::new(None);
 
-        let p1 = plan(ME, &my_pledges, &records, &ledger, 1_000, &HashMap::new(), NO_BACKOFF);
-        let p2 = plan(ME, &my_pledges, &records, &ledger, 1_000, &HashMap::new(), NO_BACKOFF);
+        let p1 = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
+        let p2 = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
         assert_eq!(p1, p2);
         assert_eq!(p1.fetch.len(), 2);
     }
