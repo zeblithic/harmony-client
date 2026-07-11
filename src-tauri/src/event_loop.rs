@@ -2954,7 +2954,7 @@ pub async fn run(
     // Subscribe to content availability announcements for the file manager.
     dispatch_action(
         RuntimeAction::Subscribe {
-            key_expr: "harmony/announce/*".to_string(),
+            key_expr: format!("{}*", crate::ANNOUNCE_PREFIX),
         },
         &session,
         &zenoh_tx,
@@ -3792,29 +3792,14 @@ pub async fn run(
                             }
                             continue;
                         }
-                        // ZEB-612 S3: record distinct announcing sessions per
-                        // CID. Own announcements loop back on the local
-                        // session — exclude own_zid so `replicaCount = 1
-                        // (self) + peers` doesn't double-count. Samples
-                        // without source info can't be attributed and are
-                        // skipped (the count is an observed lower bound).
-                        if key_expr.starts_with("harmony/announce/") {
-                            if let (Some(zid), Some(a)) = (
-                                source_zid.as_ref(),
-                                crate::parse_content_announcement(&key_expr, &payload),
-                            ) {
-                                if *zid != own_zid {
-                                    let now = start.elapsed().as_millis() as u64;
-                                    // Poison-resilient: the holder map is a
-                                    // best-effort cache — keep serving it
-                                    // rather than re-panicking the loop.
-                                    observed_holders
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .note(&a.cid, zid, now);
-                                }
-                            }
-                        }
+                        note_announce_sample(
+                            &observed_holders,
+                            &key_expr,
+                            &payload,
+                            source_zid.as_deref(),
+                            &own_zid,
+                            || start.elapsed().as_millis() as u64,
+                        );
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
@@ -6166,6 +6151,54 @@ fn emit_group_voice_signal_event(
     }
 }
 
+/// Which publishes carry our ZenohId as a sample attachment. Capacity
+/// beacons need it for hop-distance inference; content announcements
+/// (ZEB-669 slice 1) need it so receivers can attribute the announcing
+/// session — `ObservedHolders` reads the attachment, and without it the
+/// ×N "copies seen" counter never counts real peers. The zid is a
+/// transport-session id, not an owner identity: announcements stay
+/// anonymous (ZEB-669 §0.2 hybrid attribution).
+fn publish_attaches_zid(key_expr: &str) -> bool {
+    key_expr.starts_with(crate::CAPACITY_PREFIX) || key_expr.starts_with(crate::ANNOUNCE_PREFIX)
+}
+
+/// ZEB-612 S3 receive path, extracted for testability (ZEB-669 S1):
+/// record a distinct announcing session per CID. Own announcements loop
+/// back on the local session — exclude `own_zid` so `replicaCount = 1
+/// (self) + peers` doesn't double-count. Samples without source info
+/// can't be attributed and are skipped (the count is an observed lower
+/// bound); announce publishes attach the zid (`publish_attaches_zid`),
+/// so real peer announces are attributable from this build onward.
+/// `now_ms` is lazy (PR #448 review, Qodo): the receive loop is a hot
+/// path and every non-announce sample would otherwise pay an
+/// `Instant::elapsed` it never uses — the clock is read only when a
+/// sample actually lands in the holder map.
+fn note_announce_sample(
+    observed_holders: &Arc<std::sync::Mutex<crate::observed_holders::ObservedHolders>>,
+    key_expr: &str,
+    payload: &[u8],
+    source_zid: Option<&str>,
+    own_zid: &str,
+    now_ms: impl FnOnce() -> u64,
+) {
+    if !key_expr.starts_with(crate::ANNOUNCE_PREFIX) {
+        return;
+    }
+    if let (Some(zid), Some(a)) = (
+        source_zid,
+        crate::parse_content_announcement(key_expr, payload),
+    ) {
+        if zid != own_zid {
+            // Poison-resilient: the holder map is a best-effort cache —
+            // keep serving it rather than re-panicking the loop.
+            observed_holders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .note(&a.cid, zid, now_ms());
+        }
+    }
+}
+
 /// Dispatch a single RuntimeAction to the platform I/O layer.
 async fn dispatch_action(
     action: RuntimeAction,
@@ -6179,9 +6212,10 @@ async fn dispatch_action(
         // ── Zenoh: publish ───────────────────────────────────────────
         RuntimeAction::Publish { key_expr, payload } => {
             let session = session.clone();
-            // Attach our ZenohId to capacity publications so receivers can
-            // determine hop distance by comparing against their peers_zid().
-            let zid_attachment = if key_expr.starts_with(crate::CAPACITY_PREFIX) {
+            // Attach our ZenohId where receivers attribute the publisher:
+            // capacity beacons (hop distance) and content announcements
+            // (observed holders). See `publish_attaches_zid`.
+            let zid_attachment = if publish_attaches_zid(&key_expr) {
                 Some(own_zid.to_string())
             } else {
                 None
@@ -10654,5 +10688,212 @@ mod zeb620_boot_seed_tests {
                 .is_empty(),
             "no endpoint yields no connect/endpoints"
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_attachment_tests {
+    use super::*;
+
+    /// ZEB-669 slice 1 harness: publish through the production
+    /// `dispatch_action` arm on an in-process zenoh session and return
+    /// the attachment the subscriber observed. Zenoh requires the
+    /// `multi_thread` tokio flavor (`current_thread` panics on
+    /// `zenoh::open` — see `community_channel_log_engine.rs` fixtures).
+    async fn publish_and_observe_attachment(key_expr: &str) -> Option<String> {
+        let session = zenoh::open(zenoh::Config::default())
+            .await
+            .expect("zenoh open");
+        let sub = session
+            .declare_subscriber(key_expr)
+            .await
+            .expect("declare subscriber");
+        let (zenoh_tx, _zenoh_rx) = mpsc::channel::<ZenohEvent>(8);
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+        let closing = Arc::new(AtomicBool::new(false));
+        dispatch_action(
+            RuntimeAction::Publish {
+                key_expr: key_expr.to_string(),
+                // Real announce payloads are a 4-byte BE u32 size
+                // (`parse_content_announcement`); mirror that shape.
+                payload: 1234u32.to_be_bytes().to_vec(),
+            },
+            &session,
+            &zenoh_tx,
+            &app,
+            &closing,
+            "zid-under-test",
+        )
+        .await;
+        let sample = tokio::time::timeout(Duration::from_secs(10), sub.recv_async())
+            .await
+            .expect("sample within 10s")
+            .expect("subscriber alive");
+        sample
+            .attachment()
+            .and_then(|a| String::from_utf8(a.to_bytes().to_vec()).ok())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn announce_publish_carries_own_zid_attachment() {
+        let key = format!("{}{}", crate::ANNOUNCE_PREFIX, "aa".repeat(32));
+        assert_eq!(
+            publish_and_observe_attachment(&key).await.as_deref(),
+            Some("zid-under-test"),
+            "announce publishes must attach the local zid so \
+             ObservedHolders can attribute the announcing session"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_announce_publish_carries_no_attachment() {
+        assert_eq!(
+            publish_and_observe_attachment("harmony/profile/deadbeef").await,
+            None,
+            "the zid attachment stays scoped to capacity + announce keys"
+        );
+    }
+
+    /// Full receive-path loopback (PR #448 review, CodeRabbit): the
+    /// production Subscribe arm performs the `sample.attachment()` →
+    /// `source_zid` extraction that the helper-unit tests can't see.
+    /// Publish arm attaches → Subscribe arm extracts → the extracted
+    /// value feeds `note_announce_sample` and counts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscription_arm_extracts_source_zid_and_feeds_holders() {
+        let session = zenoh::open(zenoh::Config::default())
+            .await
+            .expect("zenoh open");
+        let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(8);
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+        let closing = Arc::new(AtomicBool::new(false));
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: format!("{}*", crate::ANNOUNCE_PREFIX),
+            },
+            &session,
+            &zenoh_tx,
+            &app,
+            &closing,
+            "publisher-zid",
+        )
+        .await;
+        let cid_hex = "ab".repeat(32);
+        dispatch_action(
+            RuntimeAction::Publish {
+                key_expr: format!("{}{cid_hex}", crate::ANNOUNCE_PREFIX),
+                payload: 1234u32.to_be_bytes().to_vec(),
+            },
+            &session,
+            &zenoh_tx,
+            &app,
+            &closing,
+            "publisher-zid",
+        )
+        .await;
+        let ev = tokio::time::timeout(Duration::from_secs(10), zenoh_rx.recv())
+            .await
+            .expect("event within 10s")
+            .expect("channel alive");
+        let ZenohEvent::Subscription {
+            key_expr,
+            payload,
+            source_zid,
+        } = ev
+        else {
+            panic!("expected Subscription event");
+        };
+        assert_eq!(source_zid.as_deref(), Some("publisher-zid"));
+        // A receiver node (different own zid) must count the sample.
+        let holders = Arc::new(std::sync::Mutex::new(
+            crate::observed_holders::ObservedHolders::new(),
+        ));
+        note_announce_sample(
+            &holders,
+            &key_expr,
+            &payload,
+            source_zid.as_deref(),
+            "receiver-zid",
+            || 10,
+        );
+        assert_eq!(holders.lock().unwrap().peer_count(&cid_hex), 1);
+        // Tear down the detached forwarder task the Subscribe arm
+        // spawned: mark closing (suppresses the session-lost emit) and
+        // close the session so `recv_async` errors and the task exits —
+        // otherwise the held subscriber keeps zenoh io threads alive
+        // past test end (nextest LEAK).
+        closing.store(true, Ordering::SeqCst);
+        session.close().await.expect("session close");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[test]
+    fn publish_attaches_zid_matches_announce_and_capacity_only() {
+        assert!(publish_attaches_zid("harmony/announce/aabb"));
+        assert!(publish_attaches_zid("harmony/compute/capacity/node1"));
+        assert!(!publish_attaches_zid("harmony/profile/aabb"));
+        assert!(!publish_attaches_zid("harmony/vines/aabb/follows"));
+        // Prefix discipline: no trailing-slash bypass.
+        assert!(!publish_attaches_zid("harmony/announcements/aabb"));
+    }
+}
+
+#[cfg(test)]
+mod note_announce_sample_tests {
+    use super::*;
+
+    fn holders() -> Arc<std::sync::Mutex<crate::observed_holders::ObservedHolders>> {
+        Arc::new(std::sync::Mutex::new(
+            crate::observed_holders::ObservedHolders::new(),
+        ))
+    }
+
+    fn announce_key() -> (String, String) {
+        let cid_hex = "ab".repeat(32);
+        (format!("{}{cid_hex}", crate::ANNOUNCE_PREFIX), cid_hex)
+    }
+
+    /// Real announce payloads are a 4-byte BE u32 size.
+    const PAYLOAD: [u8; 4] = 1234u32.to_be_bytes();
+
+    #[test]
+    fn foreign_zid_announce_feeds_the_holder_map() {
+        let h = holders();
+        let (key, cid_hex) = announce_key();
+        note_announce_sample(&h, &key, &PAYLOAD, Some("peer-zid"), "own-zid", || 10);
+        assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 1);
+    }
+
+    #[test]
+    fn own_zid_announce_does_not_self_count() {
+        let h = holders();
+        let (key, cid_hex) = announce_key();
+        note_announce_sample(&h, &key, &PAYLOAD, Some("own-zid"), "own-zid", || 10);
+        assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 0);
+    }
+
+    #[test]
+    fn missing_source_zid_is_skipped() {
+        let h = holders();
+        let (key, cid_hex) = announce_key();
+        note_announce_sample(&h, &key, &PAYLOAD, None, "own-zid", || 10);
+        assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 0);
+    }
+
+    #[test]
+    fn non_announce_key_is_ignored() {
+        let h = holders();
+        let (_, cid_hex) = announce_key();
+        note_announce_sample(
+            &h,
+            &format!("harmony/profile/{cid_hex}"),
+            &PAYLOAD,
+            Some("peer-zid"),
+            "own-zid",
+            || 10,
+        );
+        assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 0);
     }
 }
