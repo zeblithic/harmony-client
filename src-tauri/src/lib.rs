@@ -1353,6 +1353,23 @@ pub struct NodeState {
     /// as a fallback. Kept as the safety net for the (rare) case where the disk
     /// read fails.
     pub fleet_net_enrolled: Option<std::collections::BTreeSet<String>>,
+    /// ZEB-668 S1: the resident trust CRDT (harmony-owner enrollments /
+    /// vouching / revocations / liveness) and its replication engine.
+    /// `Some` while the node is running and an owner identity is loaded;
+    /// `None` before start_node wires the FleetSyncEngine or after
+    /// stop_node. When `None`, trust mutations fall back to
+    /// load-mutate-save on `owner_state.cbor`
+    /// (`owner_trust_sync::TrustStateAccess::FileOnly`).
+    pub owner_trust_doc:
+        Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+    pub owner_trust_sync: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+    >,
+    /// ZEB-668 S1: latched true when the trust doc shows THIS device
+    /// revoked (set by the on_applied detector or the boot check). Never
+    /// cleared at stop_node — revocation is permanent; boot re-derives it
+    /// from `owner_state.cbor`.
+    pub owner_trust_revoked_self: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// ZEB-491 (secondary): the resolved identity directory for this node run,
     /// stored so `set_butler_pin` can re-read the LIVE enrolled-device set from
     /// `owner_state.cbor` (via `owner_state::read_enrolled_device_vk_hex`) rather
@@ -1823,6 +1840,11 @@ impl Default for NodeState {
             fleet_net_snapshot: None,
             fleet_net_device_id: None,
             fleet_net_enrolled: None,
+            owner_trust_doc: None,
+            owner_trust_sync: None,
+            owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             identity_dir: None,
             routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
@@ -2104,6 +2126,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let fleet_net_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>,
     >;
+    // ZEB-668 S1: owner-trust engine, same ephemeral-runtime shutdown pattern.
+    let owner_trust_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+    >;
     // ZEB-458 P4 Phase B: relay-hold + relay-optin fleet-sync engines, taken
     // outside the lock for the same ephemeral-runtime shutdown pattern.
     let relay_hold_sync_for_shutdown: Option<
@@ -2352,6 +2378,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.fleet_net_snapshot = None;
         guard.fleet_net_device_id = None;
         guard.fleet_net_enrolled = None;
+        // ZEB-668 S1: trust engine handles die with the node; the
+        // revoked-self latch deliberately survives (permanent state).
+        owner_trust_sync_for_shutdown = guard.owner_trust_sync.take();
+        guard.owner_trust_doc = None;
         guard.identity_dir = None;
         // ZEB-418 P2: drop the republish trigger with the rest of the
         // fleet-net handles — it captures the pkarr publishers and the
@@ -2837,6 +2867,35 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for fleet-net \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-668 S1: shut down the owner-trust fleet-sync engine the same way,
+    // so the final debounced trust publish + owner_state.cbor persist run
+    // before the zenoh session dies.
+    if let Some(trust_engine) = owner_trust_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(trust_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "owner-trust FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for owner-trust \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -61110,6 +61169,12 @@ mod start_node_race_tests {
             fleet_net_snapshot: None,
             fleet_net_device_id: None,
             fleet_net_enrolled: None,
+            // ZEB-668 S1: trust replication handles unused in race tests.
+            owner_trust_doc: None,
+            owner_trust_sync: None,
+            owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             identity_dir: None,
             routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
