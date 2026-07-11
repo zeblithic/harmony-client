@@ -250,6 +250,19 @@ mod tests {
     fn sample_doc() -> FleetNetDoc {
         let mut doc = FleetNetDoc::default();
         doc.devices.insert("dev-a".into(), sample_row());
+        // ZEB-668 S4: a petname entry so persistence round-trips cover the
+        // additive map.
+        doc.petnames.insert(
+            "dev-a".into(),
+            crate::fleet_net::FleetNetPetname {
+                name: "sample".into(),
+                set_at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "dev-a".into(),
+                },
+            },
+        );
         doc
     }
 
