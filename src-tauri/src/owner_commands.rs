@@ -418,7 +418,7 @@ pub(crate) async fn revoke_device_inner(
     reason: String,
 ) -> Result<(), String> {
     // Snapshot handles under the std lock; drop before any await.
-    let (trust_doc, trust_engine, identity_dir, revoked_flag, owner_sync, fleet_net) = {
+    let (trust_doc, trust_engine, identity_dir, revoked_flag, owner_sync, fleet_net, retire_nudge) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -429,6 +429,7 @@ pub(crate) async fn revoke_device_inner(
             std::sync::Arc::clone(&g.owner_trust_revoked_self),
             g.sync_engine.clone(),
             g.fleet_net_sync.clone(),
+            g.community_device_retire_nudge.clone(),
         )
     };
     // Fall back to the resolved default identity dir when the node has not
@@ -535,6 +536,15 @@ pub(crate) async fn revoke_device_inner(
     }
 
     emit("owner-devices-updated");
+
+    // ZEB-668 S3: nudge the retire-deposit sweeper so the community
+    // retire-announce goes out immediately (the trust engine's on_applied
+    // fires on REMOTE merges only — a local revocation would otherwise wait
+    // for the next restart's startup pass). Best-effort: the sweeper is
+    // level-triggered, so a dropped nudge only costs latency.
+    if let Some(tx) = &retire_nudge {
+        let _ = tx.try_send(());
+    }
 
     if is_self {
         complete_self_revoke_terminal(&revoked_flag, &emit, owner_sync, fleet_net, trust_engine)
