@@ -266,11 +266,28 @@ export interface ContentItem {
   archived?: boolean;
   parentCid: string | null;
   isFolder: boolean;
+  /** ZEB-669 S3: "back up with buddies" flag. Root sidecar entries only —
+   *  false for manifest-derived rows. Optional so mock fixtures can omit
+   *  it; absent === not flagged. */
+  backup?: boolean;
+  /** ZEB-669 S4: provenance recorded at entry creation; `null`/absent for
+   *  legacy, manifest-derived, and demo rows (the detail panel renders no
+   *  "From" row — never fabricated). */
+  origin?: ContentOriginInfo | null;
+}
+
+/** ZEB-669 S4: mirrors Rust `OriginInfo` (camelCase serde). The reserved
+ *  kinds have no emitting seam yet — channel downloads and buddy pins
+ *  don't create index entries today. */
+export interface ContentOriginInfo {
+  kind: 'selfIngest' | 'channelDownload' | 'buddyPin';
+  introducer: string | null;
 }
 
 /** ZEB-612 S3: the detail view carries only real fields — the mock
- *  sharedWith/storageBuddies/origin surfaces return with real hosting
- *  accounting (ZEB-669). */
+ *  sharedWith/storageBuddies surfaces returned with real hosting
+ *  accounting in ZEB-669 (meter/manage sheet); `origin` is now a real
+ *  recorded-at-creation field on ContentItem. */
 export type ContentDetail = ContentItem;
 
 /** ZEB-612 S3: honest quota — real local usage plus the real (enforced)

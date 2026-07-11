@@ -2,6 +2,7 @@ import type { TauriAdapter } from './zenoh-service';
 import type {
   ContentItem,
   ContentDetail,
+  ContentOriginInfo,
   QuotaStatus,
   CleanupRecommendation,
   PublishedItem,
@@ -114,6 +115,11 @@ interface ContentItemWire {
   /** ZEB-612 S3: observed replica count — 1 (self) + distinct peer
    *  sessions seen announcing this CID. A lower bound ("copies seen"). */
   replicaCount: number;
+  /** ZEB-669 S3: "back up with buddies" flag (root sidecar rows only). */
+  backup: boolean;
+  /** ZEB-669 S4: provenance recorded at creation; null for legacy and
+   *  manifest-derived rows. */
+  origin: ContentOriginInfo | null;
 }
 
 /** Wire shape of the `get_storage_budget` query (ZEB-612 S3). */
@@ -159,6 +165,8 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
     archived: wire.archived,
     parentCid: null,
     isFolder: wire.kind === 'folder',
+    backup: wire.backup ?? false,
+    origin: wire.origin ?? null,
   };
 }
 
@@ -383,6 +391,32 @@ export class FileManagerService {
     }
     const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
     if (item) item.pinned = true;
+    this.onChange?.();
+  }
+
+  /**
+   * ZEB-669 S3: sets the "back up with buddies" flag. Backend is the
+   * eligibility authority — non-public-durable CIDs reject with a stable
+   * `ineligible:` prefix (clearing is always allowed). Rejections propagate
+   * to the caller so the detail panel can render the reason inline.
+   */
+  async setBackupFlag(sidecarId: string, backup: boolean): Promise<void> {
+    if (!this.adapter) {
+      // Offline-only path: mutate local state for Storybook/test contexts.
+      const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
+      if (item) item.backup = backup;
+      this.onChange?.();
+      return;
+    }
+    try {
+      await this.adapter.invoke('set_backup_flag', { sidecarId, backup });
+    } catch (e) {
+      // Normalize both production (string) + test (Error) rejection shapes
+      // (CLAUDE.md "Tauri IPC error extraction").
+      throw new Error(e instanceof Error ? e.message : String(e));
+    }
+    const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
+    if (item) item.backup = backup;
     this.onChange?.();
   }
 
