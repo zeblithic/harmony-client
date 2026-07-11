@@ -915,6 +915,8 @@
   let startNodeError = $state<string | null>(null);
   // ZEB-338 / PR #169: bound to the startup-error dialog for its focus trap.
   let startupErrorModalEl = $state<HTMLElement | null>(null);
+  // ZEB-668 S2: bound to the device-revoked terminal dialog for its focus trap.
+  let revokedModalEl = $state<HTMLElement | null>(null);
 
   // ZEB-338 / PR #169: the startup-error overlay is a blocking dialog, so trap
   // focus inside it (same util as WelcomeModal) — keyboard users must not be
@@ -922,6 +924,11 @@
   $effect(() => {
     if (ownerIdentityState !== 'error' || startupErrorModalEl === null) return;
     return trapFocus(startupErrorModalEl);
+  });
+  // ZEB-668 S2: same treatment for the terminal "removed" overlay.
+  $effect(() => {
+    if (ownerIdentityState !== 'revoked' || revokedModalEl === null) return;
+    return trapFocus(revokedModalEl);
   });
   let feedbackModalOpen = $state(false);
   let aboutModalOpen = $state(false);
@@ -2104,6 +2111,8 @@
         // already exists on disk but failed to load, the non-dismissible mint
         // gate would deadlock (mint refuses "already exists"). The startup-error
         // overlay offers a retry instead.
+        // 'revoked' (ZEB-668 S2): same rule — owner_state.cbor exists, so the
+        // mint gate would deadlock; the terminal "removed" overlay renders.
         showWelcomeModal = false;
       }
 
@@ -2435,6 +2444,16 @@
           }
         }
       }
+      // ZEB-668 S2: a mid-session self-revocation (this device removed itself,
+      // or a sibling's revocation replicated in via the trust engine) drops the
+      // app into the terminal "removed" state. Boot-time revocation is handled
+      // by classifyOwnerIdentity (StartNodeResponse.selfRevoked) — this event
+      // covers the live transition.
+      const unlistenRevokedSelf = await listen('device-revoked-self', () => {
+        ownerIdentityState = 'revoked';
+      });
+      fileManagerService.addUnlisten(unlistenRevokedSelf);
+
       const unlistenStatus = await listen('zenoh-status', async (event) => {
         const status = (event as { payload: { status: string } }).payload;
         if (status.status === 'connected') {
@@ -4390,6 +4409,36 @@
           Retry
         </button>
       </div>
+    </div>
+  </div>
+{/if}
+
+<!-- ZEB-668 S2: terminal state for a revoked device. No retry — the
+     revocation is monotonic (remove-wins CRDT). Honesty rule: the copy says
+     exactly what is and is not affected (local data is NOT wiped — §1
+     non-goal), and how to use Harmony on this hardware again. -->
+{#if ownerIdentityState === 'revoked'}
+  <div class="modal-overlay" data-testid="device-revoked-backdrop" role="presentation">
+    <div
+      bind:this={revokedModalEl}
+      class="modal-content startup-error-modal"
+      data-testid="device-revoked-modal"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="device-revoked-title"
+      tabindex="-1"
+    >
+      <h2 id="device-revoked-title">This device was removed from your account</h2>
+      <p>
+        This device's enrollment was revoked — by you here, or from another of
+        your devices. It no longer syncs with your other devices or posts to
+        your communities as you.
+      </p>
+      <p>
+        Your local data on this device has not been deleted. To use Harmony
+        here again, pair this device from another of your devices, or restore
+        an identity from a recovery phrase.
+      </p>
     </div>
   </div>
 {/if}
