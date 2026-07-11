@@ -119,9 +119,18 @@
       devices: view.devices.map((d) => {
         // ZEB-668 S4 ladder: petName ?? local label (self only, pre-S4
         // fallback) ?? backend displayName ("Device xxxxxxxx").
+        //
+        // `""` = explicitly CLEARED — the fleet has an opinion, so the
+        // private label must NOT fill in, or a clear issued from a sibling
+        // leaves this panel showing the stale name forever (Greptile P1,
+        // PR #454 round 2). Only null (never named) / undefined (pre-S4
+        // shape) fall back to the local label.
         const pet = d.petName?.trim();
         if (pet) return { ...d, displayName: pet };
-        if (d.isThisDevice && deviceLabel) return { ...d, displayName: deviceLabel };
+        const fleetHasNoOpinion = d.petName === null || d.petName === undefined;
+        if (fleetHasNoOpinion && d.isThisDevice && deviceLabel) {
+          return { ...d, displayName: deviceLabel };
+        }
         return d;
       }),
     };

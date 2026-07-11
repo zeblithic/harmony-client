@@ -874,6 +874,17 @@ Then `scripts/test-select --context task`, fmt, clippy (owner_commands tests cha
    sweep (the documented ZEB-631 exception structure; same class rejected in
    PR #219).
 
+## Execution amendments (PR #454 round 2)
+
+1. **Cleared petname suppresses the local-label display** (Greptile P1): a
+   sibling-issued clear (`petName: ""`) previously fell through the ladder
+   to this device's private localStorage label, permanently resurfacing the
+   stale name locally while every other device showed the placeholder. The
+   ladder now falls back to the local label only when the fleet has no
+   opinion (`null` = never named / `undefined` = pre-S4 shape). Display-only
+   — a sibling's clear still never mutates this device's private label
+   store. Pinned by panel test.
+
 ## Self-review notes
 
 - Spec §5 coverage: read seam (T3), UI relative-time + null-renders-nothing (T4), `connectedNow` (T3/T4), petname LWW map additive on FleetNetDoc not FleetNetRow (T1), IPC + empty-clears (T2), `DeviceView.petName` + label ladder + localStorage migration/read-only fallback (T3/T4). No gaps.

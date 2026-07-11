@@ -1553,6 +1553,20 @@ describe('DevicesPanel — petnames + last-seen (ZEB-668 S4)', () => {
 
   // ── PR #454 round 1 ──────────────────────────────────────────────────────
 
+  it('a fleet-cleared petname suppresses the private local label (no stale resurface)', async () => {
+    // Greptile P1 (round 2): sibling clears THIS device's petname → backend
+    // sends petName: "". The ladder must show the backend placeholder, not
+    // keep rendering the stale localStorage label.
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
+    const view = s4View();
+    view.devices[0] = { ...view.devices[0], petName: '' };
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    expect(screen.queryByText('KRILE')).toBeNull();
+    expect(screen.getByText('this device', { selector: '.device-name' })).toBeInTheDocument();
+  });
+
   it('no migration for an explicitly CLEARED petname (Some("") ≠ never named)', async () => {
     (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
     const view = s4View();
