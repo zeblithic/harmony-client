@@ -1104,6 +1104,16 @@ pub async fn run(
     // Same Arc as NodeState.content_index in production; test callers that
     // don't exercise re-announcement pass a fresh empty index.
     content_index: std::sync::Arc<std::sync::Mutex<crate::content_index::ContentIndex>>,
+    // ZEB-669 S2: verified remote buddy records, written by the
+    // `harmony/storage/*` subscription arm, read by the auto-pin engine
+    // tick and the buddy IPCs. Test callers pass a fresh store.
+    storage_records: std::sync::Arc<std::sync::Mutex<crate::storage_records::StorageRecordStore>>,
+    // ZEB-669 S2: refcounted hosting ledger (engine writes, IPCs read).
+    // Underscored until the auto-pin engine tick consumes it.
+    _storage_ledger: std::sync::Arc<std::sync::Mutex<crate::storage_ledger::StorageLedger>>,
+    // ZEB-669 S2: local buddy settings (budget/pledges), read by the
+    // engine tick to derive pacts and enforce the shared budget.
+    _storage_settings: std::sync::Arc<std::sync::Mutex<crate::storage_settings::StorageSettings>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -2964,6 +2974,23 @@ pub async fn run(
     )
     .await;
 
+    // ZEB-669 S2: storage-buddy record topics (signed pledge lists,
+    // backup sets, hosting reports). One subscription per record kind —
+    // `harmony/storage/*/*` would also match future non-record topics.
+    for kind in ["pledges", "backup-set", "hosting"] {
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: format!("{}*/{kind}", crate::STORAGE_RECORD_PREFIX),
+            },
+            &session,
+            &zenoh_tx,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
+    }
+
     // Subscribe to LAN pairing wire messages (ZEB-197 v2 pairing) ONLY when
     // a pairing consumer (`pairing_in_tx`) was wired into this event loop.
     // PR #63 review: an unconditional subscribe paid the Zenoh subscription
@@ -3800,6 +3827,26 @@ pub async fn run(
                             &own_zid,
                             || start.elapsed().as_millis() as u64,
                         );
+                        // ZEB-669 S2: signed buddy records route to the
+                        // record store; nothing else consumes them.
+                        // Hosting receipt stamps use WALL-clock ms (the
+                        // IPC layer computes report ages against the same
+                        // clock — loop-relative time isn't visible there).
+                        if key_expr.starts_with(crate::STORAGE_RECORD_PREFIX) {
+                            if note_storage_record_sample(
+                                &storage_records,
+                                &key_expr,
+                                &payload,
+                                crate::wall_clock_ms,
+                            ) {
+                                crate::node_event_sink::emit_ser(
+                                    app.as_ref(),
+                                    "storage-buddies-updated",
+                                    &serde_json::Value::Null,
+                                );
+                            }
+                            continue;
+                        }
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
@@ -6197,6 +6244,40 @@ fn note_announce_sample(
                 .note(&a.cid, zid, now_ms());
         }
     }
+}
+
+/// ZEB-669 S2: route a `harmony/storage/*` sample into the record store.
+/// Returns true when the store changed (`Inserted | UpdatedNewer`) so the
+/// caller emits `storage-buddies-updated` only on real change. Rejected
+/// records log at debug (zero state effect, like follow lists); non-store
+/// keys return false without taking the lock. `now_ms` is lazy — only a
+/// hosting sample (which stamps a receipt clock) reads it.
+fn note_storage_record_sample(
+    storage_records: &Arc<std::sync::Mutex<crate::storage_records::StorageRecordStore>>,
+    key_expr: &str,
+    payload: &[u8],
+    now_ms: impl FnOnce() -> u64,
+) -> bool {
+    use crate::storage_records::RecordOutcome;
+    let Some(rest) = key_expr.strip_prefix(crate::STORAGE_RECORD_PREFIX) else {
+        return false;
+    };
+    let Some((_owner, kind)) = rest.split_once('/') else {
+        return false;
+    };
+    let mut store = storage_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let outcome = match kind {
+        "pledges" => store.on_pledge_list_sample(key_expr, payload),
+        "backup-set" => store.on_backup_set_sample(key_expr, payload),
+        "hosting" => store.on_hosting_report_sample(key_expr, payload, now_ms()),
+        _ => return false,
+    };
+    if let RecordOutcome::Rejected(reason) = &outcome {
+        tracing::debug!(key = %key_expr, %reason, "storage record rejected");
+    }
+    outcome.changed()
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
@@ -10895,5 +10976,121 @@ mod note_announce_sample_tests {
             || 10,
         );
         assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 0);
+    }
+}
+
+#[cfg(test)]
+mod note_storage_record_sample_tests {
+    use super::*;
+    use crate::storage_records::StorageRecordStore;
+    use crate::storage_signing::{self, HostingReportEntry, PledgeEntry, PledgeListPayload};
+
+    fn store() -> Arc<std::sync::Mutex<StorageRecordStore>> {
+        Arc::new(std::sync::Mutex::new(StorageRecordStore::new(None)))
+    }
+
+    fn signer() -> harmony_identity::PrivateIdentity {
+        harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
+    }
+
+    fn signed_pledges(
+        id: &harmony_identity::PrivateIdentity,
+        updated_at: u64,
+    ) -> (String, Vec<u8>) {
+        let owner = hex::encode(id.public_identity().address_hash);
+        let mut p = PledgeListPayload {
+            owner_address: owner.clone(),
+            pledges: vec![PledgeEntry {
+                to: "someone".into(),
+                bytes: 9,
+            }],
+            updated_at,
+            identity_pub: None,
+            sig: None,
+        };
+        storage_signing::sign_pledge_list(id, &mut p);
+        (
+            format!("{}{owner}/pledges", crate::STORAGE_RECORD_PREFIX),
+            serde_json::to_vec(&p).unwrap(),
+        )
+    }
+
+    #[test]
+    fn signed_pledge_sample_routes_and_reports_change() {
+        let s = store();
+        let id = signer();
+        let (key, payload) = signed_pledges(&id, 5);
+        assert!(note_storage_record_sample(&s, &key, &payload, || 1));
+        let owner = hex::encode(id.public_identity().address_hash);
+        assert!(s.lock().unwrap().pledge_list(&owner).is_some());
+    }
+
+    #[test]
+    fn replayed_and_rejected_samples_report_no_change() {
+        let s = store();
+        let id = signer();
+        let (key, payload) = signed_pledges(&id, 5);
+        assert!(note_storage_record_sample(&s, &key, &payload, || 1));
+        // LWW replay: same updated_at ⇒ IgnoredOlder ⇒ no change.
+        assert!(!note_storage_record_sample(&s, &key, &payload, || 1));
+        // Garbage payload ⇒ Rejected ⇒ no change.
+        assert!(!note_storage_record_sample(&s, &key, b"not json", || 1));
+    }
+
+    #[test]
+    fn hosting_sample_stamps_the_lazy_receipt_clock() {
+        let s = store();
+        let id = signer();
+        let owner = hex::encode(id.public_identity().address_hash);
+        let mut h = crate::storage_signing::HostingReportPayload {
+            owner_address: owner.clone(),
+            reports: vec![HostingReportEntry {
+                beneficiary: "b".into(),
+                bytes: 1,
+                cids: 1,
+            }],
+            updated_at: 5,
+            identity_pub: None,
+            sig: None,
+        };
+        storage_signing::sign_hosting_report(&id, &mut h);
+        let key = format!("{}{owner}/hosting", crate::STORAGE_RECORD_PREFIX);
+        assert!(note_storage_record_sample(
+            &s,
+            &key,
+            &serde_json::to_vec(&h).unwrap(),
+            || 777,
+        ));
+        assert_eq!(
+            s.lock()
+                .unwrap()
+                .hosting_report(&owner)
+                .unwrap()
+                .received_at_ms,
+            777
+        );
+    }
+
+    #[test]
+    fn non_storage_and_unknown_kind_keys_are_ignored() {
+        let s = store();
+        assert!(!note_storage_record_sample(
+            &s,
+            "harmony/announce/aabb",
+            b"",
+            || 1
+        ));
+        assert!(!note_storage_record_sample(
+            &s,
+            "harmony/storage/owner/unknown-kind",
+            b"",
+            || 1
+        ));
+        assert!(!note_storage_record_sample(
+            &s,
+            "harmony/storage/owner",
+            b"",
+            || 1
+        ));
     }
 }

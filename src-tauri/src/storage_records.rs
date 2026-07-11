@@ -412,7 +412,10 @@ impl StorageRecordStore {
     /// report's local receipt clock (for age display).
     pub fn hosting_reported_for(&self, reporter: &str, beneficiary: &str) -> Option<(u64, u64)> {
         let record = self.hosting_reports.get(reporter)?;
-        let line = record.reports.iter().find(|r| r.beneficiary == beneficiary)?;
+        let line = record
+            .reports
+            .iter()
+            .find(|r| r.beneficiary == beneficiary)?;
         Some((line.bytes, record.received_at_ms))
     }
 
@@ -428,7 +431,7 @@ impl StorageRecordStore {
 /// (a valid record replayed onto a foreign topic is rejected).
 fn check_topic(key_expr: &str, kind: &str, claimed_owner: &str) -> Result<(), String> {
     let rest = key_expr
-        .strip_prefix("harmony/storage/")
+        .strip_prefix(crate::STORAGE_RECORD_PREFIX)
         .ok_or_else(|| format!("topic {key_expr} is not a storage record topic"))?;
     let mut segments = rest.split('/');
     let owner = segments
@@ -563,7 +566,10 @@ mod tests {
     }
 
     fn pledge(to: &str, bytes: u64) -> PledgeEntry {
-        PledgeEntry { to: to.into(), bytes }
+        PledgeEntry {
+            to: to.into(),
+            bytes,
+        }
     }
 
     #[test]
@@ -573,18 +579,34 @@ mod tests {
         let owner = addr_of(&id);
 
         let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 5)], 10);
-        assert_eq!(store.on_pledge_list_sample(&topic, &bytes), RecordOutcome::Inserted);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &bytes),
+            RecordOutcome::Inserted
+        );
         assert_eq!(store.pledge_list(&owner).unwrap().pledges[0].bytes, 5);
 
         let cid = public_durable_cid_hex(b"blob");
-        let (topic, bytes) =
-            signed_backup_bytes(&id, vec![BackupEntry { cid: cid.clone(), size: 4 }], 10);
-        assert_eq!(store.on_backup_set_sample(&topic, &bytes), RecordOutcome::Inserted);
+        let (topic, bytes) = signed_backup_bytes(
+            &id,
+            vec![BackupEntry {
+                cid: cid.clone(),
+                size: 4,
+            }],
+            10,
+        );
+        assert_eq!(
+            store.on_backup_set_sample(&topic, &bytes),
+            RecordOutcome::Inserted
+        );
         assert_eq!(store.backup_set(&owner).unwrap().entries[0].cid, cid);
 
         let (topic, bytes) = signed_hosting_bytes(
             &id,
-            vec![HostingReportEntry { beneficiary: "b".into(), bytes: 4, cids: 1 }],
+            vec![HostingReportEntry {
+                beneficiary: "b".into(),
+                bytes: 4,
+                cids: 1,
+            }],
             10,
         );
         assert_eq!(
@@ -608,19 +630,20 @@ mod tests {
             sig: None,
         };
         let topic = format!("harmony/storage/{owner}/pledges");
-        let outcome =
-            store.on_pledge_list_sample(&topic, &serde_json::to_vec(&unsigned).unwrap());
+        let outcome = store.on_pledge_list_sample(&topic, &serde_json::to_vec(&unsigned).unwrap());
         assert!(matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("unsigned")));
 
         let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("x", 1)], 2);
         let mut tampered: PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
         tampered.pledges[0].bytes = 999;
-        let outcome =
-            store.on_pledge_list_sample(&topic, &serde_json::to_vec(&tampered).unwrap());
+        let outcome = store.on_pledge_list_sample(&topic, &serde_json::to_vec(&tampered).unwrap());
         assert!(
             matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("signature invalid"))
         );
-        assert!(store.pledge_list(&owner).is_none(), "no state effect on rejection");
+        assert!(
+            store.pledge_list(&owner).is_none(),
+            "no state effect on rejection"
+        );
     }
 
     #[test]
@@ -650,10 +673,16 @@ mod tests {
         let owner = addr_of(&id);
 
         let (topic, v2) = signed_pledge_bytes(&id, vec![pledge("a", 2)], 20);
-        assert_eq!(store.on_pledge_list_sample(&topic, &v2), RecordOutcome::Inserted);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &v2),
+            RecordOutcome::Inserted
+        );
 
         let (_, v1) = signed_pledge_bytes(&id, vec![pledge("a", 1)], 10);
-        assert_eq!(store.on_pledge_list_sample(&topic, &v1), RecordOutcome::IgnoredOlder);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &v1),
+            RecordOutcome::IgnoredOlder
+        );
 
         let (_, v2_replay) = signed_pledge_bytes(&id, vec![pledge("a", 9)], 20);
         assert_eq!(
@@ -663,7 +692,10 @@ mod tests {
         assert_eq!(store.pledge_list(&owner).unwrap().pledges[0].bytes, 2);
 
         let (_, v3) = signed_pledge_bytes(&id, vec![pledge("a", 3)], 30);
-        assert_eq!(store.on_pledge_list_sample(&topic, &v3), RecordOutcome::UpdatedNewer);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &v3),
+            RecordOutcome::UpdatedNewer
+        );
         assert_eq!(store.pledge_list(&owner).unwrap().pledges[0].bytes, 3);
     }
 
@@ -673,7 +705,9 @@ mod tests {
         let id = test_identity();
 
         // Entry-count cap.
-        let too_many = (0..=MAX_PLEDGES_PER_LIST).map(|i| pledge(&format!("p{i}"), 1)).collect();
+        let too_many = (0..=MAX_PLEDGES_PER_LIST)
+            .map(|i| pledge(&format!("p{i}"), 1))
+            .collect();
         let (topic, bytes) = signed_pledge_bytes(&id, too_many, 1);
         assert!(matches!(
             store.on_pledge_list_sample(&topic, &bytes),
@@ -696,18 +730,27 @@ mod tests {
 
         let encrypted = ContentId::for_book(
             b"secret",
-            ContentFlags { encrypted: true, ..Default::default() },
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let ephemeral = ContentId::for_book(
             b"fleeting",
-            ContentFlags { ephemeral: true, ..Default::default() },
+            ContentFlags {
+                ephemeral: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         for bad in [encrypted, ephemeral] {
             let (topic, bytes) = signed_backup_bytes(
                 &id,
-                vec![BackupEntry { cid: hex::encode(bad.to_bytes()), size: 1 }],
+                vec![BackupEntry {
+                    cid: hex::encode(bad.to_bytes()),
+                    size: 1,
+                }],
                 1,
             );
             let outcome = store.on_backup_set_sample(&topic, &bytes);
@@ -725,25 +768,42 @@ mod tests {
         let mut store = StorageRecordStore::new(None);
         let id = test_identity();
 
-        let (topic, bytes) =
-            signed_backup_bytes(&id, vec![BackupEntry { cid: "zz".into(), size: 1 }], 1);
+        let (topic, bytes) = signed_backup_bytes(
+            &id,
+            vec![BackupEntry {
+                cid: "zz".into(),
+                size: 1,
+            }],
+            1,
+        );
         assert!(matches!(
             store.on_backup_set_sample(&topic, &bytes),
             RecordOutcome::Rejected(ref e) if e.contains("not hex")
         ));
 
-        let (_, bytes) =
-            signed_backup_bytes(&id, vec![BackupEntry { cid: "abcd".into(), size: 1 }], 1);
+        let (_, bytes) = signed_backup_bytes(
+            &id,
+            vec![BackupEntry {
+                cid: "abcd".into(),
+                size: 1,
+            }],
+            1,
+        );
         assert!(matches!(
             store.on_backup_set_sample(&topic, &bytes),
             RecordOutcome::Rejected(ref e) if e.contains("32 bytes")
         ));
 
-        let mut corrupt = ContentId::for_book(b"ok", ContentFlags::default()).unwrap().to_bytes();
+        let mut corrupt = ContentId::for_book(b"ok", ContentFlags::default())
+            .unwrap()
+            .to_bytes();
         corrupt[3] ^= 0x01; // flip a checksum bit
         let (_, bytes) = signed_backup_bytes(
             &id,
-            vec![BackupEntry { cid: hex::encode(corrupt), size: 1 }],
+            vec![BackupEntry {
+                cid: hex::encode(corrupt),
+                size: 1,
+            }],
             1,
         );
         assert!(matches!(
@@ -755,7 +815,10 @@ mod tests {
         let (_, bytes) = signed_backup_bytes(
             &id,
             vec![
-                BackupEntry { cid: good.clone(), size: 1 },
+                BackupEntry {
+                    cid: good.clone(),
+                    size: 1,
+                },
                 BackupEntry { cid: good, size: 1 },
             ],
             1,
@@ -782,10 +845,16 @@ mod tests {
             assert!(store.on_backup_set_sample(&topic, &bytes).changed());
             let (topic, bytes) = signed_hosting_bytes(
                 &id,
-                vec![HostingReportEntry { beneficiary: "b".into(), bytes: 4, cids: 1 }],
+                vec![HostingReportEntry {
+                    beneficiary: "b".into(),
+                    bytes: 4,
+                    cids: 1,
+                }],
                 5,
             );
-            assert!(store.on_hosting_report_sample(&topic, &bytes, 100).changed());
+            assert!(store
+                .on_hosting_report_sample(&topic, &bytes, 100)
+                .changed());
         }
 
         let reloaded = StorageRecordStore::new(Some(path));
@@ -820,7 +889,10 @@ mod tests {
         for i in 0..=MAX_TRACKED_OWNERS {
             store.pledge_lists.insert(
                 format!("owner-{i:04}"),
-                PledgeListRecord { pledges: vec![], updated_at: i as u64 + 1 },
+                PledgeListRecord {
+                    pledges: vec![],
+                    updated_at: i as u64 + 1,
+                },
             );
         }
         evict_stalest(&mut store.pledge_lists, |r| r.updated_at);
@@ -829,7 +901,9 @@ mod tests {
             store.pledge_list("owner-0000").is_none(),
             "stalest (min updated_at) evicted first"
         );
-        assert!(store.pledge_list(&format!("owner-{MAX_TRACKED_OWNERS:04}")).is_some());
+        assert!(store
+            .pledge_list(&format!("owner-{MAX_TRACKED_OWNERS:04}"))
+            .is_some());
     }
 
     #[test]
@@ -838,13 +912,18 @@ mod tests {
         let id = test_identity();
         let owner = addr_of(&id);
         let (topic, bytes) = signed_hosting_bytes(&id, vec![], 1);
-        assert!(store.on_hosting_report_sample(&topic, &bytes, 1_000).changed());
+        assert!(store
+            .on_hosting_report_sample(&topic, &bytes, 1_000)
+            .changed());
 
         store.sweep_hosting(1_000 + HOSTING_REPORT_STALE_MS - 1);
         assert!(store.hosting_report(&owner).is_some(), "fresh report kept");
 
         store.sweep_hosting(1_000 + HOSTING_REPORT_STALE_MS);
-        assert!(store.hosting_report(&owner).is_none(), "stale report dropped");
+        assert!(
+            store.hosting_report(&owner).is_none(),
+            "stale report dropped"
+        );
     }
 
     #[test]

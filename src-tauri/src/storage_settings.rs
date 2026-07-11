@@ -74,7 +74,10 @@ pub fn load_or_default(path: &Path) -> StorageSettings {
     match serde_json::from_slice::<StorageSettingsFile>(&bytes) {
         Ok(file) if file.version == FILE_VERSION => file.settings,
         Ok(file) => {
-            tracing::warn!("storage_settings version {} unsupported, using defaults", file.version);
+            tracing::warn!(
+                "storage_settings version {} unsupported, using defaults",
+                file.version
+            );
             StorageSettings::default()
         }
         Err(e) => {
@@ -133,7 +136,11 @@ mod tests {
         assert_eq!(loaded.my_pledges.get("buddy"), Some(&1_000));
         assert_eq!(loaded.dismissed_invites.get("spammer"), Some(&77));
         assert_eq!(
-            (loaded.pledge_floor, loaded.backup_set_floor, loaded.hosting_floor),
+            (
+                loaded.pledge_floor,
+                loaded.backup_set_floor,
+                loaded.hosting_floor
+            ),
             (5, 6, 7)
         );
     }
@@ -142,12 +149,21 @@ mod tests {
     fn corrupt_or_missing_or_foreign_version_yields_default() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = settings_path(dir.path());
-        assert_eq!(load_or_default(&path).shared_budget_bytes, DEFAULT_SHARED_BUDGET_BYTES);
+        assert_eq!(
+            load_or_default(&path).shared_budget_bytes,
+            DEFAULT_SHARED_BUDGET_BYTES
+        );
 
         std::fs::write(&path, b"{broken").unwrap();
-        assert_eq!(load_or_default(&path).shared_budget_bytes, DEFAULT_SHARED_BUDGET_BYTES);
+        assert_eq!(
+            load_or_default(&path).shared_budget_bytes,
+            DEFAULT_SHARED_BUDGET_BYTES
+        );
 
         std::fs::write(&path, br#"{"version":9,"shared_budget_bytes":1}"#).unwrap();
-        assert_eq!(load_or_default(&path).shared_budget_bytes, DEFAULT_SHARED_BUDGET_BYTES);
+        assert_eq!(
+            load_or_default(&path).shared_budget_bytes,
+            DEFAULT_SHARED_BUDGET_BYTES
+        );
     }
 }

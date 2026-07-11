@@ -85,7 +85,10 @@ impl StorageLedger {
                 }
             }
             Ok(disk) => {
-                tracing::warn!("storage_ledger version {} unsupported, starting empty", disk.version);
+                tracing::warn!(
+                    "storage_ledger version {} unsupported, starting empty",
+                    disk.version
+                );
             }
             Err(e) => {
                 tracing::warn!("storage_ledger load failed, starting empty: {e}");
@@ -186,7 +189,9 @@ impl StorageLedger {
                 .per_buddy
                 .iter()
                 .flat_map(|(owner, entries)| {
-                    entries.iter().map(move |e| (e.pinned_at_ms, owner.clone(), e.cid.clone()))
+                    entries
+                        .iter()
+                        .map(move |e| (e.pinned_at_ms, owner.clone(), e.cid.clone()))
                 })
                 .max();
             let Some((_, owner, cid)) = newest else {
@@ -293,10 +298,16 @@ mod tests {
     fn record_and_release_roundtrip() {
         let mut ledger = StorageLedger::new(None);
         assert!(ledger.record_pin("alice", "cid1", 100, 1));
-        assert!(!ledger.record_pin("alice", "cid1", 100, 2), "duplicate is a no-op");
+        assert!(
+            !ledger.record_pin("alice", "cid1", 100, 2),
+            "duplicate is a no-op"
+        );
         assert!(ledger.holds("alice", "cid1"));
         assert_eq!(ledger.bytes_for_buddy("alice"), 100);
-        assert_eq!(ledger.release("alice", "cid1"), ReleaseOutcome::LastReference);
+        assert_eq!(
+            ledger.release("alice", "cid1"),
+            ReleaseOutcome::LastReference
+        );
         assert_eq!(ledger.release("alice", "cid1"), ReleaseOutcome::NotHeld);
         assert_eq!(ledger.distinct_pinned_bytes(), 0);
     }
@@ -309,7 +320,11 @@ mod tests {
         ledger.record_pin("bob", "cid2", 40, 3);
 
         assert_eq!(ledger.distinct_pinned_bytes(), 140, "cid1 stored once");
-        assert_eq!(ledger.bytes_for_buddy("alice"), 100, "slice attribution per pact");
+        assert_eq!(
+            ledger.bytes_for_buddy("alice"),
+            100,
+            "slice attribution per pact"
+        );
         assert_eq!(ledger.bytes_for_buddy("bob"), 140);
         assert_eq!(ledger.cid_count_for_buddy("bob"), 2);
         assert_eq!(ledger.held_anywhere("cid1"), Some(100));
@@ -334,7 +349,10 @@ mod tests {
         let freed = ledger.release_buddy("bob");
         assert_eq!(freed, vec!["solo".to_string()], "shared survives via alice");
         assert!(ledger.holds("alice", "shared"));
-        assert!(ledger.release_buddy("bob").is_empty(), "second removal is a no-op");
+        assert!(
+            ledger.release_buddy("bob").is_empty(),
+            "second removal is a no-op"
+        );
     }
 
     #[test]
@@ -364,7 +382,11 @@ mod tests {
         ledger.drop_cid_everywhere("gone");
         assert_eq!(ledger.distinct_pinned_bytes(), 5);
         assert!(!ledger.holds("alice", "gone"));
-        assert_eq!(ledger.buddies(), vec!["bob".to_string()], "empty buddies pruned");
+        assert_eq!(
+            ledger.buddies(),
+            vec!["bob".to_string()],
+            "empty buddies pruned"
+        );
     }
 
     #[test]

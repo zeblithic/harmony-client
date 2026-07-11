@@ -796,6 +796,26 @@ pub struct NodeState {
     /// event loop's `harmony/announce/*` arm, read by list_content /
     /// list_root for `replicaCount` (1 self + observed peers).
     observed_holders: std::sync::Arc<std::sync::Mutex<observed_holders::ObservedHolders>>,
+    /// ZEB-669 S2: verified remote buddy records (pledges/backup-sets/
+    /// hosting), written by the event loop's `harmony/storage/*` arm,
+    /// read by the buddy IPCs and the auto-pin engine.
+    storage_records: std::sync::Arc<std::sync::Mutex<storage_records::StorageRecordStore>>,
+    /// ZEB-669 S2: refcounted hosting ledger — meter numerator + the
+    /// source for HostingReport publishes. Written by the auto-pin
+    /// engine, read by IPCs and the hosting publisher.
+    storage_ledger: std::sync::Arc<std::sync::Mutex<storage_ledger::StorageLedger>>,
+    /// ZEB-669 S2: local buddy settings (budget/pledges/dismissals/
+    /// publish floors). Arc-shared with the event loop's engine tick.
+    storage_settings: std::sync::Arc<std::sync::Mutex<storage_settings::StorageSettings>>,
+    /// ZEB-669 S2: where storage settings persist; `None` in tests.
+    storage_settings_path: Option<std::path::PathBuf>,
+    /// ZEB-669 S2: session-monotonic publish clocks, one per storage
+    /// record type — same rationale as `follow_list_clock` (two changes
+    /// within one wall second must not be LWW-equal). Atomic only for
+    /// interior mutability; writers hold the NodeState mutex.
+    pledge_clock: std::sync::atomic::AtomicU64,
+    backup_set_clock: std::sync::atomic::AtomicU64,
+    hosting_clock: std::sync::atomic::AtomicU64,
     /// Monotonic install generation. Bumped at lock-2 install site under
     /// `start_node`. Post-install checks (pairing-handle install, failure
     /// cleanup, stop_inner gating) compare against this to detect whether a
@@ -1649,6 +1669,19 @@ impl Default for NodeState {
             observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
                 observed_holders::ObservedHolders::new(),
             )),
+            storage_records: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_records::StorageRecordStore::new(None),
+            )),
+            storage_ledger: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_ledger::StorageLedger::new(None),
+            )),
+            storage_settings: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_settings::StorageSettings::default(),
+            )),
+            storage_settings_path: None,
+            pledge_clock: std::sync::atomic::AtomicU64::new(0),
+            backup_set_clock: std::sync::atomic::AtomicU64::new(0),
+            hosting_clock: std::sync::atomic::AtomicU64::new(0),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),
@@ -1949,6 +1982,21 @@ const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
 /// Publishes on this prefix attach the local zid (ZEB-669 slice 1) so
 /// receivers' `ObservedHolders` can attribute the announcing session.
 const ANNOUNCE_PREFIX: &str = "harmony/announce/";
+
+/// ZEB-669 S2: signed storage-buddy records live under
+/// `harmony/storage/{owner}/{pledges|backup-set|hosting}`.
+pub(crate) const STORAGE_RECORD_PREFIX: &str = "harmony/storage/";
+
+/// Wall-clock milliseconds since the Unix epoch. Used where a timestamp
+/// must be comparable across the event loop AND the IPC layer (e.g.
+/// hosting-report receipt stamps vs. displayed report age) — the loop's
+/// `start.elapsed()` clock is invisible outside `run()`.
+pub(crate) fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // ZEB-338: the single honest "owner identity not loaded" message. Use this at
 // owner-derived-handle guards so the phrasing can't drift between call sites.
@@ -3011,6 +3059,19 @@ pub async fn start_node_inner(
     // ZEB-671: share_follows gate for follow-list wire publication.
     let vine_settings_path = vine_settings::settings_path(&app_data_dir);
     let vine_settings_loaded = vine_settings::load_or_default(&vine_settings_path);
+    // ZEB-669 S2: storage-buddy stores. Records + ledger persist across
+    // restarts (the engine's first tick reconciles the ledger against the
+    // RAM-only cache); settings carry budget/pledges/floors.
+    let storage_settings_path = storage_settings::settings_path(&app_data_dir);
+    let storage_settings_loaded = storage_settings::load_or_default(&storage_settings_path);
+    let storage_records_arc = std::sync::Arc::new(std::sync::Mutex::new(
+        storage_records::StorageRecordStore::new(Some(app_data_dir.join("storage_records.json"))),
+    ));
+    let storage_ledger_arc = std::sync::Arc::new(std::sync::Mutex::new(
+        storage_ledger::StorageLedger::new(Some(app_data_dir.join("storage_ledger.json"))),
+    ));
+    let storage_settings_arc =
+        std::sync::Arc::new(std::sync::Mutex::new(storage_settings_loaded.clone()));
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
         follow_mgr
             .addresses()
@@ -9305,6 +9366,10 @@ pub async fn start_node_inner(
                 ));
                 let observed_holders_for_loop = observed_holders.clone();
                 let content_index_for_loop = content_index.clone();
+                // ZEB-669 S2: buddy stores shared with the engine tick.
+                let storage_records_for_loop = storage_records_arc.clone();
+                let storage_ledger_for_loop = storage_ledger_arc.clone();
+                let storage_settings_for_loop = storage_settings_arc.clone();
 
                 let ep_clone = endpoint.clone();
                 let app_clone = app.clone();
@@ -9560,6 +9625,12 @@ pub async fn start_node_inner(
                                 // announce-note arm and the re-announce tick.
                                 observed_holders_for_loop,
                                 content_index_for_loop,
+                                // ZEB-669 S2: buddy record store + ledger +
+                                // settings for the storage-record arm and
+                                // the auto-pin engine tick.
+                                storage_records_for_loop,
+                                storage_ledger_for_loop,
+                                storage_settings_for_loop,
                             )
                             .await;
                         });
@@ -9605,6 +9676,21 @@ pub async fn start_node_inner(
                             vine_settings_loaded.last_published_updated_at,
                         );
                         guard.vine_settings_path = Some(vine_settings_path);
+                        // ZEB-669 S2: buddy stores + restored publish-clock
+                        // floors (same backwards-wall-clock rationale as the
+                        // follow-list clock above).
+                        guard.storage_records = storage_records_arc;
+                        guard.storage_ledger = storage_ledger_arc;
+                        guard.storage_settings = storage_settings_arc;
+                        guard.storage_settings_path = Some(storage_settings_path);
+                        guard.pledge_clock =
+                            std::sync::atomic::AtomicU64::new(storage_settings_loaded.pledge_floor);
+                        guard.backup_set_clock = std::sync::atomic::AtomicU64::new(
+                            storage_settings_loaded.backup_set_floor,
+                        );
+                        guard.hosting_clock = std::sync::atomic::AtomicU64::new(
+                            storage_settings_loaded.hosting_floor,
+                        );
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
                         // ZEB-670: tombstone signer for delete_vine.
@@ -59561,6 +59647,19 @@ mod start_node_race_tests {
             observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
                 observed_holders::ObservedHolders::new(),
             )),
+            storage_records: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_records::StorageRecordStore::new(None),
+            )),
+            storage_ledger: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_ledger::StorageLedger::new(None),
+            )),
+            storage_settings: std::sync::Arc::new(std::sync::Mutex::new(
+                storage_settings::StorageSettings::default(),
+            )),
+            storage_settings_path: None,
+            pledge_clock: std::sync::atomic::AtomicU64::new(0),
+            backup_set_clock: std::sync::atomic::AtomicU64::new(0),
+            hosting_clock: std::sync::atomic::AtomicU64::new(0),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),

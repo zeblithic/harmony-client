@@ -343,7 +343,10 @@ mod tests {
         let mut p = pledge_list_for(&victim); // claims victim's address
         sign_pledge_list(&attacker, &mut p); // signed by attacker
         let err = verify_pledge_list(&p).unwrap_err();
-        assert!(err.contains("pubkey does not match claimed address"), "{err}");
+        assert!(
+            err.contains("pubkey does not match claimed address"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -352,21 +355,41 @@ mod tests {
         let mut p = pledge_list_for(&id);
         sign_pledge_list(&id, &mut p);
         let json = serde_json::to_string(&p).unwrap();
-        for key in ["ownerAddress", "pledges", "updatedAt", "identityPub", "sig", "\"to\"", "\"bytes\""] {
+        for key in [
+            "ownerAddress",
+            "pledges",
+            "updatedAt",
+            "identityPub",
+            "sig",
+            "\"to\"",
+            "\"bytes\"",
+        ] {
             assert!(json.contains(key), "pledge json missing {key}: {json}");
         }
 
         let mut b = backup_set_for(&id);
         sign_backup_set(&id, &mut b);
         let json = serde_json::to_string(&b).unwrap();
-        for key in ["ownerAddress", "entries", "updatedAt", "\"cid\"", "\"size\""] {
+        for key in [
+            "ownerAddress",
+            "entries",
+            "updatedAt",
+            "\"cid\"",
+            "\"size\"",
+        ] {
             assert!(json.contains(key), "backup json missing {key}: {json}");
         }
 
         let mut h = hosting_report_for(&id);
         sign_hosting_report(&id, &mut h);
         let json = serde_json::to_string(&h).unwrap();
-        for key in ["ownerAddress", "reports", "updatedAt", "beneficiary", "\"cids\""] {
+        for key in [
+            "ownerAddress",
+            "reports",
+            "updatedAt",
+            "beneficiary",
+            "\"cids\"",
+        ] {
             assert!(json.contains(key), "hosting json missing {key}: {json}");
         }
     }
@@ -387,7 +410,10 @@ mod tests {
     fn canonical_entry_boundaries_pinned() {
         let one = PledgeListPayload {
             owner_address: "o".into(),
-            pledges: vec![PledgeEntry { to: "ab".into(), bytes: 1 }],
+            pledges: vec![PledgeEntry {
+                to: "ab".into(),
+                bytes: 1,
+            }],
             updated_at: 1,
             identity_pub: None,
             sig: None,
@@ -395,8 +421,14 @@ mod tests {
         let two = PledgeListPayload {
             owner_address: "o".into(),
             pledges: vec![
-                PledgeEntry { to: "a".into(), bytes: 1 },
-                PledgeEntry { to: "b".into(), bytes: 1 },
+                PledgeEntry {
+                    to: "a".into(),
+                    bytes: 1,
+                },
+                PledgeEntry {
+                    to: "b".into(),
+                    bytes: 1,
+                },
             ],
             updated_at: 1,
             identity_pub: None,
@@ -415,7 +447,10 @@ mod tests {
     fn canonical_bytes_golden_pins() {
         let p = PledgeListPayload {
             owner_address: "aa".into(),
-            pledges: vec![PledgeEntry { to: "bb".into(), bytes: 7 }],
+            pledges: vec![PledgeEntry {
+                to: "bb".into(),
+                bytes: 7,
+            }],
             updated_at: 42,
             identity_pub: None,
             sig: None,
@@ -433,7 +468,10 @@ mod tests {
 
         let b = BackupSetPayload {
             owner_address: "aa".into(),
-            entries: vec![BackupEntry { cid: "cc".into(), size: 7 }],
+            entries: vec![BackupEntry {
+                cid: "cc".into(),
+                size: 7,
+            }],
             updated_at: 42,
             identity_pub: None,
             sig: None,

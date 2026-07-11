@@ -213,6 +213,16 @@ async fn ingest_list_pin_burn_roundtrip() {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
                     )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
+                    )),
                 )
                 .await;
             });
@@ -524,6 +534,16 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     // ZEB-612 S3: re-announce not exercised (empty index)
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
                     )),
                 )
                 .await;
@@ -944,6 +964,16 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
                     )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
+                    )),
                 )
                 .await;
             });
@@ -1220,6 +1250,16 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     // ZEB-612 S3: re-announce not exercised (empty index)
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
                     )),
                 )
                 .await;
@@ -1560,6 +1600,16 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     // ZEB-612 S3: re-announce not exercised (empty index)
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                    )),
+                    // ZEB-669 S2: buddy records/ledger/settings not exercised
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_records::StorageRecordStore::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_ledger::StorageLedger::new(None),
+                    )),
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        harmony_app::storage_settings::StorageSettings::default(),
                     )),
                 )
                 .await;
