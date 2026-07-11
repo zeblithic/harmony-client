@@ -77,6 +77,7 @@
   import { FileManagerService } from './lib/file-manager-service';
   import { StorageBuddyService } from './lib/storage-buddy-service';
   import type { ContributionSummaryDto, StorageBuddyDto } from './lib/storage-buddy-service';
+  import StorageBuddySheet from './lib/components/StorageBuddySheet.svelte';
   import { MessageService } from './lib/message-service';
   import { NotesService } from './lib/notes-service';
   import { migrateLocalNotes } from './lib/notes-migrate';
@@ -4070,6 +4071,21 @@
       />
     </div>
   </div>
+{/if}
+
+{#if manageBuddiesOpen}
+  <!-- ZEB-669 S3: storage-buddy manage sheet. Buddy rows refresh via the
+       service onChange subscription while open; actions surface their own
+       errors inline (backend stays the authority). -->
+  <StorageBuddySheet
+    buddies={storageBuddies}
+    summary={contributionSummary}
+    friendContacts={pickerContacts}
+    onClose={() => { manageBuddiesOpen = false; }}
+    onSetPledge={(addr, bytes) => storageBuddyService.setPledge(addr, bytes)}
+    onRemove={(addr) => storageBuddyService.removeBuddy(addr)}
+    onSetBudget={(bytes) => storageBuddyService.setSharedBudget(bytes)}
+  />
 {/if}
 
 {#if pendingDeleteMessageId}
