@@ -2206,6 +2206,10 @@
       void refreshContributionSummary();
       storageBuddyService.onChange(() => {
         void refreshContributionSummary();
+        // Backup-flag changes can originate outside this window (headless
+        // RPC) and arrive as storage-buddies-updated — keep the file list
+        // and detail panel honest too.
+        void fileManagerService.refreshContents();
         if (manageBuddiesOpen) void refreshStorageBuddies();
       });
       await tryConnect('community', communityService.connectAdapter(adapter));
@@ -2834,7 +2838,10 @@
   let selectedFileDetail = $derived.by(() => {
     void fileManagerVersion;
     if (!selectedFileCid) return undefined;
-    return fileManagerService.getContentDetail(selectedFileCid);
+    // Prefer the exact sidecar row: CID-only lookup can land on a
+    // duplicate-CID sibling and show stale per-row state (ZEB-164 symlink
+    // model; Greptile PR #450).
+    return fileManagerService.getContentDetail(selectedFileCid, selectedFileSidecarId ?? undefined);
   });
 
   // ZEB-612 S3: "Used by N vines" — recompute when either vine feed

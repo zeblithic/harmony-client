@@ -258,11 +258,29 @@ export class FileManagerService {
 
   /** Returns detail for a single content item, or undefined if not found.
    *  ZEB-612 S3: only real fields — the mock sharedWith/storageBuddies/
-   *  origin surfaces return with real hosting accounting (ZEB-669). */
-  getContentDetail(cid: string): ContentDetail | undefined {
-    const item = this.privateContent.find((i) => i.cid === cid);
+   *  origin surfaces return with real hosting accounting (ZEB-669).
+   *
+   *  ZEB-164 allows multiple sidecar entries to share a CID, so a CID-only
+   *  lookup can land on the wrong sibling (stale backup/pin state after a
+   *  toggle — Greptile PR #450). Pass `sidecarId` when the caller knows the
+   *  exact row; the CID lookup remains the fallback for manifest-derived
+   *  rows (empty sidecarId) and legacy callers. */
+  getContentDetail(cid: string, sidecarId?: string): ContentDetail | undefined {
+    const item =
+      (sidecarId ? this.privateContent.find((i) => i.sidecarId === sidecarId) : undefined) ??
+      this.privateContent.find((i) => i.cid === cid);
     if (!item) return undefined;
     return { ...item };
+  }
+
+  /**
+   * ZEB-669 S3: re-fetch the root listing. Storage-buddy events can carry
+   * backup-flag changes made outside this window (headless RPC, another
+   * device surface) — without a refetch the file list and detail panel go
+   * stale until an unrelated reload (Greptile PR #450). No-op in demo mode.
+   */
+  async refreshContents(): Promise<void> {
+    await this.refetchRoot();
   }
 
   /** Computes quota status from current private content. */

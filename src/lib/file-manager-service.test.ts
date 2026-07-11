@@ -138,6 +138,37 @@ describe('FileManagerService', () => {
     expect(onChange).toHaveBeenCalled();
   });
 
+  it('getContentDetail prefers the exact sidecar row among duplicate-CID siblings', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [
+        wireItem({ sidecarId: 'sc-1', cid: 'cid-shared', backup: false }),
+        wireItem({ sidecarId: 'sc-2', cid: 'cid-shared', backup: true }),
+      ],
+    });
+    await svc.connectAdapter(adapter);
+    // CID-only lookup lands on the first sibling — the sidecarId hint must win.
+    expect(svc.getContentDetail('cid-shared', 'sc-2')!.backup).toBe(true);
+    expect(svc.getContentDetail('cid-shared', 'sc-1')!.backup).toBe(false);
+    // Fallback path (manifest rows / legacy callers) still works.
+    expect(svc.getContentDetail('cid-shared')!.sidecarId).toBe('sc-1');
+  });
+
+  it('refreshContents re-fetches list_content and fires onChange', async () => {
+    const svc = new FileManagerService();
+    let rows = [wireItem({ sidecarId: 'sc-1', cid: 'cid-1', backup: false })];
+    const { adapter } = adapterWith({ list_content: () => Promise.resolve(rows) });
+    await svc.connectAdapter(adapter);
+    expect(svc.getContents()[0].backup).toBe(false);
+
+    rows = [wireItem({ sidecarId: 'sc-1', cid: 'cid-1', backup: true })];
+    const onChange = vi.fn();
+    svc.onChange = onChange;
+    await svc.refreshContents();
+    expect(svc.getContents()[0].backup).toBe(true);
+    expect(onChange).toHaveBeenCalled();
+  });
+
   it('setBackupFlag propagates the ineligible rejection without mutating state', async () => {
     const svc = new FileManagerService();
     const { adapter } = adapterWith({
