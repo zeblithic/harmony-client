@@ -52,6 +52,18 @@ pub struct DeviceView {
     /// "compromised"; free text for the crate's `Other`).
     #[serde(default)]
     pub revoked_reason: Option<String>,
+    /// ZEB-668 S4: fleet-synced petname (LWW). None = never named / cleared.
+    #[serde(default)]
+    pub pet_name: Option<String>,
+    /// ZEB-668 S4: wall-clock ms of the device's last fleet-net heartbeat
+    /// (`FleetNetRow.seen_at`, ~7.5-min cadence). None = never fleet-synced —
+    /// the panel renders NOTHING (honesty rule), never a fabricated time.
+    #[serde(default)]
+    pub last_seen_ms: Option<u64>,
+    /// ZEB-668 S4: true iff the device's iroh endpoint currently holds a
+    /// Connected peer-liveness slot (Degraded does not count).
+    #[serde(default)]
+    pub connected_now: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1992,6 +2004,10 @@ mod tests {
                 revoked: true,
                 revoked_at: Some(1_700_000_100),
                 revoked_reason: Some("lost".into()),
+                // ZEB-668 S4: same non-default trick for the fleet-join trio.
+                pet_name: Some("Koya".into()),
+                last_seen_ms: Some(1_700_000_200_000),
+                connected_now: true,
             }],
             can_back_up: true,
         };
@@ -2026,6 +2042,19 @@ mod tests {
         assert!(
             json.contains("\"revokedReason\":\"lost\""),
             "expected revokedReason, got {json}"
+        );
+        // ZEB-668 S4 fleet-join trio, pinned with the non-default values above.
+        assert!(
+            json.contains("\"petName\":\"Koya\""),
+            "expected petName, got {json}"
+        );
+        assert!(
+            json.contains("\"lastSeenMs\":1700000200000"),
+            "expected lastSeenMs, got {json}"
+        );
+        assert!(
+            json.contains("\"connectedNow\":true"),
+            "expected connectedNow, got {json}"
         );
         assert!(
             !json.contains("owner_id"),

@@ -8290,6 +8290,9 @@ pub async fn start_node_inner(
                         let task_self_owner = self_owner;
                         let task_device_id = device_id.clone();
                         let task_self_vk = butler_self_device_vk;
+                        // ZEB-668 S4: event sink for the petname live-refresh
+                        // emit below (same sink the trust detector emits on).
+                        let task_emit = std::sync::Arc::clone(&app);
                         let mut nudge_rx = fleet_net_snap_nudge_rx;
                         tokio::spawn(async move {
                             let mut prev_doc: crate::fleet_net::FleetNetDoc = task_snapshot
@@ -8342,6 +8345,20 @@ pub async fn start_node_inner(
                                             .write()
                                             .unwrap_or_else(|p| p.into_inner()) =
                                             new_doc.clone();
+                                        // ZEB-668 S4: a remote petname merge
+                                        // must live-refresh an open Devices
+                                        // panel. seen_at-only churn is
+                                        // deliberately excluded (every sibling
+                                        // heartbeat would fire it; last-seen
+                                        // copy is minutes-granular and
+                                        // refreshes on panel open).
+                                        if prev_doc.petnames != new_doc.petnames {
+                                            crate::node_event_sink::emit_ser(
+                                                &*task_emit,
+                                                "owner-devices-updated",
+                                                &serde_json::Value::Null,
+                                            );
+                                        }
                                         prev_doc = new_doc;
                                         if changed && pending.is_none() {
                                             tracing::debug!(
