@@ -2,6 +2,7 @@ import type { TauriAdapter } from './zenoh-service';
 import type {
   ContentItem,
   ContentDetail,
+  ContentOriginInfo,
   QuotaStatus,
   CleanupRecommendation,
   PublishedItem,
@@ -114,6 +115,12 @@ interface ContentItemWire {
   /** ZEB-612 S3: observed replica count — 1 (self) + distinct peer
    *  sessions seen announcing this CID. A lower bound ("copies seen"). */
   replicaCount: number;
+  /** ZEB-669 S3: "back up with buddies" flag (root sidecar rows only).
+   *  Optional: pre-ZEB-669 backends omit it (mapped to false). */
+  backup?: boolean;
+  /** ZEB-669 S4: provenance recorded at creation; null for legacy and
+   *  manifest-derived rows. Optional: pre-ZEB-669 backends omit it. */
+  origin?: ContentOriginInfo | null;
 }
 
 /** Wire shape of the `get_storage_budget` query (ZEB-612 S3). */
@@ -159,6 +166,8 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
     archived: wire.archived,
     parentCid: null,
     isFolder: wire.kind === 'folder',
+    backup: wire.backup ?? false,
+    origin: wire.origin ?? null,
   };
 }
 
@@ -249,11 +258,29 @@ export class FileManagerService {
 
   /** Returns detail for a single content item, or undefined if not found.
    *  ZEB-612 S3: only real fields — the mock sharedWith/storageBuddies/
-   *  origin surfaces return with real hosting accounting (ZEB-669). */
-  getContentDetail(cid: string): ContentDetail | undefined {
-    const item = this.privateContent.find((i) => i.cid === cid);
+   *  origin surfaces return with real hosting accounting (ZEB-669).
+   *
+   *  ZEB-164 allows multiple sidecar entries to share a CID, so a CID-only
+   *  lookup can land on the wrong sibling (stale backup/pin state after a
+   *  toggle — Greptile PR #450). Pass `sidecarId` when the caller knows the
+   *  exact row; the CID lookup remains the fallback for manifest-derived
+   *  rows (empty sidecarId) and legacy callers. */
+  getContentDetail(cid: string, sidecarId?: string): ContentDetail | undefined {
+    const item =
+      (sidecarId ? this.privateContent.find((i) => i.sidecarId === sidecarId) : undefined) ??
+      this.privateContent.find((i) => i.cid === cid);
     if (!item) return undefined;
     return { ...item };
+  }
+
+  /**
+   * ZEB-669 S3: re-fetch the root listing. Storage-buddy events can carry
+   * backup-flag changes made outside this window (headless RPC, another
+   * device surface) — without a refetch the file list and detail panel go
+   * stale until an unrelated reload (Greptile PR #450). No-op in demo mode.
+   */
+  async refreshContents(): Promise<void> {
+    await this.refetchRoot();
   }
 
   /** Computes quota status from current private content. */
@@ -383,6 +410,33 @@ export class FileManagerService {
     }
     const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
     if (item) item.pinned = true;
+    this.onChange?.();
+  }
+
+  /**
+   * ZEB-669 S3: sets the "back up with buddies" flag. Backend is the
+   * eligibility authority — non-public-durable CIDs reject with a stable
+   * `ineligible:` prefix (clearing is always allowed). Rejections propagate
+   * to the caller so the detail panel can render the reason inline.
+   */
+  async setBackupFlag(sidecarId: string, backup: boolean): Promise<void> {
+    if (!this.adapter) {
+      // Offline-only path: mutate local state for Storybook/test contexts.
+      const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
+      if (item) item.backup = backup;
+      this.onChange?.();
+      return;
+    }
+    try {
+      await this.adapter.invoke('set_backup_flag', { sidecarId, backup });
+    } catch (e) {
+      // Normalize both production (string) + test (Error) rejection shapes
+      // (CLAUDE.md "Tauri IPC error extraction").
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
+    const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
+    if (item) item.backup = backup;
     this.onChange?.();
   }
 

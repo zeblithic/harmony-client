@@ -1,13 +1,14 @@
 <script lang="ts">
-  import type { ContentDetail, ContentSensitivity, ReplicationTier } from '../types';
+  import type { ContentDetail, ContentOriginInfo, ContentSensitivity, ReplicationTier } from '../types';
   import FileMetadata from './FileMetadata.svelte';
   import SensitivityBadge from './SensitivityBadge.svelte';
   import ReplicationStatus from './ReplicationStatus.svelte';
   import FileActions from './FileActions.svelte';
 
-  // ZEB-612 S3: ShareList / StorageBuddyList / origin were mock-backed and
-  // are removed until the storage-buddies domain ships real hosting
-  // accounting (ZEB-669).
+  // ZEB-612 S3 removed the mock-backed ShareList/StorageBuddyList/origin;
+  // ZEB-669 restores backup (S3) + origin (S4) against real backends. The
+  // sharedWith viewer-ACL surface remains deferred (encrypted key-sharing —
+  // its own ticket).
   let {
     detail,
     usedByVines = 0,
@@ -20,6 +21,7 @@
     onPin,
     onUnpin,
     onExport,
+    onSetBackup,
   }: {
     detail: ContentDetail;
     /** Vines referencing this CID (client-computed, real descriptors). */
@@ -33,7 +35,77 @@
     onPin: () => void;
     onUnpin: () => void;
     onExport: () => void;
+    /** ZEB-669 S3: toggle "back up with buddies". Rejections (stable
+     *  `ineligible:` prefix) render inline; absent → section hidden. */
+    onSetBackup?: (sidecarId: string, backup: boolean) => Promise<void>;
   } = $props();
+
+  // ZEB-669 S3: frontend proxy gate for backup eligibility — the backend
+  // (CID-class check in set_backup_flag) stays the authority; this only
+  // drives the disabled state + reason copy. Clearing an already-set flag
+  // is always allowed (backend contract).
+  let backupEligible = $derived(detail.sensitivity === 'public');
+  let backupPending = $state(false);
+  let backupError = $state<string | null>(null);
+  /** Optimistic in-flight value: the checkbox is server-authoritative
+   *  (`detail.backup`), so mid-await rerenders would snap it back to the
+   *  old value (Qodo PR #450). Shown value = optimistic ?? server truth;
+   *  cleared when server truth refreshes and on rejection (which reverts
+   *  the box). */
+  let optimisticBackup = $state<boolean | null>(null);
+  /** Request identity: a file switch invalidates in-flight completions so
+   *  a stale rejection/finally can't clobber the next file's toggle state
+   *  (CodeRabbit PR #450). Plain counter — never read reactively. */
+  let backupReq = 0;
+  $effect(() => {
+    // File switch: clear ALL transient toggle state for the new file.
+    void detail.sidecarId;
+    backupReq++;
+    optimisticBackup = null;
+    backupError = null;
+    backupPending = false;
+  });
+  $effect(() => {
+    // Same-file server refresh: authoritative value arrived, drop optimism.
+    void detail.backup;
+    optimisticBackup = null;
+  });
+  let backupChecked = $derived(optimisticBackup ?? detail.backup ?? false);
+
+  async function handleBackupToggle(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const wanted = input.checked;
+    if (!onSetBackup || backupPending) return;
+    const req = ++backupReq;
+    backupPending = true;
+    backupError = null;
+    optimisticBackup = wanted;
+    try {
+      await onSetBackup(detail.sidecarId, wanted);
+    } catch (err) {
+      if (req !== backupReq) return; // stale completion — a newer file/request owns the state
+      const msg = err instanceof Error ? err.message : String(err);
+      // Strip the stable machine prefix for display copy.
+      backupError = msg.startsWith('ineligible:')
+        ? `Not eligible: ${msg.slice('ineligible:'.length).trim()}`
+        : msg;
+      optimisticBackup = null; // revert — backend rejected
+    } finally {
+      if (req === backupReq) backupPending = false;
+    }
+  }
+
+  // ZEB-669 S4: "From" row copy. Introducer pet-name resolution lands when
+  // a seam actually emits one (channelDownload/buddyPin are reserved —
+  // no index-creation path today); until then the address fallback is
+  // unreachable in practice but honest.
+  function originLabel(origin: ContentOriginInfo): string {
+    if (origin.kind === 'selfIngest') return 'Added by you';
+    const kindCopy = origin.kind === 'channelDownload' ? 'Channel download' : 'Buddy pin';
+    if (!origin.introducer) return kindCopy;
+    const a = origin.introducer;
+    return `${kindCopy} · ${a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a}`;
+  }
 
   // Copy-CID affordance — the InviteLinkManager idiom: flip to "✓ Copied"
   // for 2 s, clear the timer on unmount, surface clipboard denial inline.
@@ -71,6 +143,13 @@
     <FileMetadata item={detail} />
   </section>
 
+  {#if detail.origin}
+    <section class="panel-section from-section" data-testid="from-row">
+      <span class="from-label">From</span>
+      <span class="from-value">{originLabel(detail.origin)}</span>
+    </section>
+  {/if}
+
   <section class="panel-section">
     <SensitivityBadge sensitivity={detail.sensitivity} />
   </section>
@@ -95,6 +174,29 @@
       {onTierChange}
     />
   </section>
+
+  {#if onSetBackup && detail.sidecarId}
+    <!-- Manifest-derived rows (empty sidecarId) have no sidecar to flag;
+         no per-file buddy list here — hosting reports are aggregate. -->
+    <section class="panel-section backup-section" data-testid="backup-section">
+      <label class="backup-toggle">
+        <input
+          type="checkbox"
+          checked={backupChecked}
+          disabled={(!backupEligible && !detail.backup) || backupPending}
+          onchange={handleBackupToggle}
+          data-testid="backup-checkbox"
+        />
+        Back up with buddies
+      </label>
+      {#if !backupEligible && !detail.backup}
+        <p class="toggle-hint">Only public files can be backed up by buddies.</p>
+      {/if}
+      {#if backupError}
+        <p class="backup-error" role="alert">{backupError}</p>
+      {/if}
+    </section>
+  {/if}
 
   {#if usedByVines > 0}
     <section class="panel-section">
@@ -193,5 +295,50 @@
     font-family: var(--font-mono);
     font-size: 0.8rem;
     color: var(--text-secondary);
+  }
+
+  .from-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .from-label {
+    font-size: 0.7rem;
+    color: var(--faint);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+  }
+
+  .from-value {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+  }
+
+  .backup-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .backup-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+  }
+
+  .toggle-hint {
+    margin: 0;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+  }
+
+  .backup-error {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--danger);
   }
 </style>

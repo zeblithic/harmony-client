@@ -96,6 +96,93 @@ describe('FileManagerService', () => {
     expect(svc.getContents()[0].replicaCount).toBe(4);
   });
 
+  // ── ZEB-669 S3/S4: backup flag + origin provenance ──────────────────
+
+  it('maps wire backup and origin, defaulting false/null when absent', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [
+        wireItem({
+          sidecarId: 'sc-b',
+          cid: 'cid-b',
+          backup: true,
+          origin: { kind: 'selfIngest', introducer: null },
+        }),
+        wireItem({ sidecarId: 'sc-legacy', cid: 'cid-legacy' }),
+      ],
+    });
+    await svc.connectAdapter(adapter);
+    const byId = new Map(svc.getContents().map((i) => [i.sidecarId, i]));
+    expect(byId.get('sc-b')!.backup).toBe(true);
+    expect(byId.get('sc-b')!.origin).toEqual({ kind: 'selfIngest', introducer: null });
+    expect(byId.get('sc-legacy')!.backup).toBe(false);
+    expect(byId.get('sc-legacy')!.origin).toBeNull();
+  });
+
+  it('setBackupFlag invokes set_backup_flag and updates local state', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [wireItem({ sidecarId: 'sc-b', cid: 'cid-b', backup: false })],
+      set_backup_flag: undefined,
+    });
+    await svc.connectAdapter(adapter);
+    const onChange = vi.fn();
+    svc.onChange = onChange;
+
+    await svc.setBackupFlag('sc-b', true);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_backup_flag', {
+      sidecarId: 'sc-b',
+      backup: true,
+    });
+    expect(svc.getContents()[0].backup).toBe(true);
+    expect(onChange).toHaveBeenCalled();
+  });
+
+  it('getContentDetail prefers the exact sidecar row among duplicate-CID siblings', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [
+        wireItem({ sidecarId: 'sc-1', cid: 'cid-shared', backup: false }),
+        wireItem({ sidecarId: 'sc-2', cid: 'cid-shared', backup: true }),
+      ],
+    });
+    await svc.connectAdapter(adapter);
+    // CID-only lookup lands on the first sibling — the sidecarId hint must win.
+    expect(svc.getContentDetail('cid-shared', 'sc-2')!.backup).toBe(true);
+    expect(svc.getContentDetail('cid-shared', 'sc-1')!.backup).toBe(false);
+    // Fallback path (manifest rows / legacy callers) still works.
+    expect(svc.getContentDetail('cid-shared')!.sidecarId).toBe('sc-1');
+  });
+
+  it('refreshContents re-fetches list_content and fires onChange', async () => {
+    const svc = new FileManagerService();
+    let rows = [wireItem({ sidecarId: 'sc-1', cid: 'cid-1', backup: false })];
+    const { adapter } = adapterWith({ list_content: () => Promise.resolve(rows) });
+    await svc.connectAdapter(adapter);
+    expect(svc.getContents()[0].backup).toBe(false);
+
+    rows = [wireItem({ sidecarId: 'sc-1', cid: 'cid-1', backup: true })];
+    const onChange = vi.fn();
+    svc.onChange = onChange;
+    await svc.refreshContents();
+    expect(svc.getContents()[0].backup).toBe(true);
+    expect(onChange).toHaveBeenCalled();
+  });
+
+  it('setBackupFlag propagates the ineligible rejection without mutating state', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [wireItem({ sidecarId: 'sc-b', cid: 'cid-b', backup: false })],
+      set_backup_flag: () => Promise.reject('ineligible: content class is not public durable'),
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(svc.setBackupFlag('sc-b', true)).rejects.toThrow(
+      'ineligible: content class is not public durable'
+    );
+    expect(svc.getContents()[0].backup).toBe(false);
+  });
+
   it('fetches the pinned budget on connect and exposes it in quota status', async () => {
     const svc = new FileManagerService();
     const { adapter } = adapterWith({

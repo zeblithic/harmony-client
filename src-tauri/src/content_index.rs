@@ -102,6 +102,33 @@ pub enum ContentKind {
     Folder,
 }
 
+/// ZEB-669 S4: provenance for the detail panel's "From" row. Recorded at
+/// index-entry creation only — never inferred retroactively (honesty rule,
+/// ZEB-610 §0). Serialized camelCase because it rides `ContentItemWire`
+/// to the frontend verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OriginInfo {
+    pub kind: OriginKind,
+    /// 32-char lowercase hex owner address of whoever introduced the
+    /// content; `None` for self-ingest.
+    #[serde(default)]
+    pub introducer: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OriginKind {
+    SelfIngest,
+    /// Reserved: channel downloads write plaintext to a user-chosen path
+    /// and create no index entry today, so no seam emits this yet
+    /// (ZEB-669 plan-time seam enumeration).
+    ChannelDownload,
+    /// Reserved: buddy pins are cache+pin only (no index entry); no seam
+    /// emits this yet.
+    BuddyPin,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentIndexEntry {
     pub sidecar_id: SidecarId,
@@ -138,6 +165,11 @@ pub struct ContentIndexEntry {
     /// readable (legacy entries were never flagged).
     #[serde(default)]
     pub backup: bool,
+    /// ZEB-669 S4: provenance recorded at entry creation. `#[serde(default)]`
+    /// keeps pre-field sidecars readable — legacy entries stay `None` and the
+    /// UI renders no "From" row for them (never inferred retroactively).
+    #[serde(default)]
+    pub origin: Option<OriginInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -544,6 +576,7 @@ mod tests {
             archived: false,
             pinned: false,
             backup: false,
+            origin: None,
             kind: ContentKind::Leaf,
         }
     }
@@ -813,6 +846,48 @@ mod tests {
         let entry: ContentIndexEntry = serde_json::from_str(&json).unwrap();
         assert!(!entry.backup);
         assert!(!entry.pinned);
+    }
+
+    /// Pre-ZEB-669-S4 sidecars have no `origin` key — they must deserialize
+    /// as `None` (provenance is recorded at creation, never inferred).
+    #[test]
+    fn origin_defaults_none_on_legacy_entries() {
+        let json = format!(
+            r#"{{"sidecar_id":"{}","cid":"{}","file_name":"old.txt","size_bytes":1,
+                "stored_at_ms":1,"sensitivity":"private","replication_tier":"default",
+                "licensed":false,"archived":false}}"#,
+            SidecarId::new(),
+            "ab".repeat(32),
+        );
+        let entry: ContentIndexEntry = serde_json::from_str(&json).unwrap();
+        assert!(entry.origin.is_none());
+    }
+
+    #[test]
+    fn origin_round_trips_through_save_and_reload() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let mut entry = sample_entry([0xC4; 32]);
+        entry.origin = Some(OriginInfo {
+            kind: OriginKind::SelfIngest,
+            introducer: None,
+        });
+        let id = entry.sidecar_id;
+        idx.insert(entry);
+
+        let reloaded = ContentIndex::load(dir.path());
+        let got = reloaded.get(&id).expect("round-trips");
+        assert_eq!(
+            got.origin,
+            Some(OriginInfo {
+                kind: OriginKind::SelfIngest,
+                introducer: None,
+            })
+        );
+        // The wire spelling is camelCase — pin it so the frontend contract
+        // can't drift silently.
+        let json = serde_json::to_string(&got.origin).unwrap();
+        assert_eq!(json, r#"{"kind":"selfIngest","introducer":null}"#);
     }
 
     #[test]

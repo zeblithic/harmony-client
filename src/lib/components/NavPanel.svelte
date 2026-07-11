@@ -6,6 +6,8 @@
   import FolderTree from './FolderTree.svelte';
   import QuickFilters from './QuickFilters.svelte';
   import MoreMenu from './MoreMenu.svelte';
+  import ContributionMeter from './ContributionMeter.svelte';
+  import type { ContributionSummaryDto } from '../storage-buddy-service';
   import IdentityChip from './IdentityChip.svelte';
   import ConnectionStatusChip from './ConnectionStatusChip.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -47,6 +49,8 @@
     onDeleteChannel,
     identity,
     showConnectionStatus = false,
+    contributionSummary = null,
+    onManageBuddies,
     // ZEB-659: the network-viz window renders MockNetworkDataService's
     // fabricated topology — dev tool only until it has real data.
     showNetworkViz = import.meta.env.DEV,
@@ -107,6 +111,11 @@
     /** ZEB-606: mount the connection-status strip (fires network-health IPC
      *  on mount — default off so bare construction makes no IPC calls). */
     showConnectionStatus?: boolean;
+    /** ZEB-669 S3: Files-mode contribution meter data — `null` until
+     *  `get_contribution_summary` succeeds (meter hidden; never fabricated). */
+    contributionSummary?: ContributionSummaryDto | null;
+    /** ZEB-669 S3: opens the storage-buddy manage sheet. */
+    onManageBuddies?: () => void;
     showNetworkViz?: boolean;
   } = $props();
 
@@ -418,6 +427,11 @@
         {/if}
       {/if}
     </nav>
+    {#if appMode === 'files'}
+      <!-- ZEB-669 S3: restores the pre-ZEB-612-S3 StorageBuddySummary slot,
+           now honest — renders only after get_contribution_summary succeeds. -->
+      <ContributionMeter summary={contributionSummary ?? null} onManage={() => onManageBuddies?.()} />
+    {/if}
     <div class="nav-footer">
       <!-- ZEB-544: the rail surface is gated by `isNavModeEnabled` so the alpha
            shows a focused Communities-first set. `messages` is the home and is

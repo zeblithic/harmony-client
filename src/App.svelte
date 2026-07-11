@@ -75,6 +75,9 @@
   import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
+  import { StorageBuddyService } from './lib/storage-buddy-service';
+  import type { ContributionSummaryDto, StorageBuddyDto } from './lib/storage-buddy-service';
+  import StorageBuddySheet from './lib/components/StorageBuddySheet.svelte';
   import { MessageService } from './lib/message-service';
   import { NotesService } from './lib/notes-service';
   import { migrateLocalNotes } from './lib/notes-migrate';
@@ -1766,6 +1769,31 @@
   const trustService = new TrustService();
   const fileManagerService = new FileManagerService();
   $effect(() => () => fileManagerService.destroy());
+  // ZEB-669 S3: storage-buddy pacts + contribution meter state. Summary and
+  // buddy rows stay null/empty until their IPCs succeed (honesty gate).
+  const storageBuddyService = new StorageBuddyService();
+  $effect(() => () => storageBuddyService.destroy());
+  let contributionSummary = $state<ContributionSummaryDto | null>(null);
+  let storageBuddies = $state<StorageBuddyDto[]>([]);
+  let manageBuddiesOpen = $state(false);
+  async function refreshContributionSummary(): Promise<void> {
+    try {
+      contributionSummary = await storageBuddyService.getContributionSummary();
+    } catch (e) {
+      // Meter renders nothing on failure — log once at warn, don't fabricate.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('[storage-buddy] contribution summary fetch failed:', msg);
+      contributionSummary = null;
+    }
+  }
+  async function refreshStorageBuddies(): Promise<void> {
+    try {
+      storageBuddies = await storageBuddyService.listBuddies();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('[storage-buddy] buddy list fetch failed:', msg);
+    }
+  }
   // Declare fileManagerVersion before wiring onChange — same pattern as allMessages.
   let fileManagerVersion = $state(0);
   fileManagerService.onChange = () => { fileManagerVersion++; };
@@ -2171,6 +2199,19 @@
       // (vine.hydrate moved below fetchOwnAddress — ZEB-672: own persisted
       // reaction rows must resolve likedByMe, which needs ownAddress.)
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
+      // ZEB-669 S3: storage-buddy meter + manage sheet. The summary stays
+      // null on failure (meter renders nothing — never fabricated), and
+      // both backend events re-fetch it.
+      await tryConnect('storageBuddy', storageBuddyService.connectAdapter(adapter));
+      void refreshContributionSummary();
+      storageBuddyService.onChange(() => {
+        void refreshContributionSummary();
+        // Backup-flag changes can originate outside this window (headless
+        // RPC) and arrive as storage-buddies-updated — keep the file list
+        // and detail panel honest too.
+        void fileManagerService.refreshContents();
+        if (manageBuddiesOpen) void refreshStorageBuddies();
+      });
       await tryConnect('community', communityService.connectAdapter(adapter));
       // ZEB-663: base channel-config handler — keep the nav tree's channel
       // children fresh on create/rename/delete. CommunityView (when mounted)
@@ -2797,7 +2838,10 @@
   let selectedFileDetail = $derived.by(() => {
     void fileManagerVersion;
     if (!selectedFileCid) return undefined;
-    return fileManagerService.getContentDetail(selectedFileCid);
+    // Prefer the exact sidecar row: CID-only lookup can land on a
+    // duplicate-CID sibling and show stale per-row state (ZEB-164 symlink
+    // model; Greptile PR #450).
+    return fileManagerService.getContentDetail(selectedFileCid, selectedFileSidecarId ?? undefined);
   });
 
   // ZEB-612 S3: "Used by N vines" — recompute when either vine feed
@@ -3518,6 +3562,11 @@
         onModeChange={switchMode}
         {appMode}
         contentItems={allFileContents}
+        {contributionSummary}
+        onManageBuddies={() => {
+          manageBuddiesOpen = true;
+          void refreshStorageBuddies();
+        }}
         {fileSection}
         {currentFolderCid}
         onFolderSelect={handleNavigateFolder}
@@ -3825,6 +3874,7 @@
         onPin={handleFilePin}
         onUnpin={handleFileUnpin}
         onExport={handleFileExport}
+        onSetBackup={(sidecarId, backup) => fileManagerService.setBackupFlag(sidecarId, backup)}
       />
     {:else}
       <div class="file-detail-empty">
@@ -4031,6 +4081,21 @@
       />
     </div>
   </div>
+{/if}
+
+{#if manageBuddiesOpen}
+  <!-- ZEB-669 S3: storage-buddy manage sheet. Buddy rows refresh via the
+       service onChange subscription while open; actions surface their own
+       errors inline (backend stays the authority). -->
+  <StorageBuddySheet
+    buddies={storageBuddies}
+    summary={contributionSummary}
+    friendContacts={pickerContacts}
+    onClose={() => { manageBuddiesOpen = false; }}
+    onSetPledge={(addr, bytes) => storageBuddyService.setPledge(addr, bytes)}
+    onRemove={(addr) => storageBuddyService.removeBuddy(addr)}
+    onSetBudget={(bytes) => storageBuddyService.setSharedBudget(bytes)}
+  />
 {/if}
 
 {#if pendingDeleteMessageId}
