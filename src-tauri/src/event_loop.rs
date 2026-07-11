@@ -2929,6 +2929,21 @@ pub async fn run(
     )
     .await;
 
+    // ZEB-671: subscribe to published follow lists (Discover graph
+    // edges). Exactly one owner segment — deeper keys are non-canonical
+    // and the ingest path rejects shape mismatches anyway.
+    dispatch_action(
+        RuntimeAction::Subscribe {
+            key_expr: "harmony/vines/*/follows".to_string(),
+        },
+        &session,
+        &zenoh_tx,
+        &app,
+        &closing,
+        &own_zid,
+    )
+    .await;
+
     // Note: per-creator Zenoh subscriptions are not used yet because the
     // publish path (harmony/vines/{addr}) does not include /announce/.
     // Once harmony-node adopts the full keyspace protocol
@@ -7635,6 +7650,36 @@ fn emit_frontend_event(
             // when the tombstone freed the last live reference — the
             // caller owns `runtime` + `pin_intent` and performs the burn.
             return handle_vine_tombstone_sample(app, key_expr, payload, vine_feed_cache);
+        }
+        if key_expr.ends_with("/follows") {
+            // ZEB-671: verified follow list → cache (LWW). A real graph
+            // change (Inserted/UpdatedNewer) is announced to the frontend
+            // so it refetches degree/provenance annotations; stale
+            // re-arrivals and rejected records are absorbed silently.
+            let outcome = match vine_feed_cache.lock() {
+                Ok(mut cache) => Some(cache.on_follow_list_sample(key_expr, payload)),
+                Err(e) => {
+                    tracing::error!(error = %e, "vine_feed_cache mutex poisoned; skipping follow-list ingest");
+                    None
+                }
+            };
+            match outcome {
+                Some(
+                    crate::vine_feed_cache::FollowListOutcome::Inserted
+                    | crate::vine_feed_cache::FollowListOutcome::UpdatedNewer,
+                ) => {
+                    crate::node_event_sink::emit_ser(
+                        app.as_ref(),
+                        "vine-graph-updated",
+                        &serde_json::Value::Null,
+                    );
+                }
+                Some(crate::vine_feed_cache::FollowListOutcome::Rejected(reason)) => {
+                    tracing::debug!(key_expr, reason, "follow-list sample rejected");
+                }
+                _ => {}
+            }
+            return None;
         }
         if key_expr.contains("/reactions/") {
             // ZEB-286: route reaction through the cache. Re-emit to the

@@ -54,6 +54,20 @@ struct VineFeedDiskV1 {
     /// serde_json tolerates unknown fields by default).
     #[serde(default)]
     tombstones: Vec<TombstoneOnDisk>,
+    /// ZEB-671: cached peer follow lists. `#[serde(default)]` — same
+    /// additive-evolution posture as `tombstones`.
+    #[serde(default)]
+    follow_lists: Vec<FollowListOnDisk>,
+}
+
+/// ZEB-671: on-disk follow-list row. Signature/pub are NOT retained —
+/// verification happens once at ingest (same posture as descriptors).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FollowListOnDisk {
+    owner: String,
+    follows: Vec<String>,
+    updated_at: u64,
 }
 
 /// ZEB-670: on-disk applied-tombstone row. Signature/pub are NOT retained —
@@ -141,6 +155,25 @@ struct TombstoneRecord {
     video_cid: String,
     creator_address: String,
     deleted_at: u64,
+}
+
+/// ZEB-671: in-memory verified follow list, keyed by owner address in
+/// `VineFeedCache::follow_lists`. Signature already checked at ingest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowListEntry {
+    pub follows: Vec<String>,
+    pub updated_at: u64,
+}
+
+/// Outcome of `on_follow_list_sample`. The receive path recomputes the
+/// Discover graph only on `Inserted` / `UpdatedNewer` (stale re-arrivals
+/// and rejected records must have zero state effect).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowListOutcome {
+    Inserted,
+    UpdatedNewer,
+    IgnoredOlder,
+    Rejected(String),
 }
 
 /// ZEB-670: `vine-removed` frontend event payload, produced for every
@@ -263,6 +296,10 @@ pub struct VineFeedCache {
     /// AFTER its tombstone — or re-arriving from a still-holding peer
     /// after a restart — cannot resurrect the vine.
     tombstones: HashMap<String, TombstoneRecord>,
+    /// ZEB-671: verified peer follow lists keyed by owner address —
+    /// the raw edges the Discover graph is computed from. LWW by
+    /// `updated_at`; bounded by `MAX_FOLLOW_LISTS`.
+    follow_lists: HashMap<String, FollowListEntry>,
     /// `Some(path_to_vine_feed.json)` when constructed via `load()`;
     /// `None` for `new()`. `save()` checks this and is a no-op when None.
     path: Option<PathBuf>,
@@ -288,6 +325,7 @@ impl VineFeedCache {
             reactions: HashMap::new(),
             viewed: HashSet::new(),
             tombstones: HashMap::new(),
+            follow_lists: HashMap::new(),
             path: Some(path.clone()),
         };
         Self::populate_from_disk(&mut cache, &path);
@@ -413,6 +451,30 @@ impl VineFeedCache {
         // even when the associated descriptor age-prunes — see spec §11
         // out-of-scope on viewed-set GC).
         cache.viewed = file.viewed.into_iter().collect();
+
+        // ZEB-671: follow lists restore verbatim (already verified at
+        // ingest — sigs are never persisted). Defensive bounds mirror
+        // the ingest path in case a future/foreign build wrote more.
+        let mut lists = file.follow_lists;
+        if lists.len() > MAX_FOLLOW_LISTS {
+            // Keep the freshest MAX_FOLLOW_LISTS (ties by owner).
+            lists.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.owner.cmp(&b.owner))
+            });
+            lists.truncate(MAX_FOLLOW_LISTS);
+        }
+        for mut l in lists {
+            l.follows.truncate(MAX_FOLLOWS_PER_LIST);
+            cache.follow_lists.insert(
+                l.owner,
+                FollowListEntry {
+                    follows: l.follows,
+                    updated_at: l.updated_at,
+                },
+            );
+        }
 
         // ZEB-670: tombstones age-prune on the same 90-day window as
         // descriptors (by deleted_at) — past it, the descriptor they
@@ -848,6 +910,90 @@ impl VineFeedCache {
         Some(TombstoneOutcome::Applied { removed, evict_cid })
     }
 
+    /// ZEB-671: admit a follow-list sample from `harmony/vines/*/follows`.
+    /// Verify-first — signature, pubkey→address binding, and exact topic
+    /// shape all precede ANY state effect. LWW by `updated_at` per owner;
+    /// oversized lists are rejected; the map is bounded by
+    /// `MAX_FOLLOW_LISTS` (stalest evicted).
+    pub fn on_follow_list_sample(&mut self, key_expr: &str, payload: &[u8]) -> FollowListOutcome {
+        let list: crate::VineFollowListPayload = match serde_json::from_slice(payload) {
+            Ok(l) => l,
+            Err(e) => return FollowListOutcome::Rejected(format!("follow list parse failed: {e}")),
+        };
+
+        if let Err(e) = crate::vine_signing::verify_follow_list(&list) {
+            return FollowListOutcome::Rejected(e);
+        }
+
+        // Exact topic shape: harmony/vines/{owner}/follows — the owner
+        // segment must equal the (verified) payload owner, and no extra
+        // segments are tolerated (same posture as reactions, ZEB-673).
+        let mut segments = key_expr
+            .strip_prefix("harmony/vines/")
+            .unwrap_or_default()
+            .split('/');
+        let topic_owner = segments.next().unwrap_or_default();
+        let follows_seg = segments.next().unwrap_or_default();
+        if topic_owner != list.owner_address
+            || follows_seg != "follows"
+            || segments.next().is_some()
+        {
+            return FollowListOutcome::Rejected(format!(
+                "follow-list topic '{key_expr}' does not match payload owner '{}'",
+                list.owner_address
+            ));
+        }
+
+        if list.follows.len() > MAX_FOLLOWS_PER_LIST {
+            return FollowListOutcome::Rejected(format!(
+                "follow list exceeds cap: {} > {MAX_FOLLOWS_PER_LIST}",
+                list.follows.len()
+            ));
+        }
+
+        let outcome = match self.follow_lists.get(&list.owner_address) {
+            // `>=`: an equal-timestamp re-arrival is a no-op, so replayed
+            // records can never churn state or trigger a save.
+            Some(existing) if existing.updated_at >= list.updated_at => {
+                return FollowListOutcome::IgnoredOlder;
+            }
+            Some(_) => FollowListOutcome::UpdatedNewer,
+            None => FollowListOutcome::Inserted,
+        };
+
+        self.follow_lists.insert(
+            list.owner_address,
+            FollowListEntry {
+                follows: list.follows,
+                updated_at: list.updated_at,
+            },
+        );
+
+        // Cap enforcement — stalest updated_at evicted first (ties by
+        // owner for determinism), mirroring the tombstone cap.
+        while self.follow_lists.len() > MAX_FOLLOW_LISTS {
+            let Some(stalest) = self
+                .follow_lists
+                .iter()
+                .map(|(owner, e)| (e.updated_at, owner.clone()))
+                .min()
+                .map(|(_, owner)| owner)
+            else {
+                break;
+            };
+            self.follow_lists.remove(&stalest);
+        }
+
+        self.save();
+        outcome
+    }
+
+    /// ZEB-671: verified follow lists keyed by owner — the edge source
+    /// for the Discover graph computation.
+    pub fn follow_lists(&self) -> &HashMap<String, FollowListEntry> {
+        &self.follow_lists
+    }
+
     /// ZEB-670: true when descriptor `d` is a reshare whose original was
     /// tombstoned by its creator. Two matches:
     ///   1. direct — `reshare_of` names a tombstoned vine id;
@@ -994,6 +1140,15 @@ impl VineFeedCache {
                     video_cid: t.video_cid.clone(),
                     creator_address: t.creator_address.clone(),
                     deleted_at: t.deleted_at,
+                })
+                .collect(),
+            follow_lists: self
+                .follow_lists
+                .iter()
+                .map(|(owner, e)| FollowListOnDisk {
+                    owner: owner.clone(),
+                    follows: e.follows.clone(),
+                    updated_at: e.updated_at,
                 })
                 .collect(),
         };
@@ -3162,5 +3317,217 @@ mod tests {
 
         let cache = VineFeedCache::load(dir.path());
         assert!(cache.is_viewed("vine-x"), "legacy file must load unchanged");
+    }
+
+    // ── ZEB-671: follow-list ingest ────────────────────────────────────
+
+    /// Follow-list topic for a named test signer.
+    fn follows_topic(owner: &str) -> String {
+        format!("harmony/vines/{}/follows", addr(owner))
+    }
+
+    /// Signed follow-list JSON for a named owner; `follows` are signer
+    /// NAMES translated to derived addresses (mirroring production).
+    fn follow_list_bytes(owner: &str, follows: &[&str], updated_at: u64) -> Vec<u8> {
+        let mut payload = crate::VineFollowListPayload {
+            owner_address: addr(owner),
+            follows: follows.iter().map(|n| addr(n)).collect(),
+            updated_at,
+            identity_pub: None,
+            sig: None,
+        };
+        crate::vine_signing::sign_follow_list(&signer_for(owner), &mut payload);
+        serde_json::to_vec(&payload).unwrap()
+    }
+
+    #[test]
+    fn signed_follow_list_inserts() {
+        let mut cache = VineFeedCache::new();
+        let outcome = cache.on_follow_list_sample(
+            &follows_topic("fl-alice"),
+            &follow_list_bytes("fl-alice", &["fl-bob", "fl-carol"], 100),
+        );
+        assert_eq!(outcome, FollowListOutcome::Inserted);
+        let entry = cache.follow_lists().get(&addr("fl-alice")).expect("stored");
+        assert_eq!(entry.follows, vec![addr("fl-bob"), addr("fl-carol")]);
+        assert_eq!(entry.updated_at, 100);
+    }
+
+    #[test]
+    fn unsigned_follow_list_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let bare = serde_json::json!({
+            "ownerAddress": addr("fl-alice"),
+            "follows": [addr("fl-bob")],
+            "updatedAt": 100u64
+        });
+        let outcome = cache.on_follow_list_sample(
+            &follows_topic("fl-alice"),
+            &serde_json::to_vec(&bare).unwrap(),
+        );
+        assert!(
+            matches!(outcome, FollowListOutcome::Rejected(ref r) if r.contains("unsigned")),
+            "got {outcome:?}"
+        );
+        assert!(cache.follow_lists().is_empty(), "no state effect");
+    }
+
+    #[test]
+    fn tampered_follow_list_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let mut payload: crate::VineFollowListPayload =
+            serde_json::from_slice(&follow_list_bytes("fl-alice", &["fl-bob"], 100)).unwrap();
+        payload.follows.push(addr("fl-mallory"));
+        let outcome = cache.on_follow_list_sample(
+            &follows_topic("fl-alice"),
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        assert!(
+            matches!(outcome, FollowListOutcome::Rejected(ref r) if r.contains("signature invalid")),
+            "got {outcome:?}"
+        );
+        assert!(cache.follow_lists().is_empty(), "no state effect");
+    }
+
+    #[test]
+    fn follow_list_replayed_on_foreign_or_deeper_topic_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let bytes = follow_list_bytes("fl-alice", &["fl-bob"], 100);
+
+        // Foreign owner topic.
+        let outcome = cache.on_follow_list_sample(&follows_topic("fl-eve"), &bytes);
+        assert!(
+            matches!(outcome, FollowListOutcome::Rejected(ref r) if r.contains("does not match payload owner")),
+            "got {outcome:?}"
+        );
+
+        // Deeper key below the canonical shape.
+        let deeper = format!("harmony/vines/{}/extra/follows", addr("fl-alice"));
+        let outcome = cache.on_follow_list_sample(&deeper, &bytes);
+        assert!(
+            matches!(outcome, FollowListOutcome::Rejected(_)),
+            "got {outcome:?}"
+        );
+
+        assert!(cache.follow_lists().is_empty(), "no state effect");
+    }
+
+    #[test]
+    fn follow_list_lww_keeps_newest() {
+        let mut cache = VineFeedCache::new();
+        cache.on_follow_list_sample(
+            &follows_topic("fl-alice"),
+            &follow_list_bytes("fl-alice", &["fl-bob"], 100),
+        );
+
+        // Older ignored.
+        let outcome = cache.on_follow_list_sample(
+            &follows_topic("fl-alice"),
+            &follow_list_bytes("fl-alice", &["fl-eve"], 50),
+        );
+        assert_eq!(outcome, FollowListOutcome::IgnoredOlder);
+
+        // Equal timestamp ignored (replay is a no-op).
+        let outcome = cache.on_follow_list_sample(
+            &follows_topic("fl-alice"),
+            &follow_list_bytes("fl-alice", &["fl-eve"], 100),
+        );
+        assert_eq!(outcome, FollowListOutcome::IgnoredOlder);
+
+        // Newer replaces — including the empty-list retraction.
+        let outcome = cache.on_follow_list_sample(
+            &follows_topic("fl-alice"),
+            &follow_list_bytes("fl-alice", &[], 200),
+        );
+        assert_eq!(outcome, FollowListOutcome::UpdatedNewer);
+        let entry = cache.follow_lists().get(&addr("fl-alice")).unwrap();
+        assert!(entry.follows.is_empty(), "retraction clears the edges");
+        assert_eq!(entry.updated_at, 200);
+    }
+
+    #[test]
+    fn oversized_follow_list_is_rejected() {
+        let mut cache = VineFeedCache::new();
+        let owner = signer_for("fl-alice");
+        let mut payload = crate::VineFollowListPayload {
+            owner_address: addr("fl-alice"),
+            follows: (0..=MAX_FOLLOWS_PER_LIST)
+                .map(|i| format!("{i:064x}"))
+                .collect(),
+            updated_at: 100,
+            identity_pub: None,
+            sig: None,
+        };
+        crate::vine_signing::sign_follow_list(&owner, &mut payload);
+        let outcome = cache.on_follow_list_sample(
+            &follows_topic("fl-alice"),
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        assert!(
+            matches!(outcome, FollowListOutcome::Rejected(ref r) if r.contains("exceeds cap")),
+            "got {outcome:?}"
+        );
+        assert!(cache.follow_lists().is_empty(), "no state effect");
+    }
+
+    #[test]
+    fn follow_lists_survive_disk_reload() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let outcome = cache.on_follow_list_sample(
+                &follows_topic("fl-alice"),
+                &follow_list_bytes("fl-alice", &["fl-bob"], 100),
+            );
+            assert_eq!(outcome, FollowListOutcome::Inserted);
+        }
+        let reloaded = VineFeedCache::load(dir.path());
+        let entry = reloaded
+            .follow_lists()
+            .get(&addr("fl-alice"))
+            .expect("follow list must survive reload");
+        assert_eq!(entry.follows, vec![addr("fl-bob")]);
+        assert_eq!(entry.updated_at, 100);
+
+        // Disk shape pin: sigs are NOT retained (verify-once-at-ingest).
+        let raw = std::fs::read_to_string(dir.path().join("vine_feed.json")).unwrap();
+        assert!(
+            raw.contains("follow_lists"),
+            "envelope key is snake_case like its siblings"
+        );
+        assert!(!raw.contains("identityPub"), "sigs never persist");
+    }
+
+    #[test]
+    fn follow_list_cap_evicts_stalest() {
+        let mut cache = VineFeedCache::new();
+        // Fill to cap + 1 with direct (non-registry) identities — the
+        // registry would otherwise balloon for every later test.
+        for i in 0..=MAX_FOLLOW_LISTS {
+            let private = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let owner_addr = hex::encode(private.public_identity().address_hash);
+            let mut payload = crate::VineFollowListPayload {
+                owner_address: owner_addr.clone(),
+                follows: vec![],
+                updated_at: i as u64, // strictly increasing — entry 0 is stalest
+                identity_pub: None,
+                sig: None,
+            };
+            crate::vine_signing::sign_follow_list(&private, &mut payload);
+            let outcome = cache.on_follow_list_sample(
+                &format!("harmony/vines/{owner_addr}/follows"),
+                &serde_json::to_vec(&payload).unwrap(),
+            );
+            assert_eq!(outcome, FollowListOutcome::Inserted, "insert #{i}");
+        }
+        assert_eq!(
+            cache.follow_lists().len(),
+            MAX_FOLLOW_LISTS,
+            "cap holds after overflow"
+        );
+        assert!(
+            !cache.follow_lists().values().any(|e| e.updated_at == 0),
+            "stalest entry evicted"
+        );
     }
 }
