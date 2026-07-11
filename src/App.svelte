@@ -75,6 +75,8 @@
   import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
+  import { StorageBuddyService } from './lib/storage-buddy-service';
+  import type { ContributionSummaryDto, StorageBuddyDto } from './lib/storage-buddy-service';
   import { MessageService } from './lib/message-service';
   import { NotesService } from './lib/notes-service';
   import { migrateLocalNotes } from './lib/notes-migrate';
@@ -1766,6 +1768,29 @@
   const trustService = new TrustService();
   const fileManagerService = new FileManagerService();
   $effect(() => () => fileManagerService.destroy());
+  // ZEB-669 S3: storage-buddy pacts + contribution meter state. Summary and
+  // buddy rows stay null/empty until their IPCs succeed (honesty gate).
+  const storageBuddyService = new StorageBuddyService();
+  $effect(() => () => storageBuddyService.destroy());
+  let contributionSummary = $state<ContributionSummaryDto | null>(null);
+  let storageBuddies = $state<StorageBuddyDto[]>([]);
+  let manageBuddiesOpen = $state(false);
+  async function refreshContributionSummary(): Promise<void> {
+    try {
+      contributionSummary = await storageBuddyService.getContributionSummary();
+    } catch (e) {
+      // Meter renders nothing on failure — log once at warn, don't fabricate.
+      console.warn('[storage-buddy] contribution summary fetch failed:', e);
+      contributionSummary = null;
+    }
+  }
+  async function refreshStorageBuddies(): Promise<void> {
+    try {
+      storageBuddies = await storageBuddyService.listBuddies();
+    } catch (e) {
+      console.warn('[storage-buddy] buddy list fetch failed:', e);
+    }
+  }
   // Declare fileManagerVersion before wiring onChange — same pattern as allMessages.
   let fileManagerVersion = $state(0);
   fileManagerService.onChange = () => { fileManagerVersion++; };
@@ -2171,6 +2196,15 @@
       // (vine.hydrate moved below fetchOwnAddress — ZEB-672: own persisted
       // reaction rows must resolve likedByMe, which needs ownAddress.)
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
+      // ZEB-669 S3: storage-buddy meter + manage sheet. The summary stays
+      // null on failure (meter renders nothing — never fabricated), and
+      // both backend events re-fetch it.
+      await tryConnect('storageBuddy', storageBuddyService.connectAdapter(adapter));
+      void refreshContributionSummary();
+      storageBuddyService.onChange(() => {
+        void refreshContributionSummary();
+        if (manageBuddiesOpen) void refreshStorageBuddies();
+      });
       await tryConnect('community', communityService.connectAdapter(adapter));
       // ZEB-663: base channel-config handler — keep the nav tree's channel
       // children fresh on create/rename/delete. CommunityView (when mounted)
@@ -3518,6 +3552,11 @@
         onModeChange={switchMode}
         {appMode}
         contentItems={allFileContents}
+        {contributionSummary}
+        onManageBuddies={() => {
+          manageBuddiesOpen = true;
+          void refreshStorageBuddies();
+        }}
         {fileSection}
         {currentFolderCid}
         onFolderSelect={handleNavigateFolder}
