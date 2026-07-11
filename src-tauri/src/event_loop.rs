@@ -366,8 +366,20 @@ pub enum ContentVerbRequest {
 
 /// A follow/unfollow request sent from the Tauri command thread into the event loop.
 pub enum FollowRequest {
-    Follow { address: String },
-    Unfollow { address: String },
+    Follow {
+        address: String,
+    },
+    Unfollow {
+        address: String,
+    },
+    /// ZEB-671: publish the owner's freshly signed follow list on
+    /// `harmony/vines/{owner}/follows`. Built + signed on the command
+    /// side (which owns `FollowManager` + the owner identity); the
+    /// event loop only performs the Zenoh put and logs failures.
+    PublishFollowList {
+        owner: String,
+        payload: Vec<u8>,
+    },
 }
 
 /// Sub-D Phase 4 (ZEB-281): control messages for the profile-broadcast
@@ -4332,7 +4344,18 @@ pub async fn run(
             // subscriptions are added (once the publish path includes
             // /announce/), the follow_rx channel will drive Subscribe/
             // Unsubscribe actions here.
-            Some(_req) = follow_rx.recv() => {}
+            Some(req) = follow_rx.recv() => {
+                match req {
+                    FollowRequest::Follow { .. } | FollowRequest::Unfollow { .. } => {}
+                    // ZEB-671: wire publication of the signed follow list.
+                    FollowRequest::PublishFollowList { owner, payload } => {
+                        let key = format!("harmony/vines/{owner}/follows");
+                        if let Err(e) = session.put(&key, payload).await {
+                            tracing::error!(error = %e, key, "follow-list publish failed");
+                        }
+                    }
+                }
+            }
 
             // ── Voice frame relay (frontend → Zenoh) ────────────────
             // Await directly instead of spawning per-frame tasks — preserves

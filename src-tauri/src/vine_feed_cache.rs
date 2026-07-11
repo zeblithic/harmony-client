@@ -25,6 +25,14 @@ pub const MAX_DESCRIPTORS: usize = 5000;
 /// along with their reactions. Runtime mutations do not re-age-prune.
 pub const MAX_AGE_SECS: u64 = 90 * 86_400;
 
+/// ZEB-671: max addresses in one follow list — enforced on BOTH sides:
+/// publish truncates, ingest rejects larger lists outright.
+pub const MAX_FOLLOWS_PER_LIST: usize = 1000;
+
+/// ZEB-671: max cached follow lists (one per owner). On overflow the
+/// stalest list (lowest `updated_at`) is evicted.
+pub const MAX_FOLLOW_LISTS: usize = 5000;
+
 /// On-disk filename for the cached Vine feed. Lives under `app_data_dir`.
 const VINE_FEED_FILE: &str = "vine_feed.json";
 
