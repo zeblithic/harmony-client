@@ -370,6 +370,14 @@ struct SetButlerPinArgs {
     device_id: Option<String>,
 }
 
+/// ZEB-668 S2: device revocation. `reason` ∈ decommissioned|lost|compromised.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevokeDeviceArgs {
+    device_vk_hex: String,
+    reason: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -937,6 +945,16 @@ pub fn build_registry() -> RpcRegistry {
         |state, _sink, _a| async move { crate::get_butler_held_impl(state).await }
     );
 
+    // Device management (ZEB-668 S2).
+    rpc!(
+        m,
+        "revoke_device",
+        RevokeDeviceArgs,
+        |state, sink, a| async move {
+            crate::owner_commands::revoke_device_impl(state, sink, a.device_vk_hex, a.reason).await
+        }
+    );
+
     // Connectivity.
     rpc!(
         m,
@@ -1252,6 +1270,41 @@ mod tests {
                 }
                 Ok(_) | Err(RpcError::Command(_)) => {}
             }
+        }
+    }
+
+    /// ZEB-668 S2 (PR #452 review): same proof shape as the storage-buddy
+    /// parity test — camelCase args must parse and reach the `_impl` seam.
+    /// `identity_dir` pins to an empty tempdir so the seam deterministically
+    /// answers `noOwner:` without ever touching the developer's real
+    /// identity directory.
+    #[tokio::test]
+    async fn revoke_device_rpc_is_registered_and_wired() {
+        let reg = build_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            ..NodeState::default()
+        }));
+        let args = serde_json::json!({
+            "deviceVkHex": "ab".repeat(32),
+            "reason": "decommissioned",
+        });
+        match reg
+            .dispatch("revoke_device", state, test_sink(), args)
+            .await
+        {
+            Err(RpcError::UnknownCommand) => panic!("revoke_device must be registered"),
+            Err(RpcError::BadArgs(msg)) => {
+                panic!("revoke_device: arg struct rejected the wrapper shape: {msg}")
+            }
+            Err(RpcError::Command(msg)) => {
+                assert!(
+                    msg.starts_with("noOwner:"),
+                    "expected the no-identity seam error, got: {msg}"
+                );
+            }
+            Ok(v) => panic!("expected noOwner error on an empty identity dir, got {v:?}"),
         }
     }
 
@@ -1769,6 +1822,8 @@ mod tests {
             "set_butler_pin",
             "get_butler_pin",
             "get_butler_held",
+            // device management (ZEB-668 S2)
+            "revoke_device",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",

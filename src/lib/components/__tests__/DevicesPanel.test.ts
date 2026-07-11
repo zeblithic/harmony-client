@@ -129,10 +129,10 @@ describe('DevicesPanel — populated state', () => {
     expect(screen.getByText(/back up owner identity/i)).toBeInTheDocument();
   });
 
-  it('shows a self-sovereign badge but no rotation/revoke/danger chrome', async () => {
-    // Honesty ledger §0.5: the self-sovereign badge is honest (always true for
-    // the owner viewing this panel). Rotation / revoke / danger-zone chrome
-    // must NOT be invented — there is no backing IPC for any of them.
+  it('shows a self-sovereign badge but no rotation/danger chrome beyond Remove', async () => {
+    // Honesty ledger §0.5, amended by ZEB-668 S2: `revoke_device` now exists,
+    // so Remove affordances render (gated tests below). Rotation and
+    // delete-identity still have no backing IPC and must NOT be invented.
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1c8239b7dd809abcdef0123456789',
       ownerDisplayName: 'zeblith',
@@ -150,7 +150,6 @@ describe('DevicesPanel — populated state', () => {
     await screen.findByText('zeblith');
     expect(screen.getByText(/self-sovereign/i)).toBeTruthy();
     expect(screen.queryByText(/rotate keys/i)).toBeNull();
-    expect(screen.queryByText(/^revoke$/i)).toBeNull();
     expect(screen.queryByText(/delete this identity/i)).toBeNull();
   });
 
@@ -170,7 +169,9 @@ describe('DevicesPanel — populated state', () => {
     });
     render(DevicesPanel);
     await screen.findByText('KRILE');
-    expect(screen.getByText(/this device/i)).toBeInTheDocument();
+    // Exact match: the ZEB-668 "Remove this device" button also contains the
+    // phrase, so the marker is asserted by its full normalized text.
+    expect(screen.getByText('this device')).toBeInTheDocument();
     expect(screen.getByText(/trusted/i)).toBeInTheDocument();
     expect(screen.getByText(/aa11·bb22/i)).toBeInTheDocument();
   });
@@ -1274,5 +1275,117 @@ describe('DevicesPanel owner phrase reveal (ZEB-650 slice 2)', () => {
     // markRecoveryBackedUp dispatched the flags-changed event → the panel's
     // listener refreshed lastBackedUpMs without a remount.
     expect(await findByTestId('devices-last-backed-up')).toBeTruthy();
+  });
+});
+
+// ── ZEB-668 S2: device revoke UI ─────────────────────────────────────────────
+
+describe('DevicesPanel — device revoke (ZEB-668 S2)', () => {
+  const seedHolderView = (overrides: Record<string, unknown> = {}) => ({
+    ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+    ownerDisplayName: 'zeblith',
+    devices: [
+      {
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'KRILE',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+        butlerPinned: false,
+        deviceVkHex: 'aa'.repeat(32),
+        revoked: false,
+        revokedAt: null,
+        revokedReason: null,
+      },
+      {
+        deviceId: 'bb22cc33dd44ee55ff66778899001122',
+        displayName: 'Device bb22cc33',
+        isThisDevice: false,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_100_000,
+        fingerprint: 'bb22·cc33',
+        butlerPinned: false,
+        deviceVkHex: 'bb'.repeat(32),
+        revoked: false,
+        revokedAt: null,
+        revokedReason: null,
+      },
+    ],
+    canBackUp: true,
+    ...overrides,
+  });
+
+  it('seed-holder sees Remove… on sibling rows and Remove this device on self', async () => {
+    mockedInvoke.mockResolvedValueOnce(seedHolderView());
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.getByRole('button', { name: /remove this device/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^remove…$/i })).toBeInTheDocument();
+  });
+
+  it('non-seed device hides sibling Remove… but keeps self-remove (honesty rule)', async () => {
+    mockedInvoke.mockResolvedValueOnce(seedHolderView({ canBackUp: false }));
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.getByRole('button', { name: /remove this device/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^remove…$/i })).toBeNull();
+  });
+
+  it('sibling remove flow: dialog → type name → confirm → revoke_device + refresh', async () => {
+    mockedInvoke.mockResolvedValueOnce(seedHolderView()); // mount refresh
+    mockedInvoke.mockResolvedValueOnce(undefined); // revoke_device
+    mockedInvoke.mockResolvedValueOnce(seedHolderView()); // post-revoke refresh
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    await fireEvent.click(screen.getByRole('button', { name: /^remove…$/i }));
+    // Dialog opens with the typed-confirm input.
+    const input = await screen.findByRole('textbox', { name: /type to confirm/i });
+    await fireEvent.input(input, { target: { value: 'Device bb22cc33' } });
+    await fireEvent.click(screen.getByRole('button', { name: /^remove device$/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('revoke_device', {
+      deviceVkHex: 'bb'.repeat(32),
+      reason: 'decommissioned',
+    });
+    // Post-success refresh re-fetched the roster.
+    const calls = mockedInvoke.mock.calls.map((c: unknown[]) => c[0]);
+    expect(calls.filter((n: unknown) => n === 'get_owner_state').length).toBe(2);
+  });
+
+  it('backend prefix errors surface as friendly copy in the dialog', async () => {
+    mockedInvoke.mockResolvedValueOnce(seedHolderView());
+    mockedInvoke.mockRejectedValueOnce(new Error('lastDevice: refusing'));
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    await fireEvent.click(screen.getByRole('button', { name: /remove this device/i }));
+    const input = await screen.findByRole('textbox', { name: /type to confirm/i });
+    await fireEvent.input(input, { target: { value: 'KRILE' } });
+    await fireEvent.click(screen.getByRole('button', { name: /^remove device$/i }));
+    expect(await screen.findByText(/only active device/i)).toBeInTheDocument();
+  });
+
+  it('revoked devices leave the active list and render in the collapsed Removed section', async () => {
+    const view = seedHolderView();
+    (view.devices as Record<string, unknown>[])[1] = {
+      ...(view.devices as Record<string, unknown>[])[1],
+      revoked: true,
+      revokedAt: 1_700_200_000,
+      revokedReason: 'lost',
+    };
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    // Active count excludes the revoked device.
+    expect(screen.getByText(/my devices \(1\)/i)).toBeInTheDocument();
+    // Collapsed by default: the row is not visible until expanded.
+    expect(screen.queryByText(/^lost$/i)).toBeNull();
+    const toggle = screen.getByRole('button', { name: /removed devices \(1\)/i });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await fireEvent.click(toggle);
+    expect(screen.getByText('Device bb22cc33')).toBeInTheDocument();
+    expect(screen.getByText(/^lost$/i)).toBeInTheDocument();
+    // No butler checkbox on removed rows (only the active row's remains).
+    expect(screen.getAllByRole('checkbox').length).toBe(1);
   });
 });

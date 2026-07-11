@@ -107,3 +107,23 @@ describe('extractError', () => {
     expect(extractError('just a string')).toBe('just a string');
   });
 });
+
+describe('OwnerService.revoke (ZEB-668 S2)', () => {
+  it('revoke passes camelCase args verbatim', async () => {
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined);
+    const svc = new OwnerService();
+    await svc.revoke('ab'.repeat(32), 'lost');
+    expect(invoke).toHaveBeenCalledWith('revoke_device', {
+      deviceVkHex: 'ab'.repeat(32),
+      reason: 'lost',
+    });
+  });
+
+  it('revoke surfaces backend prefix errors unchanged', async () => {
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('notMaster: this device does not hold the master key'),
+    );
+    const svc = new OwnerService();
+    await expect(svc.revoke('cd'.repeat(32), 'compromised')).rejects.toThrow(/notMaster:/);
+  });
+});

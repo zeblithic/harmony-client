@@ -21,7 +21,19 @@ export interface DeviceView {
    * expects. `deviceId` (identity-hash form) is NOT accepted there.
    */
   deviceVkHex: string;
+  /**
+   * ZEB-668 S2: revocation surface. A revoked device keeps its enrollment
+   * row; the panel splits active vs the Removed-devices section on this.
+   */
+  revoked: boolean;
+  /** Unix seconds the revocation was issued; null when not revoked. */
+  revokedAt: number | null;
+  /** "decommissioned" | "lost" | "compromised" (free text for legacy). */
+  revokedReason: string | null;
 }
+
+/** ZEB-668 S2: the three UI-selectable revocation reasons (spec §3). */
+export type RevokeReason = 'decommissioned' | 'lost' | 'compromised';
 
 export interface TrustDecisionView {
   kind: 'full' | 'provisional' | 'refused';
@@ -61,6 +73,15 @@ export class OwnerService {
     const view = await invoke<OwnerStateView | null>('get_owner_state');
     this.state = view;
     this.onChange?.();
+  }
+
+  /**
+   * ZEB-668 S2: revoke a device (self or, from the seed-holder, a sibling).
+   * Rejections surface backend prefixes (`notMaster:`, `lastDevice:`) —
+   * callers map them to friendly copy. Callers refresh() on success.
+   */
+  async revoke(deviceVkHex: string, reason: RevokeReason): Promise<void> {
+    await invoke('revoke_device', { deviceVkHex, reason });
   }
 
   async mint(): Promise<MintIpcResult> {

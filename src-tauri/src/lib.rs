@@ -1925,6 +1925,13 @@ pub struct StartNodeResponse {
     /// `showWelcomeModal = !hasOwnerIdentity`. Forward-compat: frontend
     /// treats a missing field as `false` (older backend → show onboarding).
     pub has_owner_identity: bool,
+    /// ZEB-668 S2: true when this device's own enrollment is revoked in the
+    /// trust state. In that case `has_owner_identity` is false (the boot
+    /// refuses to wire fleet engines), which WITHOUT this flag would
+    /// misclassify as first-run `missing` and trap the user in the mint
+    /// gate (mint refuses while owner_state.cbor exists). The frontend
+    /// checks this FIRST and renders the terminal "removed" screen.
+    pub self_revoked: bool,
 }
 
 /// Profile published to/received from the network.
@@ -10519,6 +10526,7 @@ pub async fn start_node_inner(
             node_addr_for_response,
             freshly_created,
             has_owner_identity,
+            self_revoked_at_boot,
         )
     };
     let (
@@ -10547,6 +10555,7 @@ pub async fn start_node_inner(
         node_addr_for_response,
         freshly_created,
         has_owner_identity,
+        self_revoked_at_boot,
     ) = our_gen;
 
     // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
@@ -11153,6 +11162,7 @@ pub async fn start_node_inner(
                 node_addr: node_addr_for_response,
                 freshly_created,
                 has_owner_identity,
+                self_revoked: self_revoked_at_boot,
             })
         }
         Ok(Err(e)) => Err(e),
@@ -56102,6 +56112,7 @@ pub fn run() {
             owner_commands::export_owner_mnemonic_words,
             owner_commands::preview_owner_mnemonic_identity,
             owner_commands::restore_owner_mnemonic_from_words,
+            owner_commands::revoke_device,
             get_backup_staleness,
             save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,
@@ -63843,6 +63854,7 @@ mod start_node_response_tests {
             node_addr: "iroh:abc123".to_string(),
             freshly_created: true,
             has_owner_identity: false,
+            self_revoked: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -63863,6 +63875,7 @@ mod start_node_response_tests {
             node_addr: "iroh:xyz".to_string(),
             freshly_created: false,
             has_owner_identity: false,
+            self_revoked: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"freshlyCreated\":false"));
@@ -63879,13 +63892,15 @@ mod start_node_response_wire_tests {
             node_addr: "iroh:abc".to_string(),
             freshly_created: true,
             has_owner_identity: false,
+            self_revoked: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["nodeAddr"], "iroh:abc");
         assert_eq!(json["freshlyCreated"], true);
         assert_eq!(json["hasOwnerIdentity"], false);
-        // Exactly three keys — no snake_case leakage, no extra fields.
-        assert_eq!(json.as_object().unwrap().len(), 3);
+        assert_eq!(json["selfRevoked"], false);
+        // Exactly four keys — no snake_case leakage, no extra fields.
+        assert_eq!(json.as_object().unwrap().len(), 4);
     }
 
     #[test]
@@ -63894,9 +63909,27 @@ mod start_node_response_wire_tests {
             node_addr: "iroh:xyz".to_string(),
             freshly_created: false,
             has_owner_identity: true,
+            self_revoked: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["hasOwnerIdentity"], true);
+    }
+
+    /// ZEB-668 S2: the revoked-at-boot shape — has_owner_identity false but
+    /// selfRevoked true; the frontend must classify this as 'revoked', never
+    /// as first-run 'missing' (which would trap the user in the mint gate,
+    /// since mint refuses while owner_state.cbor exists).
+    #[test]
+    fn start_node_response_self_revoked_shape() {
+        let r = StartNodeResponse {
+            node_addr: "iroh:xyz".to_string(),
+            freshly_created: false,
+            has_owner_identity: false,
+            self_revoked: true,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["selfRevoked"], true);
+        assert_eq!(json["hasOwnerIdentity"], false);
     }
 }
 
