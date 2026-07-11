@@ -15218,6 +15218,7 @@ mod storage_buddy_ipc_tests {
             archived: false,
             pinned: false,
             backup: false,
+            origin: None,
             kind: content_index::ContentKind::Leaf,
         };
         let sid = entry.sidecar_id.to_string();
@@ -15370,6 +15371,7 @@ mod storage_publish_tests {
                 pinned: false,
                 backup,
                 kind: content_index::ContentKind::Leaf,
+                origin: None,
             }
         };
         {
@@ -15428,6 +15430,7 @@ mod storage_publish_tests {
                     archived: false,
                     pinned: false,
                     backup: true,
+                    origin: None,
                     kind: content_index::ContentKind::Leaf,
                 });
             }
@@ -15838,6 +15841,12 @@ pub struct ContentItemWire {
     /// sessions seen announcing this CID since boot (staleness-pruned).
     /// A LOWER BOUND, not global truth: UI copy must say "copies seen".
     pub replica_count: u32,
+    /// ZEB-669 S3: "back up with buddies" flag. Root sidecar entries only —
+    /// always false for manifest-derived rows (no sidecar to flag).
+    pub backup: bool,
+    /// ZEB-669 S4: provenance recorded at entry creation; `None` for legacy
+    /// and manifest-derived rows (the UI renders no "From" row).
+    pub origin: Option<content_index::OriginInfo>,
 }
 
 /// ZEB-612 S3: overwrite `replica_count` with 1 (self) + observed peers.
@@ -16010,6 +16019,8 @@ pub(crate) fn list_root(
                 archived: e.archived,
                 kind: kind_wire(e.kind).to_string(),
                 replica_count: 1,
+                backup: e.backup,
+                origin: e.origin.clone(),
             })
             .collect()
     };
@@ -16097,6 +16108,8 @@ pub async fn list_folder(
             // Self-held baseline; list_content joins observed peers on top
             // (direct list_folder callers — integration tests — see 1).
             replica_count: 1,
+            backup: false,
+            origin: None,
         })
         .collect())
 }
@@ -17025,6 +17038,10 @@ pub(crate) async fn send_ingest_with_name(
             archived: false,
             pinned: false,
             backup: false,
+            origin: Some(content_index::OriginInfo {
+                kind: content_index::OriginKind::SelfIngest,
+                introducer: None,
+            }),
             kind: content_index::ContentKind::Leaf,
         });
         if !inserted {
@@ -17118,6 +17135,38 @@ mod path_ingest_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, content_index::ContentKind::Leaf);
         assert_eq!(rows[0].file_name, "hello.txt");
+        // ZEB-669 S4: self-ingest records provenance at creation.
+        assert_eq!(
+            rows[0].origin,
+            Some(content_index::OriginInfo {
+                kind: content_index::OriginKind::SelfIngest,
+                introducer: None,
+            })
+        );
+    }
+
+    /// ZEB-669 S4: the folder-create seam records SelfIngest provenance,
+    /// mirroring the file-ingest seam above.
+    #[tokio::test]
+    async fn create_folder_at_root_records_self_ingest_origin() {
+        let (tx, _log) = spawn_recording_ingest_handler();
+        let index = fresh_content_index();
+
+        create_folder_at_root_with_children("Photos".into(), Vec::new(), &tx, &index)
+            .await
+            .expect("create folder");
+
+        let idx = index.lock().unwrap();
+        let rows: Vec<_> = idx.entries().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, content_index::ContentKind::Folder);
+        assert_eq!(
+            rows[0].origin,
+            Some(content_index::OriginInfo {
+                kind: content_index::OriginKind::SelfIngest,
+                introducer: None,
+            })
+        );
     }
 
     #[tokio::test]
@@ -17801,6 +17850,10 @@ pub(crate) async fn create_folder_at_root_with_children(
             archived: false,
             pinned: false,
             backup: false,
+            origin: Some(content_index::OriginInfo {
+                kind: content_index::OriginKind::SelfIngest,
+                introducer: None,
+            }),
             kind: content_index::ContentKind::Folder,
         });
         if !inserted {
@@ -19286,6 +19339,11 @@ async fn move_case_d(
             archived: false,
             pinned: false,
             backup: false,
+            // Provenance can't be reconstructed here: `moved_entry` is a
+            // folders::ManifestEntry, and manifests carry no origin — it is
+            // lost when a file enters a folder. `None` (renders nothing)
+            // beats inferring SelfIngest (ZEB-610 §0 honesty rule).
+            origin: None,
             kind: moved_entry.kind,
         })
     };
@@ -56720,6 +56778,7 @@ mod tests {
             archived,
             pinned: false,
             backup: false,
+            origin: None,
             kind: content_index::ContentKind::Leaf,
         }
     }
@@ -57440,6 +57499,11 @@ mod pin_persistence_tests {
             archived: false,
             kind: "folder".into(),
             replica_count: 3,
+            backup: true,
+            origin: Some(content_index::OriginInfo {
+                kind: content_index::OriginKind::SelfIngest,
+                introducer: None,
+            }),
         };
         let json = serde_json::to_string(&wire).expect("serialize");
         assert!(
@@ -57449,6 +57513,13 @@ mod pin_persistence_tests {
         assert!(json.contains("\"kind\":\"folder\""), "got: {json}");
         // ZEB-612 S3: camelCase pin for the observed replica count.
         assert!(json.contains("\"replicaCount\":3"), "got: {json}");
+        // ZEB-669 S3/S4: camelCase pins for the buddy-backup flag and the
+        // provenance object the detail panel consumes verbatim.
+        assert!(json.contains("\"backup\":true"), "got: {json}");
+        assert!(
+            json.contains("\"origin\":{\"kind\":\"selfIngest\",\"introducer\":null}"),
+            "got: {json}"
+        );
     }
 
     fn replica_test_item(cid_hex: &str) -> ContentItemWire {
@@ -57465,6 +57536,8 @@ mod pin_persistence_tests {
             archived: false,
             kind: "leaf".into(),
             replica_count: 1,
+            backup: false,
+            origin: None,
         }
     }
 

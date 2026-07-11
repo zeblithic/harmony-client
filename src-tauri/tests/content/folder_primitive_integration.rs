@@ -33,6 +33,7 @@ fn create_folder_at_root_then_list_shows_it() {
         archived: false,
         pinned: false,
         backup: false,
+        origin: None,
         kind: ContentKind::Folder,
     });
     assert!(inserted, "new entry inserted");
@@ -71,6 +72,7 @@ fn create_nested_folder_updates_top_level_root_cid() {
         archived: false,
         pinned: true, // must survive rekey
         backup: false,
+        origin: None,
         kind: ContentKind::Folder,
     });
 
@@ -467,6 +469,7 @@ fn pin_intent_survives_restart_for_folder() {
             archived: false,
             pinned: true,
             backup: false,
+            origin: None,
             kind: ContentKind::Folder,
         });
     }

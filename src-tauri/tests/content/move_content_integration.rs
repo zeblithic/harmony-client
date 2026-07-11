@@ -295,6 +295,7 @@ fn insert_top_level(
         archived: false,
         pinned,
         backup: false,
+        origin: None,
         kind,
     });
     assert!(inserted, "fresh SidecarId must insert cleanly");
@@ -637,6 +638,11 @@ async fn move_d_nested_to_root() {
     assert_eq!(new_top.kind, ContentKind::Leaf);
     assert_eq!(new_top.file_name, "L");
     assert!(!new_top.pinned, "Case D defaults to unpinned");
+    assert!(
+        new_top.origin.is_none(),
+        "Case D mints without provenance — manifests carry no origin, \
+         and inferring SelfIngest would violate the honesty rule (ZEB-669 S4)"
+    );
 }
 
 // ── Test 10: move_b_dst_rekey_conflict_compensating_undo_reverts ──────────

@@ -90,8 +90,8 @@ pub enum OriginKind {
 
 - [ ] `send_ingest_with_name` literal (`lib.rs:17016`): `origin: Some(content_index::OriginInfo { kind: content_index::OriginKind::SelfIngest, introducer: None }),`
 - [ ] `create_folder_at_root_with_children` literal (`lib.rs:17792`): same value.
-- [ ] `move_case_d` literal (`lib.rs:19277`): `origin: moved_entry.origin.clone(),` with a one-line comment: provenance travels with content; intent flags (pinned/backup) deliberately reset (#449 review rationale).
-- [ ] Tests: ingest path asserts the new entry's `origin == Some(SelfIngest, introducer: None)` (extend the nearest existing ingest test); Case-D move preserves a pre-set origin (extend the existing case-D integration test in `move_content_integration.rs`).
+- [ ] `move_case_d` literal (`lib.rs:19277`): stays `origin: None` with a comment. **Implementation-time correction:** `moved_entry` is a `folders::ManifestEntry` — manifests carry no provenance (it is lost when a file enters a folder), so there is nothing to copy forward; inferring `SelfIngest` would violate the honesty rule. The plan's original `moved_entry.origin.clone()` assumed an index-entry source and was wrong.
+- [ ] Tests: ingest path asserts the new entry's `origin == Some(SelfIngest, introducer: None)` (extend the nearest existing ingest test); the Case-D integration test asserts the re-minted entry's `origin.is_none()`.
 - [ ] Gate: `scripts/test-select --context task`; commit.
 
 ### Task 3: Rust — expose `backup` + `origin` on `ContentItemWire`
