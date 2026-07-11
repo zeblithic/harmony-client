@@ -10,6 +10,7 @@
   } from '../owner-service';
   import { loadProfile } from '../profile-service';
   import { loadDeviceLabel, saveDeviceLabel, resolveDefaultDeviceLabel } from '../device-label-service';
+  import { setDevicePetname, MAX_DEVICE_PETNAME_CHARS } from '../device-petname-service';
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
   import { fetchCommunitiesCount } from '../owner-meta';
   import {
@@ -110,9 +111,14 @@
     return {
       ...view,
       ...(ownerName ? { ownerDisplayName: ownerName } : {}),
-      devices: view.devices.map((d) =>
-        d.isThisDevice && deviceLabel ? { ...d, displayName: deviceLabel } : d,
-      ),
+      devices: view.devices.map((d) => {
+        // ZEB-668 S4 ladder: petName ?? local label (self only, pre-S4
+        // fallback) ?? backend displayName ("Device xxxxxxxx").
+        const pet = d.petName?.trim();
+        if (pet) return { ...d, displayName: pet };
+        if (d.isThisDevice && deviceLabel) return { ...d, displayName: deviceLabel };
+        return d;
+      }),
     };
   }
 
@@ -125,6 +131,24 @@
       loadError = extractError(e);
     } finally {
       loading = false;
+    }
+    // ZEB-668 S4: one-shot migration — a user-set pre-S4 local label seeds
+    // the fleet petname map so siblings stop showing "Device xxxxxxxx".
+    // MUST run before the hostname-default block below: at this point
+    // `deviceLabel` is still loadDeviceLabel()'s value, i.e. user-set only
+    // (hostname defaults are never persisted and must never migrate).
+    // Best-effort (node may be down); idempotent (guard is false once set).
+    // `=== null` (not falsy): migrate only when the backend AFFIRMS the
+    // device has no petname. An absent field (undefined) means a pre-S4
+    // view shape — never a migration trigger.
+    const selfDev = svc.state?.devices.find((d) => d.isThisDevice);
+    if (selfDev && selfDev.petName === null && deviceLabel) {
+      try {
+        await setDevicePetname(selfDev.deviceVkHex, deviceLabel);
+        await svc.refresh();
+      } catch {
+        // Non-fatal: retried on next panel open.
+      }
     }
     // ZEB-336: when this device has no user-set label, default the DISPLAY to
     // the OS hostname, resolved FRESH each launch. NOT persisted — only a user
@@ -172,22 +196,34 @@
     renameDraft = device.displayName;
   }
 
-  function saveRename(deviceId: string) {
+  let renameError = $state<string | null>(null);
+  let renameInFlight = $state(false);
+
+  // ZEB-668 S4: rename any row via the fleet-synced petname IPC. The self
+  // row ALSO keeps the ZEB-336 localStorage label in step — it remains the
+  // offline/pre-S4 read-only fallback in the label ladder. (Pre-S4 this only
+  // wrote localStorage, so siblings never saw the name.)
+  async function saveRename(device: DeviceView) {
     const trimmed = renameDraft.trim();
-    if (trimmed.length === 0) return;
-    // ZEB-336: a device rename writes the per-device LABEL, never the owner
-    // profile. (Pre-split this wrote profile.displayName, renaming the owner.)
-    saveDeviceLabel(trimmed);
-    deviceLabel = trimmed;
-    if (state) {
-      state = {
-        ...state,
-        devices: state.devices.map((d) =>
-          d.deviceId === deviceId ? { ...d, displayName: trimmed } : d,
-        ),
-      };
+    if (trimmed.length === 0 || trimmed.length > MAX_DEVICE_PETNAME_CHARS || renameInFlight) {
+      return;
     }
-    renamingDeviceId = null;
+    renameError = null;
+    renameInFlight = true;
+    try {
+      await setDevicePetname(device.deviceVkHex, trimmed);
+      if (device.isThisDevice) {
+        // ZEB-336: never the owner profile — only the per-device label.
+        saveDeviceLabel(trimmed);
+        deviceLabel = trimmed;
+      }
+      renamingDeviceId = null;
+      await svc.refresh();
+    } catch (e) {
+      renameError = extractError(e);
+    } finally {
+      renameInFlight = false;
+    }
   }
 
   function cancelRename() {
@@ -458,6 +494,21 @@
     return new Date(ms).toLocaleDateString();
   }
 
+  // ZEB-668 S4: heartbeat-tolerant relative time. The stamp cadence is
+  // ~7.5 min (fleet-net re-stamp tick) — hence "just now" out to 10 min and
+  // the "~" prefix on minute/hour buckets (honesty ledger: last seen = last
+  // fleet heartbeat, not live presence).
+  function formatLastSeen(ms: number): string {
+    const min = Math.floor((Date.now() - ms) / 60000);
+    if (min < 10) return 'just now';
+    if (min < 60) return `~${min}m ago`;
+    const h = Math.floor(min / 60);
+    if (h < 24) return `~${h}h ago`;
+    const d = Math.floor(h / 24);
+    if (d < 30) return `${d}d ago`;
+    return new Date(ms).toLocaleDateString();
+  }
+
   async function handleConfirmMint() {
     mintInFlight = true;
     mintError = null;
@@ -573,11 +624,11 @@
                     bind:value={renameDraft}
                     aria-label="Device name"
                     onkeydown={(e) => {
-                      if (e.key === 'Enter') saveRename(device.deviceId);
+                      if (e.key === 'Enter') saveRename(device);
                       if (e.key === 'Escape') cancelRename();
                     }}
                   />
-                  <button class="secondary" onclick={() => saveRename(device.deviceId)}>Save</button>
+                  <button class="secondary" disabled={renameInFlight} onclick={() => saveRename(device)}>Save</button>
                   <button class="secondary" onclick={cancelRename}>Cancel</button>
                 {:else}
                   <span class="device-name">{device.displayName}</span>
@@ -593,18 +644,23 @@
                     >
                       Remove this device
                     </button>
-                  {:else if state.canBackUp}
-                    <!-- Honesty rule: the sibling affordance renders only
-                         where the IPC can succeed (master seed present). -->
-                    <button
-                      class="remove-btn"
-                      onclick={() => {
-                        removeError = null;
-                        removeTarget = device;
-                      }}
-                    >
-                      Remove…
-                    </button>
+                  {:else}
+                    <!-- ZEB-668 S4: petnames are fleet-synced, so siblings
+                         are renamable from any device. -->
+                    <button class="rename-btn" onclick={() => startRename(device)}>Rename</button>
+                    {#if state.canBackUp}
+                      <!-- Honesty rule: the sibling affordance renders only
+                           where the IPC can succeed (master seed present). -->
+                      <button
+                        class="remove-btn"
+                        onclick={() => {
+                          removeError = null;
+                          removeTarget = device;
+                        }}
+                      >
+                        Remove…
+                      </button>
+                    {/if}
                   {/if}
                 {/if}
               </div>
@@ -620,6 +676,18 @@
                 <span>added {formatEnrolledAt(device.enrolledAt)}</span>
                 <span class="separator">·</span>
                 <span class="fingerprint">{device.fingerprint}</span>
+                <!-- ZEB-668 S4: presence line, non-self rows only (self is
+                     trivially present; peer liveness doesn't track self).
+                     lastSeenMs null → render nothing (honesty rule). -->
+                {#if !device.isThisDevice}
+                  {#if device.connectedNow}
+                    <span class="separator">·</span>
+                    <span class="online-badge">● online</span>
+                  {:else if device.lastSeenMs !== null}
+                    <span class="separator">·</span>
+                    <span>last seen {formatLastSeen(device.lastSeenMs)}</span>
+                  {/if}
+                {/if}
               </div>
               <!-- ZEB-418 P2 D17: always-on butler toggle -->
               <div class="butler-row">
@@ -642,6 +710,9 @@
         {/each}
         {#if butlerPinError}
           <p class="error" role="alert">{butlerPinError}</p>
+        {/if}
+        {#if renameError}
+          <p class="error" role="alert">{renameError}</p>
         {/if}
       </div>
 
@@ -1060,6 +1131,8 @@
   .trust-badge.full { color: var(--success); }
   .trust-badge.provisional { color: var(--warning-bright); }
   .trust-badge.refused { color: var(--danger); }
+  /* ZEB-668 S4: live-connection chip on sibling rows. */
+  .online-badge { color: var(--success); }
   .separator { margin: 0 6px; color: var(--text-muted); }
   .fingerprint { font-family: var(--font-mono); }
   .add-another-footer .explainer {
