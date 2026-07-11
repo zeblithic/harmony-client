@@ -798,6 +798,34 @@ Test list:
 - [ ] **Step 2: Amend this plan** with any execution deltas (Execution amendments section).
 - [ ] **Step 3: PR.** Push branch; open PR titled `ZEB-668 S3: community retire-announce — DeviceRetire event, remove-wins tombstones, fleet deposit+relay`; body: why (revoked device accepted forever — spec §4), what (three layers), design notes (§Design decisions 1-7 condensed), gates. Fire `@coderabbitai review` ONCE at open. Converge per standing loop.
 
+## Execution amendments
+
+1. **`enrollment: Box<EnrollmentCert>`** in the variant (clippy
+   `large_enum_variant` — the cert embeds two PubKeyBundles). Serde-transparent;
+   wire encoding unchanged.
+2. **Tombstone guard shape per arm:** `insert_enrolled_key_unless_retired`
+   (takes `&mut MemberState`) fits only the `get_mut` arm (DeviceAnnounce).
+   The literal-rebuilding arms — Join and both PendingJoin variants — do the
+   identical `revoked.contains(&key)` check inline and carry
+   `revoked_device_keys` forward into the rebuilt literal.
+3. **Invite-refresh arm also preserves tombstones** (not in the plan): the
+   re-invite-a-Left-member path replaces `MemberState` wholesale and would
+   have wiped tombstones — the resurrection hole via re-invite → rejoin →
+   re-announce. Now carries `revoked_device_keys` forward.
+4. **56 `MemberState` literal fixes** (52 lib/unit + 4 integration-test)
+   scripted per compiler E0063 output.
+5. **Ingest kind gate extracted** into `decode_lifecycle_event` so it is
+   unit-testable (it lives in the prod ctx behind a live registry, so the
+   planned ProbeCtx tests couldn't reach it). Three direct decode-gate tests
+   replace the planned relay-shaped ones; `retire_deposit_nudge` got its own
+   helper rather than borrowing `relay_nudge_on_applied` cross-module.
+6. **Non-member verify test** accepts `SignerNotEnrolledForActor` OR
+   `DeviceRetireForNonMember` (signer resolution fires first on an empty
+   prior; both are correct rejections — pinned so reordering is a choice).
+7. **`community_ids()` has no dedicated registry test** (plan allowed folding
+   it away if the engine-spawn harness was heavy): it is a one-line keys()
+   clone, exercised by the prod ctx path.
+
 ## Self-review notes
 
 - Spec §4 coverage: entry kind (as key-suffixed reuse — documented deviation), surviving-device relay (deposit sweeper + existing relay), receiver verify + `enrolled_device_keys` removal (T1), rejected-as-unknown (free via `SignerNotEnrolledForActor`, pinned by test 10). ✓
