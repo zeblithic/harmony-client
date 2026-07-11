@@ -2,7 +2,7 @@
 
 Status: draft for Jake's review. The four scope forks were settled interactively
 (2026-07-11): rotation = composed revoke + re-pair; revoke power = master + self;
-#3-signature gap = documented with follow-ups; extras = KeyTree epoch bump AND
+`#3`-signature gap = documented with follow-ups; extras = KeyTree epoch bump AND
 synced petnames both in scope.
 
 **Two items pending Jake's explicit confirmation (flagged, not assumed):**
@@ -77,7 +77,8 @@ pairing ceremony.
 
 ## §2 S1 — Trust-state replication (foundation)
 
-A third `FleetSyncEngine` instance — the same donor pattern `fleet_net` used —
+The next `FleetSyncEngine` dataset (the eighth engine instance overall —
+same donor pattern `fleet_net` used) —
 carrying the trust CRDT between the owner's devices:
 
 * Transport via the established dataset pattern (plan-time amendment —
@@ -92,11 +93,13 @@ carrying the trust CRDT between the owner's devices:
   so merge order cannot resurrect a device. Records that fail crate
   validation are dropped with a warn log (never trust-degrading).
 * Persistence through the existing `owner_state.cbor` save path
-  (`save_owner_state_atomic` — keychain writes stay behind the `*_inner`
+  (`save_owner_state_cbor_only` — disk-only, no keychain; keychain writes
+  elsewhere stay behind the `*_inner`
   seams per ZEB-428).
 * Publish triggers: any local trust mutation (revoke, liveness refresh,
   enrollment completion) → `notify_dirty`.
-* **Wipe-on-receipt hook:** the merge callback checks `is_revoked(self)`;
+* **Revoked-self halt hook** (no data is wiped — §1 non-goal): the merge
+  callback checks `is_revoked(self)`;
   if newly true → emit `device-revoked-self`, stop fleet publishes
   (owner-state, fleet-net, trust) and butler participation, and the UI shows
   a terminal "This device was removed from your account" state. Local user

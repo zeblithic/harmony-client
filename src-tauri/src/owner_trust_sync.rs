@@ -53,6 +53,11 @@ impl CanonicalPayload for OwnerState {}
 /// enrollment to exist; remove-wins revocations must land before
 /// vouching/liveness so a revoked signer's records are rejected).
 ///
+/// Records the local doc already knows are pre-filtered (skipped silently)
+/// so that a `add_*` rejection genuinely means an invalid/suspect record —
+/// those are dropped with a **warn** log (trust-boundary signal, per spec
+/// §2), without the benign-duplicate spam a bare re-merge would produce.
+///
 /// Changed-detection is canonical-encode compare — trust docs are tiny, and
 /// this stays correct regardless of which individual `add_*` calls were
 /// idempotent no-ops vs. real inserts.
@@ -69,24 +74,47 @@ pub fn merge_trust_remote_into_local(local: &mut OwnerState, remote: OwnerState)
         revocations,
         liveness,
     } = remote;
-    for (_id, cert) in enrollments {
+    for (id, cert) in enrollments {
+        // Enrollment certs are immutable per device in v1 — a known id is a
+        // benign re-send, not a candidate update.
+        if local.enrollments.contains_key(&id) {
+            continue;
+        }
         if let Err(e) = local.add_enrollment(cert, now, DEFAULT_ACTIVE_WINDOW_SECS) {
-            tracing::debug!(error = %e, "trust merge: enrollment dropped");
+            tracing::warn!(error = %e, "trust merge: enrollment dropped");
         }
     }
     for cert in revocations.iter() {
+        if local.is_revoked(cert.target) {
+            continue;
+        }
         if let Err(e) = local.add_revocation(cert.clone()) {
-            tracing::debug!(error = %e, "trust merge: revocation dropped");
+            tracing::warn!(error = %e, "trust merge: revocation dropped");
         }
     }
     for cert in vouching.iter() {
+        // LWW per (signer, target): skip anything not strictly newer than
+        // what we already hold from that signer about that target.
+        let known_newer = local.vouching.iter().any(|v| {
+            v.signer == cert.signer && v.target == cert.target && v.issued_at >= cert.issued_at
+        });
+        if known_newer {
+            continue;
+        }
         if let Err(e) = local.add_vouching(cert.clone()) {
-            tracing::debug!(error = %e, "trust merge: vouching dropped");
+            tracing::warn!(error = %e, "trust merge: vouching dropped");
         }
     }
-    for (_id, cert) in liveness {
+    for (id, cert) in liveness {
+        let known_newer = local
+            .liveness
+            .get(&id)
+            .is_some_and(|l| l.timestamp >= cert.timestamp);
+        if known_newer {
+            continue;
+        }
         if let Err(e) = local.add_liveness(cert) {
-            tracing::debug!(error = %e, "trust merge: liveness dropped");
+            tracing::warn!(error = %e, "trust merge: liveness dropped");
         }
     }
     let after = harmony_owner::cbor::to_canonical(&*local).ok();
@@ -177,6 +205,14 @@ impl FleetPersist<OwnerState> for TrustPersist {
         state: &OwnerState,
         tracker: &BTreeMap<String, Hlc>,
     ) -> Result<(), SyncError> {
+        // `save_owner_state_cbor_only` requires OWNER_STATE_WRITE_LOCK —
+        // the engine persists from spawn_blocking, so an unlocked write
+        // here could race pairing/mint writers and clobber a newer
+        // enrollment (Qodo PR #451). Sync lock in a sync context; held
+        // across both file writes so doc + replay stay a consistent pair.
+        let _guard = crate::owner_commands::OWNER_STATE_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         save_owner_state_cbor_only(&self.identity_dir, state).map_err(SyncError::Persist)?;
         save_trust_replay(&self.replay_path, tracker).map_err(SyncError::Persist)?;
         Ok(())
@@ -211,6 +247,13 @@ pub async fn mutate_trust_state<R>(
             Ok(r)
         }
         TrustStateAccess::FileOnly { identity_dir } => {
+            // Serialize the load-mutate-save against every other
+            // owner_state.cbor writer (mint / pairing / get_owner_state) —
+            // same lock they hold. No `.await` occurs inside the guard
+            // scope, so holding a std guard here is safe in async context.
+            let _guard = crate::owner_commands::OWNER_STATE_WRITE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut state = load_owner_state_cbor(&identity_dir)?;
             let r = f(&mut state);
             save_owner_state_cbor_only(&identity_dir, &state)?;
@@ -247,13 +290,36 @@ pub async fn resync_trust_from_disk(
 pub type HaltFn =
     Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
+/// The device-set fingerprint gating `owner-devices-updated`: enrolled ids
+/// + revoked ids. Liveness/vouching-only merges leave it unchanged, so the
+/// event fires only when the panel's device rows actually change (spec §2
+/// event contract; CodeRabbit PR #451).
+fn device_set_fingerprint(
+    doc: &OwnerState,
+) -> (
+    std::collections::BTreeSet<[u8; 16]>,
+    std::collections::BTreeSet<[u8; 16]>,
+) {
+    (
+        doc.enrollments.keys().copied().collect(),
+        doc.revocations.iter().map(|c| c.target).collect(),
+    )
+}
+
 /// The trust engine's `on_applied` consumer. Each nudge (an inbound merge
-/// that changed local state) emits `owner-devices-updated`; if the merge
-/// revealed THIS device revoked, latch the flag, emit
-/// `device-revoked-self` (exactly once), and run the halt closure.
-/// Halting from here is safe: `on_applied` only try_sends the nudge and
-/// returns, so the engine task is free to process its own shutdown
-/// message while we await it.
+/// that changed local state) emits `owner-devices-updated` when the device
+/// set (enrollments/revocations) changed; if the merge revealed THIS
+/// device revoked, latch the flag, emit `device-revoked-self` (exactly
+/// once), and run the halt closure. Halting from here is safe: `on_applied`
+/// only try_sends the nudge and returns, so the engine task is free to
+/// process its own shutdown message while we await it.
+///
+/// The halt is HYGIENE, not the security boundary: a queued publish may
+/// still slip out between the merge that delivered the revocation and this
+/// task running. That is acceptable — enforcement is receiver-side (every
+/// sibling/community that has merged the revocation rejects the key), and
+/// S2's revoke IPC orders sign → flush → halt deterministically for the
+/// self-revoke path.
 pub fn spawn_trust_applied_task(
     mut nudge_rx: tokio::sync::mpsc::Receiver<()>,
     doc: Arc<tokio::sync::Mutex<OwnerState>>,
@@ -264,9 +330,16 @@ pub fn spawn_trust_applied_task(
 ) -> tokio::task::JoinHandle<()> {
     let mut halt = Some(halt);
     tokio::spawn(async move {
+        let mut last_fp = device_set_fingerprint(&*doc.lock().await);
         while nudge_rx.recv().await.is_some() {
-            emit("owner-devices-updated");
-            let revoked = doc.lock().await.is_revoked(self_device_id);
+            let (fp, revoked) = {
+                let g = doc.lock().await;
+                (device_set_fingerprint(&g), g.is_revoked(self_device_id))
+            };
+            if fp != last_fp {
+                emit("owner-devices-updated");
+                last_fp = fp;
+            }
             if revoked && !revoked_flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 tracing::warn!(
                     "trust merge revealed this device revoked — halting fleet participation"
@@ -565,25 +638,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applied_task_emits_devices_updated_on_nudge() {
+    async fn applied_task_gates_devices_updated_on_device_set_change() {
         let now = 1_700_000_000u64;
-        let (state, _a, _s) = test_mint(now);
+        let (state, artifact, sk1) = test_mint(now);
         let self_id = *state.enrollments.keys().next().unwrap();
+        let owner_id = state.owner_id;
         let doc = Arc::new(tokio::sync::Mutex::new(state));
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
         let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _h = spawn_trust_applied_task(
             rx,
-            doc,
+            Arc::clone(&doc),
             self_id,
             Arc::clone(&flag),
             collecting_emit(Arc::clone(&events)),
             test_halt(Arc::clone(&halted)),
         );
+        // Give the task a beat to record its baseline fingerprint before
+        // the doc mutates.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Nudge with NO device-set change → no event.
         tx.send(()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(events.lock().unwrap().is_empty());
+
+        // Enrollment added → nudge → exactly one owner-devices-updated.
+        let (_sk2, cert2) = {
+            let g = doc.lock().await;
+            test_enroll_second_device(&artifact, &g, now + 10)
+        };
+        doc.lock()
+            .await
+            .add_enrollment(cert2, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        tx.send(()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(events.lock().unwrap().as_slice(), ["owner-devices-updated"]);
+
+        // Liveness-only refresh → nudge → NO further event (event contract:
+        // fires only when the device set changes).
+        doc.lock()
+            .await
+            .add_liveness(test_liveness(&sk1, owner_id, now + 20))
+            .unwrap();
+        tx.send(()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert_eq!(events.lock().unwrap().as_slice(), ["owner-devices-updated"]);
         assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
         assert!(!halted.load(std::sync::atomic::Ordering::Acquire));
@@ -599,8 +701,6 @@ mod tests {
         state
             .add_enrollment(cert_b, now + 5, DEFAULT_ACTIVE_WINDOW_SECS)
             .unwrap();
-        let rev = test_master_revocation(&artifact, self_id, now + 10);
-        state.add_revocation(rev).unwrap();
         let doc = Arc::new(tokio::sync::Mutex::new(state));
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -608,12 +708,17 @@ mod tests {
         let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _h = spawn_trust_applied_task(
             rx,
-            doc,
+            Arc::clone(&doc),
             self_id,
             Arc::clone(&flag),
             collecting_emit(Arc::clone(&events)),
             test_halt(Arc::clone(&halted)),
         );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The revocation arrives AFTER the baseline (as a real merge would).
+        let rev = test_master_revocation(&artifact, self_id, now + 10);
+        doc.lock().await.add_revocation(rev).unwrap();
         // Two nudges: the second must NOT re-fire device-revoked-self.
         tx.send(()).await.unwrap();
         tx.send(()).await.unwrap();
@@ -628,7 +733,8 @@ mod tests {
         );
         assert_eq!(
             evs.iter().filter(|e| *e == "owner-devices-updated").count(),
-            2
+            1,
+            "revocation changes the device set exactly once, got {evs:?}"
         );
     }
 
