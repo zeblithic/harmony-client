@@ -12885,6 +12885,16 @@ pub(crate) async fn publish_vine_descriptor(
         )
     };
 
+    // The identity is the signing authority: a descriptor claiming an
+    // address the key doesn't derive would "publish" successfully here
+    // while every receiver rejects the signature (Greptile PR #446).
+    let signer_addr = vine_signing::signer_address(&identity);
+    if descriptor.creator_address != signer_addr {
+        return Err(format!(
+            "refusing to sign: descriptor creator '{}' does not match signer identity '{signer_addr}'",
+            descriptor.creator_address
+        ));
+    }
     vine_signing::sign_descriptor(&identity, &mut descriptor);
 
     let key_expr = format!("harmony/vines/{}", descriptor.creator_address);
@@ -13176,6 +13186,16 @@ pub(crate) async fn publish_vine_reaction_impl(
         .unwrap_or_default()
         .as_secs();
 
+    // Same signer-authority guard as publish_vine_descriptor (Greptile
+    // PR #446): the reactor address we embed must be the one the signing
+    // key derives, or receivers reject the record after a local "ok".
+    let signer_addr = vine_signing::signer_address(&identity);
+    if node_addr != signer_addr {
+        return Err(format!(
+            "refusing to sign: node address '{node_addr}' does not match signer identity '{signer_addr}'"
+        ));
+    }
+
     let mut wire = VineReactionPayload {
         vine_id: reaction.vine_id.clone(),
         reactor_address: node_addr.clone(),
@@ -13273,6 +13293,17 @@ pub(crate) async fn delete_vine_impl(
         }
         row.video_cid
     };
+
+    // Signer-authority guard (Greptile PR #446, same class as the
+    // publish paths): the tombstone claims node_addr as creator — if the
+    // signing key derives a different address, receivers reject it after
+    // a local "published: true".
+    let signer_addr = vine_signing::signer_address(&identity);
+    if node_addr != signer_addr {
+        return Err(format!(
+            "refusing to sign: node address '{node_addr}' does not match signer identity '{signer_addr}'"
+        ));
+    }
 
     let deleted_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -13382,6 +13413,48 @@ mod delete_vine_tests {
         let (state, _rx, _addr) = fixture();
         let err = delete_vine_impl(&state, "vine-1".into()).await.unwrap_err();
         assert!(err.contains("not your vine"), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_vine_refuses_diverged_signer() {
+        // Greptile PR #446: node_addr matches the vine's creator (so the
+        // ownership check passes) but the OWNER IDENTITY derives a
+        // different address — the tombstone must be refused locally, not
+        // signed into a record every receiver rejects.
+        let signer = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let creator_identity = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let creator = hex::encode(creator_identity.public_identity().address_hash);
+        let mut cache = vine_feed_cache::VineFeedCache::new();
+        let mut descriptor = VineDescriptorPayload {
+            id: "vine-1".into(),
+            creator_address: creator.clone(),
+            creator_name: "Creator".into(),
+            created_at: 1_700_000_000,
+            video_cid: "aa".repeat(32),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+            identity_pub: None,
+            sig: None,
+        };
+        vine_signing::sign_descriptor(&creator_identity, &mut descriptor);
+        cache.on_descriptor_sample(
+            &format!("harmony/vines/{creator}"),
+            &serde_json::to_vec(&descriptor).unwrap(),
+            &std::collections::HashSet::new(),
+            1_000,
+        );
+        let (publish_tx, _rx) = tokio::sync::mpsc::channel(4);
+        let state = Mutex::new(NodeState {
+            publish_tx: Some(publish_tx),
+            node_addr: creator,
+            owner_private_identity: Some(std::sync::Arc::new(signer)),
+            vine_feed_cache: Some(std::sync::Arc::new(std::sync::Mutex::new(cache))),
+            ..NodeState::default()
+        });
+        let err = delete_vine_impl(&state, "vine-1".into()).await.unwrap_err();
+        assert!(err.contains("does not match signer"), "got {err:?}");
     }
 
     #[tokio::test]
@@ -13543,6 +13616,43 @@ mod vine_publish_signing_tests {
         let r: VineReactionPayload = serde_json::from_slice(&payload).unwrap();
         assert_eq!(r.reactor_address, node_addr, "signer is the REACTOR");
         vine_signing::verify_reaction(&r).expect("published reaction must verify");
+    }
+
+    #[tokio::test]
+    async fn publish_descriptor_refuses_diverged_signer() {
+        // Greptile PR #446: creator_address the key doesn't derive must
+        // be refused locally, not signed into a record every receiver
+        // rejects.
+        let (state, _rx, _node_addr) = fixture(true);
+        let err = publish_vine_descriptor(&state, descriptor_owned_by(&"cc".repeat(16)))
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not match signer"), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn publish_reaction_refuses_diverged_signer() {
+        // node_addr diverged from the owner identity's derived address.
+        let private = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let (publish_tx, _publish_rx) = tokio::sync::mpsc::channel(4);
+        let state = Mutex::new(NodeState {
+            publish_tx: Some(publish_tx),
+            node_addr: "cc".repeat(16),
+            owner_private_identity: Some(std::sync::Arc::new(private)),
+            ..NodeState::default()
+        });
+        let err = publish_vine_reaction_impl(
+            &state,
+            PublishReactionPayload {
+                vine_id: "vine-other-1".into(),
+                vine_creator_address: "bb".repeat(16),
+                liked: true,
+                reactor_name: "Me".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("does not match signer"), "got {err:?}");
     }
 
     #[tokio::test]

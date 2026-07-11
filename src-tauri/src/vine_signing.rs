@@ -19,11 +19,14 @@
 //! documented contract requires all field names of a struct to share one
 //! encoded length — these payloads violate it wholesale.
 //!
-//! Migration posture (see ZEB-673 design comment): the signature fields
-//! on both payloads are `Option` so pre-ZEB-673 DISK records still
-//! deserialize (tolerant on disk; they age out via the existing 90-day /
-//! 5000-descriptor bounds). WIRE arrivals without a valid signature are
-//! rejected at cache admission (strict on wire).
+//! Migration posture (see ZEB-673 design comment): signatures exist
+//! only on the wire. Disk rows (`DescriptorOnDisk`/`ReactionOnDisk`)
+//! never retain them — verification happens once at ingest, the same
+//! posture as `TombstoneOnDisk` — so records rebuilt from disk (and
+//! pre-ZEB-673 wire records) carry `None` in the `Option` signature
+//! fields. WIRE arrivals without a valid signature are rejected at
+//! cache admission (strict on wire); legacy cached rows age out via the
+//! existing 90-day / 5000-descriptor bounds.
 
 use crate::{VineDescriptorPayload, VineReactionPayload};
 
@@ -86,10 +89,19 @@ pub fn reaction_canonical_bytes(r: &VineReactionPayload) -> Vec<u8> {
     out
 }
 
+/// The address a signing identity derives — the value receivers bind
+/// signatures against. Publish paths compare this to the address they
+/// are about to embed and refuse to sign on divergence (Greptile PR
+/// #446: a mismatch would "succeed" locally while every receiver
+/// rejects the record).
+pub fn signer_address(private: &harmony_identity::PrivateIdentity) -> String {
+    hex::encode(private.public_identity().address_hash)
+}
+
 /// Sign a descriptor in place with the local owner identity, setting
 /// `identity_pub` + `sig`. The caller must have set `creator_address`
-/// to `hex(private.public_identity().address_hash)` — receivers reject
-/// mismatches in `verify_descriptor`.
+/// to `signer_address(private)` — receivers reject mismatches in
+/// `verify_descriptor`.
 pub fn sign_descriptor(private: &harmony_identity::PrivateIdentity, d: &mut VineDescriptorPayload) {
     let bytes = descriptor_canonical_bytes(d);
     d.sig = Some(hex::encode(private.sign(&bytes)));

@@ -94,6 +94,11 @@ Shipped code is authoritative; deltas from the plan text above:
 2. **Field-comment correction** (Qodo, Maintainability): the `identity_pub` doc comments no longer claim `VineFeedDiskV1` persists the wire structs verbatim; disk rows are `DescriptorOnDisk`/`ReactionOnDisk` and never retain signatures (verify-once-at-ingest, `TombstoneOnDisk` posture).
 3. **Tamper-test wording** (CodeRabbit): Step 2's original "tamper each semantic field → signature invalid" overgeneralized — address-field tampering fails the earlier binding gate ("does not match"); the shipped tests split the two, and the step text above now says so.
 
+## Post-review amendments (PR #446 round 2 — Greptile manual run)
+
+4. **Signer-authority guard** (Greptile P2): `publish_vine_descriptor`, `publish_vine_reaction_impl`, and `delete_vine_impl` now compare the address they are about to embed against `vine_signing::signer_address(&identity)` and refuse to sign on divergence — previously a `node_addr`/`owner_private_identity` mismatch would report local success while every receiver rejected the signature. New helper `vine_signing::signer_address`; one refusal test per path.
+5. **Module-doc migration wording** (Qodo follow-up, same class as amendment 2): `vine_signing.rs`'s module doc no longer says "pre-ZEB-673 DISK records still deserialize" — disk rows are separate structs that never carry signatures; the `Option` fields exist because records rebuilt from disk (and legacy wire records) have no signature to carry.
+
 ## Non-goals / notes
 
 - No frontend changes: `vine-reaction-received` re-emits the raw wire payload, so signed records carry two extra JSON fields — TS interfaces ignore unknown fields.
