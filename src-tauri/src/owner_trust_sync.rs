@@ -213,7 +213,27 @@ impl FleetPersist<OwnerState> for TrustPersist {
         let _guard = crate::owner_commands::OWNER_STATE_WRITE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        save_owner_state_cbor_only(&self.identity_dir, state).map_err(SyncError::Persist)?;
+        // Load-merge-save: the engine snapshot can be STALER than disk —
+        // pairing writes a fresh enrollment straight to owner_state.cbor,
+        // and the resident doc only learns it at the get_pairing_state
+        // resync. Saving the raw snapshot here would clobber that
+        // enrollment before the resync ever reads it (Greptile PR #451
+        // P1). Folding disk into the snapshot first makes the write
+        // monotonic: nothing either side knows is ever lost.
+        let merged = match load_owner_state_cbor(&self.identity_dir) {
+            Ok(mut disk) => {
+                let _ = merge_trust_remote_into_local(&mut disk, state.clone());
+                disk
+            }
+            Err(e) => {
+                // Missing/corrupt disk state: the snapshot is the best
+                // truth we have; save it rather than failing the persist.
+                tracing::warn!(error = %e,
+                    "trust persist: could not load disk state before save; using engine snapshot");
+                state.clone()
+            }
+        };
+        save_owner_state_cbor_only(&self.identity_dir, &merged).map_err(SyncError::Persist)?;
         save_trust_replay(&self.replay_path, tracker).map_err(SyncError::Persist)?;
         Ok(())
     }
@@ -290,10 +310,10 @@ pub async fn resync_trust_from_disk(
 pub type HaltFn =
     Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
-/// The device-set fingerprint gating `owner-devices-updated`: enrolled ids
-/// + revoked ids. Liveness/vouching-only merges leave it unchanged, so the
-/// event fires only when the panel's device rows actually change (spec §2
-/// event contract; CodeRabbit PR #451).
+/// The device-set fingerprint gating `owner-devices-updated`: the pair of
+/// enrolled ids and revoked ids. Liveness/vouching-only merges leave it
+/// unchanged, so the event fires only when the panel's device rows
+/// actually change (spec §2 event contract; CodeRabbit PR #451).
 fn device_set_fingerprint(
     doc: &OwnerState,
 ) -> (
@@ -492,6 +512,37 @@ mod tests {
         assert_eq!(reloaded.owner_id, state.owner_id);
         let replay = load_trust_replay_or_recover(&replay_path);
         assert_eq!(replay.get("device-a"), tracker.get("device-a"));
+    }
+
+    #[test]
+    fn trust_persist_preserves_newer_disk_enrollment() {
+        // Greptile PR #451 P1: pairing writes a fresh enrollment straight
+        // to disk; a pending engine persist carrying an OLDER snapshot
+        // must not clobber it. The persist load-merge-saves, so the disk
+        // file ends up as the union.
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_700_000_000u64;
+        let (old_snapshot, artifact, _sk) = test_mint(now);
+        // Disk gains a second enrollment the snapshot doesn't know.
+        let (_sk2, cert2) = test_enroll_second_device(&artifact, &old_snapshot, now + 10);
+        let mut disk_state = old_snapshot.clone();
+        disk_state
+            .add_enrollment(cert2, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        save_owner_state_cbor_only(dir.path(), &disk_state).unwrap();
+
+        let persist = TrustPersist {
+            identity_dir: dir.path().to_path_buf(),
+            replay_path: dir.path().join(OWNER_TRUST_REPLAY_FILENAME),
+        };
+        FleetPersist::persist(&persist, &old_snapshot, &BTreeMap::new()).unwrap();
+
+        let reloaded = load_owner_state_cbor(dir.path()).unwrap();
+        assert_eq!(
+            reloaded.enrollments.len(),
+            2,
+            "persist must not lose the disk-fresh enrollment"
+        );
     }
 
     #[test]
