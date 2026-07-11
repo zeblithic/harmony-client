@@ -80,10 +80,12 @@ pairing ceremony.
 A third `FleetSyncEngine` instance — the same donor pattern `fleet_net` used —
 carrying the trust CRDT between the owner's devices:
 
-* Topic `harmony/owner/{addr_hex}/trust-root-v1`; root-blob lookup tag
-  `b"owner-trust-root-blob-v1"`; KeyTree-encrypted with the same
-  `encrypt_root_publish`/`decrypt_root_publish` primitives; debounce
-  `DEFAULT_DEBOUNCE_MS` (250 ms) like its siblings.
+* Transport via the established dataset pattern (plan-time amendment —
+  seven `FleetSyncEngine` datasets already ship through
+  `spawn_dataset_sync_zenoh_adapter`): dataset `owner-trust-v1` on
+  `harmony/owner/{addr_hex}/ds/owner-trust-v1`, lookup tag
+  `b"owner-trust-v1"`; KeyTree-encrypted like every sibling dataset;
+  debounce `DEFAULT_DEBOUNCE_MS` (250 ms).
 * Merge function delegates to the crate's own idempotent mutators
   (`add_enrollment`/`add_vouching`/`add_liveness`/`add_revocation`), folding
   the remote doc's records into the local one. Revocations are remove-wins,
