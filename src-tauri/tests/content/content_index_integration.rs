@@ -196,6 +196,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
                     None, // ZEB-418 P2: p2_sync_handles not exercised in this test
                     None, // ZEB-458 P4 B: relay_sync_handles not exercised in this test
+                    None, // ZEB-668 S1: trust_sync_handles not exercised in this test
                     None, // ZEB-495: community_device_intro_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
@@ -521,6 +522,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
                     None, // ZEB-418 P2: p2_sync_handles not exercised in this test
                     None, // ZEB-458 P4 B: relay_sync_handles not exercised in this test
+                    None, // ZEB-668 S1: trust_sync_handles not exercised in this test
                     None, // ZEB-495: community_device_intro_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
@@ -955,6 +957,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
                     None, // ZEB-418 P2: p2_sync_handles not exercised in this test
                     None, // ZEB-458 P4 B: relay_sync_handles not exercised in this test
+                    None, // ZEB-668 S1: trust_sync_handles not exercised in this test
                     None, // ZEB-495: community_device_intro_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
@@ -1243,6 +1246,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
                     None, // ZEB-418 P2: p2_sync_handles not exercised in this test
                     None, // ZEB-458 P4 B: relay_sync_handles not exercised in this test
+                    None, // ZEB-668 S1: trust_sync_handles not exercised in this test
                     None, // ZEB-495: community_device_intro_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test
@@ -1598,6 +1602,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
                     None, // ZEB-418 P2: p2_sync_handles not exercised in this test
                     None, // ZEB-458 P4 B: relay_sync_handles not exercised in this test
+                    None, // ZEB-668 S1: trust_sync_handles not exercised in this test
                     None, // ZEB-495: community_device_intro_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                     None, // ZEB-373: dial telemetry not exercised in this test

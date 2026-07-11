@@ -3719,6 +3719,16 @@ pub async fn start_node_inner(
         let mut fleet_net_device_id_opt: Option<String> = None;
         let mut fleet_net_enrolled_opt: Option<std::collections::BTreeSet<String>> = None;
         let mut p2_sync_handles_opt: Option<crate::event_loop::P2SyncHandles> = None;
+        // ZEB-668 S1: owner-trust replication engine + handles. Built in the
+        // owner-loaded block (mirrors fleet-net); lifted to outer scope so the
+        // NodeState assignment and the event_loop::run call site reach them.
+        let mut owner_trust_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>,
+        > = None;
+        let mut owner_trust_sync_engine_opt: Option<
+            std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+        > = None;
+        let mut trust_sync_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
         // ZEB-495 (ZEB-340 Part 2): community-device-intro fleet-sync engine +
         // its NodeState/run handles. Built alongside the dm-inbox engine when an
         // owner identity loads; lifted to outer scope so the NodeState
@@ -5329,6 +5339,56 @@ pub async fn start_node_inner(
                             inbound_tx: fleet_net_in_tx,
                         },
                     });
+
+                    // ── ZEB-668 S1: owner-trust replication engine ─────────
+                    // The resident trust doc is seeded from the state loaded
+                    // for this boot (`loaded.state`); disk source of truth
+                    // stays owner_state.cbor, written through TrustPersist on
+                    // every debounced engine pass. Mirrors the fleet-net
+                    // block above.
+                    let trust_replay_path = identity_dir
+                        .join(crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME);
+                    let owner_trust_doc =
+                        std::sync::Arc::new(tokio::sync::Mutex::new(loaded.state.clone()));
+                    let owner_trust_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::owner_trust_sync::load_trust_replay_or_recover(&trust_replay_path),
+                    ));
+                    let (trust_out_tx, trust_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                    let (trust_in_tx, trust_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                    let owner_trust_sync =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                kt: std::sync::Arc::clone(&kt),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&owner_trust_doc),
+                                merger: crate::owner_trust_sync::trust_merger(),
+                                replay_tracker: owner_trust_tracker,
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: trust_out_tx,
+                                subscriber_rx: trust_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::owner_trust_sync::TrustPersist {
+                                        identity_dir: identity_dir.clone(),
+                                        replay_path: trust_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                on_applied: None, // S1 T4 wires the nudge task
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    owner_trust_doc_opt = Some(std::sync::Arc::clone(&owner_trust_doc));
+                    owner_trust_sync_engine_opt = Some(std::sync::Arc::clone(&owner_trust_sync));
+                    trust_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
+                        addr_hex: owner_addr_hex.clone(),
+                        outbound_rx: trust_out_rx,
+                        inbound_tx: trust_in_tx,
+                    });
+                    tracing::info!("BOOT-PROBE 08-trust: owner-trust engine constructed");
 
                     tracing::info!("BOOT-PROBE 08: fleet-net self-row staged (flush deferred), entering per-community CRDT sync");
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
@@ -9547,6 +9607,9 @@ pub async fn start_node_inner(
                 // ZEB-458 P4 Phase B: thread the relay-hold + relay-optin
                 // adapter handle bundle into event_loop::run (mirrors p2).
                 let relay_sync_handles_for_loop = relay_sync_handles_opt;
+                // ZEB-668 S1: thread the owner-trust adapter handles into
+                // event_loop::run (mirrors relay).
+                let trust_sync_handles_for_loop = trust_sync_handles_opt;
                 // ZEB-495 (ZEB-340 Part 2): thread the community-device-intro
                 // adapter handles into event_loop::run (mirrors relay).
                 let community_device_intro_sync_handles_for_loop =
@@ -9660,6 +9723,7 @@ pub async fn start_node_inner(
                                 dm_inbox_sync_handles_for_loop,
                                 p2_sync_handles_for_loop,
                                 relay_sync_handles_for_loop,
+                                trust_sync_handles_for_loop,
                                 community_device_intro_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
@@ -9969,6 +10033,10 @@ pub async fn start_node_inner(
                         guard.fleet_net_snapshot = fleet_net_snapshot_opt.clone();
                         guard.fleet_net_device_id = fleet_net_device_id_opt.clone();
                         guard.fleet_net_enrolled = fleet_net_enrolled_opt.clone();
+                        // ZEB-668 S1: resident trust doc + engine for the
+                        // IPC-side TrustStateAccess::Resident path.
+                        guard.owner_trust_doc = owner_trust_doc_opt.clone();
+                        guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();
                         // ZEB-491 (secondary): stash the identity dir so
                         // set_butler_pin can re-read the LIVE enrolled set
                         // (a device paired this session is absent from the

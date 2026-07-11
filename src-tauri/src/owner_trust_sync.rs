@@ -219,6 +219,28 @@ pub async fn mutate_trust_state<R>(
     }
 }
 
+/// Fold the on-disk trust doc into the resident doc (idempotent — the
+/// merge is monotonic, so re-folding already-known records is a no-op).
+/// Used after flows that write `owner_state.cbor` directly while the node
+/// runs (pairing install writes through `save_owner_state_atomic`, not the
+/// resident doc). Returns whether anything new was learned; nudges the
+/// engine only then.
+pub async fn resync_trust_from_disk(
+    doc: &Arc<tokio::sync::Mutex<OwnerState>>,
+    engine: &Arc<crate::fleet_sync::FleetSyncEngine<OwnerState>>,
+    identity_dir: &Path,
+) -> Result<bool, String> {
+    let disk = load_owner_state_cbor(identity_dir)?;
+    let changed = {
+        let mut guard = doc.lock().await;
+        merge_trust_remote_into_local(&mut guard, disk).changed
+    };
+    if changed {
+        engine.notify_dirty();
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +392,153 @@ mod tests {
         assert!(load_trust_replay_or_recover(&corrupt).is_empty());
         // Quarantined aside, original gone.
         assert!(!corrupt.exists());
+    }
+
+    /// Two trust engines over crossed in-memory channels sharing one CAS —
+    /// the owner_state_sync `TwoDevices` harness recipe, retargeted at the
+    /// generic engine + trust doc.
+    struct TrustPair {
+        a_engine: Arc<crate::fleet_sync::FleetSyncEngine<OwnerState>>,
+        b_engine: Arc<crate::fleet_sync::FleetSyncEngine<OwnerState>>,
+        a_doc: Arc<tokio::sync::Mutex<OwnerState>>,
+        b_doc: Arc<tokio::sync::Mutex<OwnerState>>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn spawn_trust_pair(seeded: OwnerState) -> TrustPair {
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine};
+        use crate::owner_state_crypto::KeyTree;
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kt = Arc::new(KeyTree::derive(&[0x66u8; 32]).expect("kt"));
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let a_doc = Arc::new(tokio::sync::Mutex::new(seeded.clone()));
+        let b_doc = Arc::new(tokio::sync::Mutex::new(seeded));
+
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (a_to_b_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move {
+            while let Some(bytes) = a_pub_rx.recv().await {
+                let _ = a_to_b_tx.send(bytes).await;
+            }
+        });
+        let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_to_a_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move {
+            while let Some(bytes) = b_pub_rx.recv().await {
+                let _ = b_to_a_tx.send(bytes).await;
+            }
+        });
+
+        let mk = |name: &str,
+                  doc: &Arc<tokio::sync::Mutex<OwnerState>>,
+                  pub_tx: mpsc::Sender<Vec<u8>>,
+                  sub_rx: mpsc::Receiver<Vec<u8>>| {
+            Arc::new(FleetSyncEngine::new(FleetSyncConfig {
+                kt: Arc::clone(&kt),
+                device_id: name.to_string(),
+                state: Arc::clone(doc),
+                merger: trust_merger(),
+                replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                content_store: Arc::clone(&store),
+                publisher_tx: pub_tx,
+                subscriber_rx: sub_rx,
+                persist: Arc::new(TrustPersist {
+                    identity_dir: dir.path().join(name),
+                    replay_path: dir.path().join(format!("{name}-replay.cbor")),
+                }),
+                lookup_key_tag: OWNER_TRUST_LOOKUP_TAG,
+                debounce_ms: 50,
+                publish_seen: true,
+                on_applied: None,
+                sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            }))
+        };
+        // Per-engine persist dirs must exist (save_owner_state_cbor_only
+        // writes into identity_dir directly).
+        std::fs::create_dir_all(dir.path().join("dev-a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("dev-b")).unwrap();
+        let a_engine = mk("dev-a", &a_doc, a_pub_tx, a_sub_rx);
+        let b_engine = mk("dev-b", &b_doc, b_pub_tx, b_sub_rx);
+        TrustPair {
+            a_engine,
+            b_engine,
+            a_doc,
+            b_doc,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn two_engines_converge_on_revocation() {
+        // Device A revokes device B; B's doc must converge to
+        // is_revoked(B) through the replication path.
+        let now = 1_700_000_000u64;
+        let (state_a, artifact, _sk1) = test_mint(now);
+        let (_sk_b, cert_b) = test_enroll_second_device(&artifact, &state_a, now + 10);
+        let d_b = cert_b.device_id;
+        let mut seeded = state_a;
+        seeded
+            .add_enrollment(cert_b, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        let pair = spawn_trust_pair(seeded);
+
+        let rev = test_master_revocation(&artifact, d_b, now + 20);
+        mutate_trust_state(
+            TrustStateAccess::Resident {
+                doc: Arc::clone(&pair.a_doc),
+                engine: Arc::clone(&pair.a_engine),
+            },
+            move |s| s.add_revocation(rev).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if pair.b_doc.lock().await.is_revoked(d_b) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "B never converged on the revocation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = pair.a_engine.shutdown().await;
+        let _ = pair.b_engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resync_from_disk_folds_new_enrollment_and_nudges() {
+        let now = 1_700_000_000u64;
+        let (state, artifact, _sk1) = test_mint(now);
+        let pair = spawn_trust_pair(state.clone());
+
+        // Simulate a pairing install: disk gains an enrollment the
+        // resident doc doesn't know.
+        let dir = tempfile::tempdir().unwrap();
+        let (_sk2, cert2) = test_enroll_second_device(&artifact, &state, now + 10);
+        let mut disk_state = state;
+        disk_state
+            .add_enrollment(cert2, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        save_owner_state_cbor_only(dir.path(), &disk_state).unwrap();
+
+        let changed = resync_trust_from_disk(&pair.a_doc, &pair.a_engine, dir.path())
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(pair.a_doc.lock().await.enrollments.len(), 2);
+        // Second resync learns nothing.
+        let changed2 = resync_trust_from_disk(&pair.a_doc, &pair.a_engine, dir.path())
+            .await
+            .unwrap();
+        assert!(!changed2);
+        let _ = pair.a_engine.shutdown().await;
+        let _ = pair.b_engine.shutdown().await;
     }
 
     #[tokio::test]

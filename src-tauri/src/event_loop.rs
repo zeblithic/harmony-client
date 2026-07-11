@@ -1030,6 +1030,11 @@ pub async fn run(
     // `harmony/owner/{addr_hex}/ds/{dataset}`. `None` when no owner identity is
     // loaded (and in test callers that bypass `start_node`).
     mut relay_sync_handles: Option<RelaySyncHandles>,
+    // ZEB-668 S1: the owner-trust dataset channel pair (owner-trust-v1 —
+    // harmony-owner enrollments/vouching/revocations/liveness), bridged to
+    // Zenoh on `harmony/owner/{addr_hex}/ds/owner-trust-v1`. `None` when no
+    // owner identity is loaded (and in test callers that bypass `start_node`).
+    mut trust_sync_handles: Option<DatasetSyncHandles>,
     // ZEB-495 (ZEB-340 Part 2): channel pair bridging the
     // community-device-intro FleetSyncEngine to Zenoh on
     // `harmony/owner/{addr_hex}/ds/community-device-intro-v1`. `None` when no
@@ -1913,6 +1918,24 @@ pub async fn run(
             "fleet-net-v1",
             "fleet-net-sync-degraded",
             crate::fleet_net::FLEET_NET_DATASET_MAX_BYTES,
+        )
+        .await;
+    }
+
+    // ── ZEB-668 S1: owner-trust fleet-sync Zenoh adapter ─────────────────
+    // Same plumbing as the datasets above. Replicates the harmony-owner
+    // trust CRDT (enrollments / vouching / revocations / liveness) across
+    // the owner's own fleet so a revocation issued on one device reaches
+    // its siblings. `None` when no owner identity is loaded.
+    if let Some(trust) = trust_sync_handles.take() {
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            trust,
+            crate::owner_trust_sync::OWNER_TRUST_DATASET,
+            "owner-trust-sync-degraded",
+            crate::owner_trust_sync::OWNER_TRUST_DATASET_MAX_BYTES,
         )
         .await;
     }
