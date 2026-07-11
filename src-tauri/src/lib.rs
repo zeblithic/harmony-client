@@ -8290,6 +8290,9 @@ pub async fn start_node_inner(
                         let task_self_owner = self_owner;
                         let task_device_id = device_id.clone();
                         let task_self_vk = butler_self_device_vk;
+                        // ZEB-668 S4: event sink for the petname live-refresh
+                        // emit below (same sink the trust detector emits on).
+                        let task_emit = std::sync::Arc::clone(&app);
                         let mut nudge_rx = fleet_net_snap_nudge_rx;
                         tokio::spawn(async move {
                             let mut prev_doc: crate::fleet_net::FleetNetDoc = task_snapshot
@@ -8342,6 +8345,20 @@ pub async fn start_node_inner(
                                             .write()
                                             .unwrap_or_else(|p| p.into_inner()) =
                                             new_doc.clone();
+                                        // ZEB-668 S4: a remote petname merge
+                                        // must live-refresh an open Devices
+                                        // panel. seen_at-only churn is
+                                        // deliberately excluded (every sibling
+                                        // heartbeat would fire it; last-seen
+                                        // copy is minutes-granular and
+                                        // refreshes on panel open).
+                                        if prev_doc.petnames != new_doc.petnames {
+                                            crate::node_event_sink::emit_ser(
+                                                &*task_emit,
+                                                "owner-devices-updated",
+                                                &serde_json::Value::Null,
+                                            );
+                                        }
                                         prev_doc = new_doc;
                                         if changed && pending.is_none() {
                                             tracing::debug!(
@@ -55690,6 +55707,165 @@ async fn set_butler_pin(
     set_butler_pin_impl(state.inner(), device_id).await
 }
 
+// ── ZEB-668 S4: set_device_petname ────────────────────────────────────────────
+
+/// Server-side petname length cap (chars, after trim). UI enforces the same.
+pub(crate) const MAX_DEVICE_PETNAME_CHARS: usize = 64;
+
+/// Core of `set_device_petname`, extracted for testability (mirrors
+/// `set_butler_pin_inner`). Empty/whitespace `petname` CLEARS: the entry is
+/// kept with `name: ""` so the clear replicates by LWW (removal would not
+/// converge). The stamp is seeded from the entry's own prior stamp so it
+/// strictly exceeds anything this replica has observed for that key.
+pub(crate) async fn set_device_petname_inner(
+    doc: &tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>,
+    enrolled: &std::collections::BTreeSet<String>,
+    device_vk_hex: String,
+    petname: String,
+    self_device_id: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    if !enrolled.contains(&device_vk_hex) {
+        return Err(format!(
+            "set_device_petname: device '{device_vk_hex}' is not in the enrolled device set"
+        ));
+    }
+    let trimmed = petname.trim();
+    if trimmed.chars().count() > MAX_DEVICE_PETNAME_CHARS {
+        return Err(format!(
+            "set_device_petname: petname exceeds {MAX_DEVICE_PETNAME_CHARS} characters"
+        ));
+    }
+    let mut guard = doc.lock().await;
+    let prev = guard.petnames.get(&device_vk_hex).map(|p| p.set_at.clone());
+    let new_stamp = crate::dm_outbox::next_hlc(prev.as_ref(), now_ms, self_device_id);
+    guard.petnames.insert(
+        device_vk_hex,
+        crate::fleet_net::FleetNetPetname {
+            name: trimmed.to_string(),
+            set_at: new_stamp,
+        },
+    );
+    Ok(())
+}
+
+/// ZEB-668 S4: NodeState-level core of `set_device_petname`, shared by the
+/// GUI Tauri command and the headless RPC (mirrors `set_butler_pin_impl`,
+/// including the ZEB-491 live enrolled-set union). Petnames are
+/// selection-irrelevant — nothing network-advertised changes — so unlike the
+/// pin path there is NO routing/reachability republish; instead we emit
+/// `owner-devices-updated` so an open Devices panel refreshes (local writes
+/// never fire `on_applied`).
+pub(crate) async fn set_device_petname_impl(
+    state: &Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    device_vk_hex: String,
+    petname: String,
+) -> Result<(), String> {
+    let (
+        fleet_net_doc_arc,
+        fleet_net_sync_arc,
+        fleet_net_snapshot_arc,
+        mut enrolled,
+        identity_dir,
+        self_device_id,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let doc = g.fleet_net_doc.clone().ok_or_else(|| {
+            "set_device_petname: fleet-net not running (node not started)".to_string()
+        })?;
+        let sync = g
+            .fleet_net_sync
+            .clone()
+            .ok_or_else(|| "set_device_petname: fleet-net engine not running".to_string())?;
+        let snapshot = g
+            .fleet_net_snapshot
+            .clone()
+            .ok_or_else(|| "set_device_petname: fleet-net snapshot not available".to_string())?;
+        let enrolled = g.fleet_net_enrolled.clone().unwrap_or_default();
+        let identity_dir = g.identity_dir.clone();
+        let self_device_id = g.fleet_net_device_id.clone().unwrap_or_default();
+        (doc, sync, snapshot, enrolled, identity_dir, self_device_id)
+    };
+
+    // ZEB-491: union the boot-time enrolled snapshot with the LIVE set from
+    // disk, so a device paired this session is namable without a restart
+    // (same recipe + failure-degradation as `set_butler_pin_impl`).
+    if let Some(dir) = identity_dir {
+        match tokio::task::spawn_blocking(move || {
+            crate::owner_state::read_enrolled_device_vk_hex(&dir)
+        })
+        .await
+        {
+            Ok(Ok(live)) => enrolled.extend(live),
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                "set_device_petname: live enrolled-set read failed; falling back to boot snapshot"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "set_device_petname: live enrolled-set read task panicked; falling back to boot snapshot"
+            ),
+        }
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    set_device_petname_inner(
+        &fleet_net_doc_arc,
+        &enrolled,
+        device_vk_hex,
+        petname,
+        &self_device_id,
+        now_ms,
+    )
+    .await?;
+
+    // Refresh the sync snapshot (clone under the doc lock — same pattern as
+    // `set_butler_pin_impl`; local writes don't fire `on_applied`).
+    {
+        let cloned_doc = fleet_net_doc_arc.lock().await.clone();
+        *fleet_net_snapshot_arc
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = cloned_doc;
+    }
+
+    fleet_net_sync_arc.notify_dirty();
+    if let Err(e) = fleet_net_sync_arc.flush_now().await {
+        tracing::warn!(
+            error = %e,
+            "set_device_petname: fleet-net flush failed; dirty latch will retry on next cycle"
+        );
+    }
+
+    crate::node_event_sink::emit_ser(&*sink, "owner-devices-updated", &serde_json::Value::Null);
+    Ok(())
+}
+
+/// ZEB-668 S4: IPC to set or clear (empty string) a fleet-synced device
+/// petname. Thin wrapper over `set_device_petname_impl` (GUI + headless RPC
+/// share it).
+#[tauri::command]
+async fn set_device_petname(
+    app: tauri::AppHandle,
+    device_vk_hex: String,
+    petname: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    set_device_petname_impl(
+        state.inner(),
+        std::sync::Arc::new(app),
+        device_vk_hex,
+        petname,
+    )
+    .await
+}
+
 /// ZEB-489: NodeState-level core of the headless `get_butler_pin` RPC.
 /// Read-only report of this fleet's currently pinned butler device (none →
 /// `pinned_device_id: None`). Headless-only — the GUI reads `fleet_net_doc`
@@ -56386,6 +56562,8 @@ pub fn run() {
             notes_commands::notes_delete,
             // ZEB-418 P2 D17: pin-a-butler IPC.
             set_butler_pin,
+            // ZEB-668 S4: fleet-synced device petname IPC.
+            set_device_petname,
             // ZEB-458 P4 Phase B D43: community-relay opt-in IPCs.
             set_community_relay_opt_in,
             get_community_relay_status,
@@ -64174,6 +64352,99 @@ mod butler_pin_tests {
                 "stamp after clear must be strictly newer"
             );
         }
+    }
+}
+
+// ── ZEB-668 S4: set_device_petname_inner unit tests ───────────────────────────
+
+#[cfg(test)]
+mod device_petname_tests {
+    use super::{set_device_petname_inner, MAX_DEVICE_PETNAME_CHARS};
+    use crate::fleet_net::FleetNetDoc;
+    use crate::owner_state_types::Hlc;
+    use std::collections::BTreeSet;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn set_device_petname_inner_sets_trimmed_name_with_monotonic_stamp() {
+        let doc = Mutex::new(FleetNetDoc::default());
+        let dev = "aa".repeat(32);
+        let enrolled: BTreeSet<String> = [dev.clone()].into_iter().collect();
+
+        set_device_petname_inner(
+            &doc,
+            &enrolled,
+            dev.clone(),
+            "  KRILE  ".into(),
+            "self-dev",
+            1000,
+        )
+        .await
+        .expect("first set");
+        {
+            let g = doc.lock().await;
+            let pn = &g.petnames[&dev];
+            assert_eq!(pn.name, "KRILE");
+            assert_eq!(pn.set_at.wall_ms, 1000);
+        }
+        // Second write with a REGRESSED wall clock must still strictly exceed
+        // the prior stamp (next_hlc bumps logical).
+        set_device_petname_inner(
+            &doc,
+            &enrolled,
+            dev.clone(),
+            "AVALON".into(),
+            "self-dev",
+            500,
+        )
+        .await
+        .expect("second set");
+        let g = doc.lock().await;
+        let pn = &g.petnames[&dev];
+        assert_eq!(pn.name, "AVALON");
+        assert!(pn.set_at.is_strictly_newer_than(&Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "self-dev".into(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn set_device_petname_inner_empty_clears_and_unknown_rejects() {
+        let doc = Mutex::new(FleetNetDoc::default());
+        let dev = "bb".repeat(32);
+        let enrolled: BTreeSet<String> = [dev.clone()].into_iter().collect();
+
+        set_device_petname_inner(&doc, &enrolled, dev.clone(), "Koya".into(), "self-dev", 10)
+            .await
+            .unwrap();
+        // Whitespace-only → clear: entry kept, name emptied (LWW tombstone).
+        set_device_petname_inner(&doc, &enrolled, dev.clone(), "   ".into(), "self-dev", 20)
+            .await
+            .unwrap();
+        assert_eq!(doc.lock().await.petnames[&dev].name, "");
+
+        let err =
+            set_device_petname_inner(&doc, &enrolled, "cc".repeat(32), "x".into(), "self-dev", 30)
+                .await
+                .unwrap_err();
+        assert!(err.contains("not in the enrolled device set"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn set_device_petname_inner_rejects_over_cap() {
+        let doc = Mutex::new(FleetNetDoc::default());
+        let dev = "dd".repeat(32);
+        let enrolled: BTreeSet<String> = [dev.clone()].into_iter().collect();
+        let long = "x".repeat(MAX_DEVICE_PETNAME_CHARS + 1);
+        let err = set_device_petname_inner(&doc, &enrolled, dev.clone(), long, "self-dev", 10)
+            .await
+            .unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+        assert!(
+            doc.lock().await.petnames.is_empty(),
+            "rejected write must not mutate"
+        );
     }
 }
 

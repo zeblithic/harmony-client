@@ -179,16 +179,37 @@ pub(crate) fn plan_revocation(
     })))
 }
 
+/// ZEB-668 S4: everything `build_owner_state_view` joins from the fleet-net
+/// doc + peer liveness, snapshotted in async context before the blocking
+/// task. `Default` = fleet-net cold / node not running — every joined field
+/// degrades honestly (no pin, no petnames, no last-seen, not connected).
+#[derive(Default)]
+pub(crate) struct FleetJoin {
+    /// 64-hex fleet `pinned` value (butler pin).
+    pub pinned: Option<String>,
+    /// device_vk_hex → petname as stored (the view join trims). An
+    /// empty-after-trim value is an explicitly CLEARED name (LWW tombstone
+    /// entry); an absent key means the device was never named. The
+    /// distinction flows into `DeviceView.pet_name` (`Some("")` vs `None`)
+    /// and gates the panel's one-shot label migration — a cleared name must
+    /// never be resurrected from a stale local label (PR #454 round 1).
+    pub petnames: std::collections::BTreeMap<String, String>,
+    /// device_vk_hex → (seen_at.wall_ms, iroh_endpoint_id).
+    pub rows: std::collections::BTreeMap<String, (u64, [u8; 32])>,
+    /// Endpoint ids with a live Connected liveness slot (Degraded excluded).
+    pub connected_eps: std::collections::BTreeSet<[u8; 32]>,
+}
+
 /// Build an `OwnerStateView` from a loaded state.
 ///
-/// `pinned_device_id_hex`: the 64-hex fleet-net `pinned` field (from the
-/// in-memory `FleetNetDoc`). When `Some`, the matching device row receives
-/// `butler_pinned: true`. Defaults to `false` when `None` (fleet-net cold
-/// or node not running).
+/// `fleet`: the fleet-net + liveness join snapshot (see [`FleetJoin`]). The
+/// matching device row receives `butler_pinned` / `pet_name` /
+/// `last_seen_ms` / `connected_now`; everything defaults to absent when the
+/// fleet-net doc is cold or the node is not running.
 fn build_owner_state_view(
     loaded: &LoadedOwnerState,
     this_device_name: String,
-    pinned_device_id_hex: Option<String>,
+    fleet: FleetJoin,
 ) -> OwnerStateView {
     let now = now_unix();
     let active_window = trust::DEFAULT_ACTIVE_WINDOW_SECS;
@@ -211,10 +232,25 @@ fn build_owner_state_view(
             // enrollment certs carry the ed25519 verify key directly (first 32
             // bytes of the classical bundle). Compare device_id hex forms.
             let dev_id_hex = hex::encode(cert.device_pubkeys.classical.ed25519_verify);
-            let butler_pinned = pinned_device_id_hex
+            let butler_pinned = fleet
+                .pinned
                 .as_deref()
                 .map(|p| p == dev_id_hex)
                 .unwrap_or(false);
+            // ZEB-668 S4: petname + last-seen + connected join on the same
+            // 64-hex vk key the fleet-net doc uses. Trim on read (PR #454
+            // round 1): the local writer trims, but a remote peer's entry is
+            // only LWW-merged — normalize here so a whitespace-only name can
+            // never surface as a visible petname. Some("") = explicitly
+            // cleared (distinct from None = never named — see FleetJoin doc).
+            let pet_name = fleet
+                .petnames
+                .get(&dev_id_hex)
+                .map(|s| s.trim().to_string());
+            let (last_seen_ms, connected_now) = match fleet.rows.get(&dev_id_hex) {
+                Some((ms, ep)) => (Some(*ms), fleet.connected_eps.contains(ep)),
+                None => (None, false),
+            };
             let rev_cert = loaded.state.revocations.cert_for(cert.device_id);
             DeviceView {
                 device_id: hex::encode(cert.device_id),
@@ -235,6 +271,9 @@ fn build_owner_state_view(
                 revoked: rev_cert.is_some(),
                 revoked_at: rev_cert.map(|c| c.issued_at),
                 revoked_reason: rev_cert.map(|c| revoke_reason_label(&c.reason)),
+                pet_name,
+                last_seen_ms,
+                connected_now,
             }
         })
         .collect();
@@ -305,21 +344,43 @@ pub(crate) async fn get_owner_state_inner(
     state: &std::sync::Mutex<crate::NodeState>,
     keychain: KeychainFactory,
 ) -> Result<Option<OwnerStateView>, String> {
-    // ZEB-418 P2 D17: snapshot the fleet-net pinned device ID before entering
-    // the blocking task. Reads under the NodeState lock; the Arc clone is cheap
-    // and the tokio Mutex lock is async — we do it here (async context) and pass
-    // the resolved `Option<String>` into the blocking closure (no async in there).
-    let pinned_device_id_hex: Option<String> = {
-        let fleet_net_doc_arc = {
+    // ZEB-418 P2 D17 + ZEB-668 S4: snapshot the whole fleet-net join (pin,
+    // petnames, per-row seen_at/endpoint) plus the Connected liveness set
+    // before entering the blocking task. Reads under the NodeState lock; the
+    // Arc clones are cheap and the tokio Mutex lock is async — we do it here
+    // (async context) and pass the resolved `FleetJoin` into the blocking
+    // closure (no async in there).
+    let fleet: FleetJoin = {
+        let (fleet_net_doc_arc, resolver) = {
             let g = state
                 .lock()
                 .map_err(|e| format!("NodeState poisoned: {e}"))?;
-            g.fleet_net_doc.clone()
+            (g.fleet_net_doc.clone(), g.reachability_resolver.clone())
         };
-        match fleet_net_doc_arc {
-            Some(arc) => arc.lock().await.pinned.clone(),
-            None => None,
+        let mut fleet = FleetJoin::default();
+        if let Some(arc) = fleet_net_doc_arc {
+            let doc = arc.lock().await;
+            fleet.pinned = doc.pinned.clone();
+            for (id, row) in &doc.devices {
+                fleet
+                    .rows
+                    .insert(id.clone(), (row.seen_at.wall_ms, row.iroh_endpoint_id));
+            }
+            for (id, pn) in &doc.petnames {
+                fleet.petnames.insert(id.clone(), pn.name.clone());
+            }
         }
+        if let Some(h) = resolver.and_then(|r| r.liveness()) {
+            for (ep, st) in h.states_snapshot() {
+                if matches!(
+                    st,
+                    crate::peer_liveness::LivenessStateWire::Connected { .. }
+                ) {
+                    fleet.connected_eps.insert(ep);
+                }
+            }
+        }
+        fleet
     };
     // ZEB-668 S1: snapshot the resident trust handles (Some while the node
     // runs with an owner loaded). When resident, the view renders from the
@@ -364,11 +425,7 @@ pub(crate) async fn get_owner_state_inner(
             engine.notify_dirty();
         }
         loaded.state = snapshot;
-        return Ok(Some(build_owner_state_view(
-            &loaded,
-            display_name,
-            pinned_device_id_hex,
-        )));
+        return Ok(Some(build_owner_state_view(&loaded, display_name, fleet)));
     }
     run_blocking(move || {
         // ZEB-342: hold the write lock only across load+refresh+save, so the cbor
@@ -398,11 +455,7 @@ pub(crate) async fn get_owner_state_inner(
             }
             loaded
         };
-        Ok(Some(build_owner_state_view(
-            &loaded,
-            display_name,
-            pinned_device_id_hex,
-        )))
+        Ok(Some(build_owner_state_view(&loaded, display_name, fleet)))
     })
     .await
 }
@@ -755,8 +808,8 @@ where
         };
         Ok(MintIpcResult {
             // Mint happens before the node restarts — fleet-net is not yet
-            // running so `butler_pinned` is always false here (fresh identity).
-            state: build_owner_state_view(&loaded, display_name, None),
+            // running so every fleet-joined field is absent (fresh identity).
+            state: build_owner_state_view(&loaded, display_name, FleetJoin::default()),
             recovery_token: token.to_string(),
         })
     })
@@ -1254,7 +1307,7 @@ mod tests {
         };
 
         // ── (a) Build the view with no pin; take the joiner's device_vk_hex ─
-        let view = build_owner_state_view(&loaded, "this device".into(), None);
+        let view = build_owner_state_view(&loaded, "this device".into(), FleetJoin::default());
         assert_eq!(view.devices.len(), 2, "mint device + joiner");
         let joiner_row = view
             .devices
@@ -1294,7 +1347,14 @@ mod tests {
         assert_eq!(pinned.as_deref(), Some(vk_hex.as_str()));
 
         // ── (d) Feed the doc's pinned value back; exactly the joiner pins ───
-        let view2 = build_owner_state_view(&loaded, "this device".into(), pinned);
+        let view2 = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            FleetJoin {
+                pinned,
+                ..Default::default()
+            },
+        );
         for d in &view2.devices {
             assert_eq!(
                 d.butler_pinned,
@@ -1303,6 +1363,117 @@ mod tests {
                 d.device_id
             );
         }
+    }
+
+    /// ZEB-668 S4: single-enrollment loaded-state fixture for the fleet-join
+    /// view tests (mirrors the round-trip test's mint recipe above).
+    fn minted_loaded_state() -> LoadedOwnerState {
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_000).expect("mint");
+        LoadedOwnerState {
+            state,
+            device_signing_key,
+            master_seed: Some(Zeroizing::new(*recovery_artifact.as_bytes())),
+            fleet_keytree: None,
+        }
+    }
+
+    fn fixture_vk_hex(loaded: &LoadedOwnerState) -> String {
+        let cert = loaded
+            .state
+            .enrollments
+            .values()
+            .next()
+            .expect("mint enrollment present");
+        hex::encode(cert.device_pubkeys.classical.ed25519_verify)
+    }
+
+    #[test]
+    fn view_joins_petname_last_seen_and_connected() {
+        let loaded = minted_loaded_state();
+        let dev_vk_hex = fixture_vk_hex(&loaded);
+        let ep = [0x42u8; 32];
+        let mut fleet = FleetJoin::default();
+        fleet.petnames.insert(dev_vk_hex.clone(), "KRILE".into());
+        fleet.rows.insert(dev_vk_hex.clone(), (123_456, ep));
+        fleet.connected_eps.insert(ep);
+
+        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let d = view
+            .devices
+            .iter()
+            .find(|d| d.device_vk_hex == dev_vk_hex)
+            .expect("fixture device row");
+        assert_eq!(d.pet_name.as_deref(), Some("KRILE"));
+        assert_eq!(d.last_seen_ms, Some(123_456));
+        assert!(d.connected_now);
+    }
+
+    #[test]
+    fn view_absent_fleet_row_yields_honest_nulls() {
+        let loaded = minted_loaded_state();
+        let view = build_owner_state_view(&loaded, "this device".into(), FleetJoin::default());
+        let d = &view.devices[0];
+        assert_eq!(d.pet_name, None);
+        assert_eq!(d.last_seen_ms, None);
+        assert!(!d.connected_now);
+    }
+
+    #[test]
+    fn view_cleared_petname_surfaces_as_some_empty_not_none() {
+        // PR #454 round 1: a cleared petname (LWW tombstone, name: "") must
+        // surface as Some("") — DISTINCT from None (never named). The panel's
+        // one-shot local-label migration keys on exactly this distinction: a
+        // cleared name must never be resurrected from a stale local label.
+        let loaded = minted_loaded_state();
+        let dev_vk_hex = fixture_vk_hex(&loaded);
+        let mut fleet = FleetJoin::default();
+        fleet.petnames.insert(dev_vk_hex.clone(), String::new());
+        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let d = view
+            .devices
+            .iter()
+            .find(|d| d.device_vk_hex == dev_vk_hex)
+            .expect("fixture device row");
+        assert_eq!(d.pet_name.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn view_trims_whitespace_petname_from_remote_writers() {
+        // PR #454 round 1 (Qodo): the local writer trims, but a remote
+        // peer's LWW entry lands as stored. A whitespace-only name must
+        // normalize to the cleared form, and padding must be stripped.
+        let loaded = minted_loaded_state();
+        let dev_vk_hex = fixture_vk_hex(&loaded);
+
+        let mut fleet = FleetJoin::default();
+        fleet.petnames.insert(dev_vk_hex.clone(), "   ".into());
+        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let d = view
+            .devices
+            .iter()
+            .find(|d| d.device_vk_hex == dev_vk_hex)
+            .expect("fixture device row");
+        assert_eq!(
+            d.pet_name.as_deref(),
+            Some(""),
+            "whitespace-only → cleared form"
+        );
+
+        let mut fleet = FleetJoin::default();
+        fleet
+            .petnames
+            .insert(dev_vk_hex.clone(), "  KRILE  ".into());
+        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let d = view
+            .devices
+            .iter()
+            .find(|d| d.device_vk_hex == dev_vk_hex)
+            .expect("fixture device row");
+        assert_eq!(d.pet_name.as_deref(), Some("KRILE"), "padding stripped");
     }
 
     #[test]
@@ -1717,7 +1888,7 @@ mod revoke_tests {
             master_seed: Some(Zeroizing::new(seed)),
             fleet_keytree: None,
         };
-        let view = build_owner_state_view(&loaded, "Test Device".to_string(), None);
+        let view = build_owner_state_view(&loaded, "Test Device".to_string(), FleetJoin::default());
         let revoked_row = view
             .devices
             .iter()

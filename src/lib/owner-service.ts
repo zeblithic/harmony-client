@@ -30,6 +30,18 @@ export interface DeviceView {
   revokedAt: number | null;
   /** "decommissioned" | "lost" | "compromised" (free text for legacy). */
   revokedReason: string | null;
+  /**
+   * ZEB-668 S4: fleet-synced petname (LWW; null = never named/cleared).
+   * Wins the label ladder over the local device label.
+   */
+  petName: string | null;
+  /**
+   * ZEB-668 S4: wall-ms of the last fleet-net heartbeat (~7.5 min cadence).
+   * null = never fleet-synced → render NOTHING (honesty rule).
+   */
+  lastSeenMs: number | null;
+  /** ZEB-668 S4: live Connected transport slot for this device right now. */
+  connectedNow: boolean;
 }
 
 /** ZEB-668 S2: the three UI-selectable revocation reasons (spec §3). */

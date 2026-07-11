@@ -378,6 +378,14 @@ struct RevokeDeviceArgs {
     reason: String,
 }
 
+/// ZEB-668 S4: fleet-synced device petname. Empty `petname` clears.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetDevicePetnameArgs {
+    device_vk_hex: String,
+    petname: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -954,6 +962,14 @@ pub fn build_registry() -> RpcRegistry {
             crate::owner_commands::revoke_device_impl(state, sink, a.device_vk_hex, a.reason).await
         }
     );
+    rpc!(
+        m,
+        "set_device_petname",
+        SetDevicePetnameArgs,
+        |state, sink, a| async move {
+            crate::set_device_petname_impl(state, sink, a.device_vk_hex, a.petname).await
+        }
+    );
 
     // Connectivity.
     rpc!(
@@ -1305,6 +1321,37 @@ mod tests {
                 );
             }
             Ok(v) => panic!("expected noOwner error on an empty identity dir, got {v:?}"),
+        }
+    }
+
+    /// ZEB-668 S4 (PR #454 review): dispatch proof for `set_device_petname`,
+    /// mirroring `revoke_device_rpc_is_registered_and_wired` — camelCase args
+    /// must parse and reach the `_impl` seam. A default NodeState has no
+    /// fleet-net doc, so the seam deterministically answers "fleet-net not
+    /// running" without any identity/keychain access.
+    #[tokio::test]
+    async fn set_device_petname_rpc_is_registered_and_wired() {
+        let reg = build_registry();
+        let state = Arc::new(Mutex::new(NodeState::default()));
+        let args = serde_json::json!({
+            "deviceVkHex": "ab".repeat(32),
+            "petname": "KRILE",
+        });
+        match reg
+            .dispatch("set_device_petname", state, test_sink(), args)
+            .await
+        {
+            Err(RpcError::UnknownCommand) => panic!("set_device_petname must be registered"),
+            Err(RpcError::BadArgs(msg)) => {
+                panic!("set_device_petname: arg struct rejected the wrapper shape: {msg}")
+            }
+            Err(RpcError::Command(msg)) => {
+                assert!(
+                    msg.contains("fleet-net not running"),
+                    "expected the node-not-started seam error, got: {msg}"
+                );
+            }
+            Ok(v) => panic!("expected node-not-started error on a default NodeState, got {v:?}"),
         }
     }
 
@@ -1822,8 +1869,9 @@ mod tests {
             "set_butler_pin",
             "get_butler_pin",
             "get_butler_held",
-            // device management (ZEB-668 S2)
+            // device management (ZEB-668 S2/S4)
             "revoke_device",
+            "set_device_petname",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",

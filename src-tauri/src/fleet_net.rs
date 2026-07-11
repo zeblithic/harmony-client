@@ -46,6 +46,20 @@ pub struct FleetNetRow {
     pub seen_at: Hlc,
 }
 
+/// A fleet-synced device petname (ZEB-668 S4). Assigned by ANY of the
+/// owner's devices ABOUT any device — deliberately outside `FleetNetRow`
+/// (rows are self-stamped by their subject device; petnames are not).
+/// `name: ""` means "cleared" (kept as an LWW value so a clear replicates;
+/// entry removal would not converge).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetNetPetname {
+    #[serde(rename = "n")]
+    pub name: String,
+    /// LWW stamp; strictly-newer wins, ties keep local.
+    #[serde(rename = "st")]
+    pub set_at: Hlc,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetNetDoc {
     /// Keyed by SP1 64-hex device id (same form as DmInboxEntry.deposited_by).
@@ -61,6 +75,11 @@ pub struct FleetNetDoc {
         skip_serializing_if = "hlc_is_unset"
     )]
     pub pinned_at: Hlc,
+    /// Fleet-synced device petnames (ZEB-668 S4), keyed like `devices` by SP1
+    /// 64-hex device id. Per-key LWW by `set_at`. Additive: absent on the
+    /// wire when empty, so pre-S4 payloads and peers are unaffected.
+    #[serde(rename = "pt", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub petnames: BTreeMap<String, FleetNetPetname>,
 }
 
 impl Default for FleetNetDoc {
@@ -73,6 +92,7 @@ impl Default for FleetNetDoc {
                 logical: 0,
                 device_id: String::new(),
             },
+            petnames: BTreeMap::new(),
         }
     }
 }
@@ -84,6 +104,8 @@ impl CanonicalPayloadSealed for FleetNetRow {}
 impl CanonicalPayload for FleetNetRow {}
 impl CanonicalPayloadSealed for FleetNetDoc {}
 impl CanonicalPayload for FleetNetDoc {}
+impl CanonicalPayloadSealed for FleetNetPetname {}
+impl CanonicalPayload for FleetNetPetname {}
 
 impl FleetNetDoc {
     /// LWW row merge: a remote row replaces the local row only when
@@ -124,6 +146,23 @@ impl FleetNetDoc {
             // stamp update carrying the same pin device is a no-op for callers.
             if pin_changed {
                 changed = true;
+            }
+        }
+
+        // Petnames (ZEB-668 S4): per-key LWW by set_at — same shape as the
+        // device rows above.
+        for (device_id, remote_pn) in remote.petnames {
+            match self.petnames.get(&device_id) {
+                None => {
+                    self.petnames.insert(device_id, remote_pn);
+                    changed = true;
+                }
+                Some(local_pn) => {
+                    if remote_pn.set_at.is_strictly_newer_than(&local_pn.set_at) {
+                        self.petnames.insert(device_id, remote_pn);
+                        changed = true;
+                    }
+                }
             }
         }
 
@@ -339,6 +378,18 @@ mod tests {
         }
     }
 
+    fn petname(name: &str, set_at: Hlc) -> FleetNetPetname {
+        FleetNetPetname {
+            name: name.into(),
+            set_at,
+        }
+    }
+
+    // Pins the fleet-net-v1 wire format; NEVER regenerate. Mod-level so the
+    // additive-decode test can prove pre-S4 bytes still parse (ZEB-668 S4).
+    // See EXPECTED_OUTHOLD_DOC_HEX in dm_outhold.rs for the pattern.
+    const EXPECTED_FLEET_NET_DOC_HEX: &str = "a3626476a2784061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161a3626570982018aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa6268726f72656c61792e616c7068612e636f6d627361a361771903e8616c006164656465762d61784062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262a3626570982018bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb6268726e72656c61792e626574612e636f6d627361a361771907d0616c006164656465762d6262706e784061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161627061a36177190bb8616c006164696465762d6f776e6572";
+
     // ── Row LWW tests ─────────────────────────────────────────────────────────
 
     #[test]
@@ -458,6 +509,95 @@ mod tests {
 
         local.merge_from(remote);
         assert_eq!(local.pinned.as_deref(), Some("dev-local"));
+    }
+
+    // ── Petname LWW tests (ZEB-668 S4) ───────────────────────────────────────
+
+    #[test]
+    fn petname_lww_newer_remote_wins() {
+        let mut local = FleetNetDoc::default();
+        local
+            .petnames
+            .insert("dev-a".into(), petname("old", hlc(5, "dev-x")));
+        let mut remote = FleetNetDoc::default();
+        remote
+            .petnames
+            .insert("dev-a".into(), petname("new", hlc(10, "dev-y")));
+
+        let out = local.merge_from(remote);
+        assert!(out.changed);
+        assert_eq!(local.petnames["dev-a"].name, "new");
+        assert_eq!(local.petnames["dev-a"].set_at.wall_ms, 10);
+    }
+
+    #[test]
+    fn petname_lww_older_remote_ignored_and_tie_keeps_local() {
+        let mut local = FleetNetDoc::default();
+        local
+            .petnames
+            .insert("dev-a".into(), petname("keep", hlc(10, "dev-x")));
+
+        let mut older = FleetNetDoc::default();
+        older
+            .petnames
+            .insert("dev-a".into(), petname("stale", hlc(5, "dev-x")));
+        assert!(!local.merge_from(older).changed);
+        assert_eq!(local.petnames["dev-a"].name, "keep");
+
+        let mut tie = FleetNetDoc::default();
+        tie.petnames
+            .insert("dev-a".into(), petname("tie", hlc(10, "dev-x")));
+        assert!(!local.merge_from(tie).changed);
+        assert_eq!(local.petnames["dev-a"].name, "keep");
+    }
+
+    #[test]
+    fn petname_absent_key_inserts_unconditionally() {
+        let mut local = FleetNetDoc::default();
+        let mut remote = FleetNetDoc::default();
+        remote
+            .petnames
+            .insert("dev-b".into(), petname("KRILE", hlc(1, "dev-b")));
+        assert!(local.merge_from(remote).changed);
+        assert_eq!(local.petnames["dev-b"].name, "KRILE");
+    }
+
+    #[test]
+    fn empty_petnames_map_is_omitted_from_wire_encoding() {
+        // Additive wire compat: a doc with no petnames must encode WITHOUT the
+        // "pt" key — byte-identical to the pre-S4 shape. (The pinned
+        // EXPECTED_FLEET_NET_DOC_HEX fixture is the cross-check: it must keep
+        // passing untouched.)
+        let mut doc = FleetNetDoc::default();
+        doc.devices.insert(
+            "dev-a".into(),
+            row(0x01, "relay.example.com", hlc(1, "dev-a")),
+        );
+        let mut buf = Vec::new();
+        ciborium::into_writer(&doc, &mut buf).expect("encode");
+        let val: ciborium::Value = ciborium::from_reader(buf.as_slice()).expect("decode");
+        let map = val.as_map().expect("top-level map");
+        assert!(
+            !map.iter().any(|(k, _)| k.as_text() == Some("pt")),
+            "empty petnames must be skip-serialized"
+        );
+    }
+
+    #[test]
+    fn petnames_round_trip_and_old_bytes_decode_to_empty_map() {
+        // Round-trip with an entry present.
+        let mut doc = FleetNetDoc::default();
+        doc.petnames
+            .insert("dev-a".into(), petname("KRILE", hlc(7, "dev-b")));
+        let mut buf = Vec::new();
+        ciborium::into_writer(&doc, &mut buf).expect("encode");
+        let back: FleetNetDoc = ciborium::from_reader(buf.as_slice()).expect("decode");
+        assert_eq!(back, doc);
+
+        // Pre-S4 bytes (the pinned fixture hex) decode with petnames defaulted.
+        let old = hex::decode(EXPECTED_FLEET_NET_DOC_HEX).expect("fixture hex");
+        let decoded: FleetNetDoc = ciborium::from_reader(old.as_slice()).expect("decode old");
+        assert!(decoded.petnames.is_empty());
     }
 
     // ── Butler set ordering tests ─────────────────────────────────────────────
@@ -855,9 +995,6 @@ mod tests {
         into_writer(&doc, &mut buf).expect("encode");
         let actual = hex::encode(&buf);
 
-        // Pins the fleet-net-v1 wire format; NEVER regenerate.
-        // See EXPECTED_OUTHOLD_DOC_HEX in dm_outhold.rs for the pattern.
-        const EXPECTED_FLEET_NET_DOC_HEX: &str = "a3626476a2784061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161a3626570982018aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa6268726f72656c61792e616c7068612e636f6d627361a361771903e8616c006164656465762d61784062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262a3626570982018bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb6268726e72656c61792e626574612e636f6d627361a361771907d0616c006164656465762d6262706e784061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161627061a36177190bb8616c006164696465762d6f776e6572";
         assert_eq!(
             actual, EXPECTED_FLEET_NET_DOC_HEX,
             "FleetNetDoc wire encoding drifted from pinned fixture.\nactual hex: {actual}"

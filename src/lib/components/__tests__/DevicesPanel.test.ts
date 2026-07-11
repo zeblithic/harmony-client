@@ -19,12 +19,14 @@ vi.mock('../../profile-service', () => ({
 import {
   loadDeviceLabel,
   saveDeviceLabel,
+  clearDeviceLabel,
   resolveDefaultDeviceLabel,
 } from '../../device-label-service';
 
 vi.mock('../../device-label-service', () => ({
   loadDeviceLabel: vi.fn(),
   saveDeviceLabel: vi.fn(),
+  clearDeviceLabel: vi.fn(),
   resolveDefaultDeviceLabel: vi.fn(),
 }));
 
@@ -326,13 +328,23 @@ describe('DevicesPanel — owner name and device label are separated (ZEB-336)',
   it('renaming the device does not change the owner display name', async () => {
     // Regression guard for the conflation: pre-split this rename rewrote
     // profile.displayName (the owner name).
+    const deviceRow = {
+      deviceId: 'aa11bb22', displayName: 'this device', isThisDevice: true,
+      trustDecision: { kind: 'full', reason: null },
+      enrolledAt: 1_700_000_000, fingerprint: 'aa11·bb22',
+      deviceVkHex: 'aa'.repeat(32),
+    };
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1', ownerDisplayName: 'backend',
-      devices: [{
-        deviceId: 'aa11bb22', displayName: 'this device', isThisDevice: true,
-        trustDecision: { kind: 'full', reason: null },
-        enrolledAt: 1_700_000_000, fingerprint: 'aa11·bb22',
-      }],
+      devices: [deviceRow],
+      canBackUp: true,
+    });
+    // ZEB-668 S4: rename now flows through set_device_petname + a refresh;
+    // the refreshed view carries the fleet petname.
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1', ownerDisplayName: 'backend',
+      devices: [{ ...deviceRow, petName: 'KRILE-prime' }],
       canBackUp: true,
     });
     (loadProfile as ReturnType<typeof vi.fn>).mockReturnValue({ address: 'addr', displayName: 'zeblith' });
@@ -344,7 +356,7 @@ describe('DevicesPanel — owner name and device label are separated (ZEB-336)',
     const input = screen.getByRole('textbox', { name: /device name/i });
     await fireEvent.input(input, { target: { value: 'KRILE-prime' } });
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
-    expect(screen.getByText('KRILE-prime')).toBeInTheDocument(); // device row updated
+    await screen.findByText('KRILE-prime'); // device row updated (post-refresh)
     expect(screen.getByText('zeblith')).toBeInTheDocument();     // owner header unchanged
   });
 
@@ -1387,5 +1399,266 @@ describe('DevicesPanel — device revoke (ZEB-668 S2)', () => {
     expect(screen.getByText(/^lost$/i)).toBeInTheDocument();
     // No butler checkbox on removed rows (only the active row's remains).
     expect(screen.getAllByRole('checkbox').length).toBe(1);
+  });
+});
+
+// ── ZEB-668 S4: petnames + last-seen presence line ────────────────────────────
+
+describe('DevicesPanel — petnames + last-seen (ZEB-668 S4)', () => {
+  const s4View = (overrides: Record<string, unknown> = {}) => ({
+    ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+    ownerDisplayName: 'zeblith',
+    devices: [
+      {
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this device',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+        butlerPinned: false,
+        deviceVkHex: 'aa'.repeat(32),
+        revoked: false,
+        revokedAt: null,
+        revokedReason: null,
+        petName: null as string | null,
+        lastSeenMs: null as number | null,
+        connectedNow: false,
+      },
+      {
+        deviceId: 'bb22cc33dd44ee55ff66778899001122',
+        displayName: 'Device bb22cc33',
+        isThisDevice: false,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_100_000,
+        fingerprint: 'bb22·cc33',
+        butlerPinned: false,
+        deviceVkHex: 'bb'.repeat(32),
+        revoked: false,
+        revokedAt: null,
+        revokedReason: null,
+        petName: null as string | null,
+        lastSeenMs: null as number | null,
+        connectedNow: false,
+      },
+    ],
+    canBackUp: true,
+    ...overrides,
+  });
+
+  const withSibling = (sibling: Record<string, unknown>) => {
+    const view = s4View();
+    view.devices[1] = { ...view.devices[1], ...sibling };
+    return view;
+  };
+
+  it('petName wins the label ladder on a sibling row', async () => {
+    mockedInvoke.mockResolvedValueOnce(withSibling({ petName: 'Ildwyn' }));
+    render(DevicesPanel);
+    await screen.findByText('Ildwyn');
+    expect(screen.queryByText('Device bb22cc33')).toBeNull();
+  });
+
+  it('connectedNow renders the online badge on a sibling row', async () => {
+    mockedInvoke.mockResolvedValueOnce(withSibling({ connectedNow: true }));
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    expect(screen.getByText(/online/i)).toBeInTheDocument();
+  });
+
+  it('lastSeenMs renders heartbeat-tolerant relative time when not connected', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      withSibling({ lastSeenMs: Date.now() - 2 * 3_600_000 }),
+    );
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    expect(screen.getByText(/last seen ~2h ago/i)).toBeInTheDocument();
+  });
+
+  it('null lastSeenMs renders neither presence line (honest absence)', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View());
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    expect(screen.queryByText(/online/i)).toBeNull();
+    expect(screen.queryByText(/last seen/i)).toBeNull();
+  });
+
+  it('sibling rename saves through set_device_petname with the vk-hex id', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View()); // mount refresh
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname
+    mockedInvoke.mockResolvedValueOnce(s4View()); // post-save refresh
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    // Two rename buttons now (self + sibling); take the sibling's (last).
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[renameBtns.length - 1]);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: 'Ildwyn' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'bb'.repeat(32),
+      petname: 'Ildwyn',
+    });
+    // Sibling rename must NOT touch the local this-device label.
+    expect(saveDeviceLabel).not.toHaveBeenCalled();
+  });
+
+  it('self rename keeps localStorage label in step as the offline fallback', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View()); // mount refresh
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname
+    mockedInvoke.mockResolvedValueOnce(s4View()); // post-save refresh
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[0]);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: 'KRILE-prime' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'aa'.repeat(32),
+      petname: 'KRILE-prime',
+    });
+    expect(saveDeviceLabel).toHaveBeenCalledWith('KRILE-prime');
+  });
+
+  it('one-shot migration seeds the fleet petname from a user-set local label', async () => {
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
+    mockedInvoke.mockResolvedValueOnce(s4View()); // mount refresh (self has no petName)
+    mockedInvoke.mockResolvedValueOnce(undefined); // migration set_device_petname
+    mockedInvoke.mockResolvedValueOnce(withSibling({})); // post-migration refresh
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'aa'.repeat(32),
+      petname: 'KRILE',
+    });
+  });
+
+  it('no migration when the self row already has a petname', async () => {
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
+    const view = s4View();
+    view.devices[0] = { ...view.devices[0], petName: 'Koya' };
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('Koya');
+    await tick();
+    const petnameCalls = mockedInvoke.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'set_device_petname',
+    );
+    expect(petnameCalls.length).toBe(0);
+  });
+
+  // ── PR #454 round 1 ──────────────────────────────────────────────────────
+
+  it('a fleet-cleared petname suppresses the private local label (no stale resurface)', async () => {
+    // Greptile P1 (round 2): sibling clears THIS device's petname → backend
+    // sends petName: "". The ladder must show the backend placeholder, not
+    // keep rendering the stale localStorage label.
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
+    const view = s4View();
+    view.devices[0] = { ...view.devices[0], petName: '' };
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    expect(screen.queryByText('KRILE')).toBeNull();
+    expect(screen.getByText('this device', { selector: '.device-name' })).toBeInTheDocument();
+  });
+
+  it('no migration for an explicitly CLEARED petname (Some("") ≠ never named)', async () => {
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
+    const view = s4View();
+    view.devices[0] = { ...view.devices[0], petName: '' };
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    await tick();
+    const petnameCalls = mockedInvoke.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'set_device_petname',
+    );
+    expect(petnameCalls.length).toBe(0);
+  });
+
+  it('empty save clears a sibling petname through the IPC', async () => {
+    mockedInvoke.mockResolvedValueOnce(withSibling({ petName: 'Ildwyn' })); // mount
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname (clear)
+    mockedInvoke.mockResolvedValueOnce(withSibling({ petName: '' })); // refresh
+    render(DevicesPanel);
+    await screen.findByText('Ildwyn');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[renameBtns.length - 1]);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: '' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'bb'.repeat(32),
+      petname: '',
+    });
+    // Sibling clear never touches this device's local label store.
+    expect(clearDeviceLabel).not.toHaveBeenCalled();
+    // Cleared name falls back to the backend display name.
+    await screen.findByText('Device bb22cc33');
+  });
+
+  it('clearing the self petname also removes the local fallback label', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View()); // mount (self petName null, no label → no migration)
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname (clear)
+    mockedInvoke.mockResolvedValueOnce(s4View()); // refresh
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[0]); // self row
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: '   ' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'aa'.repeat(32),
+      petname: '',
+    });
+    expect(clearDeviceLabel).toHaveBeenCalled();
+    expect(saveDeviceLabel).not.toHaveBeenCalled();
+  });
+
+  it('over-length rename shows an inline error and never invokes the IPC', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View());
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[renameBtns.length - 1]);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: 'x'.repeat(65) } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(screen.getByRole('alert')).toHaveTextContent(/too long/i);
+    const petnameCalls = mockedInvoke.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'set_device_petname',
+    );
+    expect(petnameCalls.length).toBe(0);
+    // Cancel clears the error.
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('counts code points, not UTF-16 units (64 emoji are accepted)', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View()); // mount
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname
+    mockedInvoke.mockResolvedValueOnce(s4View()); // refresh
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[renameBtns.length - 1]);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    // 64 surrogate-pair emoji = 128 UTF-16 units but exactly the 64-char cap.
+    await fireEvent.input(input, { target: { value: '😀'.repeat(64) } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'bb'.repeat(32),
+      petname: '😀'.repeat(64),
+    });
   });
 });

@@ -33,6 +33,19 @@ export function saveDeviceLabel(label: string): void {
 }
 
 /**
+ * ZEB-668 S4 (PR #454 round 1): remove the stored label. Called when the
+ * user clears this device's fleet petname — the local fallback must go too,
+ * or the ladder instantly re-shows the stale name.
+ */
+export function clearDeviceLabel(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // localStorage unavailable — non-fatal.
+  }
+}
+
+/**
  * A default label derived from the OS hostname, falling back to "This device"
  * when the hostname is unavailable (not in Tauri, plugin error, null result,
  * or `os:allow-hostname` not granted). Read-only: callers decide whether to
