@@ -219,6 +219,7 @@ pub mod owner_state_crypto;
 pub mod owner_state_persist;
 pub mod owner_state_sync;
 pub mod owner_state_types;
+pub mod owner_trust_sync;
 pub mod pairing;
 pub mod pairing_commands;
 pub mod pending_dm_invites;
