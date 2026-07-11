@@ -253,6 +253,10 @@ pub mod recovery_policy;
 pub mod resume_detector;
 mod save_dialog;
 pub mod state_snapshot;
+// ZEB-669 slice 2: storage-buddy domain — signed pledge/backup-set/
+// hosting records, bounded LWW record store, refcounted hosting ledger,
+// persisted settings, and the pure auto-pin planner.
+pub mod storage_signing;
 // ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map
 // (TunnelManager) + per-connection async driver (tunnel_task: responder
 // acceptor + initiator dialer over the persistent iroh endpoint).

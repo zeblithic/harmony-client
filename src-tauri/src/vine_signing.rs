@@ -42,7 +42,7 @@ const REACTION_DOMAIN: &str = "harmony-vine-reaction-v1";
 /// Domain-separation prefix + version for follow-list canonical bytes.
 const FOLLOW_LIST_DOMAIN: &str = "harmony-vine-follows-v1";
 
-fn push_str(out: &mut Vec<u8>, s: &str) {
+pub(crate) fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
     out.extend_from_slice(s.as_bytes());
 }
@@ -59,7 +59,7 @@ fn push_opt_str(out: &mut Vec<u8>, s: &Option<String>) {
     }
 }
 
-fn push_u64(out: &mut Vec<u8>, v: u64) {
+pub(crate) fn push_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
@@ -153,7 +153,7 @@ pub fn sign_follow_list(
 /// Ed25519 over the canonical bytes (`verify_strict` rejects
 /// non-canonical S values / small-order R points — RFC 8032 strict
 /// subset, mirroring `vine_tombstone::verify_tombstone`).
-fn verify_signed(
+pub(crate) fn verify_signed(
     identity_pub: Option<&str>,
     sig: Option<&str>,
     claimed_address: &str,
