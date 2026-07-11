@@ -1938,6 +1938,11 @@ pub struct TelemetryEventPayload {
 
 const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
 
+/// Content-availability announcements (`harmony/announce/{cid_hex}`).
+/// Publishes on this prefix attach the local zid (ZEB-669 slice 1) so
+/// receivers' `ObservedHolders` can attribute the announcing session.
+const ANNOUNCE_PREFIX: &str = "harmony/announce/";
+
 // ZEB-338: the single honest "owner identity not loaded" message. Use this at
 // owner-derived-handle guards so the phrasing can't drift between call sites.
 // (Incremental adoption — applied where edited, not a blanket sweep.)
@@ -14407,7 +14412,7 @@ pub fn parse_content_announcement(
     key_expr: &str,
     payload: &[u8],
 ) -> Option<ContentAnnouncementPayload> {
-    let cid_hex = key_expr.strip_prefix("harmony/announce/")?;
+    let cid_hex = key_expr.strip_prefix(ANNOUNCE_PREFIX)?;
     if cid_hex.is_empty() {
         return None;
     }
@@ -14443,7 +14448,7 @@ pub fn collect_reannouncements(index: &content_index::ContentIndex) -> Vec<(Stri
         }
         let size = u32::try_from(entry.size_bytes).unwrap_or(u32::MAX);
         out.push((
-            format!("harmony/announce/{}", hex::encode(entry.cid)),
+            format!("{}{}", ANNOUNCE_PREFIX, hex::encode(entry.cid)),
             size.to_be_bytes().to_vec(),
         ));
     }
