@@ -356,8 +356,11 @@
   }
 
   /* ZEB-671: degree chips per the drawn Discover anatomy — 2nd = green
-     (accent family), 3rd = clay/amber. Chip text follows --on-accent so
-     both themes keep contrast on the solid fills. */
+     (accent family), 3rd = clay/amber. Each chip uses a token PAIR
+     designed for contrast in both themes: accent/on-accent, and
+     clay-deep/clay-soft (which invert together across themes —
+     CodeRabbit PR #447 flagged white-on-clay as borderline in light
+     mode). */
   .degree-chip {
     font-family: var(--font-mono);
     font-size: 0.6rem;
@@ -370,7 +373,8 @@
   }
 
   .degree-chip.deg3 {
-    background: var(--gov-clay);
+    background: var(--gov-clay-deep);
+    color: var(--gov-clay-soft);
   }
 
   .via-line {

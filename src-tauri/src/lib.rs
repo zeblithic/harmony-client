@@ -9586,6 +9586,12 @@ pub async fn start_node_inner(
                         guard.voice_signal_tx = Some(voice_signal_tx);
                         guard.follow_mgr = Some(follow_mgr);
                         guard.vine_share_follows = vine_settings_loaded.share_follows;
+                        // ZEB-671: restore the LWW floor so a backwards
+                        // wall clock across restarts can't publish
+                        // records receivers ignore (Qodo PR #447).
+                        guard.follow_list_clock = std::sync::atomic::AtomicU64::new(
+                            vine_settings_loaded.last_published_updated_at,
+                        );
                         guard.vine_settings_path = Some(vine_settings_path);
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
@@ -14022,7 +14028,10 @@ fn build_signed_follow_list_with(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Strictly-increasing per session — see `follow_list_clock`.
+    // Strictly increasing — floored by the persisted high-water mark so
+    // the guarantee survives restarts and backwards wall clocks (Qodo
+    // PR #447). Best-effort persistence: a failed write only narrows
+    // the protection back to same-session.
     let updated_at = {
         use std::sync::atomic::Ordering;
         let prev = guard.follow_list_clock.load(Ordering::Relaxed);
@@ -14030,6 +14039,15 @@ fn build_signed_follow_list_with(
         guard.follow_list_clock.store(ts, Ordering::Relaxed);
         ts
     };
+    if let Some(path) = guard.vine_settings_path.as_ref() {
+        vine_settings::save(
+            path,
+            &vine_settings::VineSettings {
+                share_follows: guard.vine_share_follows,
+                last_published_updated_at: updated_at,
+            },
+        );
+    }
     let mut payload = VineFollowListPayload {
         owner_address: guard.node_addr.clone(),
         follows,
@@ -14154,7 +14172,15 @@ pub(crate) fn set_vine_settings_impl(
     let changed = guard.vine_share_follows != share_follows;
     guard.vine_share_follows = share_follows;
     if let Some(path) = guard.vine_settings_path.clone() {
-        vine_settings::save(&path, &vine_settings::VineSettings { share_follows });
+        vine_settings::save(
+            &path,
+            &vine_settings::VineSettings {
+                share_follows,
+                last_published_updated_at: guard
+                    .follow_list_clock
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        );
     }
     if !changed {
         return Ok(());

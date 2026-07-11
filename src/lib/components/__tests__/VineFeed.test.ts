@@ -703,6 +703,16 @@ describe('feed-level delete (ZEB-670 creator tombstone)', () => {
       await waitFor(() => expect(onSetShareFollows).toHaveBeenCalledWith(false));
     });
 
+    it('keeps the share-follows toggle disabled when the read fails', async () => {
+      const getShareFollows = vi.fn().mockRejectedValue(new Error('ipc down'));
+      const onSetShareFollows = vi.fn();
+      renderDiscover({ getShareFollows, onSetShareFollows });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('ipc down'));
+      expect((screen.getByTestId('share-follows-toggle') as HTMLInputElement).disabled).toBe(true);
+      expect(onSetShareFollows).not.toHaveBeenCalled();
+    });
+
     it('surfaces a share-follows write failure and reverts the box', async () => {
       const getShareFollows = vi.fn().mockResolvedValue(true);
       const onSetShareFollows = vi.fn().mockRejectedValue(new Error('not connected'));

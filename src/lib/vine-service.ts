@@ -430,7 +430,10 @@ export class VineService {
     // ZEB-671: the degree-1 set changed — the backend recomputed reach
     // synchronously during the IPC, so a refetch picks up new degrees.
     // No backend event fires for locally-initiated changes.
-    void this.refreshGraphAnnotations().catch(() => {});
+    void this.refreshGraphAnnotations().catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn('vine graph refresh failed:', msg);
+    });
   }
 
   async unfollow(address: string): Promise<void> {
@@ -445,7 +448,10 @@ export class VineService {
     }
     this.onChange?.();
     // ZEB-671: see follow() — refetch degree/via after the graph change.
-    void this.refreshGraphAnnotations().catch(() => {});
+    void this.refreshGraphAnnotations().catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn('vine graph refresh failed:', msg);
+    });
   }
 
   async loadFollowed(): Promise<void> {
@@ -687,7 +693,6 @@ export class VineService {
     }
   }
 
-  /** Convert wire format to frontend VineVideo type. */
   /**
    * ZEB-671: re-pull `list_vine_videos` and patch `degree`/`via` onto
    * entries already in the feed (the graph changed; rows themselves are
@@ -718,6 +723,7 @@ export class VineService {
     }
   }
 
+  /** Convert wire format to frontend VineVideo type. */
   private wireToVine(wire: VineDescriptorEvent): VineVideo {
     // Self-published vines echo back via Zenoh — map to 'self'/ownDisplayName.
     const isSelf = this.ownAddress != null && wire.creatorAddress === this.ownAddress;

@@ -33,6 +33,14 @@ pub const MAX_FOLLOWS_PER_LIST: usize = 1000;
 /// stalest list (lowest `updated_at`) is evicted.
 pub const MAX_FOLLOW_LISTS: usize = 5000;
 
+/// ZEB-671: byte ceiling for a follow-list wire payload, checked BEFORE
+/// JSON parsing (CodeRabbit PR #447 — the topic is peer-writable, and
+/// `MAX_FOLLOWS_PER_LIST` alone only rejects after serde has already
+/// paid for an arbitrarily large document). A maximal legitimate record
+/// is ~68 KB (1000 × 64-hex addresses + envelope + sig fields); 96 KB
+/// leaves comfortable slack.
+pub const MAX_FOLLOW_LIST_WIRE_BYTES: usize = 96 * 1024;
+
 /// On-disk filename for the cached Vine feed. Lives under `app_data_dir`.
 const VINE_FEED_FILE: &str = "vine_feed.json";
 
@@ -952,6 +960,14 @@ impl VineFeedCache {
     /// oversized lists are rejected; the map is bounded by
     /// `MAX_FOLLOW_LISTS` (stalest evicted).
     pub fn on_follow_list_sample(&mut self, key_expr: &str, payload: &[u8]) -> FollowListOutcome {
+        // Byte cap BEFORE parsing — the topic is peer-writable, so an
+        // oversized document must not get free serde work.
+        if payload.len() > MAX_FOLLOW_LIST_WIRE_BYTES {
+            return FollowListOutcome::Rejected(format!(
+                "follow list payload exceeds wire cap: {} > {MAX_FOLLOW_LIST_WIRE_BYTES} bytes",
+                payload.len()
+            ));
+        }
         let list: crate::VineFollowListPayload = match serde_json::from_slice(payload) {
             Ok(l) => l,
             Err(e) => return FollowListOutcome::Rejected(format!("follow list parse failed: {e}")),
@@ -3506,6 +3522,18 @@ mod tests {
         let entry = cache.follow_lists().get(&addr("fl-alice")).unwrap();
         assert!(entry.follows.is_empty(), "retraction clears the edges");
         assert_eq!(entry.updated_at, 200);
+    }
+
+    #[test]
+    fn oversized_wire_payload_is_rejected_before_parse() {
+        let mut cache = VineFeedCache::new();
+        let blob = vec![b'x'; MAX_FOLLOW_LIST_WIRE_BYTES + 1];
+        let outcome = cache.on_follow_list_sample(&follows_topic("fl-alice"), &blob);
+        assert!(
+            matches!(outcome, FollowListOutcome::Rejected(ref r) if r.contains("wire cap")),
+            "got {outcome:?}"
+        );
+        assert!(cache.follow_lists().is_empty(), "no state effect");
     }
 
     #[test]

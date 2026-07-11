@@ -3,9 +3,9 @@
 //! publication (Jake's call on ZEB-671: publish by default, one toggle
 //! to stop publishing and retract).
 //!
-//! Same atomic-write posture as `follows.rs`: write a temp file next to
-//! the target, then rename. Missing/corrupt/wrong-version files load as
-//! defaults.
+//! Writes go through `identity::write_atomic_0600` (per-write unique
+//! temp + `create_new` + fsync + rename). Missing/corrupt/wrong-version
+//! files load as defaults.
 
 use std::path::{Path, PathBuf};
 
@@ -21,12 +21,21 @@ pub struct VineSettings {
     /// retraction and suppresses all further publishes (including the
     /// boot republish) until re-enabled.
     pub share_follows: bool,
+    /// Highest `updated_at` this node has ever signed into a follow-list
+    /// record. Seeds `NodeState::follow_list_clock` at boot so the
+    /// LWW floor survives restarts — without it, a wall clock that moved
+    /// backwards across a restart could publish records every receiver
+    /// ignores (`<=` is stale), silently stalling updates and the
+    /// opt-out retraction (Qodo PR #447).
+    #[serde(default)]
+    pub last_published_updated_at: u64,
 }
 
 impl Default for VineSettings {
     fn default() -> Self {
         VineSettings {
             share_follows: true,
+            last_published_updated_at: 0,
         }
     }
 }
@@ -55,9 +64,12 @@ pub fn load_or_default(path: &Path) -> VineSettings {
     }
 }
 
-/// Atomically persist `settings` to `path` (temp file + rename).
-/// Best-effort: failures are logged, never surfaced — the in-memory
-/// value on `NodeState` remains authoritative for the session.
+/// Atomically persist `settings` to `path` via the repo's per-write
+/// unique-temp pattern (`identity::write_atomic_0600` — a fixed `.tmp`
+/// sibling would let two concurrent saves clobber each other's staging
+/// file; Qodo PR #447). Best-effort: failures are logged, never
+/// surfaced — the in-memory value on `NodeState` remains authoritative
+/// for the session.
 pub fn save(path: &Path, settings: &VineSettings) {
     let file = VineSettingsFile {
         version: FILE_VERSION,
@@ -70,21 +82,8 @@ pub fn save(path: &Path, settings: &VineSettings) {
             return;
         }
     };
-    let tmp_path = {
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(".tmp");
-        path.with_file_name(name)
-    };
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match std::fs::write(&tmp_path, &json) {
-        Ok(()) => {
-            if let Err(e) = std::fs::rename(&tmp_path, path) {
-                tracing::error!(error = %e, "vine settings rename failed");
-            }
-        }
-        Err(e) => tracing::error!(error = %e, "vine settings write failed"),
+    if let Err(e) = crate::identity::write_atomic_0600(path, &json) {
+        tracing::error!(error = %e, "vine settings write failed");
     }
 }
 
@@ -113,16 +112,33 @@ mod tests {
             &path,
             &VineSettings {
                 share_follows: false,
+                last_published_updated_at: 1_700_000_400,
             },
         );
-        assert!(!load_or_default(&path).share_follows);
+        let loaded = load_or_default(&path);
+        assert!(!loaded.share_follows);
+        assert_eq!(
+            loaded.last_published_updated_at, 1_700_000_400,
+            "LWW floor must survive restarts"
+        );
         save(
             &path,
             &VineSettings {
                 share_follows: true,
+                last_published_updated_at: 0,
             },
         );
         assert!(load_or_default(&path).share_follows);
+    }
+
+    #[test]
+    fn legacy_file_without_floor_field_defaults_to_zero() {
+        let dir = temp_dir();
+        let path = settings_path(&dir);
+        std::fs::write(&path, br#"{"version": 1, "share_follows": false}"#).unwrap();
+        let loaded = load_or_default(&path);
+        assert!(!loaded.share_follows);
+        assert_eq!(loaded.last_published_updated_at, 0);
     }
 
     #[test]

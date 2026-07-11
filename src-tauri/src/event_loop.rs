@@ -4367,6 +4367,15 @@ pub async fn run(
                         let key = format!("harmony/vines/{owner}/follows");
                         if let Err(e) = session.put(&key, payload).await {
                             tracing::error!(error = %e, key, "follow-list publish failed");
+                            // Same degraded-sync signal the other publish
+                            // adapters emit (CodeRabbit PR #447): the UI
+                            // can surface that Discover-graph propagation
+                            // is impaired instead of failing silently.
+                            crate::node_event_sink::emit_ser(
+                                app.as_ref(),
+                                "follow-list-sync-degraded",
+                                &serde_json::json!({ "reason": "publish_failed", "key": key }),
+                            );
                         }
                     }
                 }

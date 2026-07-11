@@ -93,8 +93,14 @@
   let tuneOpen = $state(false);
   /** Backend share_follows state, loaded when the Tune sheet opens. */
   let shareFollows = $state(true);
+  /** True once getShareFollows() has succeeded — the toggle stays
+   *  disabled until then so a load failure can't present an unknown
+   *  privacy state as togglable (CodeRabbit PR #447). */
+  let shareFollowsLoaded = $state(false);
   let shareFollowsBusy = $state(false);
   let shareFollowsError = $state('');
+  /** Focus target when the Tune sheet opens (dialog a11y). */
+  let tuneSheetEl = $state<HTMLDivElement | null>(null);
 
   function saveTunePrefs() {
     try {
@@ -241,8 +247,11 @@
     if (getShareFollows) {
       try {
         shareFollows = await getShareFollows();
+        shareFollowsLoaded = true;
       } catch (e: unknown) {
-        shareFollowsError = e instanceof Error ? e.message : String(e);
+        const msg = e instanceof Error ? e.message : String(e);
+        shareFollowsError = msg;
+        shareFollowsLoaded = false;
       }
     }
   }
@@ -257,12 +266,19 @@
       shareFollows = want;
       shareFollowsError = '';
     } catch (err: unknown) {
-      shareFollowsError = err instanceof Error ? err.message : String(err);
+      const msg = err instanceof Error ? err.message : String(err);
+      shareFollowsError = msg;
       input.checked = shareFollows;
     } finally {
       shareFollowsBusy = false;
     }
   }
+
+  // Dialog a11y (CodeRabbit PR #447): focus moves into the sheet on
+  // open; Escape dismisses.
+  $effect(() => {
+    if (tuneOpen) tuneSheetEl?.focus();
+  });
 
   // ── Center-detection autoplay ───────────────────────────────────────
 
@@ -595,13 +611,22 @@
   {/if}
 </div>
 
+<svelte:window onkeydown={(e) => { if (tuneOpen && e.key === 'Escape') tuneOpen = false; }} />
+
 {#if tuneOpen}
   <div
     class="tune-overlay"
     role="presentation"
     onclick={(e) => { if (e.target === e.currentTarget) tuneOpen = false; }}
   >
-    <div class="tune-sheet" role="dialog" aria-label="Tune your Discover">
+    <div
+      class="tune-sheet"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Tune your Discover"
+      tabindex="-1"
+      bind:this={tuneSheetEl}
+    >
       <h3 class="tune-title">Tune your Discover</h3>
       <p class="tune-copy">Degree follows — no algorithm, just your social graph.</p>
       <label class="tune-row">
@@ -627,7 +652,7 @@
           <input
             type="checkbox"
             checked={shareFollows}
-            disabled={shareFollowsBusy}
+            disabled={shareFollowsBusy || !shareFollowsLoaded}
             onchange={handleShareFollowsToggle}
             data-testid="share-follows-toggle"
           />

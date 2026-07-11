@@ -36,11 +36,14 @@ pub struct Reach {
 /// follow lists. `neighbors(addr)` returns the verified follow list an
 /// owner published, if cached.
 ///
-/// Deterministic: frontier and neighbor iteration are sorted, so ties
-/// (two equal-length paths to one creator) always resolve to the
-/// lexicographically smallest chain, and the visited cap always trims
-/// the same nodes. `me` and degree-1 creators never appear in the
-/// output.
+/// Deterministic: each depth is resolved in two phases — collect every
+/// (candidate, via-chain) pair the depth can produce, then commit the
+/// lexicographically smallest chain per candidate (Qodo PR #447: a
+/// single-pass insert keyed the tie-break off the intermediate node's
+/// sort order, not the full chain — `["zz","b"]` could beat `["aa","c"]`
+/// and misattribute the mute root `via[0]`). The visited cap bounds the
+/// commit phase, so the SAME nodes survive the cap every run. `me` and
+/// degree-1 creators never appear in the output.
 pub fn compute_reach<'a, F>(me: &str, my_follows: &[String], neighbors: F) -> HashMap<String, Reach>
 where
     F: Fn(&str) -> Option<&'a [String]>,
@@ -62,34 +65,59 @@ where
     let mut visited = frontier.len();
 
     for depth in 2..=MAX_DEGREE {
-        let mut next_frontier: Vec<String> = Vec::new();
+        // Phase 1: gather the smallest via-chain per candidate across the
+        // WHOLE depth. BTreeMap keeps candidates sorted so the capped
+        // commit phase is deterministic. Bounded: once the map plus the
+        // committed count reaches the visited cap, no NEW candidates are
+        // admitted (existing ones still take smaller chains).
+        let mut best: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
         for node in &frontier {
             let Some(follows) = neighbors(node) else {
                 continue;
             };
-            let mut sorted: Vec<&String> = follows.iter().collect();
-            sorted.sort();
-            for candidate in sorted {
-                if visited >= MAX_BFS_VISITED {
-                    return reach;
-                }
+            for candidate in follows {
                 if candidate == me
                     || degree_one.contains(candidate)
                     || reach.contains_key(candidate)
                 {
                     continue;
                 }
-                visited += 1;
                 let mut via = paths.get(node).cloned().unwrap_or_default();
                 via.push(node.clone());
-                if depth < MAX_DEGREE {
-                    paths.insert(candidate.clone(), via.clone());
-                    next_frontier.push(candidate.clone());
+                // Computed before the entry borrow (E0502); admission of
+                // NEW candidates stops at the cap, min-updates continue.
+                let at_cap = visited + best.len() >= MAX_BFS_VISITED;
+                match best.entry(candidate.clone()) {
+                    std::collections::btree_map::Entry::Occupied(mut e) => {
+                        if via < *e.get() {
+                            e.insert(via);
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        if at_cap {
+                            continue;
+                        }
+                        e.insert(via);
+                    }
                 }
-                reach.insert(candidate.clone(), Reach { degree: depth, via });
             }
         }
-        next_frontier.sort();
+
+        // Phase 2: commit (sorted by candidate address) and build the
+        // next frontier.
+        let mut next_frontier: Vec<String> = Vec::new();
+        for (candidate, via) in best {
+            if visited >= MAX_BFS_VISITED {
+                return reach;
+            }
+            visited += 1;
+            if depth < MAX_DEGREE {
+                paths.insert(candidate.clone(), via.clone());
+                next_frontier.push(candidate.clone());
+            }
+            reach.insert(candidate, Reach { degree: depth, via });
+        }
         frontier = next_frontier;
     }
 
@@ -196,6 +224,31 @@ mod tests {
             &[("bob", &["zoe"]), ("amy", &["zoe"])],
         );
         assert_eq!(reach.get("zoe").unwrap().via, vec!["amy".to_string()]);
+    }
+
+    #[test]
+    fn full_chain_tie_break_beats_intermediate_node_order() {
+        // Qodo PR #447: target is reachable at 3° via ["zz","b"] AND
+        // ["aa","c"]. Traversal ordered by the intermediate node would
+        // process b before c and lock in the LARGER chain; the tie-break
+        // must compare full chains and pick ["aa","c"].
+        let reach = reach_with(
+            "me",
+            &["aa", "zz"],
+            &[
+                ("aa", &["c"]),
+                ("zz", &["b"]),
+                ("b", &["target"]),
+                ("c", &["target"]),
+            ],
+        );
+        assert_eq!(
+            reach.get("target"),
+            Some(&Reach {
+                degree: 3,
+                via: vec!["aa".into(), "c".into()]
+            })
+        );
     }
 
     #[test]
