@@ -23480,6 +23480,7 @@ mod list_community_forks_tests {
                 joined_at: hlc_at(0),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         m
@@ -23652,6 +23653,7 @@ mod list_community_forks_tests {
                 joined_at: hlc_at(50),
                 left_at: Some(hlc_at(150)),
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
 
@@ -29916,6 +29918,7 @@ mod list_bootstrap_hint_tests {
             },
             left_at: None,
             enrolled_device_keys: BTreeSet::new(),
+            revoked_device_keys: BTreeSet::new(),
         }
     }
 
@@ -40002,7 +40005,11 @@ pub fn delta_to_change(
         // an already-Joined owner's MemberState — it changes no status/power
         // and projects no MembershipChange. (The roster re-renders the owner
         // identically; the multi-device effect is invisible at this layer.)
-        | crate::community_membership::MembershipEventKind::DeviceAnnounce => return None,
+        | crate::community_membership::MembershipEventKind::DeviceAnnounce
+        // ZEB-668 S3: DeviceRetire only removes/tombstones a device key —
+        // same reasoning as DeviceAnnounce: no status/power change, the
+        // roster is unchanged at this layer.
+        | crate::community_membership::MembershipEventKind::DeviceRetire { .. } => return None,
     };
     Some((cid_hex, change))
 }
@@ -40883,6 +40890,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(100, "a"),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -40892,6 +40900,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(200, "b"),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -40901,6 +40910,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(150, "c"),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -40910,6 +40920,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(300, "d"),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
 
@@ -40951,6 +40962,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(100, "x"),
                 left_at: Some(hlc(200, "x")),
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -40960,6 +40972,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(50, "y"),
                 left_at: Some(hlc(150, "y")),
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         let materialized = MaterializedMembership {
@@ -61799,6 +61812,7 @@ mod get_community_governance_tests {
             },
             left_at: None,
             enrolled_device_keys: BTreeSet::new(),
+            revoked_device_keys: BTreeSet::new(),
         }
     }
 

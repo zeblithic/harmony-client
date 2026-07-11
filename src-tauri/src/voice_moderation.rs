@@ -827,6 +827,7 @@ mod tests {
             },
             left_at: None,
             enrolled_device_keys: keys,
+            revoked_device_keys: BTreeSet::new(),
         }
     }
 

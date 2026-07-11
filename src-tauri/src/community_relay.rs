@@ -638,6 +638,7 @@ mod tests {
             joined_at: dummy_hlc(),
             left_at: None,
             enrolled_device_keys: keys,
+            revoked_device_keys: std::collections::BTreeSet::new(),
         }
     }
 

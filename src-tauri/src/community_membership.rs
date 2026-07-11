@@ -7,7 +7,7 @@
 //!
 //! See `docs/specs/2026-05-05-zeb-217-sub-c-communities-design.md`.
 
-use harmony_owner::certs::EnrollmentCert;
+use harmony_owner::certs::{EnrollmentCert, RevocationCert};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::{BTreeMap, BTreeSet};
@@ -353,6 +353,40 @@ pub enum MembershipEventKind {
     /// See `docs/specs/2026-06-18-zeb-340-part2-multi-device-per-community-design.md` §Unit 1.
     #[serde(rename = "e")]
     DeviceAnnounce,
+
+    /// ZEB-668 S3: retire-announce. A surviving enrolled device of `actor`
+    /// broadcasts that one of the owner's devices has been REVOKED, carrying
+    /// the proof (`RevocationCert`) plus the retired device's Master
+    /// `EnrollmentCert` — the cert that binds the 16-byte revocation target
+    /// to the 32-byte ed25519 key communities actually store (there is no
+    /// hash→key map on the receiving side). On materialize the key is
+    /// removed from `enrolled_device_keys` AND tombstoned in
+    /// `revoked_device_keys` (remove-wins: no replay order can re-add it).
+    ///
+    /// Signer: any surviving enrolled device — steady-state
+    /// `resolve_enrolled_signer`, NOT the cert side-channel path (the `en`
+    /// side-channel stays None; the carried certs describe the RETIRED
+    /// device, not the signer). Authorization: actor exists in `members`
+    /// (ANY status — removal is subtractive; a Left owner's compromised key
+    /// must still be retirable) and the cert pair proves itself
+    /// (`verify_device_retire_certs`). No power level.
+    ///
+    /// Variant code "t" (1-char value, unused before this). Inner field
+    /// keys are 2-char (rc, ec) per the same-length-keys invariant at this
+    /// nesting level; the embedded harmony-owner certs are opaque CBOR maps
+    /// below it (same as the `en` side-channel precedent).
+    /// See `docs/specs/2026-07-11-zeb-668-device-management-design.md` §4.
+    #[serde(rename = "t")]
+    DeviceRetire {
+        #[serde(rename = "rc")]
+        revocation: RevocationCert,
+        /// Boxed (clippy `large_enum_variant`): the cert embeds two full
+        /// `PubKeyBundle`s and would otherwise dominate every
+        /// `MembershipEventKind` value. `Box<T>` is serde-transparent —
+        /// the wire encoding is identical to the bare cert.
+        #[serde(rename = "ec")]
+        enrollment: Box<EnrollmentCert>,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -906,6 +940,19 @@ pub enum VerifyError {
     /// NEW key when the set is already at the cap is rejected, bounding the
     /// per-member verify cost regardless of input.
     EnrolledDeviceKeyLimit,
+    /// ZEB-668 S3: a `DeviceRetire` whose actor has no member entry at all.
+    /// ANY member status is acceptable (retire is subtractive; a Left/Banned
+    /// owner's stale key must still be retirable) — this fires only for
+    /// never-members.
+    DeviceRetireForNonMember,
+    /// ZEB-668 S3: a `DeviceRetire` whose carried cert pair fails
+    /// verification or doesn't bind: owner_id ≠ actor on either cert,
+    /// revocation target ≠ enrollment device_id, non-Master enrollment
+    /// issuer, bad signature on either cert, Quorum revocation issuer
+    /// (unverifiable community-side, same posture as
+    /// `EnrollmentCertInvalid`'s non-Master rule), or an oversize
+    /// `Other(reason)` string.
+    DeviceRetireCertInvalid,
 
     // ── ZEB-458 P4B CommunityRelayAnnounce verify rules ───────────────────────
     //
@@ -1134,6 +1181,18 @@ impl std::fmt::Display for VerifyError {
                 write!(
                     f,
                     "ZEB-401 DeviceAnnounce would exceed MAX_ENROLLED_DEVICE_KEYS ({MAX_ENROLLED_DEVICE_KEYS}) for the actor"
+                )
+            }
+            VerifyError::DeviceRetireForNonMember => {
+                write!(
+                    f,
+                    "ZEB-668 DeviceRetire actor has no member entry in this community"
+                )
+            }
+            VerifyError::DeviceRetireCertInvalid => {
+                write!(
+                    f,
+                    "ZEB-668 DeviceRetire carried an invalid or unbound revocation/enrollment cert pair"
                 )
             }
         }
@@ -1365,6 +1424,67 @@ pub fn enrolled_key_from_cert(
     })
 }
 
+/// ZEB-668 S3: validate the cert pair carried by a `DeviceRetire`, proving —
+/// with no communal state beyond the actor's OwnerAddr — that:
+///
+/// 1. `enrollment` is a genuine Master-issued cert for the actor's owner
+///    (embedded master key hashes to `owner_id == actor.0`), binding the
+///    16-byte `device_id` to the 32-byte ed25519 key communities store.
+///    Verified at the cert's own `issued_at`, NOT event time (unlike
+///    `enrolled_key_from_cert`): retire must work for certs that have since
+///    EXPIRED — expiry gates a key's authority to ACT, which is irrelevant
+///    to removing it; the signature binding is what's load-bearing here.
+/// 2. `revocation` targets exactly that device (`target == device_id`),
+///    names the same owner, and its signature verifies: Master-issued certs
+///    are self-contained (`verify(None)` checks the embedded master key
+///    hashes to `owner_id`); SelfDevice certs verify under the retired
+///    device's own ed25519 key taken from the enrollment cert. Quorum
+///    issuers are rejected — unverifiable community-side, same posture as
+///    `enrolled_key_from_cert`'s non-Master rule.
+/// 3. An `Other(reason)` string is capped — same DoS posture as moderation
+///    reasons (a malicious peer must not persist a giant string on every
+///    replica).
+fn verify_device_retire_certs(
+    actor: &OwnerAddr,
+    revocation: &RevocationCert,
+    enrollment: &EnrollmentCert,
+) -> Result<(), VerifyError> {
+    use harmony_owner::certs::{EnrollmentIssuer, RevocationIssuer, RevocationReason};
+    if enrollment.owner_id != actor.0
+        || revocation.owner_id != actor.0
+        || revocation.target != enrollment.device_id
+    {
+        return Err(VerifyError::DeviceRetireCertInvalid);
+    }
+    if !matches!(enrollment.issuer, EnrollmentIssuer::Master { .. }) {
+        return Err(VerifyError::DeviceRetireCertInvalid);
+    }
+    if enrollment.verify(enrollment.issued_at).is_err() {
+        return Err(VerifyError::DeviceRetireCertInvalid);
+    }
+    if let RevocationReason::Other(s) = &revocation.reason {
+        if s.chars().count() > MAX_MODERATION_REASON_CHARS {
+            return Err(VerifyError::DeviceRetireCertInvalid);
+        }
+    }
+    let ok = match &revocation.issuer {
+        RevocationIssuer::Master { .. } => revocation.verify(None).is_ok(),
+        RevocationIssuer::SelfDevice => {
+            let retired_vk = enrollment.device_pubkeys.classical.ed25519_verify;
+            match ed25519_dalek::VerifyingKey::from_bytes(&retired_vk) {
+                Ok(vk) => revocation.verify(Some(&vk)).is_ok(),
+                Err(_) => false,
+            }
+        }
+        RevocationIssuer::Quorum { .. } => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(VerifyError::DeviceRetireCertInvalid)
+    }
+}
+
 /// Steady-state signer resolution: find the actor's enrolled device key (from
 /// materialized membership) that verifies this event's signature.
 fn resolve_enrolled_signer(
@@ -1525,6 +1645,16 @@ pub struct MemberState {
     /// state); populated with exactly one today.
     #[serde(rename = "ek", default, skip_serializing_if = "BTreeSet::is_empty")]
     pub enrolled_device_keys: BTreeSet<[u8; 32]>,
+    /// ZEB-668 S3: tombstones for retired (revoked) device keys —
+    /// remove-wins. A key present here is NEVER re-added by any key-adding
+    /// arm: `materialize` is a deterministic replay in `event_sort_key`
+    /// order, and clock skew can sort a DeviceRetire BEFORE the
+    /// DeviceAnnounce it retires — without the tombstone every replica
+    /// would converge on the retired key resurrected. Additive field:
+    /// `#[serde(default)]` + empty-skip keeps pre-S3 blobs and empty-set
+    /// encodings byte-identical (no version bump).
+    #[serde(rename = "rk", default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub revoked_device_keys: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1933,10 +2063,18 @@ pub fn materialize_with_now(
                     // ZEB-339: preserve any prior enrolled keys (so a rejoin
                     // doesn't drop a previously-learned device key), then
                     // insert the key from the cert carried on this Join.
-                    let mut enrolled = m
+                    // ZEB-668 S3: tombstones are carried forward too — a
+                    // rejoin must not wipe them — and a tombstoned (retired)
+                    // key is refused re-entry (remove-wins).
+                    let (mut enrolled, revoked) = m
                         .members
                         .get(&event.actor)
-                        .map(|s| s.enrolled_device_keys.clone())
+                        .map(|s| {
+                            (
+                                s.enrolled_device_keys.clone(),
+                                s.revoked_device_keys.clone(),
+                            )
+                        })
                         .unwrap_or_default();
                     // SECURITY INVARIANT (load-bearing): the cert is ingested
                     // WITHOUT re-verification here. This is safe ONLY because an
@@ -1950,10 +2088,10 @@ pub fn materialize_with_now(
                     // If a future path ever inserts events into the log bypassing
                     // `verify_event` (e.g. snapshot-seed / import), re-verify here.
                     if let Some(cert) = event.enrollment.as_ref() {
-                        insert_enrolled_key_capped(
-                            &mut enrolled,
-                            cert.device_pubkeys.classical.ed25519_verify,
-                        );
+                        let key = cert.device_pubkeys.classical.ed25519_verify;
+                        if !revoked.contains(&key) {
+                            insert_enrolled_key_capped(&mut enrolled, key);
+                        }
                     }
                     m.members.insert(
                         event.actor,
@@ -1962,6 +2100,7 @@ pub fn materialize_with_now(
                             joined_at: event.at.clone(),
                             left_at: None,
                             enrolled_device_keys: enrolled,
+                            revoked_device_keys: revoked,
                         },
                     );
                     // ZEB-249: if any rotation has already happened
@@ -2038,6 +2177,15 @@ pub fn materialize_with_now(
                     | Some(MemberStatus::PendingJoin) => false,
                 };
                 if should_refresh {
+                    // ZEB-668 S3: tombstones survive the refresh — a
+                    // re-invited Left member's retired keys must stay
+                    // retired (remove-wins), or a post-rejoin
+                    // DeviceAnnounce could resurrect them.
+                    let revoked = m
+                        .members
+                        .get(target)
+                        .map(|s| s.revoked_device_keys.clone())
+                        .unwrap_or_default();
                     m.members.insert(
                         *target,
                         MemberState {
@@ -2045,6 +2193,7 @@ pub fn materialize_with_now(
                             joined_at: event.at.clone(),
                             left_at: None,
                             enrolled_device_keys: BTreeSet::new(),
+                            revoked_device_keys: revoked,
                         },
                     );
                 }
@@ -2407,10 +2556,18 @@ pub fn materialize_with_now(
                             // ONLY place the joiner's enrolled device key is
                             // learned, so without it their later steady-state
                             // events would fail SignerNotEnrolledForActor.
-                            let mut enrolled = m
+                            // ZEB-668 S3: tombstones carried forward + retired
+                            // keys refused re-entry (remove-wins) — same as the
+                            // Join arm.
+                            let (mut enrolled, revoked) = m
                                 .members
                                 .get(&event.actor)
-                                .map(|s| s.enrolled_device_keys.clone())
+                                .map(|s| {
+                                    (
+                                        s.enrolled_device_keys.clone(),
+                                        s.revoked_device_keys.clone(),
+                                    )
+                                })
                                 .unwrap_or_default();
                             // SECURITY INVARIANT: ingested without re-verification
                             // — safe only because this PendingJoin event was
@@ -2418,10 +2575,10 @@ pub fn materialize_with_now(
                             // before reaching the materialized log. See the Join
                             // arm above for the full rationale.
                             if let Some(cert) = event.enrollment.as_ref() {
-                                insert_enrolled_key_capped(
-                                    &mut enrolled,
-                                    cert.device_pubkeys.classical.ed25519_verify,
-                                );
+                                let key = cert.device_pubkeys.classical.ed25519_verify;
+                                if !revoked.contains(&key) {
+                                    insert_enrolled_key_capped(&mut enrolled, key);
+                                }
                             }
                             m.members.insert(
                                 event.actor,
@@ -2437,6 +2594,7 @@ pub fn materialize_with_now(
                                     joined_at: event.at.clone(),
                                     left_at: None,
                                     enrolled_device_keys: enrolled,
+                                    revoked_device_keys: revoked,
                                 },
                             );
                             // ZEB-254: mirror the Join arm's catchup invariant — a member
@@ -2458,16 +2616,24 @@ pub fn materialize_with_now(
                             // Same SECURITY INVARIANT as the Join arm: the event
                             // was already accepted by verify_event before reaching
                             // the materialized log.
-                            let mut enrolled = m
+                            // ZEB-668 S3: tombstones carried forward + retired
+                            // keys refused re-entry (remove-wins) — same as the
+                            // Join arm.
+                            let (mut enrolled, revoked) = m
                                 .members
                                 .get(&event.actor)
-                                .map(|s| s.enrolled_device_keys.clone())
+                                .map(|s| {
+                                    (
+                                        s.enrolled_device_keys.clone(),
+                                        s.revoked_device_keys.clone(),
+                                    )
+                                })
                                 .unwrap_or_default();
                             if let Some(cert) = event.enrollment.as_ref() {
-                                insert_enrolled_key_capped(
-                                    &mut enrolled,
-                                    cert.device_pubkeys.classical.ed25519_verify,
-                                );
+                                let key = cert.device_pubkeys.classical.ed25519_verify;
+                                if !revoked.contains(&key) {
+                                    insert_enrolled_key_capped(&mut enrolled, key);
+                                }
                             }
                             m.members.insert(
                                 event.actor,
@@ -2476,6 +2642,7 @@ pub fn materialize_with_now(
                                     joined_at: event.at.clone(),
                                     left_at: None,
                                     enrolled_device_keys: enrolled,
+                                    revoked_device_keys: revoked,
                                 },
                             );
                         }
@@ -2619,12 +2786,36 @@ pub fn materialize_with_now(
                             // arm. verify_event already rejects an over-limit
                             // DeviceAnnounce, but materialize holds the invariant
                             // uniformly even for an event that bypassed verification.
-                            insert_enrolled_key_capped(
-                                &mut member.enrolled_device_keys,
+                            // ZEB-668 S3: routed through the tombstone-aware
+                            // inserter — a retired key is never re-added.
+                            insert_enrolled_key_unless_retired(
+                                member,
                                 cert.device_pubkeys.classical.ed25519_verify,
                             );
                         }
                     }
+                }
+            }
+            MembershipEventKind::DeviceRetire {
+                revocation: _,
+                enrollment: cert,
+            } => {
+                // ZEB-668 S3: remove-wins retire — remove the retired key
+                // AND tombstone it so a DeviceAnnounce sorting after this
+                // event in the deterministic replay can never re-add it
+                // (clock skew can order the announce later even though it
+                // happened first).
+                //
+                // SECURITY INVARIANT (mirrors DeviceAnnounce): the cert pair
+                // was verified by verify_event → verify_device_retire_certs;
+                // this arm trusts the binding and must never panic on a
+                // malformed replayed event, hence the defensive get_mut.
+                // ANY member status qualifies (subtractive op — see the
+                // verify arm for the Left/Banned rationale).
+                if let Some(member) = m.members.get_mut(&event.actor) {
+                    let vk = cert.device_pubkeys.classical.ed25519_verify;
+                    member.enrolled_device_keys.remove(&vk);
+                    insert_revoked_tombstone_capped(&mut member.revoked_device_keys, vk);
                 }
             }
         }
@@ -3167,6 +3358,23 @@ pub fn verify_event(
                 }
             }
         }
+        MembershipEventKind::DeviceRetire {
+            revocation,
+            enrollment,
+        } => {
+            // ZEB-668 S3: subtractive retire. Actor must exist as a member —
+            // ANY status; a Left/Banned owner's stale device key must still
+            // be retirable (member state and enrolled keys persist across
+            // Leave, and a rejoin would otherwise resurrect the key). No
+            // power level: the authority is the carried RevocationCert
+            // itself, not the community ladder. Signer resolution (step 1,
+            // steady-state path) already proved the event is signed by one
+            // of the actor's currently-enrolled devices.
+            if !prior_state.members.contains_key(&event.actor) {
+                return Err(VerifyError::DeviceRetireForNonMember);
+            }
+            verify_device_retire_certs(&event.actor, revocation, enrollment)?;
+        }
     }
 
     // 5. Per-kind power rules.
@@ -3571,6 +3779,14 @@ pub fn verify_event(
             // membership check (step 4 above). A Master-signed cert for an
             // already-admitted owner only ever adds one of that owner's own
             // devices' keys — no escalation is possible.
+        }
+        MembershipEventKind::DeviceRetire { .. } => {
+            // ZEB-668 S3: NO power gate — same reasoning as DeviceAnnounce.
+            // Authorization is entirely the carried cert pair (verified in
+            // step 4's `verify_device_retire_certs`): a valid revocation for
+            // one of the actor's OWN devices only ever removes a key. No
+            // escalation is possible; requiring power would let a
+            // zero-power owner's compromised device linger.
         }
     }
 
@@ -4009,6 +4225,36 @@ fn insert_enrolled_key_capped(set: &mut BTreeSet<[u8; 32]>, key: [u8; 32]) {
     }
 }
 
+/// ZEB-668 S3: bound on `revoked_device_keys` tombstones per member — 2× the
+/// enrolled cap. Tombstones accumulate across the owner's whole rotation
+/// history and are never GC'd (that permanence is what makes them
+/// replay-order-proof). Minting one requires a valid master- or self-signed
+/// RevocationCert, so growth is owner-inflicted, not an attack surface. At
+/// the cap new tombstones are dropped — removal still happens; only the
+/// re-add guard for the dropped key degrades to order-dependent.
+pub const MAX_REVOKED_DEVICE_KEY_TOMBSTONES: usize = 2 * MAX_ENROLLED_DEVICE_KEYS;
+
+/// ZEB-668 S3: capped tombstone insert (mirrors `insert_enrolled_key_capped`).
+fn insert_revoked_tombstone_capped(set: &mut BTreeSet<[u8; 32]>, key: [u8; 32]) {
+    if set.contains(&key) || set.len() < MAX_REVOKED_DEVICE_KEY_TOMBSTONES {
+        set.insert(key);
+    }
+}
+
+/// ZEB-668 S3: tombstone-aware enrolled-key insert for materialize arms that
+/// hold a `&mut MemberState`. Refuses tombstoned (retired) keys — remove-wins
+/// — then applies the ZEB-401 cap. Key-adding arms that rebuild the
+/// `MemberState` literal from a cloned set (Join / PendingJoin) perform the
+/// identical `revoked.contains` check inline instead; a raw
+/// `insert_enrolled_key_capped` call without either guard would reopen the
+/// replay-order resurrection hole.
+fn insert_enrolled_key_unless_retired(member: &mut MemberState, key: [u8; 32]) {
+    if member.revoked_device_keys.contains(&key) {
+        return;
+    }
+    insert_enrolled_key_capped(&mut member.enrolled_device_keys, key);
+}
+
 /// ZEB-254: PendingJoin events older than this (community current HLC
 /// minus event HLC, in wall-ms) are hidden from materialize unless a
 /// matching JoinCountersign exists. 30 days.
@@ -4398,6 +4644,7 @@ mod auto_exec_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         // Power 99 is still below the 100 admin threshold — Joined alone
@@ -4431,6 +4678,7 @@ mod auto_exec_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         assert!(local_actor_can_mint_set_power(&mat, self_owner));
@@ -4467,6 +4715,7 @@ mod auto_exec_tests {
                     device_id: "test".to_string(),
                 }),
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         assert!(
@@ -4498,6 +4747,7 @@ mod auto_exec_tests {
                     device_id: "test".to_string(),
                 }),
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         assert!(
@@ -7103,6 +7353,7 @@ mod tests {
             },
             left_at: None,
             enrolled_device_keys: BTreeSet::new(),
+            revoked_device_keys: BTreeSet::new(),
         };
 
         let bytes = canonical_cbor_encode(&ms).unwrap();
@@ -7352,6 +7603,7 @@ mod zeb_254_pending_join_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
@@ -7392,6 +7644,7 @@ mod zeb_254_pending_join_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
@@ -7434,6 +7687,7 @@ mod zeb_254_pending_join_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
@@ -7478,6 +7732,7 @@ mod zeb_254_pending_join_verify_tests {
                     device_id: "t".into(),
                 }),
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
@@ -7844,6 +8099,7 @@ mod zeb_254_join_countersign_verify_tests {
             },
             left_at: None,
             enrolled_device_keys: keys,
+            revoked_device_keys: BTreeSet::new(),
         }
     }
 
@@ -8993,6 +9249,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -9006,6 +9263,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9074,6 +9332,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -9087,6 +9346,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(actor_addr, 50);
@@ -9129,6 +9389,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9170,6 +9431,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -9183,6 +9445,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9225,6 +9488,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -9238,6 +9502,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9280,6 +9545,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -9293,6 +9559,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9334,6 +9601,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9371,6 +9639,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9410,6 +9679,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -9423,6 +9693,7 @@ mod zeb_250_admin_proposal_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin1_addr, 100);
@@ -9476,6 +9747,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     },
                     left_at: None,
                     enrolled_device_keys: BTreeSet::new(),
+                    revoked_device_keys: BTreeSet::new(),
                 },
             );
             prior.power_levels.insert(addr, 100);
@@ -9539,6 +9811,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     },
                     left_at: None,
                     enrolled_device_keys: BTreeSet::new(),
+                    revoked_device_keys: BTreeSet::new(),
                 },
             );
         }
@@ -9620,6 +9893,7 @@ mod zeb_250_admin_countersign_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9670,6 +9944,7 @@ mod zeb_250_admin_countersign_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(mod_addr, 50);
@@ -9704,6 +9979,7 @@ mod zeb_250_admin_countersign_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9818,6 +10094,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -9831,6 +10108,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -9970,6 +10248,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -9983,6 +10262,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         // Store actor power as 101 directly in prior_state (bypasses PowerLevelOutOfRange,
@@ -11272,6 +11552,7 @@ mod zeb_458_community_relay_announce_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: keys,
+                revoked_device_keys: BTreeSet::new(),
             }
         };
         let mut mat = MaterializedMembership::default();
@@ -12121,6 +12402,7 @@ mod zeb_339_signer_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: keys,
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         mat
@@ -12509,6 +12791,7 @@ mod zeb_339_signer_verify_tests {
                     k.insert(owner.cert.device_pubkeys.classical.ed25519_verify);
                     k
                 },
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         assert_eq!(
@@ -12630,6 +12913,530 @@ mod zeb_339_signer_verify_tests {
         );
     }
 
+    // ── ZEB-668 S3: DeviceRetire — community retire-announce ─────────────────
+
+    /// Mint a RevocationCert for the SECOND device (the one
+    /// `mint_second_device(master_seed, device_seed)` created). Master- or
+    /// self-issued per `by_master`. Same seed recipe as `mint_test_owner`.
+    fn mint_revocation_for_second_device(
+        master_seed: u8,
+        device2_sk: &ed25519_dalek::SigningKey,
+        cert2: &EnrollmentCert,
+        by_master: bool,
+    ) -> RevocationCert {
+        use harmony_owner::certs::RevocationReason;
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+        if by_master {
+            let master_sk = ed25519_dalek::SigningKey::from_bytes(&[master_seed; 32]);
+            let master_bundle = PubKeyBundle {
+                classical: ClassicalKeys {
+                    ed25519_verify: master_sk.verifying_key().to_bytes(),
+                    x25519_pub: [0u8; 32],
+                },
+                post_quantum: None,
+            };
+            RevocationCert::sign_master(
+                &master_sk,
+                master_bundle,
+                cert2.device_id,
+                1_700_000_100,
+                RevocationReason::Lost,
+            )
+            .expect("sign_master revocation")
+        } else {
+            RevocationCert::sign_self(
+                device2_sk,
+                cert2.owner_id,
+                cert2.device_id,
+                1_700_000_100,
+                RevocationReason::Decommissioned,
+            )
+            .expect("sign_self revocation")
+        }
+    }
+
+    /// A DeviceRetire for the second device, signed by the FIRST (surviving)
+    /// device's key. Steady-state signer — no `en` side-channel.
+    fn make_device_retire(
+        owner: &TestOwner,
+        community_id: SpaceId,
+        revocation: RevocationCert,
+        cert2: &EnrollmentCert,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [0xDE; 16],
+            community_id,
+            kind: MembershipEventKind::DeviceRetire {
+                revocation,
+                enrollment: Box::new(cert2.clone()),
+            },
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        sign_event(&payload, &owner.device_key).expect("sign DeviceRetire")
+    }
+
+    /// Prior state where the owner is Joined with BOTH device keys enrolled
+    /// (first device + the given second-device key).
+    fn joined_with_both_devices(
+        owner: &TestOwner,
+        device2_key: [u8; 32],
+    ) -> MaterializedMembership {
+        let mut prior = joined_with_first_device(owner);
+        prior
+            .members
+            .get_mut(&owner.owner)
+            .expect("owner present")
+            .enrolled_device_keys
+            .insert(device2_key);
+        prior
+    }
+
+    fn retire_ctx(community_id: SpaceId, admin: OwnerAddr) -> VerifyContext {
+        VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: admin,
+            is_invite_only: false,
+        }
+    }
+
+    #[test]
+    fn verify_event_accepts_master_signed_device_retire() {
+        let owner = mint_test_owner(0x61);
+        let community_id = SpaceId([0xe1; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x61, 0x62);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        let prior = joined_with_both_devices(&owner, device2_key);
+
+        let rc = mint_revocation_for_second_device(0x61, &device2_sk, &cert2, true);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 2_000);
+
+        verify_event(&retire, &prior, &retire_ctx(community_id, owner.owner))
+            .expect("master-signed DeviceRetire from a surviving enrolled device must verify");
+    }
+
+    #[test]
+    fn verify_event_accepts_self_signed_device_retire() {
+        let owner = mint_test_owner(0x63);
+        let community_id = SpaceId([0xe2; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x63, 0x64);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        let prior = joined_with_both_devices(&owner, device2_key);
+
+        let rc = mint_revocation_for_second_device(0x63, &device2_sk, &cert2, false);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 2_000);
+
+        verify_event(&retire, &prior, &retire_ctx(community_id, owner.owner))
+            .expect("self-signed DeviceRetire (retired device's own cert) must verify");
+    }
+
+    #[test]
+    fn verify_event_rejects_device_retire_from_non_member() {
+        let owner = mint_test_owner(0x65);
+        let community_id = SpaceId([0xe3; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x65, 0x66);
+        let rc = mint_revocation_for_second_device(0x65, &device2_sk, &cert2, true);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 2_000);
+
+        let prior = MaterializedMembership::default();
+        let err = verify_event(&retire, &prior, &retire_ctx(community_id, owner.owner))
+            .expect_err("never-member actor must be rejected");
+        // Signer resolution (step 1) fires first for an empty prior — either
+        // error is a correct rejection, but pin the observed one so a future
+        // reordering is a conscious choice.
+        assert!(
+            matches!(
+                err,
+                VerifyError::SignerNotEnrolledForActor | VerifyError::DeviceRetireForNonMember
+            ),
+            "expected a non-member rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_event_rejects_device_retire_with_wrong_owner_binding() {
+        let owner = mint_test_owner(0x67);
+        let community_id = SpaceId([0xe4; 16]);
+        // Cert pair minted under a DIFFERENT master (0x68 ≠ 0x67): both certs
+        // are internally valid but belong to another owner.
+        let (other_device2_sk, other_cert2) = mint_second_device(0x68, 0x69);
+        let prior = joined_with_first_device(&owner);
+
+        let rc = mint_revocation_for_second_device(0x68, &other_device2_sk, &other_cert2, true);
+        let retire = make_device_retire(&owner, community_id, rc, &other_cert2, 2_000);
+
+        let err = verify_event(&retire, &prior, &retire_ctx(community_id, owner.owner))
+            .expect_err("cert pair for a different owner must be rejected");
+        assert!(
+            matches!(err, VerifyError::DeviceRetireCertInvalid),
+            "expected DeviceRetireCertInvalid, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_event_rejects_device_retire_with_mismatched_target() {
+        let owner = mint_test_owner(0x6a);
+        let community_id = SpaceId([0xe5; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x6a, 0x6b);
+        // Revocation cert targets a THIRD device's id — same owner, wrong target.
+        let (_, cert3) = mint_second_device(0x6a, 0x6c);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        let prior = joined_with_both_devices(&owner, device2_key);
+
+        let rc = mint_revocation_for_second_device(0x6a, &device2_sk, &cert3, true);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 2_000);
+
+        let err = verify_event(&retire, &prior, &retire_ctx(community_id, owner.owner))
+            .expect_err("revocation targeting a different device_id must be rejected");
+        assert!(
+            matches!(err, VerifyError::DeviceRetireCertInvalid),
+            "expected DeviceRetireCertInvalid, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_event_rejects_device_retire_with_tampered_revocation_sig() {
+        let owner = mint_test_owner(0x6d);
+        let community_id = SpaceId([0xe6; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x6d, 0x6e);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        let prior = joined_with_both_devices(&owner, device2_key);
+
+        let mut rc = mint_revocation_for_second_device(0x6d, &device2_sk, &cert2, true);
+        rc.signature[0] ^= 0xFF;
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 2_000);
+
+        let err = verify_event(&retire, &prior, &retire_ctx(community_id, owner.owner))
+            .expect_err("tampered revocation signature must be rejected");
+        assert!(
+            matches!(err, VerifyError::DeviceRetireCertInvalid),
+            "expected DeviceRetireCertInvalid, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_event_accepts_device_retire_for_left_member() {
+        let owner = mint_test_owner(0x6f);
+        let community_id = SpaceId([0xe7; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x6f, 0x70);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        let mut prior = joined_with_both_devices(&owner, device2_key);
+        // The owner has LEFT — keys persist; retire must still verify
+        // (any-status rule: a departed owner's compromised key must be
+        // retirable before a rejoin resurrects its authority).
+        prior.members.get_mut(&owner.owner).unwrap().status = MemberStatus::Left;
+
+        let rc = mint_revocation_for_second_device(0x6f, &device2_sk, &cert2, true);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 2_000);
+
+        verify_event(&retire, &prior, &retire_ctx(community_id, owner.owner))
+            .expect("DeviceRetire for a Left member must verify (subtractive op)");
+    }
+
+    /// Full pipeline: join → announce → retire removes the key and
+    /// tombstones it; status/joined_at untouched.
+    #[test]
+    fn materialize_device_retire_removes_and_tombstones_key() {
+        let admin = mint_test_owner(0x42);
+        let owner = mint_test_owner(0x71);
+        let community_id = SpaceId([0xe8; 16]);
+
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &owner.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join
+        };
+        let (device2_sk, cert2) = mint_second_device(0x71, 0x72);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 200);
+        let rc = mint_revocation_for_second_device(0x71, &device2_sk, &cert2, true);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 300);
+
+        let m = materialize(&[join, announce, retire], admin.owner);
+        let member = m.members.get(&owner.owner).expect("owner is a member");
+        assert!(
+            !member.enrolled_device_keys.contains(&device2_key),
+            "retired key must be removed from enrolled_device_keys"
+        );
+        assert!(
+            member.revoked_device_keys.contains(&device2_key),
+            "retired key must be tombstoned"
+        );
+        assert!(
+            member
+                .enrolled_device_keys
+                .contains(&owner.cert.device_pubkeys.classical.ed25519_verify),
+            "surviving device key untouched"
+        );
+        assert_eq!(member.status, MemberStatus::Joined, "status untouched");
+        assert_eq!(member.joined_at.wall_ms, 100, "joined_at untouched");
+    }
+
+    /// The remove-wins pin: an announce whose HLC sorts AFTER the retire's
+    /// must NOT resurrect the key — the tombstone blocks it regardless of
+    /// replay order (clock skew can order the announce later even though it
+    /// happened first).
+    #[test]
+    fn materialize_announce_after_retire_does_not_resurrect_key() {
+        let admin = mint_test_owner(0x43);
+        let owner = mint_test_owner(0x73);
+        let community_id = SpaceId([0xe9; 16]);
+
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &owner.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join
+        };
+        let (device2_sk, cert2) = mint_second_device(0x73, 0x74);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        // Retire at wall_ms 200; the announce arrives with wall_ms 300 —
+        // i.e. the announce sorts AFTER the retire in the deterministic
+        // replay. Without the tombstone this would re-add the key.
+        let rc = mint_revocation_for_second_device(0x73, &device2_sk, &cert2, true);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 200);
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 300);
+
+        let m = materialize(&[join, retire, announce], admin.owner);
+        let member = m.members.get(&owner.owner).expect("owner is a member");
+        assert!(
+            !member.enrolled_device_keys.contains(&device2_key),
+            "tombstoned key must NOT be resurrected by a later-sorting announce"
+        );
+        assert!(
+            member.revoked_device_keys.contains(&device2_key),
+            "tombstone persists"
+        );
+    }
+
+    /// End-to-end through CommunityState::insert_event: after a retire, an
+    /// event signed by the retired key is rejected exactly as an
+    /// unknown-device event — SignerNotEnrolledForActor.
+    #[test]
+    fn insert_event_rejects_events_signed_by_retired_key() {
+        use crate::community_state_crdt::{CommunityState, InsertOutcome};
+
+        let owner = mint_test_owner(0x75);
+        let community_id = SpaceId([0xea; 16]);
+        let ctx = retire_ctx(community_id, owner.owner);
+        let mut state = CommunityState::new(community_id);
+
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &owner.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..join
+        };
+        assert!(matches!(
+            state.insert_event(join, &ctx),
+            InsertOutcome::Inserted
+        ));
+
+        let (device2_sk, cert2) = mint_second_device(0x75, 0x76);
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 200);
+        assert!(matches!(
+            state.insert_event(announce, &ctx),
+            InsertOutcome::Inserted
+        ));
+
+        // Sanity: BEFORE the retire, a device2-signed steady-state event
+        // verifies (Leave at wall_ms 250, unused beyond the probe).
+        let probe_payload = EventPayload {
+            id: [7u8; 16],
+            community_id,
+            kind: MembershipEventKind::Fork {
+                fork_space_id: SpaceId([0x99; 16]),
+                reason: Some("probe".into()),
+            },
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 250,
+                logical: 0,
+                device_id: "device2".into(),
+            },
+        };
+        let probe = sign_event(&probe_payload, &device2_sk).unwrap();
+        assert!(
+            matches!(state.insert_event(probe, &ctx), InsertOutcome::Inserted),
+            "device2 events verify while its key is enrolled"
+        );
+
+        let rc = mint_revocation_for_second_device(0x75, &device2_sk, &cert2, true);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 300);
+        assert!(matches!(
+            state.insert_event(retire, &ctx),
+            InsertOutcome::Inserted
+        ));
+
+        // AFTER the retire: a device2-signed event is rejected exactly as an
+        // unknown device's would be.
+        let post_payload = EventPayload {
+            id: [8u8; 16],
+            community_id,
+            kind: MembershipEventKind::Fork {
+                fork_space_id: SpaceId([0x9a; 16]),
+                reason: Some("post-retire".into()),
+            },
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 400,
+                logical: 0,
+                device_id: "device2".into(),
+            },
+        };
+        let post = sign_event(&post_payload, &device2_sk).unwrap();
+        match state.insert_event(post, &ctx) {
+            InsertOutcome::Rejected(VerifyError::SignerNotEnrolledForActor) => {}
+            other => panic!("expected Rejected(SignerNotEnrolledForActor), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_retire_wire_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let owner = mint_test_owner(0x77);
+        let community_id = SpaceId([0xeb; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x77, 0x78);
+        let rc = mint_revocation_for_second_device(0x77, &device2_sk, &cert2, true);
+        let retire = make_device_retire(&owner, community_id, rc, &cert2, 1_234);
+
+        // Full SignedMembershipEvent round-trip.
+        let bytes = canonical_cbor_encode(&retire).expect("encode SignedMembershipEvent");
+        let decoded: SignedMembershipEvent =
+            ciborium::de::from_reader(&bytes[..]).expect("decode SignedMembershipEvent");
+        assert_eq!(retire, decoded, "DeviceRetire event must round-trip");
+
+        // The kind encodes tag "t" with 2-char inner keys rc/ec.
+        let kind_bytes = canonical_cbor_encode(&retire.kind).expect("encode kind");
+        let val: ciborium::Value =
+            ciborium::de::from_reader(&kind_bytes[..]).expect("decode kind to Value");
+        let map = val.as_map().expect("MembershipEventKind encodes as a map");
+        let tag = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("tg"))
+            .map(|(_, v)| v.clone())
+            .expect("kind map has a `tg` tag key");
+        assert_eq!(
+            tag.as_text(),
+            Some("t"),
+            "DeviceRetire wire tag must be \"t\""
+        );
+        let content = map
+            .iter()
+            .find(|(k, _)| k.as_text() != Some("tg"))
+            .map(|(_, v)| v.clone())
+            .expect("kind map has a content entry");
+        let inner = content.as_map().expect("DeviceRetire content is a map");
+        let inner_keys: Vec<&str> = inner.iter().filter_map(|(k, _)| k.as_text()).collect();
+        assert!(
+            inner_keys.contains(&"rc") && inner_keys.contains(&"ec"),
+            "DeviceRetire inner keys must be rc/ec, got {inner_keys:?}"
+        );
+    }
+
+    #[test]
+    fn revoked_tombstone_insert_is_capped() {
+        let mut set: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut i: u32 = 0;
+        while set.len() < MAX_REVOKED_DEVICE_KEY_TOMBSTONES {
+            let mut k = [0u8; 32];
+            k[0] = 0xAA;
+            k[1] = (i >> 8) as u8;
+            k[2] = (i & 0xff) as u8;
+            insert_revoked_tombstone_capped(&mut set, k);
+            i += 1;
+        }
+        assert_eq!(set.len(), MAX_REVOKED_DEVICE_KEY_TOMBSTONES);
+        // A NEW key at the cap is dropped…
+        let overflow = [0xBB; 32];
+        insert_revoked_tombstone_capped(&mut set, overflow);
+        assert!(
+            !set.contains(&overflow),
+            "overflow tombstone dropped at cap"
+        );
+        assert_eq!(set.len(), MAX_REVOKED_DEVICE_KEY_TOMBSTONES);
+        // …but re-inserting a PRESENT key stays idempotent.
+        let existing = *set.iter().next().unwrap();
+        insert_revoked_tombstone_capped(&mut set, existing);
+        assert_eq!(set.len(), MAX_REVOKED_DEVICE_KEY_TOMBSTONES);
+    }
+
+    /// Additive-field honesty: a MemberState with no tombstones encodes with
+    /// NO `rk` key — pre-S3 blobs and S3 empty-set encodings are
+    /// byte-identical (no version bump needed).
+    #[test]
+    fn member_state_with_empty_tombstones_encodes_without_rk_key() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let owner = mint_test_owner(0x79);
+        let member = MemberState {
+            status: MemberStatus::Joined,
+            joined_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: test_enrolled_keys(&owner),
+            revoked_device_keys: BTreeSet::new(),
+        };
+        let bytes = canonical_cbor_encode(&member).expect("encode MemberState");
+        let val: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("decode MemberState to Value");
+        let map = val.as_map().expect("MemberState encodes as a map");
+        assert!(
+            !map.iter().any(|(k, _)| k.as_text() == Some("rk")),
+            "empty revoked_device_keys must be omitted from the wire"
+        );
+        // And a non-empty set round-trips through the `rk` key.
+        let mut with_tombstone = member.clone();
+        with_tombstone.revoked_device_keys.insert([0xCC; 32]);
+        let bytes2 = canonical_cbor_encode(&with_tombstone).expect("encode");
+        let decoded: MemberState =
+            ciborium::de::from_reader(&bytes2[..]).expect("decode MemberState");
+        assert_eq!(
+            with_tombstone, decoded,
+            "tombstoned MemberState round-trips"
+        );
+    }
+
     // ── ZEB-401: cap per-member enrolled_device_keys ──────────────────────────
     // (The headroom-over-ZEB-169 invariant is a compile-time `const _` assert
     // next to the constant definition, not a runtime test.)
@@ -12676,6 +13483,7 @@ mod zeb_339_signer_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: keys,
+                revoked_device_keys: BTreeSet::new(),
             },
         );
 
@@ -12718,6 +13526,7 @@ mod zeb_339_signer_verify_tests {
                 },
                 left_at: None,
                 enrolled_device_keys: keys,
+                revoked_device_keys: BTreeSet::new(),
             },
         );
 
