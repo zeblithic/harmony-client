@@ -3576,11 +3576,42 @@ pub async fn start_node_inner(
         // (pre-mint), sync_handles / sync_engine are None and the rest of
         // start_node proceeds normally.
         let identity_dir = crate::owner_commands::resolve_identity_dir()?;
-        let owner_loaded = crate::owner_state::load_owner_state(
+        let mut owner_loaded = crate::owner_state::load_owner_state(
             &identity_dir,
             crate::identity::KeychainStore::new().ok(),
         )?;
         tracing::info!("BOOT-PROBE 01: owner state loaded (keychain reads done)");
+        // ZEB-668 S1 boot refusal: a device whose own enrollment is revoked
+        // in the trust CRDT must not rejoin the fleet. Dropping the loaded
+        // owner here makes every downstream owner-gated wiring block behave
+        // exactly like a no-owner boot (no fleet engines, no community
+        // participation as this owner) — start_node itself still succeeds.
+        // The identity stays on disk; the Devices panel renders the removed
+        // state from the file path, and the revoked-self latch tells the UI.
+        let self_revoked_at_boot = owner_loaded.as_ref().is_some_and(|l| {
+            l.state.is_revoked(crate::owner_state::device_id_from_signing_key(
+                &l.device_signing_key,
+            ))
+        });
+        if self_revoked_at_boot {
+            tracing::warn!(
+                "this device is revoked in the owner trust state — skipping all fleet wiring"
+            );
+            {
+                let guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard
+                    .owner_trust_revoked_self
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            crate::node_event_sink::emit_ser(
+                &*app,
+                "device-revoked-self",
+                &serde_json::Value::Null,
+            );
+            owner_loaded = None;
+        }
         // ZEB-338: snapshot before owner_loaded is moved/destructured downstream.
         let has_owner_identity = owner_loaded.is_some();
 
@@ -5355,6 +5386,7 @@ pub async fn start_node_inner(
                     ));
                     let (trust_out_tx, trust_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
                     let (trust_in_tx, trust_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                    let (trust_nudge_tx, trust_nudge_rx) = tokio::sync::mpsc::channel::<()>(8);
                     let owner_trust_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
@@ -5375,7 +5407,9 @@ pub async fn start_node_inner(
                                 lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
                                 debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
                                 publish_seen: true,
-                                on_applied: None, // S1 T4 wires the nudge task
+                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                    trust_nudge_tx,
+                                )),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
                                     std::collections::BTreeMap::new(),
                                 )),
@@ -5388,6 +5422,55 @@ pub async fn start_node_inner(
                         outbound_rx: trust_out_rx,
                         inbound_tx: trust_in_tx,
                     });
+                    // ZEB-668 S1 T4: revoked-self detector. Each applied
+                    // remote merge nudges this task → owner-devices-updated;
+                    // a merge revealing THIS device revoked latches the flag,
+                    // emits device-revoked-self once, and shuts down the
+                    // fleet engines a revoked device must stop driving
+                    // (owner-state, fleet-net, trust).
+                    {
+                        let trust_revoked_flag = {
+                            let guard = state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            std::sync::Arc::clone(&guard.owner_trust_revoked_self)
+                        };
+                        let emit_sink = std::sync::Arc::clone(&app);
+                        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                            std::sync::Arc::new(move |name: &str| {
+                                crate::node_event_sink::emit_ser(
+                                    &*emit_sink,
+                                    name,
+                                    &serde_json::Value::Null,
+                                );
+                            });
+                        let halt_owner_sync = std::sync::Arc::clone(&engine);
+                        let halt_fleet_net = std::sync::Arc::clone(&fleet_net_sync);
+                        let halt_trust = std::sync::Arc::clone(&owner_trust_sync);
+                        let halt: crate::owner_trust_sync::HaltFn = Box::new(move || {
+                            Box::pin(async move {
+                                if let Err(e) = halt_owner_sync.shutdown().await {
+                                    tracing::error!(error = %e, "revoked-self halt: owner-state engine shutdown failed");
+                                }
+                                if let Err(e) = halt_fleet_net.shutdown().await {
+                                    tracing::error!(error = %e, "revoked-self halt: fleet-net engine shutdown failed");
+                                }
+                                if let Err(e) = halt_trust.shutdown().await {
+                                    tracing::error!(error = %e, "revoked-self halt: trust engine shutdown failed");
+                                }
+                            })
+                        });
+                        crate::owner_trust_sync::spawn_trust_applied_task(
+                            trust_nudge_rx,
+                            std::sync::Arc::clone(&owner_trust_doc),
+                            crate::owner_state::device_id_from_signing_key(
+                                &loaded.device_signing_key,
+                            ),
+                            trust_revoked_flag,
+                            emit,
+                            halt,
+                        );
+                    }
                     tracing::info!("BOOT-PROBE 08-trust: owner-trust engine constructed");
 
                     tracing::info!("BOOT-PROBE 08: fleet-net self-row staged (flush deferred), entering per-community CRDT sync");

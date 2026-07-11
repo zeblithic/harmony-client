@@ -241,6 +241,45 @@ pub async fn resync_trust_from_disk(
     Ok(changed)
 }
 
+/// One-shot halt used by the revoked-self detector: lib.rs packs the
+/// shutdowns of every fleet engine a revoked device must stop driving
+/// (owner-state, fleet-net, trust) into this closure.
+pub type HaltFn =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+/// The trust engine's `on_applied` consumer. Each nudge (an inbound merge
+/// that changed local state) emits `owner-devices-updated`; if the merge
+/// revealed THIS device revoked, latch the flag, emit
+/// `device-revoked-self` (exactly once), and run the halt closure.
+/// Halting from here is safe: `on_applied` only try_sends the nudge and
+/// returns, so the engine task is free to process its own shutdown
+/// message while we await it.
+pub fn spawn_trust_applied_task(
+    mut nudge_rx: tokio::sync::mpsc::Receiver<()>,
+    doc: Arc<tokio::sync::Mutex<OwnerState>>,
+    self_device_id: [u8; 16],
+    revoked_flag: Arc<std::sync::atomic::AtomicBool>,
+    emit: Arc<dyn Fn(&str) + Send + Sync>,
+    halt: HaltFn,
+) -> tokio::task::JoinHandle<()> {
+    let mut halt = Some(halt);
+    tokio::spawn(async move {
+        while nudge_rx.recv().await.is_some() {
+            emit("owner-devices-updated");
+            let revoked = doc.lock().await.is_revoked(self_device_id);
+            if revoked && !revoked_flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                tracing::warn!(
+                    "trust merge revealed this device revoked — halting fleet participation"
+                );
+                emit("device-revoked-self");
+                if let Some(h) = halt.take() {
+                    h().await;
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +548,87 @@ mod tests {
         }
         let _ = pair.a_engine.shutdown().await;
         let _ = pair.b_engine.shutdown().await;
+    }
+
+    fn test_halt(halted: Arc<std::sync::atomic::AtomicBool>) -> HaltFn {
+        Box::new(move || {
+            Box::pin(async move {
+                halted.store(true, std::sync::atomic::Ordering::Release);
+            })
+        })
+    }
+
+    fn collecting_emit(events: Arc<std::sync::Mutex<Vec<String>>>) -> Arc<dyn Fn(&str) + Send + Sync>
+    {
+        Arc::new(move |name: &str| events.lock().unwrap().push(name.to_string()))
+    }
+
+    #[tokio::test]
+    async fn applied_task_emits_devices_updated_on_nudge() {
+        let now = 1_700_000_000u64;
+        let (state, _a, _s) = test_mint(now);
+        let self_id = *state.enrollments.keys().next().unwrap();
+        let doc = Arc::new(tokio::sync::Mutex::new(state));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _h = spawn_trust_applied_task(
+            rx,
+            doc,
+            self_id,
+            Arc::clone(&flag),
+            collecting_emit(Arc::clone(&events)),
+            test_halt(Arc::clone(&halted)),
+        );
+        tx.send(()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(events.lock().unwrap().as_slice(), ["owner-devices-updated"]);
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!halted.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn applied_task_detects_self_revocation_halts_and_fires_once() {
+        let now = 1_700_000_000u64;
+        let (mut state, artifact, _sk1) = test_mint(now);
+        let self_id = *state.enrollments.keys().next().unwrap();
+        // Second device so the fixture doesn't revoke the only enrollment.
+        let (_skb, cert_b) = test_enroll_second_device(&artifact, &state, now + 5);
+        state
+            .add_enrollment(cert_b, now + 5, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        let rev = test_master_revocation(&artifact, self_id, now + 10);
+        state.add_revocation(rev).unwrap();
+        let doc = Arc::new(tokio::sync::Mutex::new(state));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _h = spawn_trust_applied_task(
+            rx,
+            doc,
+            self_id,
+            Arc::clone(&flag),
+            collecting_emit(Arc::clone(&events)),
+            test_halt(Arc::clone(&halted)),
+        );
+        // Two nudges: the second must NOT re-fire device-revoked-self.
+        tx.send(()).await.unwrap();
+        tx.send(()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let evs = events.lock().unwrap().clone();
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+        assert!(halted.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            evs.iter().filter(|e| *e == "device-revoked-self").count(),
+            1,
+            "device-revoked-self must fire exactly once, got {evs:?}"
+        );
+        assert_eq!(
+            evs.iter().filter(|e| *e == "owner-devices-updated").count(),
+            2
+        );
     }
 
     #[tokio::test]
