@@ -11,6 +11,7 @@ use crate::owner_state::{
     TrustDecisionView, TrustKind,
 };
 use crate::recovery_policy::{MAX_RECOVERY_COMMENT_BYTES, MIN_RECOVERY_PASSPHRASE_LEN};
+use harmony_owner::certs::{RevocationCert, RevocationReason};
 use harmony_owner::lifecycle::{mint_owner, MintResult, RecoveryArtifact};
 use harmony_owner::recovery::RecoveryMetadata;
 use harmony_owner::trust;
@@ -64,6 +65,107 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wire → crate reason mapping (ZEB-668 S2 spec §3: three UI reasons; `Other`
+/// unused by the UI).
+pub(crate) fn parse_revoke_reason(reason: &str) -> Result<RevocationReason, String> {
+    match reason {
+        "decommissioned" => Ok(RevocationReason::Decommissioned),
+        "lost" => Ok(RevocationReason::Lost),
+        "compromised" => Ok(RevocationReason::Compromised),
+        other => Err(format!(
+            "invalidReason: expected decommissioned|lost|compromised, got {other:?}"
+        )),
+    }
+}
+
+/// Crate → wire label (for `DeviceView.revoked_reason`).
+pub(crate) fn revoke_reason_label(reason: &RevocationReason) -> String {
+    match reason {
+        RevocationReason::Decommissioned => "decommissioned".to_string(),
+        RevocationReason::Lost => "lost".to_string(),
+        RevocationReason::Compromised => "compromised".to_string(),
+        RevocationReason::Other(s) => s.clone(),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PlannedRevocation {
+    pub cert: RevocationCert,
+    pub is_self: bool,
+}
+
+/// Pure revocation planner: validates the request against a trust-state
+/// snapshot and constructs the signed cert. No I/O, no locks — the whole
+/// guard surface is unit-testable from mint fixtures.
+///
+/// `Ok(None)` = target already revoked (idempotent no-op).
+pub(crate) fn plan_revocation(
+    state: &harmony_owner::state::OwnerState,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    master_seed: Option<&[u8; 32]>,
+    device_vk_hex: &str,
+    reason_str: &str,
+    now: u64,
+) -> Result<Option<PlannedRevocation>, String> {
+    let reason = parse_revoke_reason(reason_str)?;
+    let vk_bytes: [u8; 32] = hex::decode(device_vk_hex)
+        .map_err(|e| format!("badDeviceVk: {e}"))?
+        .try_into()
+        .map_err(|_| "badDeviceVk: expected 32 bytes".to_string())?;
+    // Resolve the target through its enrollment — revocation of a device the
+    // owner never enrolled is meaningless (and SelfDevice certs cannot verify
+    // without the enrolled vk).
+    let target = state
+        .enrollments
+        .values()
+        .find(|c| c.device_pubkeys.classical.ed25519_verify == vk_bytes)
+        .map(|c| c.device_id)
+        .ok_or_else(|| "unknownDevice: no enrollment matches that key".to_string())?;
+    if state.is_revoked(target) {
+        return Ok(None);
+    }
+    let self_id = crate::owner_state::device_id_from_signing_key(device_signing_key);
+    let is_self = target == self_id;
+    // Last-device guard: the CALLER is demonstrably alive (it is making this
+    // call), so revoking a sibling can never leave the account with zero
+    // usable devices. Only a self-revoke with no other *active* device can —
+    // refuse that (conservative: a stale-but-enrolled sibling does not count;
+    // the user should revoke from that device or accept recovery-phrase-only).
+    if is_self {
+        let active = state.active_devices(now, trust::DEFAULT_ACTIVE_WINDOW_SECS);
+        if active.iter().all(|d| *d == self_id) {
+            return Err(
+                "lastDevice: refusing to revoke the only active device on this account".to_string(),
+            );
+        }
+    }
+    let cert = if is_self {
+        RevocationCert::sign_self(device_signing_key, state.owner_id, target, now, reason)
+            .map_err(|e| format!("failed to sign self-revocation: {e}"))?
+    } else {
+        let seed = master_seed.ok_or_else(|| {
+            "notMaster: this device does not hold the master key; only the \
+             device with your master key can remove other devices"
+                .to_string()
+        })?;
+        // Transient master reconstruct — same shape as pairing/cert.rs
+        // sign_enrollment_for_joiner: derive, sign, drop (RecoveryArtifact
+        // zeroizes its seed on drop).
+        let artifact = RecoveryArtifact::from_seed(*seed);
+        let master_pubkey = artifact.master_pubkey_bundle();
+        if master_pubkey.identity_hash() != state.owner_id {
+            return Err("master seed does not match this owner".to_string());
+        }
+        let master_sk = artifact.master_signing_key();
+        let cert = RevocationCert::sign_master(&master_sk, master_pubkey, target, now, reason)
+            .map_err(|e| format!("failed to sign revocation: {e}"))?;
+        drop(master_sk);
+        drop(artifact);
+        cert
+    };
+    Ok(Some(PlannedRevocation { cert, is_self }))
+}
+
 /// Build an `OwnerStateView` from a loaded state.
 ///
 /// `pinned_device_id_hex`: the 64-hex fleet-net `pinned` field (from the
@@ -100,6 +202,7 @@ fn build_owner_state_view(
                 .as_deref()
                 .map(|p| p == dev_id_hex)
                 .unwrap_or(false);
+            let rev_cert = loaded.state.revocations.cert_for(cert.device_id);
             DeviceView {
                 device_id: hex::encode(cert.device_id),
                 display_name: if cert.device_id == this_device_id {
@@ -116,6 +219,9 @@ fn build_owner_state_view(
                 // `set_butler_pin` — `device_id` above is the 16-byte
                 // identity hash, which the enrolled-set check rejects.
                 device_vk_hex: dev_id_hex,
+                revoked: rev_cert.is_some(),
+                revoked_at: rev_cert.map(|c| c.issued_at),
+                revoked_reason: rev_cert.map(|c| revoke_reason_label(&c.reason)),
             }
         })
         .collect();
@@ -164,9 +270,27 @@ pub async fn get_owner_state(
     get_owner_state_impl(state.inner()).await
 }
 
+/// ZEB-428: keychain construction is injected as a factory so tests pass
+/// `|| None` explicitly instead of relying on the constructor's test-build
+/// refusal. A fn pointer (not a closure type) keeps the blocking-task move
+/// `'static` while letting construction happen inside the blocking closure.
+pub(crate) type KeychainFactory = fn() -> Option<KeychainStore>;
+
+pub(crate) fn prod_keychain() -> Option<KeychainStore> {
+    KeychainStore::new().ok()
+}
+
 /// ZEB-445: shared IPC/RPC seam.
 pub(crate) async fn get_owner_state_impl(
     state: &std::sync::Mutex<crate::NodeState>,
+) -> Result<Option<OwnerStateView>, String> {
+    get_owner_state_inner(state, prod_keychain).await
+}
+
+/// ZEB-668 S2: keychain-injectable body (see `KeychainFactory`).
+pub(crate) async fn get_owner_state_inner(
+    state: &std::sync::Mutex<crate::NodeState>,
+    keychain: KeychainFactory,
 ) -> Result<Option<OwnerStateView>, String> {
     // ZEB-418 P2 D17: snapshot the fleet-net pinned device ID before entering
     // the blocking task. Reads under the NodeState lock; the Arc clone is cheap
@@ -209,7 +333,7 @@ pub(crate) async fn get_owner_state_impl(
             let _guard = OWNER_STATE_WRITE_LOCK
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            load_owner_state(&dir, KeychainStore::new().ok())
+            load_owner_state(&dir, keychain())
         })
         .await?;
         let mut loaded = match loaded_opt {
@@ -243,7 +367,7 @@ pub(crate) async fn get_owner_state_impl(
             let _guard = OWNER_STATE_WRITE_LOCK
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let mut loaded = match load_owner_state(&identity_dir, KeychainStore::new().ok())? {
+            let mut loaded = match load_owner_state(&identity_dir, keychain())? {
                 Some(l) => l,
                 None => return Ok(None),
             };
@@ -267,6 +391,155 @@ pub(crate) async fn get_owner_state_impl(
             pinned_device_id_hex,
         )))
     })
+    .await
+}
+
+/// ZEB-668 S2. Self-revoke ordering is load-bearing (spec §3): sign → add →
+/// persist → publish+flush → terminal state + engine halt. The initiating
+/// device must not wait for its own merge callback.
+pub(crate) async fn revoke_device_inner(
+    state: &std::sync::Mutex<crate::NodeState>,
+    keychain: KeychainFactory,
+    emit: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    device_vk_hex: String,
+    reason: String,
+) -> Result<(), String> {
+    // Snapshot handles under the std lock; drop before any await.
+    let (trust_doc, trust_engine, identity_dir, revoked_flag, owner_sync, fleet_net) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.owner_trust_doc.clone(),
+            g.owner_trust_sync.clone(),
+            g.identity_dir.clone(),
+            std::sync::Arc::clone(&g.owner_trust_revoked_self),
+            g.sync_engine.clone(),
+            g.fleet_net_sync.clone(),
+        )
+    };
+    // Fall back to the resolved default identity dir when the node has not
+    // populated NodeState (same source get_owner_state uses).
+    let dir = match identity_dir {
+        Some(d) => d,
+        None => resolve_identity_dir()?,
+    };
+
+    // Keys always come from disk/keychain (device sk + optional master seed).
+    let dir_for_load = dir.clone();
+    let loaded = run_blocking(move || {
+        let _guard = OWNER_STATE_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        load_owner_state(&dir_for_load, keychain())
+    })
+    .await?
+    .ok_or_else(|| "noOwner: no owner identity on this device".to_string())?;
+
+    // Guard against the freshest trust state we have: resident doc when the
+    // node is running, disk snapshot otherwise.
+    let trust_snapshot = match &trust_doc {
+        Some(doc) => doc.lock().await.clone(),
+        None => loaded.state.clone(),
+    };
+    let planned = match plan_revocation(
+        &trust_snapshot,
+        &loaded.device_signing_key,
+        loaded.master_seed.as_deref(),
+        &device_vk_hex,
+        &reason,
+        now_unix(),
+    )? {
+        Some(p) => p,
+        None => return Ok(()), // already revoked — idempotent
+    };
+    let is_self = planned.is_self;
+    let cert = planned.cert;
+
+    // Apply through the S1 substrate: resident doc + notify_dirty, or the
+    // locked load→mutate→save path when the node is down.
+    let access = match (&trust_doc, &trust_engine) {
+        (Some(doc), Some(engine)) => crate::owner_trust_sync::TrustStateAccess::Resident {
+            doc: std::sync::Arc::clone(doc),
+            engine: std::sync::Arc::clone(engine),
+        },
+        _ => crate::owner_trust_sync::TrustStateAccess::FileOnly {
+            identity_dir: dir.clone(),
+        },
+    };
+    crate::owner_trust_sync::mutate_trust_state(access, move |s| s.add_revocation(cert))
+        .await?
+        .map_err(|e| format!("revocation rejected: {e}"))?;
+
+    // Durability + propagation. Resident: force the publish+persist now.
+    // Sibling revokes tolerate a flush failure (dirty latch retries); a SELF
+    // revoke must not reach the terminal state unpublished — no sibling
+    // would ever learn of it.
+    if let Some(engine) = &trust_engine {
+        if let Err(e) = engine.flush_now().await {
+            if is_self {
+                return Err(format!(
+                    "self-revocation staged but not yet published (will retry): {e}"
+                ));
+            }
+            tracing::warn!(error = %e, "revoke_device: trust flush failed; dirty latch will retry");
+        }
+    }
+
+    emit("owner-devices-updated");
+
+    if is_self {
+        // Terminal state: latch once, tell the UI, then stop fleet engines
+        // (hygiene — enforcement is receiver-side; matches the S1 halt set).
+        if !revoked_flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            emit("device-revoked-self");
+        }
+        if let Some(engine) = owner_sync {
+            if let Err(e) = engine.shutdown().await {
+                tracing::error!(error = %e, "revoke_device: owner-state engine shutdown failed");
+            }
+        }
+        if let Some(engine) = fleet_net {
+            if let Err(e) = engine.shutdown().await {
+                tracing::error!(error = %e, "revoke_device: fleet-net engine shutdown failed");
+            }
+        }
+        if let Some(engine) = trust_engine {
+            if let Err(e) = engine.shutdown().await {
+                tracing::error!(error = %e, "revoke_device: trust engine shutdown failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ZEB-445-style shared IPC/RPC seam for `revoke_device`.
+pub(crate) async fn revoke_device_impl(
+    state: &std::sync::Mutex<crate::NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    device_vk_hex: String,
+    reason: String,
+) -> Result<(), String> {
+    let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+        std::sync::Arc::new(move |name: &str| {
+            crate::node_event_sink::emit_ser(&*sink, name, &serde_json::Value::Null);
+        });
+    revoke_device_inner(state, prod_keychain, emit, device_vk_hex, reason).await
+}
+
+#[tauri::command]
+pub async fn revoke_device(
+    app: tauri::AppHandle,
+    device_vk_hex: String,
+    reason: String,
+    state: tauri::State<'_, Mutex<crate::NodeState>>,
+) -> Result<(), String> {
+    revoke_device_impl(
+        state.inner(),
+        std::sync::Arc::new(app),
+        device_vk_hex,
+        reason,
+    )
     .await
 }
 
@@ -1038,5 +1311,297 @@ mod tests {
             "camelCase key required: {json}"
         );
         assert!(json.contains("\"words\""));
+    }
+}
+
+#[cfg(test)]
+mod revoke_tests {
+    use super::*;
+    use harmony_owner::lifecycle::enroll_via_master;
+    use harmony_owner::pubkey_bundle::PubKeyBundle;
+    use harmony_owner::state::OwnerState;
+
+    // Mint an owner (device A holds the seed) and enroll a second device B.
+    // Returns (state, a_sk, seed, b_sk, b_vk_hex).
+    fn two_device_fixture(
+        now: u64,
+    ) -> (
+        OwnerState,
+        ed25519_dalek::SigningKey,
+        [u8; 32],
+        ed25519_dalek::SigningKey,
+        String,
+    ) {
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key: a_sk,
+        } = mint_owner(now).expect("mint");
+        let seed = *recovery_artifact.as_bytes();
+        let b_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let b_vk = b_sk.verifying_key().to_bytes();
+        let enroll = enroll_via_master(
+            &state,
+            &recovery_artifact,
+            &b_sk,
+            PubKeyBundle::classical_only(b_vk),
+            now,
+            trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .expect("enroll");
+        state
+            .add_enrollment(
+                enroll.enrollment_cert,
+                now,
+                trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .expect("add enrollment");
+        for c in enroll.auto_vouch_certs {
+            let _ = state.add_vouching(c);
+        }
+        (state, a_sk, seed, b_sk, hex::encode(b_vk))
+    }
+
+    #[test]
+    fn parse_revoke_reason_maps_wire_values() {
+        assert_eq!(
+            parse_revoke_reason("decommissioned").unwrap(),
+            RevocationReason::Decommissioned
+        );
+        assert_eq!(parse_revoke_reason("lost").unwrap(), RevocationReason::Lost);
+        assert_eq!(
+            parse_revoke_reason("compromised").unwrap(),
+            RevocationReason::Compromised
+        );
+        let err = parse_revoke_reason("banana").unwrap_err();
+        assert!(err.starts_with("invalidReason:"), "{err}");
+    }
+
+    #[test]
+    fn plan_master_revoke_of_sibling_produces_master_cert() {
+        let (state, a_sk, seed, _b_sk, b_vk_hex) = two_device_fixture(1_700_000_000);
+        let now = 1_700_000_100u64;
+        let planned = plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now)
+            .expect("plan ok")
+            .expect("some plan");
+        assert!(!planned.is_self);
+        assert!(matches!(
+            planned.cert.issuer,
+            harmony_owner::certs::RevocationIssuer::Master { .. }
+        ));
+        assert_eq!(planned.cert.reason, RevocationReason::Lost);
+        // The cert must be acceptable to the CRDT.
+        let mut s2 = state.clone();
+        s2.add_revocation(planned.cert.clone())
+            .expect("cert verifies");
+        assert!(s2.is_revoked(planned.cert.target));
+    }
+
+    #[test]
+    fn plan_self_revoke_produces_self_cert_without_seed() {
+        let (state, _a_sk, _seed, b_sk, b_vk_hex) = two_device_fixture(1_700_000_000);
+        let planned = plan_revocation(
+            &state,
+            &b_sk,
+            None,
+            &b_vk_hex,
+            "decommissioned",
+            1_700_000_100,
+        )
+        .expect("plan ok")
+        .expect("some plan");
+        assert!(planned.is_self);
+        assert!(matches!(
+            planned.cert.issuer,
+            harmony_owner::certs::RevocationIssuer::SelfDevice
+        ));
+        let mut s2 = state.clone();
+        s2.add_revocation(planned.cert).expect("self cert verifies");
+    }
+
+    #[test]
+    fn plan_sibling_revoke_without_seed_is_not_master() {
+        let (state, _a, _seed, b_sk, _bhex) = two_device_fixture(1_700_000_000);
+        // Device B (no seed) targets device A: find A's vk from its enrollment.
+        let b_id = crate::owner_state::device_id_from_signing_key(&b_sk);
+        let a_vk_hex = state
+            .enrollments
+            .values()
+            .find(|c| c.device_id != b_id)
+            .map(|c| hex::encode(c.device_pubkeys.classical.ed25519_verify))
+            .expect("A enrolled");
+        let err =
+            plan_revocation(&state, &b_sk, None, &a_vk_hex, "lost", 1_700_000_100).unwrap_err();
+        assert!(err.starts_with("notMaster:"), "{err}");
+    }
+
+    #[test]
+    fn plan_refuses_revoking_last_active_device() {
+        let now = 1_700_000_000u64;
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(now).expect("mint");
+        let seed = *recovery_artifact.as_bytes();
+        let self_vk_hex = hex::encode(device_signing_key.verifying_key().to_bytes());
+        let err = plan_revocation(
+            &state,
+            &device_signing_key,
+            Some(&seed),
+            &self_vk_hex,
+            "decommissioned",
+            now + 10,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("lastDevice:"), "{err}");
+    }
+
+    #[test]
+    fn plan_unknown_target_and_bad_hex_error() {
+        let (state, a_sk, seed, _b, _bhex) = two_device_fixture(1_700_000_000);
+        let unknown_vk = hex::encode([9u8; 32]);
+        let err = plan_revocation(
+            &state,
+            &a_sk,
+            Some(&seed),
+            &unknown_vk,
+            "lost",
+            1_700_000_100,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("unknownDevice:"), "{err}");
+        let err =
+            plan_revocation(&state, &a_sk, Some(&seed), "zz", "lost", 1_700_000_100).unwrap_err();
+        assert!(err.starts_with("badDeviceVk:"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn revoke_device_inner_master_revokes_sibling_file_only() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let (state, a_sk, seed, _b, b_vk_hex) = two_device_fixture(now_unix() - 60);
+        let dir = tempfile::tempdir().unwrap();
+        save_owner_state_atomic(dir.path(), &state, &a_sk, Some(&seed), None)
+            .expect("persist identity");
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            ..crate::NodeState::default()
+        });
+        let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let ev = events.clone();
+        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+            std::sync::Arc::new(move |name: &str| ev.lock().unwrap().push(name.to_string()));
+
+        revoke_device_inner(
+            &node,
+            || None,
+            emit.clone(),
+            b_vk_hex.clone(),
+            "lost".into(),
+        )
+        .await
+        .expect("revoke ok");
+
+        // Durable: the revocation is on disk.
+        let disk = crate::owner_state::load_owner_state_cbor(dir.path()).expect("disk state");
+        let b_id = disk
+            .enrollments
+            .values()
+            .find(|c| hex::encode(c.device_pubkeys.classical.ed25519_verify) == b_vk_hex)
+            .map(|c| c.device_id)
+            .unwrap();
+        assert!(disk.is_revoked(b_id));
+        assert_eq!(events.lock().unwrap().as_slice(), ["owner-devices-updated"]);
+        // Sibling revoke must NOT latch the self-revoked flag.
+        assert!(!node
+            .lock()
+            .unwrap()
+            .owner_trust_revoked_self
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // Idempotent second call: no error, no duplicate event.
+        revoke_device_inner(&node, || None, emit, b_vk_hex, "lost".into())
+            .await
+            .expect("noop ok");
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revoke_device_inner_self_revoke_latches_and_emits_terminal_event() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let (state, _a_sk, _seed, b_sk, _b_vk_hex) = two_device_fixture(now_unix() - 60);
+        // Persist device B's identity (no seed) — B removes itself.
+        let dir = tempfile::tempdir().unwrap();
+        save_owner_state_atomic(dir.path(), &state, &b_sk, None, None).expect("persist identity");
+        let self_vk_hex = hex::encode(b_sk.verifying_key().to_bytes());
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            ..crate::NodeState::default()
+        });
+        let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let ev = events.clone();
+        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+            std::sync::Arc::new(move |name: &str| ev.lock().unwrap().push(name.to_string()));
+
+        revoke_device_inner(&node, || None, emit, self_vk_hex, "decommissioned".into())
+            .await
+            .expect("self-revoke ok");
+
+        let disk = crate::owner_state::load_owner_state_cbor(dir.path()).unwrap();
+        assert!(disk.is_revoked(crate::owner_state::device_id_from_signing_key(&b_sk)));
+        assert!(node
+            .lock()
+            .unwrap()
+            .owner_trust_revoked_self
+            .load(std::sync::atomic::Ordering::Acquire));
+        let got = events.lock().unwrap().clone();
+        assert_eq!(got, ["owner-devices-updated", "device-revoked-self"]);
+    }
+
+    #[test]
+    fn view_marks_revoked_device_with_reason_and_date() {
+        let (mut state, a_sk, seed, _b, b_vk_hex) = two_device_fixture(1_700_000_000);
+        let now = 1_700_000_100u64;
+        let planned = plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now)
+            .unwrap()
+            .unwrap();
+        let target = planned.cert.target;
+        state.add_revocation(planned.cert).unwrap();
+        let loaded = LoadedOwnerState {
+            state,
+            device_signing_key: a_sk,
+            master_seed: Some(Zeroizing::new(seed)),
+            fleet_keytree: None,
+        };
+        let view = build_owner_state_view(&loaded, "Test Device".to_string(), None);
+        let revoked_row = view
+            .devices
+            .iter()
+            .find(|d| d.device_id == hex::encode(target))
+            .expect("revoked device still in view");
+        assert!(revoked_row.revoked);
+        assert_eq!(revoked_row.revoked_at, Some(now));
+        assert_eq!(revoked_row.revoked_reason.as_deref(), Some("lost"));
+        let self_row = view.devices.iter().find(|d| d.is_this_device).unwrap();
+        assert!(!self_row.revoked);
+        assert_eq!(self_row.revoked_at, None);
+        // camelCase pin for the three new fields.
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("\"revoked\""));
+        assert!(json.contains("\"revokedAt\""));
+        assert!(json.contains("\"revokedReason\""));
+    }
+
+    #[test]
+    fn plan_already_revoked_target_is_noop() {
+        let (mut state, a_sk, seed, _b, b_vk_hex) = two_device_fixture(1_700_000_000);
+        let now = 1_700_000_100u64;
+        let planned = plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now)
+            .unwrap()
+            .unwrap();
+        state.add_revocation(planned.cert).unwrap();
+        let second =
+            plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now + 1).unwrap();
+        assert!(second.is_none(), "idempotent no-op");
     }
 }

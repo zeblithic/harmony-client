@@ -255,14 +255,24 @@ pub(crate) fn plan_revocation(
     if state.is_revoked(target) {
         return Ok(None);
     }
-    let active = state.active_devices(now, DEFAULT_ACTIVE_WINDOW_SECS);
-    if active.len() == 1 && active[0] == target {
-        return Err(
-            "lastDevice: refusing to revoke the only active device on this account".to_string(),
-        );
-    }
     let self_id = crate::owner_state::device_id_from_signing_key(device_signing_key);
     let is_self = target == self_id;
+    // Last-device guard (execution amendment): the CALLER is demonstrably
+    // alive (it is making this call), so revoking a sibling can never leave
+    // the account with zero usable devices. Only a self-revoke with no other
+    // *active* device can — refuse that. A stale-but-enrolled sibling does
+    // not count (conservative); the original `active == [target]` form
+    // misfired when a fresh, liveness-less caller targeted the sole active
+    // device (caught by plan_sibling_revoke_without_seed_is_not_master).
+    if is_self {
+        let active = state.active_devices(now, DEFAULT_ACTIVE_WINDOW_SECS);
+        if active.iter().all(|d| *d == self_id) {
+            return Err(
+                "lastDevice: refusing to revoke the only active device on this account"
+                    .to_string(),
+            );
+        }
+    }
     let cert = if is_self {
         RevocationCert::sign_self(device_signing_key, state.owner_id, target, now, reason)
             .map_err(|e| format!("failed to sign self-revocation: {e}"))?

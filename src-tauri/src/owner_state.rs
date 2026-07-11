@@ -41,6 +41,17 @@ pub struct DeviceView {
     /// cannot be inverted to this form, so it is carried explicitly.
     #[serde(default)]
     pub device_vk_hex: String,
+    /// ZEB-668 S2: revocation surface for the Removed-devices section.
+    /// A revoked device keeps its enrollment row (the CRDT never deletes
+    /// enrollments); these fields let the panel split active vs removed.
+    #[serde(default)]
+    pub revoked: bool,
+    #[serde(default)]
+    pub revoked_at: Option<u64>,
+    /// Wire label of the revocation reason ("decommissioned" | "lost" |
+    /// "compromised"; free text for the crate's `Other`).
+    #[serde(default)]
+    pub revoked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1976,6 +1987,9 @@ mod tests {
                 fingerprint: "3e2f·7a91".into(),
                 butler_pinned: false,
                 device_vk_hex: "cc".repeat(32),
+                revoked: false,
+                revoked_at: None,
+                revoked_reason: None,
             }],
             can_back_up: true,
         };

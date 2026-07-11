@@ -370,6 +370,14 @@ struct SetButlerPinArgs {
     device_id: Option<String>,
 }
 
+/// ZEB-668 S2: device revocation. `reason` ∈ decommissioned|lost|compromised.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevokeDeviceArgs {
+    device_vk_hex: String,
+    reason: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -935,6 +943,16 @@ pub fn build_registry() -> RpcRegistry {
         "get_butler_held",
         EmptyArgs,
         |state, _sink, _a| async move { crate::get_butler_held_impl(state).await }
+    );
+
+    // Device management (ZEB-668 S2).
+    rpc!(
+        m,
+        "revoke_device",
+        RevokeDeviceArgs,
+        |state, sink, a| async move {
+            crate::owner_commands::revoke_device_impl(state, sink, a.device_vk_hex, a.reason).await
+        }
     );
 
     // Connectivity.
@@ -1769,6 +1787,8 @@ mod tests {
             "set_butler_pin",
             "get_butler_pin",
             "get_butler_held",
+            // device management (ZEB-668 S2)
+            "revoke_device",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",
