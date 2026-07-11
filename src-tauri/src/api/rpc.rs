@@ -1324,6 +1324,37 @@ mod tests {
         }
     }
 
+    /// ZEB-668 S4 (PR #454 review): dispatch proof for `set_device_petname`,
+    /// mirroring `revoke_device_rpc_is_registered_and_wired` — camelCase args
+    /// must parse and reach the `_impl` seam. A default NodeState has no
+    /// fleet-net doc, so the seam deterministically answers "fleet-net not
+    /// running" without any identity/keychain access.
+    #[tokio::test]
+    async fn set_device_petname_rpc_is_registered_and_wired() {
+        let reg = build_registry();
+        let state = Arc::new(Mutex::new(NodeState::default()));
+        let args = serde_json::json!({
+            "deviceVkHex": "ab".repeat(32),
+            "petname": "KRILE",
+        });
+        match reg
+            .dispatch("set_device_petname", state, test_sink(), args)
+            .await
+        {
+            Err(RpcError::UnknownCommand) => panic!("set_device_petname must be registered"),
+            Err(RpcError::BadArgs(msg)) => {
+                panic!("set_device_petname: arg struct rejected the wrapper shape: {msg}")
+            }
+            Err(RpcError::Command(msg)) => {
+                assert!(
+                    msg.contains("fleet-net not running"),
+                    "expected the node-not-started seam error, got: {msg}"
+                );
+            }
+            Ok(v) => panic!("expected node-not-started error on a default NodeState, got {v:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn null_args_treated_as_empty() {
         let reg = build_registry();

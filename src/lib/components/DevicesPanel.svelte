@@ -9,7 +9,12 @@
     type RevokeReason,
   } from '../owner-service';
   import { loadProfile } from '../profile-service';
-  import { loadDeviceLabel, saveDeviceLabel, resolveDefaultDeviceLabel } from '../device-label-service';
+  import {
+    loadDeviceLabel,
+    saveDeviceLabel,
+    clearDeviceLabel,
+    resolveDefaultDeviceLabel,
+  } from '../device-label-service';
   import { setDevicePetname, MAX_DEVICE_PETNAME_CHARS } from '../device-petname-service';
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
   import { fetchCommunitiesCount } from '../owner-meta';
@@ -139,8 +144,10 @@
     // (hostname defaults are never persisted and must never migrate).
     // Best-effort (node may be down); idempotent (guard is false once set).
     // `=== null` (not falsy): migrate only when the backend AFFIRMS the
-    // device has no petname. An absent field (undefined) means a pre-S4
-    // view shape — never a migration trigger.
+    // device was never named. An absent field (undefined) means a pre-S4
+    // view shape, and `""` means explicitly CLEARED — neither may trigger
+    // migration (a cleared name must never be resurrected from a stale
+    // local label; PR #454 round 1).
     const selfDev = svc.state?.devices.find((d) => d.isThisDevice);
     if (selfDev && selfDev.petName === null && deviceLabel) {
       try {
@@ -192,6 +199,7 @@
   let renameDraft = $state('');
 
   function startRename(device: { deviceId: string; displayName: string; isThisDevice: boolean }) {
+    renameError = null;
     renamingDeviceId = device.deviceId;
     renameDraft = device.displayName;
   }
@@ -199,13 +207,19 @@
   let renameError = $state<string | null>(null);
   let renameInFlight = $state(false);
 
-  // ZEB-668 S4: rename any row via the fleet-synced petname IPC. The self
-  // row ALSO keeps the ZEB-336 localStorage label in step — it remains the
-  // offline/pre-S4 read-only fallback in the label ladder. (Pre-S4 this only
-  // wrote localStorage, so siblings never saw the name.)
+  // ZEB-668 S4: rename any row via the fleet-synced petname IPC. Empty
+  // input is an explicit CLEAR (backend LWW tombstone `name: ""` — PR #454
+  // round 1). The self row ALSO keeps the ZEB-336 localStorage label in
+  // step — saved on rename, removed on clear — so the local fallback can
+  // never resurrect a cleared name. (Pre-S4 this only wrote localStorage,
+  // so siblings never saw the name.)
   async function saveRename(device: DeviceView) {
+    if (renameInFlight) return;
     const trimmed = renameDraft.trim();
-    if (trimmed.length === 0 || trimmed.length > MAX_DEVICE_PETNAME_CHARS || renameInFlight) {
+    // Code points, not UTF-16 units — matches the backend's chars().count()
+    // so non-ASCII names hit the same cap on both sides (PR #454 round 1).
+    if ([...trimmed].length > MAX_DEVICE_PETNAME_CHARS) {
+      renameError = `Name is too long (max ${MAX_DEVICE_PETNAME_CHARS} characters).`;
       return;
     }
     renameError = null;
@@ -214,8 +228,13 @@
       await setDevicePetname(device.deviceVkHex, trimmed);
       if (device.isThisDevice) {
         // ZEB-336: never the owner profile — only the per-device label.
-        saveDeviceLabel(trimmed);
-        deviceLabel = trimmed;
+        if (trimmed) {
+          saveDeviceLabel(trimmed);
+          deviceLabel = trimmed;
+        } else {
+          clearDeviceLabel();
+          deviceLabel = null;
+        }
       }
       renamingDeviceId = null;
       await svc.refresh();
@@ -227,6 +246,7 @@
   }
 
   function cancelRename() {
+    renameError = null;
     renamingDeviceId = null;
   }
 
@@ -683,7 +703,9 @@
                   {#if device.connectedNow}
                     <span class="separator">·</span>
                     <span class="online-badge">● online</span>
-                  {:else if device.lastSeenMs !== null}
+                  {:else if typeof device.lastSeenMs === 'number'}
+                    <!-- typeof guard (PR #454 round 1): an omitted field
+                         (pre-S4 shape) must read as absent, same as null. -->
                     <span class="separator">·</span>
                     <span>last seen {formatLastSeen(device.lastSeenMs)}</span>
                   {/if}

@@ -845,6 +845,35 @@ Then `scripts/test-select --context task`, fmt, clippy (owner_commands tests cha
    `types_serialize_with_camelcase`) extended with the S4 trio using
    non-default values — a serde-rename regression cannot pass unnoticed.
 
+## Execution amendments (PR #454 round 1)
+
+1. **Clear-from-UI + cleared-vs-never distinction** (Qodo bug 1, extended):
+   empty rename input now clears (`setDevicePetname(vk, "")`). The DTO
+   distinguishes `Some("")` = explicitly cleared from `None` = never named —
+   without this the one-shot migration would resurrect a cleared name from a
+   stale localStorage label. Self-clear also removes the local label
+   (`clearDeviceLabel()`); a sibling's clear leaves this device's private
+   label intact (fleet layer vs private layer).
+2. **Read-path trim** (Qodo bug 3): the view join normalizes with `trim()` —
+   a remote writer's whitespace-only entry surfaces as the cleared form,
+   padding is stripped. Single normalization point in
+   `build_owner_state_view`, unit-pinned.
+3. **`typeof lastSeenMs === 'number'` render guard** (Qodo bug 2): an
+   omitted field (pre-S4 mock shape) reads as absent, same as null.
+4. **Code-point length check** (CodeRabbit): `[...trimmed].length` matches
+   the backend's `chars().count()` — 64 surrogate-pair emoji now pass both
+   sides (pinned by test).
+5. **RPC dispatch proof test** (CodeRabbit outside-diff):
+   `set_device_petname_rpc_is_registered_and_wired`, mirroring
+   `revoke_device`'s.
+6. **Rename error UX** (CodeRabbit outside-diff): over-length sets an inline
+   `renameError`; start/cancel reset it.
+7. **Rebutted** (Qodo rule violation): plan-doc per-step scoped nextest
+   commands are the TDD inner loop, not gates — every task gate runs
+   `scripts/test-select` and the pre-PR gate is the full `--all-targets`
+   sweep (the documented ZEB-631 exception structure; same class rejected in
+   PR #219).
+
 ## Self-review notes
 
 - Spec §5 coverage: read seam (T3), UI relative-time + null-renders-nothing (T4), `connectedNow` (T3/T4), petname LWW map additive on FleetNetDoc not FleetNetRow (T1), IPC + empty-clears (T2), `DeviceView.petName` + label ladder + localStorage migration/read-only fallback (T3/T4). No gaps.

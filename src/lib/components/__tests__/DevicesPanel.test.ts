@@ -19,12 +19,14 @@ vi.mock('../../profile-service', () => ({
 import {
   loadDeviceLabel,
   saveDeviceLabel,
+  clearDeviceLabel,
   resolveDefaultDeviceLabel,
 } from '../../device-label-service';
 
 vi.mock('../../device-label-service', () => ({
   loadDeviceLabel: vi.fn(),
   saveDeviceLabel: vi.fn(),
+  clearDeviceLabel: vi.fn(),
   resolveDefaultDeviceLabel: vi.fn(),
 }));
 
@@ -1547,5 +1549,102 @@ describe('DevicesPanel — petnames + last-seen (ZEB-668 S4)', () => {
       (c: unknown[]) => c[0] === 'set_device_petname',
     );
     expect(petnameCalls.length).toBe(0);
+  });
+
+  // ── PR #454 round 1 ──────────────────────────────────────────────────────
+
+  it('no migration for an explicitly CLEARED petname (Some("") ≠ never named)', async () => {
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
+    const view = s4View();
+    view.devices[0] = { ...view.devices[0], petName: '' };
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    await tick();
+    const petnameCalls = mockedInvoke.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'set_device_petname',
+    );
+    expect(petnameCalls.length).toBe(0);
+  });
+
+  it('empty save clears a sibling petname through the IPC', async () => {
+    mockedInvoke.mockResolvedValueOnce(withSibling({ petName: 'Ildwyn' })); // mount
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname (clear)
+    mockedInvoke.mockResolvedValueOnce(withSibling({ petName: '' })); // refresh
+    render(DevicesPanel);
+    await screen.findByText('Ildwyn');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[renameBtns.length - 1]);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: '' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'bb'.repeat(32),
+      petname: '',
+    });
+    // Sibling clear never touches this device's local label store.
+    expect(clearDeviceLabel).not.toHaveBeenCalled();
+    // Cleared name falls back to the backend display name.
+    await screen.findByText('Device bb22cc33');
+  });
+
+  it('clearing the self petname also removes the local fallback label', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View()); // mount (self petName null, no label → no migration)
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname (clear)
+    mockedInvoke.mockResolvedValueOnce(s4View()); // refresh
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[0]); // self row
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: '   ' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'aa'.repeat(32),
+      petname: '',
+    });
+    expect(clearDeviceLabel).toHaveBeenCalled();
+    expect(saveDeviceLabel).not.toHaveBeenCalled();
+  });
+
+  it('over-length rename shows an inline error and never invokes the IPC', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View());
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[renameBtns.length - 1]);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: 'x'.repeat(65) } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(screen.getByRole('alert')).toHaveTextContent(/too long/i);
+    const petnameCalls = mockedInvoke.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'set_device_petname',
+    );
+    expect(petnameCalls.length).toBe(0);
+    // Cancel clears the error.
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('counts code points, not UTF-16 units (64 emoji are accepted)', async () => {
+    mockedInvoke.mockResolvedValueOnce(s4View()); // mount
+    mockedInvoke.mockResolvedValueOnce(undefined); // set_device_petname
+    mockedInvoke.mockResolvedValueOnce(s4View()); // refresh
+    render(DevicesPanel);
+    await screen.findByText('Device bb22cc33');
+    const renameBtns = screen.getAllByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtns[renameBtns.length - 1]);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    // 64 surrogate-pair emoji = 128 UTF-16 units but exactly the 64-char cap.
+    await fireEvent.input(input, { target: { value: '😀'.repeat(64) } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+      deviceVkHex: 'bb'.repeat(32),
+      petname: '😀'.repeat(64),
+    });
   });
 });

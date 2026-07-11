@@ -187,8 +187,12 @@ pub(crate) fn plan_revocation(
 pub(crate) struct FleetJoin {
     /// 64-hex fleet `pinned` value (butler pin).
     pub pinned: Option<String>,
-    /// device_vk_hex → non-empty petname (cleared entries are filtered out
-    /// at population; the loop filters again defensively).
+    /// device_vk_hex → petname as stored (the view join trims). An
+    /// empty-after-trim value is an explicitly CLEARED name (LWW tombstone
+    /// entry); an absent key means the device was never named. The
+    /// distinction flows into `DeviceView.pet_name` (`Some("")` vs `None`)
+    /// and gates the panel's one-shot label migration — a cleared name must
+    /// never be resurrected from a stale local label (PR #454 round 1).
     pub petnames: std::collections::BTreeMap<String, String>,
     /// device_vk_hex → (seen_at.wall_ms, iroh_endpoint_id).
     pub rows: std::collections::BTreeMap<String, (u64, [u8; 32])>,
@@ -234,12 +238,15 @@ fn build_owner_state_view(
                 .map(|p| p == dev_id_hex)
                 .unwrap_or(false);
             // ZEB-668 S4: petname + last-seen + connected join on the same
-            // 64-hex vk key the fleet-net doc uses.
+            // 64-hex vk key the fleet-net doc uses. Trim on read (PR #454
+            // round 1): the local writer trims, but a remote peer's entry is
+            // only LWW-merged — normalize here so a whitespace-only name can
+            // never surface as a visible petname. Some("") = explicitly
+            // cleared (distinct from None = never named — see FleetJoin doc).
             let pet_name = fleet
                 .petnames
                 .get(&dev_id_hex)
-                .filter(|s| !s.is_empty())
-                .cloned();
+                .map(|s| s.trim().to_string());
             let (last_seen_ms, connected_now) = match fleet.rows.get(&dev_id_hex) {
                 Some((ms, ep)) => (Some(*ms), fleet.connected_eps.contains(ep)),
                 None => (None, false),
@@ -360,9 +367,7 @@ pub(crate) async fn get_owner_state_inner(
                     .insert(id.clone(), (row.seen_at.wall_ms, row.iroh_endpoint_id));
             }
             for (id, pn) in &doc.petnames {
-                if !pn.name.is_empty() {
-                    fleet.petnames.insert(id.clone(), pn.name.clone());
-                }
+                fleet.petnames.insert(id.clone(), pn.name.clone());
             }
         }
         if let Some(h) = resolver.and_then(|r| r.liveness()) {
@@ -1418,8 +1423,11 @@ mod tests {
     }
 
     #[test]
-    fn view_empty_petname_entry_reads_as_none() {
-        // A cleared petname (name: "") must surface as None, not Some("").
+    fn view_cleared_petname_surfaces_as_some_empty_not_none() {
+        // PR #454 round 1: a cleared petname (LWW tombstone, name: "") must
+        // surface as Some("") — DISTINCT from None (never named). The panel's
+        // one-shot local-label migration keys on exactly this distinction: a
+        // cleared name must never be resurrected from a stale local label.
         let loaded = minted_loaded_state();
         let dev_vk_hex = fixture_vk_hex(&loaded);
         let mut fleet = FleetJoin::default();
@@ -1430,7 +1438,42 @@ mod tests {
             .iter()
             .find(|d| d.device_vk_hex == dev_vk_hex)
             .expect("fixture device row");
-        assert_eq!(d.pet_name, None);
+        assert_eq!(d.pet_name.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn view_trims_whitespace_petname_from_remote_writers() {
+        // PR #454 round 1 (Qodo): the local writer trims, but a remote
+        // peer's LWW entry lands as stored. A whitespace-only name must
+        // normalize to the cleared form, and padding must be stripped.
+        let loaded = minted_loaded_state();
+        let dev_vk_hex = fixture_vk_hex(&loaded);
+
+        let mut fleet = FleetJoin::default();
+        fleet.petnames.insert(dev_vk_hex.clone(), "   ".into());
+        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let d = view
+            .devices
+            .iter()
+            .find(|d| d.device_vk_hex == dev_vk_hex)
+            .expect("fixture device row");
+        assert_eq!(
+            d.pet_name.as_deref(),
+            Some(""),
+            "whitespace-only → cleared form"
+        );
+
+        let mut fleet = FleetJoin::default();
+        fleet
+            .petnames
+            .insert(dev_vk_hex.clone(), "  KRILE  ".into());
+        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let d = view
+            .devices
+            .iter()
+            .find(|d| d.device_vk_hex == dev_vk_hex)
+            .expect("fixture device row");
+        assert_eq!(d.pet_name.as_deref(), Some("KRILE"), "padding stripped");
     }
 
     #[test]

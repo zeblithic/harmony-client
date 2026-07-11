@@ -52,7 +52,9 @@ pub struct DeviceView {
     /// "compromised"; free text for the crate's `Other`).
     #[serde(default)]
     pub revoked_reason: Option<String>,
-    /// ZEB-668 S4: fleet-synced petname (LWW). None = never named / cleared.
+    /// ZEB-668 S4: fleet-synced petname (LWW, trimmed). `None` = never
+    /// named; `Some("")` = explicitly cleared (the distinction gates the
+    /// panel's one-shot local-label migration); non-empty = display name.
     #[serde(default)]
     pub pet_name: Option<String>,
     /// ZEB-668 S4: wall-clock ms of the device's last fleet-net heartbeat

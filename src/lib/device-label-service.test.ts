@@ -52,3 +52,15 @@ describe('device-label-service — ZEB-336', () => {
     expect(await resolveDefaultDeviceLabel()).toBe('This device');
   });
 });
+
+describe('clearDeviceLabel (ZEB-668 S4, PR #454 round 1)', () => {
+  it('removes the stored label so the ladder cannot resurrect it', async () => {
+    const { saveDeviceLabel, loadDeviceLabel, clearDeviceLabel } = await import(
+      './device-label-service'
+    );
+    saveDeviceLabel('KRILE');
+    expect(loadDeviceLabel()).toBe('KRILE');
+    clearDeviceLabel();
+    expect(loadDeviceLabel()).toBeNull();
+  });
+});
