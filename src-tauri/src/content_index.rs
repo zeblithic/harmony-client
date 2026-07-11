@@ -132,6 +132,12 @@ pub struct ContentIndexEntry {
     /// because folders didn't exist before slice 1.
     #[serde(default)]
     pub kind: ContentKind,
+    /// ZEB-669 S2: "back up with buddies" flag. Flagged public-durable
+    /// entries are published in this owner's signed BackupSet so active
+    /// pacts auto-pin them. `#[serde(default)]` keeps pre-field sidecars
+    /// readable (legacy entries were never flagged).
+    #[serde(default)]
+    pub backup: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -406,6 +412,23 @@ impl ContentIndex {
         true
     }
 
+    /// ZEB-669 S2: toggle the "back up with buddies" flag. Returns true
+    /// only when the flag actually changed (unknown id or same value ⇒
+    /// false), so callers republish the BackupSet only on real change.
+    /// Eligibility (public-durable class) is the IPC layer's check —
+    /// the index stores whatever intent survived it.
+    pub fn set_backup(&mut self, id: &SidecarId, backup: bool) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        if entry.backup == backup {
+            return false;
+        }
+        entry.backup = backup;
+        self.save();
+        true
+    }
+
     /// Set replication tier on a batch of sidecar_ids. Returns the count
     /// of entries whose tier actually changed.
     pub fn set_replication_tier(&mut self, ids: &[SidecarId], tier: ReplicationTier) -> usize {
@@ -520,6 +543,7 @@ mod tests {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         }
     }
@@ -752,6 +776,43 @@ mod tests {
         assert!(!idx.set_pinned(&id, true));
         assert!(idx.set_pinned(&id, false));
         assert!(!idx.get(&id).unwrap().pinned);
+    }
+
+    #[test]
+    fn set_backup_flips_flag_persists_and_reports_change() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let id = {
+            let mut idx = ContentIndex::load(&path);
+            let entry = sample_entry([0xB2; 32]);
+            let id = entry.sidecar_id;
+            idx.insert(entry);
+            assert!(idx.set_backup(&id, true));
+            assert!(!idx.set_backup(&id, true), "same value is a no-op");
+            id
+        };
+        let mut idx = ContentIndex::load(&path);
+        assert!(idx.get(&id).unwrap().backup, "flag survives reload");
+        assert!(
+            !idx.set_backup(&SidecarId::new(), true),
+            "unknown id is a no-op"
+        );
+    }
+
+    /// Pre-ZEB-669 sidecars have no `backup` key — they must deserialize
+    /// with the flag off (they were never flagged).
+    #[test]
+    fn backup_flag_defaults_false_on_legacy_entries() {
+        let json = format!(
+            r#"{{"sidecar_id":"{}","cid":"{}","file_name":"old.txt","size_bytes":1,
+                "stored_at_ms":1,"sensitivity":"private","replication_tier":"default",
+                "licensed":false,"archived":false}}"#,
+            SidecarId::new(),
+            "ab".repeat(32),
+        );
+        let entry: ContentIndexEntry = serde_json::from_str(&json).unwrap();
+        assert!(!entry.backup);
+        assert!(!entry.pinned);
     }
 
     #[test]

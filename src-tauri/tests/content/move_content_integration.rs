@@ -293,6 +293,7 @@ fn insert_top_level(
         licensed: false,
         archived: false,
         pinned,
+        backup: false,
         kind,
     });
     assert!(inserted, "fresh SidecarId must insert cleanly");

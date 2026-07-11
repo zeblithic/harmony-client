@@ -32,6 +32,7 @@ fn create_folder_at_root_then_list_shows_it() {
         licensed: false,
         archived: false,
         pinned: false,
+        backup: false,
         kind: ContentKind::Folder,
     });
     assert!(inserted, "new entry inserted");
@@ -463,6 +464,7 @@ fn pin_intent_survives_restart_for_folder() {
             licensed: false,
             archived: false,
             pinned: true,
+            backup: false,
             kind: ContentKind::Folder,
         });
     }

@@ -815,7 +815,6 @@ pub struct NodeState {
     /// interior mutability; writers hold the NodeState mutex.
     pledge_clock: std::sync::atomic::AtomicU64,
     backup_set_clock: std::sync::atomic::AtomicU64,
-    hosting_clock: std::sync::atomic::AtomicU64,
     /// Monotonic install generation. Bumped at lock-2 install site under
     /// `start_node`. Post-install checks (pairing-handle install, failure
     /// cleanup, stop_inner gating) compare against this to detect whether a
@@ -1681,7 +1680,6 @@ impl Default for NodeState {
             storage_settings_path: None,
             pledge_clock: std::sync::atomic::AtomicU64::new(0),
             backup_set_clock: std::sync::atomic::AtomicU64::new(0),
-            hosting_clock: std::sync::atomic::AtomicU64::new(0),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),
@@ -9688,9 +9686,6 @@ pub async fn start_node_inner(
                         guard.backup_set_clock = std::sync::atomic::AtomicU64::new(
                             storage_settings_loaded.backup_set_floor,
                         );
-                        guard.hosting_clock = std::sync::atomic::AtomicU64::new(
-                            storage_settings_loaded.hosting_floor,
-                        );
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
                         // ZEB-670: tombstone signer for delete_vine.
@@ -10658,6 +10653,31 @@ pub async fn start_node_inner(
                 let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                 if guard.generation == our_gen {
                     publish_follow_list_update(&guard);
+                    // ZEB-669 S2: same once-per-boot LWW convergence for
+                    // the storage-buddy records we own. Hosting reports
+                    // are the periodic publisher task's job (below).
+                    publish_pledge_list_update(&guard);
+                    publish_backup_set_update(&guard);
+                    if let (Some(identity), Some(tx), Some(path)) = (
+                        guard.owner_private_identity.clone(),
+                        guard.publish_tx.clone(),
+                        guard.storage_settings_path.clone(),
+                    ) {
+                        let floor = guard
+                            .storage_settings
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .hosting_floor;
+                        spawn_hosting_report_publisher(
+                            identity,
+                            guard.node_addr.clone(),
+                            guard.storage_ledger.clone(),
+                            guard.storage_settings.clone(),
+                            path,
+                            tx,
+                            floor,
+                        );
+                    }
                     // ZEB-671: seed the Discover graph inputs (consumes
                     // the guard).
                     refresh_vine_graph_inputs(guard);
@@ -14237,6 +14257,490 @@ fn publish_follow_list_update(guard: &NodeState) {
     }
 }
 
+// ── ZEB-669 S2: storage-buddy record publishing ─────────────────────────
+//
+// Same architecture as the follow-list publish path: session-monotonic
+// updated_at floored by a persisted high-water mark, signer-authority
+// guard, best-effort choke points. Records ride the generic
+// `PublishRequest` channel (the descriptor path) rather than a dedicated
+// one — publish failures self-heal on the next trigger/boot republish.
+
+/// Strictly-increasing `updated_at` for one storage record type, floored
+/// by wall seconds AND the previous value (+1) — two changes within one
+/// wall second must not be LWW-equal, and a backwards wall clock across
+/// restarts must not publish records receivers ignore (the floors are
+/// restored from `storage_settings.json` at boot).
+fn next_storage_updated_at(clock: &std::sync::atomic::AtomicU64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prev = clock.load(Ordering::Relaxed);
+    let ts = now_secs.max(prev + 1);
+    clock.store(ts, Ordering::Relaxed);
+    ts
+}
+
+/// Refuse to sign a storage record for an owner address the local
+/// identity does not derive (the receiver-side binding would reject it
+/// everywhere while "succeeding" locally).
+fn storage_signer<'a>(
+    guard: &'a NodeState,
+    what: &str,
+) -> Result<&'a std::sync::Arc<harmony_identity::PrivateIdentity>, String> {
+    let identity = guard
+        .owner_private_identity
+        .as_ref()
+        .ok_or_else(|| format!("identity unavailable: cannot sign {what}"))?;
+    let signer = vine_signing::signer_address(identity);
+    if guard.node_addr != signer {
+        return Err(format!(
+            "refusing to sign: storage record owner {} does not match signer identity {signer}",
+            guard.node_addr
+        ));
+    }
+    Ok(identity)
+}
+
+/// Persist `settings` (floor updates included) — floor-then-publish
+/// ordering, matching the follow-list clock (a crash between the two
+/// re-publishes with a HIGHER timestamp, never a replayed one).
+fn persist_storage_settings(guard: &NodeState, settings: &storage_settings::StorageSettings) {
+    if let Some(path) = guard.storage_settings_path.as_ref() {
+        storage_settings::save(path, settings);
+    }
+}
+
+/// Build + sign the current pledge list from `my_pledges` (BTreeMap ⇒
+/// deterministic order), advancing + persisting the pledge floor.
+fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), String> {
+    let identity = storage_signer(guard, "pledge list")?;
+    let updated_at = next_storage_updated_at(&guard.pledge_clock);
+    let pledges: Vec<storage_signing::PledgeEntry> = {
+        let mut settings = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        settings.pledge_floor = updated_at;
+        persist_storage_settings(guard, &settings);
+        settings
+            .my_pledges
+            .iter()
+            .take(storage_records::MAX_PLEDGES_PER_LIST)
+            .map(|(to, bytes)| storage_signing::PledgeEntry {
+                to: to.clone(),
+                bytes: *bytes,
+            })
+            .collect()
+    };
+    let mut payload = storage_signing::PledgeListPayload {
+        owner_address: guard.node_addr.clone(),
+        pledges,
+        updated_at,
+        identity_pub: None,
+        sig: None,
+    };
+    storage_signing::sign_pledge_list(identity, &mut payload);
+    let topic = format!("{}{}/pledges", STORAGE_RECORD_PREFIX, payload.owner_address);
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("pledge list serialize failed: {e}"))?;
+    Ok((topic, bytes))
+}
+
+/// Build + sign the current backup set from flagged index entries:
+/// non-archived, public-durable class (defense in depth — the flag IPC
+/// already rejects ineligible classes), deduped by cid, ordered by
+/// `stored_at_ms` then cid (deterministic priority: oldest flagged
+/// first), truncated to the wire cap.
+fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), String> {
+    let identity = storage_signer(guard, "backup set")?;
+    let entries: Vec<storage_signing::BackupEntry> = {
+        let idx = guard
+            .content_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rows: Vec<(u64, String, u64)> = idx
+            .entries()
+            .filter(|e| e.backup && !e.archived)
+            .filter(|e| {
+                harmony_content::cid::ContentId::from_bytes(e.cid).content_class()
+                    == harmony_content::cid::ContentClass::PublicDurable
+            })
+            .map(|e| (e.stored_at_ms, hex::encode(e.cid), e.size_bytes))
+            .collect();
+        rows.sort();
+        let mut seen = std::collections::HashSet::new();
+        rows.into_iter()
+            .filter(|(_, cid, _)| seen.insert(cid.clone()))
+            .take(storage_records::MAX_BACKUP_ENTRIES)
+            .map(|(_, cid, size)| storage_signing::BackupEntry { cid, size })
+            .collect()
+    };
+    let updated_at = next_storage_updated_at(&guard.backup_set_clock);
+    {
+        let mut settings = guard
+            .storage_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        settings.backup_set_floor = updated_at;
+        persist_storage_settings(guard, &settings);
+    }
+    let mut payload = storage_signing::BackupSetPayload {
+        owner_address: guard.node_addr.clone(),
+        entries,
+        updated_at,
+        identity_pub: None,
+        sig: None,
+    };
+    storage_signing::sign_backup_set(identity, &mut payload);
+    let topic = format!(
+        "{}{}/backup-set",
+        STORAGE_RECORD_PREFIX, payload.owner_address
+    );
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("backup set serialize failed: {e}"))?;
+    Ok((topic, bytes))
+}
+
+/// The ledger aggregate a hosting report publishes: one line per
+/// beneficiary (bytes + cid count), never per-CID (spec §3). Also the
+/// publisher task's change fingerprint.
+fn hosting_report_lines(
+    ledger: &std::sync::Arc<Mutex<storage_ledger::StorageLedger>>,
+) -> Vec<storage_signing::HostingReportEntry> {
+    let ledger = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ledger
+        .buddies()
+        .into_iter()
+        .map(|b| storage_signing::HostingReportEntry {
+            bytes: ledger.bytes_for_buddy(&b),
+            cids: ledger.cid_count_for_buddy(&b),
+            beneficiary: b,
+        })
+        .filter(|r| r.cids > 0)
+        .take(storage_records::MAX_HOSTING_REPORTS)
+        .collect()
+}
+
+/// Build + sign a hosting report. Explicit deps (not `&NodeState`): the
+/// caller is the per-generation publisher TASK, which must own its
+/// handles outright to work identically under Tauri and headless serve
+/// (the `app.state::<…>()` shortcut is wry-only).
+fn build_signed_hosting_report_with(
+    identity: &harmony_identity::PrivateIdentity,
+    node_addr: &str,
+    reports: Vec<storage_signing::HostingReportEntry>,
+    settings: &std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
+    settings_path: &std::path::Path,
+    clock: &std::sync::atomic::AtomicU64,
+) -> Result<(String, Vec<u8>), String> {
+    let signer = vine_signing::signer_address(identity);
+    if node_addr != signer {
+        return Err(format!(
+            "refusing to sign: storage record owner {node_addr} does not match signer identity {signer}"
+        ));
+    }
+    let updated_at = next_storage_updated_at(clock);
+    {
+        let mut settings = settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        settings.hosting_floor = updated_at;
+        storage_settings::save(settings_path, &settings);
+    }
+    let mut payload = storage_signing::HostingReportPayload {
+        owner_address: node_addr.to_string(),
+        reports,
+        updated_at,
+        identity_pub: None,
+        sig: None,
+    };
+    storage_signing::sign_hosting_report(identity, &mut payload);
+    let topic = format!("{}{}/hosting", STORAGE_RECORD_PREFIX, payload.owner_address);
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|e| format!("hosting report serialize failed: {e}"))?;
+    Ok((topic, bytes))
+}
+
+/// Hand a signed storage record to the event loop for Zenoh publication.
+/// Fire-and-forget (the oneshot receiver is dropped): triggers and the
+/// boot republish self-heal a lost publish.
+fn send_storage_record_publish(
+    guard: &NodeState,
+    key_expr: String,
+    payload: Vec<u8>,
+) -> Result<(), String> {
+    let tx = guard.publish_tx.as_ref().ok_or("not connected")?;
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    tx.try_send(event_loop::PublishRequest {
+        key_expr,
+        payload,
+        reply: reply_tx,
+    })
+    .map_err(|_| "publish channel full — storage record publish not sent".to_string())
+}
+
+/// Best-effort choke point: every pledge-list publish path goes through
+/// here (set_buddy_pledge, remove_storage_buddy, boot republish).
+pub(crate) fn publish_pledge_list_update(guard: &NodeState) {
+    match build_signed_pledge_list(guard) {
+        Ok((topic, bytes)) => {
+            if let Err(e) = send_storage_record_publish(guard, topic, bytes) {
+                tracing::warn!(error = %e, "pledge-list publish hand-off failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "pledge-list publish skipped"),
+    }
+}
+
+/// Best-effort choke point: backup-set publishes (set_backup_flag, boot).
+pub(crate) fn publish_backup_set_update(guard: &NodeState) {
+    match build_signed_backup_set(guard) {
+        Ok((topic, bytes)) => {
+            if let Err(e) = send_storage_record_publish(guard, topic, bytes) {
+                tracing::warn!(error = %e, "backup-set publish hand-off failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "backup-set publish skipped"),
+    }
+}
+
+/// ZEB-669 S2: per-generation hosting-report publisher. Spawned from
+/// start_node (NEVER inline-awaited — the loop isn't draining publish_rx
+/// yet at spawn time; see the start_node inline-await hazard). Policy:
+/// check every 30 s, publish when the ledger aggregate changed or
+/// `HOSTING_REFRESH_INTERVAL_MS` elapsed (receivers prune at 3× the
+/// refresh interval). Exits when the event loop drops `publish_rx`
+/// (node stopped) — no generation plumbing needed.
+fn spawn_hosting_report_publisher(
+    identity: std::sync::Arc<harmony_identity::PrivateIdentity>,
+    node_addr: String,
+    ledger: std::sync::Arc<Mutex<storage_ledger::StorageLedger>>,
+    settings: std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
+    settings_path: std::path::PathBuf,
+    publish_tx: tokio::sync::mpsc::Sender<event_loop::PublishRequest>,
+    hosting_floor: u64,
+) {
+    tokio::spawn(async move {
+        let clock = std::sync::atomic::AtomicU64::new(hosting_floor);
+        // `None` = nothing published this session. The initial-empty
+        // aggregate is deliberately NOT published: a node that never
+        // buddied should not put an empty claim on the wire.
+        let mut published: Option<Vec<storage_signing::HostingReportEntry>> = None;
+        let mut last_publish = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if publish_tx.is_closed() {
+                tracing::debug!("hosting-report publisher exiting (node stopped)");
+                return;
+            }
+            let lines = hosting_report_lines(&ledger);
+            let changed = published.as_deref() != Some(&lines[..]);
+            let refresh_due = last_publish.elapsed().as_millis() as u64
+                >= storage_records::HOSTING_REFRESH_INTERVAL_MS;
+            let initial_empty = published.is_none() && lines.is_empty();
+            if initial_empty || !(changed || (refresh_due && !lines.is_empty())) {
+                continue;
+            }
+            match build_signed_hosting_report_with(
+                &identity,
+                &node_addr,
+                lines.clone(),
+                &settings,
+                &settings_path,
+                &clock,
+            ) {
+                Ok((topic, bytes)) => {
+                    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                    match publish_tx.try_send(event_loop::PublishRequest {
+                        key_expr: topic,
+                        payload: bytes,
+                        reply: reply_tx,
+                    }) {
+                        Ok(()) => {
+                            published = Some(lines);
+                            last_publish = std::time::Instant::now();
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "hosting-report publish deferred (channel full)");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "hosting-report publish skipped"),
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod storage_publish_tests {
+    use super::*;
+
+    fn signed_state() -> (NodeState, String) {
+        let identity = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let node_addr = vine_signing::signer_address(&identity);
+        let state = NodeState {
+            node_addr: node_addr.clone(),
+            owner_private_identity: Some(std::sync::Arc::new(identity)),
+            ..NodeState::default()
+        };
+        (state, node_addr)
+    }
+
+    #[test]
+    fn storage_clock_is_strictly_monotonic_within_session() {
+        let (state, _) = signed_state();
+        let a = next_storage_updated_at(&state.pledge_clock);
+        let b = next_storage_updated_at(&state.pledge_clock);
+        assert!(b > a, "same-wall-second publishes must not be LWW-equal");
+    }
+
+    #[test]
+    fn pledge_build_advances_and_persists_the_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, addr) = signed_state();
+        state.storage_settings_path = Some(storage_settings::settings_path(dir.path()));
+        state
+            .storage_settings
+            .lock()
+            .unwrap()
+            .my_pledges
+            .insert("buddy-a".into(), 500);
+
+        let (topic, bytes) = build_signed_pledge_list(&state).expect("build");
+        assert_eq!(topic, format!("{STORAGE_RECORD_PREFIX}{addr}/pledges"));
+        let payload: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_pledge_list(&payload).expect("self-verifies");
+        assert_eq!(payload.pledges[0].to, "buddy-a");
+
+        let on_disk =
+            storage_settings::load_or_default(state.storage_settings_path.as_ref().unwrap());
+        assert_eq!(
+            on_disk.pledge_floor, payload.updated_at,
+            "floor persisted before publish"
+        );
+    }
+
+    #[test]
+    fn refuses_to_sign_for_foreign_owner() {
+        let (mut state, _) = signed_state();
+        state.node_addr = "somebody-else".into();
+        let err = build_signed_pledge_list(&state).unwrap_err();
+        assert!(err.contains("does not match signer identity"), "{err}");
+    }
+
+    #[test]
+    fn backup_set_build_dedupes_orders_and_filters() {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let (state, _) = signed_state();
+
+        let older = ContentId::for_book(b"older", ContentFlags::default()).unwrap();
+        let newer = ContentId::for_book(b"newer", ContentFlags::default()).unwrap();
+        let encrypted = ContentId::for_book(
+            b"secret",
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mk = |cid: ContentId, stored_at_ms: u64, backup: bool, archived: bool| {
+            content_index::ContentIndexEntry {
+                sidecar_id: content_index::SidecarId::new(),
+                cid: cid.to_bytes(),
+                file_name: "f".into(),
+                size_bytes: 3,
+                stored_at_ms,
+                sensitivity: content_index::Sensitivity::Public,
+                replication_tier: content_index::ReplicationTier::Default,
+                licensed: false,
+                archived,
+                pinned: false,
+                backup,
+                kind: content_index::ContentKind::Leaf,
+            }
+        };
+        {
+            let mut idx = state.content_index.lock().unwrap();
+            idx.insert(mk(newer, 200, true, false));
+            idx.insert(mk(older, 100, true, false));
+            idx.insert(mk(older, 150, true, false)); // duplicate cid → deduped
+            idx.insert(mk(encrypted, 50, true, false)); // ineligible class
+            idx.insert(mk(
+                ContentId::for_book(b"archived", ContentFlags::default()).unwrap(),
+                10,
+                true,
+                true, // archived → excluded
+            ));
+        }
+
+        let (_, bytes) = build_signed_backup_set(&state).expect("build");
+        let payload: storage_signing::BackupSetPayload = serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_backup_set(&payload).expect("self-verifies");
+        let cids: Vec<&str> = payload.entries.iter().map(|e| e.cid.as_str()).collect();
+        assert_eq!(
+            cids,
+            vec![
+                hex::encode(older.to_bytes()).as_str(),
+                hex::encode(newer.to_bytes()).as_str()
+            ],
+            "deduped, oldest-first, ineligible/archived excluded"
+        );
+    }
+
+    #[test]
+    fn hosting_report_build_aggregates_per_beneficiary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, addr) = signed_state();
+        {
+            let mut ledger = state.storage_ledger.lock().unwrap();
+            ledger.record_pin("alice", "cid1", 100, 1);
+            ledger.record_pin("alice", "cid2", 50, 2);
+            ledger.record_pin("bob", "cid1", 100, 3);
+        }
+        let lines = hosting_report_lines(&state.storage_ledger);
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let settings_path = storage_settings::settings_path(dir.path());
+        let (topic, bytes) = build_signed_hosting_report_with(
+            state.owner_private_identity.as_ref().unwrap(),
+            &addr,
+            lines,
+            &state.storage_settings,
+            &settings_path,
+            &clock,
+        )
+        .expect("build");
+        assert_eq!(topic, format!("{STORAGE_RECORD_PREFIX}{addr}/hosting"));
+        let payload: storage_signing::HostingReportPayload =
+            serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_hosting_report(&payload).expect("self-verifies");
+        assert_eq!(payload.reports.len(), 2);
+        let alice = payload
+            .reports
+            .iter()
+            .find(|r| r.beneficiary == "alice")
+            .unwrap();
+        assert_eq!((alice.bytes, alice.cids), (150, 2));
+        let bob = payload
+            .reports
+            .iter()
+            .find(|r| r.beneficiary == "bob")
+            .unwrap();
+        assert_eq!(
+            (bob.bytes, bob.cids),
+            (100, 1),
+            "per-pact attribution counts the shared cid for bob too"
+        );
+        let on_disk = storage_settings::load_or_default(&settings_path);
+        assert_eq!(on_disk.hosting_floor, payload.updated_at, "floor persisted");
+    }
+}
+
 /// ZEB-671: refresh the Discover graph inputs on the vine cache after a
 /// local follow-set change. Extracts what it needs and DROPS the state
 /// guard before locking the cache — IPC readers (`list_vine_videos`)
@@ -15762,6 +16266,7 @@ pub(crate) async fn send_ingest_with_name(
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: content_index::ContentKind::Leaf,
         });
         if !inserted {
@@ -16537,6 +17042,7 @@ pub(crate) async fn create_folder_at_root_with_children(
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: content_index::ContentKind::Folder,
         });
         if !inserted {
@@ -18021,6 +18527,7 @@ async fn move_case_d(
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: moved_entry.kind,
         })
     };
@@ -55448,6 +55955,7 @@ mod tests {
             licensed: false,
             archived,
             pinned: false,
+            backup: false,
             kind: content_index::ContentKind::Leaf,
         }
     }
@@ -59659,7 +60167,6 @@ mod start_node_race_tests {
             storage_settings_path: None,
             pledge_clock: std::sync::atomic::AtomicU64::new(0),
             backup_set_clock: std::sync::atomic::AtomicU64::new(0),
-            hosting_clock: std::sync::atomic::AtomicU64::new(0),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),

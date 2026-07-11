@@ -277,6 +277,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                 licensed: false,
                 archived: false,
                 pinned: false,
+                backup: false,
                 kind: ContentKind::Leaf,
             }),
             "first insert should return true"
@@ -647,6 +648,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         }));
     }
@@ -745,6 +747,7 @@ fn pin_intent_survives_reload() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         });
         assert!(
@@ -1321,6 +1324,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         }));
         assert!(idx.insert(ContentIndexEntry {
@@ -1334,6 +1338,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Folder,
         }));
     }
@@ -1656,6 +1661,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
             licensed: false,
             archived: false,
             pinned: false,
+            backup: false,
             kind: ContentKind::Leaf,
         }));
     }
