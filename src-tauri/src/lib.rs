@@ -760,6 +760,14 @@ pub struct NodeState {
     /// start_node resolves the app data dir (tests leave it `None` —
     /// persistence is a no-op, mirroring the vine cache's save path).
     vine_settings_path: Option<std::path::PathBuf>,
+    /// ZEB-671: session-monotonic floor for follow-list `updated_at`.
+    /// Wall seconds alone would make two changes within one second
+    /// LWW-equal, so receivers (which ignore `<=` timestamps) would drop
+    /// the SECOND record — e.g. a follow immediately unfollowed would
+    /// stay visible remotely. Every signed list uses
+    /// `max(now, prev + 1)`. Atomic only for interior mutability — all
+    /// writers hold the NodeState mutex.
+    follow_list_clock: std::sync::atomic::AtomicU64,
     /// Shared set of followed addresses (read by the event loop for source tagging).
     followed_set: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// In-memory Vine feed cache (ZEB-286). Updated by the event loop on
@@ -1622,6 +1630,7 @@ impl Default for NodeState {
             follow_mgr: None,
             vine_share_follows: true,
             vine_settings_path: None,
+            follow_list_clock: std::sync::atomic::AtomicU64::new(0),
             followed_set: None,
             vine_feed_cache: None,
             owner_private_identity: None,
@@ -13887,6 +13896,25 @@ mod follow_list_publish_tests {
     }
 
     #[test]
+    fn rapid_changes_get_strictly_increasing_timestamps() {
+        // Two changes inside one wall-clock second must still produce
+        // increasing updated_at, or receiver LWW (which ignores `<=`)
+        // would drop the second record — a follow immediately unfollowed
+        // would stay visible remotely.
+        let (state, mut rx, _addr) = fixture(true, None);
+        follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap();
+        let (_, first) = last_publish(&mut rx).expect("first publish");
+        unfollow_vine_creator_impl(&state, "bb".repeat(16)).unwrap();
+        let (_, second) = last_publish(&mut rx).expect("second publish");
+        assert!(
+            second.updated_at > first.updated_at,
+            "same-second change must LWW-replace: {} vs {}",
+            second.updated_at,
+            first.updated_at
+        );
+    }
+
+    #[test]
     fn set_vine_settings_same_value_is_a_quiet_noop() {
         let (state, mut rx, _addr) = fixture(true, None);
         set_vine_settings_impl(&state, true).unwrap();
@@ -13990,13 +14018,22 @@ fn build_signed_follow_list_with(
         ));
     }
     follows.truncate(vine_feed_cache::MAX_FOLLOWS_PER_LIST);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Strictly-increasing per session — see `follow_list_clock`.
+    let updated_at = {
+        use std::sync::atomic::Ordering;
+        let prev = guard.follow_list_clock.load(Ordering::Relaxed);
+        let ts = now_secs.max(prev + 1);
+        guard.follow_list_clock.store(ts, Ordering::Relaxed);
+        ts
+    };
     let mut payload = VineFollowListPayload {
         owner_address: guard.node_addr.clone(),
         follows,
-        updated_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        updated_at,
         identity_pub: None,
         sig: None,
     };
@@ -59444,6 +59481,7 @@ mod start_node_race_tests {
             follow_mgr: None,
             vine_share_follows: true,
             vine_settings_path: None,
+            follow_list_clock: std::sync::atomic::AtomicU64::new(0),
             followed_set: None,
             vine_feed_cache: None,
             owner_private_identity: None,

@@ -199,3 +199,26 @@ tests in `src/lib/vine-service.test.ts`, `src/lib/components/__tests__/`.
 - PR: title `ZEB-671: Vines Discover = transitive follows (signed follow
   lists, 2°/3° graph, degree chips, Tune sheet)`; body with design summary +
   test evidence; fire `@coderabbitai review` once at open.
+
+---
+
+## Post-plan amendments (pre-PR self-review)
+
+1. **Session-monotonic `updated_at`** — wall seconds alone made two
+   changes within one second LWW-equal (receivers ignore `<=`), so a
+   follow immediately unfollowed would stay visible remotely.
+   `NodeState::follow_list_clock` floors every signed list at
+   `max(now, prev + 1)`; pinned by
+   `rapid_changes_get_strictly_increasing_timestamps`.
+2. **`DescriptorOutcome::Inserted { dto }` boxed** — the new
+   `degree`/`via` fields pushed the variant over clippy's
+   `large_enum_variant` threshold.
+3. **Graph recompute trigger for local changes** moved out of the
+   event-loop `FollowRequest::Follow/Unfollow` arm (which stays a no-op)
+   into `refresh_vine_graph_inputs`, called by the follow/unfollow IPCs
+   and the boot block — the IPC returns only after the cache reach map
+   is fresh, so the frontend's follow-triggered refetch never races it.
+4. **Mock vines carry `degree`/`via`** (one deliberately unconnected) so
+   dev mode exercises the graph-only Discover, chips, and Tune sheet.
+5. **Disk envelope key is `follow_lists`** (snake_case like its
+   siblings); per-row keys stay camelCase.
