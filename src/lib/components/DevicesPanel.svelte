@@ -1,6 +1,13 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
+  import { onDestroy, onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
+  import {
+    OwnerService,
+    extractError,
+    type DeviceView,
+    type OwnerStateView,
+    type RevokeReason,
+  } from '../owner-service';
   import { loadProfile } from '../profile-service';
   import { loadDeviceLabel, saveDeviceLabel, resolveDefaultDeviceLabel } from '../device-label-service';
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
@@ -19,6 +26,7 @@
   import Modal from './Modal.svelte';
   import OwnerRestoreWizard from './OwnerRestoreWizard.svelte';
   import OwnerPhraseReveal from './OwnerPhraseReveal.svelte';
+  import RemoveDeviceDialog from './RemoveDeviceDialog.svelte';
 
   let svc = new OwnerService();
   let state = $state<OwnerStateView | null>(null);
@@ -211,6 +219,64 @@
       butlerPinInFlight = false;
     }
   }
+
+  // ZEB-668 S2: device revoke. Active rows render normally; revoked rows
+  // move to the collapsed "Removed devices" section (real RevocationSet
+  // data — honesty rule).
+  const activeDevices = $derived((state?.devices ?? []).filter((d) => !d.revoked));
+  const removedDevices = $derived(
+    (state?.devices ?? [])
+      .filter((d) => d.revoked)
+      .toSorted((a, b) => (b.revokedAt ?? 0) - (a.revokedAt ?? 0)),
+  );
+  let removedOpen = $state(false);
+  let removeTarget = $state<DeviceView | null>(null);
+  let removeInFlight = $state(false);
+  let removeError = $state<string | null>(null);
+
+  async function handleRemoveConfirm(reason: RevokeReason) {
+    if (!removeTarget || removeInFlight) return;
+    removeError = null;
+    removeInFlight = true;
+    try {
+      await svc.revoke(removeTarget.deviceVkHex, reason);
+      // A self-revoke also fires device-revoked-self → App-level terminal
+      // state; the refresh below just keeps this panel honest meanwhile.
+      await svc.refresh();
+      removeTarget = null;
+    } catch (e) {
+      removeError = extractError(e);
+    } finally {
+      removeInFlight = false;
+    }
+  }
+
+  // Live refresh when trust state changes under us (S1 replication: a
+  // sibling's revoke/enrollment arrives via the trust engine's detector).
+  let unlistenDevicesUpdated: (() => void) | null = null;
+  onMount(() => {
+    let cancelled = false;
+    listen('owner-devices-updated', () => {
+      void svc.refresh();
+    })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenDevicesUpdated = unlisten;
+      })
+      .catch(() => {
+        // Registration can fail in tests / headless — non-fatal.
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
+  onDestroy(() => {
+    unlistenDevicesUpdated?.();
+    unlistenDevicesUpdated = null;
+  });
 
   async function openBackup() {
     backupOpen = true;
@@ -490,8 +556,8 @@
 
       <!-- ② Devices list -->
       <div class="devices-list">
-        <div class="label">MY DEVICES ({state.devices.length})</div>
-        {#each state.devices as device (device.deviceId)}
+        <div class="label">MY DEVICES ({activeDevices.length})</div>
+        {#each activeDevices as device (device.deviceId)}
           <div class="device-row">
             <div class="device-icon">{deviceInitial(device.displayName)}</div>
             <div class="device-meta">
@@ -513,6 +579,27 @@
                   {#if device.isThisDevice}
                     <span class="this-device-marker">this device</span>
                     <button class="rename-btn" onclick={() => startRename(device)}>Rename</button>
+                    <button
+                      class="remove-btn"
+                      onclick={() => {
+                        removeError = null;
+                        removeTarget = device;
+                      }}
+                    >
+                      Remove this device
+                    </button>
+                  {:else if state.canBackUp}
+                    <!-- Honesty rule: the sibling affordance renders only
+                         where the IPC can succeed (master seed present). -->
+                    <button
+                      class="remove-btn"
+                      onclick={() => {
+                        removeError = null;
+                        removeTarget = device;
+                      }}
+                    >
+                      Remove…
+                    </button>
                   {/if}
                 {/if}
               </div>
@@ -553,6 +640,33 @@
         {/if}
       </div>
 
+      <!-- ②b Removed devices (ZEB-668 S2) — collapsed; real RevocationSet data -->
+      {#if removedDevices.length > 0}
+        <div class="removed-section">
+          <button
+            class="removed-toggle"
+            aria-expanded={removedOpen}
+            onclick={() => (removedOpen = !removedOpen)}
+          >
+            <span class="removed-chevron" aria-hidden="true">{removedOpen ? '▾' : '▸'}</span>
+            Removed devices ({removedDevices.length})
+          </button>
+          {#if removedOpen}
+            {#each removedDevices as device (device.deviceId)}
+              <div class="removed-row">
+                <span class="removed-name">{device.displayName}</span>
+                {#if device.revokedReason}
+                  <span class="removed-reason">{device.revokedReason}</span>
+                {/if}
+                {#if device.revokedAt !== null}
+                  <span class="removed-date">removed {formatEnrolledAt(device.revokedAt)}</span>
+                {/if}
+              </div>
+            {/each}
+          {/if}
+        </div>
+      {/if}
+
       <!-- ③ Add-another-device footer -->
       <div class="add-another-footer">
         <div class="label">ADD ANOTHER DEVICE</div>
@@ -572,6 +686,21 @@
         {/if}
       </div>
     </div>
+  {/if}
+
+  {#if removeTarget}
+    <RemoveDeviceDialog
+      deviceName={removeTarget.displayName}
+      isSelf={removeTarget.isThisDevice}
+      isSeedHolder={removeTarget.isThisDevice && state?.canBackUp === true}
+      busy={removeInFlight}
+      error={removeError}
+      onConfirm={handleRemoveConfirm}
+      onCancel={() => {
+        removeTarget = null;
+        removeError = null;
+      }}
+    />
   {/if}
 
   {#if backupOpen}
@@ -948,6 +1077,57 @@
   }
   .rename-btn:hover {
     background: var(--bg-tertiary);
+  }
+  /* ZEB-668 S2: destructive row affordance + Removed-devices section */
+  .remove-btn {
+    font-size: 11px;
+    padding: 4px 8px;
+    border: 1px solid var(--danger-border-muted, var(--border));
+    background: var(--surface-raised);
+    color: var(--danger);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .remove-btn:hover {
+    background: var(--bg-tertiary);
+  }
+  .removed-section {
+    margin-top: 4px;
+  }
+  .removed-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    padding: 4px 0;
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .removed-chevron {
+    font-size: 10px;
+  }
+  .removed-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 0 0 16px;
+    opacity: 0.75;
+    font-size: 0.9rem;
+  }
+  .removed-name {
+    color: var(--text-primary);
+  }
+  .removed-reason {
+    color: var(--danger);
+    font-size: 0.8rem;
+  }
+  .removed-date {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
   }
   /* ZEB-418 P2 D17: butler pin toggle */
   .butler-row {
