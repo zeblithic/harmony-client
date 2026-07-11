@@ -63,15 +63,25 @@
 
   // ── Shared budget (slider + number pair, bidirectionally synced) ────────
   // Bidirectional sync: both inputs share the same $state (ChangeQuorumDialog
-  // idiom); seeded once on open — commits round-trip through the backend.
+  // idiom). Late-arriving or event-refreshed summaries re-seed the pair
+  // unless the user is mid-edit (Qodo PR #450 — a once-only untrack seed
+  // went stale when `summary` started null or changed while open).
   let budgetGb = $state(untrack(() => (summary ? summary.budgetBytes / GB : 0)));
+  let budgetDirty = $state(false);
+  $effect(() => {
+    const bytes = summary?.budgetBytes;
+    if (bytes != null && !budgetDirty) budgetGb = bytes / GB;
+  });
   function clampBudgetOnBlur() {
     if (Number.isNaN(budgetGb) || !Number.isFinite(budgetGb)) budgetGb = 0;
     if (budgetGb < 0) budgetGb = 0;
   }
-  function commitBudget() {
+  async function commitBudget() {
     clampBudgetOnBlur();
-    void run(onSetBudget(Math.round(budgetGb * GB)));
+    await run(onSetBudget(Math.round(budgetGb * GB)));
+    // Commit round-trips through the backend event → refreshed summary is
+    // authoritative again.
+    budgetDirty = false;
   }
 
   // ── Per-buddy pledge editing ─────────────────────────────────────────────
@@ -89,9 +99,13 @@
   function commitPledge(b: StorageBuddyDto) {
     void run(onSetPledge(b.ownerAddress, Math.round(pledgeGb(b) * GB)));
   }
-  /** Slider max: the shared budget (you can't honestly pledge past it);
-   *  falls back to the current pledge when it already exceeds the budget. */
+  /** Slider max: the shared budget (you can't honestly pledge past it). */
   let pledgeMaxGb = $derived(Math.max(1, summary ? Math.ceil(summary.budgetBytes / GB) : 1));
+  /** Per-row max: an already-over-budget pledge must still be representable
+   *  (browser range inputs silently clamp value to max — Qodo PR #450). */
+  function sliderMaxGb(b: StorageBuddyDto): number {
+    return Math.max(pledgeMaxGb, Math.ceil(pledgeGb(b)));
+  }
 
   // ── Tier-2 remove confirm (VoiceChannelView arm-token idiom) ────────────
   let confirmingRemove = $state<string | null>(null);
@@ -165,7 +179,8 @@
           step="1"
           bind:value={budgetGb}
           disabled={summary == null}
-          onchange={commitBudget}
+          oninput={() => (budgetDirty = true)}
+          onchange={() => void commitBudget()}
           aria-label="Shared budget slider (GB)"
           data-testid="budget-slider"
         />
@@ -175,7 +190,8 @@
           step="0.1"
           bind:value={budgetGb}
           disabled={summary == null}
-          onblur={commitBudget}
+          oninput={() => (budgetDirty = true)}
+          onblur={() => void commitBudget()}
           aria-label="Shared budget (GB)"
           data-testid="budget-number"
         />
@@ -217,7 +233,7 @@
               <input
                 type="range"
                 min="0"
-                max={pledgeMaxGb}
+                max={sliderMaxGb(b)}
                 step="0.5"
                 value={pledgeGb(b)}
                 oninput={(e) => setPledgeEdit(b.ownerAddress, Number(e.currentTarget.value))}

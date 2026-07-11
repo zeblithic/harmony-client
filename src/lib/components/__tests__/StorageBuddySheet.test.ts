@@ -189,4 +189,27 @@ describe('StorageBuddySheet', () => {
     await fireEvent.click(screen.getByTestId('sheet-done'));
     expect(p.onClose).toHaveBeenCalledOnce();
   });
+
+  it('a late-arriving summary re-seeds the budget pair (Qodo: stale untrack seed)', async () => {
+    const p = props({ summary: null });
+    const { rerender } = render(StorageBuddySheet, { props: p });
+    const number = screen.getByTestId('budget-number') as HTMLInputElement;
+    expect(number.value).toBe('0');
+    expect(number.disabled).toBe(true);
+    await rerender({ ...p, summary: summary({ budgetBytes: 25 * GB }) });
+    expect(number.value).toBe('25');
+    expect(number.disabled).toBe(false);
+  });
+
+  it('an over-budget pledge keeps the slider max at the pledge (no silent clamp)', () => {
+    render(StorageBuddySheet, {
+      props: props({
+        buddies: [buddy({ myPledgeBytes: 40 * GB })],
+        summary: summary({ budgetBytes: 10 * GB }),
+      }),
+    });
+    const slider = screen.getByTestId('pledge-slider') as HTMLInputElement;
+    expect(slider.max).toBe('40');
+    expect(slider.value).toBe('40');
+  });
 });

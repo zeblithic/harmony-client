@@ -47,24 +47,51 @@
   let backupEligible = $derived(detail.sensitivity === 'public');
   let backupPending = $state(false);
   let backupError = $state<string | null>(null);
+  /** Optimistic in-flight value: the checkbox is server-authoritative
+   *  (`detail.backup`), so mid-await rerenders would snap it back to the
+   *  old value (Qodo PR #450). Shown value = optimistic ?? server truth;
+   *  cleared when server truth refreshes and on rejection (which reverts
+   *  the box). */
+  let optimisticBackup = $state<boolean | null>(null);
+  /** Request identity: a file switch invalidates in-flight completions so
+   *  a stale rejection/finally can't clobber the next file's toggle state
+   *  (CodeRabbit PR #450). Plain counter — never read reactively. */
+  let backupReq = 0;
+  $effect(() => {
+    // File switch: clear ALL transient toggle state for the new file.
+    void detail.sidecarId;
+    backupReq++;
+    optimisticBackup = null;
+    backupError = null;
+    backupPending = false;
+  });
+  $effect(() => {
+    // Same-file server refresh: authoritative value arrived, drop optimism.
+    void detail.backup;
+    optimisticBackup = null;
+  });
+  let backupChecked = $derived(optimisticBackup ?? detail.backup ?? false);
 
   async function handleBackupToggle(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
     const wanted = input.checked;
     if (!onSetBackup || backupPending) return;
+    const req = ++backupReq;
     backupPending = true;
     backupError = null;
+    optimisticBackup = wanted;
     try {
       await onSetBackup(detail.sidecarId, wanted);
     } catch (err) {
+      if (req !== backupReq) return; // stale completion — a newer file/request owns the state
       const msg = err instanceof Error ? err.message : String(err);
       // Strip the stable machine prefix for display copy.
       backupError = msg.startsWith('ineligible:')
         ? `Not eligible: ${msg.slice('ineligible:'.length).trim()}`
         : msg;
-      input.checked = !wanted; // revert — backend rejected
+      optimisticBackup = null; // revert — backend rejected
     } finally {
-      backupPending = false;
+      if (req === backupReq) backupPending = false;
     }
   }
 
@@ -155,7 +182,7 @@
       <label class="backup-toggle">
         <input
           type="checkbox"
-          checked={detail.backup ?? false}
+          checked={backupChecked}
           disabled={(!backupEligible && !detail.backup) || backupPending}
           onchange={handleBackupToggle}
           data-testid="backup-checkbox"

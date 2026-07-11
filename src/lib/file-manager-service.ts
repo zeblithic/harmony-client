@@ -115,11 +115,12 @@ interface ContentItemWire {
   /** ZEB-612 S3: observed replica count — 1 (self) + distinct peer
    *  sessions seen announcing this CID. A lower bound ("copies seen"). */
   replicaCount: number;
-  /** ZEB-669 S3: "back up with buddies" flag (root sidecar rows only). */
-  backup: boolean;
+  /** ZEB-669 S3: "back up with buddies" flag (root sidecar rows only).
+   *  Optional: pre-ZEB-669 backends omit it (mapped to false). */
+  backup?: boolean;
   /** ZEB-669 S4: provenance recorded at creation; null for legacy and
-   *  manifest-derived rows. */
-  origin: ContentOriginInfo | null;
+   *  manifest-derived rows. Optional: pre-ZEB-669 backends omit it. */
+  origin?: ContentOriginInfo | null;
 }
 
 /** Wire shape of the `get_storage_budget` query (ZEB-612 S3). */
@@ -413,7 +414,8 @@ export class FileManagerService {
     } catch (e) {
       // Normalize both production (string) + test (Error) rejection shapes
       // (CLAUDE.md "Tauri IPC error extraction").
-      throw new Error(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
     }
     const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
     if (item) item.backup = backup;

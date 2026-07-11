@@ -17,7 +17,7 @@
 - **Error extraction:** `e instanceof Error ? e.message : String(e)` (prod rejections are strings).
 - **Wire keys are camelCase** (serde `rename_all = "camelCase"`); Rust command args snake_case → JS args camelCase.
 - **Never bump `content-index.json` `FILE_VERSION`** — `read_file` discards the whole index on version mismatch (`content_index.rs:208-221`). Additive fields use `#[serde(default)]` only.
-- **Iterative gates:** `scripts/test-select --context task` per task; final sweep in Task 9. Frontend gates: `npx tsc --noEmit`, `npx vitest run`.
+- **Iterative gates:** `scripts/test-select --context task` per task; final sweep in Task 9. Paste the emitted `round=… bucket=…` summary line into the task report so the selection is auditable. Frontend gates: `npx tsc --noEmit`, `npx vitest run`.
 - Spec §8 "wire-format fixture coverage for every new record type": `origin` is a **local sidecar field, not a network record** — the decode-old/round-trip-new coverage lives in `content_index.rs` unit tests (precedent: `backup_flag_defaults_false_on_legacy_entries` at 804-816, `save_persists_kind_field` at 844-858).
 
 ## Plan-time facts (ground truth, main @ 9c47b16e)

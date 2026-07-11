@@ -1781,7 +1781,8 @@
       contributionSummary = await storageBuddyService.getContributionSummary();
     } catch (e) {
       // Meter renders nothing on failure — log once at warn, don't fabricate.
-      console.warn('[storage-buddy] contribution summary fetch failed:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('[storage-buddy] contribution summary fetch failed:', msg);
       contributionSummary = null;
     }
   }
@@ -1789,7 +1790,8 @@
     try {
       storageBuddies = await storageBuddyService.listBuddies();
     } catch (e) {
-      console.warn('[storage-buddy] buddy list fetch failed:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('[storage-buddy] buddy list fetch failed:', msg);
     }
   }
   // Declare fileManagerVersion before wiring onChange — same pattern as allMessages.

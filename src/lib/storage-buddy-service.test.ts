@@ -114,6 +114,33 @@ describe('StorageBuddyService', () => {
     expect(adapter.listeners.size).toBe(0);
   });
 
+  it('destroy completes teardown even when an unlistener throws', async () => {
+    // Fresh service whose FIRST unlisten throws — the second must still run.
+    const listeners = new Map<string, (event: unknown) => void>();
+    let secondUnlistenRan = false;
+    let first = true;
+    const throwing = {
+      invoke: vi.fn(),
+      listen: vi.fn(async (event: string, handler: (event: unknown) => void) => {
+        listeners.set(event, handler);
+        if (first) {
+          first = false;
+          return () => {
+            throw new Error('unlisten failed');
+          };
+        }
+        return () => {
+          secondUnlistenRan = true;
+          listeners.delete(event);
+        };
+      }),
+    } as unknown as TauriAdapter;
+    const svc = new StorageBuddyService();
+    await svc.connectAdapter(throwing);
+    expect(() => svc.destroy()).not.toThrow();
+    expect(secondUnlistenRan).toBe(true);
+  });
+
   it('normalizes string rejections into Error (prod rejections are strings)', async () => {
     (adapter.invoke as ReturnType<typeof vi.fn>).mockRejectedValue(
       'pledge cap reached (64 buddies)'

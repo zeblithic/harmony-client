@@ -122,7 +122,15 @@ export class StorageBuddyService {
   }
 
   destroy(): void {
-    for (const fn of this.unlisteners) fn();
+    for (const fn of this.unlisteners) {
+      // Exception-safe teardown (PendingJoinsPanel safeUnlisten precedent):
+      // one throwing unlisten must not leak the rest.
+      try {
+        fn();
+      } catch {
+        // ignore — teardown must complete
+      }
+    }
     this.unlisteners = [];
     this.changeListeners.clear();
     // Null the adapter so connectAdapter's duplicate-init guard doesn't no-op

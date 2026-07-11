@@ -192,12 +192,16 @@ describe('FileDetailPanel', () => {
     expect(onSetBackup).toHaveBeenCalledWith(mockDetail.sidecarId, true);
   });
 
-  it('clearing stays allowed when an already-flagged file is no longer eligible', () => {
-    renderPanel({ sensitivity: 'private', backup: true }, { onSetBackup: vi.fn() });
+  it('clearing stays allowed when an already-flagged file is no longer eligible', async () => {
+    const onSetBackup = vi.fn().mockResolvedValue(undefined);
+    renderPanel({ sensitivity: 'private', backup: true }, { onSetBackup });
     const box = screen.getByTestId('backup-checkbox') as HTMLInputElement;
     expect(box.checked).toBe(true);
     expect(box.disabled).toBe(false);
     expect(screen.queryByText('Only public files can be backed up by buddies.')).toBeNull();
+    // The clearing flow itself must reach the backend (CodeRabbit PR #450).
+    await fireEvent.click(box);
+    expect(onSetBackup).toHaveBeenCalledWith(mockDetail.sidecarId, false);
   });
 
   it('renders the ineligible rejection inline and reverts the checkbox', async () => {
