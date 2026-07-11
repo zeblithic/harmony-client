@@ -143,6 +143,17 @@ impl StorageLedger {
 
     /// Release `buddy`'s attribution of `cid`.
     pub fn release(&mut self, buddy: &str, cid: &str) -> ReleaseOutcome {
+        let outcome = self.release_inner(buddy, cid);
+        if outcome != ReleaseOutcome::NotHeld {
+            self.save();
+        }
+        outcome
+    }
+
+    /// Release without persisting — batch callers (`evict_newest_first`)
+    /// save once per sweep instead of once per cid (PR #449 review,
+    /// CodeRabbit: a large budget shrink must not fsync per eviction).
+    fn release_inner(&mut self, buddy: &str, cid: &str) -> ReleaseOutcome {
         let Some(entries) = self.per_buddy.get_mut(buddy) else {
             return ReleaseOutcome::NotHeld;
         };
@@ -154,13 +165,11 @@ impl StorageLedger {
         if entries.is_empty() {
             self.per_buddy.remove(buddy);
         }
-        let outcome = if self.refcount(cid) == 0 {
+        if self.refcount(cid) == 0 {
             ReleaseOutcome::LastReference
         } else {
             ReleaseOutcome::StillReferenced
-        };
-        self.save();
-        outcome
+        }
     }
 
     /// Release every attribution held for `buddy` (pact revoked/removed).
@@ -184,6 +193,7 @@ impl StorageLedger {
     /// still-referenced cids free no bytes but honor eviction order.
     pub fn evict_newest_first(&mut self, target_bytes: u64) -> Vec<String> {
         let mut freed = Vec::new();
+        let mut removed_any = false;
         while self.distinct_pinned_bytes() > target_bytes {
             let newest = self
                 .per_buddy
@@ -197,9 +207,13 @@ impl StorageLedger {
             let Some((_, owner, cid)) = newest else {
                 break;
             };
-            if let ReleaseOutcome::LastReference = self.release(&owner, &cid) {
+            if self.release_inner(&owner, &cid) == ReleaseOutcome::LastReference {
                 freed.push(cid);
             }
+            removed_any = true;
+        }
+        if removed_any {
+            self.save();
         }
         freed
     }

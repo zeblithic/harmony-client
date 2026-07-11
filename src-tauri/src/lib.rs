@@ -14390,20 +14390,49 @@ fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), Strin
         settings.backup_set_floor = updated_at;
         persist_storage_settings(guard, &settings);
     }
-    let mut payload = storage_signing::BackupSetPayload {
-        owner_address: guard.node_addr.clone(),
-        entries,
-        updated_at,
-        identity_pub: None,
-        sig: None,
+    // PR #449 review (Qodo): receivers enforce MAX_BACKUP_SET_WIRE_BYTES
+    // BEFORE parsing, so an oversize publish is deterministically dropped
+    // by every peer. Enforce the cap on the SIGNED serialization here,
+    // truncating deterministically (the list is priority-ordered, so the
+    // oldest flagged entries always survive). Each shrink re-signs — the
+    // signature covers the final entry list.
+    let mut entries = entries;
+    let (topic, bytes) = loop {
+        let mut payload = storage_signing::BackupSetPayload {
+            owner_address: guard.node_addr.clone(),
+            entries: entries.clone(),
+            updated_at,
+            identity_pub: None,
+            sig: None,
+        };
+        storage_signing::sign_backup_set(identity, &mut payload);
+        let bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("backup set serialize failed: {e}"))?;
+        if bytes.len() <= storage_records::MAX_BACKUP_SET_WIRE_BYTES {
+            let topic = format!(
+                "{}{}/backup-set",
+                STORAGE_RECORD_PREFIX, payload.owner_address
+            );
+            break (topic, bytes);
+        }
+        if entries.is_empty() {
+            return Err(format!(
+                "backup set base payload exceeds wire cap ({} bytes)",
+                bytes.len()
+            ));
+        }
+        // Overshoot-proportional shrink converges in a couple of rounds.
+        let over = bytes.len() - storage_records::MAX_BACKUP_SET_WIRE_BYTES;
+        let per_entry = (bytes.len() / entries.len()).max(1);
+        let drop_n = (over / per_entry + 1).min(entries.len());
+        let kept = entries.len() - drop_n;
+        tracing::warn!(
+            dropped = drop_n,
+            kept,
+            "backup set exceeds wire cap; truncating lowest-priority entries"
+        );
+        entries.truncate(kept);
     };
-    storage_signing::sign_backup_set(identity, &mut payload);
-    let topic = format!(
-        "{}{}/backup-set",
-        STORAGE_RECORD_PREFIX, payload.owner_address
-    );
-    let bytes =
-        serde_json::to_vec(&payload).map_err(|e| format!("backup set serialize failed: {e}"))?;
     Ok((topic, bytes))
 }
 
@@ -15368,6 +15397,57 @@ mod storage_publish_tests {
                 hex::encode(newer.to_bytes()).as_str()
             ],
             "deduped, oldest-first, ineligible/archived excluded"
+        );
+    }
+
+    /// PR #449 review (Qodo): receivers drop over-cap payloads before
+    /// parse — the publisher must never emit one. The priority prefix
+    /// (oldest flagged first) survives truncation.
+    #[test]
+    fn backup_set_build_never_exceeds_wire_cap_and_keeps_priority_prefix() {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let (state, _) = signed_state();
+        let mut first_cid = None;
+        {
+            let mut idx = state.content_index.lock().unwrap();
+            for i in 0..storage_records::MAX_BACKUP_ENTRIES {
+                let cid = ContentId::for_book(&(i as u64).to_le_bytes(), ContentFlags::default())
+                    .unwrap();
+                if i == 0 {
+                    first_cid = Some(hex::encode(cid.to_bytes()));
+                }
+                idx.insert(content_index::ContentIndexEntry {
+                    sidecar_id: content_index::SidecarId::new(),
+                    cid: cid.to_bytes(),
+                    file_name: format!("f{i}"),
+                    size_bytes: u64::MAX - i as u64, // widest JSON digits
+                    stored_at_ms: i as u64,
+                    sensitivity: content_index::Sensitivity::Public,
+                    replication_tier: content_index::ReplicationTier::Default,
+                    licensed: false,
+                    archived: false,
+                    pinned: false,
+                    backup: true,
+                    kind: content_index::ContentKind::Leaf,
+                });
+            }
+        }
+        let (_, bytes) = build_signed_backup_set(&state).expect("build");
+        assert!(
+            bytes.len() <= storage_records::MAX_BACKUP_SET_WIRE_BYTES,
+            "published payload must fit the receivers' pre-parse cap ({} bytes)",
+            bytes.len()
+        );
+        let payload: storage_signing::BackupSetPayload = serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_backup_set(&payload).expect("re-signed after truncation");
+        assert!(
+            payload.entries.len() < storage_records::MAX_BACKUP_ENTRIES,
+            "this fixture must actually trigger truncation"
+        );
+        assert_eq!(
+            payload.entries[0].cid,
+            first_cid.unwrap(),
+            "oldest flagged entry (highest priority) survives"
         );
     }
 

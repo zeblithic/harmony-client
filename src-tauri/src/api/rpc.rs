@@ -1213,6 +1213,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_buddy_rpcs_are_registered_and_wired() {
+        // ZEB-669 S2 (PR #449 review): same proof shape as the vine-follow
+        // parity test — valid-shaped args on a default NodeState must reach
+        // the `_impl` seam (Ok or a Command error from the seam itself),
+        // never UnknownCommand (unregistered) or BadArgs (arg-struct
+        // mismatch with the Tauri wrapper's camelCase shape).
+        let reg = build_registry();
+        let owner = "ab".repeat(16); // valid 32-hex owner address
+        let cases = [
+            ("get_storage_buddies", serde_json::json!({})),
+            (
+                "set_buddy_pledge",
+                serde_json::json!({ "ownerAddress": owner, "bytes": 1024 }),
+            ),
+            (
+                "remove_storage_buddy",
+                serde_json::json!({ "ownerAddress": owner }),
+            ),
+            (
+                "set_shared_budget",
+                serde_json::json!({ "bytes": 5_000_000 }),
+            ),
+            ("get_contribution_summary", serde_json::json!({})),
+            (
+                "set_backup_flag",
+                serde_json::json!({
+                    "sidecarId": "00000000-0000-4000-8000-000000000000",
+                    "backup": true
+                }),
+            ),
+        ];
+        for (method, args) in cases {
+            match reg.dispatch(method, test_state(), test_sink(), args).await {
+                Err(RpcError::UnknownCommand) => panic!("{method} must be registered"),
+                Err(RpcError::BadArgs(msg)) => {
+                    panic!("{method}: arg struct rejected the wrapper shape: {msg}")
+                }
+                Ok(_) | Err(RpcError::Command(_)) => {}
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn null_args_treated_as_empty() {
         let reg = build_registry();
         // `null` body must be treated as `{}` — a no-arg command must not

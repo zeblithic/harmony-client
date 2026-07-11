@@ -165,6 +165,10 @@ impl StorageRecordStore {
             if row.entries.len() > MAX_BACKUP_ENTRIES {
                 continue;
             }
+            if let Err(reason) = validate_backup_entries(&row.entries) {
+                tracing::warn!(owner = %row.owner, %reason, "storage_records reload: dropping ineligible backup set");
+                continue;
+            }
             store.backup_sets.insert(
                 row.owner,
                 BackupSetRecord {
@@ -286,32 +290,8 @@ impl StorageRecordStore {
                 set.entries.len()
             ));
         }
-        let mut seen = std::collections::HashSet::new();
-        for e in &set.entries {
-            let raw = match hex::decode(&e.cid) {
-                Ok(r) => r,
-                Err(_) => {
-                    return RecordOutcome::Rejected(format!("backup set cid not hex: {}", e.cid));
-                }
-            };
-            let bytes32: [u8; 32] = match raw.try_into() {
-                Ok(b) => b,
-                Err(_) => {
-                    return RecordOutcome::Rejected("backup set cid is not 32 bytes".into());
-                }
-            };
-            let cid = harmony_content::cid::ContentId::from_bytes(bytes32);
-            if cid.verify_checksum().is_err() {
-                return RecordOutcome::Rejected("backup set cid checksum invalid".into());
-            }
-            if cid.content_class() != harmony_content::cid::ContentClass::PublicDurable {
-                return RecordOutcome::Rejected(
-                    "backup set entry is not public durable content".into(),
-                );
-            }
-            if !seen.insert(bytes32) {
-                return RecordOutcome::Rejected("backup set contains duplicate cid".into());
-            }
+        if let Err(reason) = validate_backup_entries(&set.entries) {
+            return RecordOutcome::Rejected(reason);
         }
         let outcome = lww_insert(
             &mut self.backup_sets,
@@ -424,6 +404,32 @@ impl StorageRecordStore {
         self.hosting_reports
             .retain(|_, r| now_ms.saturating_sub(r.received_at_ms) < HOSTING_REPORT_STALE_MS);
     }
+}
+
+/// Per-entry BackupSet eligibility, shared by wire ingest AND disk
+/// reload (PR #449 review, Qodo): a tampered `storage_records.json`
+/// must not smuggle in entries the wire path would reject — encrypted/
+/// ephemeral classes are never announced, so the planner must never see
+/// them regardless of how the record arrived.
+fn validate_backup_entries(entries: &[BackupEntry]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for e in entries {
+        let raw = hex::decode(&e.cid).map_err(|_| format!("backup set cid not hex: {}", e.cid))?;
+        let bytes32: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| "backup set cid is not 32 bytes".to_string())?;
+        let cid = harmony_content::cid::ContentId::from_bytes(bytes32);
+        if cid.verify_checksum().is_err() {
+            return Err("backup set cid checksum invalid".into());
+        }
+        if cid.content_class() != harmony_content::cid::ContentClass::PublicDurable {
+            return Err("backup set entry is not public durable content".into());
+        }
+        if !seen.insert(bytes32) {
+            return Err("backup set contains duplicate cid".into());
+        }
+    }
+    Ok(())
 }
 
 /// Owner-bound topic-shape check: `harmony/storage/{owner}/{kind}`,
@@ -878,6 +884,34 @@ mod tests {
         std::fs::write(&path, br#"{"version":99,"pledgeLists":[],"backupSets":[]}"#).unwrap();
         let store = StorageRecordStore::new(Some(path));
         assert!(store.pledge_lists.is_empty());
+    }
+
+    /// PR #449 review (Qodo): the disk file is not a trusted channel —
+    /// reload re-runs the same eligibility validation as wire ingest.
+    #[test]
+    fn tampered_disk_backup_set_with_ineligible_cid_is_dropped_on_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("storage_records.json");
+        let encrypted = ContentId::for_book(
+            b"secret",
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tampered = format!(
+            r#"{{"version":1,"pledgeLists":[],"backupSets":[
+                {{"owner":"mallory","entries":[{{"cid":"{}","size":1}}],"updatedAt":9}}
+            ]}}"#,
+            hex::encode(encrypted.to_bytes()),
+        );
+        std::fs::write(&path, tampered).unwrap();
+        let store = StorageRecordStore::new(Some(path));
+        assert!(
+            store.backup_set("mallory").is_none(),
+            "ineligible entries must not survive the reload path"
+        );
     }
 
     #[test]

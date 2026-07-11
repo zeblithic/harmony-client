@@ -3881,19 +3881,27 @@ pub async fn run(
                                 .ok()
                                 .and_then(|v| <[u8; 32]>::try_from(v).ok())
                             {
-                                Some(cid_bytes) if pin_intent.contains(&cid_bytes) => {
+                                Some(cid_bytes)
+                                    if pin_intent.contains(&cid_bytes)
+                                        || buddy_engine.buddy_pins.contains(&cid_bytes) =>
+                                {
                                     tracing::info!(
                                         cid = %cid_hex,
-                                        "vine tombstone: content locally pinned; keeping bytes"
+                                        "vine tombstone: content locally or buddy-pinned; keeping bytes"
                                     );
                                 }
                                 Some(cid_bytes) => {
                                     let root = ContentId::from_bytes(cid_bytes);
                                     let doomed =
                                         collect_descendants(runtime.storage_tier().cache(), root);
+                                    let protective: std::collections::HashSet<[u8; 32]> =
+                                        pin_intent
+                                            .union(&buddy_engine.buddy_pins)
+                                            .copied()
+                                            .collect();
                                     let keep = compute_keep_set(
                                         runtime.storage_tier().cache(),
-                                        &pin_intent,
+                                        &protective,
                                         doomed.len(),
                                     );
                                     for id in doomed {
@@ -4300,24 +4308,38 @@ pub async fn run(
                     ContentVerbRequest::Unpin { cid, reply } => {
                         // ZEB-155: clear intent so a later fetch doesn't re-pin.
                         pin_intent.remove(&cid);
-                        let root = ContentId::from_bytes(cid);
-                        let doomed = collect_descendants(runtime.storage_tier().cache(), root);
+                        // ZEB-669 S2 (PR #449 review): a buddy pact may
+                        // still pin this root — clear only the USER's
+                        // intent and leave the physical pin to the
+                        // engine's ownership.
+                        if buddy_engine.buddy_pins.contains(&cid) {
+                            let _ = reply.send(Ok(true));
+                        } else {
+                            let root = ContentId::from_bytes(cid);
+                            let doomed =
+                                collect_descendants(runtime.storage_tier().cache(), root);
 
-                        // ZEB-156: any CID reachable from a still-pinned root
-                        // must stay pinned even when it sits in `doomed`. See
-                        // `compute_keep_set` for the cross-cutting rationale.
-                        let keep = compute_keep_set(
-                            runtime.storage_tier().cache(),
-                            &pin_intent,
-                            doomed.len(),
-                        );
+                            // ZEB-156: any CID reachable from a still-pinned root
+                            // must stay pinned even when it sits in `doomed`. See
+                            // `compute_keep_set` for the cross-cutting rationale.
+                            // ZEB-669 S2: buddy roots protect their subtrees too.
+                            let protective: std::collections::HashSet<[u8; 32]> = pin_intent
+                                .union(&buddy_engine.buddy_pins)
+                                .copied()
+                                .collect();
+                            let keep = compute_keep_set(
+                                runtime.storage_tier().cache(),
+                                &protective,
+                                doomed.len(),
+                            );
 
-                        for id in doomed {
-                            if !keep.contains(&id) {
-                                runtime.unpin_content(&id);
+                            for id in doomed {
+                                if !keep.contains(&id) {
+                                    runtime.unpin_content(&id);
+                                }
                             }
+                            let _ = reply.send(Ok(true));
                         }
-                        let _ = reply.send(Ok(true));
                     }
                     ContentVerbRequest::Burn { cid, reply } => {
                         // Burn on a RAM-only client cascades the runtime-side
@@ -4327,6 +4349,17 @@ pub async fn run(
                         // command removes the sidecar entry, but this keeps
                         // the in-memory set consistent if the orders diverge).
                         pin_intent.remove(&cid);
+                        // ZEB-669 S2 (PR #449 review): burn is the user
+                        // explicitly destroying local bytes — it overrides
+                        // buddy ownership. Drop the ledger claim too so
+                        // hosting reports stay honest; the engine refetches
+                        // next tick if the pact still wants it.
+                        if buddy_engine.buddy_pins.remove(&cid) {
+                            storage_ledger
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .drop_cid_everywhere(&hex::encode(cid));
+                        }
                         let root = ContentId::from_bytes(cid);
                         let doomed = collect_descendants(runtime.storage_tier().cache(), root);
 
@@ -4334,9 +4367,13 @@ pub async fn run(
                         // root must not destroy bytes another pinned root
                         // still relies on. See `compute_keep_set` for the
                         // shared-subtree case the Tauri OR-join misses.
+                        let protective: std::collections::HashSet<[u8; 32]> = pin_intent
+                            .union(&buddy_engine.buddy_pins)
+                            .copied()
+                            .collect();
                         let keep = compute_keep_set(
                             runtime.storage_tier().cache(),
-                            &pin_intent,
+                            &protective,
                             doomed.len(),
                         );
 
@@ -5846,16 +5883,30 @@ pub async fn run(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     for cid_hex in ledger.distinct_cids() {
-                        let present = hex::decode(&cid_hex)
+                        let cid_bytes = hex::decode(&cid_hex)
                             .ok()
-                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
-                            .is_some_and(|b| admitted.contains(&b));
-                        if !present {
-                            tracing::info!(
-                                cid = %cid_hex,
-                                "buddy ledger: cid absent from cache after restart; dropping claim (will refetch)"
-                            );
-                            ledger.drop_cid_everywhere(&cid_hex);
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok());
+                        match cid_bytes {
+                            Some(b) if admitted.contains(&b) => {
+                                // Present (shouldn't happen on a RAM-only
+                                // cache, but stay correct if persistence
+                                // ever lands): re-establish the physical
+                                // pin + buddy ownership.
+                                buddy_engine.buddy_pins.insert(b);
+                                let root = ContentId::from_bytes(b);
+                                for id in
+                                    collect_descendants(runtime.storage_tier().cache(), root)
+                                {
+                                    runtime.pin_content(id);
+                                }
+                            }
+                            _ => {
+                                tracing::info!(
+                                    cid = %cid_hex,
+                                    "buddy ledger: cid absent from cache after restart; dropping claim (will refetch)"
+                                );
+                                ledger.drop_cid_everywhere(&cid_hex);
+                            }
                         }
                     }
                 }
@@ -5918,6 +5969,12 @@ pub async fn run(
                             contribution_changed = true;
                         }
                     }
+                    // PR #449 review (CodeRabbit): an attribute_only above
+                    // can re-reference a cid that a release just queued for
+                    // unpinning (release for pact A + attribution for pact
+                    // B in one plan). Physically unpin only what the FINAL
+                    // ledger state no longer claims anywhere.
+                    to_unpin.retain(|cid_hex| ledger.held_anywhere(cid_hex).is_none());
                 }
                 for cid_hex in to_unpin {
                     let Some(cid_bytes) = hex::decode(&cid_hex)
@@ -5926,14 +5983,22 @@ pub async fn run(
                     else {
                         continue;
                     };
-                    // Mirror the ContentVerbRequest::Unpin arm: keep-set
-                    // protects subtrees shared with still-pinned roots.
-                    pin_intent.remove(&cid_bytes);
+                    // Release BUDDY ownership only. If the user manually
+                    // pinned the same root, the physical pin stays (PR
+                    // #449 review, CodeRabbit) — pin_intent is theirs.
+                    buddy_engine.buddy_pins.remove(&cid_bytes);
+                    if pin_intent.contains(&cid_bytes) {
+                        continue;
+                    }
                     let root = ContentId::from_bytes(cid_bytes);
                     let doomed = collect_descendants(runtime.storage_tier().cache(), root);
+                    let protective: std::collections::HashSet<[u8; 32]> = pin_intent
+                        .union(&buddy_engine.buddy_pins)
+                        .copied()
+                        .collect();
                     let keep = compute_keep_set(
                         runtime.storage_tier().cache(),
-                        &pin_intent,
+                        &protective,
                         doomed.len(),
                     );
                     for id in doomed {
@@ -5971,7 +6036,18 @@ pub async fn run(
                         else {
                             continue; // ingest-validated; defensive only
                         };
-                        let max = usize::try_from(headroom).unwrap_or(usize::MAX);
+                        // PR #449 review (Qodo): cap each fetch near its
+                        // CLAIMED size (2× slack for bundle overhead /
+                        // benign drift, 64 KiB floor), still bounded by
+                        // global headroom — an under-claiming record must
+                        // not burn the whole remaining budget on one
+                        // download that gets dropped at completion.
+                        let per_fetch_cap = cand
+                            .claimed
+                            .saturating_mul(2)
+                            .max(64 * 1024)
+                            .min(headroom);
+                        let max = usize::try_from(per_fetch_cap).unwrap_or(usize::MAX);
                         headroom = headroom.saturating_sub(cand.claimed);
                         buddy_engine.inflight.insert(
                             cand.cid.clone(),
@@ -6047,37 +6123,75 @@ pub async fn run(
                         tracing::debug!(cid = %done.cid, error = %e, attempts, "buddy fetch failed; backing off");
                     }
                     Ok(actual) => {
-                        // Serialized budget reconcile at ACTUAL size. On
-                        // overflow the content stays admitted-unpinned
+                        // Serialized reconcile at ACTUAL size, revalidating
+                        // everything that may have moved while the fetch
+                        // ran (PR #449 review, CodeRabbit): the pact must
+                        // still be mutual, the entry still wanted, the
+                        // per-buddy slice must fit the ACTUAL (claims are
+                        // hints), and the shared budget must fit. On any
+                        // failure the content stays admitted-unpinned
                         // (evictable) and never enters the ledger — the
-                        // honesty rule.
-                        let fits = {
+                        // honesty rule. Backoff prevents replan thrash
+                        // when claimed < actual would re-propose it.
+                        let admit_err: Option<&'static str> = {
+                            let records = storage_records
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             let ledger = storage_ledger
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             let settings = storage_settings
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let pledge = settings.my_pledges.get(&done.buddy).copied();
+                            let still_mutual = pledge.is_some()
+                                && records
+                                    .pledge_list(&done.buddy)
+                                    .is_some_and(|r| {
+                                        r.pledges.iter().any(|p| p.to == own_owner_addr)
+                                    });
+                            let still_wanted = records
+                                .backup_set(&done.buddy)
+                                .is_some_and(|s| s.entries.iter().any(|e| e.cid == done.cid));
+                            let slice_fits = pledge.is_some_and(|p| {
+                                ledger
+                                    .bytes_for_buddy(&done.buddy)
+                                    .saturating_add(actual)
+                                    <= p
+                            });
                             let reserved: u64 =
                                 buddy_engine.inflight.values().map(|f| f.claimed).sum();
-                            ledger
+                            let budget_fits = ledger
                                 .distinct_pinned_bytes()
                                 .saturating_add(reserved)
                                 .saturating_add(actual)
-                                <= settings.shared_budget_bytes
+                                <= settings.shared_budget_bytes;
+                            if !still_mutual {
+                                Some("pact withdrawn while fetching")
+                            } else if !still_wanted {
+                                Some("entry removed from backup set while fetching")
+                            } else if !slice_fits {
+                                Some("actual size exceeds the per-buddy pledge slice")
+                            } else if !budget_fits {
+                                Some("actual size exceeds remaining shared budget")
+                            } else {
+                                None
+                            }
                         };
-                        if !fits {
+                        if let Some(reason) = admit_err {
                             tracing::info!(
-                                cid = %done.cid, actual,
-                                "buddy fetch actual size exceeds remaining budget; skipping pin"
+                                cid = %done.cid, actual, reason,
+                                "buddy fetch completed but not admitted; skipping pin"
                             );
                             buddy_engine.backoff.insert(
                                 done.cid.clone(),
                                 (1, now_ms + BUDDY_FETCH_BACKOFF_BASE_MS),
                             );
                         } else {
-                            // Mirror the ContentVerbRequest::Pin arm.
-                            pin_intent.insert(done.cid_bytes);
+                            // Mirror the ContentVerbRequest::Pin arm, but
+                            // record BUDDY ownership (never pin_intent —
+                            // that set is the user's manual intent).
+                            buddy_engine.buddy_pins.insert(done.cid_bytes);
                             let root = ContentId::from_bytes(done.cid_bytes);
                             let all =
                                 collect_descendants(runtime.storage_tier().cache(), root);
@@ -6091,15 +6205,23 @@ pub async fn run(
                                 // Pin-count quota exhausted: undo (keep-set
                                 // protected) and back off — the pact reads
                                 // Catching up rather than half-pinning.
-                                pin_intent.remove(&done.cid_bytes);
+                                buddy_engine.buddy_pins.remove(&done.cid_bytes);
                                 let doomed =
                                     collect_descendants(runtime.storage_tier().cache(), root);
+                                let protective: std::collections::HashSet<[u8; 32]> =
+                                    pin_intent
+                                        .union(&buddy_engine.buddy_pins)
+                                        .copied()
+                                        .collect();
                                 let keep = compute_keep_set(
                                     runtime.storage_tier().cache(),
-                                    &pin_intent,
+                                    &protective,
                                     doomed.len(),
                                 );
                                 for id in doomed {
+                                    // keep-set is built from the union, so
+                                    // a manually-pinned root's subtree is
+                                    // already protected.
                                     if !keep.contains(&id) {
                                         runtime.unpin_content(&id);
                                     }
@@ -6592,6 +6714,12 @@ struct BuddyEngineState {
     inflight: std::collections::HashMap<String, crate::buddy_pin_planner::InflightFetch>,
     /// cid-hex → (attempts, loop-relative retry-at ms).
     backoff: std::collections::HashMap<String, (u32, u64)>,
+    /// Roots pinned ON BEHALF OF BUDDIES — kept separate from the
+    /// manual `pin_intent` (PR #449 review, CodeRabbit): a buddy release
+    /// must never erase the user's own pin intent, and a manual unpin
+    /// must never physically unpin a root the ledger still claims.
+    /// Physical unpin happens only when NEITHER set holds the root.
+    buddy_pins: std::collections::HashSet<[u8; 32]>,
     /// First-tick boot honesty sweep done?
     booted: bool,
 }
