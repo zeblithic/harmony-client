@@ -200,6 +200,10 @@ pub fn verify_hosting_report(p: &HostingReportPayload) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A mutation applied to a signed payload to prove the signature
+    /// covers the mutated field.
+    type Tamper<T> = Box<dyn Fn(&mut T)>;
+
     fn test_identity() -> harmony_identity::PrivateIdentity {
         harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
     }
@@ -286,7 +290,7 @@ mod tests {
     #[test]
     fn tampered_pledge_fields_invalidate_signature() {
         let id = test_identity();
-        let tampers: Vec<Box<dyn Fn(&mut PledgeListPayload)>> = vec![
+        let tampers: Vec<Tamper<PledgeListPayload>> = vec![
             Box::new(|p| p.updated_at += 1),
             Box::new(|p| p.pledges[0].bytes += 1),
             Box::new(|p| p.pledges[0].to.push('x')),
@@ -304,7 +308,7 @@ mod tests {
     #[test]
     fn tampered_backup_set_fields_invalidate_signature() {
         let id = test_identity();
-        let tampers: Vec<Box<dyn Fn(&mut BackupSetPayload)>> = vec![
+        let tampers: Vec<Tamper<BackupSetPayload>> = vec![
             Box::new(|p| p.updated_at += 1),
             Box::new(|p| p.entries[0].size += 1),
             Box::new(|p| p.entries[0].cid.push('f')),
@@ -321,7 +325,7 @@ mod tests {
     #[test]
     fn tampered_hosting_report_fields_invalidate_signature() {
         let id = test_identity();
-        let tampers: Vec<Box<dyn Fn(&mut HostingReportPayload)>> = vec![
+        let tampers: Vec<Tamper<HostingReportPayload>> = vec![
             Box::new(|p| p.updated_at += 1),
             Box::new(|p| p.reports[0].bytes += 1),
             Box::new(|p| p.reports[0].cids += 1),

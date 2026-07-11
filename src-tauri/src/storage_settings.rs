@@ -122,8 +122,10 @@ mod tests {
     fn roundtrip_save_load() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = settings_path(dir.path());
-        let mut s = StorageSettings::default();
-        s.shared_budget_bytes = 42;
+        let mut s = StorageSettings {
+            shared_budget_bytes: 42,
+            ..Default::default()
+        };
         s.my_pledges.insert("buddy".into(), 1_000);
         s.dismissed_invites.insert("spammer".into(), 77);
         s.pledge_floor = 5;
