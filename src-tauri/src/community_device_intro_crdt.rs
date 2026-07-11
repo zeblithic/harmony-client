@@ -77,6 +77,15 @@ impl CommunityDeviceIntroDoc {
         format!("{}:{}", hex::encode(community_id.0), device_id)
     }
 
+    /// ZEB-668 S3: map key for a RETIRE entry — the intro key plus a ":r"
+    /// suffix. Distinct from `key()` so a retire never collides with the
+    /// same device's still-pending intro entry (insert-once would otherwise
+    /// silently drop whichever deposits second). Same `device_id` = 64-hex
+    /// ed25519 verify key — here of the RETIRED device.
+    pub fn retire_key(community_id: &SpaceId, device_id: &str) -> String {
+        format!("{}:{}:r", hex::encode(community_id.0), device_id)
+    }
+
     /// Insert-once + `relayed_by`-union merge. A new key is inserted whole; an
     /// existing key unions its grow-only `relayed_by` set (concurrent relays by
     /// siblings can never race). The `signed_event` / `community_id` /
@@ -140,6 +149,19 @@ mod tests {
     fn key_is_community_hex_colon_device() {
         let k = CommunityDeviceIntroDoc::key(&SpaceId([0xAB; 16]), "dev-64hex");
         assert_eq!(k, format!("{}:dev-64hex", "ab".repeat(16)));
+    }
+
+    /// ZEB-668 S3: retire keys are the intro key plus a ":r" suffix —
+    /// never colliding with the same device's intro entry.
+    #[test]
+    fn retire_key_is_intro_key_plus_r_suffix() {
+        let c = SpaceId([0xAB; 16]);
+        let k = CommunityDeviceIntroDoc::retire_key(&c, "dev-64hex");
+        assert_eq!(
+            k,
+            format!("{}:r", CommunityDeviceIntroDoc::key(&c, "dev-64hex"))
+        );
+        assert_ne!(k, CommunityDeviceIntroDoc::key(&c, "dev-64hex"));
     }
 
     #[test]

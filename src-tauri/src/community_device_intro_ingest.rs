@@ -243,6 +243,36 @@ pub struct ProdCommunityDeviceIntroIngestCtx {
     pub enrolled: BTreeSet<String>,
 }
 
+/// Decode a dataset entry's `signed_event` bytes and enforce the dataset's
+/// kind contract. Defense-in-depth (ZEB-495, Greptile): this dataset carries
+/// device-LIFECYCLE events only — `DeviceAnnounce` (the self-introduce
+/// deposit, ZEB-495) and `DeviceRetire` (the retire-announce deposit,
+/// ZEB-668 S3) are its only writers. Gating before relay means any other
+/// kind smuggled in by a bug, a misbehaving enrolled sibling, or a future
+/// refactor that reuses this relay path can never ride into the community
+/// engine (where `verify_event` might otherwise accept an
+/// enrolled-device-authored `Leave`/`Ban`). Unrelayable by construction ⇒
+/// the caller leaves the entry pending (Err), TTL-reaped — exactly like the
+/// forged-announce `Rejected` path.
+fn decode_lifecycle_event(
+    bytes: &[u8],
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    let signed: crate::community_membership::SignedMembershipEvent =
+        crate::owner_state_crypto::canonical_cbor_decode(bytes)
+            .map_err(|e| format!("decode device-lifecycle event: {e:?}"))?;
+    if !matches!(
+        signed.kind,
+        crate::community_membership::MembershipEventKind::DeviceAnnounce
+            | crate::community_membership::MembershipEventKind::DeviceRetire { .. }
+    ) {
+        return Err(format!(
+            "unexpected event kind in community-device-intro dataset: {:?}",
+            signed.kind
+        ));
+    }
+    Ok(signed)
+}
+
 #[async_trait]
 impl CommunityDeviceIntroIngestCtx for ProdCommunityDeviceIntroIngestCtx {
     fn self_device_id(&self) -> String {
@@ -255,27 +285,7 @@ impl CommunityDeviceIntroIngestCtx for ProdCommunityDeviceIntroIngestCtx {
         let Some(engine) = self.registry.engine_arc(&entry.community_id).await else {
             return Ok(false);
         };
-        let signed: crate::community_membership::SignedMembershipEvent =
-            crate::owner_state_crypto::canonical_cbor_decode(&entry.signed_event)
-                .map_err(|e| format!("decode DeviceAnnounce: {e:?}"))?;
-        // Defense-in-depth (ZEB-495, Greptile): this dataset's contract is
-        // EXCLUSIVELY `DeviceAnnounce` events — the self-introduce deposit is the
-        // only writer, and it only ever deposits that kind. Assert it before
-        // relaying so a non-`DeviceAnnounce` event smuggled in by a bug, a
-        // misbehaving enrolled sibling, or a future refactor that reuses this
-        // relay path can never ride into the community engine (where
-        // `verify_event` might otherwise accept an enrolled-device-authored
-        // `Leave`/`Ban`). Unrelayable by construction ⇒ leave pending (Err),
-        // TTL-reaped — exactly like the forged-announce `Rejected` path below.
-        if !matches!(
-            signed.kind,
-            crate::community_membership::MembershipEventKind::DeviceAnnounce
-        ) {
-            return Err(format!(
-                "non-DeviceAnnounce event in community-device-intro dataset: {:?}",
-                signed.kind
-            ));
-        }
+        let signed = decode_lifecycle_event(&entry.signed_event)?;
         match engine.insert_local_event(signed).await {
             // Inserted OR AlreadyKnown ⇒ relayed (idempotent).
             Ok(crate::community_state_crdt::InsertOutcome::Inserted)
@@ -629,5 +639,67 @@ mod tests {
         nudge(); // buffer full — dropped, must not block/panic
         assert_eq!(rx.recv().await, Some(()));
         assert!(rx.try_recv().is_err(), "extras coalesced into one nudge");
+    }
+
+    // ── ZEB-668 S3: dataset kind contract (decode_lifecycle_event) ────────
+
+    /// Sign a membership event of the given kind with a realistic owner and
+    /// return its canonical CBOR bytes.
+    fn signed_event_bytes(kind: crate::community_membership::MembershipEventKind) -> Vec<u8> {
+        use crate::community_membership::{mint_test_owner, sign_event, EventPayload};
+        let owner = mint_test_owner(0x81);
+        let payload = EventPayload {
+            id: [0xAD; 16],
+            community_id: SpaceId([0x11; 16]),
+            kind,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let signed = sign_event(&payload, &owner.device_key).expect("sign");
+        crate::owner_state_crypto::canonical_cbor_encode(&signed).expect("encode")
+    }
+
+    #[test]
+    fn decode_gate_accepts_device_announce() {
+        let bytes =
+            signed_event_bytes(crate::community_membership::MembershipEventKind::DeviceAnnounce);
+        decode_lifecycle_event(&bytes).expect("DeviceAnnounce passes the dataset kind gate");
+    }
+
+    #[test]
+    fn decode_gate_accepts_device_retire() {
+        use crate::community_membership::mint_test_owner;
+        use harmony_owner::certs::{RevocationCert, RevocationReason};
+        let owner = mint_test_owner(0x82);
+        let rc = RevocationCert::sign_self(
+            &owner.device_key,
+            owner.cert.owner_id,
+            owner.cert.device_id,
+            1_700_000_100,
+            RevocationReason::Decommissioned,
+        )
+        .expect("sign_self revocation");
+        let bytes = signed_event_bytes(
+            crate::community_membership::MembershipEventKind::DeviceRetire {
+                revocation: rc,
+                enrollment: Box::new(owner.cert.clone()),
+            },
+        );
+        decode_lifecycle_event(&bytes).expect("DeviceRetire passes the dataset kind gate");
+    }
+
+    #[test]
+    fn decode_gate_rejects_non_lifecycle_kinds() {
+        let bytes = signed_event_bytes(crate::community_membership::MembershipEventKind::Leave);
+        let err = decode_lifecycle_event(&bytes)
+            .expect_err("a Leave smuggled into the dataset must be rejected");
+        assert!(
+            err.contains("unexpected event kind"),
+            "gate error names the contract, got: {err}"
+        );
     }
 }

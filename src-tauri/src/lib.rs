@@ -4962,12 +4962,19 @@ pub async fn start_node_inner(
                         });
                     // Enrolled-device snapshot for the relay sweeper's GC
                     // coverage check (same 64-hex form as dm-inbox).
+                    // ZEB-668 S3: REVOKED devices are excluded — a revoked
+                    // device never relays, so including it would stall every
+                    // entry's coverage-GC to the 30-day TTL. Boot-time
+                    // snapshot (live refresh is a filed follow-up).
                     let community_device_intro_enrolled: std::collections::BTreeSet<String> =
                         loaded
                             .state
                             .enrollments
-                            .values()
-                            .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+                            .iter()
+                            .filter(|(device_id, _)| !loaded.state.is_revoked(**device_id))
+                            .map(|(_, cert)| {
+                                hex::encode(cert.device_pubkeys.classical.ed25519_verify)
+                            })
                             .collect();
 
                     tracing::info!("BOOT-PROBE 05c: community-device-intro engine constructed");
