@@ -366,8 +366,20 @@ pub enum ContentVerbRequest {
 
 /// A follow/unfollow request sent from the Tauri command thread into the event loop.
 pub enum FollowRequest {
-    Follow { address: String },
-    Unfollow { address: String },
+    Follow {
+        address: String,
+    },
+    Unfollow {
+        address: String,
+    },
+    /// ZEB-671: publish the owner's freshly signed follow list on
+    /// `harmony/vines/{owner}/follows`. Built + signed on the command
+    /// side (which owns `FollowManager` + the owner identity); the
+    /// event loop only performs the Zenoh put and logs failures.
+    PublishFollowList {
+        owner: String,
+        payload: Vec<u8>,
+    },
 }
 
 /// Sub-D Phase 4 (ZEB-281): control messages for the profile-broadcast
@@ -2917,6 +2929,21 @@ pub async fn run(
     )
     .await;
 
+    // ZEB-671: subscribe to published follow lists (Discover graph
+    // edges). Exactly one owner segment — deeper keys are non-canonical
+    // and the ingest path rejects shape mismatches anyway.
+    dispatch_action(
+        RuntimeAction::Subscribe {
+            key_expr: "harmony/vines/*/follows".to_string(),
+        },
+        &session,
+        &zenoh_tx,
+        &app,
+        &closing,
+        &own_zid,
+    )
+    .await;
+
     // Note: per-creator Zenoh subscriptions are not used yet because the
     // publish path (harmony/vines/{addr}) does not include /announce/.
     // Once harmony-node adopts the full keyspace protocol
@@ -4332,7 +4359,27 @@ pub async fn run(
             // subscriptions are added (once the publish path includes
             // /announce/), the follow_rx channel will drive Subscribe/
             // Unsubscribe actions here.
-            Some(_req) = follow_rx.recv() => {}
+            Some(req) = follow_rx.recv() => {
+                match req {
+                    FollowRequest::Follow { .. } | FollowRequest::Unfollow { .. } => {}
+                    // ZEB-671: wire publication of the signed follow list.
+                    FollowRequest::PublishFollowList { owner, payload } => {
+                        let key = format!("harmony/vines/{owner}/follows");
+                        if let Err(e) = session.put(&key, payload).await {
+                            tracing::error!(error = %e, key, "follow-list publish failed");
+                            // Same degraded-sync signal the other publish
+                            // adapters emit (CodeRabbit PR #447): the UI
+                            // can surface that Discover-graph propagation
+                            // is impaired instead of failing silently.
+                            crate::node_event_sink::emit_ser(
+                                app.as_ref(),
+                                "follow-list-sync-degraded",
+                                &serde_json::json!({ "reason": "publish_failed", "key": key }),
+                            );
+                        }
+                    }
+                }
+            }
 
             // ── Voice frame relay (frontend → Zenoh) ────────────────
             // Await directly instead of spawning per-frame tasks — preserves
@@ -7612,6 +7659,40 @@ fn emit_frontend_event(
             // when the tombstone freed the last live reference — the
             // caller owns `runtime` + `pin_intent` and performs the burn.
             return handle_vine_tombstone_sample(app, key_expr, payload, vine_feed_cache);
+        }
+        if key_expr.ends_with("/follows") {
+            // ZEB-671: verified follow list → cache (LWW). A real graph
+            // change (Inserted/UpdatedNewer) is announced to the frontend
+            // so it refetches degree/provenance annotations; stale
+            // re-arrivals and rejected records are absorbed silently.
+            // `reach_changed` gates the emit: an admitted list from an
+            // owner outside the viewer's graph does not change any
+            // degree, and the frontend should not refetch for it.
+            let reach_changed = match vine_feed_cache.lock() {
+                Ok(mut cache) => match cache.on_follow_list_sample(key_expr, payload) {
+                    crate::vine_feed_cache::FollowListOutcome::Inserted
+                    | crate::vine_feed_cache::FollowListOutcome::UpdatedNewer => {
+                        cache.recompute_reach()
+                    }
+                    crate::vine_feed_cache::FollowListOutcome::Rejected(reason) => {
+                        tracing::debug!(key_expr, reason, "follow-list sample rejected");
+                        false
+                    }
+                    crate::vine_feed_cache::FollowListOutcome::IgnoredOlder => false,
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "vine_feed_cache mutex poisoned; skipping follow-list ingest");
+                    false
+                }
+            };
+            if reach_changed {
+                crate::node_event_sink::emit_ser(
+                    app.as_ref(),
+                    "vine-graph-updated",
+                    &serde_json::Value::Null,
+                );
+            }
+            return None;
         }
         if key_expr.contains("/reactions/") {
             // ZEB-286: route reaction through the cache. Re-emit to the

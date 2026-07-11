@@ -12,6 +12,7 @@
     reshareCount = 0, canReshare = false, resharing = false, onReshare,
     canDelete = false, deleting = false, onDelete,
     onViewOriginal,
+    degreeLabel = null, viaLabel = null,
   }: {
     vine: VineVideo;
     /** True when this card is the feed's single playing card. */
@@ -46,6 +47,10 @@
     /** Ask the feed to open the delete confirmation for this vine. */
     onDelete?: (vine: VineVideo) => void;
     onViewOriginal?: (vineId: string) => void;
+    /** ZEB-671: Discover degree chip text ("2nd" / "3rd"); null hides it. */
+    degreeLabel?: string | null;
+    /** ZEB-671: provenance line ("Devin follows @ravi"); null hides it. */
+    viaLabel?: string | null;
   } = $props();
 
   let videoEl = $state<HTMLVideoElement | null>(null);
@@ -166,6 +171,13 @@
     <div class="creator-row">
       <Avatar address={vine.creatorAddress} size={26} displayName={creatorLabel} />
       <span class="creator-name">{creatorLabel}</span>
+      {#if degreeLabel}
+        <span
+          class="degree-chip"
+          class:deg3={degreeLabel === '3rd'}
+          data-testid="degree-chip"
+        >{degreeLabel}</span>
+      {/if}
       <span class="timestamp">{timeStr}</span>
       {#if showFollowButton}
         <button
@@ -179,6 +191,9 @@
         </button>
       {/if}
     </div>
+    {#if viaLabel}
+      <p class="via-line" data-testid="via-line">{viaLabel}</p>
+    {/if}
     {#if vine.title}
       <p class="vine-title">{vine.title}</p>
     {/if}
@@ -338,6 +353,34 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  /* ZEB-671: degree chips per the drawn Discover anatomy — 2nd = green
+     (accent family), 3rd = clay/amber. Each chip uses a token PAIR
+     designed for contrast in both themes: accent/on-accent, and
+     clay-deep/clay-soft (which invert together across themes —
+     CodeRabbit PR #447 flagged white-on-clay as borderline in light
+     mode). */
+  .degree-chip {
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    font-weight: 600;
+    color: var(--on-accent);
+    background: var(--accent);
+    padding: 2px 8px;
+    border-radius: 999px;
+    flex-shrink: 0;
+  }
+
+  .degree-chip.deg3 {
+    background: var(--gov-clay-deep);
+    color: var(--gov-clay-soft);
+  }
+
+  .via-line {
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    margin: 2px 0 0;
   }
 
   .creator-name {

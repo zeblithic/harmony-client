@@ -28,12 +28,19 @@
 //! cache admission (strict on wire); legacy cached rows age out via the
 //! existing 90-day / 5000-descriptor bounds.
 
-use crate::{VineDescriptorPayload, VineReactionPayload};
+//! ZEB-671 extends the same scheme to `VineFollowListPayload` (signed by
+//! the list OWNER, published on `harmony/vines/{owner}/follows`). Unlike
+//! descriptors/reactions there is no unsigned legacy for follow lists —
+//! the record type is born strict.
+
+use crate::{VineDescriptorPayload, VineFollowListPayload, VineReactionPayload};
 
 /// Domain-separation prefix + version for descriptor canonical bytes.
 const DESCRIPTOR_DOMAIN: &str = "harmony-vine-descriptor-v1";
 /// Domain-separation prefix + version for reaction canonical bytes.
 const REACTION_DOMAIN: &str = "harmony-vine-reaction-v1";
+/// Domain-separation prefix + version for follow-list canonical bytes.
+const FOLLOW_LIST_DOMAIN: &str = "harmony-vine-follows-v1";
 
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -89,6 +96,23 @@ pub fn reaction_canonical_bytes(r: &VineReactionPayload) -> Vec<u8> {
     out
 }
 
+/// Deterministic byte string a follow-list signature covers: domain ‖
+/// owner ‖ updated_at ‖ u32-LE entry count ‖ each address
+/// length-prefixed. The count prefix pins the list boundary the same way
+/// per-field length prefixes pin string boundaries (`["ab"]` vs
+/// `["a","b"]` cannot collide).
+pub fn follow_list_canonical_bytes(p: &VineFollowListPayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + p.follows.len() * 40);
+    push_str(&mut out, FOLLOW_LIST_DOMAIN);
+    push_str(&mut out, &p.owner_address);
+    push_u64(&mut out, p.updated_at);
+    out.extend_from_slice(&(p.follows.len() as u32).to_le_bytes());
+    for addr in &p.follows {
+        push_str(&mut out, addr);
+    }
+    out
+}
+
 /// The address a signing identity derives — the value receivers bind
 /// signatures against. Publish paths compare this to the address they
 /// are about to embed and refuse to sign on divergence (Greptile PR
@@ -113,6 +137,16 @@ pub fn sign_reaction(private: &harmony_identity::PrivateIdentity, r: &mut VineRe
     let bytes = reaction_canonical_bytes(r);
     r.sig = Some(hex::encode(private.sign(&bytes)));
     r.identity_pub = Some(hex::encode(private.public_identity().to_public_bytes()));
+}
+
+/// Sign a follow list in place; `owner_address` must match `private`.
+pub fn sign_follow_list(
+    private: &harmony_identity::PrivateIdentity,
+    p: &mut VineFollowListPayload,
+) {
+    let bytes = follow_list_canonical_bytes(p);
+    p.sig = Some(hex::encode(private.sign(&bytes)));
+    p.identity_pub = Some(hex::encode(private.public_identity().to_public_bytes()));
 }
 
 /// Shared verification core: pubkey→address binding, then strict
@@ -168,6 +202,19 @@ pub fn verify_reaction(r: &VineReactionPayload) -> Result<(), String> {
         &r.reactor_address,
         &reaction_canonical_bytes(r),
         "reaction",
+    )
+}
+
+/// Verify a received follow list: the signer is the list OWNER (the
+/// payload's `owner_address` — receivers additionally bind it to the
+/// topic's owner segment at cache admission).
+pub fn verify_follow_list(p: &VineFollowListPayload) -> Result<(), String> {
+    verify_signed(
+        p.identity_pub.as_deref(),
+        p.sig.as_deref(),
+        &p.owner_address,
+        &follow_list_canonical_bytes(p),
+        "follow list",
     )
 }
 
@@ -382,6 +429,130 @@ mod tests {
         let json = serde_json::to_value(&signed).unwrap();
         assert!(json.get("identityPub").is_some());
         assert!(json.get("sig").is_some());
+    }
+
+    fn follow_list_for(private: &harmony_identity::PrivateIdentity) -> VineFollowListPayload {
+        VineFollowListPayload {
+            owner_address: addr_of(private),
+            follows: vec!["aa".repeat(16), "bb".repeat(16), "cc".repeat(16)],
+            updated_at: 1_700_000_200,
+            identity_pub: None,
+            sig: None,
+        }
+    }
+
+    #[test]
+    fn follow_list_sign_verify_roundtrip() {
+        let id = test_identity();
+        let mut p = follow_list_for(&id);
+        sign_follow_list(&id, &mut p);
+        assert!(verify_follow_list(&p).is_ok());
+
+        // Empty list (the opt-out retraction shape) must also roundtrip.
+        let mut empty = follow_list_for(&id);
+        empty.follows = vec![];
+        sign_follow_list(&id, &mut empty);
+        assert!(verify_follow_list(&empty).is_ok());
+    }
+
+    #[test]
+    fn follow_list_unsigned_is_rejected() {
+        let id = test_identity();
+        let p = follow_list_for(&id);
+        assert!(verify_follow_list(&p).unwrap_err().contains("unsigned"));
+    }
+
+    #[test]
+    fn follow_list_tamper_any_semantic_field_invalidates() {
+        let id = test_identity();
+        let base = {
+            let mut p = follow_list_for(&id);
+            sign_follow_list(&id, &mut p);
+            p
+        };
+        let tampers: Vec<Tamper<VineFollowListPayload>> = vec![
+            Box::new(|p| p.updated_at += 1),
+            Box::new(|p| p.follows.push("dd".repeat(16))),
+            Box::new(|p| {
+                p.follows.pop();
+            }),
+            Box::new(|p| p.follows.swap(0, 1)),
+            Box::new(|p| p.follows[0] = "ee".repeat(16)),
+            Box::new(|p| p.follows.clear()),
+        ];
+        for (i, tamper) in tampers.iter().enumerate() {
+            let mut p = base.clone();
+            tamper(&mut p);
+            let err = verify_follow_list(&p).unwrap_err();
+            assert!(err.contains("signature invalid"), "tamper #{i} got {err:?}");
+        }
+    }
+
+    #[test]
+    fn follow_list_pubkey_address_mismatch_is_rejected() {
+        let id = test_identity();
+        let other = test_identity();
+        let mut p = follow_list_for(&id);
+        sign_follow_list(&other, &mut p);
+        assert!(verify_follow_list(&p)
+            .unwrap_err()
+            .contains("does not match"));
+    }
+
+    #[test]
+    fn follow_list_canonical_entry_boundaries_are_pinned() {
+        // ["ab"] vs ["a","b"]: same concatenated bytes, different shape —
+        // the count prefix + per-entry length prefixes must distinguish.
+        let id = test_identity();
+        let mut a = follow_list_for(&id);
+        a.follows = vec!["ab".into()];
+        let mut b = follow_list_for(&id);
+        b.follows = vec!["a".into(), "b".into()];
+        assert_ne!(
+            follow_list_canonical_bytes(&a),
+            follow_list_canonical_bytes(&b)
+        );
+
+        // Shift across an entry boundary: ["ab","c"] vs ["a","bc"].
+        let mut c = follow_list_for(&id);
+        c.follows = vec!["ab".into(), "c".into()];
+        let mut d = follow_list_for(&id);
+        d.follows = vec!["a".into(), "bc".into()];
+        assert_ne!(
+            follow_list_canonical_bytes(&c),
+            follow_list_canonical_bytes(&d)
+        );
+    }
+
+    #[test]
+    fn follow_list_serde_camel_case_pin() {
+        let id = test_identity();
+        let mut p = follow_list_for(&id);
+        sign_follow_list(&id, &mut p);
+        let json = serde_json::to_value(&p).unwrap();
+        assert!(json.get("ownerAddress").is_some());
+        assert!(json.get("follows").is_some());
+        assert!(json.get("updatedAt").is_some());
+        assert!(json.get("identityPub").is_some());
+        assert!(json.get("sig").is_some());
+
+        // Unsigned construction shape omits the sig fields entirely.
+        let unsigned = follow_list_for(&id);
+        let json = serde_json::to_value(&unsigned).unwrap();
+        assert!(json.get("identityPub").is_none());
+        assert!(json.get("sig").is_none());
+
+        // And a sig-less JSON parses (pre-sign/disk shape) but verify
+        // rejects it — strict on wire.
+        let bare = serde_json::json!({
+            "ownerAddress": "aabb",
+            "follows": ["ccdd"],
+            "updatedAt": 1_700_000_300u64
+        });
+        let parsed: VineFollowListPayload = serde_json::from_value(bare).unwrap();
+        assert!(verify_follow_list(&parsed)
+            .unwrap_err()
+            .contains("unsigned"));
     }
 
     #[test]

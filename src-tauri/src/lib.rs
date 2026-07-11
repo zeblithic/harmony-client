@@ -259,6 +259,8 @@ pub mod state_snapshot;
 pub mod tunnel_manager;
 pub mod tunnel_task;
 pub mod vine_feed_cache;
+pub mod vine_follow_graph;
+pub mod vine_settings;
 pub mod vine_signing;
 pub mod vine_tombstone;
 pub mod voice;
@@ -751,6 +753,21 @@ pub struct NodeState {
     voice_signal_tx: Option<tokio::sync::mpsc::Sender<voice_signal::VoiceSignalRequest>>,
     /// Persistent follow manager (disk-backed follow list).
     follow_mgr: Option<follows::FollowManager>,
+    /// ZEB-671: publish the follow list on the wire (public + opt-out).
+    /// Loaded from `vine_settings.json` at start_node; `true` by default.
+    vine_share_follows: bool,
+    /// ZEB-671: where `set_vine_settings` persists. `None` until
+    /// start_node resolves the app data dir (tests leave it `None` —
+    /// persistence is a no-op, mirroring the vine cache's save path).
+    vine_settings_path: Option<std::path::PathBuf>,
+    /// ZEB-671: session-monotonic floor for follow-list `updated_at`.
+    /// Wall seconds alone would make two changes within one second
+    /// LWW-equal, so receivers (which ignore `<=` timestamps) would drop
+    /// the SECOND record — e.g. a follow immediately unfollowed would
+    /// stay visible remotely. Every signed list uses
+    /// `max(now, prev + 1)`. Atomic only for interior mutability — all
+    /// writers hold the NodeState mutex.
+    follow_list_clock: std::sync::atomic::AtomicU64,
     /// Shared set of followed addresses (read by the event loop for source tagging).
     followed_set: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// In-memory Vine feed cache (ZEB-286). Updated by the event loop on
@@ -1611,6 +1628,9 @@ impl Default for NodeState {
             voice_channel_tx: None,
             voice_signal_tx: None,
             follow_mgr: None,
+            vine_share_follows: true,
+            vine_settings_path: None,
+            follow_list_clock: std::sync::atomic::AtomicU64::new(0),
             followed_set: None,
             vine_feed_cache: None,
             owner_private_identity: None,
@@ -2976,6 +2996,9 @@ pub async fn start_node_inner(
     let app_data_dir = crate::resolve_app_data_dir()?;
     std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
     let follow_mgr = follows::FollowManager::load(&app_data_dir);
+    // ZEB-671: share_follows gate for follow-list wire publication.
+    let vine_settings_path = vine_settings::settings_path(&app_data_dir);
+    let vine_settings_loaded = vine_settings::load_or_default(&vine_settings_path);
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
         follow_mgr
             .addresses()
@@ -9562,6 +9585,14 @@ pub async fn start_node_inner(
                         guard.voice_channel_tx = Some(voice_channel_tx);
                         guard.voice_signal_tx = Some(voice_signal_tx);
                         guard.follow_mgr = Some(follow_mgr);
+                        guard.vine_share_follows = vine_settings_loaded.share_follows;
+                        // ZEB-671: restore the LWW floor so a backwards
+                        // wall clock across restarts can't publish
+                        // records receivers ignore (Qodo PR #447).
+                        guard.follow_list_clock = std::sync::atomic::AtomicU64::new(
+                            vine_settings_loaded.last_published_updated_at,
+                        );
+                        guard.vine_settings_path = Some(vine_settings_path);
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
                         // ZEB-670: tombstone signer for delete_vine.
@@ -10517,6 +10548,21 @@ pub async fn start_node_inner(
                         // sink impl handles its own delivery internally.
                         app.emit("iroh-relays-changed", serde_json::Value::Null);
                     }
+                }
+            }
+
+            // ZEB-671: republish the signed follow list once per boot so the
+            // record survives network churn (peers that never saw a live
+            // follow/unfollow publish still converge via LWW). Lock is held
+            // only for the non-blocking try_send hand-off to the event loop —
+            // the Zenoh put itself runs there, never inline here.
+            {
+                let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                if guard.generation == our_gen {
+                    publish_follow_list_update(&guard);
+                    // ZEB-671: seed the Discover graph inputs (consumes
+                    // the guard).
+                    refresh_vine_graph_inputs(guard);
                 }
             }
 
@@ -12814,6 +12860,15 @@ pub struct VineVideoDto {
     /// ZEB-670: true when this row is a reshare whose original was
     /// tombstoned by its creator — render as a "Removed by creator" stub.
     pub original_removed: bool,
+    /// ZEB-671: graph distance (2 or 3) when the creator is reachable
+    /// through the transitive follow graph. `None` for followed creators
+    /// (degree 1 lives in the Followed feed) and unreachable ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degree: Option<u8>,
+    /// ZEB-671: the follow chain that reached the creator — `via[0]` is
+    /// one of the viewer's follows; the creator is not included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<Vec<String>>,
 }
 
 /// Response returned by list_followed — one entry per followed address.
@@ -12856,6 +12911,30 @@ pub struct PublishReactionPayload {
     pub liked: bool,
     #[serde(default)]
     pub reactor_name: String,
+}
+
+/// Follow list published/received over Zenoh (ZEB-671, public + opt-out).
+/// One record per owner on `harmony/vines/{owner_address}/follows`,
+/// replaced whole on every follow/unfollow (receivers keep the newest
+/// `updated_at` — last-writer-wins). Carries ADDRESSES ONLY: local
+/// pet-names (`follows::FollowEntry::name`) never go on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VineFollowListPayload {
+    pub owner_address: String,
+    pub follows: Vec<String>,
+    pub updated_at: u64,
+    /// ZEB-671: hex 64-byte identity pub (X25519‖Ed25519) of the OWNER.
+    /// `Option` only for the pre-sign construction window and disk rows
+    /// (signatures exist only on the wire); receivers reject `None`.
+    /// Unlike descriptors/reactions there is no unsigned legacy for this
+    /// record type — it ships strict from day one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_pub: Option<String>,
+    /// ZEB-671: hex 64-byte Ed25519 signature over
+    /// `vine_signing::follow_list_canonical_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 /// Build + publish a vine descriptor on `harmony/vines/{creator_address}`.
@@ -13682,6 +13761,206 @@ mod vine_publish_signing_tests {
     }
 }
 
+#[cfg(test)]
+mod follow_list_publish_tests {
+    use super::*;
+
+    fn temp_data_dir() -> std::path::PathBuf {
+        use rand::Rng;
+        let id: u64 = rand::thread_rng().gen();
+        let dir = std::env::temp_dir().join(format!("harmony_follow_publish_test_{id}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// NodeState with the three seams the follow-list publish path uses:
+    /// `FollowManager`, `follow_tx`, owner identity. `identity: false`
+    /// exercises the cannot-sign skip; `node_addr_override` exercises the
+    /// signer-authority guard.
+    fn fixture(
+        identity: bool,
+        node_addr_override: Option<String>,
+    ) -> (
+        Mutex<NodeState>,
+        tokio::sync::mpsc::Receiver<event_loop::FollowRequest>,
+        String,
+    ) {
+        let private = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let derived = hex::encode(private.public_identity().address_hash);
+        let node_addr = node_addr_override.unwrap_or(derived);
+        let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(8);
+        let state = Mutex::new(NodeState {
+            follow_tx: Some(follow_tx),
+            follow_mgr: Some(follows::FollowManager::load(&temp_data_dir())),
+            followed_set: Some(std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            ))),
+            node_addr: node_addr.clone(),
+            owner_private_identity: identity.then(|| std::sync::Arc::new(private)),
+            ..NodeState::default()
+        });
+        (state, follow_rx, node_addr)
+    }
+
+    /// Drain queued FollowRequests, returning the LAST PublishFollowList
+    /// (each follow/unfollow publishes a full replacement snapshot).
+    fn last_publish(
+        rx: &mut tokio::sync::mpsc::Receiver<event_loop::FollowRequest>,
+    ) -> Option<(String, VineFollowListPayload)> {
+        let mut found = None;
+        while let Ok(req) = rx.try_recv() {
+            if let event_loop::FollowRequest::PublishFollowList { owner, payload } = req {
+                let parsed = serde_json::from_slice(&payload).expect("payload parses");
+                found = Some((owner, parsed));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn follow_publishes_signed_follow_list() {
+        let (state, mut rx, node_addr) = fixture(true, None);
+        assert!(follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap());
+
+        let (owner, payload) = last_publish(&mut rx).expect("follow must publish the list");
+        assert_eq!(owner, node_addr);
+        assert_eq!(payload.owner_address, node_addr);
+        assert_eq!(payload.follows, vec!["bb".repeat(16)]);
+        vine_signing::verify_follow_list(&payload).expect("published list must verify");
+    }
+
+    #[test]
+    fn unfollow_republishes_without_removed_address() {
+        let (state, mut rx, _addr) = fixture(true, None);
+        follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap();
+        follow_vine_creator_impl(&state, "cc".repeat(16), None).unwrap();
+        assert!(unfollow_vine_creator_impl(&state, "bb".repeat(16)).unwrap());
+
+        let (_, payload) = last_publish(&mut rx).expect("unfollow must republish");
+        assert_eq!(payload.follows, vec!["cc".repeat(16)]);
+        vine_signing::verify_follow_list(&payload).expect("republished list must verify");
+    }
+
+    #[test]
+    fn follow_without_identity_skips_publish_but_succeeds_locally() {
+        let (state, mut rx, _addr) = fixture(false, None);
+        assert!(follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap());
+        assert!(
+            last_publish(&mut rx).is_none(),
+            "no identity → no wire publish; the local follow still lands"
+        );
+    }
+
+    #[test]
+    fn follow_list_refuses_diverged_signer() {
+        // node_addr the identity does not derive: sign is refused (the
+        // record would be rejected by every receiver), follow still lands.
+        let (state, mut rx, _addr) = fixture(true, Some("cc".repeat(16)));
+        assert!(follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap());
+        assert!(last_publish(&mut rx).is_none());
+    }
+
+    #[test]
+    fn disable_sharing_publishes_empty_retraction() {
+        let (state, mut rx, node_addr) = fixture(true, None);
+        follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap();
+        last_publish(&mut rx).expect("follow publishes");
+
+        set_vine_settings_impl(&state, false).unwrap();
+        let (_, payload) = last_publish(&mut rx).expect("disable must retract");
+        assert_eq!(payload.owner_address, node_addr);
+        assert!(payload.follows.is_empty(), "retraction is an empty list");
+        vine_signing::verify_follow_list(&payload).expect("retraction must verify");
+    }
+
+    #[test]
+    fn follow_while_sharing_disabled_publishes_nothing() {
+        let (state, mut rx, _addr) = fixture(true, None);
+        set_vine_settings_impl(&state, false).unwrap();
+        last_publish(&mut rx); // drain the retraction
+
+        assert!(follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap());
+        assert!(
+            last_publish(&mut rx).is_none(),
+            "share_follows off suppresses the wire publish; local follow still lands"
+        );
+        assert!(!get_vine_settings_impl(&state).unwrap().share_follows);
+    }
+
+    #[test]
+    fn reenable_sharing_republishes_current_list() {
+        let (state, mut rx, _addr) = fixture(true, None);
+        set_vine_settings_impl(&state, false).unwrap();
+        follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap();
+        follow_vine_creator_impl(&state, "cc".repeat(16), None).unwrap();
+        last_publish(&mut rx); // drain the retraction (follows published nothing)
+
+        set_vine_settings_impl(&state, true).unwrap();
+        let (_, payload) = last_publish(&mut rx).expect("re-enable must republish");
+        assert_eq!(payload.follows, vec!["bb".repeat(16), "cc".repeat(16)]);
+        vine_signing::verify_follow_list(&payload).expect("republished list must verify");
+    }
+
+    #[test]
+    fn disable_without_identity_fails_and_keeps_sharing_on() {
+        // Greptile PR #447 P1: a disable whose retraction cannot be
+        // SIGNED must fail loudly and leave sharing on — success here
+        // would strand peers on the stale list with all future
+        // publishes suppressed.
+        let (state, mut rx, _addr) = fixture(false, None);
+        let err = set_vine_settings_impl(&state, false).unwrap_err();
+        assert!(err.contains("cannot sign"), "got {err:?}");
+        assert!(get_vine_settings_impl(&state).unwrap().share_follows);
+        assert!(last_publish(&mut rx).is_none());
+    }
+
+    #[test]
+    fn disable_without_channel_fails_and_keeps_sharing_on() {
+        // Same guarantee when the retraction cannot be QUEUED (node not
+        // running): the flag must not flip.
+        let private = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let node_addr = hex::encode(private.public_identity().address_hash);
+        let state = Mutex::new(NodeState {
+            follow_tx: None,
+            node_addr,
+            owner_private_identity: Some(std::sync::Arc::new(private)),
+            ..NodeState::default()
+        });
+        let err = set_vine_settings_impl(&state, false).unwrap_err();
+        assert!(err.contains("not connected"), "got {err:?}");
+        assert!(get_vine_settings_impl(&state).unwrap().share_follows);
+    }
+
+    #[test]
+    fn rapid_changes_get_strictly_increasing_timestamps() {
+        // Two changes inside one wall-clock second must still produce
+        // increasing updated_at, or receiver LWW (which ignores `<=`)
+        // would drop the second record — a follow immediately unfollowed
+        // would stay visible remotely.
+        let (state, mut rx, _addr) = fixture(true, None);
+        follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap();
+        let (_, first) = last_publish(&mut rx).expect("first publish");
+        unfollow_vine_creator_impl(&state, "bb".repeat(16)).unwrap();
+        let (_, second) = last_publish(&mut rx).expect("second publish");
+        assert!(
+            second.updated_at > first.updated_at,
+            "same-second change must LWW-replace: {} vs {}",
+            second.updated_at,
+            first.updated_at
+        );
+    }
+
+    #[test]
+    fn set_vine_settings_same_value_is_a_quiet_noop() {
+        let (state, mut rx, _addr) = fixture(true, None);
+        set_vine_settings_impl(&state, true).unwrap();
+        assert!(
+            last_publish(&mut rx).is_none(),
+            "no transition → no retraction and no republish"
+        );
+    }
+}
+
 /// Shared seam for `list_vine_videos` (GUI command + headless RPC): return all
 /// vines in the local cache, newest-first, with local-only `viewed` state.
 ///
@@ -13753,6 +14032,211 @@ async fn follow_vine_creator(
     follow_vine_creator_impl(state.inner(), address, name)
 }
 
+/// ZEB-671: build + sign a follow-list payload with the given addresses
+/// (the current list on follow/unfollow/boot; `vec![]` for the opt-out
+/// retraction). Truncates to `MAX_FOLLOWS_PER_LIST` (receivers reject
+/// larger lists). Same signer-authority guard as the descriptor/reaction
+/// publish paths: refuse to sign an owner address the local identity
+/// does not derive.
+fn build_signed_follow_list_with(
+    guard: &NodeState,
+    mut follows: Vec<String>,
+) -> Result<VineFollowListPayload, String> {
+    let identity = guard
+        .owner_private_identity
+        .as_ref()
+        .ok_or("identity unavailable: cannot sign follow list")?;
+    let signer = vine_signing::signer_address(identity);
+    if guard.node_addr != signer {
+        return Err(format!(
+            "refusing to sign: follow-list owner {} does not match signer identity {signer}",
+            guard.node_addr
+        ));
+    }
+    follows.truncate(vine_feed_cache::MAX_FOLLOWS_PER_LIST);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Strictly increasing — floored by the persisted high-water mark so
+    // the guarantee survives restarts and backwards wall clocks (Qodo
+    // PR #447). Best-effort persistence: a failed write only narrows
+    // the protection back to same-session.
+    let updated_at = {
+        use std::sync::atomic::Ordering;
+        let prev = guard.follow_list_clock.load(Ordering::Relaxed);
+        let ts = now_secs.max(prev + 1);
+        guard.follow_list_clock.store(ts, Ordering::Relaxed);
+        ts
+    };
+    if let Some(path) = guard.vine_settings_path.as_ref() {
+        vine_settings::save(
+            path,
+            &vine_settings::VineSettings {
+                share_follows: guard.vine_share_follows,
+                last_published_updated_at: updated_at,
+            },
+        );
+    }
+    let mut payload = VineFollowListPayload {
+        owner_address: guard.node_addr.clone(),
+        follows,
+        updated_at,
+        identity_pub: None,
+        sig: None,
+    };
+    vine_signing::sign_follow_list(identity, &mut payload);
+    Ok(payload)
+}
+
+/// ZEB-671: build + sign the CURRENT local follow list for wire
+/// publication. Addresses only — `FollowEntry::name` pet-names never
+/// leave the device.
+fn build_signed_follow_list(guard: &NodeState) -> Result<VineFollowListPayload, String> {
+    let mgr = guard.follow_mgr.as_ref().ok_or("not connected")?;
+    build_signed_follow_list_with(guard, mgr.addresses())
+}
+
+/// ZEB-671: hand a signed payload to the event loop for Zenoh
+/// publication. Returns `Err` when the hand-off itself fails (node not
+/// running, serialize failure, channel full) — the routine
+/// follow/unfollow/boot callers treat that as best-effort and log, but
+/// the opt-out retraction path must FAIL LOUDLY instead (Greptile PR
+/// #447 P1: a dropped retraction plus suppressed future publishes would
+/// strand peers on the stale list forever).
+fn send_follow_list_publish(
+    guard: &NodeState,
+    payload: VineFollowListPayload,
+) -> Result<(), String> {
+    let tx = guard.follow_tx.as_ref().ok_or("not connected")?;
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("follow-list serialize failed: {e}"))?;
+    tx.try_send(event_loop::FollowRequest::PublishFollowList {
+        owner: payload.owner_address,
+        payload: bytes,
+    })
+    .map_err(|_| "follow_tx full — follow-list publish not sent to event loop".to_string())
+}
+
+/// ZEB-671: publish the current follow list — the shared trigger for
+/// follow/unfollow and the boot republish. No-op while `share_follows`
+/// is off (this choke point covers every routine publish path; the
+/// explicit empty-list retraction is sent by `set_vine_settings_impl`).
+fn publish_follow_list_update(guard: &NodeState) {
+    if !guard.vine_share_follows {
+        tracing::debug!("follow-list publish suppressed (share_follows off)");
+        return;
+    }
+    let payload = match build_signed_follow_list(guard) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "follow-list publish skipped");
+            return;
+        }
+    };
+    if let Err(e) = send_follow_list_publish(guard, payload) {
+        tracing::error!(error = %e, "follow-list publish hand-off failed");
+    }
+}
+
+/// ZEB-671: refresh the Discover graph inputs on the vine cache after a
+/// local follow-set change. Extracts what it needs and DROPS the state
+/// guard before locking the cache — IPC readers (`list_vine_videos`)
+/// establish the same state-then-cache order by cloning the Arc first,
+/// and the event loop locks the cache without the state lock at all.
+fn refresh_vine_graph_inputs(guard: std::sync::MutexGuard<'_, NodeState>) {
+    let me = guard.node_addr.clone();
+    let follows = guard
+        .follow_mgr
+        .as_ref()
+        .map(|m| m.addresses())
+        .unwrap_or_default();
+    let cache = guard.vine_feed_cache.clone();
+    drop(guard);
+    if let Some(cache) = cache {
+        match cache.lock() {
+            Ok(mut c) => {
+                c.set_graph_inputs(me, follows);
+            }
+            Err(e) => tracing::error!(error = %e, "vine_feed_cache poisoned; graph inputs stale"),
+        }
+    }
+}
+
+/// Vine settings exposed to the frontend (ZEB-671).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VineSettingsDto {
+    pub share_follows: bool,
+}
+
+/// Shared seam for `get_vine_settings`. Reads the session value on
+/// `NodeState` (loaded from `vine_settings.json` at start_node; default
+/// `true` before a node ever starts).
+pub(crate) fn get_vine_settings_impl(state: &Mutex<NodeState>) -> Result<VineSettingsDto, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    Ok(VineSettingsDto {
+        share_follows: guard.vine_share_follows,
+    })
+}
+
+#[tauri::command]
+fn get_vine_settings(state: tauri::State<'_, Mutex<NodeState>>) -> Result<VineSettingsDto, String> {
+    get_vine_settings_impl(state.inner())
+}
+
+/// Shared seam for `set_vine_settings` (ZEB-671). Flipping
+/// `share_follows` off publishes an EMPTY signed list — the LWW
+/// retraction that clears this owner's edges on every receiver — and
+/// suppresses all further publishes; flipping it on republishes the
+/// current list. Persisting to disk is best-effort (path is `None`
+/// until a node has started).
+pub(crate) fn set_vine_settings_impl(
+    state: &Mutex<NodeState>,
+    share_follows: bool,
+) -> Result<(), String> {
+    let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let changed = guard.vine_share_follows != share_follows;
+
+    // Disabling is TRANSACTIONAL (Greptile PR #447 P1): the empty-list
+    // retraction must be signed and queued BEFORE the flag flips —
+    // otherwise peers keep the stale non-empty list while every future
+    // publish (incl. boot republish) is suppressed by the new setting.
+    // A failure here surfaces to the Tune sheet, which reverts the
+    // toggle. Enabling stays best-effort: with sharing back on, the
+    // next follow change or boot republish recovers a dropped publish.
+    if changed && !share_follows {
+        let payload = build_signed_follow_list_with(&guard, vec![])?;
+        send_follow_list_publish(&guard, payload)?;
+    }
+
+    guard.vine_share_follows = share_follows;
+    if let Some(path) = guard.vine_settings_path.clone() {
+        vine_settings::save(
+            &path,
+            &vine_settings::VineSettings {
+                share_follows,
+                last_published_updated_at: guard
+                    .follow_list_clock
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        );
+    }
+    if changed && share_follows {
+        // Re-enabled: republish the full current list.
+        publish_follow_list_update(&guard);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_vine_settings(
+    share_follows: bool,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    set_vine_settings_impl(state.inner(), share_follows)
+}
+
 /// Shared seam for `follow_vine_creator` (GUI command + headless RPC).
 /// Returns `Ok(true)` if newly followed, `Ok(false)` if already followed.
 /// `Err("not connected")` if the node is not running; `Err` on self-follow.
@@ -13785,6 +14269,12 @@ pub(crate) fn follow_vine_creator_impl(
             tracing::error!("follow_tx full — follow update not sent to event loop");
         }
     }
+
+    // ZEB-671: share the updated follow list on the wire (public + opt-out)
+    // and refresh the Discover graph — the degree-1 set changed. The
+    // graph refresh consumes the guard.
+    publish_follow_list_update(&guard);
+    refresh_vine_graph_inputs(guard);
 
     Ok(true)
 }
@@ -13823,6 +14313,12 @@ pub(crate) fn unfollow_vine_creator_impl(
             tracing::error!("follow_tx full — unfollow update not sent to event loop");
         }
     }
+
+    // ZEB-671: share the updated follow list on the wire (public + opt-out)
+    // and refresh the Discover graph — the degree-1 set changed. The
+    // graph refresh consumes the guard.
+    publish_follow_list_update(&guard);
+    refresh_vine_graph_inputs(guard);
 
     Ok(true)
 }
@@ -53879,6 +54375,8 @@ pub fn run() {
             follow_vine_creator,
             unfollow_vine_creator,
             list_followed,
+            get_vine_settings,
+            set_vine_settings,
             mark_vine_viewed,
             publish_vine,
             publish_vine_reaction,
@@ -59037,6 +59535,9 @@ mod start_node_race_tests {
             voice_channel_tx: None,
             voice_signal_tx: None,
             follow_mgr: None,
+            vine_share_follows: true,
+            vine_settings_path: None,
+            follow_list_clock: std::sync::atomic::AtomicU64::new(0),
             followed_set: None,
             vine_feed_cache: None,
             owner_private_identity: None,

@@ -331,8 +331,9 @@ describe('VineService', () => {
     const external = vi.fn();
     svc.addUnlisten(external);
     svc.destroy();
-    // Three adapter listeners registered (vine-received + vine-reaction-received + vine-removed)
-    expect(unlisten).toHaveBeenCalledTimes(3);
+    // Four adapter listeners registered (vine-received + vine-reaction-received
+    // + vine-removed + vine-graph-updated)
+    expect(unlisten).toHaveBeenCalledTimes(4);
     expect(external).toHaveBeenCalledOnce();
   });
 
@@ -341,8 +342,9 @@ describe('VineService', () => {
     await svc.connectAdapter(adapter);
     svc.destroy();
     svc.destroy();
-    // Three adapter listeners registered (vine-received + vine-reaction-received + vine-removed)
-    expect(unlisten).toHaveBeenCalledTimes(3);
+    // Four adapter listeners registered (vine-received + vine-reaction-received
+    // + vine-removed + vine-graph-updated)
+    expect(unlisten).toHaveBeenCalledTimes(4);
   });
 
   // ── Follow / feed routing ──────────────────────────────────────────
@@ -1328,4 +1330,86 @@ describe('ZEB-670 round-1 fixes (PR #445)', () => {
     expect(byId('v-dave').originalRemoved ?? false).toBe(false);
     expect(byId('v-new').originalRemoved ?? false).toBe(false);
   });
+
+// ── ZEB-671: Discover graph annotations ─────────────────────────────
+
+describe('VineService graph annotations (ZEB-671)', () => {
+  let svc: VineService;
+
+  beforeEach(() => {
+    svc = new VineService();
+  });
+
+    it('maps degree/via from vine-received events', async () => {
+      const { adapter, emit } = createMockAdapter();
+      await svc.connectAdapter(adapter);
+      emit('vine-received', {
+        id: 'net-g1', creatorAddress: 'ravi-addr', creatorName: 'Ravi',
+        createdAt: 1, videoCid: 'cid-g1', source: 'discover',
+        degree: 2, via: ['devin-addr'],
+      } satisfies VineDescriptorEvent);
+      const v = svc.discoverVines.find(x => x.id === 'net-g1')!;
+      expect(v.degree).toBe(2);
+      expect(v.via).toEqual(['devin-addr']);
+    });
+
+    it('registers a vine-graph-updated listener', async () => {
+      const { adapter } = createMockAdapter();
+      await svc.connectAdapter(adapter);
+      expect(adapter.listen).toHaveBeenCalledWith('vine-graph-updated', expect.any(Function));
+    });
+
+    it('patches annotations onto existing entries when the graph updates', async () => {
+      const { adapter, emit } = createMockAdapter();
+      await svc.connectAdapter(adapter);
+      // Arrives before any graph exists — no annotation.
+      emit('vine-received', {
+        id: 'net-g2', creatorAddress: 'ravi-addr', creatorName: 'Ravi',
+        createdAt: 1, videoCid: 'cid-g2', source: 'discover',
+      } satisfies VineDescriptorEvent);
+      expect(svc.discoverVines.find(x => x.id === 'net-g2')!.degree).toBeUndefined();
+
+      vi.mocked(adapter.invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === 'list_vine_videos') {
+          return [{
+            id: 'net-g2', creatorAddress: 'ravi-addr', creatorName: 'Ravi',
+            createdAt: 1, videoCid: 'cid-g2', degree: 2, via: ['devin-addr'],
+          }];
+        }
+        return undefined;
+      });
+      const changed = vi.fn();
+      svc.onChange = changed;
+      emit('vine-graph-updated', null);
+
+      await vi.waitFor(() => expect(changed).toHaveBeenCalled());
+      const v = svc.discoverVines.find(x => x.id === 'net-g2')!;
+      expect(v.degree).toBe(2);
+      expect(v.via).toEqual(['devin-addr']);
+    });
+
+    it('refreshGraphAnnotations does not fire onChange when nothing changed', async () => {
+      const { adapter, emit } = createMockAdapter();
+      await svc.connectAdapter(adapter);
+      emit('vine-received', {
+        id: 'net-g3', creatorAddress: 'ravi-addr', creatorName: 'Ravi',
+        createdAt: 1, videoCid: 'cid-g3', source: 'discover',
+        degree: 2, via: ['devin-addr'],
+      } satisfies VineDescriptorEvent);
+
+      vi.mocked(adapter.invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === 'list_vine_videos') {
+          return [{
+            id: 'net-g3', creatorAddress: 'ravi-addr', creatorName: 'Ravi',
+            createdAt: 1, videoCid: 'cid-g3', degree: 2, via: ['devin-addr'],
+          }];
+        }
+        return undefined;
+      });
+      const changed = vi.fn();
+      svc.onChange = changed;
+      await svc.refreshGraphAnnotations();
+      expect(changed).not.toHaveBeenCalled();
+    });
+});
 });
