@@ -259,6 +259,7 @@ pub mod state_snapshot;
 pub mod tunnel_manager;
 pub mod tunnel_task;
 pub mod vine_feed_cache;
+pub mod vine_follow_graph;
 pub mod vine_settings;
 pub mod vine_signing;
 pub mod vine_tombstone;
@@ -10544,6 +10545,9 @@ pub async fn start_node_inner(
                 let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                 if guard.generation == our_gen {
                     publish_follow_list_update(&guard);
+                    // ZEB-671: seed the Discover graph inputs (consumes
+                    // the guard).
+                    refresh_vine_graph_inputs(guard);
                 }
             }
 
@@ -12841,6 +12845,15 @@ pub struct VineVideoDto {
     /// ZEB-670: true when this row is a reshare whose original was
     /// tombstoned by its creator — render as a "Removed by creator" stub.
     pub original_removed: bool,
+    /// ZEB-671: graph distance (2 or 3) when the creator is reachable
+    /// through the transitive follow graph. `None` for followed creators
+    /// (degree 1 lives in the Followed feed) and unreachable ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degree: Option<u8>,
+    /// ZEB-671: the follow chain that reached the creator — `via[0]` is
+    /// one of the viewer's follows; the creator is not included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<Vec<String>>,
 }
 
 /// Response returned by list_followed — one entry per followed address.
@@ -14044,6 +14057,30 @@ fn publish_follow_list_update(guard: &NodeState) {
     send_follow_list_publish(guard, payload);
 }
 
+/// ZEB-671: refresh the Discover graph inputs on the vine cache after a
+/// local follow-set change. Extracts what it needs and DROPS the state
+/// guard before locking the cache — IPC readers (`list_vine_videos`)
+/// establish the same state-then-cache order by cloning the Arc first,
+/// and the event loop locks the cache without the state lock at all.
+fn refresh_vine_graph_inputs(guard: std::sync::MutexGuard<'_, NodeState>) {
+    let me = guard.node_addr.clone();
+    let follows = guard
+        .follow_mgr
+        .as_ref()
+        .map(|m| m.addresses())
+        .unwrap_or_default();
+    let cache = guard.vine_feed_cache.clone();
+    drop(guard);
+    if let Some(cache) = cache {
+        match cache.lock() {
+            Ok(mut c) => {
+                c.set_graph_inputs(me, follows);
+            }
+            Err(e) => tracing::error!(error = %e, "vine_feed_cache poisoned; graph inputs stale"),
+        }
+    }
+}
+
 /// Vine settings exposed to the frontend (ZEB-671).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -14140,8 +14177,11 @@ pub(crate) fn follow_vine_creator_impl(
         }
     }
 
-    // ZEB-671: share the updated follow list on the wire (public + opt-out).
+    // ZEB-671: share the updated follow list on the wire (public + opt-out)
+    // and refresh the Discover graph — the degree-1 set changed. The
+    // graph refresh consumes the guard.
     publish_follow_list_update(&guard);
+    refresh_vine_graph_inputs(guard);
 
     Ok(true)
 }
@@ -14181,8 +14221,11 @@ pub(crate) fn unfollow_vine_creator_impl(
         }
     }
 
-    // ZEB-671: share the updated follow list on the wire (public + opt-out).
+    // ZEB-671: share the updated follow list on the wire (public + opt-out)
+    // and refresh the Discover graph — the degree-1 set changed. The
+    // graph refresh consumes the guard.
     publish_follow_list_update(&guard);
+    refresh_vine_graph_inputs(guard);
 
     Ok(true)
 }

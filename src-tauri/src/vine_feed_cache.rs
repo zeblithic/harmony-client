@@ -131,7 +131,7 @@ pub enum VineSource {
 /// to re-walk the cache.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DescriptorOutcome {
-    Inserted { dto: VineVideoDtoWithSource },
+    Inserted { dto: Box<VineVideoDtoWithSource> },
     AlreadyPresent,
     Rejected(String),
 }
@@ -264,6 +264,14 @@ pub struct VineVideoDtoWithSource {
     /// ZEB-670: true when this row is a reshare whose original was
     /// tombstoned by its creator — render as a "Removed by creator" stub.
     pub original_removed: bool,
+    /// ZEB-671: graph distance (2 or 3) for Discover provenance. See
+    /// `VineVideoDto::degree`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degree: Option<u8>,
+    /// ZEB-671: follow chain that reached the creator. See
+    /// `VineVideoDto::via`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +308,15 @@ pub struct VineFeedCache {
     /// the raw edges the Discover graph is computed from. LWW by
     /// `updated_at`; bounded by `MAX_FOLLOW_LISTS`.
     follow_lists: HashMap<String, FollowListEntry>,
+    /// ZEB-671: the viewer's own address — BFS root for the Discover
+    /// graph. Set via `set_graph_inputs` (start_node + follow/unfollow).
+    graph_me: String,
+    /// ZEB-671: the viewer's LOCAL follows (degree-1 ground truth; never
+    /// the own published echo).
+    graph_my_follows: Vec<String>,
+    /// ZEB-671: derived reachability (creator → degree + via-path).
+    /// Recomputed on graph-input or follow-list change; NOT persisted.
+    reach: HashMap<String, crate::vine_follow_graph::Reach>,
     /// `Some(path_to_vine_feed.json)` when constructed via `load()`;
     /// `None` for `new()`. `save()` checks this and is a no-op when None.
     path: Option<PathBuf>,
@@ -326,6 +343,9 @@ impl VineFeedCache {
             viewed: HashSet::new(),
             tombstones: HashMap::new(),
             follow_lists: HashMap::new(),
+            graph_me: String::new(),
+            graph_my_follows: Vec::new(),
+            reach: HashMap::new(),
             path: Some(path.clone()),
         };
         Self::populate_from_disk(&mut cache, &path);
@@ -624,7 +644,7 @@ impl VineFeedCache {
         }
 
         self.save();
-        Some(DescriptorOutcome::Inserted { dto })
+        Some(DescriptorOutcome::Inserted { dto: Box::new(dto) })
     }
 
     /// Return all cached descriptors as `VineVideoDto`, sorted by
@@ -646,6 +666,14 @@ impl VineFeedCache {
                 original_creator_address: cv.descriptor.original_creator_address.clone(),
                 original_creator_name: cv.descriptor.original_creator_name.clone(),
                 original_removed: self.original_removed(&cv.descriptor),
+                degree: self
+                    .reach
+                    .get(&cv.descriptor.creator_address)
+                    .map(|r| r.degree),
+                via: self
+                    .reach
+                    .get(&cv.descriptor.creator_address)
+                    .map(|r| r.via.clone()),
             })
             .collect();
         out.sort_by_key(|v| std::cmp::Reverse(v.created_at));
@@ -673,6 +701,14 @@ impl VineFeedCache {
             original_creator_address: descriptor.original_creator_address.clone(),
             original_creator_name: descriptor.original_creator_name.clone(),
             original_removed: self.original_removed(descriptor),
+            degree: self
+                .reach
+                .get(&descriptor.creator_address)
+                .map(|r| r.degree),
+            via: self
+                .reach
+                .get(&descriptor.creator_address)
+                .map(|r| r.via.clone()),
         }
     }
 
@@ -992,6 +1028,33 @@ impl VineFeedCache {
     /// for the Discover graph computation.
     pub fn follow_lists(&self) -> &HashMap<String, FollowListEntry> {
         &self.follow_lists
+    }
+
+    /// ZEB-671: install the viewer-side graph inputs (own address +
+    /// LOCAL follows) and recompute reachability. Returns `true` when
+    /// the derived reach map changed. Called from start_node (once the
+    /// node identity is known) and from the follow/unfollow IPCs.
+    pub fn set_graph_inputs(&mut self, me: String, my_follows: Vec<String>) -> bool {
+        self.graph_me = me;
+        self.graph_my_follows = my_follows;
+        self.recompute_reach()
+    }
+
+    /// ZEB-671: recompute Discover reachability from the stored graph
+    /// inputs over the cached follow lists. Returns `true` on change.
+    /// Cheap no-op before `set_graph_inputs` (empty root set → empty
+    /// reach).
+    pub fn recompute_reach(&mut self) -> bool {
+        let next = crate::vine_follow_graph::compute_reach(
+            &self.graph_me,
+            &self.graph_my_follows,
+            |owner| self.follow_lists.get(owner).map(|e| e.follows.as_slice()),
+        );
+        if next == self.reach {
+            return false;
+        }
+        self.reach = next;
+        true
     }
 
     /// ZEB-670: true when descriptor `d` is a reshare whose original was
@@ -3496,6 +3559,68 @@ mod tests {
             "envelope key is snake_case like its siblings"
         );
         assert!(!raw.contains("identityPub"), "sigs never persist");
+    }
+
+    #[test]
+    fn set_graph_inputs_reports_reach_changes() {
+        let mut cache = VineFeedCache::new();
+        // Inputs with no cached lists → reach stays empty → no change.
+        assert!(!cache.set_graph_inputs(addr("fl-me"), vec![addr("fl-devin")]));
+
+        // devin → ravi arrives: recompute flips ravi to 2°.
+        cache.on_follow_list_sample(
+            &follows_topic("fl-devin"),
+            &follow_list_bytes("fl-devin", &["fl-ravi"], 100),
+        );
+        assert!(cache.recompute_reach(), "new 2° edge must report change");
+        assert!(!cache.recompute_reach(), "idempotent recompute");
+
+        // ravi → ada extends to 3°.
+        cache.on_follow_list_sample(
+            &follows_topic("fl-ravi"),
+            &follow_list_bytes("fl-ravi", &["fl-ada"], 100),
+        );
+        assert!(cache.recompute_reach(), "new 3° edge must report change");
+
+        // Unfollow devin: reach collapses to empty.
+        assert!(cache.set_graph_inputs(addr("fl-me"), vec![]));
+    }
+
+    #[test]
+    fn reach_annotations_populate_discover_dtos() {
+        let mut cache = VineFeedCache::new();
+
+        // A vine from ravi arrives as Discover (nobody followed).
+        let payload = canonical_descriptor_bytes(
+            "vine-reach-1",
+            "fl-ravi",
+            "Ravi",
+            &"aa".repeat(32),
+            None,
+            None,
+            1_000,
+            None,
+            None,
+        );
+        let outcome =
+            cache.on_descriptor_sample(&topic("fl-ravi"), &payload, &followed_set_with(&[]), 1_000);
+        assert!(matches!(outcome, Some(DescriptorOutcome::Inserted { .. })));
+
+        // No graph yet → no annotation.
+        let rows = cache.list_descriptors();
+        assert_eq!(rows[0].degree, None);
+
+        // devin (my follow) publishes a list containing ravi → 2°.
+        cache.on_follow_list_sample(
+            &follows_topic("fl-devin"),
+            &follow_list_bytes("fl-devin", &["fl-ravi"], 100),
+        );
+        cache.set_graph_inputs(addr("fl-me"), vec![addr("fl-devin")]);
+
+        let rows = cache.list_descriptors();
+        let row = rows.iter().find(|r| r.id == "vine-reach-1").unwrap();
+        assert_eq!(row.degree, Some(2));
+        assert_eq!(row.via, Some(vec![addr("fl-devin")]));
     }
 
     #[test]

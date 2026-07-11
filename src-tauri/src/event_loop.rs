@@ -7656,28 +7656,32 @@ fn emit_frontend_event(
             // change (Inserted/UpdatedNewer) is announced to the frontend
             // so it refetches degree/provenance annotations; stale
             // re-arrivals and rejected records are absorbed silently.
-            let outcome = match vine_feed_cache.lock() {
-                Ok(mut cache) => Some(cache.on_follow_list_sample(key_expr, payload)),
+            // `reach_changed` gates the emit: an admitted list from an
+            // owner outside the viewer's graph does not change any
+            // degree, and the frontend should not refetch for it.
+            let reach_changed = match vine_feed_cache.lock() {
+                Ok(mut cache) => match cache.on_follow_list_sample(key_expr, payload) {
+                    crate::vine_feed_cache::FollowListOutcome::Inserted
+                    | crate::vine_feed_cache::FollowListOutcome::UpdatedNewer => {
+                        cache.recompute_reach()
+                    }
+                    crate::vine_feed_cache::FollowListOutcome::Rejected(reason) => {
+                        tracing::debug!(key_expr, reason, "follow-list sample rejected");
+                        false
+                    }
+                    crate::vine_feed_cache::FollowListOutcome::IgnoredOlder => false,
+                },
                 Err(e) => {
                     tracing::error!(error = %e, "vine_feed_cache mutex poisoned; skipping follow-list ingest");
-                    None
+                    false
                 }
             };
-            match outcome {
-                Some(
-                    crate::vine_feed_cache::FollowListOutcome::Inserted
-                    | crate::vine_feed_cache::FollowListOutcome::UpdatedNewer,
-                ) => {
-                    crate::node_event_sink::emit_ser(
-                        app.as_ref(),
-                        "vine-graph-updated",
-                        &serde_json::Value::Null,
-                    );
-                }
-                Some(crate::vine_feed_cache::FollowListOutcome::Rejected(reason)) => {
-                    tracing::debug!(key_expr, reason, "follow-list sample rejected");
-                }
-                _ => {}
+            if reach_changed {
+                crate::node_event_sink::emit_ser(
+                    app.as_ref(),
+                    "vine-graph-updated",
+                    &serde_json::Value::Null,
+                );
             }
             return None;
         }
