@@ -13902,6 +13902,36 @@ mod follow_list_publish_tests {
     }
 
     #[test]
+    fn disable_without_identity_fails_and_keeps_sharing_on() {
+        // Greptile PR #447 P1: a disable whose retraction cannot be
+        // SIGNED must fail loudly and leave sharing on — success here
+        // would strand peers on the stale list with all future
+        // publishes suppressed.
+        let (state, mut rx, _addr) = fixture(false, None);
+        let err = set_vine_settings_impl(&state, false).unwrap_err();
+        assert!(err.contains("cannot sign"), "got {err:?}");
+        assert!(get_vine_settings_impl(&state).unwrap().share_follows);
+        assert!(last_publish(&mut rx).is_none());
+    }
+
+    #[test]
+    fn disable_without_channel_fails_and_keeps_sharing_on() {
+        // Same guarantee when the retraction cannot be QUEUED (node not
+        // running): the flag must not flip.
+        let private = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let node_addr = hex::encode(private.public_identity().address_hash);
+        let state = Mutex::new(NodeState {
+            follow_tx: None,
+            node_addr,
+            owner_private_identity: Some(std::sync::Arc::new(private)),
+            ..NodeState::default()
+        });
+        let err = set_vine_settings_impl(&state, false).unwrap_err();
+        assert!(err.contains("not connected"), "got {err:?}");
+        assert!(get_vine_settings_impl(&state).unwrap().share_follows);
+    }
+
+    #[test]
     fn rapid_changes_get_strictly_increasing_timestamps() {
         // Two changes inside one wall-clock second must still produce
         // increasing updated_at, or receiver LWW (which ignores `<=`)
@@ -14068,29 +14098,24 @@ fn build_signed_follow_list(guard: &NodeState) -> Result<VineFollowListPayload, 
 }
 
 /// ZEB-671: hand a signed payload to the event loop for Zenoh
-/// publication. Best-effort: the local state change already succeeded —
-/// wire propagation failures are logged, and the boot republish is the
-/// recovery path.
-fn send_follow_list_publish(guard: &NodeState, payload: VineFollowListPayload) {
-    let Some(tx) = guard.follow_tx.as_ref() else {
-        return;
-    };
-    let bytes = match serde_json::to_vec(&payload) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(error = %e, "follow-list serialize failed");
-            return;
-        }
-    };
-    if tx
-        .try_send(event_loop::FollowRequest::PublishFollowList {
-            owner: payload.owner_address,
-            payload: bytes,
-        })
-        .is_err()
-    {
-        tracing::error!("follow_tx full — follow-list publish not sent to event loop");
-    }
+/// publication. Returns `Err` when the hand-off itself fails (node not
+/// running, serialize failure, channel full) — the routine
+/// follow/unfollow/boot callers treat that as best-effort and log, but
+/// the opt-out retraction path must FAIL LOUDLY instead (Greptile PR
+/// #447 P1: a dropped retraction plus suppressed future publishes would
+/// strand peers on the stale list forever).
+fn send_follow_list_publish(
+    guard: &NodeState,
+    payload: VineFollowListPayload,
+) -> Result<(), String> {
+    let tx = guard.follow_tx.as_ref().ok_or("not connected")?;
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("follow-list serialize failed: {e}"))?;
+    tx.try_send(event_loop::FollowRequest::PublishFollowList {
+        owner: payload.owner_address,
+        payload: bytes,
+    })
+    .map_err(|_| "follow_tx full — follow-list publish not sent to event loop".to_string())
 }
 
 /// ZEB-671: publish the current follow list — the shared trigger for
@@ -14109,7 +14134,9 @@ fn publish_follow_list_update(guard: &NodeState) {
             return;
         }
     };
-    send_follow_list_publish(guard, payload);
+    if let Err(e) = send_follow_list_publish(guard, payload) {
+        tracing::error!(error = %e, "follow-list publish hand-off failed");
+    }
 }
 
 /// ZEB-671: refresh the Discover graph inputs on the vine cache after a
@@ -14170,6 +14197,19 @@ pub(crate) fn set_vine_settings_impl(
 ) -> Result<(), String> {
     let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
     let changed = guard.vine_share_follows != share_follows;
+
+    // Disabling is TRANSACTIONAL (Greptile PR #447 P1): the empty-list
+    // retraction must be signed and queued BEFORE the flag flips —
+    // otherwise peers keep the stale non-empty list while every future
+    // publish (incl. boot republish) is suppressed by the new setting.
+    // A failure here surfaces to the Tune sheet, which reverts the
+    // toggle. Enabling stays best-effort: with sharing back on, the
+    // next follow change or boot republish recovers a dropped publish.
+    if changed && !share_follows {
+        let payload = build_signed_follow_list_with(&guard, vec![])?;
+        send_follow_list_publish(&guard, payload)?;
+    }
+
     guard.vine_share_follows = share_follows;
     if let Some(path) = guard.vine_settings_path.clone() {
         vine_settings::save(
@@ -14182,19 +14222,9 @@ pub(crate) fn set_vine_settings_impl(
             },
         );
     }
-    if !changed {
-        return Ok(());
-    }
-    if share_follows {
+    if changed && share_follows {
         // Re-enabled: republish the full current list.
         publish_follow_list_update(&guard);
-    } else {
-        // Disabled: retract via an empty-list record (newer updated_at
-        // wins LWW on every receiver).
-        match build_signed_follow_list_with(&guard, vec![]) {
-            Ok(payload) => send_follow_list_publish(&guard, payload),
-            Err(e) => tracing::warn!(error = %e, "follow-list retraction skipped"),
-        }
     }
     Ok(())
 }
