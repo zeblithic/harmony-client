@@ -4977,22 +4977,13 @@ pub async fn start_node_inner(
                             outbound_rx: community_device_intro_out_rx,
                             inbound_tx: community_device_intro_in_tx,
                         });
-                    // Enrolled-device snapshot for the relay sweeper's GC
-                    // coverage check (same 64-hex form as dm-inbox).
-                    // ZEB-668 S3: REVOKED devices are excluded — a revoked
-                    // device never relays, so including it would stall every
-                    // entry's coverage-GC to the 30-day TTL. Boot-time
-                    // snapshot (live refresh is a filed follow-up).
-                    let community_device_intro_enrolled: std::collections::BTreeSet<String> =
-                        loaded
-                            .state
-                            .enrollments
-                            .iter()
-                            .filter(|(device_id, _)| !loaded.state.is_revoked(**device_id))
-                            .map(|(_, cert)| {
-                                hex::encode(cert.device_pubkeys.classical.ed25519_verify)
-                            })
-                            .collect();
+                    // ZEB-668 S3 (CodeRabbit PR #453): the relay sweeper's GC
+                    // coverage set is computed LIVE from the trust doc on
+                    // every sweep (`live_enrolled_intro_ids` — enrolled minus
+                    // revoked), replacing the pre-S3 boot-time snapshot. A
+                    // device revoked mid-session leaves the coverage set
+                    // immediately instead of stalling every entry's
+                    // coverage-GC to the 30-day TTL.
 
                     tracing::info!("BOOT-PROBE 05c: community-device-intro engine constructed");
                     // ── ZEB-458 P4 Phase B: relay-hold + relay-optin datasets ─
@@ -5665,7 +5656,7 @@ pub async fn start_node_inner(
                             crate::community_device_intro_ingest::ProdCommunityDeviceIntroIngestCtx {
                                 device_id: device_id.clone(),
                                 registry: std::sync::Arc::clone(&registry),
-                                enrolled: community_device_intro_enrolled,
+                                trust_doc: std::sync::Arc::clone(&owner_trust_doc),
                             },
                         );
                         let sweeper_engine = std::sync::Arc::clone(&community_device_intro_sync);

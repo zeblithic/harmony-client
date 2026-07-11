@@ -940,6 +940,13 @@ pub enum VerifyError {
     /// NEW key when the set is already at the cap is rejected, bounding the
     /// per-member verify cost regardless of input.
     EnrolledDeviceKeyLimit,
+    /// ZEB-668 S3 (Qodo PR #453): a `DeviceAnnounce` whose carried cert key
+    /// is tombstoned in the actor's `revoked_device_keys`. The cert stays
+    /// master-signed-valid after revocation, so without this reject a
+    /// retired device could insert verify-passing (materialize-no-op)
+    /// announces forever. Verify-time mirror of the materialize tombstone
+    /// guard.
+    DeviceAnnounceForRetiredKey,
     /// ZEB-668 S3: a `DeviceRetire` whose actor has no member entry at all.
     /// ANY member status is acceptable (retire is subtractive; a Left/Banned
     /// owner's stale key must still be retirable) — this fires only for
@@ -1181,6 +1188,12 @@ impl std::fmt::Display for VerifyError {
                 write!(
                     f,
                     "ZEB-401 DeviceAnnounce would exceed MAX_ENROLLED_DEVICE_KEYS ({MAX_ENROLLED_DEVICE_KEYS}) for the actor"
+                )
+            }
+            VerifyError::DeviceAnnounceForRetiredKey => {
+                write!(
+                    f,
+                    "ZEB-668 DeviceAnnounce carries a cert for a retired (tombstoned) device key"
                 )
             }
             VerifyError::DeviceRetireForNonMember => {
@@ -2815,7 +2828,10 @@ pub fn materialize_with_now(
                 if let Some(member) = m.members.get_mut(&event.actor) {
                     let vk = cert.device_pubkeys.classical.ed25519_verify;
                     member.enrolled_device_keys.remove(&vk);
-                    insert_revoked_tombstone_capped(&mut member.revoked_device_keys, vk);
+                    // Uncapped by design — see the tombstone note next to
+                    // `insert_enrolled_key_unless_retired` (authenticated,
+                    // contains-only, and a cap would break remove-wins).
+                    member.revoked_device_keys.insert(vk);
                 }
             }
         }
@@ -3355,6 +3371,21 @@ pub fn verify_event(
                     && member.enrolled_device_keys.len() >= MAX_ENROLLED_DEVICE_KEYS
                 {
                     return Err(VerifyError::EnrolledDeviceKeyLimit);
+                }
+                // ZEB-668 S3 (Qodo PR #453): reject a DeviceAnnounce for a
+                // TOMBSTONED key at verify time, not just materialize time.
+                // DeviceAnnounce's signer comes from the carried cert (which
+                // stays master-signed-valid after revocation), so without
+                // this a retired device could keep inserting verify-passing
+                // announce events forever — each a materialize no-op thanks
+                // to the tombstone, but unbounded authenticated log spam.
+                // Deterministic across replicas: prior_state is
+                // sort-order-derived (prior_state_at_event), not
+                // arrival-order. Same loses-nothing rationale as the cap
+                // reject above; a Join carrying a tombstoned key still
+                // admits the member and drops the key at materialize.
+                if member.revoked_device_keys.contains(&key) {
+                    return Err(VerifyError::DeviceAnnounceForRetiredKey);
                 }
             }
         }
@@ -4225,21 +4256,17 @@ fn insert_enrolled_key_capped(set: &mut BTreeSet<[u8; 32]>, key: [u8; 32]) {
     }
 }
 
-/// ZEB-668 S3: bound on `revoked_device_keys` tombstones per member — 2× the
-/// enrolled cap. Tombstones accumulate across the owner's whole rotation
-/// history and are never GC'd (that permanence is what makes them
-/// replay-order-proof). Minting one requires a valid master- or self-signed
-/// RevocationCert, so growth is owner-inflicted, not an attack surface. At
-/// the cap new tombstones are dropped — removal still happens; only the
-/// re-add guard for the dropped key degrades to order-dependent.
-pub const MAX_REVOKED_DEVICE_KEY_TOMBSTONES: usize = 2 * MAX_ENROLLED_DEVICE_KEYS;
-
-/// ZEB-668 S3: capped tombstone insert (mirrors `insert_enrolled_key_capped`).
-fn insert_revoked_tombstone_capped(set: &mut BTreeSet<[u8; 32]>, key: [u8; 32]) {
-    if set.contains(&key) || set.len() < MAX_REVOKED_DEVICE_KEY_TOMBSTONES {
-        set.insert(key);
-    }
-}
+// ZEB-668 S3, revised in PR #453 review: tombstones are deliberately
+// UNCAPPED. Every tombstone requires a `DeviceRetire` that passed
+// `verify_event` (a valid master- or self-signed RevocationCert), so growth
+// is authenticated and owner-inflicted — and the event log itself grows by
+// one event per retire regardless, so capping the derived set bounds
+// nothing. A cap would silently drop the remove-wins guarantee for the
+// overflow key (a pre-retirement DeviceAnnounce sorting later in replay
+// could re-add a revoked key — CodeRabbit PR #453). Unlike
+// `enrolled_device_keys` (iterated per signature resolution — the ZEB-401
+// cost bound), tombstones are only ever probed with `contains`, so an
+// unbounded set adds no per-verify iteration cost.
 
 /// ZEB-668 S3: tombstone-aware enrolled-key insert for materialize arms that
 /// hold a `&mut MemberState`. Refuses tombstoned (retired) keys — remove-wins
@@ -13138,6 +13165,33 @@ mod zeb_339_signer_verify_tests {
             .expect("DeviceRetire for a Left member must verify (subtractive op)");
     }
 
+    /// Qodo PR #453: a DeviceAnnounce for a tombstoned key must be rejected
+    /// at VERIFY time (the carried cert stays master-signed-valid after
+    /// revocation, so without this a retired device could insert
+    /// verify-passing, materialize-no-op announces forever).
+    #[test]
+    fn verify_event_rejects_device_announce_for_tombstoned_key() {
+        let owner = mint_test_owner(0x7b);
+        let community_id = SpaceId([0xec; 16]);
+        let (device2_sk, cert2) = mint_second_device(0x7b, 0x7c);
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+        let mut prior = joined_with_first_device(&owner);
+        prior
+            .members
+            .get_mut(&owner.owner)
+            .unwrap()
+            .revoked_device_keys
+            .insert(device2_key);
+
+        let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 2_000);
+        let err = verify_event(&announce, &prior, &retire_ctx(community_id, owner.owner))
+            .expect_err("announce for a tombstoned key must be rejected");
+        assert!(
+            matches!(err, VerifyError::DeviceAnnounceForRetiredKey),
+            "expected DeviceAnnounceForRetiredKey, got {err:?}"
+        );
+    }
+
     /// Full pipeline: join → announce → retire removes the key and
     /// tombstones it; status/joined_at untouched.
     #[test]
@@ -13371,31 +13425,40 @@ mod zeb_339_signer_verify_tests {
         );
     }
 
+    /// Tombstones are UNCAPPED by design (PR #453 review): every one requires
+    /// a verify_event-passing RevocationCert, so growth is authenticated, and
+    /// a cap would silently break remove-wins for the overflow key. Pin that
+    /// retires past the old 2×MAX_ENROLLED_DEVICE_KEYS bound all tombstone.
     #[test]
-    fn revoked_tombstone_insert_is_capped() {
-        let mut set: BTreeSet<[u8; 32]> = BTreeSet::new();
-        let mut i: u32 = 0;
-        while set.len() < MAX_REVOKED_DEVICE_KEY_TOMBSTONES {
+    fn revoked_tombstones_are_not_capped() {
+        let owner = mint_test_owner(0x7a);
+        let mut member = MemberState {
+            status: MemberStatus::Joined,
+            joined_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: test_enrolled_keys(&owner),
+            revoked_device_keys: BTreeSet::new(),
+        };
+        let n = 2 * MAX_ENROLLED_DEVICE_KEYS + 8;
+        for i in 0..n as u32 {
             let mut k = [0u8; 32];
             k[0] = 0xAA;
             k[1] = (i >> 8) as u8;
             k[2] = (i & 0xff) as u8;
-            insert_revoked_tombstone_capped(&mut set, k);
-            i += 1;
+            member.revoked_device_keys.insert(k);
+            // Remove-wins holds for EVERY tombstone, including past the old
+            // cap: the guarded inserter refuses each one.
+            insert_enrolled_key_unless_retired(&mut member, k);
+            assert!(
+                !member.enrolled_device_keys.contains(&k),
+                "tombstoned key must never re-enroll (i={i})"
+            );
         }
-        assert_eq!(set.len(), MAX_REVOKED_DEVICE_KEY_TOMBSTONES);
-        // A NEW key at the cap is dropped…
-        let overflow = [0xBB; 32];
-        insert_revoked_tombstone_capped(&mut set, overflow);
-        assert!(
-            !set.contains(&overflow),
-            "overflow tombstone dropped at cap"
-        );
-        assert_eq!(set.len(), MAX_REVOKED_DEVICE_KEY_TOMBSTONES);
-        // …but re-inserting a PRESENT key stays idempotent.
-        let existing = *set.iter().next().unwrap();
-        insert_revoked_tombstone_capped(&mut set, existing);
-        assert_eq!(set.len(), MAX_REVOKED_DEVICE_KEY_TOMBSTONES);
+        assert_eq!(member.revoked_device_keys.len(), n, "no tombstone dropped");
     }
 
     /// Additive-field honesty: a MemberState with no tombstones encodes with

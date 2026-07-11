@@ -226,21 +226,35 @@ async fn sweep_once(
 /// Production [`CommunityDeviceIntroIngestCtx`] over real `start_node` handles.
 ///
 /// * relay = `registry.engine_arc(&community_id)`; `None` ⇒ `Ok(false)` (not a
-///   member here); else decode the signed `DeviceAnnounce` and
+///   member here); else decode the signed lifecycle event and
 ///   `insert_local_event` (idempotent — `AlreadyKnown` on dup);
-/// * `enrolled` = a start_node-time snapshot of the `harmony_owner`
-///   `OwnerState.enrollments` certs mapped through
-///   `hex::encode(cert.device_pubkeys.classical.ed25519_verify)` (the SP1
-///   64-hex device-id form). Enrollment changes require a node restart, so the
-///   snapshot tracks the set for the engine's lifetime (mirrors
-///   `ProdDmInboxIngestCtx`).
+/// * enrolled ids are computed LIVE from the S1 trust doc on every sweep
+///   (ZEB-668 S3, CodeRabbit PR #453): since S2, enrollment changes no
+///   longer require a restart — a device revoked mid-session must leave the
+///   coverage set immediately or coverage-GC stalls to the 30-day TTL for
+///   every entry. (The pre-S3 design snapshotted at start_node, mirroring
+///   `ProdDmInboxIngestCtx` — which still does; see the ZEB-668 follow-up.)
 pub struct ProdCommunityDeviceIntroIngestCtx {
     /// This device's SP1 device id (64-hex of the device ed25519 verify key).
     pub device_id: String,
     /// The community-sync registry (engine lookup by community id).
     pub registry: Arc<crate::community_state_sync::CommunitySyncRegistry>,
-    /// Enrolled device ids (64-hex), snapshotted at start_node.
-    pub enrolled: BTreeSet<String>,
+    /// The S1 owner trust doc — the live source of enrollments/revocations.
+    pub trust_doc: Arc<Mutex<harmony_owner::state::OwnerState>>,
+}
+
+/// ZEB-668 S3: the coverage set — enrolled AND not revoked, in the 64-hex
+/// ed25519-vk form `relayed_by` uses. A revoked device never relays, so
+/// keeping it in the set would make every entry's coverage unreachable.
+/// Standalone (not a ctx method) so it is unit-testable against a minted
+/// `OwnerState` without a registry.
+pub fn live_enrolled_intro_ids(state: &harmony_owner::state::OwnerState) -> BTreeSet<String> {
+    state
+        .enrollments
+        .iter()
+        .filter(|(device_id, _)| !state.is_revoked(**device_id))
+        .map(|(_, cert)| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+        .collect()
 }
 
 /// Decode a dataset entry's `signed_event` bytes and enforce the dataset's
@@ -300,7 +314,7 @@ impl CommunityDeviceIntroIngestCtx for ProdCommunityDeviceIntroIngestCtx {
     }
 
     async fn enrolled_device_ids(&self) -> BTreeSet<String> {
-        self.enrolled.clone()
+        live_enrolled_intro_ids(&*self.trust_doc.lock().await)
     }
 
     fn now_ms(&self) -> u64 {
@@ -690,6 +704,62 @@ mod tests {
             },
         );
         decode_lifecycle_event(&bytes).expect("DeviceRetire passes the dataset kind gate");
+    }
+
+    /// ZEB-668 S3 (CodeRabbit PR #453): the live coverage set drops a device
+    /// the moment its revocation lands in the trust doc — no restart, no
+    /// stale boot snapshot pinning coverage-GC to the TTL.
+    #[test]
+    fn live_enrolled_ids_exclude_revoked_devices() {
+        use harmony_owner::certs::{RevocationCert, RevocationReason};
+        use harmony_owner::lifecycle::{enroll_via_master, mint_owner, MintResult};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
+
+        let now = 1_700_000_000u64;
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key: _sk1,
+        } = mint_owner(now).unwrap();
+
+        let sk2 = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32]);
+        let pkb2 = PubKeyBundle::classical_only(sk2.verifying_key().to_bytes());
+        let device2_vk_hex = hex::encode(sk2.verifying_key().to_bytes());
+        let res = enroll_via_master(
+            &state,
+            &recovery_artifact,
+            &sk2,
+            pkb2,
+            now,
+            DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .unwrap();
+        let device2_id = res.enrollment_cert.device_id;
+        state
+            .add_enrollment(res.enrollment_cert, now, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+
+        let before = live_enrolled_intro_ids(&state);
+        assert_eq!(before.len(), 2, "both devices enrolled pre-revocation");
+        assert!(before.contains(&device2_vk_hex));
+
+        let rc = RevocationCert::sign_master(
+            &recovery_artifact.master_signing_key(),
+            recovery_artifact.master_pubkey_bundle(),
+            device2_id,
+            now + 10,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        state.add_revocation(rc).unwrap();
+
+        let after = live_enrolled_intro_ids(&state);
+        assert_eq!(after.len(), 1, "revoked device leaves the coverage set");
+        assert!(
+            !after.contains(&device2_vk_hex),
+            "revoked device's id excluded"
+        );
     }
 
     #[test]

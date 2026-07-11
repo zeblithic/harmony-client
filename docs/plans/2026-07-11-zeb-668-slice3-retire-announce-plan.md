@@ -826,6 +826,38 @@ Test list:
    it away if the engine-spawn harness was heavy): it is a one-line keys()
    clone, exercised by the prod ctx path.
 
+## Execution amendments (PR #453 round 1)
+
+1. **Tombstones uncapped** (CodeRabbit Major): the planned
+   `MAX_REVOKED_DEVICE_KEY_TOMBSTONES` cap silently broke remove-wins for the
+   overflow key. Every tombstone requires a verify_event-passing cert
+   (authenticated growth) and the event log grows per retire regardless, so
+   the cap bounded nothing; tombstones are `contains`-probed only (no
+   ZEB-401-style per-verify iteration cost). Cap + capped inserter removed;
+   pin test asserts remove-wins holds past the old bound.
+2. **Verify-time reject of tombstoned `DeviceAnnounce`** (Qodo): the carried
+   cert stays master-signed-valid after revocation, so a retired device could
+   insert verify-passing (materialize-no-op) announces forever — authenticated
+   log spam. New `VerifyError::DeviceAnnounceForRetiredKey` in the step-4
+   gate; deterministic across replicas (prior state is sort-order-derived).
+   Join keeps materialize-level key-drop (must still re-admit the member —
+   the ZEB-401 precedent).
+3. **Live coverage set** (CodeRabbit Major): the boot-time enrolled snapshot
+   + revoked filter is replaced by `live_enrolled_intro_ids(&OwnerState)`
+   computed from the S1 trust doc on every sweep — the plan's "live refresh
+   follow-up" pulled into this slice (post-S2, enrollment changes no longer
+   imply restart, so the snapshot premise was stale). dm-inbox's static
+   snapshot remains the follow-up.
+4. **`community_ids()` deleted** (CodeRabbit): duplicated the pre-existing
+   `known_ids()` (missed in survey); prod ctx uses `known_ids()`.
+5. **`changed`/log only on real insert** (CodeRabbit + Qodo): deposit uses
+   `Entry::Vacant` so a lost sibling race doesn't fire `notify_dirty` or a
+   misleading "deposited" log.
+6. **Qodo's "matches! partial-move won't compile" finding rebutted**: `matches!`
+   on a place expression with bind-nothing patterns borrows for the
+   discriminant read — no move. The exact code compiles (CI rust-check green,
+   full workspace nextest 4400/4400 on the flagged commit).
+
 ## Self-review notes
 
 - Spec §4 coverage: entry kind (as key-suffixed reuse — documented deviation), surviving-device relay (deposit sweeper + existing relay), receiver verify + `enrolled_device_keys` removal (T1), rejected-as-unknown (free via `SignerNotEnrolledForActor`, pinned by test 10). ✓

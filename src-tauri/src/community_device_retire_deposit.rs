@@ -115,22 +115,24 @@ pub async fn deposit_pending_retires(
                 Ok(bytes) => {
                     let mut g = doc.lock().await;
                     // Insert-once under the write lock — a sibling's deposit
-                    // may have merged in between our peek and now; the merge
-                    // layer is first-writer-wins on `signed_event` either way.
-                    g.entries
-                        .entry(key)
-                        .or_insert_with(|| CommunityDeviceIntroEntry {
+                    // may have merged in between our peek and now. `changed`
+                    // and the log fire only on a REAL insert (Qodo/CodeRabbit
+                    // PR #453): a lost race is not a deposit and must not
+                    // trigger notify_dirty.
+                    if let std::collections::btree_map::Entry::Vacant(slot) = g.entries.entry(key) {
+                        slot.insert(CommunityDeviceIntroEntry {
                             signed_event: bytes,
                             community_id,
                             deposited_at: hlc,
                             relayed_by: BTreeSet::new(),
                         });
-                    changed = true;
-                    tracing::info!(
-                        community_id = ?community_id,
-                        retired = %retired_vk_hex,
-                        "ZEB-668 S3: DeviceRetire deposited for relay"
-                    );
+                        changed = true;
+                        tracing::info!(
+                            community_id = ?community_id,
+                            retired = %retired_vk_hex,
+                            "ZEB-668 S3: DeviceRetire deposited for relay"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -221,7 +223,7 @@ impl CommunityDeviceRetireDepositCtx for ProdCommunityDeviceRetireDepositCtx {
     }
 
     async fn depositable_communities(&self) -> Vec<SpaceId> {
-        let ids = self.registry.community_ids().await;
+        let ids = self.registry.known_ids().await;
         let mut out = Vec::new();
         for id in ids {
             // Re-resolve per id — an engine may despawn between enumerate

@@ -5094,14 +5094,6 @@ impl CommunitySyncRegistry {
         self.engines.lock().await.get(community_id).cloned()
     }
 
-    /// ZEB-668 S3: ids of every currently-spawned community engine. Used by
-    /// the retire-deposit sweeper to enumerate candidate communities; each
-    /// id is re-resolved via [`Self::engine_arc`] at use time (an engine may
-    /// despawn between enumerate and use).
-    pub async fn community_ids(&self) -> Vec<SpaceId> {
-        self.engines.lock().await.keys().copied().collect()
-    }
-
     /// ZEB-249 Task 6: returns a clone of the registry's shared
     /// `IdentityResolver`. IPC handlers that need to look up members'
     /// 64-byte identity pubs (e.g., to derive X25519 pubkeys for
