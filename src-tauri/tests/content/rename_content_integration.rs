@@ -239,6 +239,7 @@ async fn spawn_test_runtime() -> TestHarness {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });

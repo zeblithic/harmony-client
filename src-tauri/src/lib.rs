@@ -9179,6 +9179,8 @@ pub async fn start_node_inner(
             };
 
         let node_addr_for_state = node_addr.clone();
+        // ZEB-669 S2: the engine tick's planner `me`.
+        let own_owner_addr_for_loop = node_addr.clone();
         // ZEB-331: second clone for the StartNodeResponse returned to the
         // frontend — node_addr moves into NodeConfig and node_addr_for_state
         // moves into guard.node_addr, so we carry this out via the tuple.
@@ -9630,6 +9632,7 @@ pub async fn start_node_inner(
                                 storage_records_for_loop,
                                 storage_ledger_for_loop,
                                 storage_settings_for_loop,
+                                own_owner_addr_for_loop,
                             )
                             .await;
                         });

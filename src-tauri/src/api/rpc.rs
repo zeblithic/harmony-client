@@ -1678,6 +1678,12 @@ mod tests {
             "follow_vine_creator",
             "unfollow_vine_creator",
             "list_followed",
+            // storage buddies (ZEB-669 S2)
+            "get_storage_buddies",
+            "set_buddy_pledge",
+            "remove_storage_buddy",
+            "set_shared_budget",
+            "get_contribution_summary",
             // friends
             "list_friends",
             "generate_friend_token",

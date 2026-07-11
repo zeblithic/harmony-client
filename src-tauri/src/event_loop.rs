@@ -1109,11 +1109,15 @@ pub async fn run(
     // tick and the buddy IPCs. Test callers pass a fresh store.
     storage_records: std::sync::Arc<std::sync::Mutex<crate::storage_records::StorageRecordStore>>,
     // ZEB-669 S2: refcounted hosting ledger (engine writes, IPCs read).
-    // Underscored until the auto-pin engine tick consumes it.
-    _storage_ledger: std::sync::Arc<std::sync::Mutex<crate::storage_ledger::StorageLedger>>,
+    storage_ledger: std::sync::Arc<std::sync::Mutex<crate::storage_ledger::StorageLedger>>,
     // ZEB-669 S2: local buddy settings (budget/pledges), read by the
     // engine tick to derive pacts and enforce the shared budget.
-    _storage_settings: std::sync::Arc<std::sync::Mutex<crate::storage_settings::StorageSettings>>,
+    storage_settings: std::sync::Arc<std::sync::Mutex<crate::storage_settings::StorageSettings>>,
+    // ZEB-669 S2: the local OWNER address (hex address_hash) — the
+    // planner's `me` for pact derivation. Empty when no identity is
+    // loaded; the engine tick no-ops then. Distinct from `own_zid`,
+    // which is the transport-session id (announces stay anonymous).
+    own_owner_addr: String,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -3398,6 +3402,11 @@ pub async fn run(
         crate::observed_holders::REANNOUNCE_INTERVAL_MS,
     ));
     reannounce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // ZEB-669 S2: auto-pin engine tick + fetch-completion channel.
+    let mut buddy_sync_tick = tokio::time::interval(Duration::from_millis(BUDDY_SYNC_INTERVAL_MS));
+    buddy_sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (buddy_fetch_tx, mut buddy_fetch_rx) = mpsc::channel::<BuddyFetchResult>(16);
+    let mut buddy_engine = BuddyEngineState::default();
 
     // ── ZEB-358 voice moderation ──────────────────────────────────
     // Receiver-side enforcement state shared with the per-channel control
@@ -5818,6 +5827,315 @@ pub async fn run(
                     .await;
                 }
             }
+            // ── ZEB-669 S2: auto-pin engine tick ────────────────────
+            _ = buddy_sync_tick.tick(), if !own_owner_addr.is_empty() => {
+                let now_ms = start.elapsed().as_millis() as u64;
+                // (1) Boot honesty sweep, once: the cache is RAM-only, so
+                // ledger claims that didn't survive the restart are dropped
+                // — hosting reports must only ever claim actually-held
+                // bytes. Wanted cids re-enter via the normal fetch path.
+                if !buddy_engine.booted {
+                    buddy_engine.booted = true;
+                    let admitted: std::collections::HashSet<[u8; 32]> = runtime
+                        .storage_tier()
+                        .cache()
+                        .iter_admitted()
+                        .map(|id| id.to_bytes())
+                        .collect();
+                    let mut ledger = storage_ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for cid_hex in ledger.distinct_cids() {
+                        let present = hex::decode(&cid_hex)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                            .is_some_and(|b| admitted.contains(&b));
+                        if !present {
+                            tracing::info!(
+                                cid = %cid_hex,
+                                "buddy ledger: cid absent from cache after restart; dropping claim (will refetch)"
+                            );
+                            ledger.drop_cid_everywhere(&cid_hex);
+                        }
+                    }
+                }
+                // (2) Hosting-report staleness sweep (wall clock — receipt
+                // stamps are wall ms, see note_storage_record_sample).
+                storage_records
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .sweep_hosting(crate::wall_clock_ms());
+                // (3) Plan under short locks (guards dropped before any
+                // await; the plan is applied mechanically below).
+                let plan = {
+                    let records = storage_records
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let ledger = storage_ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let settings = storage_settings
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let backoff = &buddy_engine.backoff;
+                    crate::buddy_pin_planner::plan(
+                        &own_owner_addr,
+                        &settings.my_pledges,
+                        &records,
+                        &ledger,
+                        settings.shared_budget_bytes,
+                        &buddy_engine.inflight,
+                        &|cid| backoff.get(cid).is_some_and(|(_, at)| *at > now_ms),
+                    )
+                };
+                // (4) Releases + evictions + attributions (ledger first,
+                // physical unpins after the guard drops).
+                let mut contribution_changed = false;
+                let mut to_unpin: Vec<String> = Vec::new();
+                {
+                    let mut ledger = storage_ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for buddy in &plan.release_buddies {
+                        to_unpin.extend(ledger.release_buddy(buddy));
+                        contribution_changed = true;
+                    }
+                    for (buddy, cid_hex) in &plan.release {
+                        if matches!(
+                            ledger.release(buddy, cid_hex),
+                            crate::storage_ledger::ReleaseOutcome::LastReference
+                        ) {
+                            to_unpin.push(cid_hex.clone());
+                        }
+                        contribution_changed = true;
+                    }
+                    if let Some(target) = plan.evict_to {
+                        to_unpin.extend(ledger.evict_newest_first(target));
+                        contribution_changed = true;
+                    }
+                    for (buddy, cid_hex, size) in &plan.attribute_only {
+                        if ledger.record_pin(buddy, cid_hex, *size, crate::wall_clock_ms()) {
+                            contribution_changed = true;
+                        }
+                    }
+                }
+                for cid_hex in to_unpin {
+                    let Some(cid_bytes) = hex::decode(&cid_hex)
+                        .ok()
+                        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                    else {
+                        continue;
+                    };
+                    // Mirror the ContentVerbRequest::Unpin arm: keep-set
+                    // protects subtrees shared with still-pinned roots.
+                    pin_intent.remove(&cid_bytes);
+                    let root = ContentId::from_bytes(cid_bytes);
+                    let doomed = collect_descendants(runtime.storage_tier().cache(), root);
+                    let keep = compute_keep_set(
+                        runtime.storage_tier().cache(),
+                        &pin_intent,
+                        doomed.len(),
+                    );
+                    for id in doomed {
+                        if !keep.contains(&id) {
+                            runtime.unpin_content(&id);
+                        }
+                    }
+                }
+                // (5) Spawn fetches, bounded; reservations are already in
+                // the plan's arithmetic and recorded here before spawn.
+                let capacity =
+                    BUDDY_FETCH_MAX_INFLIGHT.saturating_sub(buddy_engine.inflight.len());
+                if capacity > 0 && !plan.fetch.is_empty() {
+                    // Defensive per-fetch byte ceiling: global headroom at
+                    // reservation time (authoritative check happens at
+                    // completion with ACTUAL sizes).
+                    let mut headroom = {
+                        let ledger = storage_ledger
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let settings = storage_settings
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let reserved: u64 =
+                            buddy_engine.inflight.values().map(|f| f.claimed).sum();
+                        settings
+                            .shared_budget_bytes
+                            .saturating_sub(ledger.distinct_pinned_bytes())
+                            .saturating_sub(reserved)
+                    };
+                    for cand in plan.fetch.into_iter().take(capacity) {
+                        let Some(cid_bytes) = hex::decode(&cand.cid)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                        else {
+                            continue; // ingest-validated; defensive only
+                        };
+                        let max = usize::try_from(headroom).unwrap_or(usize::MAX);
+                        headroom = headroom.saturating_sub(cand.claimed);
+                        buddy_engine.inflight.insert(
+                            cand.cid.clone(),
+                            crate::buddy_pin_planner::InflightFetch {
+                                buddy: cand.buddy.clone(),
+                                claimed: cand.claimed,
+                            },
+                        );
+                        let session = session.clone();
+                        let cas_op_tx_for_buddy = cas_op_tx.clone();
+                        let tx = buddy_fetch_tx.clone();
+                        tokio::spawn(async move {
+                            let fetch_one = move |cid: ContentId| {
+                                let session = session.clone();
+                                async move {
+                                    let cid_hex = hex::encode(cid.to_bytes());
+                                    let prefix = cid_hex.get(1..2).unwrap_or("");
+                                    let key = format!("harmony/content/{prefix}/{cid_hex}");
+                                    fetch_via_zenoh(&session, &key, Some(max)).await
+                                }
+                            };
+                            // serveable: false — public durables serve
+                            // freely regardless (content_cid_servable
+                            // checks only the encrypted bit).
+                            let fetch = wrap_fetch_one_with_admission(
+                                fetch_one,
+                                cas_op_tx_for_buddy,
+                                false,
+                            );
+                            let result =
+                                fetch_recursive(fetch, ContentId::from_bytes(cid_bytes), Some(max))
+                                    .await
+                                    .map(|bytes| bytes.len() as u64);
+                            let _ = tx
+                                .send(BuddyFetchResult {
+                                    buddy: cand.buddy,
+                                    cid: cand.cid,
+                                    cid_bytes,
+                                    result,
+                                })
+                                .await;
+                        });
+                    }
+                }
+                if contribution_changed {
+                    crate::node_event_sink::emit_ser(
+                        app.as_ref(),
+                        "contribution-updated",
+                        &serde_json::Value::Null,
+                    );
+                }
+            }
+
+            // ── ZEB-669 S2: buddy fetch completions ─────────────────
+            Some(done) = buddy_fetch_rx.recv() => {
+                buddy_engine.inflight.remove(&done.cid);
+                let now_ms = start.elapsed().as_millis() as u64;
+                match done.result {
+                    Err(e) => {
+                        let attempts = buddy_engine
+                            .backoff
+                            .get(&done.cid)
+                            .map(|(a, _)| *a)
+                            .unwrap_or(0)
+                            + 1;
+                        let delay = BUDDY_FETCH_BACKOFF_BASE_MS
+                            .checked_shl(attempts.min(7) - 1)
+                            .unwrap_or(u64::MAX)
+                            .min(BUDDY_FETCH_BACKOFF_MAX_MS);
+                        buddy_engine
+                            .backoff
+                            .insert(done.cid.clone(), (attempts, now_ms + delay));
+                        tracing::debug!(cid = %done.cid, error = %e, attempts, "buddy fetch failed; backing off");
+                    }
+                    Ok(actual) => {
+                        // Serialized budget reconcile at ACTUAL size. On
+                        // overflow the content stays admitted-unpinned
+                        // (evictable) and never enters the ledger — the
+                        // honesty rule.
+                        let fits = {
+                            let ledger = storage_ledger
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let settings = storage_settings
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let reserved: u64 =
+                                buddy_engine.inflight.values().map(|f| f.claimed).sum();
+                            ledger
+                                .distinct_pinned_bytes()
+                                .saturating_add(reserved)
+                                .saturating_add(actual)
+                                <= settings.shared_budget_bytes
+                        };
+                        if !fits {
+                            tracing::info!(
+                                cid = %done.cid, actual,
+                                "buddy fetch actual size exceeds remaining budget; skipping pin"
+                            );
+                            buddy_engine.backoff.insert(
+                                done.cid.clone(),
+                                (1, now_ms + BUDDY_FETCH_BACKOFF_BASE_MS),
+                            );
+                        } else {
+                            // Mirror the ContentVerbRequest::Pin arm.
+                            pin_intent.insert(done.cid_bytes);
+                            let root = ContentId::from_bytes(done.cid_bytes);
+                            let all =
+                                collect_descendants(runtime.storage_tier().cache(), root);
+                            let mut any_failed = false;
+                            for id in all {
+                                if !runtime.pin_content(id) {
+                                    any_failed = true;
+                                }
+                            }
+                            if any_failed {
+                                // Pin-count quota exhausted: undo (keep-set
+                                // protected) and back off — the pact reads
+                                // Catching up rather than half-pinning.
+                                pin_intent.remove(&done.cid_bytes);
+                                let doomed =
+                                    collect_descendants(runtime.storage_tier().cache(), root);
+                                let keep = compute_keep_set(
+                                    runtime.storage_tier().cache(),
+                                    &pin_intent,
+                                    doomed.len(),
+                                );
+                                for id in doomed {
+                                    if !keep.contains(&id) {
+                                        runtime.unpin_content(&id);
+                                    }
+                                }
+                                buddy_engine.backoff.insert(
+                                    done.cid.clone(),
+                                    (1, now_ms + BUDDY_FETCH_BACKOFF_BASE_MS),
+                                );
+                                tracing::warn!(
+                                    cid = %done.cid,
+                                    "buddy pin failed (pin quota exhausted); backing off"
+                                );
+                            } else {
+                                buddy_engine.backoff.remove(&done.cid);
+                                let changed = storage_ledger
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .record_pin(
+                                        &done.buddy,
+                                        &done.cid,
+                                        actual,
+                                        crate::wall_clock_ms(),
+                                    );
+                                if changed {
+                                    crate::node_event_sink::emit_ser(
+                                        app.as_ref(),
+                                        "contribution-updated",
+                                        &serde_json::Value::Null,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             _ = voice_sweep_tick.tick(),
                 if !voice_keys.is_empty() || !groupdm_presence_subs.is_empty() => {
                 let now = (voice_now_ms)();
@@ -6244,6 +6562,38 @@ fn note_announce_sample(
                 .note(&a.cid, zid, now_ms());
         }
     }
+}
+
+/// ZEB-669 S2: auto-pin engine cadence (reconcile pacts every 30 s).
+pub(crate) const BUDDY_SYNC_INTERVAL_MS: u64 = 30_000;
+/// Bounded concurrent buddy fetches — network fetches are spawned, so
+/// this caps memory/bandwidth, not loop latency.
+const BUDDY_FETCH_MAX_INFLIGHT: usize = 4;
+/// Exponential fetch backoff: base × 2^attempts, capped at one hour.
+const BUDDY_FETCH_BACKOFF_BASE_MS: u64 = 60_000;
+const BUDDY_FETCH_BACKOFF_MAX_MS: u64 = 3_600_000;
+
+/// Outcome of one spawned buddy fetch task.
+struct BuddyFetchResult {
+    buddy: String,
+    cid: String,
+    cid_bytes: [u8; 32],
+    /// Ok(actual assembled bytes) — the value the ledger records.
+    result: Result<u64, String>,
+}
+
+/// Loop-local auto-pin engine state. Living inside the single-threaded
+/// select loop is what makes budget admission SERIALIZED (spec §3, PR
+/// #448 review): reservations are taken and reconciled on one thread,
+/// so concurrent fetches can never observe stale remaining-budget.
+#[derive(Default)]
+struct BuddyEngineState {
+    /// cid-hex → reservation, while a fetch task runs.
+    inflight: std::collections::HashMap<String, crate::buddy_pin_planner::InflightFetch>,
+    /// cid-hex → (attempts, loop-relative retry-at ms).
+    backoff: std::collections::HashMap<String, (u32, u64)>,
+    /// First-tick boot honesty sweep done?
+    booted: bool,
 }
 
 /// ZEB-669 S2: route a `harmony/storage/*` sample into the record store.

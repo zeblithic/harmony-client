@@ -289,6 +289,7 @@ fn spawn_event_loop(
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });

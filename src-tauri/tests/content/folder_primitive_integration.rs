@@ -70,6 +70,7 @@ fn create_nested_folder_updates_top_level_root_cid() {
         licensed: false,
         archived: false,
         pinned: true, // must survive rekey
+        backup: false,
         kind: ContentKind::Folder,
     });
 
@@ -335,6 +336,7 @@ async fn spawn_test_runtime() -> TestHarness {
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
+                    String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
                 )
                 .await;
             });
