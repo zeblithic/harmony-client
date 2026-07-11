@@ -823,6 +823,28 @@ Then `scripts/test-select --context task`, fmt, clippy (owner_commands tests cha
 - [ ] `npx tsc --noEmit && npx vitest run`
 - [ ] Open PR (body: slice summary, spec §5 link, honesty-ledger notes, gates evidence), fire `@coderabbitai review` once.
 
+## Execution amendments
+
+1. **T2 emit lives in `_impl`, not the GUI wrapper.** The repo idiom
+   (`revoke_device_impl`) passes a `NodeEventSink` into the impl; both the
+   GUI command (`Arc::new(app)`) and the headless RPC (its own sink) get the
+   `owner-devices-updated` emit. Strictly better than the planned
+   GUI-wrapper-only emit.
+2. **No second `generate_handler!` registration.** The test builder list
+   (`add_dm_ipc_handlers`) is DM/voting/voice-scoped and does not carry
+   `set_butler_pin` either — only the prod list gains `set_device_petname`.
+3. **T4 migration guard is `petName === null`, not falsy.** An absent field
+   (undefined) means a pre-S4 view shape (only reachable in tests/mocks) and
+   must never trigger migration. Also keeps pre-S4 test fixtures inert.
+4. **ZEB-336 rename test updated** for the new contract: rename now flows
+   through `set_device_petname` + refresh, so the test stubs the post-save
+   fetch (view carries the petname) instead of asserting a local mutation.
+5. **T1: `EXPECTED_FLEET_NET_DOC_HEX` hoisted** from fn-local to tests-mod
+   const (same bytes, moved verbatim) so the old-bytes decode test shares it.
+6. **T3: the camelCase serde pin test** (`owner_state.rs`,
+   `types_serialize_with_camelcase`) extended with the S4 trio using
+   non-default values — a serde-rename regression cannot pass unnoticed.
+
 ## Self-review notes
 
 - Spec §5 coverage: read seam (T3), UI relative-time + null-renders-nothing (T4), `connectedNow` (T3/T4), petname LWW map additive on FleetNetDoc not FleetNetRow (T1), IPC + empty-clears (T2), `DeviceView.petName` + label ladder + localStorage migration/read-only fallback (T3/T4). No gaps.
