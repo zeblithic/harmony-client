@@ -79,10 +79,12 @@ fn make_node_config() -> NodeConfig {
 }
 
 /// Build a minimal `VineDescriptorPayload` for use in cache tests.
-fn make_vine_descriptor(vine_id: &str, creator_addr: &str, video_cid_hex: &str) -> Vec<u8> {
-    let payload = VineDescriptorPayload {
+/// `creator` is a signer NAME — translated to its derived address and
+/// creator-signed (ZEB-673 strict wire admission).
+fn make_vine_descriptor(vine_id: &str, creator: &str, video_cid_hex: &str) -> Vec<u8> {
+    let mut payload = VineDescriptorPayload {
         id: vine_id.to_string(),
-        creator_address: creator_addr.to_string(),
+        creator_address: crate::vine_signing_testutil::addr(creator),
         creator_name: "Test Creator".to_string(),
         created_at: 1_700_000_000_000,
         video_cid: video_cid_hex.to_string(),
@@ -90,7 +92,13 @@ fn make_vine_descriptor(vine_id: &str, creator_addr: &str, video_cid_hex: &str) 
         reshare_of: None,
         original_creator_address: None,
         original_creator_name: None,
+        identity_pub: None,
+        sig: None,
     };
+    harmony_app::vine_signing::sign_descriptor(
+        &crate::vine_signing_testutil::signer_for(creator),
+        &mut payload,
+    );
     serde_json::to_vec(&payload).expect("descriptor serialization")
 }
 
@@ -368,8 +376,8 @@ async fn creator_ingests_video_recipient_fetches_bytes() {
 
     // ── Step 2: model descriptor arrival on recipient cache ──────────────
     let vine_id = "test-vine-001";
-    let creator_addr = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    let descriptor_payload = make_vine_descriptor(vine_id, creator_addr, &cid_hex);
+    let creator_addr = crate::vine_signing_testutil::addr("rt-creator");
+    let descriptor_payload = make_vine_descriptor(vine_id, "rt-creator", &cid_hex);
     let topic = format!("harmony/vines/{creator_addr}");
     let followed: HashSet<String> = HashSet::new();
 
@@ -464,11 +472,11 @@ async fn vine_full_round_trip_publish_feed_view_fetch_reshare() {
 
     // ── 2. Feed: the descriptor lands in the recipient's feed ────────────
     let vine_id = "rt-vine-001";
-    let creator_addr = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    let creator_addr = crate::vine_signing_testutil::addr("rt-creator");
     let followed: HashSet<String> = HashSet::new(); // creator not followed → discover bucket
     let outcome = recipient_cache.lock().unwrap().on_descriptor_sample(
         &format!("harmony/vines/{creator_addr}"),
-        &make_vine_descriptor(vine_id, creator_addr, &cid_hex),
+        &make_vine_descriptor(vine_id, "rt-creator", &cid_hex),
         &followed,
         1_700_000_001_000,
     );
@@ -524,11 +532,11 @@ async fn vine_full_round_trip_publish_feed_view_fetch_reshare() {
     );
 
     // ── 5. Reshare: the reshare descriptor carries attribution to origin ─
-    let resharer_addr = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00";
+    let resharer_addr = crate::vine_signing_testutil::addr("rt-resharer");
     let reshare_id = "rt-vine-reshare-001";
-    let reshare_payload = VineDescriptorPayload {
+    let mut reshare_payload = VineDescriptorPayload {
         id: reshare_id.to_string(),
-        creator_address: resharer_addr.to_string(),
+        creator_address: resharer_addr.clone(),
         creator_name: "Resharer".to_string(),
         created_at: 1_700_000_002_000,
         video_cid: cid_hex.clone(), // a reshare points at the same video CID
@@ -536,7 +544,13 @@ async fn vine_full_round_trip_publish_feed_view_fetch_reshare() {
         reshare_of: Some(vine_id.to_string()),
         original_creator_address: Some(creator_addr.to_string()),
         original_creator_name: Some("Test Creator".to_string()),
+        identity_pub: None,
+        sig: None,
     };
+    harmony_app::vine_signing::sign_descriptor(
+        &crate::vine_signing_testutil::signer_for("rt-resharer"),
+        &mut reshare_payload,
+    );
     let reshare_outcome = recipient_cache.lock().unwrap().on_descriptor_sample(
         &format!("harmony/vines/{resharer_addr}"),
         &serde_json::to_vec(&reshare_payload).expect("reshare descriptor serialization"),
@@ -561,7 +575,7 @@ async fn vine_full_round_trip_publish_feed_view_fetch_reshare() {
     );
     assert_eq!(
         reshare.original_creator_address.as_deref(),
-        Some(creator_addr),
+        Some(creator_addr.as_str()),
         "reshare attributes the original creator's address"
     );
     assert_eq!(
@@ -650,8 +664,8 @@ async fn descriptor_arrives_before_video_cid_resolves_fetch_content_retry() {
 
     // ── Step 1: descriptor arrives on recipient (content not yet present) ─
     let vine_id = "test-vine-002";
-    let creator_addr = "deadbeefcafe00112233445566778899aabbccddeeff00112233445566778899";
-    let descriptor_payload = make_vine_descriptor(vine_id, creator_addr, &cid_hex);
+    let creator_addr = crate::vine_signing_testutil::addr("rt-creator-2");
+    let descriptor_payload = make_vine_descriptor(vine_id, "rt-creator-2", &cid_hex);
     let topic = format!("harmony/vines/{creator_addr}");
     let followed: HashSet<String> = HashSet::new();
 

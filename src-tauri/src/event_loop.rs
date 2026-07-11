@@ -2886,10 +2886,13 @@ pub async fn run(
     )
     .await;
 
-    // Subscribe to vine reactions (likes/unlikes).
+    // Subscribe to vine reactions (likes/unlikes). Exactly `*/*` — the
+    // canonical key is `…/reactions/{vine_id}/{reactor}`, and `**` would
+    // deliver arbitrarily deep non-canonical keys to the verify path
+    // (wasted signature work; Qodo PR #446 round 1).
     dispatch_action(
         RuntimeAction::Subscribe {
-            key_expr: "harmony/vines/*/reactions/**".to_string(),
+            key_expr: "harmony/vines/*/reactions/*/*".to_string(),
         },
         &session,
         &zenoh_tx,
@@ -7789,13 +7792,16 @@ mod vine_tombstone_routing_tests {
 
     fn insert_descriptor(
         cache: &Arc<Mutex<crate::vine_feed_cache::VineFeedCache>>,
+        signer: &harmony_identity::PrivateIdentity,
         vine_id: &str,
-        addr: &str,
         cid: &str,
     ) {
-        let d = crate::VineDescriptorPayload {
+        // ZEB-673: cache admission is strict — the seed must be
+        // creator-signed and arrive on the signer's own topic.
+        let addr = hex::encode(signer.public_identity().address_hash);
+        let mut d = crate::VineDescriptorPayload {
             id: vine_id.into(),
-            creator_address: addr.into(),
+            creator_address: addr.clone(),
             creator_name: "Creator".into(),
             created_at: 1_700_000_000,
             video_cid: cid.into(),
@@ -7803,7 +7809,10 @@ mod vine_tombstone_routing_tests {
             reshare_of: None,
             original_creator_address: None,
             original_creator_name: None,
+            identity_pub: None,
+            sig: None,
         };
+        crate::vine_signing::sign_descriptor(signer, &mut d);
         let outcome = cache.lock().unwrap().on_descriptor_sample(
             &format!("harmony/vines/{addr}"),
             &serde_json::to_vec(&d).unwrap(),
@@ -7841,7 +7850,7 @@ mod vine_tombstone_routing_tests {
             id,
             addr,
         } = fixture();
-        insert_descriptor(&cache, "vine-1", &addr, "aa".repeat(32).as_str());
+        insert_descriptor(&cache, &id, "vine-1", "aa".repeat(32).as_str());
 
         let evict = handle_vine_tombstone_sample(
             &sink,
@@ -7869,7 +7878,7 @@ mod vine_tombstone_routing_tests {
             id,
             addr,
         } = fixture();
-        insert_descriptor(&cache, "vine-1", &addr, "cid-aaa");
+        insert_descriptor(&cache, &id, "vine-1", "cid-aaa");
 
         let mut t: crate::vine_tombstone::VineTombstonePayload =
             serde_json::from_slice(&signed_tombstone_bytes(&id, "vine-1", "cid-aaa", &addr))

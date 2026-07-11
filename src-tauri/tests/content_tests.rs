@@ -32,3 +32,5 @@ mod vine_content_roundtrip_integration;
 mod vine_feed_cache_integration;
 #[path = "content/vine_feed_persistence_integration.rs"]
 mod vine_feed_persistence_integration;
+#[path = "content/vine_signing_testutil.rs"]
+mod vine_signing_testutil;
