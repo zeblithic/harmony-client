@@ -94,11 +94,21 @@ pub(crate) struct PlannedRevocation {
     pub is_self: bool,
 }
 
+/// Outcome of [`plan_revocation`].
+#[derive(Debug)]
+pub(crate) enum RevocationPlan {
+    /// Target is already revoked. `is_self` lets the caller complete a
+    /// PENDING terminal transition — a prior self-revoke that mutated the
+    /// doc but failed at flush must converge on retry (CodeRabbit PR #452).
+    AlreadyRevoked {
+        is_self: bool,
+    },
+    Planned(Box<PlannedRevocation>),
+}
+
 /// Pure revocation planner: validates the request against a trust-state
 /// snapshot and constructs the signed cert. No I/O, no locks — the whole
 /// guard surface is unit-testable from mint fixtures.
-///
-/// `Ok(None)` = target already revoked (idempotent no-op).
 pub(crate) fn plan_revocation(
     state: &harmony_owner::state::OwnerState,
     device_signing_key: &ed25519_dalek::SigningKey,
@@ -106,7 +116,7 @@ pub(crate) fn plan_revocation(
     device_vk_hex: &str,
     reason_str: &str,
     now: u64,
-) -> Result<Option<PlannedRevocation>, String> {
+) -> Result<RevocationPlan, String> {
     let reason = parse_revoke_reason(reason_str)?;
     let vk_bytes: [u8; 32] = hex::decode(device_vk_hex)
         .map_err(|e| format!("badDeviceVk: {e}"))?
@@ -121,11 +131,11 @@ pub(crate) fn plan_revocation(
         .find(|c| c.device_pubkeys.classical.ed25519_verify == vk_bytes)
         .map(|c| c.device_id)
         .ok_or_else(|| "unknownDevice: no enrollment matches that key".to_string())?;
-    if state.is_revoked(target) {
-        return Ok(None);
-    }
     let self_id = crate::owner_state::device_id_from_signing_key(device_signing_key);
     let is_self = target == self_id;
+    if state.is_revoked(target) {
+        return Ok(RevocationPlan::AlreadyRevoked { is_self });
+    }
     // Last-device guard: the CALLER is demonstrably alive (it is making this
     // call), so revoking a sibling can never leave the account with zero
     // usable devices. Only a self-revoke with no other *active* device can —
@@ -163,7 +173,10 @@ pub(crate) fn plan_revocation(
         drop(artifact);
         cert
     };
-    Ok(Some(PlannedRevocation { cert, is_self }))
+    Ok(RevocationPlan::Planned(Box::new(PlannedRevocation {
+        cert,
+        is_self,
+    })))
 }
 
 /// Build an `OwnerStateView` from a loaded state.
@@ -450,8 +463,32 @@ pub(crate) async fn revoke_device_inner(
         &reason,
         now_unix(),
     )? {
-        Some(p) => p,
-        None => return Ok(()), // already revoked — idempotent
+        RevocationPlan::Planned(p) => p,
+        RevocationPlan::AlreadyRevoked { is_self: false } => return Ok(()), // idempotent
+        RevocationPlan::AlreadyRevoked { is_self: true } => {
+            // The doc already carries our own revocation but the terminal
+            // transition may be PENDING — a prior self-revoke that failed
+            // between mutation and flush would otherwise strand this device
+            // running revoked forever (CodeRabbit PR #452). Idempotent when
+            // terminal already completed (flag latched → plain success).
+            if revoked_flag.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            if let Some(engine) = &trust_engine {
+                engine.flush_now().await.map_err(|e| {
+                    format!("self-revocation staged but not yet published (will retry): {e}")
+                })?;
+            }
+            complete_self_revoke_terminal(
+                &revoked_flag,
+                &emit,
+                owner_sync,
+                fleet_net,
+                trust_engine,
+            )
+            .await;
+            return Ok(());
+        }
     };
     let is_self = planned.is_self;
     let cert = planned.cert;
@@ -467,14 +504,25 @@ pub(crate) async fn revoke_device_inner(
             identity_dir: dir.clone(),
         },
     };
-    crate::owner_trust_sync::mutate_trust_state(access, move |s| s.add_revocation(cert))
-        .await?
-        .map_err(|e| format!("revocation rejected: {e}"))?;
+    // Re-check revoked INSIDE the mutation closure: the planning snapshot is
+    // taken outside the doc lock, so a concurrent revoke of the same target
+    // must degrade to the documented idempotent no-op, atomically with the
+    // insert (CodeRabbit PR #452). The crate's insert is itself a monotonic
+    // earliest-wins merge, so this guard is belt-and-suspenders.
+    crate::owner_trust_sync::mutate_trust_state(access, move |s| {
+        if s.is_revoked(cert.target) {
+            return Ok(());
+        }
+        s.add_revocation(cert)
+    })
+    .await?
+    .map_err(|e| format!("revocation rejected: {e}"))?;
 
     // Durability + propagation. Resident: force the publish+persist now.
     // Sibling revokes tolerate a flush failure (dirty latch retries); a SELF
     // revoke must not reach the terminal state unpublished — no sibling
-    // would ever learn of it.
+    // would ever learn of it. (The retry that converges a failed self flush
+    // is the AlreadyRevoked{is_self} arm above.)
     if let Some(engine) = &trust_engine {
         if let Err(e) = engine.flush_now().await {
             if is_self {
@@ -489,28 +537,45 @@ pub(crate) async fn revoke_device_inner(
     emit("owner-devices-updated");
 
     if is_self {
-        // Terminal state: latch once, tell the UI, then stop fleet engines
-        // (hygiene — enforcement is receiver-side; matches the S1 halt set).
-        if !revoked_flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            emit("device-revoked-self");
-        }
-        if let Some(engine) = owner_sync {
-            if let Err(e) = engine.shutdown().await {
-                tracing::error!(error = %e, "revoke_device: owner-state engine shutdown failed");
-            }
-        }
-        if let Some(engine) = fleet_net {
-            if let Err(e) = engine.shutdown().await {
-                tracing::error!(error = %e, "revoke_device: fleet-net engine shutdown failed");
-            }
-        }
-        if let Some(engine) = trust_engine {
-            if let Err(e) = engine.shutdown().await {
-                tracing::error!(error = %e, "revoke_device: trust engine shutdown failed");
-            }
-        }
+        complete_self_revoke_terminal(&revoked_flag, &emit, owner_sync, fleet_net, trust_engine)
+            .await;
     }
     Ok(())
+}
+
+/// Terminal state for a self-revoked device: latch once, tell the UI, then
+/// stop fleet engines (hygiene — enforcement is receiver-side; matches the
+/// S1 detector's halt set). Every step is idempotent, so the pending-retry
+/// path can re-run it safely.
+async fn complete_self_revoke_terminal(
+    revoked_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    emit: &std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    owner_sync: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    fleet_net: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_net::FleetNetDoc>>,
+    >,
+    trust_engine: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+    >,
+) {
+    if !revoked_flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        emit("device-revoked-self");
+    }
+    if let Some(engine) = owner_sync {
+        if let Err(e) = engine.shutdown().await {
+            tracing::error!(error = %e, "revoke_device: owner-state engine shutdown failed");
+        }
+    }
+    if let Some(engine) = fleet_net {
+        if let Err(e) = engine.shutdown().await {
+            tracing::error!(error = %e, "revoke_device: fleet-net engine shutdown failed");
+        }
+    }
+    if let Some(engine) = trust_engine {
+        if let Err(e) = engine.shutdown().await {
+            tracing::error!(error = %e, "revoke_device: trust engine shutdown failed");
+        }
+    }
 }
 
 /// ZEB-445-style shared IPC/RPC seam for `revoke_device`.
@@ -1381,9 +1446,11 @@ mod revoke_tests {
     fn plan_master_revoke_of_sibling_produces_master_cert() {
         let (state, a_sk, seed, _b_sk, b_vk_hex) = two_device_fixture(1_700_000_000);
         let now = 1_700_000_100u64;
-        let planned = plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now)
-            .expect("plan ok")
-            .expect("some plan");
+        let RevocationPlan::Planned(planned) =
+            plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now).expect("plan ok")
+        else {
+            panic!("expected a planned revocation");
+        };
         assert!(!planned.is_self);
         assert!(matches!(
             planned.cert.issuer,
@@ -1400,7 +1467,7 @@ mod revoke_tests {
     #[test]
     fn plan_self_revoke_produces_self_cert_without_seed() {
         let (state, _a_sk, _seed, b_sk, b_vk_hex) = two_device_fixture(1_700_000_000);
-        let planned = plan_revocation(
+        let RevocationPlan::Planned(planned) = plan_revocation(
             &state,
             &b_sk,
             None,
@@ -1408,8 +1475,9 @@ mod revoke_tests {
             "decommissioned",
             1_700_000_100,
         )
-        .expect("plan ok")
-        .expect("some plan");
+        .expect("plan ok") else {
+            panic!("expected a planned revocation");
+        };
         assert!(planned.is_self);
         assert!(matches!(
             planned.cert.issuer,
@@ -1558,13 +1626,79 @@ mod revoke_tests {
         assert_eq!(got, ["owner-devices-updated", "device-revoked-self"]);
     }
 
+    /// CodeRabbit PR #452: a self-revoke that mutated the doc but failed at
+    /// flush must CONVERGE on retry — the already-revoked path completes the
+    /// pending terminal transition instead of silently succeeding.
+    #[tokio::test]
+    async fn revoke_device_inner_retry_completes_pending_self_terminal() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let (mut state, a_sk, seed, b_sk, _b_vk_hex) = two_device_fixture(now_unix() - 60);
+        // Simulate the stranded state: B's self-revocation is already in the
+        // persisted doc (as if a prior call failed between mutation-persist
+        // and terminal), but the revoked flag was never latched.
+        let RevocationPlan::Planned(planned) = plan_revocation(
+            &state,
+            &b_sk,
+            None,
+            &hex::encode(b_sk.verifying_key().to_bytes()),
+            "decommissioned",
+            now_unix() - 30,
+        )
+        .unwrap() else {
+            panic!("expected a planned revocation");
+        };
+        state.add_revocation(planned.cert).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        save_owner_state_atomic(dir.path(), &state, &b_sk, None, None).expect("persist identity");
+        let _ = (a_sk, seed);
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            ..crate::NodeState::default()
+        });
+        let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let ev = events.clone();
+        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+            std::sync::Arc::new(move |name: &str| ev.lock().unwrap().push(name.to_string()));
+
+        // Retry: already revoked on disk, flag unlatched -> terminal completes.
+        revoke_device_inner(
+            &node,
+            || None,
+            emit.clone(),
+            hex::encode(b_sk.verifying_key().to_bytes()),
+            "decommissioned".into(),
+        )
+        .await
+        .expect("retry ok");
+        assert!(node
+            .lock()
+            .unwrap()
+            .owner_trust_revoked_self
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(events.lock().unwrap().as_slice(), ["device-revoked-self"]);
+
+        // Second retry after terminal completed: plain idempotent success.
+        revoke_device_inner(
+            &node,
+            || None,
+            emit,
+            hex::encode(b_sk.verifying_key().to_bytes()),
+            "decommissioned".into(),
+        )
+        .await
+        .expect("idempotent ok");
+        assert_eq!(events.lock().unwrap().len(), 1, "no duplicate emission");
+    }
+
     #[test]
     fn view_marks_revoked_device_with_reason_and_date() {
         let (mut state, a_sk, seed, _b, b_vk_hex) = two_device_fixture(1_700_000_000);
         let now = 1_700_000_100u64;
-        let planned = plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now)
-            .unwrap()
-            .unwrap();
+        let RevocationPlan::Planned(planned) =
+            plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now).unwrap()
+        else {
+            panic!("expected a planned revocation");
+        };
         let target = planned.cert.target;
         state.add_revocation(planned.cert).unwrap();
         let loaded = LoadedOwnerState {
@@ -1596,12 +1730,17 @@ mod revoke_tests {
     fn plan_already_revoked_target_is_noop() {
         let (mut state, a_sk, seed, _b, b_vk_hex) = two_device_fixture(1_700_000_000);
         let now = 1_700_000_100u64;
-        let planned = plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now)
-            .unwrap()
-            .unwrap();
+        let RevocationPlan::Planned(planned) =
+            plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now).unwrap()
+        else {
+            panic!("expected a planned revocation");
+        };
         state.add_revocation(planned.cert).unwrap();
         let second =
             plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now + 1).unwrap();
-        assert!(second.is_none(), "idempotent no-op");
+        assert!(
+            matches!(second, RevocationPlan::AlreadyRevoked { is_self: false }),
+            "idempotent no-op: {second:?}"
+        );
     }
 }

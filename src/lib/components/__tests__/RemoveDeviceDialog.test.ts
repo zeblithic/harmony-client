@@ -68,6 +68,15 @@ describe('RemoveDeviceDialog (ZEB-668 S2)', () => {
     expect(screen.getByRole('button', { name: /remove device/i })).toBeDisabled();
   });
 
+  it('gates Cancel behind busy (mid-flight close would strand the next confirm)', async () => {
+    const p = props({ busy: true });
+    render(RemoveDeviceDialog, { props: p });
+    const cancel = screen.getByRole('button', { name: /cancel/i });
+    expect(cancel).toBeDisabled();
+    await fireEvent.click(cancel);
+    expect(p.onCancel).not.toHaveBeenCalled();
+  });
+
   it('cancel invokes onCancel', async () => {
     const p = props();
     render(RemoveDeviceDialog, { props: p });

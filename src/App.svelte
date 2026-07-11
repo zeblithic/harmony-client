@@ -2448,9 +2448,20 @@
       // or a sibling's revocation replicated in via the trust engine) drops the
       // app into the terminal "removed" state. Boot-time revocation is handled
       // by classifyOwnerIdentity (StartNodeResponse.selfRevoked) — this event
-      // covers the live transition.
+      // covers the live transition. Local media is client-owned (the backend
+      // only stops its own engines), so mirror the quit-requested teardown:
+      // a revoked device must not keep holding the mic or an active call
+      // (CodeRabbit PR #452).
       const unlistenRevokedSelf = await listen('device-revoked-self', () => {
         ownerIdentityState = 'revoked';
+        void voiceSession?.leave().catch(() => {});
+        void callSession?.end().catch(() => {});
+        if (groupCall) {
+          const gp = get(groupCall.state).phase;
+          if (gp !== 'idle' && gp !== 'incoming') {
+            void groupCall.leave().catch(() => {});
+          }
+        }
       });
       fileManagerService.addUnlisten(unlistenRevokedSelf);
 

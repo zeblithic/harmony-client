@@ -1987,9 +1987,11 @@ mod tests {
                 fingerprint: "3e2f·7a91".into(),
                 butler_pinned: false,
                 device_vk_hex: "cc".repeat(32),
-                revoked: false,
-                revoked_at: None,
-                revoked_reason: None,
+                // ZEB-668 S2: non-default values so a serde-rename regression
+                // on the revocation trio cannot pass unnoticed.
+                revoked: true,
+                revoked_at: Some(1_700_000_100),
+                revoked_reason: Some("lost".into()),
             }],
             can_back_up: true,
         };
@@ -2011,6 +2013,19 @@ mod tests {
         assert!(
             json.contains("\"deviceVkHex\""),
             "expected deviceVkHex, got {json}"
+        );
+        // ZEB-668 S2 revocation trio, pinned with the non-default values above.
+        assert!(
+            json.contains("\"revoked\":true"),
+            "expected revoked:true, got {json}"
+        );
+        assert!(
+            json.contains("\"revokedAt\":1700000100"),
+            "expected revokedAt, got {json}"
+        );
+        assert!(
+            json.contains("\"revokedReason\":\"lost\""),
+            "expected revokedReason, got {json}"
         );
         assert!(
             !json.contains("owner_id"),

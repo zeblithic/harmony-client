@@ -1035,3 +1035,17 @@ Open the PR (body: what/why, S1-boot-trap fix called out, honesty-ledger copy de
 - **Spec coverage:** §3 IPC (T1+T3), issuer selection + `notMaster:` (T1), `lastDevice:` guard (T1), self-revoke ordering incl. flush + halt (T3), retire-announce queue hand-off — S3's slice, explicitly NOT here (spec assigns it to the retire-announce slice); DevicesPanel affordances + honesty gating (T5), TypeToConfirmDialog-style typed confirm + reason picker (T5 — sibling component since the donor has no content slot; deviation documented), Removed section from real RevocationSet data (T2+T5), DeviceView additions (T2), terminal state (T6) + the S1 boot-trap fix via `selfRevoked` (T3+T4; not in spec text — discovered during planning, spec's terminal-state intent requires it).
 - **Placeholder scan:** clean — every code step carries real code; the two "mirror the working call / copy it exactly" notes point at specific existing lines, not unwritten designs.
 - **Type consistency:** `RevokeReason` string union == backend `parse_revoke_reason` wire values; `revoked`/`revokedAt`/`revokedReason` camelCase == serde rename; `revoke_device` args `deviceVkHex`/`reason` == snake_case params.
+
+---
+
+## Execution amendments (PR #452 round 1)
+
+The code blocks above are the plan as written; the following review-driven deltas are the as-merged reality (CodeRabbit + Qodo, round 1):
+
+1. **Formatting-gate wording:** per-task Step gates run `cargo fmt --all` (auto-format while iterating); the *verification* form `cargo fmt --all -- --check` is the final-sweep/CI gate, as the Global Constraints state. The per-task lines are formatters, not checks — deliberate.
+2. **`plan_revocation` returns `RevocationPlan`** (`AlreadyRevoked { is_self } | Planned(Box<PlannedRevocation>)`, boxed per clippy `large_enum_variant`) instead of `Option<PlannedRevocation>`: the already-revoked path must expose `is_self` so a retry after a failed self-revoke flush can **complete the pending terminal transition** (flush → latch → `device-revoked-self` → engine shutdowns, all idempotent; plain success once the flag is latched). Pinned by `revoke_device_inner_retry_completes_pending_self_terminal`.
+3. **Idempotency is atomic with the mutation:** the `mutate_trust_state` closure re-checks `s.is_revoked(cert.target)` before `add_revocation` — the planning snapshot is taken outside the doc lock. (The crate's `RevocationSet::insert` is itself a monotonic earliest-wins merge, so this is belt-and-suspenders.)
+4. **Dialog copy:** severed vs not-severed surfaces named distinctly ("posting in your communities, syncing with your other devices, and message deposits and relay" vs "direct messages and vine feeds are separate surfaces and are not blocked yet"); "Afterward" (US). Cancel (button + Modal dismiss) is gated on `busy` — closing mid-flight strands the shared in-flight guard and silently drops the next confirm.
+5. **`device-revoked-self` listener in App.svelte also tears down local media** (voice/call/group-call, mirroring the quit-requested handler) — the backend stops its engines, but the mic and WebRTC sessions are client-owned.
+6. **Additional tests:** `revoke_device_rpc_is_registered_and_wired` (dispatch parity, tempdir-pinned identity dir), non-default revocation values asserted in `owner_state.rs` wire test, dialog cancel-gating test.
+7. **`toSorted()` → `.filter().sort()`** (ES2023 unavailable on older system WebViews).

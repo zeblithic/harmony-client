@@ -225,9 +225,11 @@
   // data — honesty rule).
   const activeDevices = $derived((state?.devices ?? []).filter((d) => !d.revoked));
   const removedDevices = $derived(
+    // .filter() already yields a fresh array, so in-place .sort() is safe —
+    // and unlike ES2023 .toSorted(), it works on older system WebViews.
     (state?.devices ?? [])
       .filter((d) => d.revoked)
-      .toSorted((a, b) => (b.revokedAt ?? 0) - (a.revokedAt ?? 0)),
+      .sort((a, b) => (b.revokedAt ?? 0) - (a.revokedAt ?? 0)),
   );
   let removedOpen = $state(false);
   let removeTarget = $state<DeviceView | null>(null);
@@ -257,7 +259,10 @@
   onMount(() => {
     let cancelled = false;
     listen('owner-devices-updated', () => {
-      void svc.refresh();
+      svc.refresh().catch(() => {
+        // Live refresh is best-effort; a stale roster self-heals on the
+        // next event or panel open.
+      });
     })
       .then((unlisten) => {
         if (cancelled) {

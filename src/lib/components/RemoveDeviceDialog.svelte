@@ -48,20 +48,26 @@
   });
 </script>
 
-<Modal onCancel={onCancel} ariaLabelledby={titleId}>
+<Modal
+  onCancel={() => {
+    if (!busy) onCancel();
+  }}
+  ariaLabelledby={titleId}
+>
   <h2 class="dialog-title" id={titleId}>
     {isSelf ? 'Remove this device?' : `Remove ${deviceName}?`}
   </h2>
   <p class="dialog-message">
-    Removing this device cuts it off from posting in your communities, fleet sync between your
+    Removing this device cuts it off from posting in your communities, syncing with your other
     devices, and message deposits and relay.
   </p>
   <p class="dialog-message honesty">
-    Existing direct-message and feed publishing from that device is not blocked yet.
+    Its direct messages and vine feeds are separate surfaces and are not blocked yet — those
+    cutoffs land in follow-up work.
   </p>
   {#if isSelf && isSeedHolder}
     <p class="dialog-message warning">
-      This device holds your master key. Afterwards you will need your recovery phrase to manage
+      This device holds your master key. Afterward you will need your recovery phrase to manage
       devices.
     </p>
   {/if}
@@ -88,7 +94,18 @@
   {/if}
 
   <div class="dialog-actions">
-    <button class="cancel-btn" onclick={onCancel}>Cancel</button>
+    <!-- Cancel is gated on busy too: closing mid-flight resets removeTarget
+         while the shared in-flight flag still blocks the next confirm — the
+         user's next attempt would be silently dropped (CodeRabbit PR #452). -->
+    <button
+      class="cancel-btn"
+      disabled={busy}
+      onclick={() => {
+        if (!busy) onCancel();
+      }}
+    >
+      Cancel
+    </button>
     <button
       class="confirm-btn destructive"
       disabled={!matches || busy}
