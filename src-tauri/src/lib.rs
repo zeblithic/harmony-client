@@ -3589,9 +3589,10 @@ pub async fn start_node_inner(
         // The identity stays on disk; the Devices panel renders the removed
         // state from the file path, and the revoked-self latch tells the UI.
         let self_revoked_at_boot = owner_loaded.as_ref().is_some_and(|l| {
-            l.state.is_revoked(crate::owner_state::device_id_from_signing_key(
-                &l.device_signing_key,
-            ))
+            l.state
+                .is_revoked(crate::owner_state::device_id_from_signing_key(
+                    &l.device_signing_key,
+                ))
         });
         if self_revoked_at_boot {
             tracing::warn!(
@@ -5377,8 +5378,8 @@ pub async fn start_node_inner(
                     // stays owner_state.cbor, written through TrustPersist on
                     // every debounced engine pass. Mirrors the fleet-net
                     // block above.
-                    let trust_replay_path = identity_dir
-                        .join(crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME);
+                    let trust_replay_path =
+                        identity_dir.join(crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME);
                     let owner_trust_doc =
                         std::sync::Arc::new(tokio::sync::Mutex::new(loaded.state.clone()));
                     let owner_trust_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(

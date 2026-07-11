@@ -304,8 +304,8 @@ mod tests {
     ) -> (SigningKey, harmony_owner::certs::EnrollmentCert) {
         let sk = SigningKey::generate(&mut rand::rngs::OsRng);
         let pkb = PubKeyBundle::classical_only(sk.verifying_key().to_bytes());
-        let res = enroll_via_master(state, artifact, &sk, pkb, now, DEFAULT_ACTIVE_WINDOW_SECS)
-            .unwrap();
+        let res =
+            enroll_via_master(state, artifact, &sk, pkb, now, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
         (sk, res.enrollment_cert)
     }
 
@@ -558,8 +558,9 @@ mod tests {
         })
     }
 
-    fn collecting_emit(events: Arc<std::sync::Mutex<Vec<String>>>) -> Arc<dyn Fn(&str) + Send + Sync>
-    {
+    fn collecting_emit(
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Arc<dyn Fn(&str) + Send + Sync> {
         Arc::new(move |name: &str| events.lock().unwrap().push(name.to_string()))
     }
 
