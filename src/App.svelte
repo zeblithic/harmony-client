@@ -3865,6 +3865,7 @@
         onPin={handleFilePin}
         onUnpin={handleFileUnpin}
         onExport={handleFileExport}
+        onSetBackup={(sidecarId, backup) => fileManagerService.setBackupFlag(sidecarId, backup)}
       />
     {:else}
       <div class="file-detail-empty">

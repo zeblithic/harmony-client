@@ -160,4 +160,67 @@ describe('FileDetailPanel', () => {
     await fireEvent.click(confirmBtn);
     expect(onBurn).toHaveBeenCalledOnce();
   });
+
+  // ── ZEB-669 S3: "Back up with buddies" toggle ─────────────────────────
+
+  it('backup section renders only when onSetBackup is provided AND the row has a sidecar', () => {
+    const { unmount } = renderPanel({}, { onSetBackup: vi.fn() });
+    expect(screen.getByTestId('backup-section')).toBeTruthy();
+    unmount();
+    // Manifest-derived rows (empty sidecarId) have no sidecar to flag.
+    const { unmount: u2 } = renderPanel({ sidecarId: '' }, { onSetBackup: vi.fn() });
+    expect(screen.queryByTestId('backup-section')).toBeNull();
+    u2();
+    // No handler (e.g. bare construction) → section hidden.
+    renderPanel();
+    expect(screen.queryByTestId('backup-section')).toBeNull();
+  });
+
+  it('disables the toggle with reason copy for non-public files', () => {
+    renderPanel({ sensitivity: 'private' }, { onSetBackup: vi.fn() });
+    const box = screen.getByTestId('backup-checkbox') as HTMLInputElement;
+    expect(box.disabled).toBe(true);
+    expect(screen.getByText('Only public files can be backed up by buddies.')).toBeTruthy();
+  });
+
+  it('enables the toggle for public files and calls onSetBackup', async () => {
+    const onSetBackup = vi.fn().mockResolvedValue(undefined);
+    renderPanel({ sensitivity: 'public' }, { onSetBackup });
+    const box = screen.getByTestId('backup-checkbox') as HTMLInputElement;
+    expect(box.disabled).toBe(false);
+    await fireEvent.click(box);
+    expect(onSetBackup).toHaveBeenCalledWith(mockDetail.sidecarId, true);
+  });
+
+  it('clearing stays allowed when an already-flagged file is no longer eligible', () => {
+    renderPanel({ sensitivity: 'private', backup: true }, { onSetBackup: vi.fn() });
+    const box = screen.getByTestId('backup-checkbox') as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    expect(box.disabled).toBe(false);
+    expect(screen.queryByText('Only public files can be backed up by buddies.')).toBeNull();
+  });
+
+  it('renders the ineligible rejection inline and reverts the checkbox', async () => {
+    const onSetBackup = vi
+      .fn()
+      .mockRejectedValue(new Error('ineligible: content class is not public durable'));
+    renderPanel({ sensitivity: 'public' }, { onSetBackup });
+    const box = screen.getByTestId('backup-checkbox') as HTMLInputElement;
+    await fireEvent.click(box);
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Not eligible: content class is not public durable');
+    expect(box.checked).toBe(false);
+  });
+
+  // ── ZEB-669 S4: "From" (origin) row ───────────────────────────────────
+
+  it('renders no From row when origin is absent (legacy/manifest rows)', () => {
+    renderPanel();
+    expect(screen.queryByTestId('from-row')).toBeNull();
+  });
+
+  it('renders "Added by you" for self-ingested entries', () => {
+    renderPanel({ origin: { kind: 'selfIngest', introducer: null } });
+    expect(screen.getByTestId('from-row').textContent).toContain('Added by you');
+  });
 });
