@@ -433,6 +433,10 @@ export const vineVideos: VineVideo[] = [
     videoCid: 'cid-video-alice-01',
     title: 'Transport layer demo',
     viewed: false,
+    // ZEB-671: mock Discover provenance so dev mode exercises the
+    // degree chips + via lines + Tune sheet (graph-only Discover).
+    degree: 2,
+    via: ['e5f6g7h8'],
   },
   {
     id: 'vine-02',
@@ -442,6 +446,8 @@ export const vineVideos: VineVideo[] = [
     videoCid: 'cid-video-bob-01',
     title: 'Mesh routing in action',
     viewed: true,
+    degree: 2,
+    via: ['i9j0k1l2'],
   },
   {
     id: 'vine-03',
@@ -450,6 +456,8 @@ export const vineVideos: VineVideo[] = [
     createdAt: vineBase + 300,
     videoCid: 'cid-video-carol-01',
     viewed: false,
+    degree: 3,
+    via: ['e5f6g7h8', 'a1b2c3d4'],
   },
   {
     id: 'vine-04',
@@ -460,6 +468,8 @@ export const vineVideos: VineVideo[] = [
     title: 'Cache hit rates explained',
     reshareOf: 'vine-02',
     viewed: false,
+    degree: 2,
+    via: ['e5f6g7h8'],
   },
   {
     id: 'vine-05',
@@ -469,6 +479,8 @@ export const vineVideos: VineVideo[] = [
     videoCid: 'cid-video-dave-01',
     title: 'Zenoh key expressions tutorial',
     viewed: true,
+    // Deliberately NO degree/via: exercises the graph-only Discover
+    // filter (unconnected creators don't render) in dev mode (ZEB-671).
   },
 ];
 

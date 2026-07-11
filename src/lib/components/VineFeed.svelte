@@ -29,6 +29,8 @@
     playTarget = null,
     onPlayTargetConsumed,
     ownAddress,
+    getShareFollows,
+    onSetShareFollows,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -59,9 +61,52 @@
     onPlayTargetConsumed?: () => void;
     /** Local node's hex address — own-original reshare suppression (FIX 2, PR #120). */
     ownAddress?: string;
+    /** ZEB-671: read the backend share_follows setting (Tune sheet). */
+    getShareFollows?: () => Promise<boolean>;
+    /** ZEB-671: flip the backend share_follows setting (Tune sheet). */
+    onSetShareFollows?: (on: boolean) => Promise<void>;
   } = $props();
 
   let feedFilter = $state<FeedFilter>('all');
+
+  // ── ZEB-671: Tune prefs (frontend-local; the graph itself is backend) ──
+  const TUNE_KEY = 'harmony.vines.tune.v1';
+  function loadTunePrefs(): { deg2: boolean; deg3: boolean; muted: string[] } {
+    try {
+      const raw = localStorage.getItem(TUNE_KEY);
+      if (raw) {
+        const p = JSON.parse(raw) as { deg2?: boolean; deg3?: boolean; muted?: string[] };
+        return { deg2: p.deg2 !== false, deg3: p.deg3 !== false, muted: p.muted ?? [] };
+      }
+    } catch {
+      // Missing/corrupt storage → defaults.
+    }
+    return { deg2: true, deg3: true, muted: [] };
+  }
+  const tuneInit = loadTunePrefs();
+  /** Show 2nd-degree vines (someone your follow follows). */
+  let deg2 = $state(tuneInit.deg2);
+  /** Show 3rd-degree vines (a follow-of-a-follow-of-a-follow). */
+  let deg3 = $state(tuneInit.deg3);
+  /** Follow roots whose Discover influence is muted (via[0] addresses). */
+  let muted = $state(new Set<string>(tuneInit.muted));
+  let tuneOpen = $state(false);
+  /** Backend share_follows state, loaded when the Tune sheet opens. */
+  let shareFollows = $state(true);
+  let shareFollowsBusy = $state(false);
+  let shareFollowsError = $state('');
+
+  function saveTunePrefs() {
+    try {
+      localStorage.setItem(
+        TUNE_KEY,
+        JSON.stringify({ deg2, deg3, muted: [...muted] }),
+      );
+    } catch {
+      // Storage unavailable — prefs stay session-local.
+    }
+  }
+
   let playingId = $state<string | null>(null);
   /**
    * Card kept visible under the Unviewed filter even after becoming viewed —
@@ -88,8 +133,20 @@
   /** cids with an in-flight resolveVideo call (non-reactive bookkeeping). */
   const pendingCids = new Set<string>();
 
+  // ZEB-671: Discover is graph-only — a vine renders only when its
+  // creator has a transitive-follow degree (2° or 3°), honoring the Tune
+  // toggles and muted roots. Own offline-fallback publishes
+  // (creatorAddress 'self') stay visible: they are not discovery.
+  let discoverGraphVines = $derived(
+    discoverVines.filter(v =>
+      v.creatorAddress === 'self'
+      || (((v.degree === 2 && deg2) || (v.degree === 3 && deg3))
+        && !(v.via?.[0] != null && muted.has(v.via[0])))
+    )
+  );
+
   let activeVines = $derived(
-    activeTab === 'following' ? followedVines : discoverVines
+    activeTab === 'following' ? followedVines : discoverGraphVines
   );
 
   let sortedVines = $derived(
@@ -129,6 +186,83 @@
     }
     return map;
   });
+
+  // ZEB-671: addr → display name for provenance lines. Descriptor
+  // creator names are the same source every card already renders;
+  // unknown addresses fall back to a truncated hex.
+  let nameByAddr = $derived.by(() => {
+    const m = new Map<string, string>();
+    for (const v of [...followedVines, ...discoverVines]) {
+      if (!m.has(v.creatorAddress)) m.set(v.creatorAddress, v.creatorName);
+    }
+    return m;
+  });
+
+  function nameOf(addr: string): string {
+    return nameByAddr.get(addr) ?? `${addr.slice(0, 8)}…`;
+  }
+
+  function degreeLabelOf(v: VineVideo): string | null {
+    return v.degree === 2 ? '2nd' : v.degree === 3 ? '3rd' : null;
+  }
+
+  /** "Devin follows @ravi" (2°) / "Devin → @ravi → @ada" (3°). */
+  function viaLabelOf(v: VineVideo): string | null {
+    const via = v.via;
+    if (!via || via.length === 0) return null;
+    if (v.degree === 2) return `${nameOf(via[0])} follows @${v.creatorName}`;
+    if (v.degree === 3 && via.length >= 2) {
+      return `${nameOf(via[0])} → @${nameOf(via[1])} → @${v.creatorName}`;
+    }
+    return null;
+  }
+
+  /** Unique provenance roots across the UNFILTERED discover pool — muted
+   *  roots must stay listed so they can be unmuted. */
+  let muteRoots = $derived.by(() => {
+    const set = new Set<string>();
+    for (const v of discoverVines) {
+      if (v.via?.[0] != null) set.add(v.via[0]);
+    }
+    return [...set].sort();
+  });
+
+  function toggleMute(root: string) {
+    const next = new Set(muted);
+    if (next.has(root)) next.delete(root);
+    else next.add(root);
+    muted = next;
+    saveTunePrefs();
+  }
+
+  async function openTune() {
+    tuneOpen = true;
+    shareFollowsError = '';
+    if (getShareFollows) {
+      try {
+        shareFollows = await getShareFollows();
+      } catch (e: unknown) {
+        shareFollowsError = e instanceof Error ? e.message : String(e);
+      }
+    }
+  }
+
+  async function handleShareFollowsToggle(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const want = input.checked;
+    if (!onSetShareFollows) return;
+    shareFollowsBusy = true;
+    try {
+      await onSetShareFollows(want);
+      shareFollows = want;
+      shareFollowsError = '';
+    } catch (err: unknown) {
+      shareFollowsError = err instanceof Error ? err.message : String(err);
+      input.checked = shareFollows;
+    } finally {
+      shareFollowsBusy = false;
+    }
+  }
 
   // ── Center-detection autoplay ───────────────────────────────────────
 
@@ -381,6 +515,11 @@
         Unviewed{#if unviewedCount > 0}&nbsp;({unviewedCount}){/if}
       </button>
     </div>
+  {:else}
+    <div class="filter-bar">
+      <span class="discover-hint">Your follow graph, 2°–3° — no algorithm.</span>
+      <button type="button" class="tune-btn" data-testid="tune-btn" onclick={openTune}>⚙ Tune</button>
+    </div>
   {/if}
 
   {#if reshareError}
@@ -401,7 +540,9 @@
             Follow creators to build your feed. Check out the Discover tab to find people to follow.
           {/if}
         {:else}
-          No vines on the network yet.
+          Nothing in your extended follow graph yet. Discover surfaces
+          vines from people your follows follow (2nd and 3rd degree) —
+          no algorithm, just your social graph.
         {/if}
       </p>
       {#if onPublish && !allCaughtUp}
@@ -445,12 +586,63 @@
             deleting={deletingId === vine.id}
             onDelete={requestDelete}
             {onViewOriginal}
+            degreeLabel={activeTab === 'discover' ? degreeLabelOf(vine) : null}
+            viaLabel={activeTab === 'discover' ? viaLabelOf(vine) : null}
           />
         </div>
       {/each}
     </div>
   {/if}
 </div>
+
+{#if tuneOpen}
+  <div
+    class="tune-overlay"
+    role="presentation"
+    onclick={(e) => { if (e.target === e.currentTarget) tuneOpen = false; }}
+  >
+    <div class="tune-sheet" role="dialog" aria-label="Tune your Discover">
+      <h3 class="tune-title">Tune your Discover</h3>
+      <p class="tune-copy">Degree follows — no algorithm, just your social graph.</p>
+      <label class="tune-row">
+        <input type="checkbox" bind:checked={deg2} onchange={saveTunePrefs} />
+        <span>2nd degree — someone your follow follows</span>
+      </label>
+      <label class="tune-row">
+        <input type="checkbox" bind:checked={deg3} onchange={saveTunePrefs} />
+        <span>3rd degree — a follow-of-a-follow-of-a-follow</span>
+      </label>
+      {#if muteRoots.length > 0}
+        <p class="tune-subhead">Mute a follow's influence</p>
+        {#each muteRoots as root (root)}
+          <label class="tune-row">
+            <input type="checkbox" checked={!muted.has(root)} onchange={() => toggleMute(root)} />
+            <span>via {nameOf(root)}</span>
+          </label>
+        {/each}
+      {/if}
+      {#if getShareFollows && onSetShareFollows}
+        <div class="tune-divider" role="separator"></div>
+        <label class="tune-row">
+          <input
+            type="checkbox"
+            checked={shareFollows}
+            disabled={shareFollowsBusy}
+            onchange={handleShareFollowsToggle}
+            data-testid="share-follows-toggle"
+          />
+          <span>Share my follows — powers your friends' Discover the same way</span>
+        </label>
+        {#if shareFollowsError}
+          <p class="tune-error" role="alert">{shareFollowsError}</p>
+        {/if}
+      {/if}
+      <button type="button" class="tune-done" onclick={() => { tuneOpen = false; }}>
+        Done · {discoverGraphVines.length} {discoverGraphVines.length === 1 ? 'vine' : 'vines'} in Discover
+      </button>
+    </div>
+  </div>
+{/if}
 
 {#if reshareTarget}
   <ReshareConfirmDialog
@@ -651,5 +843,111 @@
     height: 100%;
     scroll-snap-align: start;
     scroll-snap-stop: always;
+  }
+
+  /* ── ZEB-671: Discover Tune ─────────────────────────────────────── */
+
+  .discover-hint {
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    align-self: center;
+  }
+
+  .tune-btn {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .tune-btn:hover {
+    border-color: var(--accent);
+  }
+
+  .tune-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    z-index: 30;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+  }
+
+  .tune-sheet {
+    background: var(--bg-primary);
+    border-radius: 12px 12px 0 0;
+    padding: 20px 20px 16px;
+    width: min(420px, 100%);
+    max-height: 70vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .tune-title {
+    margin: 0;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+  }
+
+  .tune-copy {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+  }
+
+  .tune-subhead {
+    margin: 6px 0 0;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+  }
+
+  .tune-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.8rem;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .tune-divider {
+    border-top: 1px solid var(--border);
+    margin: 6px 0 0;
+  }
+
+  .tune-error {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--gov-clay-deep);
+  }
+
+  .tune-done {
+    margin-top: 8px;
+    padding: 11px;
+    border: none;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--on-accent);
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .tune-done:hover {
+    opacity: 0.85;
   }
 </style>

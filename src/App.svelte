@@ -3772,6 +3772,13 @@
       onPlayTargetConsumed={() => { viewOriginalTarget = null; }}
       resolveVideo={resolveVideoFn}
       ownAddress={myAddress || undefined}
+      getShareFollows={tauriAdapter ? async () => {
+        const s = await tauriAdapter!.invoke('get_vine_settings', {}) as { shareFollows: boolean };
+        return s.shareFollows;
+      } : undefined}
+      onSetShareFollows={tauriAdapter ? async (on: boolean) => {
+        await tauriAdapter!.invoke('set_vine_settings', { shareFollows: on });
+      } : undefined}
     />
     {#if showVinePublish}
       <VinePublishDialog onPublish={handleVinePublish} onPickVideo={isTauri() ? handlePickVineVideo : undefined} resolveVideo={resolveVideoFn} onClose={() => showVinePublish = false} />

@@ -24,6 +24,10 @@ export interface VineDescriptorEvent {
   viewed?: boolean;
   /** See VineVideo.originalRemoved (ZEB-670). */
   originalRemoved?: boolean;
+  /** See VineVideo.degree (ZEB-671). */
+  degree?: number;
+  /** See VineVideo.via (ZEB-671). */
+  via?: string[];
 }
 
 /** Wire format for the `vine-removed` event (ZEB-670 tombstone applied). */
@@ -195,6 +199,19 @@ export class VineService {
           // (covers both our own delete's loopback echo and remote
           // deletes — one path, mirroring vine-received).
           this.applyRemoval(event.payload as VineRemovedEvent);
+        },
+      ));
+
+      localUnlisteners.push(await adapter.listen(
+        'vine-graph-updated',
+        () => {
+          // ZEB-671: the backend's Discover reach map changed (a peer's
+          // follow list arrived). Refetch rows to pick up new
+          // degree/via annotations; errors are non-fatal (the next
+          // update retries).
+          void this.refreshGraphAnnotations().catch((err: unknown) => {
+            console.warn('vine graph refresh failed:', err instanceof Error ? err.message : String(err));
+          });
         },
       ));
     } catch (err) {
@@ -410,6 +427,10 @@ export class VineService {
       this.followedVines = [...this.followedVines, ...toMove];
     }
     this.onChange?.();
+    // ZEB-671: the degree-1 set changed — the backend recomputed reach
+    // synchronously during the IPC, so a refetch picks up new degrees.
+    // No backend event fires for locally-initiated changes.
+    void this.refreshGraphAnnotations().catch(() => {});
   }
 
   async unfollow(address: string): Promise<void> {
@@ -423,6 +444,8 @@ export class VineService {
       this.discoverVines = [...toMove, ...this.discoverVines];
     }
     this.onChange?.();
+    // ZEB-671: see follow() — refetch degree/via after the graph change.
+    void this.refreshGraphAnnotations().catch(() => {});
   }
 
   async loadFollowed(): Promise<void> {
@@ -665,6 +688,36 @@ export class VineService {
   }
 
   /** Convert wire format to frontend VineVideo type. */
+  /**
+   * ZEB-671: re-pull `list_vine_videos` and patch `degree`/`via` onto
+   * entries already in the feed (the graph changed; rows themselves are
+   * the same). New never-seen rows are NOT added here — arrival stays
+   * `vine-received`/`hydrate()`'s job; this only refreshes annotations.
+   */
+  async refreshGraphAnnotations(): Promise<void> {
+    if (!this.adapter) return;
+    const rows = (await this.adapter.invoke('list_vine_videos', {})) as VineDescriptorEvent[];
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const sameVia = (a?: string[], b?: string[]) =>
+      (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === (b ?? [])[i]);
+    let changed = false;
+    const patch = (arr: VineVideo[]): VineVideo[] =>
+      arr.map((v) => {
+        const row = byId.get(v.id);
+        if (!row) return v;
+        if (row.degree === v.degree && sameVia(row.via, v.via)) return v;
+        changed = true;
+        return { ...v, degree: row.degree, via: row.via };
+      });
+    const followed = patch(this.followedVines);
+    const discover = patch(this.discoverVines);
+    if (changed) {
+      this.followedVines = followed;
+      this.discoverVines = discover;
+      this.onChange?.();
+    }
+  }
+
   private wireToVine(wire: VineDescriptorEvent): VineVideo {
     // Self-published vines echo back via Zenoh — map to 'self'/ownDisplayName.
     const isSelf = this.ownAddress != null && wire.creatorAddress === this.ownAddress;
@@ -683,6 +736,8 @@ export class VineService {
       originalCreatorName: wire.originalCreatorName,
       viewed: wire.viewed === true || isSelf,
       originalRemoved: wire.originalRemoved === true,
+      degree: wire.degree,
+      via: wire.via,
     };
   }
 

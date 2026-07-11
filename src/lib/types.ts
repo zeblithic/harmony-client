@@ -165,6 +165,18 @@ export interface VineVideo {
    * no playback, no like/reshare.
    */
   originalRemoved?: boolean;
+  /**
+   * ZEB-671: transitive-follow graph distance (2 or 3) when the creator
+   * is reachable through published follow lists. Undefined for followed
+   * creators and unreachable ones — Discover renders only vines with a
+   * degree ("no algorithm, just your social graph").
+   */
+  degree?: number;
+  /**
+   * ZEB-671: the follow chain that reached the creator — `via[0]` is one
+   * of the viewer's own follows; the creator is not included.
+   */
+  via?: string[];
 }
 
 export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook' | 'mail' | 'mint' | 'network';

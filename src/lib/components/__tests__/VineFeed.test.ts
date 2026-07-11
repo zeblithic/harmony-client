@@ -197,6 +197,8 @@ describe('VineFeed', () => {
     const discoverVines: VineVideo[] = [{
       id: 'dv-01', creatorAddress: 'xyz', creatorName: 'Dave',
       createdAt: 1700000300, videoCid: 'cid-d', title: 'Discover vine', viewed: false,
+      // ZEB-671: Discover is graph-only — a vine renders only with a degree.
+      degree: 2, via: ['root-1'],
     }];
     render(VineFeed, { props: {
       followedVines: [], discoverVines, viewedIds: new Set(),
@@ -227,6 +229,7 @@ describe('VineFeed', () => {
     const discoverVines: VineVideo[] = [{
       id: 'fb-01', creatorAddress: 'xyz', creatorName: 'Eve',
       createdAt: 1700000300, videoCid: 'cid-e', title: 'Eve vine', viewed: false,
+      degree: 2, via: ['root-1'],
     }];
     render(VineFeed, { props: {
       followedVines: [], discoverVines, viewedIds: new Set(),
@@ -284,6 +287,7 @@ describe('VineFeed', () => {
       createdAt: 1700001000,
       videoCid: 'cid-orig',
       viewed: false,
+      degree: 2, via: ['root-1'],
     };
     const reshare = (suffix: string, reshareOf: string): VineVideo => ({
       id: `r-${suffix}`,
@@ -293,6 +297,8 @@ describe('VineFeed', () => {
       videoCid: `cid-${suffix}`,
       reshareOf,
       viewed: false,
+      // ZEB-671: Discover renders graph-reachable creators only.
+      degree: 2, via: ['root-1'],
     });
     render(VineFeed, { props: {
       followedVines: [reshare('a', 'vine-orig'), reshare('b', 'vine-orig')],
@@ -316,6 +322,8 @@ describe('VineFeed', () => {
       reshareOf: 'orig-1',
       originalCreatorName: 'OrigName',
       viewed: false,
+      // ZEB-671: Discover renders graph-reachable creators only.
+      degree: 2, via: ['root-1'],
     };
     render(VineFeed, { props: {
       followedVines: [],
@@ -588,5 +596,128 @@ describe('feed-level delete (ZEB-670 creator tombstone)', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Delete vine' }));
     await fireEvent.click(screen.getByRole('button', { name: /^Delete$/ }));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/not your vine/));
+  });
+
+  // ── ZEB-671: graph-only Discover + Tune ──────────────────────────
+
+  describe('Discover graph (ZEB-671)', () => {
+    const graphVines: VineVideo[] = [
+      {
+        id: 'g2-01', creatorAddress: 'ravi-addr', creatorName: 'Ravi',
+        createdAt: 1700000400, videoCid: 'cid-g2', title: 'Second degree', viewed: false,
+        degree: 2, via: ['devin-addr'],
+      },
+      {
+        id: 'g3-01', creatorAddress: 'ada-addr', creatorName: 'Ada',
+        createdAt: 1700000500, videoCid: 'cid-g3', title: 'Third degree', viewed: false,
+        degree: 3, via: ['devin-addr', 'ravi-addr'],
+      },
+      {
+        id: 'nog-01', creatorAddress: 'stranger-addr', creatorName: 'Stranger',
+        createdAt: 1700000600, videoCid: 'cid-nog', title: 'Unconnected', viewed: false,
+      },
+    ];
+
+    function renderDiscover(extra: Record<string, unknown> = {}) {
+      return render(VineFeed, { props: {
+        followedVines: [], discoverVines: graphVines, viewedIds: new Set(),
+        activeTab: 'discover', followedAddresses: new Set(),
+        ...extra,
+      } });
+    }
+
+    beforeEach(() => {
+      localStorage.removeItem('harmony.vines.tune.v1');
+    });
+
+    it('renders only graph-reachable vines (no degree → hidden)', () => {
+      renderDiscover();
+      expect(screen.getByText('Ravi')).toBeTruthy();
+      expect(screen.getByText('Ada')).toBeTruthy();
+      expect(screen.queryByText('Stranger')).toBeNull();
+    });
+
+    it('badges cards with 2nd/3rd degree chips and provenance lines', () => {
+      renderDiscover();
+      const chips = screen.getAllByTestId('degree-chip');
+      expect(chips.map(c => c.textContent)).toEqual(expect.arrayContaining(['2nd', '3rd']));
+      // 2°: "{root} follows @{creator}" — root name unknown → truncated addr.
+      expect(screen.getByText(/devin-ad… follows @Ravi/)).toBeTruthy();
+      // 3°: chain copy; middle hop resolves to Ravi's known creatorName.
+      expect(screen.getByText(/devin-ad… → @Ravi → @Ada/)).toBeTruthy();
+    });
+
+    it('keeps own offline-fallback publishes visible without a degree', () => {
+      const own: VineVideo = {
+        id: 'own-01', creatorAddress: 'self', creatorName: 'You',
+        createdAt: 1700000700, videoCid: 'cid-own', title: 'Mine', viewed: true,
+      };
+      renderDiscover({ discoverVines: [...graphVines, own] });
+      expect(screen.getByText('You')).toBeTruthy();
+    });
+
+    it('Tune 2° toggle hides second-degree vines and updates the count', async () => {
+      renderDiscover();
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      expect(screen.getByRole('dialog', { name: 'Tune your Discover' })).toBeTruthy();
+      expect(screen.getByText(/Done · 2 vines in Discover/)).toBeTruthy();
+
+      const deg2Toggle = screen.getByText(/2nd degree — someone/).closest('label')!
+        .querySelector('input')!;
+      await fireEvent.click(deg2Toggle);
+      expect(screen.getByText(/Done · 1 vine in Discover/)).toBeTruthy();
+      expect(screen.queryByText('Ravi')).toBeNull();
+      expect(screen.getByText('Ada')).toBeTruthy();
+    });
+
+    it('muting a follow root hides its vines', async () => {
+      renderDiscover();
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      // Sole root is devin-addr — both vines trace to it.
+      const muteToggle = screen.getByText(/via devin-ad…/).closest('label')!
+        .querySelector('input')!;
+      await fireEvent.click(muteToggle);
+      expect(screen.getByText(/Done · 0 vines in Discover/)).toBeTruthy();
+      expect(screen.queryByText('Ravi')).toBeNull();
+      expect(screen.queryByText('Ada')).toBeNull();
+    });
+
+    it('persists Tune prefs to localStorage', async () => {
+      renderDiscover();
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      const deg3Toggle = screen.getByText(/3rd degree — a follow/).closest('label')!
+        .querySelector('input')!;
+      await fireEvent.click(deg3Toggle);
+      const stored = JSON.parse(localStorage.getItem('harmony.vines.tune.v1')!);
+      expect(stored.deg3).toBe(false);
+    });
+
+    it('Share-my-follows toggle reads and writes through the props', async () => {
+      const getShareFollows = vi.fn().mockResolvedValue(true);
+      const onSetShareFollows = vi.fn().mockResolvedValue(undefined);
+      renderDiscover({ getShareFollows, onSetShareFollows });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(getShareFollows).toHaveBeenCalled());
+
+      await fireEvent.click(screen.getByTestId('share-follows-toggle'));
+      await waitFor(() => expect(onSetShareFollows).toHaveBeenCalledWith(false));
+    });
+
+    it('surfaces a share-follows write failure and reverts the box', async () => {
+      const getShareFollows = vi.fn().mockResolvedValue(true);
+      const onSetShareFollows = vi.fn().mockRejectedValue(new Error('not connected'));
+      renderDiscover({ getShareFollows, onSetShareFollows });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(getShareFollows).toHaveBeenCalled());
+
+      await fireEvent.click(screen.getByTestId('share-follows-toggle'));
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('not connected'));
+      expect((screen.getByTestId('share-follows-toggle') as HTMLInputElement).checked).toBe(true);
+    });
+
+    it('shows the graph-only empty state copy', () => {
+      renderDiscover({ discoverVines: [] });
+      expect(screen.getByText(/no algorithm, just your social graph/)).toBeTruthy();
+    });
   });
 });
