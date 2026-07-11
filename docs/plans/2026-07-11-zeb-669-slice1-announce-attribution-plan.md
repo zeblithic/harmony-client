@@ -363,7 +363,7 @@ Expected: clean (commit any fmt-only diff into the Task 2 commit via `--amend` o
 
 - [ ] **Step 2: Iterative selection gate**
 
-Run: `scripts/test-select --context task` (repo root). Paste the printed `round=… bucket=…` line into the PR notes.
+Run: `scripts/test-select --context task` (repo root). Copy the printed `round=… bucket=…` summary line into the task report (and surface it in the PR notes) so the selection is auditable.
 Expected: PASS.
 
 - [ ] **Step 3: Full sweep (final gate)**
@@ -374,3 +374,8 @@ Expected: all pass (~4,270 tests).
 - [ ] **Step 4: Open PR**
 
 Push branch, open PR against main titled `ZEB-669 S1: attach zid to announce publishes (feed the observed-holders counter)`, body explains the bug + fix + wire-compat note, ends with the Claude Code attribution + session URL. Fire `@coderabbitai review` once at open.
+
+## Post-plan amendments (PR #448 review round 1)
+
+1. **Lazy receive-loop clock (Qodo):** `note_announce_sample` takes `now_ms: impl FnOnce() -> u64` instead of a pre-computed `u64` — the receive loop is a hot path and every non-announce sample would otherwise pay an `Instant::elapsed` it never uses. Call site passes `|| start.elapsed().as_millis() as u64`; tests pass `|| 10`.
+2. **Subscription-path e2e test (CodeRabbit):** `subscription_arm_extracts_source_zid_and_feeds_holders` — drives the production Subscribe arm (the `sample.attachment()` → `source_zid` extraction the helper units can't see): Publish arm attaches → Subscribe arm extracts → extracted value feeds `note_announce_sample` and counts for a receiver with a different own zid.

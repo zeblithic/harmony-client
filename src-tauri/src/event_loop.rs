@@ -3798,7 +3798,7 @@ pub async fn run(
                             &payload,
                             source_zid.as_deref(),
                             &own_zid,
-                            start.elapsed().as_millis() as u64,
+                            || start.elapsed().as_millis() as u64,
                         );
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
@@ -6169,13 +6169,17 @@ fn publish_attaches_zid(key_expr: &str) -> bool {
 /// can't be attributed and are skipped (the count is an observed lower
 /// bound); announce publishes attach the zid (`publish_attaches_zid`),
 /// so real peer announces are attributable from this build onward.
+/// `now_ms` is lazy (PR #448 review, Qodo): the receive loop is a hot
+/// path and every non-announce sample would otherwise pay an
+/// `Instant::elapsed` it never uses — the clock is read only when a
+/// sample actually lands in the holder map.
 fn note_announce_sample(
     observed_holders: &Arc<std::sync::Mutex<crate::observed_holders::ObservedHolders>>,
     key_expr: &str,
     payload: &[u8],
     source_zid: Option<&str>,
     own_zid: &str,
-    now_ms: u64,
+    now_ms: impl FnOnce() -> u64,
 ) {
     if !key_expr.starts_with(crate::ANNOUNCE_PREFIX) {
         return;
@@ -6190,7 +6194,7 @@ fn note_announce_sample(
             observed_holders
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .note(&a.cid, zid, now_ms);
+                .note(&a.cid, zid, now_ms());
         }
     }
 }
@@ -10751,6 +10755,80 @@ mod dispatch_attachment_tests {
         );
     }
 
+    /// Full receive-path loopback (PR #448 review, CodeRabbit): the
+    /// production Subscribe arm performs the `sample.attachment()` →
+    /// `source_zid` extraction that the helper-unit tests can't see.
+    /// Publish arm attaches → Subscribe arm extracts → the extracted
+    /// value feeds `note_announce_sample` and counts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscription_arm_extracts_source_zid_and_feeds_holders() {
+        let session = zenoh::open(zenoh::Config::default())
+            .await
+            .expect("zenoh open");
+        let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(8);
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+        let closing = Arc::new(AtomicBool::new(false));
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: format!("{}*", crate::ANNOUNCE_PREFIX),
+            },
+            &session,
+            &zenoh_tx,
+            &app,
+            &closing,
+            "publisher-zid",
+        )
+        .await;
+        let cid_hex = "ab".repeat(32);
+        dispatch_action(
+            RuntimeAction::Publish {
+                key_expr: format!("{}{cid_hex}", crate::ANNOUNCE_PREFIX),
+                payload: 1234u32.to_be_bytes().to_vec(),
+            },
+            &session,
+            &zenoh_tx,
+            &app,
+            &closing,
+            "publisher-zid",
+        )
+        .await;
+        let ev = tokio::time::timeout(Duration::from_secs(10), zenoh_rx.recv())
+            .await
+            .expect("event within 10s")
+            .expect("channel alive");
+        let ZenohEvent::Subscription {
+            key_expr,
+            payload,
+            source_zid,
+        } = ev
+        else {
+            panic!("expected Subscription event");
+        };
+        assert_eq!(source_zid.as_deref(), Some("publisher-zid"));
+        // A receiver node (different own zid) must count the sample.
+        let holders = Arc::new(std::sync::Mutex::new(
+            crate::observed_holders::ObservedHolders::new(),
+        ));
+        note_announce_sample(
+            &holders,
+            &key_expr,
+            &payload,
+            source_zid.as_deref(),
+            "receiver-zid",
+            || 10,
+        );
+        assert_eq!(holders.lock().unwrap().peer_count(&cid_hex), 1);
+        // Tear down the detached forwarder task the Subscribe arm
+        // spawned: mark closing (suppresses the session-lost emit) and
+        // close the session so `recv_async` errors and the task exits —
+        // otherwise the held subscriber keeps zenoh io threads alive
+        // past test end (nextest LEAK).
+        closing.store(true, Ordering::SeqCst);
+        session.close().await.expect("session close");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     #[test]
     fn publish_attaches_zid_matches_announce_and_capacity_only() {
         assert!(publish_attaches_zid("harmony/announce/aabb"));
@@ -10784,7 +10862,7 @@ mod note_announce_sample_tests {
     fn foreign_zid_announce_feeds_the_holder_map() {
         let h = holders();
         let (key, cid_hex) = announce_key();
-        note_announce_sample(&h, &key, &PAYLOAD, Some("peer-zid"), "own-zid", 10);
+        note_announce_sample(&h, &key, &PAYLOAD, Some("peer-zid"), "own-zid", || 10);
         assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 1);
     }
 
@@ -10792,7 +10870,7 @@ mod note_announce_sample_tests {
     fn own_zid_announce_does_not_self_count() {
         let h = holders();
         let (key, cid_hex) = announce_key();
-        note_announce_sample(&h, &key, &PAYLOAD, Some("own-zid"), "own-zid", 10);
+        note_announce_sample(&h, &key, &PAYLOAD, Some("own-zid"), "own-zid", || 10);
         assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 0);
     }
 
@@ -10800,7 +10878,7 @@ mod note_announce_sample_tests {
     fn missing_source_zid_is_skipped() {
         let h = holders();
         let (key, cid_hex) = announce_key();
-        note_announce_sample(&h, &key, &PAYLOAD, None, "own-zid", 10);
+        note_announce_sample(&h, &key, &PAYLOAD, None, "own-zid", || 10);
         assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 0);
     }
 
@@ -10814,7 +10892,7 @@ mod note_announce_sample_tests {
             &PAYLOAD,
             Some("peer-zid"),
             "own-zid",
-            10,
+            || 10,
         );
         assert_eq!(h.lock().unwrap().peer_count(&cid_hex), 0);
     }
