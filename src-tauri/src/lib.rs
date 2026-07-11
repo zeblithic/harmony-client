@@ -12858,6 +12858,30 @@ pub struct PublishReactionPayload {
     pub reactor_name: String,
 }
 
+/// Follow list published/received over Zenoh (ZEB-671, public + opt-out).
+/// One record per owner on `harmony/vines/{owner_address}/follows`,
+/// replaced whole on every follow/unfollow (receivers keep the newest
+/// `updated_at` — last-writer-wins). Carries ADDRESSES ONLY: local
+/// pet-names (`follows::FollowEntry::name`) never go on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VineFollowListPayload {
+    pub owner_address: String,
+    pub follows: Vec<String>,
+    pub updated_at: u64,
+    /// ZEB-671: hex 64-byte identity pub (X25519‖Ed25519) of the OWNER.
+    /// `Option` only for the pre-sign construction window and disk rows
+    /// (signatures exist only on the wire); receivers reject `None`.
+    /// Unlike descriptors/reactions there is no unsigned legacy for this
+    /// record type — it ships strict from day one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_pub: Option<String>,
+    /// ZEB-671: hex 64-byte Ed25519 signature over
+    /// `vine_signing::follow_list_canonical_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+}
+
 /// Build + publish a vine descriptor on `harmony/vines/{creator_address}`.
 ///
 /// Shared core for the GUI `publish_vine` command and the headless
