@@ -226,21 +226,65 @@ async fn sweep_once(
 /// Production [`CommunityDeviceIntroIngestCtx`] over real `start_node` handles.
 ///
 /// * relay = `registry.engine_arc(&community_id)`; `None` ⇒ `Ok(false)` (not a
-///   member here); else decode the signed `DeviceAnnounce` and
+///   member here); else decode the signed lifecycle event and
 ///   `insert_local_event` (idempotent — `AlreadyKnown` on dup);
-/// * `enrolled` = a start_node-time snapshot of the `harmony_owner`
-///   `OwnerState.enrollments` certs mapped through
-///   `hex::encode(cert.device_pubkeys.classical.ed25519_verify)` (the SP1
-///   64-hex device-id form). Enrollment changes require a node restart, so the
-///   snapshot tracks the set for the engine's lifetime (mirrors
-///   `ProdDmInboxIngestCtx`).
+/// * enrolled ids are computed LIVE from the S1 trust doc on every sweep
+///   (ZEB-668 S3, CodeRabbit PR #453): since S2, enrollment changes no
+///   longer require a restart — a device revoked mid-session must leave the
+///   coverage set immediately or coverage-GC stalls to the 30-day TTL for
+///   every entry. (The pre-S3 design snapshotted at start_node, mirroring
+///   `ProdDmInboxIngestCtx` — which still does; see the ZEB-668 follow-up.)
 pub struct ProdCommunityDeviceIntroIngestCtx {
     /// This device's SP1 device id (64-hex of the device ed25519 verify key).
     pub device_id: String,
     /// The community-sync registry (engine lookup by community id).
     pub registry: Arc<crate::community_state_sync::CommunitySyncRegistry>,
-    /// Enrolled device ids (64-hex), snapshotted at start_node.
-    pub enrolled: BTreeSet<String>,
+    /// The S1 owner trust doc — the live source of enrollments/revocations.
+    pub trust_doc: Arc<Mutex<harmony_owner::state::OwnerState>>,
+}
+
+/// ZEB-668 S3: the coverage set — enrolled AND not revoked, in the 64-hex
+/// ed25519-vk form `relayed_by` uses. A revoked device never relays, so
+/// keeping it in the set would make every entry's coverage unreachable.
+/// Standalone (not a ctx method) so it is unit-testable against a minted
+/// `OwnerState` without a registry.
+pub fn live_enrolled_intro_ids(state: &harmony_owner::state::OwnerState) -> BTreeSet<String> {
+    state
+        .enrollments
+        .iter()
+        .filter(|(device_id, _)| !state.is_revoked(**device_id))
+        .map(|(_, cert)| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+        .collect()
+}
+
+/// Decode a dataset entry's `signed_event` bytes and enforce the dataset's
+/// kind contract. Defense-in-depth (ZEB-495, Greptile): this dataset carries
+/// device-LIFECYCLE events only — `DeviceAnnounce` (the self-introduce
+/// deposit, ZEB-495) and `DeviceRetire` (the retire-announce deposit,
+/// ZEB-668 S3) are its only writers. Gating before relay means any other
+/// kind smuggled in by a bug, a misbehaving enrolled sibling, or a future
+/// refactor that reuses this relay path can never ride into the community
+/// engine (where `verify_event` might otherwise accept an
+/// enrolled-device-authored `Leave`/`Ban`). Unrelayable by construction ⇒
+/// the caller leaves the entry pending (Err), TTL-reaped — exactly like the
+/// forged-announce `Rejected` path.
+fn decode_lifecycle_event(
+    bytes: &[u8],
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    let signed: crate::community_membership::SignedMembershipEvent =
+        crate::owner_state_crypto::canonical_cbor_decode(bytes)
+            .map_err(|e| format!("decode device-lifecycle event: {e:?}"))?;
+    if !matches!(
+        signed.kind,
+        crate::community_membership::MembershipEventKind::DeviceAnnounce
+            | crate::community_membership::MembershipEventKind::DeviceRetire { .. }
+    ) {
+        return Err(format!(
+            "unexpected event kind in community-device-intro dataset: {:?}",
+            signed.kind
+        ));
+    }
+    Ok(signed)
 }
 
 #[async_trait]
@@ -255,27 +299,7 @@ impl CommunityDeviceIntroIngestCtx for ProdCommunityDeviceIntroIngestCtx {
         let Some(engine) = self.registry.engine_arc(&entry.community_id).await else {
             return Ok(false);
         };
-        let signed: crate::community_membership::SignedMembershipEvent =
-            crate::owner_state_crypto::canonical_cbor_decode(&entry.signed_event)
-                .map_err(|e| format!("decode DeviceAnnounce: {e:?}"))?;
-        // Defense-in-depth (ZEB-495, Greptile): this dataset's contract is
-        // EXCLUSIVELY `DeviceAnnounce` events — the self-introduce deposit is the
-        // only writer, and it only ever deposits that kind. Assert it before
-        // relaying so a non-`DeviceAnnounce` event smuggled in by a bug, a
-        // misbehaving enrolled sibling, or a future refactor that reuses this
-        // relay path can never ride into the community engine (where
-        // `verify_event` might otherwise accept an enrolled-device-authored
-        // `Leave`/`Ban`). Unrelayable by construction ⇒ leave pending (Err),
-        // TTL-reaped — exactly like the forged-announce `Rejected` path below.
-        if !matches!(
-            signed.kind,
-            crate::community_membership::MembershipEventKind::DeviceAnnounce
-        ) {
-            return Err(format!(
-                "non-DeviceAnnounce event in community-device-intro dataset: {:?}",
-                signed.kind
-            ));
-        }
+        let signed = decode_lifecycle_event(&entry.signed_event)?;
         match engine.insert_local_event(signed).await {
             // Inserted OR AlreadyKnown ⇒ relayed (idempotent).
             Ok(crate::community_state_crdt::InsertOutcome::Inserted)
@@ -290,7 +314,7 @@ impl CommunityDeviceIntroIngestCtx for ProdCommunityDeviceIntroIngestCtx {
     }
 
     async fn enrolled_device_ids(&self) -> BTreeSet<String> {
-        self.enrolled.clone()
+        live_enrolled_intro_ids(&*self.trust_doc.lock().await)
     }
 
     fn now_ms(&self) -> u64 {
@@ -629,5 +653,123 @@ mod tests {
         nudge(); // buffer full — dropped, must not block/panic
         assert_eq!(rx.recv().await, Some(()));
         assert!(rx.try_recv().is_err(), "extras coalesced into one nudge");
+    }
+
+    // ── ZEB-668 S3: dataset kind contract (decode_lifecycle_event) ────────
+
+    /// Sign a membership event of the given kind with a realistic owner and
+    /// return its canonical CBOR bytes.
+    fn signed_event_bytes(kind: crate::community_membership::MembershipEventKind) -> Vec<u8> {
+        use crate::community_membership::{mint_test_owner, sign_event, EventPayload};
+        let owner = mint_test_owner(0x81);
+        let payload = EventPayload {
+            id: [0xAD; 16],
+            community_id: SpaceId([0x11; 16]),
+            kind,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let signed = sign_event(&payload, &owner.device_key).expect("sign");
+        crate::owner_state_crypto::canonical_cbor_encode(&signed).expect("encode")
+    }
+
+    #[test]
+    fn decode_gate_accepts_device_announce() {
+        let bytes =
+            signed_event_bytes(crate::community_membership::MembershipEventKind::DeviceAnnounce);
+        decode_lifecycle_event(&bytes).expect("DeviceAnnounce passes the dataset kind gate");
+    }
+
+    #[test]
+    fn decode_gate_accepts_device_retire() {
+        use crate::community_membership::mint_test_owner;
+        use harmony_owner::certs::{RevocationCert, RevocationReason};
+        let owner = mint_test_owner(0x82);
+        let rc = RevocationCert::sign_self(
+            &owner.device_key,
+            owner.cert.owner_id,
+            owner.cert.device_id,
+            1_700_000_100,
+            RevocationReason::Decommissioned,
+        )
+        .expect("sign_self revocation");
+        let bytes = signed_event_bytes(
+            crate::community_membership::MembershipEventKind::DeviceRetire {
+                revocation: rc,
+                enrollment: Box::new(owner.cert.clone()),
+            },
+        );
+        decode_lifecycle_event(&bytes).expect("DeviceRetire passes the dataset kind gate");
+    }
+
+    /// ZEB-668 S3 (CodeRabbit PR #453): the live coverage set drops a device
+    /// the moment its revocation lands in the trust doc — no restart, no
+    /// stale boot snapshot pinning coverage-GC to the TTL.
+    #[test]
+    fn live_enrolled_ids_exclude_revoked_devices() {
+        use harmony_owner::certs::{RevocationCert, RevocationReason};
+        use harmony_owner::lifecycle::{enroll_via_master, mint_owner, MintResult};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
+
+        let now = 1_700_000_000u64;
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key: _sk1,
+        } = mint_owner(now).unwrap();
+
+        let sk2 = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32]);
+        let pkb2 = PubKeyBundle::classical_only(sk2.verifying_key().to_bytes());
+        let device2_vk_hex = hex::encode(sk2.verifying_key().to_bytes());
+        let res = enroll_via_master(
+            &state,
+            &recovery_artifact,
+            &sk2,
+            pkb2,
+            now,
+            DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .unwrap();
+        let device2_id = res.enrollment_cert.device_id;
+        state
+            .add_enrollment(res.enrollment_cert, now, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+
+        let before = live_enrolled_intro_ids(&state);
+        assert_eq!(before.len(), 2, "both devices enrolled pre-revocation");
+        assert!(before.contains(&device2_vk_hex));
+
+        let rc = RevocationCert::sign_master(
+            &recovery_artifact.master_signing_key(),
+            recovery_artifact.master_pubkey_bundle(),
+            device2_id,
+            now + 10,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        state.add_revocation(rc).unwrap();
+
+        let after = live_enrolled_intro_ids(&state);
+        assert_eq!(after.len(), 1, "revoked device leaves the coverage set");
+        assert!(
+            !after.contains(&device2_vk_hex),
+            "revoked device's id excluded"
+        );
+    }
+
+    #[test]
+    fn decode_gate_rejects_non_lifecycle_kinds() {
+        let bytes = signed_event_bytes(crate::community_membership::MembershipEventKind::Leave);
+        let err = decode_lifecycle_event(&bytes)
+            .expect_err("a Leave smuggled into the dataset must be rejected");
+        assert!(
+            err.contains("unexpected event kind"),
+            "gate error names the contract, got: {err}"
+        );
     }
 }

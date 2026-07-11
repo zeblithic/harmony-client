@@ -119,6 +119,7 @@ pub mod community_channel_log_engine;
 pub mod community_device_intro_crdt;
 pub mod community_device_intro_ingest;
 pub mod community_device_intro_persist;
+pub mod community_device_retire_deposit;
 pub mod community_dfrost_crypto;
 pub mod community_dfrost_log;
 pub mod community_dfrost_log_engine;
@@ -1239,6 +1240,15 @@ pub struct NodeState {
     >,
     pub community_device_intro_device_id: Option<String>,
 
+    /// ZEB-668 S3: nudge sender for the community retire-deposit sweeper.
+    /// `revoke_device` sends after a successful local revocation so the
+    /// retire-announce deposits immediately (the trust engine's `on_applied`
+    /// fires on REMOTE merges only). Best-effort `try_send` — the sweeper's
+    /// startup pass + trust-apply nudges are the level-triggered guarantee;
+    /// this is just latency. `Some` while the node runs with an owner
+    /// identity loaded.
+    pub community_device_retire_nudge: Option<tokio::sync::mpsc::Sender<()>>,
+
     /// ZEB-458 P4 Phase B: relay-hold dataset (`relay-hold-v1`, D38) — the
     /// relay's held opaque blobs, replicated across the relay's OWN fleet so
     /// every device of a volunteering owner can serve a recipient pull. `Some`
@@ -1812,6 +1822,7 @@ impl Default for NodeState {
             community_device_intro_tracker: None,
             community_device_intro_sync: None,
             community_device_intro_device_id: None,
+            community_device_retire_nudge: None,
             // ZEB-458 P4 Phase B: relay-hold + relay-optin dataset handles +
             // the resolver/publisher/driver slots stay None until start_node
             // wires the FleetSyncEngines (and T11b spawns the active tasks).
@@ -2366,6 +2377,9 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.community_device_intro_doc = None;
         guard.community_device_intro_tracker = None;
         guard.community_device_intro_device_id = None;
+        // ZEB-668 S3: dropping the local-revoke nudge sender contributes to
+        // the retire-deposit task's exit (it ends when EVERY sender drops).
+        guard.community_device_retire_nudge = None;
         // ZEB-418 SP2 P2: take the dm-outhold + fleet-net engines for
         // shutdown and clear the remaining handles (mirrors dm-inbox). The
         // dm-outhold engine shutdown ALSO stops the apply sweeper: the
@@ -3778,6 +3792,9 @@ pub async fn start_node_inner(
                 tokio::sync::Mutex<crate::community_device_intro_crdt::CommunityDeviceIntroDoc>,
             >,
         > = None;
+        // ZEB-668 S3: the retire-deposit sweeper's nudge sender, stashed in
+        // NodeState so revoke_device can nudge after a LOCAL revocation.
+        let mut community_device_retire_nudge_opt: Option<tokio::sync::mpsc::Sender<()>> = None;
         let mut community_device_intro_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
@@ -4960,15 +4977,13 @@ pub async fn start_node_inner(
                             outbound_rx: community_device_intro_out_rx,
                             inbound_tx: community_device_intro_in_tx,
                         });
-                    // Enrolled-device snapshot for the relay sweeper's GC
-                    // coverage check (same 64-hex form as dm-inbox).
-                    let community_device_intro_enrolled: std::collections::BTreeSet<String> =
-                        loaded
-                            .state
-                            .enrollments
-                            .values()
-                            .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
-                            .collect();
+                    // ZEB-668 S3 (CodeRabbit PR #453): the relay sweeper's GC
+                    // coverage set is computed LIVE from the trust doc on
+                    // every sweep (`live_enrolled_intro_ids` — enrolled minus
+                    // revoked), replacing the pre-S3 boot-time snapshot. A
+                    // device revoked mid-session leaves the coverage set
+                    // immediately instead of stalling every entry's
+                    // coverage-GC to the 30-day TTL.
 
                     tracing::info!("BOOT-PROBE 05c: community-device-intro engine constructed");
                     // ── ZEB-458 P4 Phase B: relay-hold + relay-optin datasets ─
@@ -5395,8 +5410,17 @@ pub async fn start_node_inner(
                     let (trust_out_tx, trust_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
                     let (trust_in_tx, trust_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
                     let (trust_nudge_tx, trust_nudge_rx) = tokio::sync::mpsc::channel::<()>(8);
-                    let owner_trust_sync =
-                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                    // ZEB-668 S3: retire-deposit sweeper nudge. Created here
+                    // so the trust engine's on_applied can nudge BOTH the S1
+                    // revoked-self detector and the S3 retire-deposit sweep
+                    // (a remote merge is how a sibling's revocation reaches
+                    // this device). The rx is consumed by the sweeper spawn
+                    // after the community registry is built; a second sender
+                    // is stashed in NodeState for the local-revoke path.
+                    let (retire_deposit_nudge_tx, retire_deposit_nudge_rx) =
+                        tokio::sync::mpsc::channel::<()>(1);
+                    let owner_trust_sync = std::sync::Arc::new(
+                        crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
                                 kt: std::sync::Arc::clone(&kt),
                                 device_id: device_id.clone(),
@@ -5415,14 +5439,28 @@ pub async fn start_node_inner(
                                 lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
                                 debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
                                 publish_seen: true,
-                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
-                                    trust_nudge_tx,
-                                )),
+                                on_applied: Some({
+                                    // ZEB-668: one applied-merge, two consumers —
+                                    // the S1 revoked-self detector and the S3
+                                    // retire-deposit sweeper.
+                                    let detector = crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                        trust_nudge_tx,
+                                    );
+                                    let retire =
+                                        crate::community_device_retire_deposit::retire_deposit_nudge(
+                                            retire_deposit_nudge_tx.clone(),
+                                        );
+                                    std::sync::Arc::new(move || {
+                                        detector();
+                                        retire();
+                                    })
+                                }),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
                                     std::collections::BTreeMap::new(),
                                 )),
                             },
-                        ));
+                        ),
+                    );
                     owner_trust_doc_opt = Some(std::sync::Arc::clone(&owner_trust_doc));
                     owner_trust_sync_engine_opt = Some(std::sync::Arc::clone(&owner_trust_sync));
                     trust_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
@@ -5618,7 +5656,7 @@ pub async fn start_node_inner(
                             crate::community_device_intro_ingest::ProdCommunityDeviceIntroIngestCtx {
                                 device_id: device_id.clone(),
                                 registry: std::sync::Arc::clone(&registry),
-                                enrolled: community_device_intro_enrolled,
+                                trust_doc: std::sync::Arc::clone(&owner_trust_doc),
                             },
                         );
                         let sweeper_engine = std::sync::Arc::clone(&community_device_intro_sync);
@@ -5633,6 +5671,45 @@ pub async fn start_node_inner(
                                 ),
                             ),
                         );
+                    }
+
+                    // ── ZEB-668 S3: community retire-deposit sweeper. Diffs
+                    // the S1 trust doc's revocations against the intro
+                    // dataset and deposits signed `DeviceRetire` events for
+                    // the relay sweeper above to drive into each community.
+                    // Spawned HERE for the same reason as the relay sweeper:
+                    // its ProdCtx needs the just-built registry. One startup
+                    // pass (revocations minted/replicated while offline),
+                    // then one debounced pass per nudge (trust on_applied +
+                    // local revoke_device). Exits when both senders drop
+                    // (trust engine shutdown + NodeState clear).
+                    {
+                        let retire_ctx: std::sync::Arc<
+                            dyn crate::community_device_retire_deposit::CommunityDeviceRetireDepositCtx,
+                        > = std::sync::Arc::new(
+                            crate::community_device_retire_deposit::ProdCommunityDeviceRetireDepositCtx {
+                                trust_doc: std::sync::Arc::clone(&owner_trust_doc),
+                                registry: std::sync::Arc::clone(&registry),
+                                signing_key: std::sync::Arc::clone(&community_signing_key_arc),
+                                self_vk: community_signing_key_arc.verifying_key().to_bytes(),
+                                self_owner,
+                                device_id: device_id.clone(),
+                                hlc_tracker: std::sync::Arc::clone(&tracker),
+                            },
+                        );
+                        let retire_engine = std::sync::Arc::clone(&community_device_intro_sync);
+                        tokio::spawn(
+                            crate::community_device_retire_deposit::run_community_device_retire_deposit_task(
+                                std::sync::Arc::clone(&community_device_intro_doc),
+                                retire_ctx,
+                                retire_deposit_nudge_rx,
+                                std::sync::Arc::new(move || retire_engine.notify_dirty()),
+                                std::time::Duration::from_millis(
+                                    crate::community_device_retire_deposit::RETIRE_DEPOSIT_DEBOUNCE_MS,
+                                ),
+                            ),
+                        );
+                        community_device_retire_nudge_opt = Some(retire_deposit_nudge_tx);
                     }
 
                     // ZEB-270 Phase 3 Task 4.5: per-(community, channel)
@@ -10082,6 +10159,10 @@ pub async fn start_node_inner(
                             community_device_intro_sync_engine_opt.clone();
                         guard.community_device_intro_device_id =
                             community_device_intro_device_id_opt.clone();
+                        // ZEB-668 S3: local-revoke nudge for the retire-deposit
+                        // sweeper (see NodeState field docs).
+                        guard.community_device_retire_nudge =
+                            community_device_retire_nudge_opt.clone();
                         // ZEB-458 P4 Phase B: store the relay-hold + relay-optin
                         // dataset handles + the shared resolver. The opt-in IPC
                         // (set_community_relay_opt_in / get_community_relay_status)
@@ -23480,6 +23561,7 @@ mod list_community_forks_tests {
                 joined_at: hlc_at(0),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
         m
@@ -23652,6 +23734,7 @@ mod list_community_forks_tests {
                 joined_at: hlc_at(50),
                 left_at: Some(hlc_at(150)),
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
             },
         );
 
@@ -29916,6 +29999,7 @@ mod list_bootstrap_hint_tests {
             },
             left_at: None,
             enrolled_device_keys: BTreeSet::new(),
+            revoked_device_keys: BTreeSet::new(),
         }
     }
 
@@ -40002,7 +40086,11 @@ pub fn delta_to_change(
         // an already-Joined owner's MemberState — it changes no status/power
         // and projects no MembershipChange. (The roster re-renders the owner
         // identically; the multi-device effect is invisible at this layer.)
-        | crate::community_membership::MembershipEventKind::DeviceAnnounce => return None,
+        | crate::community_membership::MembershipEventKind::DeviceAnnounce
+        // ZEB-668 S3: DeviceRetire only removes/tombstones a device key —
+        // same reasoning as DeviceAnnounce: no status/power change, the
+        // roster is unchanged at this layer.
+        | crate::community_membership::MembershipEventKind::DeviceRetire { .. } => return None,
     };
     Some((cid_hex, change))
 }
@@ -40883,6 +40971,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(100, "a"),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -40892,6 +40981,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(200, "b"),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -40901,6 +40991,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(150, "c"),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -40910,6 +41001,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(300, "d"),
                 left_at: None,
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
 
@@ -40951,6 +41043,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(100, "x"),
                 left_at: Some(hlc(200, "x")),
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -40960,6 +41053,7 @@ mod community_member_dto_tests {
                 joined_at: hlc(50, "y"),
                 left_at: Some(hlc(150, "y")),
                 enrolled_device_keys: std::collections::BTreeSet::new(),
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
         let materialized = MaterializedMembership {
@@ -61306,6 +61400,7 @@ mod start_node_race_tests {
             community_device_intro_tracker: None,
             community_device_intro_sync: None,
             community_device_intro_device_id: None,
+            community_device_retire_nudge: None,
             // ZEB-458 P4 Phase B: relay-hold + relay-optin handles + the
             // resolver/publisher/driver slots unused in race tests.
             relay_hold_doc: None,
@@ -61799,6 +61894,7 @@ mod get_community_governance_tests {
             },
             left_at: None,
             enrolled_device_keys: BTreeSet::new(),
+            revoked_device_keys: BTreeSet::new(),
         }
     }
 

@@ -155,6 +155,7 @@ async fn seeded_registry(
                 },
                 left_at: None,
                 enrolled_device_keys: keys,
+                revoked_device_keys: std::collections::BTreeSet::new(),
             },
         );
     }
