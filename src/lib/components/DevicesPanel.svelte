@@ -327,7 +327,14 @@
     removeError = null;
     removeInFlight = true;
     try {
-      await svc.revoke(removeTarget.deviceVkHex, reason);
+      // ZEB-677 S3: master-less path — write a co-sign request instead of
+      // revoking directly. The pending banner takes over as the surface;
+      // the revocation lands when a sibling approves.
+      if (!state?.canBackUp && removeTarget.quorumRemovable) {
+        await svc.requestQuorumRevocation(removeTarget.deviceVkHex, reason);
+      } else {
+        await svc.revoke(removeTarget.deviceVkHex, reason);
+      }
       // A self-revoke also fires device-revoked-self → App-level terminal
       // state; the refresh below just keeps this panel honest meanwhile.
       await svc.refresh();
@@ -336,6 +343,35 @@
       removeError = extractError(e);
     } finally {
       removeInFlight = false;
+    }
+  }
+
+  // ZEB-677 S3: quorum co-sign banner state. In-flight keyed by request id
+  // so one slow approval doesn't lock a second banner's buttons.
+  let quorumActionInFlight = $state<string | null>(null);
+  let quorumError = $state<string | null>(null);
+
+  /** Petname/display-name join for banner copy; 8-hex prefix fallback. */
+  function quorumDeviceName(deviceId: string): string {
+    const row = state?.devices.find((d) => d.deviceId === deviceId);
+    return row?.petName?.trim() || row?.displayName || deviceId.slice(0, 8);
+  }
+
+  async function handleQuorumAction(requestId: string, action: 'approve' | 'decline') {
+    if (quorumActionInFlight) return;
+    quorumError = null;
+    quorumActionInFlight = requestId;
+    try {
+      if (action === 'approve') {
+        await svc.cosignQuorumRequest(requestId);
+      } else {
+        await svc.declineQuorumRequest(requestId);
+      }
+      await svc.refresh();
+    } catch (e) {
+      quorumError = extractError(e);
+    } finally {
+      quorumActionInFlight = null;
     }
   }
 
@@ -427,21 +463,36 @@
 
   // Live refresh when trust state changes under us (S1 replication: a
   // sibling's revoke/enrollment arrives via the trust engine's detector).
+  // ZEB-677 S3: owner-quorum-updated joins it — a co-sign request arriving
+  // or completing must surface without a panel reopen.
   let unlistenDevicesUpdated: (() => void) | null = null;
+  let unlistenQuorumUpdated: (() => void) | null = null;
   onMount(() => {
     let cancelled = false;
-    listen('owner-devices-updated', () => {
+    const refresh = () => {
       svc.refresh().catch(() => {
         // Live refresh is best-effort; a stale roster self-heals on the
         // next event or panel open.
       });
-    })
+    };
+    listen('owner-devices-updated', refresh)
       .then((unlisten) => {
         if (cancelled) {
           unlisten();
           return;
         }
         unlistenDevicesUpdated = unlisten;
+      })
+      .catch(() => {
+        // Registration can fail in tests / headless — non-fatal.
+      });
+    listen('owner-quorum-updated', refresh)
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenQuorumUpdated = unlisten;
       })
       .catch(() => {
         // Registration can fail in tests / headless — non-fatal.
@@ -453,6 +504,8 @@
   onDestroy(() => {
     unlistenDevicesUpdated?.();
     unlistenDevicesUpdated = null;
+    unlistenQuorumUpdated?.();
+    unlistenQuorumUpdated = null;
   });
 
   async function openBackup() {
@@ -776,6 +829,56 @@
         </div>
       {/if}
 
+      <!-- ZEB-677 S3: quorum co-sign surfaces. Approve is click-confirm —
+           the destructive typed-confirm already happened on the initiating
+           device (spec §4.2). -->
+      {#each (state.quorumRequests ?? []).filter((r) => r.canCosign) as req (req.requestId)}
+        <div class="epoch-banner quorum-banner" data-testid="quorum-cosign-banner">
+          <p class="epoch-text">
+            Co-sign request from <strong>{quorumDeviceName(req.initiatorDeviceId)}</strong>: remove
+            <strong>{quorumDeviceName(req.targetDeviceId)}</strong> ({req.reason})
+          </p>
+          <div class="quorum-actions">
+            <button
+              class="primary"
+              data-testid="quorum-approve"
+              disabled={quorumActionInFlight !== null}
+              onclick={() => handleQuorumAction(req.requestId, 'approve')}
+            >
+              {quorumActionInFlight === req.requestId ? 'Signing…' : 'Approve'}
+            </button>
+            <button
+              class="secondary"
+              data-testid="quorum-decline"
+              disabled={quorumActionInFlight !== null}
+              onclick={() => handleQuorumAction(req.requestId, 'decline')}
+            >
+              Decline
+            </button>
+          </div>
+        </div>
+      {/each}
+      {#each (state.quorumRequests ?? []).filter((r) => r.initiatedByMe) as req (req.requestId)}
+        <div class="epoch-banner quorum-banner" data-testid="quorum-pending-note">
+          <p class="epoch-text">
+            {#if req.declined}
+              Removal of <strong>{quorumDeviceName(req.targetDeviceId)}</strong> was declined by
+              another device.
+            {:else if req.cosignerSigned}
+              Removal of <strong>{quorumDeviceName(req.targetDeviceId)}</strong> was co-signed —
+              finishing up.
+            {:else}
+              Waiting for another device to co-sign the removal of
+              <strong>{quorumDeviceName(req.targetDeviceId)}</strong> — expires
+              {new Date(req.expiresAtMs).toLocaleString()}.
+            {/if}
+          </p>
+        </div>
+      {/each}
+      {#if quorumError}
+        <p class="error" role="alert">{quorumError}</p>
+      {/if}
+
       <!-- ② Devices list -->
       <div class="devices-list">
         <div class="label">MY DEVICES ({activeDevices.length})</div>
@@ -819,7 +922,9 @@
                            where the IPC can succeed (master seed present). -->
                       <!-- ZEB-668 S6: replace = remove + re-pair + petname
                            carry-over; same severity as remove (the removal
-                           is immediate), so the same button treatment. -->
+                           is immediate), so the same button treatment.
+                           Master-only: re-pairing needs the seed (the S4
+                           arm flow is the master-less enrollment story). -->
                       <button
                         class="remove-btn"
                         onclick={() => {
@@ -829,6 +934,11 @@
                       >
                         Replace…
                       </button>
+                    {/if}
+                    {#if state.canBackUp || device.quorumRemovable}
+                      <!-- ZEB-677 S3: also visible on master-less devices
+                           when a sibling can co-sign (quorumRemovable is
+                           computed server-side, spec §4.1). -->
                       <button
                         class="remove-btn"
                         onclick={() => {
@@ -952,6 +1062,7 @@
       deviceName={removeTarget.displayName}
       isSelf={removeTarget.isThisDevice}
       isSeedHolder={removeTarget.isThisDevice && state?.canBackUp === true}
+      quorum={state?.canBackUp !== true && removeTarget.quorumRemovable === true}
       busy={removeInFlight}
       error={removeError}
       onConfirm={handleRemoveConfirm}
@@ -1448,6 +1559,13 @@
     border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
     background: color-mix(in srgb, var(--warning) 10%, transparent);
     border-radius: 6px;
+  }
+
+  /* ZEB-677 S3: co-sign banner shares the epoch-banner shape; the action
+     row sits under the request line. */
+  .quorum-actions {
+    display: flex;
+    gap: 0.5rem;
   }
 
   .epoch-text {
