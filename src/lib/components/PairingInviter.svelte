@@ -3,13 +3,39 @@
   import { PairingService, extractError, type PairingState } from '../pairing-service';
   import Modal from './Modal.svelte';
 
-  let { hostname = 'this device', onClose } = $props<{ hostname?: string; onClose?: () => void }>();
+  let { hostname = 'this device', onClose, onComplete } = $props<{
+    hostname?: string;
+    onClose?: () => void;
+    // ZEB-668 S6: fired once per mount when pairing completes, with the
+    // successor's device id (32-hex identity hash — NOT the 64-hex vk).
+    onComplete?: (deviceIdHex: string) => void;
+  }>();
 
   const svc = new PairingService();
   let state = $state<PairingState>({ kind: 'idle' });
   let error = $state<string | null>(null);
 
   svc.onChange = () => { state = svc.state; };
+
+  // ZEB-668 S6: on completion, re-fetch the snapshot BEFORE announcing —
+  // the backend's Complete branch folds the new enrollment into the
+  // resident trust doc (the panel's render source). Fail open: pairing
+  // succeeded and disk is durable; the next poll or boot retries the fold.
+  let completeNotified = false;
+  $effect(() => {
+    if (state.kind === 'complete' && !completeNotified) {
+      completeNotified = true;
+      const deviceIdHex = state.deviceIdHex;
+      void (async () => {
+        try {
+          await svc.refreshSnapshot();
+        } catch {
+          /* fold is best-effort — see above */
+        }
+        onComplete?.(deviceIdHex);
+      })();
+    }
+  });
 
   onMount(async () => {
     try {

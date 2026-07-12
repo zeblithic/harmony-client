@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import PairingInviter from '../PairingInviter.svelte';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
@@ -8,7 +8,9 @@ vi.mock('@tauri-apps/api/event', () => ({
 }));
 
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 const mockedInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
+const mockedListen = listen as unknown as ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -69,6 +71,67 @@ describe('PairingInviter', () => {
     const dialog = await screen.findByRole('dialog');
     expect(dialog).toHaveAttribute('aria-modal', 'true');
     expect(dialog).toHaveAttribute('aria-labelledby', 'invite-heading');
+  });
+
+  // ZEB-668 S6: completion seam. onComplete must fire AFTER a fold
+  // re-fetch of get_pairing_state — the backend's Complete branch is what
+  // folds the freshly-persisted enrollment into the resident trust doc,
+  // and the Devices panel (which consumes onComplete) renders from that
+  // doc. Without the fold the successor row is invisible until restart.
+  it('fires onComplete once with the device id only AFTER the fold re-fetch settles', async () => {
+    const complete = { kind: 'complete', deviceIdHex: 'cc'.repeat(16) };
+    // Deferred second fetch (CodeRabbit, PR #456 round 1): with an
+    // immediately-resolved mock, a regression that fires onComplete
+    // without awaiting refreshSnapshot() would still pass.
+    let stateFetches = 0;
+    let resolveRefresh!: (value: typeof complete) => void;
+    const refresh = new Promise<typeof complete>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    mockedInvoke.mockImplementation((cmd: unknown) => {
+      if (cmd !== 'get_pairing_state') return Promise.resolve(undefined);
+      stateFetches += 1;
+      return stateFetches === 1 ? Promise.resolve(complete) : refresh;
+    });
+    const onComplete = vi.fn();
+    render(PairingInviter, { props: { hostname: 'KRILE', onComplete } });
+    await waitFor(() => expect(stateFetches).toBe(2));
+    expect(onComplete).not.toHaveBeenCalled(); // fold still pending
+    resolveRefresh(complete);
+    await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+    expect(onComplete).toHaveBeenCalledWith('cc'.repeat(16));
+  });
+
+  it('does not re-fire onComplete on a duplicate complete flush', async () => {
+    let listener: ((e: { payload: unknown }) => void) | undefined;
+    mockedListen.mockImplementation(
+      (_evt: string, cb: (e: { payload: unknown }) => void) => {
+        listener = cb;
+        return Promise.resolve(() => {});
+      },
+    );
+    const complete = { kind: 'complete', deviceIdHex: 'cc'.repeat(16) };
+    let stateFetches = 0;
+    let resolveRefresh!: (value: typeof complete) => void;
+    const refresh = new Promise<typeof complete>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    mockedInvoke.mockImplementation((cmd: unknown) => {
+      if (cmd !== 'get_pairing_state') return Promise.resolve(undefined);
+      stateFetches += 1;
+      return stateFetches === 1 ? Promise.resolve(complete) : refresh;
+    });
+    const onComplete = vi.fn();
+    render(PairingInviter, { props: { hostname: 'KRILE', onComplete } });
+    await waitFor(() => expect(stateFetches).toBe(2));
+    // Duplicate flush lands WHILE the fold is still pending — the
+    // notified-once guard must hold across the await, not just after it.
+    listener!({ payload: complete });
+    resolveRefresh(complete);
+    await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+    listener!({ payload: complete }); // and again after settling
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(onComplete).toHaveBeenCalledTimes(1);
   });
 
   // ZEB-610 Commons chrome regression guard: the SAS stays in a mono display
