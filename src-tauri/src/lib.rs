@@ -173,6 +173,7 @@ pub mod dm_outhold_persist;
 pub mod dm_signing;
 pub mod dm_tunnel_contact;
 pub mod emoji_names;
+pub mod enrollment_verify;
 pub mod event_loop;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
