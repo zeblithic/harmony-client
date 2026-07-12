@@ -189,9 +189,19 @@ pub fn merge_quorum_remote_into_local(
     remote: QuorumReqDoc,
 ) -> MergeOutcome {
     let before = crate::owner_state_crypto::canonical_cbor_encode(&*local).ok();
+    // Real wall clock, like the trust merge: an expired remote request is
+    // never (re-)inserted, so a stale peer republishing one can't ping-pong
+    // it back after the local sweep pruned it.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     for (id, req) in remote.requests {
         match local.requests.get_mut(&id) {
             None => {
+                if now_ms > req.expires_at_ms {
+                    continue;
+                }
                 if !within_caps(&req) {
                     tracing::warn!(request = %id, "quorum merge: over-cap request dropped");
                     continue;
@@ -675,6 +685,10 @@ mod tests {
 
     const NOW_SECS: u64 = 1_700_000_000;
     const NOW_MS: u64 = NOW_SECS * 1000;
+    /// Default fixture expiry — far future (~2099) because the MERGE skips
+    /// expired inserts against the REAL wall clock, while prune tests pass
+    /// their own explicit `now_ms`. Tests that exercise expiry override it.
+    const FAR_FUTURE_MS: u64 = 4_100_000_000_000;
 
     fn hlc(wall_ms: u64, device: &str) -> Hlc {
         Hlc {
@@ -696,7 +710,7 @@ mod tests {
             initiator_sigs: BTreeMap::new(),
             signatures: BTreeMap::new(),
             issued_at: NOW_SECS,
-            expires_at_ms: NOW_MS + QUORUM_REVOCATION_TTL_MS,
+            expires_at_ms: FAR_FUTURE_MS,
         }
     }
 
@@ -847,6 +861,20 @@ mod tests {
         );
         assert!(!merge_quorum_remote_into_local(&mut full, one_more).changed);
         assert_eq!(full.requests.len(), MAX_QUORUM_REQUESTS);
+    }
+
+    #[test]
+    fn merge_never_inserts_expired_requests() {
+        // The merge checks expiry against the REAL wall clock, so a stale
+        // peer republishing an expired request can't ping-pong it back
+        // after the local sweep pruned it.
+        let mut local = QuorumReqDoc::default();
+        let mut remote = QuorumReqDoc::default();
+        let mut expired = test_request(&"11".repeat(16), &"22".repeat(16));
+        expired.expires_at_ms = NOW_MS; // 2023 — long past by the real clock
+        remote.requests.insert("aa".repeat(16), expired);
+        assert!(!merge_quorum_remote_into_local(&mut local, remote).changed);
+        assert!(local.requests.is_empty());
     }
 
     #[test]

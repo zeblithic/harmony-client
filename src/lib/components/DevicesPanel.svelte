@@ -346,8 +346,9 @@
     }
   }
 
-  // ZEB-677 S3: quorum co-sign banner state. In-flight keyed by request id
-  // so one slow approval doesn't lock a second banner's buttons.
+  // ZEB-677 S3: quorum co-sign banner state. The in-flight id gates ALL
+  // banners (one ceremony action at a time — deliberate) and labels the
+  // busy button.
   let quorumActionInFlight = $state<string | null>(null);
   let quorumError = $state<string | null>(null);
 
