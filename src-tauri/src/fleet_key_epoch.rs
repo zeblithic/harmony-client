@@ -166,6 +166,17 @@ impl FleetKeyEpochDoc {
         vk.verify_strict(&bytes, &sig).is_ok()
     }
 
+    /// ZEB-677 S5 — verify a carrier doc by whichever issuer signed it: a
+    /// quorum doc (`quorum_sig` present) via [`Self::verify_quorum`], else the
+    /// master path via [`Self::verify`]. The single reader entry point.
+    pub fn verify_any(&self, owner_id: &[u8; 16], now_secs: u64) -> bool {
+        if self.quorum_sig.is_some() {
+            self.verify_quorum(owner_id, now_secs)
+        } else {
+            self.verify(owner_id)
+        }
+    }
+
     /// ZEB-677 S5 — one quorum signer's detached ed25519 signature over the
     /// doc's [`Self::signing_bytes`]. The initiator and each co-signer produce
     /// one of these; [`Self::assemble_quorum`] collects them.
@@ -269,21 +280,33 @@ impl<T: serde::Serialize> crate::owner_state_crypto::CanonicalPayload for Canoni
 
 /// Monotonic + authenticated merge for the carrier engine: adopt `remote`
 /// wholesale iff its epoch is STRICTLY higher than the local doc's AND its
-/// master signature verifies against `owner_id`. Everything else (equal or
-/// lower epoch, unsigned, wrong owner, bad signature) leaves `local`
-/// untouched. Returns whether local changed.
+/// signature verifies against `owner_id` (master OR quorum — ZEB-677 S5).
+/// Everything else (equal or lower epoch, unsigned, wrong owner, bad
+/// signature) leaves `local` untouched. `now_secs` bounds the quorum signers'
+/// cert active-window check. Returns whether local changed.
+/// Current Unix time in **seconds** — the unit of an `EnrollmentCert`'s active
+/// window (`verify(now_secs)`), for quorum-doc verification. 0 on clock error.
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn merge_fleet_keys_remote(
     local: &mut FleetKeyEpochDoc,
     remote: FleetKeyEpochDoc,
     owner_id: &[u8; 16],
+    now_secs: u64,
 ) -> bool {
     if remote.epoch <= local.epoch {
         return false;
     }
-    if !remote.verify(owner_id) {
+    if !remote.verify_any(owner_id, now_secs) {
         tracing::warn!(
             remote_epoch = remote.epoch,
-            "fleet-keys carrier: rejected remote doc with invalid master signature"
+            quorum = remote.quorum_sig.is_some(),
+            "fleet-keys carrier: rejected remote doc with invalid signature"
         );
         return false;
     }
@@ -323,7 +346,11 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), crate::fleet
 /// adoption of every legitimate carrier doc until a strictly-higher epoch
 /// appeared. An unverifiable persisted doc degrades to the default and
 /// re-replicates.
-pub fn load_doc_or_recover(path: &std::path::Path, owner_id: &[u8; 16]) -> FleetKeyEpochDoc {
+pub fn load_doc_or_recover(
+    path: &std::path::Path,
+    owner_id: &[u8; 16],
+    now_secs: u64,
+) -> FleetKeyEpochDoc {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FleetKeyEpochDoc::default(),
@@ -350,9 +377,9 @@ pub fn load_doc_or_recover(path: &std::path::Path, owner_id: &[u8; 16]) -> Fleet
     };
     // Epoch 0 is the never-bumped default (unsigned by construction); any
     // bumped doc must carry a valid master signature.
-    if doc.epoch > 0 && !doc.verify(owner_id) {
+    if doc.epoch > 0 && !doc.verify_any(owner_id, now_secs) {
         tracing::warn!(path = %path.display(), epoch = doc.epoch,
-            "fleet-keys doc failed master-signature verification; starting from default");
+            "fleet-keys doc failed signature verification; starting from default");
         return FleetKeyEpochDoc::default();
     }
     doc
@@ -663,6 +690,8 @@ mod tests {
         assert!(back.verify_quorum(&master.identity_hash(), now));
     }
 
+    const MERGE_NOW: u64 = 1_700_000_000;
+
     #[test]
     fn merge_adopts_strictly_higher_signed_remote_only() {
         let (remote1, owner_id) = signed_doc([3u8; 32], 1);
@@ -671,7 +700,8 @@ mod tests {
         assert!(merge_fleet_keys_remote(
             &mut local,
             remote1.clone(),
-            &owner_id
+            &owner_id,
+            MERGE_NOW
         ));
         assert_eq!(local.epoch, 1);
 
@@ -679,13 +709,18 @@ mod tests {
         assert!(!merge_fleet_keys_remote(
             &mut local,
             remote1.clone(),
-            &owner_id
+            &owner_id,
+            MERGE_NOW
         ));
 
         // Lower epoch after a higher one: kept local.
         let (remote2, _) = signed_doc([3u8; 32], 2);
-        assert!(merge_fleet_keys_remote(&mut local, remote2, &owner_id));
-        assert!(!merge_fleet_keys_remote(&mut local, remote1, &owner_id));
+        assert!(merge_fleet_keys_remote(
+            &mut local, remote2, &owner_id, MERGE_NOW
+        ));
+        assert!(!merge_fleet_keys_remote(
+            &mut local, remote1, &owner_id, MERGE_NOW
+        ));
         assert_eq!(local.epoch, 2);
     }
 
@@ -697,14 +732,51 @@ mod tests {
         let mut unsigned = good.clone();
         unsigned.master_sig = Vec::new();
         let mut local = FleetKeyEpochDoc::default();
-        assert!(!merge_fleet_keys_remote(&mut local, unsigned, &owner_id));
+        assert!(!merge_fleet_keys_remote(
+            &mut local, unsigned, &owner_id, MERGE_NOW
+        ));
         assert_eq!(local, FleetKeyEpochDoc::default());
 
         // Signed by a DIFFERENT master (a revoked device forging with its
         // own key): identity hash doesn't match this owner.
         let (forged, _other_owner) = signed_doc([9u8; 32], 5);
-        assert!(!merge_fleet_keys_remote(&mut local, forged, &owner_id));
+        assert!(!merge_fleet_keys_remote(
+            &mut local, forged, &owner_id, MERGE_NOW
+        ));
         assert_eq!(local.epoch, 0);
+    }
+
+    #[test]
+    fn merge_adopts_valid_quorum_doc_and_rejects_bad_bundle() {
+        let now = 1_700_000_000;
+        let artifact = RecoveryArtifact::from_seed([5u8; 32]);
+        let master = artifact.master_pubkey_bundle();
+        let owner_id = master.identity_hash();
+        let owner_sk = artifact.master_signing_key();
+        let a = mint_master_device(&owner_sk, &master, 0x11, now);
+        let b = mint_master_device(&owner_sk, &master, 0x22, now);
+
+        // A valid quorum doc at a higher epoch is adopted.
+        let good = quorum_doc(1, &[a.clone(), b.clone()]);
+        let mut local = FleetKeyEpochDoc::default();
+        assert!(merge_fleet_keys_remote(
+            &mut local,
+            good.clone(),
+            &owner_id,
+            now
+        ));
+        assert_eq!(local.epoch, 1);
+        assert!(local.quorum_sig.is_some());
+
+        // A tampered quorum doc (extra sealed entry) at a higher epoch is rejected.
+        let mut tampered = quorum_doc(2, &[a, b]);
+        tampered
+            .sealed
+            .insert("intruder".to_string(), vec![0xEE; 8]);
+        assert!(!merge_fleet_keys_remote(
+            &mut local, tampered, &owner_id, now
+        ));
+        assert_eq!(local.epoch, 1, "tampered quorum doc did not clobber local");
     }
 
     #[test]
@@ -752,7 +824,7 @@ mod tests {
 
         // Missing files recover to defaults.
         assert_eq!(
-            load_doc_or_recover(&doc_path, &owner_id),
+            load_doc_or_recover(&doc_path, &owner_id, MERGE_NOW),
             FleetKeyEpochDoc::default()
         );
         assert!(load_replay_or_recover(&replay_path).is_empty());
@@ -769,13 +841,13 @@ mod tests {
             replay_path: replay_path.clone(),
         };
         crate::fleet_sync::FleetPersist::persist(&persist, &doc, &tracker).expect("persist");
-        assert_eq!(load_doc_or_recover(&doc_path, &owner_id), doc);
+        assert_eq!(load_doc_or_recover(&doc_path, &owner_id, MERGE_NOW), doc);
         assert_eq!(load_replay_or_recover(&replay_path), tracker);
 
         // Corrupt doc recovers to default rather than failing the boot.
         std::fs::write(&doc_path, [0xFF, 0x00]).expect("corrupt");
         assert_eq!(
-            load_doc_or_recover(&doc_path, &owner_id),
+            load_doc_or_recover(&doc_path, &owner_id, MERGE_NOW),
             FleetKeyEpochDoc::default()
         );
 
@@ -786,7 +858,7 @@ mod tests {
         forged.epoch = 99;
         crate::fleet_sync::FleetPersist::persist(&persist, &forged, &tracker).expect("persist");
         assert_eq!(
-            load_doc_or_recover(&doc_path, &owner_id),
+            load_doc_or_recover(&doc_path, &owner_id, MERGE_NOW),
             FleetKeyEpochDoc::default(),
             "tampered persisted doc must degrade to default"
         );

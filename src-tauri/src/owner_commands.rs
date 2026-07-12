@@ -2249,7 +2249,10 @@ mod revoke_tests {
                     move |l: &mut crate::fleet_key_epoch::FleetKeyEpochDoc, r| {
                         crate::fleet_sync::MergeOutcome {
                             changed: crate::fleet_key_epoch::merge_fleet_keys_remote(
-                                l, r, &owner_id,
+                                l,
+                                r,
+                                &owner_id,
+                                crate::fleet_key_epoch::now_unix_secs(),
                             ),
                         }
                     },

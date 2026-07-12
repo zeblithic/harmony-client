@@ -5815,6 +5815,7 @@ pub async fn start_node_inner(
                         crate::fleet_key_epoch::load_doc_or_recover(
                             &fleet_keys_doc_path,
                             &loaded.state.owner_id,
+                            crate::fleet_key_epoch::now_unix_secs(),
                         ),
                     ));
                     let fleet_keys_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -5842,6 +5843,7 @@ pub async fn start_node_inner(
                                                     local,
                                                     remote,
                                                     &fleet_keys_owner_id,
+                                                    crate::fleet_key_epoch::now_unix_secs(),
                                                 ),
                                         }
                                     },
