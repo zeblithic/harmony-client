@@ -995,6 +995,44 @@ fn build_fleet_handover_hex(
     }
 }
 
+/// ZEB-677 S4 (spec §5.4): a quorum-enrolled joiner mints its OWN vouches for
+/// each active sibling — the `enroll_via_quorum` direction; only the joiner
+/// holds its signing key, so it is the one to sign them. Added to the joiner's
+/// owner_state before persistence so they ride trust-sync (paired with the
+/// co-signer's reciprocal `Vouch`, they settle the trust graph). No-op unless
+/// the enrollment was quorum-issued (a master-issued cert is self-sufficient).
+fn mint_joiner_auto_vouches(
+    owner_state: &mut OwnerState,
+    our_sk: &SigningKey,
+    our_device_id: [u8; 16],
+    issuer_is_quorum: bool,
+    now: u64,
+) {
+    if !issuer_is_quorum {
+        return;
+    }
+    let owner_id = owner_state.owner_id;
+    for sibling in owner_state.active_devices(now, DEFAULT_ACTIVE_WINDOW_SECS) {
+        if sibling == our_device_id {
+            continue;
+        }
+        match harmony_owner::certs::VouchingCert::sign(
+            our_sk,
+            owner_id,
+            sibling,
+            harmony_owner::certs::Stance::Vouch,
+            now,
+        ) {
+            Ok(v) => {
+                if let Err(e) = owner_state.add_vouching(v) {
+                    tracing::warn!(error = %e, "joiner auto-vouch: add_vouching failed; skipped");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "joiner auto-vouch: sign failed; skipped"),
+        }
+    }
+}
+
 /// ZEB-677 S4: run the shared ENROLL finish for the seedless quorum path once
 /// the co-signed cert has arrived. Recomputes the joiner pubkey + the resident
 /// fleet-key handover from the (still-valid) ctx, then delegates to
@@ -1546,7 +1584,7 @@ async fn on_encrypted_payload(
                         return;
                     }
                 };
-            let owner_state: OwnerState = match ciborium::from_reader(state_bytes.as_slice()) {
+            let mut owner_state: OwnerState = match ciborium::from_reader(state_bytes.as_slice()) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = state_tx.send(PairingState::Failed {
@@ -1667,6 +1705,20 @@ async fn on_encrypted_payload(
 
             let our_sk = ctx.our_signing_key.take().expect("joiner has signing key");
             let our_device_id = our_pubkey.identity_hash();
+            // ZEB-677 S4 (spec §5.4): a quorum-enrolled joiner mints its OWN
+            // vouches for each active sibling before persistence, so they ride
+            // trust-sync (only the joiner holds its signing key). No-op for a
+            // master-issued enrollment — the master signature is the authority.
+            mint_joiner_auto_vouches(
+                &mut owner_state,
+                &our_sk,
+                our_device_id,
+                matches!(
+                    cert.issuer,
+                    harmony_owner::certs::EnrollmentIssuer::Quorum { .. }
+                ),
+                now,
+            );
             // See the Inviter side for rationale on send() error → Failed:
             // a closed channel here means the persistence drainer is gone,
             // and reporting Complete would tell the user pairing worked
@@ -1705,6 +1757,86 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
     use tokio::time::timeout;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn joiner_auto_vouches_active_siblings_only_for_quorum() {
+        let now = 1_700_000_000;
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key: a_sk,
+        } = mint_owner(now).unwrap();
+        let owner_id = state.owner_id;
+        let a_id = crate::owner_state::device_id_from_signing_key(&a_sk);
+        // Enroll sibling B via master + give A, B liveness so they are active.
+        let b_sk = SigningKey::generate(&mut OsRng);
+        let b_pk = PubKeyBundle::classical_only(b_sk.verifying_key().to_bytes());
+        let b_res = harmony_owner::lifecycle::enroll_via_master(
+            &state,
+            &recovery_artifact,
+            &b_sk,
+            b_pk,
+            now + 1,
+            DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .unwrap();
+        let b_id = b_res.enrollment_cert.device_id;
+        state
+            .add_enrollment(b_res.enrollment_cert, now + 1, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        for sk in [&a_sk, &b_sk] {
+            state
+                .add_liveness(
+                    harmony_owner::certs::LivenessCert::sign(sk, owner_id, now + 2).unwrap(),
+                )
+                .unwrap();
+        }
+        // The joiner is already enrolled in the owner_state it received (the
+        // inviter installed its cert before shipping) — add_vouching requires
+        // the signer be enrolled. No liveness → it is not an "active sibling".
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_res = harmony_owner::lifecycle::enroll_via_master(
+            &state,
+            &recovery_artifact,
+            &joiner_sk,
+            joiner_pk,
+            now + 1,
+            DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .unwrap();
+        let joiner_id = joiner_res.enrollment_cert.device_id;
+        state
+            .add_enrollment(
+                joiner_res.enrollment_cert,
+                now + 1,
+                DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
+
+        // Master-issued enrollment → no auto-vouches.
+        let mut master_case = state.clone();
+        mint_joiner_auto_vouches(&mut master_case, &joiner_sk, joiner_id, false, now + 3);
+        assert!(master_case.vouching.vouches_for(a_id).next().is_none());
+
+        // Quorum-issued → the joiner vouches each active sibling, never itself.
+        let mut quorum_case = state.clone();
+        mint_joiner_auto_vouches(&mut quorum_case, &joiner_sk, joiner_id, true, now + 3);
+        for sib in [a_id, b_id] {
+            assert!(
+                quorum_case
+                    .vouching
+                    .vouches_for(sib)
+                    .any(|v| v.signer == joiner_id),
+                "joiner should vouch sibling {}",
+                hex::encode(sib)
+            );
+        }
+        assert!(
+            quorum_case.vouching.vouches_for(joiner_id).next().is_none(),
+            "joiner never vouches itself"
+        );
+    }
 
     fn fixed_clock(t: u64) -> Arc<dyn Fn() -> u64 + Send + Sync> {
         Arc::new(move || t)
