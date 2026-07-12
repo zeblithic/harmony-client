@@ -114,12 +114,22 @@ pub(crate) fn plan_quorum_revocation_request(
                 .to_string(),
         );
     }
-    let cosigners = eligible_cosigners(trust, now_secs, self_id, target);
+    let mut cosigners = eligible_cosigners(trust, now_secs, self_id, target);
     if cosigners.is_empty() {
         return Err(
             "noQuorum: no other active device with a master-issued enrollment can co-sign"
                 .to_string(),
         );
+    }
+    // The merge drops requests whose per-device maps exceed
+    // MAX_QUORUM_SIG_ENTRIES (`within_caps`), so an uncapped candidate set
+    // in a 17+-device fleet would make the request unreplicable. Keep the
+    // most-recently-live candidates (Qodo PR #459 round 1).
+    if cosigners.len() > crate::owner_quorum_sync::MAX_QUORUM_SIG_ENTRIES {
+        cosigners.sort_by_key(|id| {
+            std::cmp::Reverse(trust.liveness.get(id).map(|l| l.timestamp).unwrap_or(0))
+        });
+        cosigners.truncate(crate::owner_quorum_sync::MAX_QUORUM_SIG_ENTRIES);
     }
     let owner_id = trust.owner_id;
     let mut initiator_sigs = std::collections::BTreeMap::new();
@@ -178,8 +188,15 @@ pub(crate) fn cosign_request_core(
             "expired: this request has expired — ask the other device to retry".to_string(),
         );
     }
-    if req.declined_by.contains(&self_hex) {
+    // Only VERIFIED declines count (a forged entry naming this device must
+    // not block its co-sign; a real decline from any eligible voter kills
+    // the request for everyone).
+    let decliners = crate::owner_quorum_sync::verified_decliners(trust, request_id, req);
+    if decliners.contains(&self_hex) {
         return Err("declined: this device already declined the request".to_string());
+    }
+    if !decliners.is_empty() {
+        return Err("declined: another device declined the request".to_string());
     }
     if req.signatures.contains_key(&self_hex) {
         return Ok(false);
@@ -259,10 +276,14 @@ pub(crate) fn cosign_request_core(
     Ok(true)
 }
 
-/// Doc-mutating core for decline. Returns `Ok(true)` when the tombstone
-/// was added, `Ok(false)` when already declined (idempotent).
+/// Doc-mutating core for decline: a SIGNED veto (unsigned entries never
+/// count — see `owner_quorum_sync::verified_decliners`). Returns
+/// `Ok(true)` when the tombstone was added, `Ok(false)` when already
+/// declined (idempotent).
 pub(crate) fn decline_request_core(
     doc: &mut QuorumReqDoc,
+    trust: &OwnerState,
+    device_signing_key: &ed25519_dalek::SigningKey,
     self_id: [u8; 16],
     request_id: &str,
 ) -> Result<bool, String> {
@@ -278,7 +299,13 @@ pub(crate) fn decline_request_core(
                 .to_string(),
         );
     }
-    Ok(req.declined_by.insert(self_hex))
+    if req.declined_by.contains_key(&self_hex) {
+        return Ok(false);
+    }
+    let payload = crate::owner_quorum_sync::decline_signing_payload(trust.owner_id, request_id);
+    let sig = harmony_owner::signing::sign_with_tag(device_signing_key, tags::REVOCATION, &payload);
+    req.declined_by.insert(self_hex, hex::encode(sig));
+    Ok(true)
 }
 
 /// Snapshot the resident handles the ceremony IPCs need. All three
@@ -360,15 +387,22 @@ pub(crate) async fn request_quorum_revocation_inner(
     )?;
     {
         let mut g = doc.lock().await;
+        // Sweep-on-write: settled residue (expired / already-revoked
+        // targets) must not trip the duplicate or cap checks below.
+        let now_ms = now_unix_ms();
+        crate::owner_quorum_sync::prune_settled_requests(&mut g, &trust_snapshot, now_ms);
         // One live request per target: a duplicate would double the banner
-        // on every sibling and complete idempotently anyway.
+        // on every sibling and complete idempotently anyway. A request
+        // dead under a VERIFIED decline doesn't block a retry.
         let QuorumRequestKind::Revocation { target_hex, .. } = &request.kind;
-        let duplicate = g.requests.values().any(|r| {
+        let duplicate = g.requests.iter().any(|(rid, r)| {
             let QuorumRequestKind::Revocation {
                 target_hex: existing,
                 ..
             } = &r.kind;
-            existing == target_hex && r.declined_by.is_empty() && now_unix_ms() <= r.expires_at_ms
+            existing == target_hex
+                && now_ms <= r.expires_at_ms
+                && crate::owner_quorum_sync::verified_decliners(&trust_snapshot, rid, r).is_empty()
         });
         if duplicate {
             return Err(
@@ -425,12 +459,19 @@ pub(crate) async fn decline_quorum_request_inner(
     emit: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
     request_id: String,
 ) -> Result<(), String> {
-    let (doc, engine, _trust_doc, dir) = snapshot_handles(state)?;
+    let (doc, engine, trust_doc, dir) = snapshot_handles(state)?;
     let loaded = load_keys(dir, keychain).await?;
     let self_id = crate::owner_state::device_id_from_signing_key(&loaded.device_signing_key);
+    let trust_snapshot = trust_doc.lock().await.clone();
     let declined = {
         let mut g = doc.lock().await;
-        decline_request_core(&mut g, self_id, &request_id)?
+        decline_request_core(
+            &mut g,
+            &trust_snapshot,
+            &loaded.device_signing_key,
+            self_id,
+            &request_id,
+        )?
     };
     if declined {
         engine.notify_dirty();
@@ -760,11 +801,8 @@ mod tests {
                 .unwrap_err()
                 .starts_with("ownRequest:")
         );
-        // Declined earlier.
-        {
-            let req = doc.requests.get_mut(&id).unwrap();
-            req.declined_by.insert(hex::encode(f.b_id));
-        }
+        // Declined earlier (a real, verifiable veto by B).
+        decline_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id).expect("decline");
         assert!(
             cosign_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id, NOW_MS + 20_000)
                 .unwrap_err()
@@ -801,15 +839,29 @@ mod tests {
     fn decline_core_tombstones_and_rejects_initiator() {
         let f = three_device_fleet();
         let (mut doc, id) = doc_with_request(&f);
-        assert!(decline_request_core(&mut doc, f.b_id, &id).expect("decline ok"));
-        assert!(doc.requests[&id].declined_by.contains(&hex::encode(f.b_id)));
+        assert!(
+            decline_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id).expect("decline ok")
+        );
+        // The tombstone is a VERIFIED veto (signed by B over the decline
+        // payload), not merely a raw map entry.
+        assert!(
+            crate::owner_quorum_sync::verified_decliners(&f.trust, &id, &doc.requests[&id])
+                .contains(&hex::encode(f.b_id))
+        );
         // Idempotent.
-        assert!(!decline_request_core(&mut doc, f.b_id, &id).expect("idempotent"));
-        assert!(decline_request_core(&mut doc, f.a_id, &id)
-            .unwrap_err()
-            .starts_with("ownRequest:"));
-        assert!(decline_request_core(&mut doc, f.b_id, "ff00")
-            .unwrap_err()
-            .starts_with("unknownRequest:"));
+        assert!(
+            !decline_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id).expect("idempotent")
+        );
+        // The initiator cannot decline its own request.
+        assert!(
+            decline_request_core(&mut doc, &f.trust, &f.a_sk, f.a_id, &id)
+                .unwrap_err()
+                .starts_with("ownRequest:")
+        );
+        assert!(
+            decline_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, "ff00")
+                .unwrap_err()
+                .starts_with("unknownRequest:")
+        );
     }
 }

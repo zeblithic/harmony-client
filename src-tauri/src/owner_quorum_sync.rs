@@ -21,8 +21,15 @@
 //! ## Merge discipline
 //!
 //! Requests are keyed by a 16-byte random id: unknown ids insert (bounded
-//! by `MAX_QUORUM_REQUESTS`); known ids union `initiator_sigs` /
-//! `signatures` / `declined_by` grow-only with existing entries winning.
+//! by `MAX_QUORUM_REQUESTS`, with an expiry-horizon sanity check); known
+//! ids union `initiator_sigs` / `signatures` / `declined_by`. The union is
+//! COMMUTATIVE: conflicting values for the same key resolve to the
+//! lexicographically smaller value, and caps are enforced by
+//! union-then-truncate in sorted key order — so every replica converges on
+//! the same set regardless of arrival order. (A hostile in-fleet writer
+//! can still plant garbage values — it holds the fleet keys — but garbage
+//! never verifies; enforcement lives in the signature checks, and the
+//! deterministic merge just guarantees replicas agree on WHAT they hold.)
 //! Identity fields (`kind`, initiator, timestamps) must match on re-merge
 //! or the remote copy is dropped with a warn — the id is random, so a
 //! mismatch is a tamper signal, not a race. `enroll_arms` cells are LWW on
@@ -33,6 +40,17 @@
 //! no explicit tombstone needed). Declined requests stay resident (dead,
 //! hidden from the co-sign UI) until expiry so a union re-merge from a
 //! device that never saw the decline cannot resurrect them as actionable.
+//!
+//! ## Declines are signed
+//!
+//! A decline permanently kills a request, and the whole point of the
+//! ceremony is removing a possibly-compromised device — so a decline must
+//! not be forgeable by the device being removed. `declined_by` maps
+//! decliner id → detached signature over `decline_signing_payload`, and a
+//! decline only COUNTS (`verified_decliners`) when the signature verifies
+//! against the decliner's enrolled key AND the decliner is an eligible
+//! voter: enrolled, master-issued, not revoked, and neither the request's
+//! target nor its initiator. Unverifiable entries are inert junk.
 
 use crate::fleet_sync::{FleetPersist, MergeOutcome, Merger, SyncError};
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
@@ -40,7 +58,7 @@ use crate::owner_state_types::Hlc;
 use ciborium::{from_reader, into_writer};
 use harmony_owner::certs::{RevocationCert, RevocationReason};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -71,6 +89,16 @@ pub const MAX_QUORUM_REQUESTS: usize = 32;
 /// fleet-size ceiling and bounds hostile growth.
 pub const MAX_QUORUM_SIG_ENTRIES: usize = 16;
 
+/// Clock-skew allowance when validating remote expiry stamps. A remote
+/// request may not claim an expiry beyond `now + TTL + skew` — otherwise
+/// 32 `u64::MAX`-expiry requests would exhaust `MAX_QUORUM_REQUESTS`
+/// forever (they'd never prune).
+pub const QUORUM_CLOCK_SKEW_MS: u64 = 60 * 60 * 1000;
+
+/// The S4 arm window is 15 minutes; the same horizon rule bounds hostile
+/// arm cells (window + skew).
+pub const QUORUM_ARM_HORIZON_MS: u64 = 15 * 60 * 1000 + QUORUM_CLOCK_SKEW_MS;
+
 /// What a pending request asks the fleet to co-sign. Revocation only in
 /// S3; the S4 enrollment ceremony adds its variant, and S5 threads the
 /// bundled next-epoch doc through `QuorumRequestSigs::epoch_doc_sig_hex`.
@@ -91,7 +119,8 @@ pub enum QuorumRequestKind {
 /// One device's detached signatures over a request's constituent payloads.
 /// One approval action yields all of them (spec §3). `epoch_doc_sig_hex`
 /// is the S5 slot (bundled epoch bump) — always `None` in S3.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// `Ord` backs the merge's deterministic conflict resolution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct QuorumRequestSigs {
     #[serde(rename = "e", default, skip_serializing_if = "Option::is_none")]
     pub epoch_doc_sig_hex: Option<String>,
@@ -108,10 +137,13 @@ pub struct QuorumRequest {
     /// Creation stamp — LWW metadata / display ordering only.
     #[serde(rename = "c")]
     pub created_at: Hlc,
-    /// Device-id hexes that declined. Grow-only; ANY decline tombstones
-    /// the request (spec §3) — it stays resident but dead until expiry.
-    #[serde(rename = "d", default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub declined_by: BTreeSet<String>,
+    /// decliner device-id hex → hex of its detached signature over
+    /// `decline_signing_payload` (see module docs). Grow-only; ANY
+    /// VERIFIED decline from an eligible voter tombstones the request
+    /// (spec §3) — it stays resident but dead until expiry. Unverified
+    /// entries never count.
+    #[serde(rename = "d", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub declined_by: BTreeMap<String, String>,
     /// Hex of the initiating device's 16-byte device id.
     #[serde(rename = "i")]
     pub initiator_hex: String,
@@ -181,6 +213,37 @@ fn same_identity(a: &QuorumRequest, b: &QuorumRequest) -> bool {
         && a.expires_at_ms == b.expires_at_ms
 }
 
+/// Commutative bounded map union: conflicting values for the same key
+/// resolve to the smaller value; the result is truncated to `cap` entries
+/// in sorted key order. Pure function of the two input maps — replicas
+/// converge regardless of merge order.
+fn union_bounded<V: Ord>(
+    existing: &mut BTreeMap<String, V>,
+    incoming: BTreeMap<String, V>,
+    cap: usize,
+) {
+    for (k, v) in incoming {
+        match existing.entry(k) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(v);
+            }
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                if v < *e.get() {
+                    e.insert(v);
+                }
+            }
+        }
+    }
+    while existing.len() > cap {
+        let last = existing
+            .keys()
+            .next_back()
+            .expect("non-empty over cap")
+            .clone();
+        existing.remove(&last);
+    }
+}
+
 /// Fold a remote quorum doc into local. Pure union — no pruning here (see
 /// module docs). Changed-detection is canonical-encode compare (docs are
 /// tiny), matching the trust-merge donor.
@@ -190,24 +253,27 @@ pub fn merge_quorum_remote_into_local(
 ) -> MergeOutcome {
     let before = crate::owner_state_crypto::canonical_cbor_encode(&*local).ok();
     // Real wall clock, like the trust merge: an expired remote request is
-    // never (re-)inserted, so a stale peer republishing one can't ping-pong
-    // it back after the local sweep pruned it.
+    // never (re-)inserted (a stale peer republishing one can't ping-pong
+    // it back after the local sweep pruned it), and a remote request may
+    // not claim an expiry beyond the TTL horizon (32 u64::MAX-expiry
+    // requests would otherwise exhaust the cap forever).
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let expiry_horizon = now_ms.saturating_add(QUORUM_REVOCATION_TTL_MS + QUORUM_CLOCK_SKEW_MS);
     for (id, req) in remote.requests {
         match local.requests.get_mut(&id) {
             None => {
                 if now_ms > req.expires_at_ms {
                     continue;
                 }
-                if !within_caps(&req) {
-                    tracing::warn!(request = %id, "quorum merge: over-cap request dropped");
+                if req.expires_at_ms > expiry_horizon {
+                    tracing::warn!(request = %id, "quorum merge: over-horizon expiry; dropped");
                     continue;
                 }
-                if local.requests.len() >= MAX_QUORUM_REQUESTS {
-                    tracing::warn!(request = %id, "quorum merge: request cap reached; dropped");
+                if !within_caps(&req) {
+                    tracing::warn!(request = %id, "quorum merge: over-cap request dropped");
                     continue;
                 }
                 local.requests.insert(id, req);
@@ -220,29 +286,45 @@ pub fn merge_quorum_remote_into_local(
                     );
                     continue;
                 }
-                // Grow-only unions; existing entries always win.
-                for (k, v) in req.initiator_sigs {
-                    if existing.initiator_sigs.len() >= MAX_QUORUM_SIG_ENTRIES {
-                        break;
-                    }
-                    existing.initiator_sigs.entry(k).or_insert(v);
-                }
-                for (k, v) in req.signatures {
-                    if existing.signatures.len() >= MAX_QUORUM_SIG_ENTRIES {
-                        break;
-                    }
-                    existing.signatures.entry(k).or_insert(v);
-                }
-                for d in req.declined_by {
-                    if existing.declined_by.len() >= MAX_QUORUM_SIG_ENTRIES {
-                        break;
-                    }
-                    existing.declined_by.insert(d);
-                }
+                union_bounded(
+                    &mut existing.initiator_sigs,
+                    req.initiator_sigs,
+                    MAX_QUORUM_SIG_ENTRIES,
+                );
+                union_bounded(
+                    &mut existing.signatures,
+                    req.signatures,
+                    MAX_QUORUM_SIG_ENTRIES,
+                );
+                union_bounded(
+                    &mut existing.declined_by,
+                    req.declined_by,
+                    MAX_QUORUM_SIG_ENTRIES,
+                );
             }
         }
     }
+    // Deterministic request-count cap: union-then-truncate in sorted id
+    // order, so replicas keep the SAME 32 requests whatever the arrival
+    // order was. (An in-fleet flooder can evict — it holds the fleet keys
+    // and could equally flood any dataset; the bound is resource hygiene,
+    // not a security boundary.)
+    while local.requests.len() > MAX_QUORUM_REQUESTS {
+        let last = local
+            .requests
+            .keys()
+            .next_back()
+            .expect("non-empty over cap")
+            .clone();
+        tracing::warn!(request = %last, "quorum merge: request cap reached; evicted");
+        local.requests.remove(&last);
+    }
     for (armer, arm) in remote.enroll_arms {
+        // Horizon rule for arm cells too (15-min window + skew).
+        if arm.armed_until_ms > now_ms.saturating_add(QUORUM_ARM_HORIZON_MS) {
+            tracing::warn!(armer = %armer, "quorum merge: over-horizon arm cell; dropped");
+            continue;
+        }
         match local.enroll_arms.get(&armer) {
             Some(cur) if !arm.set_at.is_strictly_newer_than(&cur.set_at) => {}
             _ => {
@@ -322,6 +404,71 @@ pub fn revocation_pair_payload(
     pair.sort();
     RevocationCert::quorum_signing_payload_bytes(owner_id, target, issued_at, reason, &pair)
         .map_err(|e| format!("quorum pair payload: {e}"))
+}
+
+/// Domain-separated payload a decliner signs to veto a request (module
+/// docs: declines must not be forgeable). The prefix cannot collide with
+/// the crate's canonical-CBOR cert payloads (those start with a CBOR map
+/// header byte), and the owner id + request id bind the veto to exactly
+/// one ceremony.
+pub fn decline_signing_payload(owner_id: [u8; 16], request_id_hex: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 + 16 + request_id_hex.len());
+    buf.extend_from_slice(b"harmony-zeb677-quorum-decline-v1");
+    buf.extend_from_slice(&owner_id);
+    buf.extend_from_slice(request_id_hex.as_bytes());
+    buf
+}
+
+/// The decliner ids whose veto COUNTS for this request: entry signature
+/// verifies over `decline_signing_payload` against the decliner's enrolled
+/// key, and the decliner is an eligible voter — enrolled, Master-issued,
+/// not revoked, and neither the target nor the initiator (the device being
+/// removed must never veto its own removal; the initiator cancels by
+/// letting the request expire, not by declining).
+pub fn verified_decliners(
+    trust: &harmony_owner::state::OwnerState,
+    request_id_hex: &str,
+    req: &QuorumRequest,
+) -> std::collections::BTreeSet<String> {
+    let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind;
+    let payload = decline_signing_payload(trust.owner_id, request_id_hex);
+    req.declined_by
+        .iter()
+        .filter(|(id_hex, sig_hex)| {
+            if **id_hex == req.initiator_hex || *id_hex == target_hex {
+                return false;
+            }
+            let Ok(id) = parse_device_id_hex(id_hex) else {
+                return false;
+            };
+            if trust.is_revoked(id) {
+                return false;
+            }
+            let Some(cert) = trust.enrollments.get(&id) else {
+                return false;
+            };
+            if !crate::owner_quorum_commands::is_master_issued(cert) {
+                return false;
+            }
+            let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(
+                &cert.device_pubkeys.classical.ed25519_verify,
+            ) else {
+                return false;
+            };
+            let Ok(sig) = hex::decode(sig_hex) else {
+                return false;
+            };
+            harmony_owner::signing::verify_with_tag(
+                &vk,
+                harmony_owner::signing::tags::REVOCATION,
+                &payload,
+                &sig,
+                "Revocation-Quorum-Decline",
+            )
+            .is_ok()
+        })
+        .map(|(id_hex, _)| id_hex.clone())
+        .collect()
 }
 
 /// Save the doc atomically (schema byte + canonical CBOR).
@@ -549,10 +696,13 @@ pub async fn run_quorum_sweep(
         let pruned = prune_settled_requests(&mut doc, &trust_snapshot, now_ms);
         let mut candidates = Vec::new();
         for (id, req) in doc.requests.iter() {
-            if req.initiator_hex != self_hex
-                || now_ms > req.expires_at_ms
-                || !req.declined_by.is_empty()
-            {
+            if req.initiator_hex != self_hex || now_ms > req.expires_at_ms {
+                continue;
+            }
+            // ANY verified decline tombstones the request (unverified
+            // entries are forgeable junk and never block — the target
+            // must not be able to veto its own removal).
+            if !verified_decliners(&trust_snapshot, id, req).is_empty() {
                 continue;
             }
             if let Some(cert) =
@@ -594,15 +744,24 @@ pub async fn run_quorum_sweep(
         .await;
         match applied {
             Ok(Ok(())) => {
-                if let Err(e) = trust_engine.flush_now().await {
-                    tracing::warn!(error = %e,
-                        "quorum sweep: trust flush failed; dirty latch will retry");
-                }
                 emit("owner-devices-updated");
                 if let Some(tx) = retire_nudge {
                     let _ = tx.try_send(());
                 }
-                completed.push(cand.request_id);
+                // The request is the ceremony's only retry source — retire
+                // it ONLY once the revocation is durably flushed. On flush
+                // failure the request stays resident; the dirty latch
+                // retries the publish+persist, and the next sweep prunes
+                // via the revoked-target predicate once the trust doc
+                // carries the revocation durably.
+                match trust_engine.flush_now().await {
+                    Ok(()) => completed.push(cand.request_id),
+                    Err(e) => {
+                        tracing::warn!(error = %e, request = %cand.request_id,
+                            "quorum sweep: trust flush failed; request retained until the \
+                             revocation is durable (dirty latch retries)");
+                    }
+                }
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, request = %cand.request_id,
@@ -636,10 +795,19 @@ pub async fn run_quorum_sweep(
     }
 }
 
+/// Cadence of the fallback expiry sweep — without it, expired requests
+/// and arms would linger (consuming the request cap) whenever no inbound
+/// merge arrives to nudge the task.
+const QUORUM_SWEEP_INTERVAL_SECS: u64 = 60;
+
 /// The quorum engine's `on_applied` consumer: each nudge (an inbound merge
 /// that changed the doc, or the one boot tick) runs a completion sweep and
-/// then tells the UI the pending-request surface changed. The boot tick
-/// covers signatures that accumulated while this device was offline.
+/// then tells the UI the pending-request surface changed. A 60-second
+/// interval backstops TTL expiry when no merges arrive; interval ticks
+/// only emit when the sweep actually changed the doc (no idle refresh
+/// spam). The boot tick covers signatures that accumulated while this
+/// device was offline. Exits when every nudge sender is dropped (engine
+/// shutdown).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_quorum_applied_task(
     mut nudge_rx: tokio::sync::mpsc::Receiver<()>,
@@ -653,11 +821,21 @@ pub fn spawn_quorum_applied_task(
     retire_nudge: Option<tokio::sync::mpsc::Sender<()>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while nudge_rx.recv().await.is_some() {
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_secs(QUORUM_SWEEP_INTERVAL_SECS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let from_nudge = tokio::select! {
+                n = nudge_rx.recv() => match n {
+                    Some(()) => true,
+                    None => break,
+                },
+                _ = tick.tick() => false,
+            };
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-            run_quorum_sweep(
+            let outcome = run_quorum_sweep(
                 &quorum_doc,
                 &quorum_engine,
                 &trust_doc,
@@ -670,7 +848,9 @@ pub fn spawn_quorum_applied_task(
                 now.as_millis() as u64,
             )
             .await;
-            emit("owner-quorum-updated");
+            if from_nudge || outcome.doc_changed {
+                emit("owner-quorum-updated");
+            }
         }
     })
 }
@@ -701,7 +881,7 @@ mod tests {
     fn test_request(initiator: &str, target: &str) -> QuorumRequest {
         QuorumRequest {
             created_at: hlc(NOW_MS, initiator),
-            declined_by: BTreeSet::new(),
+            declined_by: BTreeMap::new(),
             initiator_hex: initiator.to_string(),
             kind: QuorumRequestKind::Revocation {
                 reason: "lost".to_string(),
@@ -780,7 +960,11 @@ mod tests {
         let mut remote_c = QuorumReqDoc::default();
         let mut req_c = base.clone();
         req_c.signatures.insert("cc".repeat(16), sigs("c-sig"));
-        req_c.declined_by.insert("dd".repeat(16));
+        // Value is opaque here — this test exercises the raw CRDT union, not
+        // signature verification (that lives in `verified_decliners`).
+        req_c
+            .declined_by
+            .insert("dd".repeat(16), "unverified-sig".to_string());
         remote_c.requests.insert(id.clone(), req_c);
 
         assert!(merge_quorum_remote_into_local(&mut local, remote_b).changed);
@@ -791,25 +975,44 @@ mod tests {
     }
 
     #[test]
-    fn merge_never_overwrites_existing_entries() {
+    fn merge_is_commutative_on_conflicting_values() {
+        // Two replicas can only hold DIFFERENT values for the same signature
+        // key via tampering: an honest ed25519 co-signature over the fixed
+        // pair payload is byte-identical everywhere (RFC 8032 deterministic
+        // nonces), so honest replicas never conflict on a key. When a
+        // conflict does arise, the union must converge to the SAME value
+        // regardless of merge order (smaller value wins). The tampered value
+        // is harmless — it fails `verify_with_tag` at assembly and can never
+        // forge a revocation.
         let id = "ab".repeat(16);
-        let mut base = test_request(&"11".repeat(16), &"22".repeat(16));
-        base.signatures.insert("bb".repeat(16), sigs("original"));
-        let mut local = QuorumReqDoc::default();
-        local.requests.insert(id.clone(), base.clone());
+        let base = test_request(&"11".repeat(16), &"22".repeat(16));
+        let key = "bb".repeat(16);
+        let doc_with = |sig: &str| {
+            let mut d = QuorumReqDoc::default();
+            let mut r = base.clone();
+            r.signatures.insert(key.clone(), sigs(sig));
+            d.requests.insert(id.clone(), r);
+            d
+        };
 
-        let mut remote = QuorumReqDoc::default();
-        let mut req = base.clone();
-        req.signatures
-            .insert("bb".repeat(16), sigs("attacker-swap"));
-        remote.requests.insert(id.clone(), req);
+        // merge(original, swap) and merge(swap, original) must agree.
+        let mut ab = doc_with("original");
+        merge_quorum_remote_into_local(&mut ab, doc_with("attacker-swap"));
+        let mut ba = doc_with("attacker-swap");
+        merge_quorum_remote_into_local(&mut ba, doc_with("original"));
 
-        let outcome = merge_quorum_remote_into_local(&mut local, remote);
-        assert!(!outcome.changed);
         assert_eq!(
-            local.requests[&id].signatures[&"bb".repeat(16)].primary_sig_hex,
-            "original"
+            ab.requests[&id].signatures, ba.requests[&id].signatures,
+            "union must be commutative regardless of arrival order"
         );
+        // Deterministic tiebreak: smaller value wins ("attacker-swap" < "original").
+        assert_eq!(
+            ab.requests[&id].signatures[&key].primary_sig_hex,
+            "attacker-swap"
+        );
+        // Identical values (the honest case) never register as a change.
+        let mut same = doc_with("original");
+        assert!(!merge_quorum_remote_into_local(&mut same, doc_with("original")).changed);
     }
 
     #[test]
@@ -928,9 +1131,13 @@ mod tests {
         // Live request against a soon-revoked target.
         doc.requests
             .insert("bb".repeat(16), test_request(&"11".repeat(16), &victim_hex));
-        // Declined-but-unexpired request: retained.
+        // Declined-but-unexpired request: retained. (Prune ignores
+        // `declined_by` entirely — retention is by expiry/revoked-target — so
+        // the signature value is irrelevant here.)
         let mut declined = test_request(&"11".repeat(16), &target_hex);
-        declined.declined_by.insert("22".repeat(16));
+        declined
+            .declined_by
+            .insert("22".repeat(16), "unverified-sig".to_string());
         doc.requests.insert("cc".repeat(16), declined);
         // Malformed target: dropped.
         doc.requests.insert(
@@ -1335,10 +1542,10 @@ mod tests {
         // B declines.
         {
             let mut doc_b = pair.b.quorum_doc.lock().await;
-            assert!(
-                crate::owner_quorum_commands::decline_request_core(&mut doc_b, f.b_id, &id)
-                    .expect("decline")
-            );
+            assert!(crate::owner_quorum_commands::decline_request_core(
+                &mut doc_b, &f.trust, &f.b_sk, f.b_id, &id,
+            )
+            .expect("decline"));
         }
         pair.b.quorum_engine.notify_dirty();
 
@@ -1711,12 +1918,13 @@ mod tests {
     async fn sweep_never_assembles_foreign_declined_or_expired_requests() {
         let f = sweep_fleet();
         let (mut doc, id) = planned_and_cosigned(&f);
-        // Declined: tombstoned even with a valid signature present.
-        doc.requests
-            .get_mut(&id)
-            .unwrap()
-            .declined_by
-            .insert(hex::encode(f.b_id));
+        // Declined: tombstoned even with a valid signature present. B's
+        // decline is a real, verifiable veto (the sweep skips only VERIFIED
+        // declines).
+        crate::owner_quorum_commands::decline_request_core(
+            &mut doc, &f.trust, &f.b_sk, f.b_id, &id,
+        )
+        .expect("b declines");
         // Expired copy under another id: pruned without assembly.
         let mut expired = doc.requests[&id].clone();
         expired.declined_by.clear();

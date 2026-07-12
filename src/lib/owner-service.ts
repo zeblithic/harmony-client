@@ -16,16 +16,20 @@ export interface OwnerStateView {
   /**
    * ZEB-677 S3: whether THIS device holds the master seed. Same value as
    * `canBackUp` today; kept distinct because their semantics diverge —
-   * this one gates the quorum-ceremony surfaces.
+   * this one gates the quorum-ceremony surfaces. Optional: a stale backend
+   * predating S3 omits every quorum field (read as `=== true`).
    */
-  selfIsMaster: boolean;
+  selfIsMaster?: boolean;
   /**
-   * ZEB-677 S3: pending quorum co-sign requests (unexpired). May be
-   * undefined against a stale backend — read through `?? []`.
+   * ZEB-677 S3: pending quorum co-sign requests (unexpired). Optional: a
+   * stale backend omits it — read through `?? []`.
    */
-  quorumRequests: QuorumRequestView[];
-  /** ZEB-677 S3 (S4 arm flow surface): wall-ms the arm window closes. */
-  quorumArmedUntilMs: number | null;
+  quorumRequests?: QuorumRequestView[];
+  /**
+   * ZEB-677 S3 (S4 arm flow surface): wall-ms the arm window closes.
+   * Optional: a stale backend omits it.
+   */
+  quorumArmedUntilMs?: number | null;
 }
 
 /**
@@ -90,8 +94,9 @@ export interface DeviceView {
    * ZEB-677 S3: this sibling row may be removed via the quorum co-sign
    * ceremony (master seed absent here; this device + one other active
    * sibling hold master-issued certs). Always false on seed-holders.
+   * Optional: a stale backend omits it — read as `=== true`.
    */
-  quorumRemovable: boolean;
+  quorumRemovable?: boolean;
 }
 
 /** ZEB-668 S2: the three UI-selectable revocation reasons (spec §3). */

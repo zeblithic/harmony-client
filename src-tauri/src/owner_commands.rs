@@ -450,8 +450,11 @@ fn build_owner_state_view(
                 &r.kind;
             let initiated_by_me = r.initiator_hex == this_device_hex;
             let signed_by_me = r.signatures.contains_key(&this_device_hex);
-            let declined_by_me = r.declined_by.contains(&this_device_hex);
-            let declined = !r.declined_by.is_empty();
+            // Only VERIFIED declines surface (an unverifiable entry is
+            // forgeable junk and must not render the request as dead).
+            let decliners = crate::owner_quorum_sync::verified_decliners(&loaded.state, id, r);
+            let declined_by_me = decliners.contains(&this_device_hex);
+            let declined = !decliners.is_empty();
             let target_is_me = *target_hex == this_device_hex;
             let target_revoked = crate::owner_quorum_sync::parse_device_id_hex(target_hex)
                 .map(|t| loaded.state.is_revoked(t))
@@ -2694,9 +2697,20 @@ mod revoke_tests {
             .doc
             .requests
             .insert("02".repeat(16), mk_request(a_id, &[b_id], now_ms + 1000));
-        // Declined request → dead for co-sign.
+        // Declined request → dead for co-sign. A (this device) was asked to
+        // co-sign and vetoed instead; the decline is a VERIFIED signature (an
+        // unverifiable entry would not surface as declined).
         let mut declined = mk_request(b_id, &[a_id], now_ms + 1000);
-        declined.declined_by.insert(hex::encode(b_id));
+        let decline_payload =
+            crate::owner_quorum_sync::decline_signing_payload(state.owner_id, &"03".repeat(16));
+        let decline_sig = harmony_owner::signing::sign_with_tag(
+            &a_sk,
+            harmony_owner::signing::tags::REVOCATION,
+            &decline_payload,
+        );
+        declined
+            .declined_by
+            .insert(a_hex.clone(), hex::encode(decline_sig));
         quorum.doc.requests.insert("03".repeat(16), declined);
         // Already signed by A → cosignerSigned, not canCosign.
         let mut signed = mk_request(b_id, &[a_id], now_ms + 1000);

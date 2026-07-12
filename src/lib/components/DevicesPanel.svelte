@@ -468,6 +468,16 @@
   // or completing must surface without a panel reopen.
   let unlistenDevicesUpdated: (() => void) | null = null;
   let unlistenQuorumUpdated: (() => void) | null = null;
+  // Teardown of a Tauri unlisten handle must never throw mid-sequence: if the
+  // first handle threw, the second would leak (stale refresh callbacks firing
+  // after unmount). Swallow — the listener is being discarded regardless.
+  function safeUnlisten(fn: (() => void) | null | undefined) {
+    try {
+      fn?.();
+    } catch {
+      /* ignore — teardown errors are non-fatal */
+    }
+  }
   onMount(() => {
     let cancelled = false;
     const refresh = () => {
@@ -479,7 +489,7 @@
     listen('owner-devices-updated', refresh)
       .then((unlisten) => {
         if (cancelled) {
-          unlisten();
+          safeUnlisten(unlisten);
           return;
         }
         unlistenDevicesUpdated = unlisten;
@@ -490,7 +500,7 @@
     listen('owner-quorum-updated', refresh)
       .then((unlisten) => {
         if (cancelled) {
-          unlisten();
+          safeUnlisten(unlisten);
           return;
         }
         unlistenQuorumUpdated = unlisten;
@@ -503,9 +513,9 @@
     };
   });
   onDestroy(() => {
-    unlistenDevicesUpdated?.();
+    safeUnlisten(unlistenDevicesUpdated);
     unlistenDevicesUpdated = null;
-    unlistenQuorumUpdated?.();
+    safeUnlisten(unlistenQuorumUpdated);
     unlistenQuorumUpdated = null;
   });
 
