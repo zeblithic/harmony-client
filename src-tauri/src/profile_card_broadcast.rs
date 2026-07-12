@@ -8,7 +8,7 @@ use crate::owner_state_crypto::{
 };
 use crate::owner_state_types::Hlc;
 use ed25519_dalek::{Signer, SigningKey};
-use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
+use harmony_owner::certs::EnrollmentCert;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -64,6 +64,14 @@ pub struct ProfileCardBroadcast {
         deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
     )]
     pub signature: [u8; 64],
+    /// ZEB-677: Master-issued signer certs backing a Quorum-issued
+    /// `enrollment`. Empty for Master-issued certs (key omitted on the wire;
+    /// old peers ignore it). Unlike the deposit frames, this field sits
+    /// INSIDE the card's whole-struct signature — the presenting side must
+    /// populate it before `sign_card`, and old cards (empty default) still
+    /// verify because signer and verifier encode identically.
+    #[serde(rename = "eb", default, skip_serializing_if = "Vec::is_empty")]
+    pub signer_certs: Vec<EnrollmentCert>,
 }
 
 impl CanonicalPayloadSealed for ProfileCardBroadcast {}
@@ -86,7 +94,9 @@ pub enum CardError {
 
 /// Build + Ed25519-sign a card over canonical CBOR with `signature` zeroed.
 /// `signer` MUST be the enrolled device key (pub ==
-/// `enrollment.device_pubkeys.classical.ed25519_verify`).
+/// `enrollment.device_pubkeys.classical.ed25519_verify`). For Master-issued
+/// certs (every self-cert today); a Quorum-issued cert needs
+/// [`sign_card_with_bundle`] so peers can verify it (ZEB-677).
 #[allow(clippy::too_many_arguments)]
 pub fn sign_card(
     signer: &SigningKey,
@@ -96,6 +106,34 @@ pub fn sign_card(
     avatar_cid: Option<[u8; 32]>,
     profile_page_root: Option<[u8; 32]>,
     enrollment: EnrollmentCert,
+    shared_at: Hlc,
+) -> Result<ProfileCardBroadcast, CardError> {
+    sign_card_with_bundle(
+        signer,
+        owner_id,
+        display_name,
+        status_text,
+        avatar_cid,
+        profile_page_root,
+        enrollment,
+        Vec::new(),
+        shared_at,
+    )
+}
+
+/// [`sign_card`] with a signer-cert bundle for Quorum-issued `enrollment`
+/// certs (ZEB-677). The bundle sits inside the card's whole-struct
+/// signature, so it is bound at sign time.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_card_with_bundle(
+    signer: &SigningKey,
+    owner_id: [u8; 16],
+    display_name: String,
+    status_text: String,
+    avatar_cid: Option<[u8; 32]>,
+    profile_page_root: Option<[u8; 32]>,
+    enrollment: EnrollmentCert,
+    signer_certs: Vec<EnrollmentCert>,
     shared_at: Hlc,
 ) -> Result<ProfileCardBroadcast, CardError> {
     // Fail-fast on cert/owner + signer/key binding so we never emit a card that
@@ -121,6 +159,7 @@ pub fn sign_card(
         enrollment,
         shared_at,
         signature: [0u8; 64],
+        signer_certs,
     };
     let bytes = canonical_cbor_encode(&card)?;
     card.signature = signer.sign(&bytes).to_bytes();
@@ -163,20 +202,22 @@ pub fn verify_card(
     if card.status_text.len() > MAX_STATUS_TEXT_BYTES {
         return Err(CardVerifyError::StatusTextTooLong);
     }
-    card.enrollment
-        .verify(now_secs)
-        .map_err(|_| CardVerifyError::EnrollmentCertInvalid)?;
-    // Reject non-Master issuers: the profile card path cannot fully verify
-    // Quorum signatures, and cert.verify() only structurally-checks them
-    // (mirrors enrolled_key_from_cert in community_membership.rs).
-    if !matches!(card.enrollment.issuer, EnrollmentIssuer::Master { .. }) {
-        return Err(CardVerifyError::EnrollmentCertInvalid);
-    }
-    if card.enrollment.owner_id != card.owner_id {
-        return Err(CardVerifyError::EnrollmentOwnerMismatch);
-    }
-    let device_ed25519 = card.enrollment.device_pubkeys.classical.ed25519_verify;
-    let vk = ed25519_dalek::VerifyingKey::from_bytes(&device_ed25519)
+    // ZEB-677: chokepoint verification — Master certs self-contained; Quorum
+    // certs against the card's signer-cert bundle (depth-1). No-bundle
+    // quorum certs still fail closed.
+    let verified = crate::enrollment_verify::verify_enrollment_any_issuer(
+        &card.enrollment,
+        &card.signer_certs,
+        Some(&card.owner_id),
+        now_secs,
+    )
+    .map_err(|e| match e {
+        crate::enrollment_verify::EnrollmentVerifyError::OwnerMismatch => {
+            CardVerifyError::EnrollmentOwnerMismatch
+        }
+        _ => CardVerifyError::EnrollmentCertInvalid,
+    })?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&verified.device_ed25519)
         .map_err(|_| CardVerifyError::SignatureInvalid)?;
     let mut for_sig = card.clone();
     for_sig.signature = [0u8; 64];
@@ -950,6 +991,7 @@ mod tests {
     fn no_avatar_card_is_byte_identical_to_pre_field_encoding() {
         let owner = crate::community_membership::mint_test_owner(0x5B);
         let card = ProfileCardBroadcast {
+            signer_certs: Vec::new(),
             owner_id: owner.owner.0,
             display_name: "Bo".into(),
             status_text: "".into(),
@@ -1135,13 +1177,16 @@ mod tests {
     }
 
     #[test]
-    fn verify_card_rejects_non_master_issuer() {
+    fn verify_card_rejects_quorum_without_bundle() {
         use harmony_owner::{
             certs::{EnrollmentCert, EnrollmentIssuer},
             pubkey_bundle::{ClassicalKeys, PubKeyBundle},
         };
-        // Build a structurally-valid Quorum cert that passes cert.verify() but
-        // should be rejected by verify_card (only Master certs accepted).
+        // Build a structurally-valid Quorum cert that passes cert.verify()'s
+        // structural branch. Without a signer-cert bundle on the card, the
+        // quorum part signatures cannot be verified — must be rejected
+        // (ZEB-677: the old blanket non-Master rejection narrowed to the
+        // no-bundle case; see verify_card_accepts_quorum_with_bundle).
         let device_sk = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
         let device_bundle = PubKeyBundle {
             classical: ClassicalKeys {
@@ -1188,6 +1233,47 @@ mod tests {
             verify_card(&card, 0),
             Err(CardVerifyError::EnrollmentCertInvalid)
         ));
+    }
+
+    /// ZEB-677: a card whose enrollment is a genuine Quorum-issued cert
+    /// verifies when it carries the Master-issued signer-cert bundle
+    /// (signed into the card, so it is tamper-bound).
+    #[test]
+    fn verify_card_accepts_quorum_with_bundle() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xA8);
+        let card = sign_card_with_bundle(
+            &world.c_sk,
+            world.owner_id,
+            "quorum device".into(),
+            "".into(),
+            None,
+            None,
+            world.c_quorum_cert.clone(),
+            world.bundle.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .expect("sign card with quorum cert + bundle");
+        let owner = verify_card(&card, WORLD_NOW).expect("quorum card with bundle verifies");
+        assert_eq!(owner, world.owner_id);
+
+        // Stripping the bundle breaks BOTH the quorum verification and the
+        // card signature (the bundle is inside the signed bytes).
+        let mut stripped = card.clone();
+        stripped.signer_certs = Vec::new();
+        assert!(verify_card(&stripped, WORLD_NOW).is_err());
+
+        // Serde: absent key decodes to empty (old encoders), populated
+        // bundle round-trips.
+        let bytes = canonical_cbor_encode(&card).expect("encode");
+        let back: ProfileCardBroadcast =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(back.signer_certs, world.bundle);
+        assert_eq!(card, back);
     }
 
     #[test]

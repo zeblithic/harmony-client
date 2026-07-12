@@ -287,6 +287,7 @@ impl CommunityRelayPullDriver {
             .to_bytes()
             .to_vec();
         RelayPullQuery {
+            signer_certs_cbor: Vec::new(),
             recipient_owner: self.self_owner,
             community_id: *community,
             requester_enrollment_cert: self.enrollment_cert_bytes.clone(),
@@ -311,6 +312,7 @@ impl CommunityRelayPullDriver {
                 .to_bytes()
                 .to_vec();
             RelayPullAckFrame {
+                signer_certs_cbor: Vec::new(),
                 recipient_owner: self_owner,
                 community_id: community,
                 requester_enrollment_cert: cert.clone(),

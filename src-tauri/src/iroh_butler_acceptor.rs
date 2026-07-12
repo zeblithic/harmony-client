@@ -58,7 +58,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ed25519_dalek::{Signature, VerifyingKey};
 use harmony_content::cid::{ContentFlags, ContentId};
-use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
+use harmony_owner::certs::EnrollmentCert;
 use iroh::endpoint::Connection;
 
 use crate::butler_deposit::{
@@ -441,6 +441,23 @@ fn decode_enrollment_cert_strict(bytes: &[u8]) -> Result<EnrollmentCert, Deposit
     Ok(cert)
 }
 
+/// ZEB-677: strict decode of the frame's `signer_certs_cbor` bundle (canonical
+/// CBOR of `Vec<EnrollmentCert>`; empty bytes ⇒ empty bundle — the wire omits
+/// the key for Master-issued certs). Same trailing-byte discipline as
+/// [`decode_enrollment_cert_strict`].
+fn decode_signer_certs_strict(bytes: &[u8]) -> Result<Vec<EnrollmentCert>, DepositReject> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cursor = std::io::Cursor::new(bytes);
+    let certs: Vec<EnrollmentCert> =
+        ciborium::from_reader(&mut cursor).map_err(|_| DepositReject::BadCert)?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(DepositReject::BadCert);
+    }
+    Ok(certs)
+}
+
 /// ZEB-424 (D27): does the butler share a LIVE group-DM space with
 /// `sender_owner`? Pure scan over the replicated `OwnerState.spaces` — the
 /// same state step-1 admission already reads the friend graph from. A match
@@ -528,42 +545,42 @@ pub async fn handle_deposit_core(
     };
 
     // Step 2 — decode + verify the sender device's EnrollmentCert and bind
-    // its issuing master to the admitted identity: internally valid,
-    // Master-issued, owner id == frame.sender_owner, and the issuing master
+    // its issuing master to the admitted identity: internally valid (Master
+    // self-contained, or Quorum against the presented signer bundle,
+    // ZEB-677), owner id == frame.sender_owner, and the master anchor
     // satisfies the admission-path binding below (friend path → byte-for-byte
     // pin against the friend graph's stored master; co-member path → the
     // owner-id-derived anchor, D29.1 — both are the trust anchor for their
     // path).
     let cert = decode_enrollment_cert_strict(&frame.sender_enrollment_cert)?;
-    cert.verify(ctx.now_secs())
-        .map_err(|_| DepositReject::BadCert)?;
-    let cert_master = match &cert.issuer {
-        EnrollmentIssuer::Master { master_pubkey } => master_pubkey.classical.ed25519_verify,
-        // cert.verify() only structurally checks Quorum certs (it cannot
-        // verify quorum signatures without an OwnerState walk-back), so a
-        // non-Master issuer is rejected outright — mirrors
-        // `iroh_friend_acceptor::verify_enrolled_device`.
-        _ => return Err(DepositReject::BadCert),
-    };
-    if cert.owner_id != frame.sender_owner {
-        return Err(DepositReject::BadCert);
-    }
+    let signer_certs = decode_signer_certs_strict(&frame.signer_certs_cbor)?;
+    // ZEB-677: chokepoint verification — Master certs self-contained; Quorum
+    // certs against the frame's signer-cert bundle (depth-1). Returns the
+    // enrolled device key + the master anchor (from the bundle for quorum).
+    let verified = crate::enrollment_verify::verify_enrollment_any_issuer(
+        &cert,
+        &signer_certs,
+        Some(&frame.sender_owner),
+        ctx.now_secs(),
+    )
+    .map_err(|_| DepositReject::BadCert)?;
+    let cert_master = verified.master_ed25519;
     // Master binding (D29.1): the friend path keeps its byte-for-byte pin
     // against the stored master; the co-member path derives the anchor from
     // the owner id (the owner id IS the hash of the master bundle —
     // `owner_id_from_master_ed25519`; the invariant
-    // `iroh_friend_acceptor::master_ed25519_from_cert_matches_owner_id` pins it).
+    // `iroh_friend_acceptor::verified_master_anchor_matches_owner_id` pins it).
     //
-    // Both branches are defense-in-depth: `cert.verify()` above already
-    // rejects `hash(master) != owner_id` (the `EnrollmentCertInvalid` taxonomy
-    // in community_membership.rs), and we already require `cert.owner_id ==
-    // sender_owner`, so any cert reaching here necessarily satisfies the
-    // derived check. We keep an EXPLICIT per-variant pin anyway — the friend
-    // branch as the long-standing trust anchor, the co-member branch to make
-    // that anchor self-evident and resilient if `verify`'s internal
-    // owner_id↔master binding ever moves. Neither is expected to be a live
-    // rejection path for a well-formed cert; that's why a forged-master unit
-    // test is intentionally omitted (such a cert can't pass `verify()`).
+    // Both branches are defense-in-depth: the chokepoint verification above
+    // already rejects `hash(master) != owner_id` (per signer cert for the
+    // quorum path), and binds `cert.owner_id == sender_owner`, so any cert
+    // reaching here necessarily satisfies the derived check. We keep an
+    // EXPLICIT per-variant pin anyway — the friend branch as the
+    // long-standing trust anchor, the co-member branch to make that anchor
+    // self-evident and resilient if the internal owner_id↔master binding
+    // ever moves. Neither is expected to be a live rejection path for a
+    // well-formed cert; that's why a forged-master unit test is
+    // intentionally omitted (such a cert can't pass verification).
     match admission {
         Admission::Friend(friend_master) => {
             if cert_master != friend_master {
@@ -578,7 +595,7 @@ pub async fn handle_deposit_core(
             }
         }
     }
-    let device_vk_bytes = cert.device_pubkeys.classical.ed25519_verify;
+    let device_vk_bytes = verified.device_ed25519;
 
     // Step 3 — verify the frame signature over
     // `BUTLER_DEPOSIT_SIG_DOMAIN ‖ recipient_owner ‖ sealed_blob` against
@@ -984,6 +1001,7 @@ mod tests {
     }
 
     fn master_from_cert(cert: &EnrollmentCert) -> [u8; 32] {
+        use harmony_owner::certs::EnrollmentIssuer;
         match &cert.issuer {
             EnrollmentIssuer::Master { master_pubkey } => master_pubkey.classical.ed25519_verify,
             other => panic!("test certs are Master-issued, got {other:?}"),
@@ -1077,6 +1095,7 @@ mod tests {
         let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
         Fixture {
             frame: DepositFrame {
+                signer_certs_cbor: Vec::new(),
                 recipient_owner: BUTLER_OWNER,
                 sender_owner: so.owner.0,
                 sender_enrollment_cert: cert_bytes,
@@ -1122,6 +1141,7 @@ mod tests {
         let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
         Fixture {
             frame: DepositFrame {
+                signer_certs_cbor: Vec::new(),
                 recipient_owner: BUTLER_OWNER,
                 sender_owner: so.owner.0,
                 sender_enrollment_cert: cert_bytes,
@@ -1405,6 +1425,74 @@ mod tests {
             "expected PersistFailed, got {err:?}"
         );
         assert!(failing.store.lock().unwrap().is_empty());
+    }
+
+    /// ZEB-677: a deposit whose sender cert is QUORUM-issued is accepted when
+    /// the frame carries the Master-issued signer-cert bundle (the master
+    /// anchor for the friend-graph pin comes from the verified bundle);
+    /// with the bundle stripped it fails closed as BadCert.
+    #[tokio::test]
+    async fn deposit_with_quorum_cert_requires_bundle() {
+        use crate::enrollment_verify::quorum_fixtures::mint_quorum_world;
+        let world = mint_quorum_world(0xB0);
+        let sender_owner = crate::owner_state_types::OwnerAddr(world.owner_id);
+        let space_id = SpaceId([0x77; 16]);
+        let storage_blob = b"encrypted-dm-storage-blob-bytes".to_vec();
+        let message_cid = ContentId::for_book(
+            &storage_blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid for blob");
+        let (cidnotify_packet, identity_pub, dm_device_hash) =
+            build_cidnotify(sender_owner, space_id, message_cid);
+        let payload = DepositPayload {
+            cidnotify_packet: Some(cidnotify_packet.clone()),
+            storage_blob: storage_blob.clone(),
+            invite_packet: None,
+        };
+        let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
+        let sealed = seal_payload_bytes(&payload_bytes);
+        // Device C (quorum-enrolled) signs the deposit.
+        let sig = sign_frame(&BUTLER_OWNER, &sealed, &world.c_sk);
+        let cert_bytes =
+            harmony_owner::cbor::to_canonical(&world.c_quorum_cert).expect("encode cert");
+        let bundle_bytes = harmony_owner::cbor::to_canonical(&world.bundle).expect("encode bundle");
+        let f = Fixture {
+            frame: DepositFrame {
+                recipient_owner: BUTLER_OWNER,
+                sender_owner: world.owner_id,
+                sender_enrollment_cert: cert_bytes,
+                sig,
+                sealed_blob: sealed,
+                signer_certs_cbor: bundle_bytes,
+            },
+            sender_owner: world.owner_id,
+            // The friend-graph pin: the owner's master anchor, which the
+            // acceptor must recover from the signer-cert bundle.
+            sender_master: world.master_ed25519,
+            space_id,
+            message_cid,
+            cidnotify_packet,
+            storage_blob,
+            dm_device_hash,
+            identity_pub,
+        };
+        let ctx = TestCtx::for_fixture(&f);
+        handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect("quorum-certed deposit with bundle must be accepted");
+
+        // Bundle stripped → the quorum cert cannot be verified → BadCert.
+        let mut stripped = f.frame.clone();
+        stripped.signer_certs_cbor = Vec::new();
+        let ctx2 = TestCtx::for_fixture(&f);
+        let err = handle_deposit_core(&stripped, &ctx2)
+            .await
+            .expect_err("quorum cert without bundle must be rejected");
+        assert!(matches!(err, DepositReject::BadCert), "got {err:?}");
     }
 
     /// ZEB-424 (D27/D29.1/D28.1): a sender who is NOT a friend at all but

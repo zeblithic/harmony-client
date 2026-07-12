@@ -42,7 +42,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ed25519_dalek::{Signature, VerifyingKey};
 use harmony_content::cid::{ContentFlags, ContentId};
-use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
+use harmony_owner::certs::EnrollmentCert;
 use iroh::endpoint::Connection;
 
 use crate::butler_deposit::{
@@ -185,6 +185,25 @@ fn decode_enrollment_cert_strict(bytes: &[u8]) -> Result<EnrollmentCert, RelayDe
     Ok(cert)
 }
 
+/// ZEB-677: strict decode of a frame's `signer_certs_cbor` bundle (canonical
+/// CBOR of `Vec<EnrollmentCert>`; empty bytes ⇒ empty bundle). Generic over
+/// the reject type so the deposit and pull paths share it.
+fn decode_signer_certs_strict<E>(bytes: &[u8], reject: E) -> Result<Vec<EnrollmentCert>, E>
+where
+    E: Clone,
+{
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cursor = std::io::Cursor::new(bytes);
+    let certs: Vec<EnrollmentCert> =
+        ciborium::from_reader(&mut cursor).map_err(|_| reject.clone())?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(reject);
+    }
+    Ok(certs)
+}
+
 // =====================================================================
 // Core pipeline
 // =====================================================================
@@ -230,28 +249,26 @@ pub async fn handle_relay_deposit_core(
     // Step 2 — decode + verify the sender device's EnrollmentCert and bind
     // its issuing master to the admitted identity via the owner-id-derived
     // anchor (D29.1 co-member branch — there is NO friend-graph pin on a
-    // relay; the derived anchor IS the trust anchor):
+    // relay; the derived anchor IS the trust anchor). ZEB-677: verification
+    // routes through the enrollment_verify chokepoint — Master certs
+    // self-contained, Quorum certs against the frame's signer-cert bundle
+    // (depth-1); the master anchor comes from the verified chain.
     //
-    //   cert decode → Master-issued → `cert.verify(now_secs())` →
-    //   `cert.owner_id == frame.sender_owner` →
-    //   `owner_id_from_master_ed25519(cert_master) == OwnerAddr(sender_owner)`
-    //
-    // The last check is defense-in-depth: `cert.verify()` already rejects
-    // `hash(master) != owner_id`, and we've required `cert.owner_id ==
-    // sender_owner`, so a well-formed cert reaching here necessarily satisfies
-    // the derived check. We keep it explicit for clarity and resilience.
+    // The derived-anchor check is defense-in-depth: the chokepoint already
+    // rejects `hash(master) != owner_id` and binds `cert.owner_id ==
+    // sender_owner`, so a well-formed cert reaching here necessarily
+    // satisfies it. We keep it explicit for clarity and resilience.
     let cert = decode_enrollment_cert_strict(&frame.sender_enrollment_cert)?;
-    cert.verify(ctx.now_secs())
-        .map_err(|_| RelayDepositReject::BadCert)?;
-    let cert_master = match &cert.issuer {
-        EnrollmentIssuer::Master { master_pubkey } => master_pubkey.classical.ed25519_verify,
-        // Non-Master issuers (Quorum certs) cannot be verified without an
-        // OwnerState walk-back; reject outright, mirroring the butler acceptor.
-        _ => return Err(RelayDepositReject::BadCert),
-    };
-    if cert.owner_id != frame.sender_owner {
-        return Err(RelayDepositReject::BadCert);
-    }
+    let signer_certs =
+        decode_signer_certs_strict(&frame.signer_certs_cbor, RelayDepositReject::BadCert)?;
+    let verified = crate::enrollment_verify::verify_enrollment_any_issuer(
+        &cert,
+        &signer_certs,
+        Some(&frame.sender_owner),
+        ctx.now_secs(),
+    )
+    .map_err(|_| RelayDepositReject::BadCert)?;
+    let cert_master = verified.master_ed25519;
     // Owner-id-derived anchor (D29.1 co-member branch, identical to the
     // butler's CoMember arm in iroh_butler_acceptor):
     if crate::friend_graph::owner_id_from_master_ed25519(&cert_master)
@@ -259,7 +276,7 @@ pub async fn handle_relay_deposit_core(
     {
         return Err(RelayDepositReject::BadCert);
     }
-    let device_vk_bytes = cert.device_pubkeys.classical.ed25519_verify;
+    let device_vk_bytes = verified.device_ed25519;
 
     // Step 3 — verify the frame signature over
     // `COMMUNITY_RELAY_DEPOSIT_SIG_DOMAIN ‖ recipient_owner ‖ community_id ‖ sealed_blob`
@@ -421,26 +438,25 @@ pub trait RelayPullCtx: Send + Sync {
 /// operation (query vs. ack payloads differ).
 async fn auth_pull_cert_and_membership(
     cert_bytes: &[u8],
+    signer_certs_bytes: &[u8],
     recipient_owner: &[u8; 16],
     community_id: &SpaceId,
     ctx: &dyn RelayPullCtx,
 ) -> Result<(VerifyingKey, String), RelayPullReject> {
-    // Step 1 — decode + verify the requester's EnrollmentCert (same strict
-    // helper as the deposit acceptor, adapted for pull rejects).
+    // Step 1-2 — decode + verify the requester's EnrollmentCert via the
+    // ZEB-677 chokepoint (Master self-contained; Quorum against the frame's
+    // signer-cert bundle, depth-1), binding it to the claimed
+    // recipient_owner identity.
     let cert = decode_pull_cert_strict(cert_bytes)?;
-    cert.verify(ctx.now_secs())
-        .map_err(|_| RelayPullReject::BadCert)?;
-
-    // Step 2 — require Master issuer; extract master pubkey.
-    let cert_master = match &cert.issuer {
-        EnrollmentIssuer::Master { master_pubkey } => master_pubkey.classical.ed25519_verify,
-        _ => return Err(RelayPullReject::BadCert),
-    };
-
-    // Bind cert to the claimed recipient_owner identity.
-    if cert.owner_id != *recipient_owner {
-        return Err(RelayPullReject::BadCert);
-    }
+    let signer_certs = decode_signer_certs_strict(signer_certs_bytes, RelayPullReject::BadCert)?;
+    let verified = crate::enrollment_verify::verify_enrollment_any_issuer(
+        &cert,
+        &signer_certs,
+        Some(recipient_owner),
+        ctx.now_secs(),
+    )
+    .map_err(|_| RelayPullReject::BadCert)?;
+    let cert_master = verified.master_ed25519;
 
     // Step 3 — owner-id-derived anchor (D29.1 co-member branch).
     if crate::friend_graph::owner_id_from_master_ed25519(&cert_master)
@@ -449,7 +465,7 @@ async fn auth_pull_cert_and_membership(
         return Err(RelayPullReject::BadCert);
     }
 
-    let device_vk_bytes = cert.device_pubkeys.classical.ed25519_verify;
+    let device_vk_bytes = verified.device_ed25519;
 
     // Step 4 — membership gate. This defeats held-blob enumeration by
     // ex-members or strangers; the blobs are still sealed regardless.
@@ -525,6 +541,7 @@ pub async fn handle_relay_pull_query(
     // here drains exactly what that device has acked.
     let (device_vk, requester_device_id) = auth_pull_cert_and_membership(
         &query.requester_enrollment_cert,
+        &query.signer_certs_cbor,
         &query.recipient_owner,
         &query.community_id,
         ctx,
@@ -620,6 +637,7 @@ pub async fn handle_relay_pull_ack(
     community_id: &SpaceId,
     ack: &RelayPullAck,
     requester_cert_bytes: &[u8],
+    requester_signer_certs_bytes: &[u8],
     ack_sig: &[u8],
     ctx: &dyn RelayPullCtx,
 ) -> Result<(), RelayPullReject> {
@@ -629,9 +647,14 @@ pub async fn handle_relay_pull_ack(
     }
 
     // Cert + anchor + membership.
-    let (device_vk, requester_device_id) =
-        auth_pull_cert_and_membership(requester_cert_bytes, recipient_owner, community_id, ctx)
-            .await?;
+    let (device_vk, requester_device_id) = auth_pull_cert_and_membership(
+        requester_cert_bytes,
+        requester_signer_certs_bytes,
+        recipient_owner,
+        community_id,
+        ctx,
+    )
+    .await?;
 
     // Verify the ack-specific signature over
     // `COMMUNITY_RELAY_PULL_ACK_SIG_DOMAIN ‖ recipient_owner ‖ community_id ‖ sorted(content_ids)`.
@@ -973,6 +996,7 @@ impl IrohCommunityRelayPullAcceptor {
                     &frame.community_id,
                     &ack,
                     &frame.requester_enrollment_cert,
+                    &frame.signer_certs_cbor,
                     &frame.sig,
                     self.ctx.as_ref(),
                 )
@@ -1289,6 +1313,70 @@ mod tests {
             !ev.iter().any(|e| e == "decrypt"),
             "relay must NEVER decrypt: {ev:?}"
         );
+    }
+
+    /// ZEB-677: a relay deposit whose sender cert is QUORUM-issued is
+    /// accepted when the frame carries the Master-issued signer-cert bundle;
+    /// with the bundle stripped it fails closed as BadCert. (The pull path
+    /// shares `auth_pull_cert_and_membership`, which routes through the same
+    /// chokepoint.)
+    #[tokio::test]
+    async fn relay_deposit_with_quorum_cert_requires_bundle() {
+        use crate::enrollment_verify::quorum_fixtures::mint_quorum_world;
+        let world = mint_quorum_world(0xB4);
+        let r = recipient();
+        let cid = community_id();
+        let payload = DepositPayload {
+            cidnotify_packet: Some(b"fake-cidnotify-packet".to_vec()),
+            storage_blob: b"dm-storage-blob-opaque-to-relay".to_vec(),
+            invite_packet: None,
+        };
+        let cert_bytes =
+            harmony_owner::cbor::to_canonical(&world.c_quorum_cert).expect("encode cert");
+        // Device C (quorum-enrolled) signs the deposit; the frame sig does
+        // not cover the cert fields, so attaching the bundle post-build is
+        // exactly what a real sender would produce.
+        let mut frame = build_relay_deposit_frame(
+            r.owner.0,
+            &r.cert.device_pubkeys.classical.ed25519_verify,
+            world.owner_id,
+            cid,
+            cert_bytes,
+            &world.c_sk,
+            &payload,
+        )
+        .expect("build relay deposit frame");
+        frame.signer_certs_cbor =
+            harmony_owner::cbor::to_canonical(&world.bundle).expect("encode bundle");
+        let expected_content_id = ContentId::for_book(
+            &frame.sealed_blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("content_id");
+        let f = Fixture {
+            sealed_blob: frame.sealed_blob.clone(),
+            sender_owner: world.owner_id,
+            recipient_owner: r.owner.0,
+            frame,
+            expected_content_id,
+        };
+        let ctx = TestRelayDepositCtx::for_fixture(&f);
+        handle_relay_deposit_core(&f.frame, &ctx)
+            .await
+            .expect("quorum-certed relay deposit with bundle must be accepted");
+
+        // Bundle stripped → BadCert, nothing persisted.
+        let mut stripped = f.frame.clone();
+        stripped.signer_certs_cbor = Vec::new();
+        let ctx2 = TestRelayDepositCtx::for_fixture(&f);
+        let err = handle_relay_deposit_core(&stripped, &ctx2)
+            .await
+            .expect_err("quorum cert without bundle must be rejected");
+        assert!(matches!(err, RelayDepositReject::BadCert), "got {err:?}");
+        assert!(ctx2.store.lock().unwrap().is_empty());
     }
 
     // ----------------------------------------------------------------
@@ -1682,6 +1770,7 @@ mod tests {
             .to_bytes()
             .to_vec();
         RelayPullQuery {
+            signer_certs_cbor: Vec::new(),
             recipient_owner: recipient.owner.0,
             community_id,
             requester_enrollment_cert: cert_bytes,
@@ -2027,6 +2116,7 @@ mod tests {
             .to_bytes()
             .to_vec();
         let query = RelayPullQuery {
+            signer_certs_cbor: Vec::new(),
             recipient_owner: recipient.owner.0,
             community_id: cid,
             requester_enrollment_cert: other_cert_bytes,
@@ -2198,7 +2288,7 @@ mod tests {
 
         // Ack: mark_pulled records the requester device in pulled_by for
         // the acked content IDs (does NOT call gc in the test mock).
-        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &ack_sig, &ctx)
+        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &[], &ack_sig, &ctx)
             .await
             .expect("ack must succeed");
 
@@ -2229,7 +2319,7 @@ mod tests {
         );
 
         // Ack for an already-GC'd key is a no-op (not an error).
-        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &ack_sig, &ctx)
+        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &[], &ack_sig, &ctx)
             .await
             .expect("second ack for already-removed key must be a no-op");
     }
@@ -2268,7 +2358,7 @@ mod tests {
         };
 
         // Must succeed — unknown content IDs are silently ignored.
-        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &ack_sig, &ctx)
+        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &[], &ack_sig, &ctx)
             .await
             .expect("ack for unknown content_id must be a no-op, not an error");
 
@@ -2328,6 +2418,7 @@ mod tests {
             &cid,
             &ack,
             &cert_bytes,
+            &[],
             &correct_ack_sig,
             &ctx,
         )
@@ -2350,6 +2441,7 @@ mod tests {
             &cid,
             &ack,
             &cert_bytes,
+            &[],
             &old_query_sig,
             &ctx,
         )
@@ -2416,6 +2508,7 @@ mod tests {
             &cid,
             &tampered_ack,
             &cert_bytes,
+            &[],
             &ack_sig,
             &ctx,
         )
