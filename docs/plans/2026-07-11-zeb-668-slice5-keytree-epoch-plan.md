@@ -312,6 +312,44 @@ export async function bumpFleetEpoch(): Promise<number> {
 - [ ] `npx tsc --noEmit && npx vitest run`
 - [ ] PR: title `ZEB-668 S5: fleet KeyTree epoch bump on revoke — per-epoch derivation, fleet-keys-v1 carrier, dual-epoch window`; body leads with the §6.1 amendments (spec deviation front and center for review); fire `@coderabbitai review` ONCE at open.
 
+## Execution amendments (implementation-time)
+
+1. **Nine dataset engines, not three** (T2): ground truth found the fleet
+   tree cloned into owner-state, fleet-net, trust, notes, DM-inbox,
+   DM-outhold, relay-hold, relay-optin, community-device-intro AND the mint
+   engine (its own bespoke task, converted the same way). All rotate via
+   the shared `FleetKeySet`.
+2. **Friend-secret domain pinned to epoch-0** (T2, spec §6.1 amendment 6):
+   friend secrets are sealed once and stored durably in the CRDT —
+   rotating `friend_aead` would orphan them all at window close, and buys
+   nothing against a revoked device that can no longer receive the CRDT.
+   The pre-existing `kt` binding (pkarr friend publisher, friend
+   handshake acceptor, NodeState.owner_keytree) stays the pinned epoch-0
+   tree; only the dataset engines take the swappable set. Re-seal
+   migration recorded as a §9 follow-up candidate.
+3. **Trusted-master-vk resolution** (T3 step 1): the carrier doc embeds the
+   master `PubKeyBundle` and verification checks
+   `identity_hash() == owner_id` + strict ed25519 verify — the exact
+   pattern of the crate's `RevocationIssuer::Master` (revocation.rs:145).
+   No new trust root.
+4. **Boot epoch-0 exclusion** (T4): after a window closes, the vault still
+   holds epoch-0 (carrier key), so the boot gate admits epoch-0 into the
+   DATA accept set only when it is the sole epoch — otherwise a reboot
+   would silently reopen the closed window to a revoked device's epoch-0
+   publishes. First-bump stragglers mid-window degrade to CRDT catch-up.
+5. **Revoke-hook test needed a resident trust ENGINE** (T4): the mutation
+   path picks Resident access only when doc+engine are both present (prod
+   invariant); a doc-only NodeState silently went FileOnly and the hook's
+   survivor enumeration read a stale resident doc.
+6. **Pairing epoch source** (T3 step 6): `StartInviter` carries
+   `fleet_current_epoch` read from the resident `FleetKeySet` at the IPC
+   layer (the state machine has no NodeState access; reading the carrier
+   persist file from inside the SM would have raced the engine).
+7. **Bump concurrency guard** (T4): both bump paths re-check
+   `new_doc.epoch > resident.epoch` under the doc lock before adopting, so
+   a concurrent remote merge to a higher epoch wins and the local bump
+   reports a retryable error instead of rolling the doc back.
+
 ## Self-review notes (plan-time)
 
 - Spec §6 bullets covered: per-epoch salt ✓(T1), seal-per-survivor via trust… **amended** to carrier ✓(T3/§6.1), vault install via seams ✓(T2/T3), dual-epoch window ✓(T2 accept-set, T4 close), any-epoch import ✓(T1), no version gate ✓(D11, release-note item for the PR body), self-revoke-no-bump + seed-holder copy ✓(T4/T5).
