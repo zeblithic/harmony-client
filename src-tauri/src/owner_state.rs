@@ -18,6 +18,14 @@ pub struct OwnerStateView {
     pub owner_display_name: String,
     pub devices: Vec<DeviceView>,
     pub can_back_up: bool,
+    /// ZEB-668 S5: the fleet's current KeyTree epoch (0 = never bumped).
+    #[serde(default)]
+    pub fleet_epoch: u32,
+    /// ZEB-668 S5: true when any revocation postdates the last epoch bump —
+    /// that device still holds decryptable fleet material. Seed-holders see
+    /// the rotate action; other devices a passive note.
+    #[serde(default)]
+    pub fleet_epoch_stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2014,6 +2022,10 @@ mod tests {
                 connected_now: true,
             }],
             can_back_up: true,
+            // ZEB-668 S5: non-default values so the epoch pair's renames
+            // are pinned too.
+            fleet_epoch: 3,
+            fleet_epoch_stale: true,
         };
         let json = serde_json::to_string(&view).unwrap();
         // The wire format MUST be camelCase — JS depends on this.
@@ -2033,6 +2045,15 @@ mod tests {
         assert!(
             json.contains("\"deviceVkHex\""),
             "expected deviceVkHex, got {json}"
+        );
+        // ZEB-668 S5 epoch pair, non-default values above.
+        assert!(
+            json.contains("\"fleetEpoch\":3"),
+            "expected fleetEpoch:3, got {json}"
+        );
+        assert!(
+            json.contains("\"fleetEpochStale\":true"),
+            "expected fleetEpochStale:true, got {json}"
         );
         // ZEB-668 S2 revocation trio, pinned with the non-default values above.
         assert!(

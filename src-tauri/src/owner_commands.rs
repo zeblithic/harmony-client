@@ -298,6 +298,11 @@ pub(crate) struct FleetJoin {
     pub rows: std::collections::BTreeMap<String, (u64, [u8; 32])>,
     /// Endpoint ids with a live Connected liveness slot (Degraded excluded).
     pub connected_eps: std::collections::BTreeSet<[u8; 32]>,
+    /// ZEB-668 S5: fleet-keys carrier snapshot — current epoch + the
+    /// wall-clock of the bump that produced it (0/0 = never bumped, or the
+    /// carrier is cold).
+    pub carrier_epoch: u32,
+    pub carrier_bump_wall_ms: u64,
 }
 
 /// Build an `OwnerStateView` from a loaded state.
@@ -378,11 +383,24 @@ fn build_owner_state_view(
         })
         .collect();
 
+    // ZEB-668 S5: the fleet keys are stale when ANY revocation postdates
+    // the last bump — that device still holds decryptable material. Cert
+    // `issued_at` is SECONDS; the carrier bump stamp is MILLISECONDS.
+    // Pre-S5 fleets (bump 0) with any revocation are honestly stale until
+    // their first rotation.
+    let fleet_epoch_stale = loaded
+        .state
+        .revocations
+        .iter()
+        .any(|c| c.issued_at.saturating_mul(1000) > fleet.carrier_bump_wall_ms);
+
     OwnerStateView {
         owner_id: hex::encode(loaded.state.owner_id),
         owner_display_name: this_device_name,
         devices,
         can_back_up: loaded.master_seed.is_some(),
+        fleet_epoch: fleet.carrier_epoch,
+        fleet_epoch_stale,
     }
 }
 
@@ -451,13 +469,23 @@ pub(crate) async fn get_owner_state_inner(
     // (async context) and pass the resolved `FleetJoin` into the blocking
     // closure (no async in there).
     let fleet: FleetJoin = {
-        let (fleet_net_doc_arc, resolver) = {
+        let (fleet_net_doc_arc, resolver, carrier_doc_arc) = {
             let g = state
                 .lock()
                 .map_err(|e| format!("NodeState poisoned: {e}"))?;
-            (g.fleet_net_doc.clone(), g.reachability_resolver.clone())
+            (
+                g.fleet_net_doc.clone(),
+                g.reachability_resolver.clone(),
+                g.fleet_key_epoch_doc.clone(),
+            )
         };
         let mut fleet = FleetJoin::default();
+        // ZEB-668 S5: carrier snapshot for the epoch/staleness pair.
+        if let Some(arc) = carrier_doc_arc {
+            let doc = arc.lock().await;
+            fleet.carrier_epoch = doc.epoch;
+            fleet.carrier_bump_wall_ms = doc.bump_wall_ms;
+        }
         if let Some(arc) = fleet_net_doc_arc {
             let doc = arc.lock().await;
             fleet.pinned = doc.pinned.clone();
@@ -2321,6 +2349,63 @@ mod revoke_tests {
         .await
         .expect("idempotent ok");
         assert_eq!(events.lock().unwrap().len(), 1, "no duplicate emission");
+    }
+
+    /// ZEB-668 S5: `fleetEpochStale` = any revocation newer than the last
+    /// bump. Cert `issued_at` is seconds; the bump stamp is milliseconds.
+    #[test]
+    fn view_fleet_epoch_staleness_tracks_revocations_vs_bump() {
+        let (mut state, a_sk, seed, _b, b_vk_hex) = two_device_fixture(1_700_000_000);
+
+        // No revocations → never stale, even pre-bump.
+        let loaded = LoadedOwnerState {
+            state: state.clone(),
+            device_signing_key: a_sk.clone(),
+            master_seed: Some(Zeroizing::new(seed)),
+            fleet_keytree: None,
+        };
+        let view = build_owner_state_view(&loaded, "d".into(), FleetJoin::default());
+        assert!(!view.fleet_epoch_stale);
+        assert_eq!(view.fleet_epoch, 0);
+
+        // Revoke B at t=1_700_000_100 (seconds).
+        let now = 1_700_000_100u64;
+        let RevocationPlan::Planned(planned) =
+            plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now).unwrap()
+        else {
+            panic!("expected planned");
+        };
+        state.add_revocation(planned.cert).unwrap();
+        let loaded = LoadedOwnerState {
+            state,
+            device_signing_key: a_sk,
+            master_seed: Some(Zeroizing::new(seed)),
+            fleet_keytree: None,
+        };
+
+        // Pre-S5 carrier (0/0): the revocation makes the fleet honestly stale.
+        let view = build_owner_state_view(&loaded, "d".into(), FleetJoin::default());
+        assert!(view.fleet_epoch_stale, "pre-bump fleet with a revocation");
+
+        // Bump BEFORE the revocation (ms): still stale.
+        let stale_join = FleetJoin {
+            carrier_epoch: 1,
+            carrier_bump_wall_ms: (now - 10) * 1000,
+            ..Default::default()
+        };
+        let view = build_owner_state_view(&loaded, "d".into(), stale_join);
+        assert!(view.fleet_epoch_stale, "revocation postdates the bump");
+        assert_eq!(view.fleet_epoch, 1);
+
+        // Bump AFTER the revocation: fresh.
+        let fresh_join = FleetJoin {
+            carrier_epoch: 2,
+            carrier_bump_wall_ms: (now + 10) * 1000,
+            ..Default::default()
+        };
+        let view = build_owner_state_view(&loaded, "d".into(), fresh_join);
+        assert!(!view.fleet_epoch_stale, "bump postdates every revocation");
+        assert_eq!(view.fleet_epoch, 2);
     }
 
     #[test]

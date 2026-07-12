@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import DevicesPanel from '../DevicesPanel.svelte';
 
@@ -1662,3 +1662,80 @@ describe('DevicesPanel — petnames + last-seen (ZEB-668 S4)', () => {
     });
   });
 });
+
+// ── ZEB-668 S5: fleet-key staleness banner + rotate action ────────────────────
+
+describe('DevicesPanel — fleet epoch staleness (ZEB-668 S5)', () => {
+  const s5View = (overrides: Record<string, unknown> = {}) => ({
+    ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+    ownerDisplayName: 'zeblith',
+    devices: [
+      {
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this device',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+        butlerPinned: false,
+        deviceVkHex: 'aa'.repeat(32),
+        revoked: false,
+        revokedAt: null,
+        revokedReason: null,
+        petName: null as string | null,
+        lastSeenMs: null as number | null,
+        connectedNow: false,
+      },
+    ],
+    canBackUp: true,
+    fleetEpoch: 0,
+    fleetEpochStale: false,
+    ...overrides,
+  });
+
+  it('renders nothing when the fleet keys are fresh', async () => {
+    mockedInvoke.mockResolvedValueOnce(s5View());
+    render(DevicesPanel);
+    await screen.findByText(/my devices/i);
+    expect(screen.queryByTestId('fleet-epoch-banner')).not.toBeInTheDocument();
+  });
+
+  it('stale + seed-holder: banner with a Rotate button that bumps and refreshes', async () => {
+    mockedInvoke.mockResolvedValueOnce(s5View({ fleetEpochStale: true }));
+    render(DevicesPanel);
+    await screen.findByTestId('fleet-epoch-banner');
+    const btn = screen.getByTestId('rotate-fleet-keys');
+    mockedInvoke.mockResolvedValueOnce(1); // bump_fleet_epoch → new epoch
+    mockedInvoke.mockResolvedValueOnce(s5View({ fleetEpoch: 1, fleetEpochStale: false }));
+    await fireEvent.click(btn);
+    await waitFor(() =>
+      expect(screen.queryByTestId('fleet-epoch-banner')).not.toBeInTheDocument()
+    );
+    expect(mockedInvoke).toHaveBeenCalledWith('bump_fleet_epoch');
+  });
+
+  it('stale + cert-only device: passive note, no button', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      s5View({ fleetEpochStale: true, canBackUp: false })
+    );
+    render(DevicesPanel);
+    await screen.findByTestId('fleet-epoch-banner');
+    expect(
+      screen.getByText(/rotate them from the device that holds your master key/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('rotate-fleet-keys')).not.toBeInTheDocument();
+  });
+
+  it('bump rejection surfaces as an alert and re-click is possible', async () => {
+    mockedInvoke.mockResolvedValueOnce(s5View({ fleetEpochStale: true }));
+    render(DevicesPanel);
+    await screen.findByTestId('fleet-epoch-banner');
+    mockedInvoke.mockRejectedValueOnce('notMaster: nope');
+    await fireEvent.click(screen.getByTestId('rotate-fleet-keys'));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/notMaster/);
+    // Banner still present; button re-enabled for retry.
+    expect(screen.getByTestId('rotate-fleet-keys')).not.toBeDisabled();
+  });
+});
+
