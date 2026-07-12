@@ -8,8 +8,9 @@ caches third-party dependency artifacts). See ZEB-499.
 
 ## How it's wired
 
-- The three Rust jobs (`rust-check`, `rust-test`, `msrv`) install sccache via
-  the pinned `taiki-e/install-action` and set `RUSTC_WRAPPER=sccache`.
+- The Rust jobs (`rust-check`, the `rust-test` shard matrix — ZEB-676, and
+  `msrv`) install sccache via the pinned `taiki-e/install-action` and set
+  `RUSTC_WRAPPER=sccache`.
 - Backend config is workflow-level env: `SCCACHE_BUCKET=harmony-sccache`,
   `SCCACHE_ENDPOINT` (R2 S3 endpoint), `SCCACHE_REGION=auto`, and
   `SCCACHE_S3_KEY_PREFIX=harmony-client` (namespaces our entries vs the

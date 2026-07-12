@@ -95,18 +95,21 @@ Rules when writing tests that touch identity persistence:
 
 ## CI architecture
 
-The `.github/workflows/ci.yml` workflow runs four parallel jobs:
+The `.github/workflows/ci.yml` workflow runs these jobs in parallel (timings measured 2026-07, ZEB-676 recalibration):
 
 | Job | Purpose | Typical wall-clock |
 |---|---|---|
-| `rust-check` | `cargo fmt --check` + `cargo clippy -D warnings` | 4-5 min |
-| `rust-test` | `cargo nextest run` | 4-5 min |
-| `msrv` | `cargo check` against declared MSRV | 2-3 min |
-| `frontend` | `npx tsc --noEmit` + `npx vitest run` | 2-3 min |
+| `rust-check` | `cargo fmt --check` + `cargo clippy -D warnings` | ~4 min |
+| `rust-test` ×3 shards | `cargo nextest run --partition hash:k/3` | ~10-13 min per shard |
+| `rust-test-gate` ("Rust — test (nextest)") | roll-up: green iff all 3 shards pass | seconds |
+| `msrv` | `cargo check` against declared MSRV | ~3.5 min |
+| `frontend` | `npx tsc --noEmit` + `npx vitest run` | ~3.5 min |
 
-All four run in parallel. **Total wall-clock = max of the four ≈ 5 min** (per ZEB-273 split — was 10 min before).
+**Total wall-clock = max of the jobs ≈ 12 min** on a warm cache. A cold sccache miss (toolchain bump) can push a Rust job toward its 35-min timeout — that is slow, not hung.
 
-**Why split rust-check from rust-test:** clippy and test each compile the workspace independently (cargo doesn't share intermediate artifacts across subcommands without `sccache`). Running them in series doubles the rust-side wall-clock; parallelizing across two runners halves it at the cost of ~80% more CI minutes (acceptable trade since engineer wall-clock dominates).
+**Why rust-test is sharded (ZEB-676):** by 2026-07 the single rust-test job ran ~21-22 min while every other job took ~4 — and the cost was **test execution, not compilation** (measured on a zero-Rust-diff PR: compile+link 3m47s at a 100% sccache/R2 hit rate vs ~16 min executing 4,438 tests on the 4-vCPU runner). Each shard still compiles the full workspace (`--all-targets` compile coverage stays complete everywhere, cheap off R2) and runs a stable hash-partition third of the tests. When a shard trends past ~15 min, bump the shard count in ci.yml (matrix + the `/3` denominators together).
+
+**Why split rust-check from rust-test (ZEB-273):** clippy and test each compile the workspace independently. Running them in series doubles the rust-side wall-clock; parallelizing across runners trades CI minutes for engineer wall-clock (standard runners are free on public repos, so the trade costs nothing).
 
 ## Code conventions
 
