@@ -305,21 +305,55 @@ pub(crate) struct FleetJoin {
     pub carrier_bump_wall_ms: u64,
 }
 
+/// ZEB-677 S3: snapshot of the resident quorum-request doc for the view
+/// join. Default (empty doc, now 0) when the node is not running — no
+/// resident doc means no ceremony surface, honestly.
+#[derive(Default)]
+pub(crate) struct QuorumJoin {
+    pub doc: crate::owner_quorum_sync::QuorumReqDoc,
+    pub now_ms: u64,
+}
+
 /// Build an `OwnerStateView` from a loaded state.
 ///
 /// `fleet`: the fleet-net + liveness join snapshot (see [`FleetJoin`]). The
 /// matching device row receives `butler_pinned` / `pet_name` /
 /// `last_seen_ms` / `connected_now`; everything defaults to absent when the
 /// fleet-net doc is cold or the node is not running.
+///
+/// `quorum`: the quorum-request doc snapshot (see [`QuorumJoin`]) feeding
+/// the co-sign banner rows + per-device `quorum_removable`.
 fn build_owner_state_view(
     loaded: &LoadedOwnerState,
     this_device_name: String,
     fleet: FleetJoin,
+    quorum: QuorumJoin,
 ) -> OwnerStateView {
     let now = now_unix();
     let active_window = trust::DEFAULT_ACTIVE_WINDOW_SECS;
     let freshness = trust::DEFAULT_FRESHNESS_WINDOW_SECS;
     let this_device_id = derive_this_device_id(&loaded.device_signing_key);
+    let this_device_hex = hex::encode(this_device_id);
+    let self_is_master = loaded.master_seed.is_some();
+    let self_master_certed = loaded
+        .state
+        .enrollments
+        .get(&this_device_id)
+        .is_some_and(crate::owner_quorum_commands::is_master_issued);
+    // Active master-certed device ids — the co-signer candidate pool for
+    // `quorum_removable` (spec §4.1 visibility rule).
+    let active_master_certed: std::collections::BTreeSet<[u8; 16]> = loaded
+        .state
+        .active_devices(now, active_window)
+        .into_iter()
+        .filter(|id| {
+            loaded
+                .state
+                .enrollments
+                .get(id)
+                .is_some_and(crate::owner_quorum_commands::is_master_issued)
+        })
+        .collect();
 
     let devices: Vec<DeviceView> = loaded
         .state
@@ -379,6 +413,16 @@ fn build_owner_state_view(
                 pet_name,
                 last_seen_ms,
                 connected_now,
+                // ZEB-677 S3: sibling removable via the co-sign ceremony —
+                // seed absent here, self master-certed, and some OTHER
+                // active master-certed sibling (≠ self, ≠ this row) exists.
+                quorum_removable: cert.device_id != this_device_id
+                    && rev_cert.is_none()
+                    && !self_is_master
+                    && self_master_certed
+                    && active_master_certed
+                        .iter()
+                        .any(|id| *id != this_device_id && *id != cert.device_id),
             }
         })
         .collect();
@@ -394,6 +438,53 @@ fn build_owner_state_view(
         .iter()
         .any(|c| c.issued_at.saturating_mul(1000) > fleet.carrier_bump_wall_ms);
 
+    // ZEB-677 S3: pending co-sign requests (unexpired only), pre-joined so
+    // the panel just renders `can_cosign` / `initiated_by_me`.
+    let quorum_requests: Vec<crate::owner_state::QuorumRequestView> = quorum
+        .doc
+        .requests
+        .iter()
+        .filter(|(_, r)| quorum.now_ms <= r.expires_at_ms)
+        .map(|(id, r)| {
+            let crate::owner_quorum_sync::QuorumRequestKind::Revocation { reason, target_hex } =
+                &r.kind;
+            let initiated_by_me = r.initiator_hex == this_device_hex;
+            let signed_by_me = r.signatures.contains_key(&this_device_hex);
+            let declined_by_me = r.declined_by.contains(&this_device_hex);
+            let declined = !r.declined_by.is_empty();
+            let target_is_me = *target_hex == this_device_hex;
+            let target_revoked = crate::owner_quorum_sync::parse_device_id_hex(target_hex)
+                .map(|t| loaded.state.is_revoked(t))
+                .unwrap_or(true);
+            crate::owner_state::QuorumRequestView {
+                request_id: id.clone(),
+                kind: "revocation".to_string(),
+                target_device_id: target_hex.clone(),
+                initiator_device_id: r.initiator_hex.clone(),
+                reason: reason.clone(),
+                expires_at_ms: r.expires_at_ms,
+                initiated_by_me,
+                signed_by_me,
+                declined_by_me,
+                declined,
+                cosigner_signed: !r.signatures.is_empty(),
+                can_cosign: !initiated_by_me
+                    && !signed_by_me
+                    && !declined
+                    && !target_is_me
+                    && !target_revoked
+                    && self_master_certed
+                    && r.initiator_sigs.contains_key(&this_device_hex),
+            }
+        })
+        .collect();
+    let quorum_armed_until_ms = quorum
+        .doc
+        .enroll_arms
+        .get(&this_device_hex)
+        .filter(|arm| quorum.now_ms <= arm.armed_until_ms)
+        .map(|arm| arm.armed_until_ms);
+
     OwnerStateView {
         owner_id: hex::encode(loaded.state.owner_id),
         owner_display_name: this_device_name,
@@ -401,6 +492,9 @@ fn build_owner_state_view(
         can_back_up: loaded.master_seed.is_some(),
         fleet_epoch: fleet.carrier_epoch,
         fleet_epoch_stale,
+        self_is_master,
+        quorum_requests,
+        quorum_armed_until_ms,
     }
 }
 
@@ -514,14 +608,27 @@ pub(crate) async fn get_owner_state_inner(
     // runs with an owner loaded). When resident, the view renders from the
     // replicated trust doc and a liveness refresh reaches siblings through
     // the trust engine instead of only a silent local file write.
-    let trust_resident = {
+    let (trust_resident, quorum_doc_arc) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        match (g.owner_trust_doc.clone(), g.owner_trust_sync.clone()) {
+        let trust = match (g.owner_trust_doc.clone(), g.owner_trust_sync.clone()) {
             (Some(doc), Some(engine)) => Some((doc, engine)),
             _ => None,
-        }
+        };
+        (trust, g.owner_quorum_doc.clone())
+    };
+    // ZEB-677 S3: quorum-request snapshot for the co-sign surfaces. Empty
+    // join when the node is down — no resident doc, no ceremony surface.
+    let quorum: QuorumJoin = match quorum_doc_arc {
+        Some(arc) => QuorumJoin {
+            doc: arc.lock().await.clone(),
+            now_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        },
+        None => QuorumJoin::default(),
     };
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
@@ -553,7 +660,12 @@ pub(crate) async fn get_owner_state_inner(
             engine.notify_dirty();
         }
         loaded.state = snapshot;
-        return Ok(Some(build_owner_state_view(&loaded, display_name, fleet)));
+        return Ok(Some(build_owner_state_view(
+            &loaded,
+            display_name,
+            fleet,
+            quorum,
+        )));
     }
     run_blocking(move || {
         // ZEB-342: hold the write lock only across load+refresh+save, so the cbor
@@ -583,7 +695,12 @@ pub(crate) async fn get_owner_state_inner(
             }
             loaded
         };
-        Ok(Some(build_owner_state_view(&loaded, display_name, fleet)))
+        Ok(Some(build_owner_state_view(
+            &loaded,
+            display_name,
+            fleet,
+            quorum,
+        )))
     })
     .await
 }
@@ -1020,7 +1137,12 @@ where
         Ok(MintIpcResult {
             // Mint happens before the node restarts — fleet-net is not yet
             // running so every fleet-joined field is absent (fresh identity).
-            state: build_owner_state_view(&loaded, display_name, FleetJoin::default()),
+            state: build_owner_state_view(
+                &loaded,
+                display_name,
+                FleetJoin::default(),
+                QuorumJoin::default(),
+            ),
             recovery_token: token.to_string(),
         })
     })
@@ -1518,7 +1640,12 @@ mod tests {
         };
 
         // ── (a) Build the view with no pin; take the joiner's device_vk_hex ─
-        let view = build_owner_state_view(&loaded, "this device".into(), FleetJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
         assert_eq!(view.devices.len(), 2, "mint device + joiner");
         let joiner_row = view
             .devices
@@ -1565,6 +1692,7 @@ mod tests {
                 pinned,
                 ..Default::default()
             },
+            QuorumJoin::default(),
         );
         for d in &view2.devices {
             assert_eq!(
@@ -1612,7 +1740,8 @@ mod tests {
         fleet.rows.insert(dev_vk_hex.clone(), (123_456, ep));
         fleet.connected_eps.insert(ep);
 
-        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let view =
+            build_owner_state_view(&loaded, "this device".into(), fleet, QuorumJoin::default());
         let d = view
             .devices
             .iter()
@@ -1626,7 +1755,12 @@ mod tests {
     #[test]
     fn view_absent_fleet_row_yields_honest_nulls() {
         let loaded = minted_loaded_state();
-        let view = build_owner_state_view(&loaded, "this device".into(), FleetJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
         let d = &view.devices[0];
         assert_eq!(d.pet_name, None);
         assert_eq!(d.last_seen_ms, None);
@@ -1643,7 +1777,8 @@ mod tests {
         let dev_vk_hex = fixture_vk_hex(&loaded);
         let mut fleet = FleetJoin::default();
         fleet.petnames.insert(dev_vk_hex.clone(), String::new());
-        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let view =
+            build_owner_state_view(&loaded, "this device".into(), fleet, QuorumJoin::default());
         let d = view
             .devices
             .iter()
@@ -1662,7 +1797,8 @@ mod tests {
 
         let mut fleet = FleetJoin::default();
         fleet.petnames.insert(dev_vk_hex.clone(), "   ".into());
-        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let view =
+            build_owner_state_view(&loaded, "this device".into(), fleet, QuorumJoin::default());
         let d = view
             .devices
             .iter()
@@ -1678,7 +1814,8 @@ mod tests {
         fleet
             .petnames
             .insert(dev_vk_hex.clone(), "  KRILE  ".into());
-        let view = build_owner_state_view(&loaded, "this device".into(), fleet);
+        let view =
+            build_owner_state_view(&loaded, "this device".into(), fleet, QuorumJoin::default());
         let d = view
             .devices
             .iter()
@@ -2361,6 +2498,293 @@ mod revoke_tests {
         assert_eq!(events.lock().unwrap().len(), 1, "no duplicate emission");
     }
 
+    /// ZEB-677 S3: three master-enrolled devices with fresh liveness, keyed
+    /// for the quorum-view tests. Returns (state, a_sk, b_id, c_id, c_vk_hex).
+    fn quorum_view_fixture(
+        now: u64,
+    ) -> (
+        OwnerState,
+        ed25519_dalek::SigningKey,
+        [u8; 16],
+        [u8; 16],
+        String,
+    ) {
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key: a_sk,
+        } = mint_owner(now).expect("mint");
+        let owner_id = state.owner_id;
+        let mut enroll = |t: u64| {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let res = enroll_via_master(
+                &state,
+                &recovery_artifact,
+                &sk,
+                PubKeyBundle::classical_only(sk.verifying_key().to_bytes()),
+                t,
+                trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .expect("enroll");
+            let id = res.enrollment_cert.device_id;
+            state
+                .add_enrollment(res.enrollment_cert, t, trust::DEFAULT_ACTIVE_WINDOW_SECS)
+                .expect("add");
+            (sk, id)
+        };
+        let (b_sk, b_id) = enroll(now + 1);
+        let (c_sk, c_id) = enroll(now + 2);
+        let c_vk_hex = hex::encode(c_sk.verifying_key().to_bytes());
+        for sk in [&a_sk, &b_sk, &c_sk] {
+            state
+                .add_liveness(
+                    harmony_owner::certs::LivenessCert::sign(sk, owner_id, now + 3).unwrap(),
+                )
+                .expect("liveness");
+        }
+        (state, a_sk, b_id, c_id, c_vk_hex)
+    }
+
+    fn masterless_loaded(state: &OwnerState, sk: &ed25519_dalek::SigningKey) -> LoadedOwnerState {
+        LoadedOwnerState {
+            state: state.clone(),
+            device_signing_key: sk.clone(),
+            master_seed: None,
+            fleet_keytree: None,
+        }
+    }
+
+    #[test]
+    fn view_self_is_master_mirrors_seed_presence() {
+        let now = now_unix() - 60;
+        let (state, a_sk, _b, _c, _cvk) = quorum_view_fixture(now);
+        let with_seed = LoadedOwnerState {
+            state: state.clone(),
+            device_signing_key: a_sk.clone(),
+            master_seed: Some(Zeroizing::new([0x11; 32])),
+            fleet_keytree: None,
+        };
+        let view = build_owner_state_view(
+            &with_seed,
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert!(view.self_is_master);
+        let view2 = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert!(!view2.self_is_master);
+    }
+
+    #[test]
+    fn view_quorum_removable_matrix() {
+        let now = now_unix() - 60;
+        let (state, a_sk, b_id, c_id, _cvk) = quorum_view_fixture(now);
+        let a_id = crate::owner_state::device_id_from_signing_key(&a_sk);
+
+        // Master-less A in a 3-device fleet: sibling rows removable via
+        // quorum; the self row never is.
+        let view = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        let row = |id: [u8; 16]| {
+            view.devices
+                .iter()
+                .find(|d| d.device_id == hex::encode(id))
+                .expect("row")
+                .clone()
+        };
+        assert!(row(b_id).quorum_removable);
+        assert!(row(c_id).quorum_removable);
+        assert!(
+            !row(a_id).quorum_removable,
+            "self row is never quorum-removable"
+        );
+
+        // Seed present → the direct Remove path; quorum affordance off.
+        let with_seed = LoadedOwnerState {
+            state: state.clone(),
+            device_signing_key: a_sk.clone(),
+            master_seed: Some(Zeroizing::new([0x11; 32])),
+            fleet_keytree: None,
+        };
+        let view_seed = build_owner_state_view(
+            &with_seed,
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert!(view_seed.devices.iter().all(|d| !d.quorum_removable));
+
+        // No liveness for C: B's row loses its second co-signer candidate
+        // (only C could co-sign a removal of B — it is inactive), while
+        // C's own row keeps B as the candidate.
+        let mut stale_c = state.clone();
+        stale_c.liveness.remove(&c_id);
+        let view_stale = build_owner_state_view(
+            &masterless_loaded(&stale_c, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        let row_s = |id: [u8; 16]| {
+            view_stale
+                .devices
+                .iter()
+                .find(|d| d.device_id == hex::encode(id))
+                .expect("row")
+                .clone()
+        };
+        assert!(
+            !row_s(b_id).quorum_removable,
+            "no active co-signer besides the target"
+        );
+        assert!(row_s(c_id).quorum_removable, "B can co-sign C's removal");
+    }
+
+    #[test]
+    fn view_quorum_requests_flags_and_arm_window() {
+        let now = now_unix() - 60;
+        let now_ms = now * 1000;
+        let (state, a_sk, b_id, c_id, _cvk) = quorum_view_fixture(now);
+        let a_id = crate::owner_state::device_id_from_signing_key(&a_sk);
+        let a_hex = hex::encode(a_id);
+
+        let mk_request = |initiator: [u8; 16], addressed_to: &[[u8; 16]], expires_at_ms: u64| {
+            crate::owner_quorum_sync::QuorumRequest {
+                created_at: crate::owner_state_types::Hlc {
+                    wall_ms: now_ms,
+                    logical: 0,
+                    device_id: hex::encode(initiator),
+                },
+                declined_by: Default::default(),
+                initiator_hex: hex::encode(initiator),
+                kind: crate::owner_quorum_sync::QuorumRequestKind::Revocation {
+                    reason: "lost".into(),
+                    target_hex: hex::encode(c_id),
+                },
+                initiator_sigs: addressed_to
+                    .iter()
+                    .map(|id| (hex::encode(id), "00".repeat(64)))
+                    .collect(),
+                signatures: Default::default(),
+                issued_at: now,
+                expires_at_ms,
+            }
+        };
+
+        let mut quorum = QuorumJoin {
+            doc: Default::default(),
+            now_ms,
+        };
+        // B asks A to co-sign removing C → canCosign.
+        quorum
+            .doc
+            .requests
+            .insert("01".repeat(16), mk_request(b_id, &[a_id], now_ms + 1000));
+        // A's own request → initiatedByMe, never canCosign.
+        quorum
+            .doc
+            .requests
+            .insert("02".repeat(16), mk_request(a_id, &[b_id], now_ms + 1000));
+        // Declined request → dead for co-sign.
+        let mut declined = mk_request(b_id, &[a_id], now_ms + 1000);
+        declined.declined_by.insert(hex::encode(b_id));
+        quorum.doc.requests.insert("03".repeat(16), declined);
+        // Already signed by A → cosignerSigned, not canCosign.
+        let mut signed = mk_request(b_id, &[a_id], now_ms + 1000);
+        signed.signatures.insert(
+            a_hex.clone(),
+            crate::owner_quorum_sync::QuorumRequestSigs {
+                epoch_doc_sig_hex: None,
+                primary_sig_hex: "00".repeat(64),
+            },
+        );
+        quorum.doc.requests.insert("04".repeat(16), signed);
+        // Expired → filtered out entirely.
+        quorum
+            .doc
+            .requests
+            .insert("05".repeat(16), mk_request(b_id, &[a_id], now_ms - 1));
+        // Not addressed to A (no co-sign slot) → not canCosign.
+        quorum
+            .doc
+            .requests
+            .insert("06".repeat(16), mk_request(b_id, &[], now_ms + 1000));
+        // Own arm cell, unexpired → surfaces.
+        quorum.doc.enroll_arms.insert(
+            a_hex.clone(),
+            crate::owner_quorum_sync::EnrollArm {
+                set_at: crate::owner_state_types::Hlc {
+                    wall_ms: now_ms,
+                    logical: 0,
+                    device_id: a_hex.clone(),
+                },
+                armed_until_ms: now_ms + 900_000,
+            },
+        );
+
+        let view = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            quorum,
+        );
+        assert_eq!(view.quorum_requests.len(), 5, "expired request filtered");
+        let by_id = |id: &str| {
+            view.quorum_requests
+                .iter()
+                .find(|r| r.request_id == id.repeat(16))
+                .expect("request view")
+        };
+        let r1 = by_id("01");
+        assert!(r1.can_cosign && !r1.initiated_by_me && !r1.signed_by_me && !r1.declined);
+        assert_eq!(r1.kind, "revocation");
+        assert_eq!(r1.reason, "lost");
+        assert_eq!(r1.target_device_id, hex::encode(c_id));
+        assert_eq!(r1.initiator_device_id, hex::encode(b_id));
+        let r2 = by_id("02");
+        assert!(r2.initiated_by_me && !r2.can_cosign);
+        let r3 = by_id("03");
+        assert!(r3.declined && !r3.can_cosign);
+        let r4 = by_id("04");
+        assert!(r4.signed_by_me && r4.cosigner_signed && !r4.can_cosign);
+        let r6 = by_id("06");
+        assert!(!r6.can_cosign, "no co-sign slot for this device");
+        assert_eq!(view.quorum_armed_until_ms, Some(now_ms + 900_000));
+
+        // Expired arm cell → None.
+        let mut expired_arm = QuorumJoin {
+            doc: Default::default(),
+            now_ms,
+        };
+        expired_arm.doc.enroll_arms.insert(
+            a_hex.clone(),
+            crate::owner_quorum_sync::EnrollArm {
+                set_at: crate::owner_state_types::Hlc {
+                    wall_ms: now_ms,
+                    logical: 0,
+                    device_id: a_hex,
+                },
+                armed_until_ms: now_ms - 1,
+            },
+        );
+        let view2 = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            expired_arm,
+        );
+        assert_eq!(view2.quorum_armed_until_ms, None);
+    }
+
     /// ZEB-668 S5: `fleetEpochStale` = any revocation newer than the last
     /// bump. Cert `issued_at` is seconds; the bump stamp is milliseconds.
     #[test]
@@ -2374,7 +2798,12 @@ mod revoke_tests {
             master_seed: Some(Zeroizing::new(seed)),
             fleet_keytree: None,
         };
-        let view = build_owner_state_view(&loaded, "d".into(), FleetJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
         assert!(!view.fleet_epoch_stale);
         assert_eq!(view.fleet_epoch, 0);
 
@@ -2396,7 +2825,12 @@ mod revoke_tests {
         };
 
         // Pre-S5 carrier (0/0): the revocation makes the fleet honestly stale.
-        let view = build_owner_state_view(&loaded, "d".into(), FleetJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
         assert!(view.fleet_epoch_stale, "pre-bump fleet with a revocation");
 
         // Bump BEFORE the revocation (ms): still stale.
@@ -2405,7 +2839,7 @@ mod revoke_tests {
             carrier_bump_wall_ms: (now - 10) * 1000,
             ..Default::default()
         };
-        let view = build_owner_state_view(&loaded, "d".into(), stale_join);
+        let view = build_owner_state_view(&loaded, "d".into(), stale_join, QuorumJoin::default());
         assert!(view.fleet_epoch_stale, "revocation postdates the bump");
         assert_eq!(view.fleet_epoch, 1);
 
@@ -2415,7 +2849,7 @@ mod revoke_tests {
             carrier_bump_wall_ms: (now + 10) * 1000,
             ..Default::default()
         };
-        let view = build_owner_state_view(&loaded, "d".into(), fresh_join);
+        let view = build_owner_state_view(&loaded, "d".into(), fresh_join, QuorumJoin::default());
         assert!(!view.fleet_epoch_stale, "bump postdates every revocation");
         assert_eq!(view.fleet_epoch, 2);
     }
@@ -2439,7 +2873,12 @@ mod revoke_tests {
             master_seed: Some(Zeroizing::new(seed)),
             fleet_keytree: None,
         };
-        let view = build_owner_state_view(&loaded, "Test Device".to_string(), FleetJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "Test Device".to_string(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
         let revoked_row = view
             .devices
             .iter()
