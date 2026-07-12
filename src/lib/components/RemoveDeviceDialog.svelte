@@ -10,6 +10,7 @@
     error,
     onConfirm,
     onCancel,
+    mode = 'remove',
   }: {
     deviceName: string;
     isSelf: boolean;
@@ -18,6 +19,11 @@
     error: string | null;
     onConfirm: (reason: RevokeReason) => void;
     onCancel: () => void;
+    // ZEB-668 S6: 'replace' = remove-then-re-pair flow. The reason is
+    // locked to 'decommissioned' (the radios are hidden) and the copy
+    // states removal-first semantics; same typed-confirm tier — the
+    // removal itself is identical to a plain remove.
+    mode?: 'remove' | 'replace';
   } = $props();
 
   let typed = $state('');
@@ -55,12 +61,27 @@
   ariaLabelledby={titleId}
 >
   <h2 class="dialog-title" id={titleId}>
-    {isSelf ? 'Remove this device?' : `Remove ${deviceName}?`}
+    {#if mode === 'replace'}
+      Replace {deviceName}?
+    {:else}
+      {isSelf ? 'Remove this device?' : `Remove ${deviceName}?`}
+    {/if}
   </h2>
-  <p class="dialog-message">
-    Removing this device cuts it off from posting in your communities, syncing with your other
-    devices, and message deposits and relay.
-  </p>
+  {#if mode === 'replace'}
+    <p class="dialog-message">
+      {deviceName} is removed first (recorded as decommissioned), then pairing opens to enroll
+      its replacement. The removal takes effect immediately — even if you cancel pairing.
+    </p>
+    <p class="dialog-message">
+      Your owner identity and master key are unchanged — the new device joins under the same
+      identity, and this device's name carries over.
+    </p>
+  {:else}
+    <p class="dialog-message">
+      Removing this device cuts it off from posting in your communities, syncing with your other
+      devices, and message deposits and relay.
+    </p>
+  {/if}
   <p class="dialog-message honesty">
     Its direct messages and vine feeds are separate surfaces and are not blocked yet — those
     cutoffs land in follow-up work.
@@ -75,16 +96,18 @@
     <p class="dialog-message honesty">Your local data on this device is not deleted.</p>
   {/if}
 
-  <fieldset class="reason-group">
-    <legend class="reason-legend">Reason</legend>
-    {#each reasons as r (r.value)}
-      <label class="reason-option">
-        <input type="radio" name="revoke-reason" value={r.value} bind:group={reason} />
-        <span class="reason-label">{r.label}</span>
-        <span class="reason-hint">— {r.hint}</span>
-      </label>
-    {/each}
-  </fieldset>
+  {#if mode === 'remove'}
+    <fieldset class="reason-group">
+      <legend class="reason-legend">Reason</legend>
+      {#each reasons as r (r.value)}
+        <label class="reason-option">
+          <input type="radio" name="revoke-reason" value={r.value} bind:group={reason} />
+          <span class="reason-label">{r.label}</span>
+          <span class="reason-hint">— {r.hint}</span>
+        </label>
+      {/each}
+    </fieldset>
+  {/if}
 
   <p class="dialog-hint">Type <code>{deviceName}</code> to confirm</p>
   <input class="dialog-input" type="text" aria-label="Type to confirm" bind:value={typed} />
@@ -109,9 +132,9 @@
     <button
       class="confirm-btn destructive"
       disabled={!matches || busy}
-      onclick={() => onConfirm(reason)}
+      onclick={() => onConfirm(mode === 'replace' ? 'decommissioned' : reason)}
     >
-      Remove device
+      {mode === 'replace' ? 'Remove & continue' : 'Remove device'}
     </button>
   </div>
 </Modal>

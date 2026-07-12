@@ -84,3 +84,37 @@ describe('RemoveDeviceDialog (ZEB-668 S2)', () => {
     expect(p.onCancel).toHaveBeenCalled();
   });
 });
+
+describe('RemoveDeviceDialog replace mode (ZEB-668 S6)', () => {
+  it('renders the replace title, hides reason radios, and locks decommissioned', async () => {
+    const p = props({ mode: 'replace' });
+    render(RemoveDeviceDialog, { props: p });
+    expect(screen.getByText('Replace Study Mac?')).toBeInTheDocument();
+    expect(screen.queryAllByRole('radio')).toHaveLength(0);
+    const confirm = screen.getByRole('button', { name: /remove & continue/i });
+    expect(confirm).toBeDisabled();
+    await fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Study Mac' } });
+    await fireEvent.click(confirm);
+    expect(p.onConfirm).toHaveBeenCalledWith('decommissioned');
+  });
+
+  it('states removal-first semantics and that the master key is unchanged (§7 scope note)', () => {
+    render(RemoveDeviceDialog, { props: props({ mode: 'replace' }) });
+    expect(screen.getByText(/removed first|removes .* first/i)).toBeInTheDocument();
+    expect(screen.getByText(/even if you cancel pairing/i)).toBeInTheDocument();
+    expect(screen.getByText(/owner identity and master key are unchanged/i)).toBeInTheDocument();
+  });
+
+  it('keeps the honesty copy about un-severed surfaces in replace mode', () => {
+    render(RemoveDeviceDialog, { props: props({ mode: 'replace' }) });
+    expect(screen.getByText(/not blocked yet/i)).toBeInTheDocument();
+  });
+
+  it('still requires the exact device name in replace mode', async () => {
+    const p = props({ mode: 'replace' });
+    render(RemoveDeviceDialog, { props: p });
+    await fireEvent.input(screen.getByRole('textbox'), { target: { value: 'wrong' } });
+    expect(screen.getByRole('button', { name: /remove & continue/i })).toBeDisabled();
+    expect(p.onConfirm).not.toHaveBeenCalled();
+  });
+});
