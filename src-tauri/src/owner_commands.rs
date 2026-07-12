@@ -255,6 +255,8 @@ pub(crate) fn plan_fleet_epoch_bump(
         sealed,
         master_pubkey: None,
         master_sig: Vec::new(),
+        quorum_sig: None,
+        signer_certs: Vec::new(),
     };
     doc.sign(&artifact.master_signing_key(), master_pubkey)?;
     Ok((doc, new_kt))
