@@ -1950,6 +1950,10 @@ mod tests {
             "revoke_device",
             "set_device_petname",
             "bump_fleet_epoch",
+            // quorum revocation ceremony (ZEB-677 S3)
+            "request_quorum_revocation",
+            "cosign_quorum_request",
+            "decline_quorum_request",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",
