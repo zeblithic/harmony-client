@@ -5737,6 +5737,13 @@ pub async fn start_node_inner(
                             ));
                         let apply_identity_dir = identity_dir.clone();
                         let apply_emit = std::sync::Arc::clone(&app);
+                        // PR #455 round 2 (Greptile P1): the install path runs
+                        // the window-close decision itself, so a restarted
+                        // seed-holder (boot set = {0}) lands on the CORRECT
+                        // post-install state instead of accepting epoch-0
+                        // until the next republish tick.
+                        let apply_trust = std::sync::Arc::clone(&owner_trust_doc);
+                        let apply_fleet_net = std::sync::Arc::clone(&fleet_net_doc);
                         // ZEB-428 seam (PR #455 round 1): the keychain enters
                         // the task as an injected factory, never constructed
                         // at the use sites.
@@ -5760,6 +5767,25 @@ pub async fn start_node_inner(
                                     );
                                     continue;
                                 }
+                                // Window state for the epoch being installed:
+                                // closed → newest only; open → {N-1, N}.
+                                let window_closed = {
+                                    let survivor_seen = crate::fleet_epoch_survivor_seen_ms(
+                                        &apply_trust,
+                                        &apply_fleet_net,
+                                    )
+                                    .await;
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u64;
+                                    crate::owner_commands::fleet_epoch_window_should_close(
+                                        doc_snapshot.bump_wall_ms,
+                                        now_ms,
+                                        &survivor_seen,
+                                    )
+                                };
                                 let installed = tokio::task::spawn_blocking({
                                     let doc = doc_snapshot.clone();
                                     let device_sk = apply_device_sk.clone();
@@ -5792,8 +5818,38 @@ pub async fn start_node_inner(
                                             kt
                                         };
                                         keys.install(std::sync::Arc::new(new_kt));
-                                        // Cert-only devices persist the enlarged
-                                        // set; seed-holders never read the slot.
+                                        // Reconstruct the WINDOW state (PR #455
+                                        // round 2, Greptile P1): closed → the
+                                        // new epoch only; open → exactly
+                                        // {N-1, N}. Anything older the boot
+                                        // set carried (a restarted seed-holder
+                                        // boots {0}) is evicted either way —
+                                        // a revoked device holds every epoch
+                                        // below the bump that excluded it.
+                                        let prev_epoch = doc.epoch.saturating_sub(1);
+                                        if window_closed {
+                                            keys.retain_newest_only();
+                                        } else {
+                                            if let Some(seed) = seed {
+                                                if doc.epoch >= 1
+                                                    && !keys.epochs().contains(&prev_epoch)
+                                                {
+                                                    match crate::owner_state_crypto::KeyTree::derive_at_epoch(
+                                                        seed, prev_epoch,
+                                                    ) {
+                                                        Ok(kt_prev) => keys
+                                                            .install(std::sync::Arc::new(kt_prev)),
+                                                        Err(e) => tracing::warn!(
+                                                            error = %e,
+                                                            "could not derive previous epoch for the open window"
+                                                        ),
+                                                    }
+                                                }
+                                            }
+                                            keys.retain_min_epoch(prev_epoch);
+                                        }
+                                        // Cert-only devices persist the set;
+                                        // seed-holders never read the slot.
                                         // The helper guarantees the epoch-0
                                         // carrier key rides along even though
                                         // the data accept set excludes it
@@ -5804,6 +5860,7 @@ pub async fn start_node_inner(
                                                 &boot_keychain(),
                                                 &dir,
                                                 &keys,
+                                                0,
                                             )?;
                                         }
                                         Ok(doc.epoch)
@@ -8515,25 +8572,11 @@ pub async fn start_node_inner(
                                         (doc.bump_wall_ms, doc.epoch)
                                     };
                                     if bump_ms > 0 {
-                                        let survivor_seen: Vec<Option<u64>> = {
-                                            let trust = window_trust.lock().await;
-                                            let rows = fleet_doc.lock().await;
-                                            trust
-                                                .enrollments
-                                                .iter()
-                                                .filter(|(id, _)| !trust.is_revoked(**id))
-                                                .map(|(_, cert)| {
-                                                    let vk_hex = hex::encode(
-                                                        cert.device_pubkeys
-                                                            .classical
-                                                            .ed25519_verify,
-                                                    );
-                                                    rows.devices
-                                                        .get(&vk_hex)
-                                                        .map(|r| r.seen_at.wall_ms)
-                                                })
-                                                .collect()
-                                        };
+                                        let survivor_seen = crate::fleet_epoch_survivor_seen_ms(
+                                            &window_trust,
+                                            &fleet_doc,
+                                        )
+                                        .await;
                                         let now_ms = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
@@ -8544,41 +8587,55 @@ pub async fn start_node_inner(
                                             now_ms,
                                             &survivor_seen,
                                         ) {
-                                            window_keys.retain_newest_only();
-                                            tracing::info!(
-                                                epoch = window_keys.newest().epoch,
-                                                "fleet epoch window closed; old epoch dropped from accept set"
-                                            );
-                                            // Cert-only devices rewrite the vault
-                                            // to {epoch-0, current} (epoch-0 keys
-                                            // the carrier forever; seed-holders
-                                            // never read the slot).
-                                            if !window_is_seed_holder {
+                                            // DURABILITY FIRST (PR #455 round 2,
+                                            // Greptile P1): cert devices persist
+                                            // the pruned vault BEFORE narrowing
+                                            // memory — a failed write must leave
+                                            // >1 in-memory epochs so this tick's
+                                            // check fires again; narrowing first
+                                            // would strand a stale on-disk accept
+                                            // set that reopens the window at the
+                                            // next boot. Seed-holders have no
+                                            // vault to persist.
+                                            let newest_epoch = window_keys.newest().epoch;
+                                            let persisted = if window_is_seed_holder {
+                                                true
+                                            } else {
                                                 let dir = window_identity_dir.clone();
                                                 let keys_for_prune = window_keys.clone();
-                                                // Shared helper (PR #455 round 1):
-                                                // guarantees the epoch-0 carrier
-                                                // key survives the rewrite, via
-                                                // the injected keychain seam.
                                                 let prune = tokio::task::spawn_blocking(move || {
                                                     crate::fleet_key_epoch::persist_vault_material_set(
                                                         &window_keychain(),
                                                         &dir,
                                                         &keys_for_prune,
+                                                        newest_epoch,
                                                     )
                                                 })
                                                 .await;
                                                 match prune {
-                                                    Ok(Ok(())) => {}
-                                                    Ok(Err(e)) => tracing::warn!(
-                                                        error = %e,
-                                                        "fleet epoch window: vault prune failed (retries next tick)"
-                                                    ),
-                                                    Err(e) => tracing::warn!(
-                                                        error = %e,
-                                                        "fleet epoch window: vault prune task panicked"
-                                                    ),
+                                                    Ok(Ok(())) => true,
+                                                    Ok(Err(e)) => {
+                                                        tracing::warn!(
+                                                            error = %e,
+                                                            "fleet epoch window: vault prune failed; close retried next tick"
+                                                        );
+                                                        false
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            error = %e,
+                                                            "fleet epoch window: vault prune task panicked; close retried next tick"
+                                                        );
+                                                        false
+                                                    }
                                                 }
+                                            };
+                                            if persisted {
+                                                window_keys.retain_newest_only();
+                                                tracing::info!(
+                                                    epoch = newest_epoch,
+                                                    "fleet epoch window closed; old epoch dropped from accept set"
+                                                );
                                             }
                                         }
                                     }
@@ -56288,6 +56345,29 @@ async fn set_device_petname(
 /// carrier, adopts the signed doc into the resident carrier, installs the
 /// new tree into the shared key set, and flushes the carrier engine.
 /// Returns the new epoch.
+/// ZEB-668 S5 (PR #455 round 2): survivor fleet-net `seen_at.wall_ms`
+/// snapshot for the dual-epoch window-close decision — every enrolled,
+/// non-revoked device, `None` where no fleet-net row exists yet. Shared by
+/// the periodic tick and the carrier install path (a replay-driven install
+/// must reconstruct the CORRECT window state, not merely add the new epoch
+/// beside whatever the boot set held).
+pub(crate) async fn fleet_epoch_survivor_seen_ms(
+    trust: &tokio::sync::Mutex<harmony_owner::state::OwnerState>,
+    fleet_net: &tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>,
+) -> Vec<Option<u64>> {
+    let trust = trust.lock().await;
+    let rows = fleet_net.lock().await;
+    trust
+        .enrollments
+        .iter()
+        .filter(|(id, _)| !trust.is_revoked(**id))
+        .map(|(_, cert)| {
+            let vk_hex = hex::encode(cert.device_pubkeys.classical.ed25519_verify);
+            rows.devices.get(&vk_hex).map(|r| r.seen_at.wall_ms)
+        })
+        .collect()
+}
+
 pub(crate) async fn bump_fleet_epoch_impl(
     state: &Mutex<NodeState>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,

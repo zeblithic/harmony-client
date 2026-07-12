@@ -277,6 +277,18 @@ impl FleetKeySet {
         set.truncate(1);
     }
 
+    /// Drop every epoch strictly below `min_epoch` (PR #455 round 2,
+    /// Greptile P1): a replay-driven install must evict stale epochs the
+    /// boot set carried (a restarted seed-holder boots at epoch 0), not
+    /// merely add the new epoch beside them. Never empties the set — the
+    /// newest epoch always survives even when `min_epoch` overshoots it.
+    pub fn retain_min_epoch(&self, min_epoch: u32) {
+        let mut set = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let newest = set[0].epoch;
+        let floor = min_epoch.min(newest);
+        set.retain(|k| k.epoch >= floor);
+    }
+
     /// Installed epochs, descending.
     pub fn epochs(&self) -> Vec<u32> {
         self.lock_read().iter().map(|k| k.epoch).collect()
@@ -1348,6 +1360,22 @@ mod tests {
         set.install(arc_tree(1));
         let epochs: Vec<u32> = set.accept_set().iter().map(|k| k.epoch).collect();
         assert_eq!(epochs, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn fleet_key_set_retain_min_epoch_evicts_stale_but_never_empties() {
+        let set = FleetKeySet::new(arc_tree(0));
+        set.install(arc_tree(3));
+        set.install(arc_tree(4));
+        set.retain_min_epoch(3);
+        assert_eq!(
+            set.epochs(),
+            vec![4, 3],
+            "epoch 0 evicted, window pair kept"
+        );
+        // Overshooting min clamps to the newest epoch instead of emptying.
+        set.retain_min_epoch(99);
+        assert_eq!(set.epochs(), vec![4]);
     }
 
     #[test]

@@ -307,10 +307,17 @@ pub fn persist_vault_material_set(
     keychain: &Option<crate::identity::KeychainStore>,
     identity_dir: &std::path::Path,
     keys: &crate::owner_state_crypto::FleetKeySet,
+    min_epoch: u32,
 ) -> Result<(), String> {
+    // `min_epoch` lets the window-close path persist the PRUNED set BEFORE
+    // narrowing memory (PR #455 round 2, Greptile P1: durability first — a
+    // failed write must leave the in-memory set wide so the next tick
+    // retries). Epoch-0 rides along regardless of the floor: it is the
+    // carrier key, not a data epoch.
     let mut materials: Vec<crate::owner_state_crypto::FleetKeyMaterial> = keys
         .accept_set()
         .iter()
+        .filter(|k| k.epoch >= min_epoch)
         .map(|k| k.to_fleet_material())
         .collect();
     if !materials.iter().any(|m| m.epoch == 0) {
@@ -552,12 +559,12 @@ mod tests {
         // Seed the slot with a set that INCLUDES epoch-0.
         let with_zero = crate::owner_state_crypto::FleetKeySet::new(std::sync::Arc::clone(&kt0));
         with_zero.install(std::sync::Arc::clone(&kt2));
-        persist_vault_material_set(&None, dir.path(), &with_zero).expect("persist with 0");
+        persist_vault_material_set(&None, dir.path(), &with_zero, 0).expect("persist with 0");
 
         // Now persist from a set WITHOUT epoch-0 (post-window data set):
         // epoch-0 must be re-read from the existing slot and survive.
         let without_zero = crate::owner_state_crypto::FleetKeySet::new(kt2);
-        persist_vault_material_set(&None, dir.path(), &without_zero).expect("persist without 0");
+        persist_vault_material_set(&None, dir.path(), &without_zero, 0).expect("persist without 0");
         let bytes = crate::owner_state::load_fleet_keytree(&None, dir.path())
             .expect("load ok")
             .expect("slot present");
@@ -575,9 +582,30 @@ mod tests {
             &None,
             dir2.path(),
             &crate::owner_state_crypto::FleetKeySet::new(kt3),
+            0,
         )
         .expect_err("must refuse without epoch-0 anywhere");
         assert!(err.contains("epoch-0"), "{err}");
+
+        // PR #455 round 2 (Greptile P1): the min_epoch floor persists the
+        // PRUNED set (old data epoch dropped, epoch-0 carrier key kept) so
+        // the close path can write durability-first.
+        let kt4 = std::sync::Arc::new(
+            crate::owner_state_crypto::KeyTree::derive_at_epoch(&seed, 4).expect("kt4"),
+        );
+        with_zero.install(kt4); // {4, 2, 0}
+        persist_vault_material_set(&None, dir.path(), &with_zero, 4).expect("pruned persist");
+        let bytes = crate::owner_state::load_fleet_keytree(&None, dir.path())
+            .expect("load ok")
+            .expect("slot present");
+        let set = crate::owner_state_crypto::decode_fleet_material_set(&bytes).expect("decode");
+        let mut epochs: Vec<u32> = set.iter().map(|m| m.epoch).collect();
+        epochs.sort_unstable();
+        assert_eq!(
+            epochs,
+            vec![0, 4],
+            "old data epoch pruned, carrier key kept"
+        );
     }
 
     #[test]
