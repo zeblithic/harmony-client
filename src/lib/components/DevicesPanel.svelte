@@ -339,6 +339,65 @@
     }
   }
 
+  // ZEB-668 S6: replace = typed-confirm revoke (reason locked to
+  // "decommissioned") + immediately launch inviter pairing; the old row's
+  // fleet petname carries to the successor at pairing completion.
+  let replaceTarget = $state<DeviceView | null>(null);
+  let replaceInFlight = $state(false);
+  let replaceError = $state<string | null>(null);
+  // Captured at confirm; null = nothing to carry. Cleared by the carry
+  // attempt or by closing the pairing modal un-completed (the replace
+  // honestly degrades to a plain remove — the revoke already landed).
+  let pendingCarryPetname = $state<string | null>(null);
+  let carryError = $state<string | null>(null);
+
+  async function handleReplaceConfirm() {
+    if (!replaceTarget || replaceInFlight) return;
+    replaceError = null;
+    replaceInFlight = true;
+    try {
+      const carry = replaceTarget.petName?.trim() || null;
+      // Revoke BEFORE pairing: the master path bumps the fleet epoch, so
+      // the inviter seals the successor into the post-revocation window,
+      // never the compromised one.
+      await svc.revoke(replaceTarget.deviceVkHex, 'decommissioned');
+      await svc.refresh();
+      pendingCarryPetname = carry;
+      carryError = null;
+      replaceTarget = null;
+      inviterOpen = true;
+    } catch (e) {
+      replaceError = extractError(e);
+    } finally {
+      replaceInFlight = false;
+    }
+  }
+
+  async function handlePairingComplete(deviceIdHex: string) {
+    const carry = pendingCarryPetname;
+    pendingCarryPetname = null;
+    try {
+      // The successor row must be visible to map its 32-hex deviceId to
+      // the 64-hex vk the petname IPC keys on (PairingInviter folded the
+      // enrollment into the resident doc before firing onComplete).
+      await svc.refresh();
+    } catch {
+      // Best-effort; owner-devices-updated re-refreshes.
+    }
+    if (!carry) return;
+    const successor = state?.devices.find((d) => d.deviceId === deviceIdHex);
+    if (!successor) {
+      carryError = `Couldn't carry the name "${carry}" to the new device — rename it manually.`;
+      return;
+    }
+    try {
+      await setDevicePetname(successor.deviceVkHex, carry);
+      await svc.refresh();
+    } catch (e) {
+      carryError = `Couldn't carry the name "${carry}" to the new device — rename it manually. (${extractError(e)})`;
+    }
+  }
+
   // Live refresh when trust state changes under us (S1 replication: a
   // sibling's revoke/enrollment arrives via the trust engine's detector).
   let unlistenDevicesUpdated: (() => void) | null = null;
@@ -729,8 +788,20 @@
                          are renamable from any device. -->
                     <button class="rename-btn" onclick={() => startRename(device)}>Rename</button>
                     {#if state.canBackUp}
-                      <!-- Honesty rule: the sibling affordance renders only
+                      <!-- Honesty rule: the sibling affordances render only
                            where the IPC can succeed (master seed present). -->
+                      <!-- ZEB-668 S6: replace = remove + re-pair + petname
+                           carry-over; same severity as remove (the removal
+                           is immediate), so the same button treatment. -->
+                      <button
+                        class="remove-btn"
+                        onclick={() => {
+                          replaceError = null;
+                          replaceTarget = device;
+                        }}
+                      >
+                        Replace…
+                      </button>
                       <button
                         class="remove-btn"
                         onclick={() => {
@@ -796,6 +867,9 @@
         {#if renameError}
           <p class="error" role="alert">{renameError}</p>
         {/if}
+        {#if carryError}
+          <p class="error" role="alert">{carryError}</p>
+        {/if}
       </div>
 
       <!-- ②b Removed devices (ZEB-668 S2) — collapsed; real RevocationSet data -->
@@ -857,6 +931,24 @@
       onCancel={() => {
         removeTarget = null;
         removeError = null;
+      }}
+    />
+  {/if}
+
+  {#if replaceTarget}
+    <!-- ZEB-668 S6: sibling-only (self rows never offer Replace), so
+         isSelf/isSeedHolder are statically false. -->
+    <RemoveDeviceDialog
+      mode="replace"
+      deviceName={replaceTarget.displayName}
+      isSelf={false}
+      isSeedHolder={false}
+      busy={replaceInFlight}
+      error={replaceError}
+      onConfirm={handleReplaceConfirm}
+      onCancel={() => {
+        replaceTarget = null;
+        replaceError = null;
       }}
     />
   {/if}
@@ -931,10 +1023,17 @@
     }} />
   {/if}
   {#if inviterOpen}
-    <PairingInviter hostname={state?.ownerDisplayName ?? 'this device'} onClose={async () => {
-      inviterOpen = false;
-      await svc.refresh();
-    }} />
+    <PairingInviter
+      hostname={state?.ownerDisplayName ?? 'this device'}
+      onComplete={handlePairingComplete}
+      onClose={async () => {
+        inviterOpen = false;
+        // Abandoned replace-pairing: the revoke already landed; drop the
+        // pending carry so a LATER unrelated pairing can't inherit it.
+        pendingCarryPetname = null;
+        await svc.refresh();
+      }}
+    />
   {/if}
 
   {#if modalOpen}
