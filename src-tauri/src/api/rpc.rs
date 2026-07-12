@@ -386,6 +386,13 @@ struct SetDevicePetnameArgs {
     petname: String,
 }
 
+/// ZEB-677 S3: quorum ceremony verbs addressed by request id.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuorumRequestIdArgs {
+    request_id: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayNameArgs {
@@ -968,6 +975,39 @@ pub fn build_registry() -> RpcRegistry {
         SetDevicePetnameArgs,
         |state, sink, a| async move {
             crate::set_device_petname_impl(state, sink, a.device_vk_hex, a.petname).await
+        }
+    );
+    // ZEB-677 S3: quorum revocation ceremony.
+    rpc!(
+        m,
+        "request_quorum_revocation",
+        RevokeDeviceArgs,
+        |state, sink, a| async move {
+            crate::owner_quorum_commands::request_quorum_revocation_impl(
+                state,
+                sink,
+                a.device_vk_hex,
+                a.reason,
+            )
+            .await
+        }
+    );
+    rpc!(
+        m,
+        "cosign_quorum_request",
+        QuorumRequestIdArgs,
+        |state, sink, a| async move {
+            crate::owner_quorum_commands::cosign_quorum_request_impl(state, sink, a.request_id)
+                .await
+        }
+    );
+    rpc!(
+        m,
+        "decline_quorum_request",
+        QuorumRequestIdArgs,
+        |state, sink, a| async move {
+            crate::owner_quorum_commands::decline_quorum_request_impl(state, sink, a.request_id)
+                .await
         }
     );
     rpc!(

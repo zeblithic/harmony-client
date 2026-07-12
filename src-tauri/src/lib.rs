@@ -216,6 +216,7 @@ pub mod open_join_auth;
 pub mod open_join_dial;
 pub mod owner_commands;
 pub mod owner_loaded;
+pub mod owner_quorum_commands;
 pub mod owner_quorum_sync;
 pub mod owner_state;
 pub mod owner_state_crdt;
@@ -1383,6 +1384,16 @@ pub struct NodeState {
     /// cleared at stop_node — revocation is permanent; boot re-derives it
     /// from `owner_state.cbor`.
     pub owner_trust_revoked_self: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// ZEB-677 S3: the resident quorum co-sign request doc
+    /// (`owner-quorum-req-v1`) and its replication engine. `Some` while
+    /// the node runs with an owner identity loaded. The quorum ceremony
+    /// IPCs require these (no FileOnly fallback — a co-sign request
+    /// without replication is meaningless).
+    pub owner_quorum_doc:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_quorum_sync::QuorumReqDoc>>>,
+    pub owner_quorum_sync: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::owner_quorum_sync::QuorumReqDoc>>,
+    >,
     /// ZEB-668 S5: resident fleet-keys carrier doc (`fleet-keys-v1`) + its
     /// engine, and the swappable key set shared by every fleet dataset
     /// engine. The bump IPC mutates the doc + installs into `fleet_keys`;
@@ -1871,6 +1882,8 @@ impl Default for NodeState {
             owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            owner_quorum_doc: None,
+            owner_quorum_sync: None,
             fleet_key_epoch_doc: None,
             fleet_key_epoch_sync: None,
             fleet_keys: None,
@@ -2166,6 +2179,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let owner_trust_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
     >;
+    // ZEB-677 S3: quorum-request engine, same shutdown pattern.
+    let owner_quorum_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::owner_quorum_sync::QuorumReqDoc>>,
+    >;
     // ZEB-668 S5: fleet-keys carrier engine, same shutdown pattern.
     let fleet_key_epoch_sync_for_shutdown: Option<
         std::sync::Arc<
@@ -2427,6 +2444,9 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // revoked-self latch deliberately survives (permanent state).
         owner_trust_sync_for_shutdown = guard.owner_trust_sync.take();
         guard.owner_trust_doc = None;
+        // ZEB-677 S3: quorum-request engine handles die with the node.
+        owner_quorum_sync_for_shutdown = guard.owner_quorum_sync.take();
+        guard.owner_quorum_doc = None;
         // ZEB-668 S5: carrier engine dies with the node too.
         fleet_key_epoch_sync_for_shutdown = guard.fleet_key_epoch_sync.take();
         guard.fleet_key_epoch_doc = None;
@@ -2916,6 +2936,35 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for fleet-net \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-677 S3: shut down the quorum-request engine the same way, so the
+    // final debounced request publish + doc persist run before the zenoh
+    // session dies.
+    if let Some(quorum_engine) = owner_quorum_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(quorum_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "owner-quorum FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for owner-quorum \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -57025,6 +57074,9 @@ pub fn run() {
             owner_commands::preview_owner_mnemonic_identity,
             owner_commands::restore_owner_mnemonic_from_words,
             owner_commands::revoke_device,
+            owner_quorum_commands::request_quorum_revocation,
+            owner_quorum_commands::cosign_quorum_request,
+            owner_quorum_commands::decline_quorum_request,
             get_backup_staleness,
             save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,
@@ -62262,6 +62314,8 @@ mod start_node_race_tests {
             owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            owner_quorum_doc: None,
+            owner_quorum_sync: None,
             fleet_key_epoch_doc: None,
             fleet_key_epoch_sync: None,
             fleet_keys: None,
