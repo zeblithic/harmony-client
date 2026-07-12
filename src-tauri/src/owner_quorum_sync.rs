@@ -878,6 +878,190 @@ fn collect_enrollment_cosign(
     None
 }
 
+/// A-side (spec §5.2/§5.3): pick an armed, active, Master-certed sibling
+/// and build an `Enrollment` request for `joiner`, with THIS device's
+/// authenticating quorum part attached (keyed by the chosen cosigner). Pure
+/// — the caller supplies the arms snapshot + `now_ms` and writes/publishes
+/// the returned request. `request_id` is caller-supplied so the planner is
+/// deterministic under test.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_enrollment_request(
+    trust: &harmony_owner::state::OwnerState,
+    enroll_arms: &BTreeMap<String, EnrollArm>,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    self_id: [u8; 16],
+    joiner_device_id: [u8; 16],
+    joiner_pubkeys: &harmony_owner::pubkey_bundle::PubKeyBundle,
+    issued_at: u64,
+    now_ms: u64,
+    request_id: [u8; 16],
+) -> Result<(String, QuorumRequest), String> {
+    let self_hex = hex::encode(self_id);
+    // Depth-1: the initiator's own part is only valid if it is Master-certed.
+    let self_cert = trust
+        .enrollments
+        .get(&self_id)
+        .ok_or_else(|| "notEnrolled: this device has no enrollment".to_string())?;
+    if !crate::owner_quorum_commands::is_master_issued(self_cert) {
+        return Err("notEligible: this device is not master-certed".to_string());
+    }
+    // Pick an armed sibling that can actually co-sign: live arm, active,
+    // Master-certed, not self, not revoked.
+    let active: std::collections::BTreeSet<[u8; 16]> = trust
+        .active_devices(issued_at, harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS)
+        .into_iter()
+        .collect();
+    let sibling = enroll_arms
+        .iter()
+        .filter(|(armer, arm)| arm.armed_until_ms > now_ms && **armer != self_hex)
+        .filter_map(|(armer, _)| parse_device_id_hex(armer).ok())
+        .find(|id| {
+            *id != self_id
+                && active.contains(id)
+                && !trust.is_revoked(*id)
+                && trust
+                    .enrollments
+                    .get(id)
+                    .is_some_and(crate::owner_quorum_commands::is_master_issued)
+        })
+        .ok_or_else(|| {
+            "noArmedSibling: no other device has an active enrollment window — ask a sibling \
+             to Approve adding a device"
+                .to_string()
+        })?;
+    let mut signers = [self_id, sibling];
+    signers.sort();
+    let payload = enrollment_quorum_payload(
+        trust.owner_id,
+        joiner_device_id,
+        joiner_pubkeys,
+        issued_at,
+        &signers,
+    )?;
+    let a_part =
+        harmony_owner::certs::EnrollmentCert::sign_quorum_part(device_signing_key, &payload);
+    let mut joiner_pk_cbor = Vec::new();
+    ciborium::into_writer(joiner_pubkeys, &mut joiner_pk_cbor)
+        .map_err(|e| format!("encode joiner pubkeys: {e}"))?;
+    let mut initiator_sigs = BTreeMap::new();
+    initiator_sigs.insert(hex::encode(sibling), hex::encode(a_part));
+    let req = QuorumRequest {
+        created_at: Hlc {
+            wall_ms: now_ms,
+            logical: 0,
+            device_id: self_hex.clone(),
+        },
+        declined_by: BTreeMap::new(),
+        initiator_hex: self_hex,
+        kind: QuorumRequestKind::Enrollment {
+            joiner_device_id_hex: hex::encode(joiner_device_id),
+            joiner_pubkeys_cbor_hex: hex::encode(joiner_pk_cbor),
+        },
+        initiator_sigs,
+        signatures: BTreeMap::new(),
+        issued_at,
+        // Bound to the arm window: a co-signer only acts inside it anyway.
+        expires_at_ms: now_ms.saturating_add(ARM_WINDOW_MS),
+    };
+    Ok((hex::encode(request_id), req))
+}
+
+/// A-side completion: assemble the quorum `EnrollmentCert` for a request
+/// THIS device initiated, from the first cosigner signature that verifies
+/// against the current trust doc. Returns `None` until a valid co-signature
+/// has merged in. The initiator's own part is its `initiator_sigs` entry for
+/// that cosigner. Mirror of `try_assemble` for the enrollment ceremony.
+pub(crate) fn try_assemble_enrollment(
+    doc: &QuorumReqDoc,
+    trust: &harmony_owner::state::OwnerState,
+    self_id: [u8; 16],
+    request_id: &str,
+) -> Option<harmony_owner::certs::EnrollmentCert> {
+    let self_hex = hex::encode(self_id);
+    let req = doc.requests.get(request_id)?;
+    if req.initiator_hex != self_hex {
+        return None;
+    }
+    let QuorumRequestKind::Enrollment {
+        joiner_device_id_hex,
+        joiner_pubkeys_cbor_hex,
+    } = &req.kind
+    else {
+        return None;
+    };
+    let joiner_id = parse_device_id_hex(joiner_device_id_hex).ok()?;
+    let joiner_pk = decode_joiner_pubkeys(joiner_pubkeys_cbor_hex).ok()?;
+    for (cosigner_hex, sigs) in &req.signatures {
+        let Ok(cosigner) = parse_device_id_hex(cosigner_hex) else {
+            continue;
+        };
+        if cosigner == self_id || trust.is_revoked(cosigner) {
+            continue;
+        }
+        let Some(cosigner_cert) = trust.enrollments.get(&cosigner) else {
+            continue;
+        };
+        if !crate::owner_quorum_commands::is_master_issued(cosigner_cert) {
+            continue;
+        }
+        let mut signers = [self_id, cosigner];
+        signers.sort();
+        let Ok(payload) = enrollment_quorum_payload(
+            trust.owner_id,
+            joiner_id,
+            &joiner_pk,
+            req.issued_at,
+            &signers,
+        ) else {
+            continue;
+        };
+        let Ok(cosig) = hex::decode(&sigs.primary_sig_hex) else {
+            continue;
+        };
+        let Ok(cosigner_vk) = ed25519_dalek::VerifyingKey::from_bytes(
+            &cosigner_cert.device_pubkeys.classical.ed25519_verify,
+        ) else {
+            continue;
+        };
+        if harmony_owner::signing::verify_with_tag(
+            &cosigner_vk,
+            harmony_owner::signing::tags::ENROLLMENT,
+            &payload,
+            &cosig,
+            "Enrollment-Quorum-Member",
+        )
+        .is_err()
+        {
+            tracing::warn!(request = %request_id, "enrollment assemble: cosigner sig failed; skipped");
+            continue;
+        }
+        // A's own part is its authenticating entry for this cosigner.
+        let Some(a_sig_hex) = req.initiator_sigs.get(cosigner_hex) else {
+            continue;
+        };
+        let Ok(a_sig) = hex::decode(a_sig_hex) else {
+            continue;
+        };
+        let mut parts = vec![(self_id, a_sig), (cosigner, cosig)];
+        parts.sort_by_key(|(id, _)| *id);
+        match harmony_owner::certs::EnrollmentCert::assemble_quorum(
+            trust.owner_id,
+            joiner_id,
+            joiner_pk.clone(),
+            req.issued_at,
+            None,
+            parts,
+        ) {
+            Ok(cert) => return Some(cert),
+            Err(e) => {
+                tracing::warn!(error = %e, "enrollment assemble failed; skipped");
+                continue;
+            }
+        }
+    }
+    None
+}
+
 /// One completion pass over the quorum doc (spec §3: completion is
 /// initiator-driven). Prunes settled requests, then — for requests THIS
 /// device initiated — assembles the K=2 cert from the first cosigner
@@ -2504,6 +2688,86 @@ mod tests {
         }
         let _ = rig.quorum_engine.shutdown().await;
         let _ = rig.trust_engine.shutdown().await;
+    }
+
+    /// A-side planner picks the armed sibling and its request assembles into
+    /// a valid cert once that sibling co-signs — the full A-plan → B-cosign →
+    /// A-assemble path, pure (no engine).
+    #[test]
+    fn plan_enrollment_then_assemble_after_cosign() {
+        let f = sweep_fleet();
+        let now_secs = NOW_SECS + 10;
+        let now_ms = NOW_MS + 10_000;
+        let joiner_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_id = joiner_pk.identity_hash();
+
+        // B is the only armed sibling.
+        let mut arms = BTreeMap::new();
+        arms.insert(
+            hex::encode(f.b_id),
+            EnrollArm {
+                set_at: hlc(now_ms, "bb"),
+                armed_until_ms: now_ms + ARM_WINDOW_MS,
+            },
+        );
+
+        // A plans the request.
+        let (id, req) = plan_enrollment_request(
+            &f.trust, &arms, &f.a_sk, f.a_id, joiner_id, &joiner_pk, now_secs, now_ms, [0xab; 16],
+        )
+        .expect("plan");
+        // The request targets B (the armed sibling) and carries A's part.
+        assert_eq!(req.initiator_hex, hex::encode(f.a_id));
+        assert!(req.initiator_sigs.contains_key(&hex::encode(f.b_id)));
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(id.clone(), req);
+
+        // Before B co-signs, assembly yields nothing.
+        assert!(try_assemble_enrollment(&doc, &f.trust, f.a_id, &id).is_none());
+
+        // B co-signs (same sorted-[A,B] payload).
+        let mut signers = [f.a_id, f.b_id];
+        signers.sort();
+        let payload =
+            enrollment_quorum_payload(f.trust.owner_id, joiner_id, &joiner_pk, now_secs, &signers)
+                .unwrap();
+        let b_part = harmony_owner::certs::EnrollmentCert::sign_quorum_part(&f.b_sk, &payload);
+        doc.requests
+            .get_mut(&id)
+            .unwrap()
+            .signatures
+            .insert(hex::encode(f.b_id), sigs(&hex::encode(b_part)));
+
+        // A assembles a valid quorum enrollment cert.
+        let cert = try_assemble_enrollment(&doc, &f.trust, f.a_id, &id).expect("assemble");
+        let a_cert = f.trust.enrollments.get(&f.a_id).unwrap().clone();
+        let b_cert = f.trust.enrollments.get(&f.b_id).unwrap().clone();
+        cert.verify_quorum_with_signers(&[a_cert, b_cert], now_secs + 1)
+            .expect("valid cert");
+        assert_eq!(cert.device_id, joiner_id);
+    }
+
+    #[test]
+    fn plan_enrollment_request_errors_without_armed_sibling() {
+        let f = sweep_fleet();
+        let now_secs = NOW_SECS + 10;
+        let now_ms = NOW_MS + 10_000;
+        let joiner_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let err = plan_enrollment_request(
+            &f.trust,
+            &BTreeMap::new(), // no arms
+            &f.a_sk,
+            f.a_id,
+            joiner_pk.identity_hash(),
+            &joiner_pk,
+            now_secs,
+            now_ms,
+            [0xab; 16],
+        )
+        .unwrap_err();
+        assert!(err.starts_with("noArmedSibling:"), "got: {err}");
     }
 
     #[test]

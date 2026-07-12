@@ -217,6 +217,7 @@ pub mod open_join_dial;
 pub mod owner_commands;
 pub mod owner_loaded;
 pub mod owner_quorum_commands;
+pub mod owner_quorum_enroll;
 pub mod owner_quorum_sync;
 pub mod owner_state;
 pub mod owner_state_crdt;
