@@ -89,13 +89,12 @@ pub fn verify_enrollment_any_issuer(
             // depth against a crate regression, not a trust decision.
             let mut anchor: Option<[u8; 32]> = None;
             for id in signers {
-                let signer_cert = signer_certs
-                    .iter()
-                    .find(|c| c.device_id == *id)
-                    .ok_or(EnrollmentVerifyError::Invalid(OwnerError::NotEnrolled {
+                let signer_cert = signer_certs.iter().find(|c| c.device_id == *id).ok_or(
+                    EnrollmentVerifyError::Invalid(OwnerError::NotEnrolled {
                         owner: cert.owner_id,
                         device: *id,
-                    }))?;
+                    }),
+                )?;
                 let EnrollmentIssuer::Master { master_pubkey } = &signer_cert.issuer else {
                     return Err(EnrollmentVerifyError::Invalid(
                         OwnerError::InvalidSignature {
@@ -363,7 +362,7 @@ mod tests {
         assert!(matches!(
             verify_enrollment_any_issuer(
                 &world.c_quorum_cert,
-                &[world.a_cert.clone()],
+                std::slice::from_ref(&world.a_cert),
                 None,
                 WORLD_NOW
             ),

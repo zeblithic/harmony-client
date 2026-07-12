@@ -50520,8 +50520,8 @@ pub async fn connectivity_link_friend_iroh_inner(
 ) -> Result<FriendLinkOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest,
-        FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
+        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
+        FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -53604,8 +53604,8 @@ pub async fn connectivity_add_friend_by_key_inner(
 ) -> Result<AddFriendOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest,
-        FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
+        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
+        FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 

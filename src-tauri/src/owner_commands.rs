@@ -1996,8 +1996,12 @@ mod revoke_tests {
             harmony_owner::certs::RevocationIssuer::SelfDevice
         ));
         let mut s2 = state.clone();
-        s2.add_revocation(planned.cert, 1_700_000_100, trust::DEFAULT_ACTIVE_WINDOW_SECS)
-            .expect("self cert verifies");
+        s2.add_revocation(
+            planned.cert,
+            1_700_000_100,
+            trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .expect("self cert verifies");
     }
 
     #[test]

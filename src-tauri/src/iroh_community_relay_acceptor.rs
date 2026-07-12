@@ -2288,9 +2288,17 @@ mod tests {
 
         // Ack: mark_pulled records the requester device in pulled_by for
         // the acked content IDs (does NOT call gc in the test mock).
-        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &[], &ack_sig, &ctx)
-            .await
-            .expect("ack must succeed");
+        handle_relay_pull_ack(
+            &recipient.owner.0,
+            &cid,
+            &ack,
+            &cert_bytes,
+            &[],
+            &ack_sig,
+            &ctx,
+        )
+        .await
+        .expect("ack must succeed");
 
         // After mark_pulled: pulled_by is set.
         let pb = ctx.pulled_by_for(&key);
@@ -2319,9 +2327,17 @@ mod tests {
         );
 
         // Ack for an already-GC'd key is a no-op (not an error).
-        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &[], &ack_sig, &ctx)
-            .await
-            .expect("second ack for already-removed key must be a no-op");
+        handle_relay_pull_ack(
+            &recipient.owner.0,
+            &cid,
+            &ack,
+            &cert_bytes,
+            &[],
+            &ack_sig,
+            &ctx,
+        )
+        .await
+        .expect("second ack for already-removed key must be a no-op");
     }
 
     // ----------------------------------------------------------------
@@ -2358,9 +2374,17 @@ mod tests {
         };
 
         // Must succeed — unknown content IDs are silently ignored.
-        handle_relay_pull_ack(&recipient.owner.0, &cid, &ack, &cert_bytes, &[], &ack_sig, &ctx)
-            .await
-            .expect("ack for unknown content_id must be a no-op, not an error");
+        handle_relay_pull_ack(
+            &recipient.owner.0,
+            &cid,
+            &ack,
+            &cert_bytes,
+            &[],
+            &ack_sig,
+            &ctx,
+        )
+        .await
+        .expect("ack for unknown content_id must be a no-op, not an error");
 
         // Nothing was inserted or removed.
         assert!(ctx.doc.lock().unwrap().entries.is_empty());
