@@ -11,6 +11,7 @@
     onConfirm,
     onCancel,
     mode = 'remove',
+    quorum = false,
   }: {
     deviceName: string;
     isSelf: boolean;
@@ -24,6 +25,10 @@
     // states removal-first semantics; same typed-confirm tier — the
     // removal itself is identical to a plain remove.
     mode?: 'remove' | 'replace';
+    // ZEB-677 S3: master-less removal via the co-sign ceremony. Confirm
+    // writes a co-sign request instead of revoking directly; the copy
+    // says so (honesty rule, spec §4.1). Same typed-confirm tier.
+    quorum?: boolean;
   } = $props();
 
   let typed = $state('');
@@ -50,6 +55,13 @@
     if (error.startsWith('notMaster:'))
       return 'Only the device holding your master key can remove other devices.';
     if (error.startsWith('lastDevice:')) return "You can't remove your only active device.";
+    // ZEB-677 S3: quorum-request rejections.
+    if (error.startsWith('duplicateRequest:'))
+      return 'A co-sign request for that device is already waiting on your other devices.';
+    if (error.startsWith('noQuorum:'))
+      return 'No other active device can co-sign — removing devices needs your recovery phrase.';
+    if (error.startsWith('nodeNotRunning:'))
+      return 'Start the node first — the request has to reach your other devices.';
     return error;
   });
 </script>
@@ -86,6 +98,12 @@
     Its direct messages and vine feeds are separate surfaces and are not blocked yet — those
     cutoffs land in follow-up work.
   </p>
+  {#if quorum}
+    <p class="dialog-message warning" data-testid="remove-quorum-copy">
+      This device doesn't hold your master key. Your other devices will be asked to co-sign —
+      the removal happens once one of them approves.
+    </p>
+  {/if}
   {#if isSelf && isSeedHolder}
     <p class="dialog-message warning">
       This device holds your master key. Afterward you will need your recovery phrase to manage
@@ -134,7 +152,7 @@
       disabled={!matches || busy}
       onclick={() => onConfirm(mode === 'replace' ? 'decommissioned' : reason)}
     >
-      {mode === 'replace' ? 'Remove & continue' : 'Remove device'}
+      {mode === 'replace' ? 'Remove & continue' : quorum ? 'Request removal' : 'Remove device'}
     </button>
   </div>
 </Modal>

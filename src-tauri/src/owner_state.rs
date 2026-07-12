@@ -26,6 +26,49 @@ pub struct OwnerStateView {
     /// the rotate action; other devices a passive note.
     #[serde(default)]
     pub fleet_epoch_stale: bool,
+    /// ZEB-677 S3: whether THIS device holds the master seed. Identical to
+    /// `can_back_up` today by design — kept distinct because their future
+    /// semantics diverge (spec §5): `can_back_up` speaks to backup
+    /// affordances, `self_is_master` gates the quorum-ceremony surfaces.
+    #[serde(default)]
+    pub self_is_master: bool,
+    /// ZEB-677 S3: pending quorum co-sign requests (unexpired), rendered
+    /// as the DevicesPanel co-sign banner / pending notes.
+    #[serde(default)]
+    pub quorum_requests: Vec<QuorumRequestView>,
+    /// ZEB-677 S3 (surface for the S4 arm flow): wall-ms this device's
+    /// enrollment co-sign window closes; `None` when not armed.
+    #[serde(default)]
+    pub quorum_armed_until_ms: Option<u64>,
+}
+
+/// ZEB-677 S3: one pending quorum co-sign request, pre-joined server-side
+/// so the panel stays presentation-only (`can_cosign` encodes the whole
+/// eligibility rule). Device ids are the 32-hex identity-hash form —
+/// joinable against `DeviceView.device_id` for petname display.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumRequestView {
+    pub request_id: String,
+    /// "revocation" (S4 adds "enrollment").
+    pub kind: String,
+    pub target_device_id: String,
+    pub initiator_device_id: String,
+    /// Wire label ("decommissioned" | "lost" | "compromised").
+    pub reason: String,
+    pub expires_at_ms: u64,
+    pub initiated_by_me: bool,
+    pub signed_by_me: bool,
+    pub declined_by_me: bool,
+    /// ANY device declined — the request is tombstoned (spec §3) and the
+    /// initiator's pending note renders it as declined.
+    pub declined: bool,
+    /// At least one co-signature has arrived (initiator-side: completion
+    /// is imminent).
+    pub cosigner_signed: bool,
+    /// This device may approve right now: not the initiator/target, holds
+    /// a master-issued cert, has a co-sign slot, and nobody declined.
+    pub can_cosign: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +117,14 @@ pub struct DeviceView {
     /// Connected peer-liveness slot (Degraded does not count).
     #[serde(default)]
     pub connected_now: bool,
+    /// ZEB-677 S3: this sibling row may be removed via the quorum co-sign
+    /// ceremony — the master seed is absent here, THIS device holds a
+    /// master-issued cert, and at least one other active master-certed
+    /// sibling (excluding this row) can co-sign (spec §4.1). Always false
+    /// on seed-holding devices (they remove directly) and on self/revoked
+    /// rows.
+    #[serde(default)]
+    pub quorum_removable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2020,12 +2071,31 @@ mod tests {
                 pet_name: Some("Koya".into()),
                 last_seen_ms: Some(1_700_000_200_000),
                 connected_now: true,
+                // ZEB-677 S3: non-default so the rename is pinned.
+                quorum_removable: true,
             }],
             can_back_up: true,
             // ZEB-668 S5: non-default values so the epoch pair's renames
             // are pinned too.
             fleet_epoch: 3,
             fleet_epoch_stale: true,
+            // ZEB-677 S3: non-default values pin the quorum trio's renames.
+            self_is_master: true,
+            quorum_requests: vec![QuorumRequestView {
+                request_id: "ab".repeat(16),
+                kind: "revocation".into(),
+                target_device_id: "11".repeat(16),
+                initiator_device_id: "22".repeat(16),
+                reason: "lost".into(),
+                expires_at_ms: 1_700_000_300_000,
+                initiated_by_me: false,
+                signed_by_me: false,
+                declined_by_me: false,
+                declined: false,
+                cosigner_signed: false,
+                can_cosign: true,
+            }],
+            quorum_armed_until_ms: Some(1_700_000_400_000),
         };
         let json = serde_json::to_string(&view).unwrap();
         // The wire format MUST be camelCase — JS depends on this.
@@ -2080,6 +2150,35 @@ mod tests {
         assert!(
             json.contains("\"connectedNow\":true"),
             "expected connectedNow, got {json}"
+        );
+        // ZEB-677 S3 quorum surfaces, pinned with the non-default values above.
+        assert!(
+            json.contains("\"selfIsMaster\":true"),
+            "expected selfIsMaster:true, got {json}"
+        );
+        assert!(
+            json.contains("\"quorumRemovable\":true"),
+            "expected quorumRemovable:true, got {json}"
+        );
+        assert!(
+            json.contains("\"quorumArmedUntilMs\":1700000400000"),
+            "expected quorumArmedUntilMs, got {json}"
+        );
+        assert!(
+            json.contains("\"quorumRequests\""),
+            "expected quorumRequests, got {json}"
+        );
+        assert!(
+            json.contains("\"requestId\"")
+                && json.contains("\"targetDeviceId\"")
+                && json.contains("\"initiatorDeviceId\"")
+                && json.contains("\"expiresAtMs\"")
+                && json.contains("\"initiatedByMe\"")
+                && json.contains("\"signedByMe\"")
+                && json.contains("\"declinedByMe\"")
+                && json.contains("\"cosignerSigned\"")
+                && json.contains("\"canCosign\":true"),
+            "expected camelCase QuorumRequestView keys, got {json}"
         );
         assert!(
             !json.contains("owner_id"),

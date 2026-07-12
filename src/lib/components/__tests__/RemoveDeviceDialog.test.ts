@@ -118,3 +118,34 @@ describe('RemoveDeviceDialog replace mode (ZEB-668 S6)', () => {
     expect(p.onConfirm).not.toHaveBeenCalled();
   });
 });
+
+// ── ZEB-677 S3: quorum (master-less co-sign) removal mode ─────────────────────
+
+describe('RemoveDeviceDialog — quorum mode (ZEB-677 S3)', () => {
+  it('shows the co-sign copy and Request removal label when quorum is set', async () => {
+    const p = props({ quorum: true });
+    render(RemoveDeviceDialog, { props: p });
+    expect(screen.getByTestId('remove-quorum-copy').textContent).toMatch(/asked to co-sign/i);
+    const confirm = screen.getByRole('button', { name: /request removal/i });
+    expect(confirm).toBeDisabled();
+    // Typed-confirm tier unchanged.
+    await fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Study Mac' } });
+    expect(confirm).toBeEnabled();
+    await fireEvent.click(confirm);
+    expect(p.onConfirm).toHaveBeenCalledWith('decommissioned');
+  });
+
+  it('hides the co-sign copy and keeps the direct label without quorum', () => {
+    render(RemoveDeviceDialog, { props: props() });
+    expect(screen.queryByTestId('remove-quorum-copy')).toBeNull();
+    expect(screen.getByRole('button', { name: /remove device/i })).toBeInTheDocument();
+  });
+
+  it('maps quorum backend prefixes to friendly copy', () => {
+    render(
+      RemoveDeviceDialog,
+      { props: props({ quorum: true, error: 'noQuorum: no other active device' }) },
+    );
+    expect(screen.getByRole('alert').textContent).toMatch(/needs your recovery phrase/i);
+  });
+});

@@ -13,6 +13,46 @@ export interface OwnerStateView {
    * Seed-holders (`canBackUp`) get the rotate action; others a passive note.
    */
   fleetEpochStale: boolean;
+  /**
+   * ZEB-677 S3: whether THIS device holds the master seed. Same value as
+   * `canBackUp` today; kept distinct because their semantics diverge —
+   * this one gates the quorum-ceremony surfaces. Optional: a stale backend
+   * predating S3 omits every quorum field (read as `=== true`).
+   */
+  selfIsMaster?: boolean;
+  /**
+   * ZEB-677 S3: pending quorum co-sign requests (unexpired). Optional: a
+   * stale backend omits it — read through `?? []`.
+   */
+  quorumRequests?: QuorumRequestView[];
+  /**
+   * ZEB-677 S3 (S4 arm flow surface): wall-ms the arm window closes.
+   * Optional: a stale backend omits it.
+   */
+  quorumArmedUntilMs?: number | null;
+}
+
+/**
+ * ZEB-677 S3: one pending quorum co-sign request, pre-joined server-side —
+ * `canCosign` already encodes the whole eligibility rule; device ids join
+ * against `DeviceView.deviceId` for petname display.
+ */
+export interface QuorumRequestView {
+  requestId: string;
+  /** "revocation" (S4 adds "enrollment"). */
+  kind: string;
+  targetDeviceId: string;
+  initiatorDeviceId: string;
+  reason: string;
+  expiresAtMs: number;
+  initiatedByMe: boolean;
+  signedByMe: boolean;
+  declinedByMe: boolean;
+  /** ANY device declined — the request is dead (initiator sees "declined"). */
+  declined: boolean;
+  /** A co-signature has arrived (initiator-side: completion imminent). */
+  cosignerSigned: boolean;
+  canCosign: boolean;
 }
 
 export interface DeviceView {
@@ -50,6 +90,13 @@ export interface DeviceView {
   lastSeenMs: number | null;
   /** ZEB-668 S4: live Connected transport slot for this device right now. */
   connectedNow: boolean;
+  /**
+   * ZEB-677 S3: this sibling row may be removed via the quorum co-sign
+   * ceremony (master seed absent here; this device + one other active
+   * sibling hold master-issued certs). Always false on seed-holders.
+   * Optional: a stale backend omits it — read as `=== true`.
+   */
+  quorumRemovable?: boolean;
 }
 
 /** ZEB-668 S2: the three UI-selectable revocation reasons (spec §3). */
@@ -102,6 +149,26 @@ export class OwnerService {
    */
   async revoke(deviceVkHex: string, reason: RevokeReason): Promise<void> {
     await invoke('revoke_device', { deviceVkHex, reason });
+  }
+
+  /**
+   * ZEB-677 S3: master-less removal — writes a co-sign request that a
+   * sibling approves; the revocation lands when the co-signature returns.
+   * Rejections surface backend prefixes (`noQuorum:`, `duplicateRequest:`,
+   * `nodeNotRunning:`); callers map them to friendly copy.
+   */
+  async requestQuorumRevocation(deviceVkHex: string, reason: RevokeReason): Promise<string> {
+    return invoke<string>('request_quorum_revocation', { deviceVkHex, reason });
+  }
+
+  /** ZEB-677 S3: approve a sibling's pending co-sign request. */
+  async cosignQuorumRequest(requestId: string): Promise<void> {
+    await invoke('cosign_quorum_request', { requestId });
+  }
+
+  /** ZEB-677 S3: decline a sibling's pending co-sign request (tombstones it). */
+  async declineQuorumRequest(requestId: string): Promise<void> {
+    await invoke('decline_quorum_request', { requestId });
   }
 
   async mint(): Promise<MintIpcResult> {

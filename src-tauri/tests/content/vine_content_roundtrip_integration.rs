@@ -263,6 +263,7 @@ fn spawn_event_loop(
                     None, // ZEB-418 P2: p2_sync_handles not exercised in this test
                     None, // ZEB-458 P4 B: relay_sync_handles not exercised in this test
                     None, // ZEB-668 S1: trust_sync_handles not exercised in this test
+                    None, // ZEB-677 S3: quorum_sync_handles not exercised in this test
                     None, // ZEB-668 S5: fleet_keys_sync_handles not exercised in this test
                     None, // ZEB-495: community_device_intro_sync_handles not exercised in this test
                     None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test

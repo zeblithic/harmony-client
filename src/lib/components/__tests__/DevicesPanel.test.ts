@@ -2047,3 +2047,189 @@ describe('DevicesPanel — replace device (ZEB-668 S6)', () => {
     );
   });
 });
+
+// ── ZEB-677 S3: quorum co-sign ceremony surfaces ──────────────────────────────
+
+describe('DevicesPanel — quorum co-sign ceremony (ZEB-677 S3)', () => {
+  const device = (idByte: string, name: string, self = false) => ({
+    deviceId: idByte.repeat(16),
+    displayName: name,
+    isThisDevice: self,
+    trustDecision: { kind: 'full', reason: null },
+    enrolledAt: 1_700_000_000,
+    fingerprint: `${idByte}${idByte}·xx`,
+    butlerPinned: false,
+    deviceVkHex: idByte.repeat(32),
+    revoked: false,
+    revokedAt: null,
+    revokedReason: null,
+    petName: null,
+    lastSeenMs: null,
+    connectedNow: false,
+    quorumRemovable: !self,
+  });
+
+  /** Master-less 3-device fleet: self KRILE, siblings Bramble + Copse. */
+  const masterlessView = (overrides: Record<string, unknown> = {}) => ({
+    ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+    ownerDisplayName: 'zeblith',
+    devices: [
+      device('aa', 'KRILE', true),
+      { ...device('bb', 'Bramble'), petName: 'Bramble' },
+      { ...device('cc', 'Copse'), petName: 'Copse' },
+    ],
+    canBackUp: false,
+    selfIsMaster: false,
+    fleetEpoch: 0,
+    fleetEpochStale: false,
+    quorumRequests: [],
+    quorumArmedUntilMs: null,
+    ...overrides,
+  });
+
+  const cosignRequest = (overrides: Record<string, unknown> = {}) => ({
+    requestId: '0102'.repeat(8),
+    kind: 'revocation',
+    targetDeviceId: 'cc'.repeat(16),
+    initiatorDeviceId: 'bb'.repeat(16),
+    reason: 'lost',
+    expiresAtMs: 1_900_000_000_000,
+    initiatedByMe: false,
+    signedByMe: false,
+    declinedByMe: false,
+    declined: false,
+    cosignerSigned: false,
+    canCosign: true,
+    ...overrides,
+  });
+
+  it('renders the co-sign banner with joined names; Approve calls cosign_quorum_request', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      masterlessView({ quorumRequests: [cosignRequest()] }),
+    );
+    mockedInvoke.mockResolvedValueOnce(undefined); // cosign_quorum_request
+    mockedInvoke.mockResolvedValueOnce(masterlessView()); // post-approve refresh
+    render(DevicesPanel);
+    const banner = await screen.findByTestId('quorum-cosign-banner');
+    expect(banner.textContent).toContain('Bramble');
+    expect(banner.textContent).toContain('Copse');
+    expect(banner.textContent).toContain('lost');
+    await fireEvent.click(screen.getByTestId('quorum-approve'));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('cosign_quorum_request', {
+      requestId: '0102'.repeat(8),
+    });
+  });
+
+  it('Decline calls decline_quorum_request', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      masterlessView({ quorumRequests: [cosignRequest()] }),
+    );
+    mockedInvoke.mockResolvedValueOnce(undefined); // decline_quorum_request
+    mockedInvoke.mockResolvedValueOnce(masterlessView());
+    render(DevicesPanel);
+    await screen.findByTestId('quorum-cosign-banner');
+    await fireEvent.click(screen.getByTestId('quorum-decline'));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('decline_quorum_request', {
+      requestId: '0102'.repeat(8),
+    });
+  });
+
+  it('no banner when canCosign is false (signed / declined / not addressed)', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      masterlessView({
+        quorumRequests: [cosignRequest({ canCosign: false, signedByMe: true })],
+      }),
+    );
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.queryByTestId('quorum-cosign-banner')).toBeNull();
+  });
+
+  it('initiator sees the pending note (waiting → declined variants)', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      masterlessView({
+        quorumRequests: [
+          cosignRequest({ initiatedByMe: true, canCosign: false }),
+        ],
+      }),
+    );
+    render(DevicesPanel);
+    const note = await screen.findByTestId('quorum-pending-note');
+    expect(note.textContent).toMatch(/waiting for another device to co-sign/i);
+    expect(note.textContent).toContain('Copse');
+  });
+
+  it('initiator pending note renders the declined state', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      masterlessView({
+        quorumRequests: [
+          cosignRequest({ initiatedByMe: true, canCosign: false, declined: true }),
+        ],
+      }),
+    );
+    render(DevicesPanel);
+    const note = await screen.findByTestId('quorum-pending-note');
+    expect(note.textContent).toMatch(/was declined/i);
+  });
+
+  it('master-less sibling rows show Remove… when quorumRemovable', async () => {
+    mockedInvoke.mockResolvedValueOnce(masterlessView());
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.getAllByRole('button', { name: /^remove…$/i }).length).toBe(2);
+    // Replace stays master-only.
+    expect(screen.queryByRole('button', { name: /^replace…$/i })).toBeNull();
+  });
+
+  it('master-less sibling rows hide Remove… when not quorumRemovable', async () => {
+    const view = masterlessView();
+    (view.devices as Record<string, unknown>[]).forEach((d) => {
+      d.quorumRemovable = false;
+    });
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.queryByRole('button', { name: /^remove…$/i })).toBeNull();
+  });
+
+  it('quorum remove confirm calls request_quorum_revocation, not revoke_device, and shows the co-sign copy', async () => {
+    mockedInvoke.mockResolvedValueOnce(masterlessView());
+    mockedInvoke.mockResolvedValueOnce('req-id-1'); // request_quorum_revocation
+    mockedInvoke.mockResolvedValueOnce(
+      masterlessView({
+        quorumRequests: [cosignRequest({ initiatedByMe: true, canCosign: false })],
+      }),
+    );
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    // Bramble's row (first sibling Remove…).
+    await fireEvent.click(screen.getAllByRole('button', { name: /^remove…$/i })[0]);
+    expect(await screen.findByTestId('remove-quorum-copy')).toBeInTheDocument();
+    const input = await screen.findByRole('textbox', { name: /type to confirm/i });
+    await fireEvent.input(input, { target: { value: 'Bramble' } });
+    await fireEvent.click(screen.getByRole('button', { name: /^request removal$/i }));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('request_quorum_revocation', {
+      deviceVkHex: 'bb'.repeat(32),
+      reason: 'decommissioned',
+    });
+    const calls = mockedInvoke.mock.calls.map((c: unknown[]) => c[0]);
+    expect(calls).not.toContain('revoke_device');
+  });
+
+  it('tolerates a stale backend view without quorum fields', async () => {
+    const view = masterlessView();
+    delete (view as Record<string, unknown>).quorumRequests;
+    delete (view as Record<string, unknown>).quorumArmedUntilMs;
+    (view.devices as Record<string, unknown>[]).forEach((d) => {
+      delete d.quorumRemovable;
+    });
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.queryByTestId('quorum-cosign-banner')).toBeNull();
+    expect(screen.queryByRole('button', { name: /^remove…$/i })).toBeNull();
+  });
+});

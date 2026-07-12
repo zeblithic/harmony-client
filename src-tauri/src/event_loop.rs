@@ -1035,6 +1035,10 @@ pub async fn run(
     // Zenoh on `harmony/owner/{addr_hex}/ds/owner-trust-v1`. `None` when no
     // owner identity is loaded (and in test callers that bypass `start_node`).
     mut trust_sync_handles: Option<DatasetSyncHandles>,
+    // ZEB-677 S3: the quorum co-sign request dataset channel pair
+    // (owner-quorum-req-v1) — pending quorum revocation requests across
+    // the owner's fleet. `None` when no owner identity is loaded.
+    mut quorum_sync_handles: Option<DatasetSyncHandles>,
     // ZEB-668 S5: the fleet-keys carrier dataset channel pair
     // (fleet-keys-v1) — epoch bump distribution across the owner's fleet.
     // `None` when no owner identity is loaded.
@@ -1940,6 +1944,24 @@ pub async fn run(
             crate::owner_trust_sync::OWNER_TRUST_DATASET,
             "owner-trust-sync-degraded",
             crate::owner_trust_sync::OWNER_TRUST_DATASET_MAX_BYTES,
+        )
+        .await;
+    }
+
+    // ── ZEB-677 S3: owner-quorum-req fleet-sync Zenoh adapter ────────────
+    // Same plumbing as the datasets above. Replicates pending quorum
+    // co-sign requests (revocation ceremony) across the owner's own fleet
+    // so a sibling can approve and the initiator can assemble the cert.
+    // `None` when no owner identity is loaded.
+    if let Some(quorum) = quorum_sync_handles.take() {
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            quorum,
+            crate::owner_quorum_sync::OWNER_QUORUM_DATASET,
+            "owner-quorum-sync-degraded",
+            crate::owner_quorum_sync::OWNER_QUORUM_DATASET_MAX_BYTES,
         )
         .await;
     }

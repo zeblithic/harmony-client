@@ -216,6 +216,8 @@ pub mod open_join_auth;
 pub mod open_join_dial;
 pub mod owner_commands;
 pub mod owner_loaded;
+pub mod owner_quorum_commands;
+pub mod owner_quorum_sync;
 pub mod owner_state;
 pub mod owner_state_crdt;
 pub mod owner_state_crypto;
@@ -1382,6 +1384,16 @@ pub struct NodeState {
     /// cleared at stop_node — revocation is permanent; boot re-derives it
     /// from `owner_state.cbor`.
     pub owner_trust_revoked_self: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// ZEB-677 S3: the resident quorum co-sign request doc
+    /// (`owner-quorum-req-v1`) and its replication engine. `Some` while
+    /// the node runs with an owner identity loaded. The quorum ceremony
+    /// IPCs require these (no FileOnly fallback — a co-sign request
+    /// without replication is meaningless).
+    pub owner_quorum_doc:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_quorum_sync::QuorumReqDoc>>>,
+    pub owner_quorum_sync: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::owner_quorum_sync::QuorumReqDoc>>,
+    >,
     /// ZEB-668 S5: resident fleet-keys carrier doc (`fleet-keys-v1`) + its
     /// engine, and the swappable key set shared by every fleet dataset
     /// engine. The bump IPC mutates the doc + installs into `fleet_keys`;
@@ -1870,6 +1882,8 @@ impl Default for NodeState {
             owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            owner_quorum_doc: None,
+            owner_quorum_sync: None,
             fleet_key_epoch_doc: None,
             fleet_key_epoch_sync: None,
             fleet_keys: None,
@@ -2165,6 +2179,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let owner_trust_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
     >;
+    // ZEB-677 S3: quorum-request engine, same shutdown pattern.
+    let owner_quorum_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::owner_quorum_sync::QuorumReqDoc>>,
+    >;
     // ZEB-668 S5: fleet-keys carrier engine, same shutdown pattern.
     let fleet_key_epoch_sync_for_shutdown: Option<
         std::sync::Arc<
@@ -2426,6 +2444,9 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // revoked-self latch deliberately survives (permanent state).
         owner_trust_sync_for_shutdown = guard.owner_trust_sync.take();
         guard.owner_trust_doc = None;
+        // ZEB-677 S3: quorum-request engine handles die with the node.
+        owner_quorum_sync_for_shutdown = guard.owner_quorum_sync.take();
+        guard.owner_quorum_doc = None;
         // ZEB-668 S5: carrier engine dies with the node too.
         fleet_key_epoch_sync_for_shutdown = guard.fleet_key_epoch_sync.take();
         guard.fleet_key_epoch_doc = None;
@@ -2915,6 +2936,35 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for fleet-net \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-677 S3: shut down the quorum-request engine the same way, so the
+    // final debounced request publish + doc persist run before the zenoh
+    // session dies.
+    if let Some(quorum_engine) = owner_quorum_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(quorum_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "owner-quorum FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for owner-quorum \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -3838,6 +3888,17 @@ pub async fn start_node_inner(
             std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
         > = None;
         let mut trust_sync_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
+        // ZEB-677 S3: quorum-request engine + handles, lifted for the
+        // NodeState assignment and event_loop::run (mirrors trust).
+        let mut owner_quorum_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::owner_quorum_sync::QuorumReqDoc>>,
+        > = None;
+        let mut owner_quorum_sync_engine_opt: Option<
+            std::sync::Arc<
+                crate::fleet_sync::FleetSyncEngine<crate::owner_quorum_sync::QuorumReqDoc>,
+            >,
+        > = None;
+        let mut quorum_sync_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
         // ZEB-668 S5: fleet-keys carrier engine + handles + the shared key
         // set, lifted for the NodeState assignment and event_loop::run.
         let mut fleet_keys_doc_opt: Option<
@@ -5595,6 +5656,92 @@ pub async fn start_node_inner(
                         outbound_rx: trust_out_rx,
                         inbound_tx: trust_in_tx,
                     });
+                    // ── ZEB-677 S3: owner-quorum-req replication engine ────
+                    // Pending co-sign requests (quorum revocation ceremony).
+                    // Mirrors the trust block above; the doc persists to its
+                    // own file pair. The applied task is the initiator's
+                    // completion sweep: on each inbound merge (or the one
+                    // boot tick) it assembles K=2 certs from arrived
+                    // co-signatures and applies them through the trust doc.
+                    let quorum_doc_path =
+                        identity_dir.join(crate::owner_quorum_sync::OWNER_QUORUM_DOC_FILENAME);
+                    let quorum_replay_path =
+                        identity_dir.join(crate::owner_quorum_sync::OWNER_QUORUM_REPLAY_FILENAME);
+                    let owner_quorum_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::owner_quorum_sync::load_quorum_doc_or_recover(&quorum_doc_path),
+                    ));
+                    let owner_quorum_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::owner_quorum_sync::load_quorum_replay_or_recover(
+                            &quorum_replay_path,
+                        ),
+                    ));
+                    let (quorum_out_tx, quorum_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                    let (quorum_in_tx, quorum_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                    let (quorum_nudge_tx, quorum_nudge_rx) = tokio::sync::mpsc::channel::<()>(8);
+                    let owner_quorum_sync_engine =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                keys: keys.clone(),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&owner_quorum_doc),
+                                merger: crate::owner_quorum_sync::quorum_merger(),
+                                replay_tracker: owner_quorum_tracker,
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: quorum_out_tx,
+                                subscriber_rx: quorum_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::owner_quorum_sync::QuorumPersist {
+                                        doc_path: quorum_doc_path,
+                                        replay_path: quorum_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: crate::owner_quorum_sync::OWNER_QUORUM_LOOKUP_TAG,
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: true,
+                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                    quorum_nudge_tx.clone(),
+                                )),
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    owner_quorum_doc_opt = Some(std::sync::Arc::clone(&owner_quorum_doc));
+                    owner_quorum_sync_engine_opt =
+                        Some(std::sync::Arc::clone(&owner_quorum_sync_engine));
+                    quorum_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
+                        addr_hex: owner_addr_hex.clone(),
+                        outbound_rx: quorum_out_rx,
+                        inbound_tx: quorum_in_tx,
+                    });
+                    {
+                        let emit_sink = std::sync::Arc::clone(&app);
+                        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                            std::sync::Arc::new(move |name: &str| {
+                                crate::node_event_sink::emit_ser(
+                                    &*emit_sink,
+                                    name,
+                                    &serde_json::Value::Null,
+                                );
+                            });
+                        crate::owner_quorum_sync::spawn_quorum_applied_task(
+                            quorum_nudge_rx,
+                            std::sync::Arc::clone(&owner_quorum_doc),
+                            std::sync::Arc::clone(&owner_quorum_sync_engine),
+                            std::sync::Arc::clone(&owner_trust_doc),
+                            std::sync::Arc::clone(&owner_trust_sync),
+                            loaded.device_signing_key.clone(),
+                            crate::owner_state::device_id_from_signing_key(
+                                &loaded.device_signing_key,
+                            ),
+                            emit,
+                            Some(retire_deposit_nudge_tx.clone()),
+                        );
+                        // Boot tick: complete ceremonies whose co-signatures
+                        // arrived while this device was offline.
+                        let _ = quorum_nudge_tx.try_send(());
+                    }
+                    tracing::info!("BOOT-PROBE 08b-quorum: owner-quorum engine constructed");
                     // ZEB-668 S1 T4: revoked-self detector. Each applied
                     // remote merge nudges this task → owner-devices-updated;
                     // a merge revealing THIS device revoked latches the flag,
@@ -5620,6 +5767,7 @@ pub async fn start_node_inner(
                         let halt_owner_sync = std::sync::Arc::clone(&engine);
                         let halt_fleet_net = std::sync::Arc::clone(&fleet_net_sync);
                         let halt_trust = std::sync::Arc::clone(&owner_trust_sync);
+                        let halt_quorum = std::sync::Arc::clone(&owner_quorum_sync_engine);
                         let halt: crate::owner_trust_sync::HaltFn = Box::new(move || {
                             Box::pin(async move {
                                 if let Err(e) = halt_owner_sync.shutdown().await {
@@ -5630,6 +5778,11 @@ pub async fn start_node_inner(
                                 }
                                 if let Err(e) = halt_trust.shutdown().await {
                                     tracing::error!(error = %e, "revoked-self halt: trust engine shutdown failed");
+                                }
+                                // ZEB-677 S3: a revoked device must stop
+                                // driving the quorum-request dataset too.
+                                if let Err(e) = halt_quorum.shutdown().await {
+                                    tracing::error!(error = %e, "revoked-self halt: quorum engine shutdown failed");
                                 }
                             })
                         });
@@ -10260,6 +10413,9 @@ pub async fn start_node_inner(
                 // ZEB-668 S1: thread the owner-trust adapter handles into
                 // event_loop::run (mirrors relay).
                 let trust_sync_handles_for_loop = trust_sync_handles_opt;
+                // ZEB-677 S3: thread the quorum-request adapter handles into
+                // event_loop::run (mirrors trust).
+                let quorum_sync_handles_for_loop = quorum_sync_handles_opt;
                 // ZEB-668 S5: thread the fleet-keys carrier adapter handles
                 // into event_loop::run (mirrors trust).
                 let fleet_keys_sync_handles_for_loop = fleet_keys_handles_opt;
@@ -10377,6 +10533,7 @@ pub async fn start_node_inner(
                                 p2_sync_handles_for_loop,
                                 relay_sync_handles_for_loop,
                                 trust_sync_handles_for_loop,
+                                quorum_sync_handles_for_loop,
                                 fleet_keys_sync_handles_for_loop,
                                 community_device_intro_sync_handles_for_loop,
                                 iroh_handles_into_loop,
@@ -10695,6 +10852,8 @@ pub async fn start_node_inner(
                         // IPC-side TrustStateAccess::Resident path.
                         guard.owner_trust_doc = owner_trust_doc_opt.clone();
                         guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();
+                        guard.owner_quorum_doc = owner_quorum_doc_opt.clone();
+                        guard.owner_quorum_sync = owner_quorum_sync_engine_opt.clone();
                         // ZEB-668 S5: carrier doc/engine + the shared key set
                         // (bump IPC + window-close both reach them here).
                         guard.fleet_key_epoch_doc = fleet_keys_doc_opt.clone();
@@ -57024,6 +57183,9 @@ pub fn run() {
             owner_commands::preview_owner_mnemonic_identity,
             owner_commands::restore_owner_mnemonic_from_words,
             owner_commands::revoke_device,
+            owner_quorum_commands::request_quorum_revocation,
+            owner_quorum_commands::cosign_quorum_request,
+            owner_quorum_commands::decline_quorum_request,
             get_backup_staleness,
             save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,
@@ -62261,6 +62423,8 @@ mod start_node_race_tests {
             owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            owner_quorum_doc: None,
+            owner_quorum_sync: None,
             fleet_key_epoch_doc: None,
             fleet_key_epoch_sync: None,
             fleet_keys: None,
