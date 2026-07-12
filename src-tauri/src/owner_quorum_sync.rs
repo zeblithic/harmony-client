@@ -482,6 +482,47 @@ pub fn revocation_pair_payload(
 /// the crate's canonical-CBOR cert payloads (those start with a CBOR map
 /// header byte), and the owner id + request id bind the veto to exactly
 /// one ceremony.
+/// True when the request's INITIATOR has signed an abandon marker into
+/// `declined_by[initiator]` — the convergent "I gave up on this ceremony"
+/// signal written by `LiveQuorumEnrollPort` on co-sign timeout. The
+/// signature is verified against the initiator's enrolled key over
+/// `decline_signing_payload` (same tag/label as a revocation decline), so a
+/// forged marker cannot silently block a live enrollment. Grow-only union
+/// carries it to every replica, so an abandoned enrollment request is never
+/// co-signed even after a stale re-merge.
+fn initiator_abandoned(
+    trust: &harmony_owner::state::OwnerState,
+    request_id_hex: &str,
+    req: &QuorumRequest,
+) -> bool {
+    let Some(sig_hex) = req.declined_by.get(&req.initiator_hex) else {
+        return false;
+    };
+    let (Ok(initiator), Ok(sig)) = (
+        parse_device_id_hex(&req.initiator_hex),
+        hex::decode(sig_hex),
+    ) else {
+        return false;
+    };
+    let Some(cert) = trust.enrollments.get(&initiator) else {
+        return false;
+    };
+    let Ok(vk) =
+        ed25519_dalek::VerifyingKey::from_bytes(&cert.device_pubkeys.classical.ed25519_verify)
+    else {
+        return false;
+    };
+    let payload = decline_signing_payload(trust.owner_id, request_id_hex);
+    harmony_owner::signing::verify_with_tag(
+        &vk,
+        harmony_owner::signing::tags::REVOCATION,
+        &payload,
+        &sig,
+        "Revocation-Quorum-Decline",
+    )
+    .is_ok()
+}
+
 pub fn decline_signing_payload(owner_id: [u8; 16], request_id_hex: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32 + 16 + request_id_hex.len());
     buf.extend_from_slice(b"harmony-zeb677-quorum-decline-v1");
@@ -817,6 +858,14 @@ fn collect_enrollment_cosign(
             || req.initiator_hex == self_hex
             || req.signatures.contains_key(&self_hex)
         {
+            continue;
+        }
+        // The initiator can convergently ABANDON its own request (a grow-only
+        // `declined_by` entry survives a union re-merge, unlike a delete) — do
+        // not co-sign it, so a lagging replica re-merging an abandoned request
+        // can't make us burn our single-use arm on a ceremony the inviter has
+        // already given up on (Greptile).
+        if initiator_abandoned(trust, id, req) {
             continue;
         }
         let QuorumRequestKind::Enrollment {
@@ -2877,6 +2926,62 @@ mod tests {
         )
         .await;
         assert_eq!(outcome.enrollment_cosigns, 0, "no arm ⇒ no co-sign");
+        {
+            let doc = rig.quorum_doc.lock().await;
+            assert!(!doc
+                .requests
+                .get(&rid)
+                .unwrap()
+                .signatures
+                .contains_key(&hex::encode(f.b_id)));
+        }
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
+    }
+
+    /// Convergent abandon (Greptile): an armed B must NOT co-sign an
+    /// enrollment request whose initiator has signed an abandon marker into
+    /// `declined_by` — even though B holds a live arm and the request is
+    /// otherwise valid — so a stale re-merge can't burn B's single-use arm.
+    #[tokio::test]
+    async fn armed_b_skips_abandoned_enrollment_request() {
+        let f = sweep_fleet();
+        let now_secs = NOW_SECS + 10;
+        let now_ms = NOW_MS + 10_000;
+        let (mut doc, rid, _a_part, _jid, _jpk) =
+            enrollment_request_for(&f, now_secs, now_ms, true);
+        // A abandons its own request (signed `declined_by[A]`).
+        let payload = decline_signing_payload(f.trust.owner_id, &rid);
+        let a_sig = harmony_owner::signing::sign_with_tag(
+            &f.a_sk,
+            harmony_owner::signing::tags::REVOCATION,
+            &payload,
+        );
+        doc.requests
+            .get_mut(&rid)
+            .unwrap()
+            .declined_by
+            .insert(hex::encode(f.a_id), hex::encode(a_sig));
+
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.b_sk,
+            f.b_id,
+            &collecting_emit(events),
+            None,
+            now_secs + 1,
+            now_ms + 1,
+        )
+        .await;
+        assert_eq!(
+            outcome.enrollment_cosigns, 0,
+            "an abandoned request must not be co-signed"
+        );
         {
             let doc = rig.quorum_doc.lock().await;
             assert!(!doc

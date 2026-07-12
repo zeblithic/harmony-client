@@ -148,10 +148,13 @@ impl QuorumEnrollPort for LiveQuorumEnrollPort {
                 }
                 Some(None) => {
                     if start.elapsed() >= timeout {
-                        // Abandon the request so a delayed sibling does not
-                        // later co-sign + vouch + burn its single-use arm on a
-                        // ceremony the inviter has already given up on.
-                        self.remove_request(&request_id).await;
+                        // Convergently abandon the request so a delayed sibling
+                        // does not later co-sign + vouch + burn its single-use
+                        // arm on a ceremony the inviter has already given up on.
+                        // A plain delete is NOT convergent (the grow-only union
+                        // re-merges it from a lagging replica), so we write a
+                        // signed `declined_by[self]` marker instead (Greptile).
+                        self.abandon_request(&request_id).await;
                         return Err(
                             "cosignTimeout: your other device didn't co-sign in time — re-arm \
                              and retry"
@@ -167,8 +170,9 @@ impl QuorumEnrollPort for LiveQuorumEnrollPort {
 
 impl LiveQuorumEnrollPort {
     /// Drop a request from the resident quorum doc and publish the removal
-    /// (best-effort flush — the dirty latch retries). Used on both success
-    /// (the cert is assembled) and timeout (the ceremony is abandoned).
+    /// (best-effort flush — the dirty latch retries). Used on SUCCESS: the
+    /// cosigner has already consumed its single-use arm, so a re-merge cannot
+    /// drive a second co-sign, and this is just local cleanup.
     async fn remove_request(&self, request_id: &str) {
         {
             let mut doc = self.quorum_doc.lock().await;
@@ -177,6 +181,33 @@ impl LiveQuorumEnrollPort {
         self.quorum_engine.notify_dirty();
         if let Err(e) = self.quorum_engine.flush_now().await {
             tracing::warn!(error = %e, "quorum enroll: request-removal flush failed; dirty latch will retry");
+        }
+    }
+
+    /// CONVERGENTLY abandon a request on timeout: sign an abandon marker into
+    /// `declined_by[self]` (the initiator). Unlike a delete, the grow-only
+    /// `declined_by` union carries the marker to every replica, so a lagging
+    /// sibling re-merging the stale request still sees it as abandoned
+    /// (`initiator_abandoned`) and does not co-sign it.
+    async fn abandon_request(&self, request_id: &str) {
+        let owner_id = self.trust_doc.lock().await.owner_id;
+        let payload = crate::owner_quorum_sync::decline_signing_payload(owner_id, request_id);
+        let sig = harmony_owner::signing::sign_with_tag(
+            &self.device_signing_key,
+            harmony_owner::signing::tags::REVOCATION,
+            &payload,
+        );
+        {
+            let mut doc = self.quorum_doc.lock().await;
+            if let Some(req) = doc.requests.get_mut(request_id) {
+                req.declined_by
+                    .entry(hex::encode(self.self_id))
+                    .or_insert_with(|| hex::encode(sig));
+            }
+        }
+        self.quorum_engine.notify_dirty();
+        if let Err(e) = self.quorum_engine.flush_now().await {
+            tracing::warn!(error = %e, "quorum enroll: abandon flush failed; dirty latch will retry");
         }
     }
 }
