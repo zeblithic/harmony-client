@@ -70,6 +70,19 @@ export class PairingService {
     this.unlistener = null;
   }
 
+  /**
+   * ZEB-668 S6: re-fetch the backend snapshot. On Complete this is more
+   * than a read — `get_pairing_state_inner` folds the freshly-persisted
+   * enrollment from `owner_state.cbor` into the resident trust doc
+   * (ZEB-668 S1), which is what the Devices panel renders from while the
+   * node runs. Calling this at completion is what makes the new device
+   * visible (and petname-addressable by row lookup) without a restart.
+   */
+  async refreshSnapshot(): Promise<void> {
+    this.state = await invoke<PairingState>('get_pairing_state');
+    this.onChange?.();
+  }
+
   async startInviter(displayName: string): Promise<void> {
     await invoke('start_inviter_pairing', { displayName });
   }

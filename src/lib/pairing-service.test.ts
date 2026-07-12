@@ -57,6 +57,22 @@ describe('PairingService', () => {
     expect(invoke).toHaveBeenCalledWith('cancel_pairing');
   });
 
+  // ZEB-668 S6: the re-fetch matters beyond the returned value — on
+  // Complete, get_pairing_state_inner folds the freshly-persisted
+  // enrollment into the resident trust doc (which the Devices panel
+  // renders from). This pins the frontend half of that contract.
+  it('refreshSnapshot re-fetches get_pairing_state, applies it, and fires onChange', async () => {
+    const complete = { kind: 'complete', deviceIdHex: 'cc'.repeat(16) };
+    mockedInvoke.mockResolvedValueOnce(complete);
+    const svc = new PairingService();
+    const changed = vi.fn();
+    svc.onChange = changed;
+    await svc.refreshSnapshot();
+    expect(invoke).toHaveBeenCalledWith('get_pairing_state');
+    expect(svc.state).toEqual(complete);
+    expect(changed).toHaveBeenCalledTimes(1);
+  });
+
   it('subscribes to pairing-state-changed and updates state', async () => {
     let listener: ((event: { payload: unknown }) => void) | undefined;
     mockedListen.mockImplementation((_event: string, cb: (e: { payload: unknown }) => void) => {
