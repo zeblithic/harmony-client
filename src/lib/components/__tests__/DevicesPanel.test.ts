@@ -313,6 +313,57 @@ describe('DevicesPanel — degraded state (canBackUp: false)', () => {
   });
 });
 
+describe('DevicesPanel — fleet-epoch rotate affordance (ZEB-677 S5)', () => {
+  const staleState = (extra: Record<string, unknown>) => ({
+    ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+    ownerDisplayName: 'me',
+    devices: [{
+      deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+      displayName: 'this', isThisDevice: true,
+      trustDecision: { kind: 'full', reason: null },
+      enrolledAt: 1_700_000_000, fingerprint: 'aa11·bb22',
+    }],
+    fleetEpoch: 2,
+    fleetEpochStale: true,
+    ...extra,
+  });
+
+  it('seed-holder sees the direct rotate button', async () => {
+    mockedInvoke.mockResolvedValueOnce(staleState({ canBackUp: true }));
+    render(DevicesPanel);
+    expect(await screen.findByTestId('rotate-fleet-keys')).toBeInTheDocument();
+    expect(screen.queryByTestId('rotate-fleet-keys-quorum')).toBeNull();
+  });
+
+  it('master-less quorum-capable fleet sees the co-sign rotate button', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      staleState({ canBackUp: false, selfIsMaster: false, canArmEnrollment: true }),
+    );
+    render(DevicesPanel);
+    const btn = await screen.findByTestId('rotate-fleet-keys-quorum');
+    expect(btn).toBeInTheDocument();
+    expect(screen.queryByTestId('rotate-fleet-keys')).toBeNull();
+
+    mockedInvoke.mockResolvedValue(null); // the request + refresh calls
+    await fireEvent.click(btn);
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith('request_quorum_epoch_bump'),
+    );
+  });
+
+  it('non-seed device without a quorum sees only the master-device note', async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      staleState({ canBackUp: false, selfIsMaster: false, canArmEnrollment: false }),
+    );
+    render(DevicesPanel);
+    expect(
+      await screen.findByText(/rotate them from the device that holds your master key/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('rotate-fleet-keys')).toBeNull();
+    expect(screen.queryByTestId('rotate-fleet-keys-quorum')).toBeNull();
+  });
+});
+
 describe('DevicesPanel — owner name and device label are separated (ZEB-336)', () => {
   it('shows the owner name in the header and the device label in the row', async () => {
     // Backend returns placeholders for both; the local stores override them

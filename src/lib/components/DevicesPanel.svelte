@@ -16,7 +16,7 @@
     resolveDefaultDeviceLabel,
   } from '../device-label-service';
   import { setDevicePetname, MAX_DEVICE_PETNAME_CHARS } from '../device-petname-service';
-  import { bumpFleetEpoch } from '../fleet-epoch-service';
+  import { bumpFleetEpoch, requestQuorumEpochBump } from '../fleet-epoch-service';
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
   import { fetchCommunitiesCount } from '../owner-meta';
   import {
@@ -234,6 +234,26 @@
       rotateError = extractError(e);
     } finally {
       rotateInFlight = false;
+    }
+  }
+
+  // ZEB-677 S5: master-less rotation. A device without the master seed opens a
+  // K=2 quorum request; a sibling co-signs and the initiator's sweep installs
+  // the new epoch. Distinct in-flight/error state from the seed-holder path.
+  let quorumRotateInFlight = $state(false);
+  let quorumRotateError = $state<string | null>(null);
+
+  async function requestQuorumRotate() {
+    if (quorumRotateInFlight) return;
+    quorumRotateError = null;
+    quorumRotateInFlight = true;
+    try {
+      await requestQuorumEpochBump();
+      await svc.refresh();
+    } catch (e) {
+      quorumRotateError = extractError(e);
+    } finally {
+      quorumRotateInFlight = false;
     }
   }
 
@@ -915,6 +935,26 @@
               Fleet keys predate the last device removal. Rotate them from the
               device that holds your master key.
             </p>
+            {#if state.canArmEnrollment === true}
+              <!-- ZEB-677 S5: no master seed available? A K=2 quorum across
+                   your other Master-certed devices can rotate instead. -->
+              <p class="epoch-text">
+                Lost your master device? Your other devices can co-sign the
+                rotation — until it lands, a removed device may still read
+                fleet-synced data.
+              </p>
+              <button
+                class="secondary"
+                data-testid="rotate-fleet-keys-quorum"
+                disabled={quorumRotateInFlight}
+                onclick={requestQuorumRotate}
+              >
+                {quorumRotateInFlight ? 'Requesting…' : 'Rotate fleet keys (needs a co-sign)'}
+              </button>
+              {#if quorumRotateError}
+                <p class="error" role="alert">{quorumRotateError}</p>
+              {/if}
+            {/if}
           {/if}
         </div>
       {/if}

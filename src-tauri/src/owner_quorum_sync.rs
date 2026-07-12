@@ -1333,6 +1333,7 @@ async fn install_quorum_epoch_doc(
 /// Thin wrapper: run a sweep with NO fleet-keys carrier (revoke-only; the
 /// bundled/standalone epoch bump is skipped). Production and the S5 integration
 /// test call [`run_quorum_sweep_with_carrier`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_quorum_sweep(
     quorum_doc: &Arc<tokio::sync::Mutex<QuorumReqDoc>>,
     quorum_engine: &Arc<crate::fleet_sync::FleetSyncEngine<QuorumReqDoc>>,
@@ -1418,7 +1419,10 @@ pub async fn run_quorum_sweep_with_carrier(
     }
 
     // Phase B: apply each completed request through the authoritative path.
+    // `completed` (pruned in Phase C) holds BOTH revocations and epoch bumps;
+    // `revocations_applied` counts only the former for the outcome.
     let mut completed = Vec::new();
+    let mut revocations_applied = 0usize;
     let mut epoch_bumps_installed = 0usize;
     for cand in candidates {
         let CompletionCandidate {
@@ -1462,6 +1466,7 @@ pub async fn run_quorum_sweep_with_carrier(
                         match trust_engine.flush_now().await {
                             Ok(()) => {
                                 completed.push(request_id);
+                                revocations_applied += 1;
                                 // NO-ROLLBACK: install the bundled crypto cutoff
                                 // AFTER the revoke is durable. A failed bump
                                 // leaves the revoke standing; the fleetEpochStale
@@ -1516,8 +1521,9 @@ pub async fn run_quorum_sweep_with_carrier(
         }
     }
 
-    // Phase C: drop completed requests from the quorum doc.
-    let applied_count = completed.len();
+    // Phase C: drop completed requests (revocations AND epoch bumps) from the
+    // quorum doc.
+    let pruned_count = completed.len();
     if !completed.is_empty() {
         {
             let mut doc = quorum_doc.lock().await;
@@ -1590,8 +1596,8 @@ pub async fn run_quorum_sweep_with_carrier(
     }
 
     SweepOutcome {
-        doc_changed: pruned || applied_count > 0 || enroll_cosigns > 0 || epoch_bumps_installed > 0,
-        revocations_applied: applied_count,
+        doc_changed: pruned || pruned_count > 0 || enroll_cosigns > 0,
+        revocations_applied,
         enrollment_cosigns: enroll_cosigns,
         epoch_bumps_installed,
     }
@@ -3034,6 +3040,73 @@ mod tests {
         // The carrier advanced to N+1 and the initiator publishes on the new epoch.
         assert_eq!(cr.carrier.carrier_doc.lock().await.epoch, 5);
         assert_eq!(cr.carrier.fleet_keys.newest().epoch, 5);
+    }
+
+    #[tokio::test]
+    async fn manual_epoch_bump_ceremony_installs_without_revocation() {
+        let f = sweep_fleet();
+        // A opens a standalone rotation at current epoch 4.
+        let (id, req) = crate::owner_quorum_commands::plan_quorum_epoch_bump_request(
+            &f.trust,
+            &f.a_sk,
+            false,
+            4,
+            NOW_SECS + 10,
+            NOW_MS + 10_000,
+            [0xef; 16],
+        )
+        .expect("plan bump");
+        assert!(matches!(req.kind, QuorumRequestKind::EpochBump { .. }));
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(id.clone(), req);
+
+        // B co-signs manually (the epoch-doc part rides `primary_sig_hex`).
+        let signed = crate::owner_quorum_commands::cosign_request_core(
+            &mut doc,
+            &f.trust,
+            &f.b_sk,
+            f.b_id,
+            &id,
+            NOW_MS + 20_000,
+        )
+        .expect("cosign bump");
+        assert!(signed);
+        let b_hex = hex::encode(f.b_id);
+        assert!(!doc.requests[&id].signatures[&b_hex]
+            .primary_sig_hex
+            .is_empty());
+
+        // A assembles: no revocation cert, a valid quorum-signed carrier at N+1.
+        let assembly =
+            super::try_assemble(&f.trust, &f.a_sk, f.a_id, &doc.requests[&id]).expect("assemble");
+        assert!(assembly.cert.is_none(), "epoch bump has no revocation cert");
+        let epoch_doc = assembly.epoch_doc.expect("epoch doc");
+        assert_eq!(epoch_doc.epoch, 5);
+        assert!(epoch_doc.verify_quorum(&f.trust.owner_id, NOW_SECS + 30));
+
+        // The sweep installs it (no revocation applied).
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let cr = carrier_rig();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let outcome = run_quorum_sweep_with_carrier(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::clone(&events)),
+            None,
+            NOW_SECS + 30,
+            NOW_MS + 30_000,
+            Some(&cr.carrier),
+        )
+        .await;
+        assert_eq!(outcome.revocations_applied, 0, "no revocation");
+        assert_eq!(outcome.epoch_bumps_installed, 1);
+        assert_eq!(cr.carrier.carrier_doc.lock().await.epoch, 5);
+        assert_eq!(cr.carrier.fleet_keys.newest().epoch, 5);
+        assert!(rig.quorum_doc.lock().await.requests.is_empty());
     }
 
     #[tokio::test]
