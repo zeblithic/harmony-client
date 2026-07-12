@@ -1871,6 +1871,95 @@ describe('DevicesPanel — replace device (ZEB-668 S6)', () => {
     );
   });
 
+  it('refresh failure after a successful revoke still opens pairing (round 1)', async () => {
+    // The revoke is irreversible — gating pairing on the refresh would
+    // strand the user and invite a duplicate revoke on retry.
+    let ownerView: unknown = s6View();
+    let revoked = false;
+    mockedInvoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === 'get_owner_state') {
+        if (revoked) throw new Error('transient: node busy');
+        return ownerView;
+      }
+      if (cmd === 'revoke_device') {
+        revoked = true;
+        return undefined;
+      }
+      if (cmd === 'get_pairing_state') {
+        return {
+          kind: 'discovering',
+          role: 'inviter',
+          ephemeralPubkeyHex: '',
+          sessionId: '00000000-0000-0000-0000-000000000010',
+        };
+      }
+      return undefined;
+    });
+
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    await fireEvent.click(screen.getByRole('button', { name: /^replace…$/i }));
+    const input = await screen.findByRole('textbox', { name: /type to confirm/i });
+    await fireEvent.input(input, { target: { value: 'Living room' } });
+    await fireEvent.click(screen.getByRole('button', { name: /remove & continue/i }));
+
+    // Pairing launches despite the failing refresh.
+    await screen.findByText(/looking for nearby devices/i);
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith('start_inviter_pairing', {
+        displayName: 'zeblith',
+      }),
+    );
+  });
+
+  it('successor invisible on the first refresh → carried on the bounded second attempt (round 1)', async () => {
+    const before = s6View();
+    const afterRevoke = s6View();
+    afterRevoke.devices[1].revoked = true;
+    const withSuccessor = s6View();
+    withSuccessor.devices[1].revoked = true;
+    withSuccessor.devices.push({ ...successorRow });
+
+    let ownerView: unknown = before;
+    let completed = false;
+    let postCompleteFetches = 0;
+    mockedInvoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === 'get_owner_state') {
+        if (completed) {
+          postCompleteFetches += 1;
+          // First post-complete refresh is stale; the second sees the row.
+          if (postCompleteFetches >= 2) ownerView = withSuccessor;
+        }
+        return ownerView;
+      }
+      if (cmd === 'revoke_device') {
+        ownerView = afterRevoke;
+        return undefined;
+      }
+      if (cmd === 'get_pairing_state') {
+        completed = true;
+        return { kind: 'complete', deviceIdHex: SUCCESSOR_ID };
+      }
+      return undefined;
+    });
+
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    await fireEvent.click(screen.getByRole('button', { name: /^replace…$/i }));
+    const input = await screen.findByRole('textbox', { name: /type to confirm/i });
+    await fireEvent.input(input, { target: { value: 'Living room' } });
+    await fireEvent.click(screen.getByRole('button', { name: /remove & continue/i }));
+
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith('set_device_petname', {
+        deviceVkHex: SUCCESSOR_VK,
+        petname: 'Living room',
+      }),
+    );
+    // And no stale carry alert.
+    expect(screen.queryByText(/couldn't carry the name/i)).toBeNull();
+  });
+
   it('never-named old device → no petname write for the successor', async () => {
     const before = s6View(null);
     const withSuccessor = s6View(null);

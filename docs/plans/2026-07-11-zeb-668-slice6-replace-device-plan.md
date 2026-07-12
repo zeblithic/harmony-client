@@ -34,8 +34,9 @@ closes that for ALL pairings, not just replace.
 - Petname key is `deviceVkHex` (64-hex), NEVER `deviceId` (32-hex);
   Complete reports `deviceIdHex` (32-hex) → map via refreshed device list.
 - Gates: `npx vitest run` + `npx tsc --noEmit`; `scripts/test-select
-  --context task` for the (empty) Rust surface; no Rust diff → full nextest
-  sweep is CI's (state this in the PR body).
+  --context task` for the (empty) Rust surface — paste the printed
+  `round=… bucket=…` summary line into the task report whenever it runs;
+  no Rust diff → full nextest sweep is CI's (state this in the PR body).
 
 ---
 

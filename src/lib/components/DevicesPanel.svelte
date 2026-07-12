@@ -361,11 +361,20 @@
       // the inviter seals the successor into the post-revocation window,
       // never the compromised one.
       await svc.revoke(replaceTarget.deviceVkHex, 'decommissioned');
-      await svc.refresh();
+      // The revoke is the only hard gate. Once it lands, pairing MUST
+      // open — gating on the refresh strands the user mid-flow after an
+      // irreversible removal, and a retry would re-revoke an
+      // already-revoked device (Qodo + CodeRabbit, PR #456 round 1).
       pendingCarryPetname = carry;
       carryError = null;
       replaceTarget = null;
       inviterOpen = true;
+      try {
+        await svc.refresh();
+      } catch {
+        // Best-effort: owner-devices-updated or the next panel refresh
+        // catches this row up.
+      }
     } catch (e) {
       replaceError = extractError(e);
     } finally {
@@ -376,16 +385,34 @@
   async function handlePairingComplete(deviceIdHex: string) {
     const carry = pendingCarryPetname;
     pendingCarryPetname = null;
-    try {
-      // The successor row must be visible to map its 32-hex deviceId to
-      // the 64-hex vk the petname IPC keys on (PairingInviter folded the
-      // enrollment into the resident doc before firing onComplete).
-      await svc.refresh();
-    } catch {
-      // Best-effort; owner-devices-updated re-refreshes.
+    // A stale alert from an earlier failed carry must not survive an
+    // unrelated pairing's completion (CodeRabbit, PR #456 round 1).
+    carryError = null;
+    // The successor row must be visible to map its 32-hex deviceId to the
+    // 64-hex vk the petname IPC keys on (PairingInviter folded the
+    // enrollment into the resident doc before firing onComplete). Two
+    // bounded attempts: a transiently-failed first refresh must not lose
+    // the carry (Qodo, PR #456 round 1) — but no background retry
+    // machinery; on final miss we degrade to the honest alert, which
+    // names the value so a manual rename recovers it.
+    if (!carry) {
+      try {
+        await svc.refresh();
+      } catch {
+        // Best-effort; owner-devices-updated re-refreshes.
+      }
+      return;
     }
-    if (!carry) return;
-    const successor = state?.devices.find((d) => d.deviceId === deviceIdHex);
+    let successor: DeviceView | undefined;
+    for (let attempt = 0; attempt < 2 && !successor; attempt += 1) {
+      try {
+        await svc.refresh();
+      } catch {
+        // Best-effort; the second attempt (or owner-devices-updated)
+        // covers a transient failure.
+      }
+      successor = state?.devices.find((d) => d.deviceId === deviceIdHex);
+    }
     if (!successor) {
       carryError = `Couldn't carry the name "${carry}" to the new device — rename it manually.`;
       return;

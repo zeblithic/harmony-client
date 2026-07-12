@@ -78,17 +78,28 @@ describe('PairingInviter', () => {
   // folds the freshly-persisted enrollment into the resident trust doc,
   // and the Devices panel (which consumes onComplete) renders from that
   // doc. Without the fold the successor row is invisible until restart.
-  it('fires onComplete once with the device id after re-fetching get_pairing_state', async () => {
+  it('fires onComplete once with the device id only AFTER the fold re-fetch settles', async () => {
     const complete = { kind: 'complete', deviceIdHex: 'cc'.repeat(16) };
-    mockedInvoke.mockImplementation(async (cmd: unknown) =>
-      cmd === 'get_pairing_state' ? complete : undefined,
-    );
+    // Deferred second fetch (CodeRabbit, PR #456 round 1): with an
+    // immediately-resolved mock, a regression that fires onComplete
+    // without awaiting refreshSnapshot() would still pass.
+    let stateFetches = 0;
+    let resolveRefresh!: (value: typeof complete) => void;
+    const refresh = new Promise<typeof complete>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    mockedInvoke.mockImplementation((cmd: unknown) => {
+      if (cmd !== 'get_pairing_state') return Promise.resolve(undefined);
+      stateFetches += 1;
+      return stateFetches === 1 ? Promise.resolve(complete) : refresh;
+    });
     const onComplete = vi.fn();
     render(PairingInviter, { props: { hostname: 'KRILE', onComplete } });
+    await waitFor(() => expect(stateFetches).toBe(2));
+    expect(onComplete).not.toHaveBeenCalled(); // fold still pending
+    resolveRefresh(complete);
     await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
     expect(onComplete).toHaveBeenCalledWith('cc'.repeat(16));
-    const stateFetches = mockedInvoke.mock.calls.filter((c) => c[0] === 'get_pairing_state');
-    expect(stateFetches.length).toBe(2); // init snapshot + fold-on-complete
   });
 
   it('does not re-fire onComplete on a duplicate complete flush', async () => {
@@ -100,13 +111,25 @@ describe('PairingInviter', () => {
       },
     );
     const complete = { kind: 'complete', deviceIdHex: 'cc'.repeat(16) };
-    mockedInvoke.mockImplementation(async (cmd: unknown) =>
-      cmd === 'get_pairing_state' ? complete : undefined,
-    );
+    let stateFetches = 0;
+    let resolveRefresh!: (value: typeof complete) => void;
+    const refresh = new Promise<typeof complete>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    mockedInvoke.mockImplementation((cmd: unknown) => {
+      if (cmd !== 'get_pairing_state') return Promise.resolve(undefined);
+      stateFetches += 1;
+      return stateFetches === 1 ? Promise.resolve(complete) : refresh;
+    });
     const onComplete = vi.fn();
     render(PairingInviter, { props: { hostname: 'KRILE', onComplete } });
+    await waitFor(() => expect(stateFetches).toBe(2));
+    // Duplicate flush lands WHILE the fold is still pending — the
+    // notified-once guard must hold across the await, not just after it.
+    listener!({ payload: complete });
+    resolveRefresh(complete);
     await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
-    listener!({ payload: complete }); // duplicate event flush
+    listener!({ payload: complete }); // and again after settling
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(onComplete).toHaveBeenCalledTimes(1);
   });
