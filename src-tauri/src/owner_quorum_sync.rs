@@ -994,6 +994,431 @@ mod tests {
         assert_ne!(p1, p3);
     }
 
+    // ── Task 6: two-engine ceremony integration tests ───────────────────
+
+    /// One device's half of the replicated pair: both datasets resident.
+    struct DevRig {
+        quorum_doc: Arc<tokio::sync::Mutex<QuorumReqDoc>>,
+        quorum_engine: Arc<crate::fleet_sync::FleetSyncEngine<QuorumReqDoc>>,
+        trust_doc: Arc<tokio::sync::Mutex<OwnerState>>,
+        trust_engine: Arc<crate::fleet_sync::FleetSyncEngine<OwnerState>>,
+    }
+
+    struct QuorumPair {
+        a: DevRig,
+        b: DevRig,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Two devices, BOTH datasets (trust + quorum) crossed over in-memory
+    /// channels sharing one CAS + KeyTree — the trust-sync `TrustPair`
+    /// harness extended for the ceremony (spec §10: donor trust-sync tests).
+    fn spawn_quorum_pair(seeded_trust: OwnerState) -> QuorumPair {
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine};
+        use crate::owner_state_crypto::KeyTree;
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kt = Arc::new(KeyTree::derive(&[0x77u8; 32]).expect("kt"));
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+
+        // Crossed channel pair builder: returns (a_pub_tx, a_sub_rx,
+        // b_pub_tx, b_sub_rx) where a's publishes feed b's subscriber and
+        // vice versa.
+        let mut crossed = || {
+            let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+            let (a_to_b_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+            tokio::spawn(async move {
+                while let Some(bytes) = a_pub_rx.recv().await {
+                    let _ = a_to_b_tx.send(bytes).await;
+                }
+            });
+            let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+            let (b_to_a_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+            tokio::spawn(async move {
+                while let Some(bytes) = b_pub_rx.recv().await {
+                    let _ = b_to_a_tx.send(bytes).await;
+                }
+            });
+            (a_pub_tx, a_sub_rx, b_pub_tx, b_sub_rx)
+        };
+        let (tq_a_pub, tq_a_sub, tq_b_pub, tq_b_sub) = crossed();
+        let (qq_a_pub, qq_a_sub, qq_b_pub, qq_b_sub) = crossed();
+
+        let mk_dev = |name: &str,
+                      trust_seed: OwnerState,
+                      t_pub: mpsc::Sender<Vec<u8>>,
+                      t_sub: mpsc::Receiver<Vec<u8>>,
+                      q_pub: mpsc::Sender<Vec<u8>>,
+                      q_sub: mpsc::Receiver<Vec<u8>>| {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            let trust_doc = Arc::new(tokio::sync::Mutex::new(trust_seed));
+            let trust_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
+                keys: crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt)),
+                device_id: name.to_string(),
+                state: Arc::clone(&trust_doc),
+                merger: crate::owner_trust_sync::trust_merger(),
+                replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                content_store: Arc::clone(&store),
+                publisher_tx: t_pub,
+                subscriber_rx: t_sub,
+                persist: Arc::new(crate::owner_trust_sync::TrustPersist {
+                    identity_dir: dir.path().join(name),
+                    replay_path: dir.path().join(format!("{name}-trust-replay.cbor")),
+                }),
+                lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
+                debounce_ms: 50,
+                publish_seen: true,
+                on_applied: None,
+                sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            }));
+            let quorum_doc = Arc::new(tokio::sync::Mutex::new(QuorumReqDoc::default()));
+            let quorum_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
+                keys: crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt)),
+                device_id: name.to_string(),
+                state: Arc::clone(&quorum_doc),
+                merger: quorum_merger(),
+                replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                content_store: Arc::clone(&store),
+                publisher_tx: q_pub,
+                subscriber_rx: q_sub,
+                persist: Arc::new(QuorumPersist {
+                    doc_path: dir.path().join(format!("{name}-quorum.cbor")),
+                    replay_path: dir.path().join(format!("{name}-quorum-replay.cbor")),
+                }),
+                lookup_key_tag: OWNER_QUORUM_LOOKUP_TAG,
+                debounce_ms: 50,
+                publish_seen: true,
+                on_applied: None,
+                sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            }));
+            DevRig {
+                quorum_doc,
+                quorum_engine,
+                trust_doc,
+                trust_engine,
+            }
+        };
+
+        let a = mk_dev(
+            "dev-a",
+            seeded_trust.clone(),
+            tq_a_pub,
+            tq_a_sub,
+            qq_a_pub,
+            qq_a_sub,
+        );
+        let b = mk_dev(
+            "dev-b",
+            seeded_trust,
+            tq_b_pub,
+            tq_b_sub,
+            qq_b_pub,
+            qq_b_sub,
+        );
+        QuorumPair { a, b, _dir: dir }
+    }
+
+    async fn shutdown_pair(pair: QuorumPair) {
+        let _ = pair.a.quorum_engine.shutdown().await;
+        let _ = pair.a.trust_engine.shutdown().await;
+        let _ = pair.b.quorum_engine.shutdown().await;
+        let _ = pair.b.trust_engine.shutdown().await;
+    }
+
+    /// Poll until `pred` returns true (5 s deadline, donor loop shape).
+    async fn wait_for<F, Fut>(what: &str, mut pred: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if pred().await {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for: {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn two_engines_full_ceremony_revocation_lands_fleet_wide() {
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 60;
+        let base_ms = base * 1000;
+        let f = sweep_fleet_at(base);
+        let pair = spawn_quorum_pair(f.trust.clone());
+
+        // A initiates (the IPC body minus NodeState: plan + insert + nudge).
+        let (id, req) = crate::owner_quorum_commands::plan_quorum_revocation_request(
+            &f.trust,
+            &f.a_sk,
+            false,
+            &f.c_vk_hex,
+            "lost",
+            base + 10,
+            base_ms + 10_000,
+            [0xaa; 16],
+        )
+        .expect("plan");
+        pair.a
+            .quorum_doc
+            .lock()
+            .await
+            .requests
+            .insert(id.clone(), req);
+        pair.a.quorum_engine.notify_dirty();
+
+        // The request replicates to B.
+        let id_for_b = id.clone();
+        let b_doc = Arc::clone(&pair.b.quorum_doc);
+        wait_for("request to reach B", move || {
+            let doc = Arc::clone(&b_doc);
+            let id = id_for_b.clone();
+            async move { doc.lock().await.requests.contains_key(&id) }
+        })
+        .await;
+
+        // B approves (cosign core against B's resident docs).
+        {
+            let trust_b = pair.b.trust_doc.lock().await.clone();
+            let mut doc_b = pair.b.quorum_doc.lock().await;
+            let signed = crate::owner_quorum_commands::cosign_request_core(
+                &mut doc_b,
+                &trust_b,
+                &f.b_sk,
+                f.b_id,
+                &id,
+                base_ms + 20_000,
+            )
+            .expect("cosign");
+            assert!(signed);
+        }
+        pair.b.quorum_engine.notify_dirty();
+
+        // B's signature replicates back to A.
+        let id_for_a = id.clone();
+        let a_doc = Arc::clone(&pair.a.quorum_doc);
+        let b_hex = hex::encode(f.b_id);
+        wait_for("co-signature to reach A", move || {
+            let doc = Arc::clone(&a_doc);
+            let id = id_for_a.clone();
+            let b_hex = b_hex.clone();
+            async move {
+                doc.lock()
+                    .await
+                    .requests
+                    .get(&id)
+                    .is_some_and(|r| r.signatures.contains_key(&b_hex))
+            }
+        })
+        .await;
+
+        // A's completion sweep (what the applied task runs on the nudge).
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let outcome = run_quorum_sweep(
+            &pair.a.quorum_doc,
+            &pair.a.quorum_engine,
+            &pair.a.trust_doc,
+            &pair.a.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::clone(&events)),
+            None,
+            base + 30,
+            base_ms + 30_000,
+        )
+        .await;
+        assert_eq!(outcome.revocations_applied, 1);
+        assert!(pair.a.trust_doc.lock().await.is_revoked(f.c_id));
+        assert!(pair.a.quorum_doc.lock().await.requests.is_empty());
+
+        // The revocation lands fleet-wide through TRUST replication.
+        let b_trust = Arc::clone(&pair.b.trust_doc);
+        let c_id = f.c_id;
+        wait_for("revocation to reach B's trust doc", move || {
+            let doc = Arc::clone(&b_trust);
+            async move { doc.lock().await.is_revoked(c_id) }
+        })
+        .await;
+
+        // B's own sweep prunes its copy via the revoked-target predicate.
+        let outcome_b = run_quorum_sweep(
+            &pair.b.quorum_doc,
+            &pair.b.quorum_engine,
+            &pair.b.trust_doc,
+            &pair.b.trust_engine,
+            &f.b_sk,
+            f.b_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            base + 40,
+            base_ms + 40_000,
+        )
+        .await;
+        assert_eq!(outcome_b.revocations_applied, 0);
+        assert!(pair.b.quorum_doc.lock().await.requests.is_empty());
+
+        shutdown_pair(pair).await;
+    }
+
+    #[tokio::test]
+    async fn two_engines_decline_tombstones_and_expiry_prunes() {
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 60;
+        let base_ms = base * 1000;
+        let f = sweep_fleet_at(base);
+        let pair = spawn_quorum_pair(f.trust.clone());
+
+        let (id, req) = crate::owner_quorum_commands::plan_quorum_revocation_request(
+            &f.trust,
+            &f.a_sk,
+            false,
+            &f.c_vk_hex,
+            "compromised",
+            base + 10,
+            base_ms + 10_000,
+            [0xbb; 16],
+        )
+        .expect("plan");
+        let expires_at_ms = req.expires_at_ms;
+        pair.a
+            .quorum_doc
+            .lock()
+            .await
+            .requests
+            .insert(id.clone(), req);
+        pair.a.quorum_engine.notify_dirty();
+
+        let id_for_b = id.clone();
+        let b_doc = Arc::clone(&pair.b.quorum_doc);
+        wait_for("request to reach B", move || {
+            let doc = Arc::clone(&b_doc);
+            let id = id_for_b.clone();
+            async move { doc.lock().await.requests.contains_key(&id) }
+        })
+        .await;
+
+        // B declines.
+        {
+            let mut doc_b = pair.b.quorum_doc.lock().await;
+            assert!(
+                crate::owner_quorum_commands::decline_request_core(&mut doc_b, f.b_id, &id)
+                    .expect("decline")
+            );
+        }
+        pair.b.quorum_engine.notify_dirty();
+
+        // The tombstone reaches A.
+        let id_for_a = id.clone();
+        let a_doc = Arc::clone(&pair.a.quorum_doc);
+        wait_for("decline to reach A", move || {
+            let doc = Arc::clone(&a_doc);
+            let id = id_for_a.clone();
+            async move {
+                doc.lock()
+                    .await
+                    .requests
+                    .get(&id)
+                    .is_some_and(|r| !r.declined_by.is_empty())
+            }
+        })
+        .await;
+
+        // A's sweep never assembles a declined request; it stays resident
+        // (UI-dead) until expiry.
+        let outcome = run_quorum_sweep(
+            &pair.a.quorum_doc,
+            &pair.a.quorum_engine,
+            &pair.a.trust_doc,
+            &pair.a.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            base + 30,
+            base_ms + 30_000,
+        )
+        .await;
+        assert_eq!(outcome.revocations_applied, 0);
+        assert!(!pair.a.trust_doc.lock().await.is_revoked(f.c_id));
+        assert!(pair.a.quorum_doc.lock().await.requests.contains_key(&id));
+
+        // Past expiry the sweep prunes it.
+        let outcome2 = run_quorum_sweep(
+            &pair.a.quorum_doc,
+            &pair.a.quorum_engine,
+            &pair.a.trust_doc,
+            &pair.a.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            base + 40,
+            expires_at_ms + 1,
+        )
+        .await;
+        assert!(outcome2.doc_changed);
+        assert!(pair.a.quorum_doc.lock().await.requests.is_empty());
+
+        shutdown_pair(pair).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_after_completion_prunes_without_reapply() {
+        // Initiator-crash retry shape: a prior ceremony already revoked
+        // the target when a stale duplicate request resurfaces (e.g. the
+        // initiator died between apply and prune, or the user re-requested
+        // against a sibling's not-yet-converged view). The sweep prunes it
+        // via the revoked-target predicate without a second add_revocation.
+        let f = sweep_fleet();
+        let (doc, id) = planned_and_cosigned(&f);
+        // Complete the ceremony out-of-band: assemble the pending request
+        // and apply it to the trust state the sweep will see.
+        let mut trust_revoked = f.trust.clone();
+        let assembled =
+            super::try_assemble(&f.trust, &f.a_sk, f.a_id, &doc.requests[&id]).expect("assemble");
+        trust_revoked
+            .add_revocation(assembled, NOW_SECS + 30, DEFAULT_ACTIVE_WINDOW_SECS)
+            .expect("apply");
+        assert!(trust_revoked.is_revoked(f.c_id));
+
+        // The doc still carries the (now stale) pending request.
+        let rig = sweep_rig(trust_revoked, doc);
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            NOW_SECS + 60,
+            NOW_MS + 60_000,
+        )
+        .await;
+        assert_eq!(
+            outcome.revocations_applied, 0,
+            "already-revoked target must not re-apply"
+        );
+        assert!(outcome.doc_changed, "stale duplicate pruned");
+        assert!(rig.quorum_doc.lock().await.requests.is_empty());
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
+    }
+
     // ── Task 3: completion-sweep tests ──────────────────────────────────
 
     struct SweepFleet {
@@ -1007,13 +1432,23 @@ mod tests {
     }
 
     /// Three master-enrolled devices with fresh liveness: A (initiator),
-    /// B (cosigner), C (target).
+    /// B (cosigner), C (target). Fixed epoch (fine for single-rig sweeps,
+    /// which pass explicit `now` everywhere).
     fn sweep_fleet() -> SweepFleet {
+        sweep_fleet_at(NOW_SECS)
+    }
+
+    /// Same fleet anchored at an arbitrary `base` — the two-engine tests
+    /// use real-clock-relative time because the REPLICATION merge path
+    /// (`merge_trust_remote_into_local`) validates with the real wall
+    /// clock: a fixed-2023 fixture's liveness fails the 90-day
+    /// active-window check there and the quorum revocation is dropped.
+    fn sweep_fleet_at(base: u64) -> SweepFleet {
         let MintResult {
             mut state,
             recovery_artifact,
             device_signing_key: a_sk,
-        } = mint_owner(NOW_SECS).expect("mint");
+        } = mint_owner(base).expect("mint");
         let a_id = crate::owner_state::device_id_from_signing_key(&a_sk);
         let owner_id = state.owner_id;
         let mut enroll = |now: u64| {
@@ -1033,13 +1468,13 @@ mod tests {
                 .expect("add enrollment");
             (sk, id)
         };
-        let (b_sk, b_id) = enroll(NOW_SECS + 1);
-        let (c_sk, c_id) = enroll(NOW_SECS + 2);
+        let (b_sk, b_id) = enroll(base + 1);
+        let (c_sk, c_id) = enroll(base + 2);
         let c_vk_hex = hex::encode(c_sk.verifying_key().to_bytes());
         for sk in [&a_sk, &b_sk, &c_sk] {
             state
                 .add_liveness(
-                    harmony_owner::certs::LivenessCert::sign(sk, owner_id, NOW_SECS + 3).unwrap(),
+                    harmony_owner::certs::LivenessCert::sign(sk, owner_id, base + 3).unwrap(),
                 )
                 .expect("liveness");
         }
