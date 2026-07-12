@@ -57186,6 +57186,8 @@ pub fn run() {
             owner_quorum_commands::request_quorum_revocation,
             owner_quorum_commands::cosign_quorum_request,
             owner_quorum_commands::decline_quorum_request,
+            owner_quorum_commands::arm_quorum_enrollment,
+            owner_quorum_commands::disarm_quorum_enrollment,
             get_backup_staleness,
             save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,

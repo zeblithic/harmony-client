@@ -1010,6 +1010,23 @@ pub fn build_registry() -> RpcRegistry {
                 .await
         }
     );
+    // ZEB-677 S4: pre-armed enrollment co-sign window.
+    rpc!(
+        m,
+        "arm_quorum_enrollment",
+        EmptyArgs,
+        |state, sink, _a| async move {
+            crate::owner_quorum_commands::arm_quorum_enrollment_impl(state, sink).await
+        }
+    );
+    rpc!(
+        m,
+        "disarm_quorum_enrollment",
+        EmptyArgs,
+        |state, sink, _a| async move {
+            crate::owner_quorum_commands::disarm_quorum_enrollment_impl(state, sink).await
+        }
+    );
     rpc!(
         m,
         "bump_fleet_epoch",
@@ -1954,6 +1971,9 @@ mod tests {
             "request_quorum_revocation",
             "cosign_quorum_request",
             "decline_quorum_request",
+            // quorum enrollment arm window (ZEB-677 S4)
+            "arm_quorum_enrollment",
+            "disarm_quorum_enrollment",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",

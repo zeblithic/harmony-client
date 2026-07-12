@@ -95,9 +95,11 @@ pub const MAX_QUORUM_SIG_ENTRIES: usize = 16;
 /// forever (they'd never prune).
 pub const QUORUM_CLOCK_SKEW_MS: u64 = 60 * 60 * 1000;
 
-/// The S4 arm window is 15 minutes; the same horizon rule bounds hostile
-/// arm cells (window + skew).
-pub const QUORUM_ARM_HORIZON_MS: u64 = 15 * 60 * 1000 + QUORUM_CLOCK_SKEW_MS;
+/// The S4 pre-armed enrollment co-sign window: 15 minutes, single-use.
+pub const ARM_WINDOW_MS: u64 = 15 * 60 * 1000;
+
+/// The same horizon rule bounds hostile arm cells (window + skew).
+pub const QUORUM_ARM_HORIZON_MS: u64 = ARM_WINDOW_MS + QUORUM_CLOCK_SKEW_MS;
 
 /// What a pending request asks the fleet to co-sign. Revocation only in
 /// S3; the S4 enrollment ceremony adds its variant, and S5 threads the
@@ -397,6 +399,38 @@ pub fn prune_settled_requests(
     doc.enroll_arms
         .retain(|_, arm| now_ms <= arm.armed_until_ms);
     doc.requests.len() != before_reqs || doc.enroll_arms.len() != before_arms
+}
+
+/// Stamp THIS device's arm cell with a strictly-newer Hlc so the merge's
+/// LWW always prefers it over the prior arm/disarm/consume (the cell is
+/// keyed by armer device-id, so every write to it supersedes the same key).
+/// `armed_until_ms <= now_ms` ⇒ disarmed. We NEVER delete the cell: a delete
+/// can be resurrected when an older `set_at` re-merges from another replica,
+/// so disarm/consume write an already-expired cell that wins LWW and is
+/// reaped later by `prune_settled_requests`. The `(wall_ms, logical)` bump
+/// guarantees strict newness even for two writes in the same millisecond.
+pub(crate) fn stamp_arm_cell(
+    doc: &mut QuorumReqDoc,
+    self_id: [u8; 16],
+    armed_until_ms: u64,
+    now_ms: u64,
+) {
+    let self_hex = hex::encode(self_id);
+    let (wall_ms, logical) = match doc.enroll_arms.get(&self_hex).map(|a| &a.set_at) {
+        Some(prev) if prev.wall_ms >= now_ms => (prev.wall_ms, prev.logical + 1),
+        _ => (now_ms, 0),
+    };
+    doc.enroll_arms.insert(
+        self_hex.clone(),
+        EnrollArm {
+            set_at: Hlc {
+                wall_ms,
+                logical,
+                device_id: self_hex,
+            },
+            armed_until_ms,
+        },
+    );
 }
 
 /// Decode a 16-byte device-id hex string.
@@ -925,6 +959,30 @@ mod tests {
             epoch_doc_sig_hex: None,
             primary_sig_hex: sig.to_string(),
         }
+    }
+
+    #[test]
+    fn stamp_arm_cell_is_monotonic_and_disarm_expires() {
+        let mut doc = QuorumReqDoc::default();
+        let me = [0x11u8; 16];
+        let me_hex = hex::encode(me);
+        // Arm: a future single-use window.
+        stamp_arm_cell(&mut doc, me, NOW_MS + ARM_WINDOW_MS, NOW_MS);
+        let armed = doc.enroll_arms.get(&me_hex).expect("armed").clone();
+        assert!(armed.armed_until_ms > NOW_MS);
+        // Disarm at the SAME wall-ms: must still win LWW via logical bump.
+        stamp_arm_cell(&mut doc, me, NOW_MS - 1, NOW_MS);
+        let disarmed = doc.enroll_arms.get(&me_hex).expect("cell present").clone();
+        assert!(
+            disarmed.armed_until_ms <= NOW_MS,
+            "disarm writes an already-expired cell"
+        );
+        assert!(
+            disarmed.set_at.is_strictly_newer_than(&armed.set_at),
+            "disarm must win LWW over the armed cell"
+        );
+        // Never deleted — a stale re-merge cannot resurrect the window.
+        assert!(doc.enroll_arms.contains_key(&me_hex));
     }
 
     #[test]

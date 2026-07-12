@@ -32,6 +32,12 @@ pub struct OwnerStateView {
     /// affordances, `self_is_master` gates the quorum-ceremony surfaces.
     #[serde(default)]
     pub self_is_master: bool,
+    /// ZEB-677 S4: whether THIS device may arm an enrollment co-sign window
+    /// — master-less fleet, this device Master-certed, and ≥1 other active
+    /// Master-certed sibling to act as the inviter. Gates the DevicesPanel
+    /// "Approve adding a device" affordance (spec §5.1).
+    #[serde(default)]
+    pub can_arm_enrollment: bool,
     /// ZEB-677 S3: pending quorum co-sign requests (unexpired), rendered
     /// as the DevicesPanel co-sign banner / pending notes.
     #[serde(default)]
@@ -2081,6 +2087,7 @@ mod tests {
             fleet_epoch_stale: true,
             // ZEB-677 S3: non-default values pin the quorum trio's renames.
             self_is_master: true,
+            can_arm_enrollment: true,
             quorum_requests: vec![QuorumRequestView {
                 request_id: "ab".repeat(16),
                 kind: "revocation".into(),

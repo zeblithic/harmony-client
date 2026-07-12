@@ -354,6 +354,12 @@ fn build_owner_state_view(
                 .is_some_and(crate::owner_quorum_commands::is_master_issued)
         })
         .collect();
+    // S4: can THIS device arm an enrollment window? Only a master-less fleet
+    // uses quorum enrollment; it needs this device Master-certed plus ≥1
+    // OTHER active Master-certed sibling to act as the inviter (spec §5.1).
+    let can_arm_enrollment = !self_is_master
+        && self_master_certed
+        && active_master_certed.iter().any(|id| *id != this_device_id);
 
     let devices: Vec<DeviceView> = loaded
         .state
@@ -501,6 +507,7 @@ fn build_owner_state_view(
         fleet_epoch: fleet.carrier_epoch,
         fleet_epoch_stale,
         self_is_master,
+        can_arm_enrollment,
         quorum_requests,
         quorum_armed_until_ms,
     }
@@ -2586,6 +2593,58 @@ mod revoke_tests {
             QuorumJoin::default(),
         );
         assert!(!view2.self_is_master);
+    }
+
+    #[test]
+    fn view_can_arm_enrollment_matrix() {
+        let now = now_unix() - 60;
+        let (state, a_sk, b_id, c_id, _cvk) = quorum_view_fixture(now);
+
+        // Master-less A with active master-certed siblings → can arm.
+        let view = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert!(
+            view.can_arm_enrollment,
+            "master-less device with an active master-certed sibling can arm"
+        );
+
+        // Seed present → normal pairing; the arm affordance is off.
+        let with_seed = LoadedOwnerState {
+            state: state.clone(),
+            device_signing_key: a_sk.clone(),
+            master_seed: Some(Zeroizing::new([0x11; 32])),
+            fleet_keytree: None,
+        };
+        let view_seed = build_owner_state_view(
+            &with_seed,
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert!(
+            !view_seed.can_arm_enrollment,
+            "a master holder adds devices through normal pairing"
+        );
+
+        // No active sibling: strip B and C liveness so A is the only active
+        // master-certed device → no inviter/co-signer → cannot arm.
+        let mut lonely = state.clone();
+        lonely.liveness.remove(&b_id);
+        lonely.liveness.remove(&c_id);
+        let view_lonely = build_owner_state_view(
+            &masterless_loaded(&lonely, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert!(
+            !view_lonely.can_arm_enrollment,
+            "no active master-certed sibling → cannot arm"
+        );
     }
 
     #[test]
