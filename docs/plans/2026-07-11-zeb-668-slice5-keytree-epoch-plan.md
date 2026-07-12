@@ -166,7 +166,7 @@ impl FleetKeySet {
 - [ ] **Step 2: Implement `FleetKeySet`; green.**
 - [ ] **Step 3: Failing tests for vault multi-material encode/decode** (owner_state.rs tests): round-trip `Vec<FleetKeyMaterial>` of 2; legacy bytes (CBOR of a single material) decode to a 1-vec — construct legacy bytes inline with `ciborium::into_writer(&single, …)`.
 - [ ] **Step 4: Implement vault format.** Write path always encodes `Vec`; read path tries `Vec<FleetKeyMaterial>` first, falls back to single. Retype `LoadedOwnerState.fleet_keytree`; load gate (:482-494) semantics unchanged (cert-only loads, seed-holder skips).
-- [ ] **Step 5: Thread `FleetKeySet` through the engines.** `FleetSyncConfig { kt: Arc<KeyTree> }` → `keys: FleetKeySet`; `Ctx` likewise. In `handle_incoming_publish`: try `decrypt_root_publish(&kt, &wire)` for each `keys.accept_set()` entry; the FIRST success binds `kt` for the remainder of the function (`space_lookup_key` + `decrypt_entry` at :780-781 use the same epoch's tree — a publish is entirely single-epoch). All decrypt candidates failing → existing Dropped path (log once, not per-candidate). Publish sites use `keys.newest()`. Apply the identical pattern to `owner_state_sync.rs`. Boot (lib.rs:4340): seed path `FleetKeySet::new(Arc::new(KeyTree::derive(seed)?))`; cert path: build from ALL decodable vault materials (`install` each; first = any — sort handles order); the three data engines share ONE `FleetKeySet` clone.
+- [ ] **Step 5: Thread `FleetKeySet` through the engines.** `FleetSyncConfig { kt: Arc<KeyTree> }` → `keys: FleetKeySet`; `Ctx` likewise. In `handle_incoming_publish`: try `decrypt_root_publish(&kt, &wire)` for each `keys.accept_set()` entry; the FIRST success binds `kt` for the remainder of the function (`space_lookup_key` + `decrypt_entry` at :780-781 use the same epoch's tree — a publish is entirely single-epoch). All decrypt candidates failing → existing Dropped path (log once, not per-candidate). Publish sites use `keys.newest()`. Apply the identical pattern to `owner_state_sync.rs`. Boot (lib.rs:4340): seed path `FleetKeySet::new(Arc::new(KeyTree::derive(seed)?))`; cert path: build the DATA accept set from the decodable vault materials **excluding epoch-0 whenever any higher epoch exists** (normative — after a window closes, epoch-0 is carrier-only; re-admitting it at boot would silently reopen revoked-device epoch-0 reads; epoch-0 participates only when it is the sole epoch, i.e. a pre-bump fleet). The pinned lowest-epoch tree is kept separately for the carrier. All data engines share ONE `FleetKeySet` clone.
 - [ ] **Step 6: Engine round-trip test.** Extend the existing fleet_sync tests (grep `mod tests` in fleet_sync.rs for the donor round-trip test): a publish encrypted under epoch-1 keys decrypts when the receiver's set holds {0,1}, and is Dropped when it holds only {0}.
 - [ ] **Step 7: Task gate** (test-select task + fmt + clippy `--all-targets`).
 - [ ] **Step 8: Commit** `ZEB-668 S5 T2: FleetKeySet accept-set through fleet engines + multi-epoch vault slot`.
@@ -314,11 +314,11 @@ export async function bumpFleetEpoch(): Promise<number> {
 
 ## Execution amendments (implementation-time)
 
-1. **Nine dataset engines, not three** (T2): ground truth found the fleet
+1. **Ten rotating engines, not three** (T2): ground truth found the fleet
    tree cloned into owner-state, fleet-net, trust, notes, DM-inbox,
    DM-outhold, relay-hold, relay-optin, community-device-intro AND the mint
-   engine (its own bespoke task, converted the same way). All rotate via
-   the shared `FleetKeySet`.
+   engine (its own bespoke task, converted the same way) — ten in all. All
+   rotate via the shared `FleetKeySet`.
 2. **Friend-secret domain pinned to epoch-0** (T2, spec §6.1 amendment 6):
    friend secrets are sealed once and stored durably in the CRDT —
    rotating `friend_aead` would orphan them all at window close, and buys

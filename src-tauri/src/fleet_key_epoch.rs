@@ -202,7 +202,15 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), crate::fleet
 
 /// Load the carrier doc; missing file → default; corrupt → warn + default
 /// (the doc re-replicates from any sibling, so recovery is safe).
-pub fn load_doc_or_recover(path: &std::path::Path) -> FleetKeyEpochDoc {
+///
+/// Verifies the master signature against `owner_id` for any non-default doc
+/// (PR #455 round 1, Qodo bug 2): the monotonic merge rejects remotes with
+/// `epoch <= local` BEFORE verifying them, so a locally-corrupted (or
+/// tampered) doc with a spuriously high epoch would otherwise stall
+/// adoption of every legitimate carrier doc until a strictly-higher epoch
+/// appeared. An unverifiable persisted doc degrades to the default and
+/// re-replicates.
+pub fn load_doc_or_recover(path: &std::path::Path, owner_id: &[u8; 16]) -> FleetKeyEpochDoc {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FleetKeyEpochDoc::default(),
@@ -212,21 +220,29 @@ pub fn load_doc_or_recover(path: &std::path::Path) -> FleetKeyEpochDoc {
             return FleetKeyEpochDoc::default();
         }
     };
-    match bytes.split_first() {
+    let doc: FleetKeyEpochDoc = match bytes.split_first() {
         Some((&FLEET_KEYS_SCHEMA_V1, rest)) => match ciborium::from_reader(rest) {
             Ok(doc) => doc,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e,
                     "fleet-keys doc decode failed; starting from default");
-                FleetKeyEpochDoc::default()
+                return FleetKeyEpochDoc::default();
             }
         },
         _ => {
             tracing::warn!(path = %path.display(),
                 "fleet-keys doc has unknown schema byte; starting from default");
-            FleetKeyEpochDoc::default()
+            return FleetKeyEpochDoc::default();
         }
+    };
+    // Epoch 0 is the never-bumped default (unsigned by construction); any
+    // bumped doc must carry a valid master signature.
+    if doc.epoch > 0 && !doc.verify(owner_id) {
+        tracing::warn!(path = %path.display(), epoch = doc.epoch,
+            "fleet-keys doc failed master-signature verification; starting from default");
+        return FleetKeyEpochDoc::default();
     }
+    doc
 }
 
 /// Load the carrier replay tracker; any failure → empty (replay protection
@@ -276,6 +292,43 @@ impl crate::fleet_sync::FleetPersist<FleetKeyEpochDoc> for FleetKeyEpochPersist 
         })?;
         atomic_write(&self.replay_path, &rbytes)
     }
+}
+
+/// Persist the vault `fleet_keytree` slot from the CURRENT data accept set,
+/// guaranteeing the epoch-0 material rides along (PR #455 round 1, Qodo
+/// bug 1): the data set deliberately excludes epoch-0 once a higher epoch
+/// exists, but epoch-0 keys the carrier forever — a slot write without it
+/// would brick carrier access on the next boot. When the accept set lacks
+/// epoch-0, it is re-read from the existing slot; if it cannot be found
+/// anywhere, the write is REFUSED (the new epoch re-installs from the
+/// carrier replay on the next merge, whereas a slot without epoch-0 is
+/// unrecoverable).
+pub fn persist_vault_material_set(
+    keychain: &Option<crate::identity::KeychainStore>,
+    identity_dir: &std::path::Path,
+    keys: &crate::owner_state_crypto::FleetKeySet,
+) -> Result<(), String> {
+    let mut materials: Vec<crate::owner_state_crypto::FleetKeyMaterial> = keys
+        .accept_set()
+        .iter()
+        .map(|k| k.to_fleet_material())
+        .collect();
+    if !materials.iter().any(|m| m.epoch == 0) {
+        if let Ok(Some(bytes)) = crate::owner_state::load_fleet_keytree(keychain, identity_dir) {
+            if let Ok(old_set) = crate::owner_state_crypto::decode_fleet_material_set(&bytes) {
+                materials.extend(old_set.into_iter().filter(|m| m.epoch == 0));
+            }
+        }
+    }
+    if !materials.iter().any(|m| m.epoch == 0) {
+        return Err(
+            "refusing to persist fleet_keytree without epoch-0 material (the carrier key); \
+             the pending epochs re-install from the carrier replay"
+                .to_string(),
+        );
+    }
+    let bytes = crate::owner_state_crypto::encode_fleet_material_set(&materials)?;
+    crate::owner_state::save_fleet_keytree(keychain, identity_dir, &bytes)
 }
 
 // ── Receiver-side install (the on_applied consumer) ─────────────────────────
@@ -438,11 +491,14 @@ mod tests {
         let doc_path = dir.path().join(FLEET_KEYS_FILENAME);
         let replay_path = dir.path().join(FLEET_KEYS_REPLAY_FILENAME);
 
-        // Missing files recover to defaults.
-        assert_eq!(load_doc_or_recover(&doc_path), FleetKeyEpochDoc::default());
-        assert!(load_replay_or_recover(&replay_path).is_empty());
+        let (doc, owner_id) = signed_doc([3u8; 32], 2);
 
-        let (doc, _owner) = signed_doc([3u8; 32], 2);
+        // Missing files recover to defaults.
+        assert_eq!(
+            load_doc_or_recover(&doc_path, &owner_id),
+            FleetKeyEpochDoc::default()
+        );
+        assert!(load_replay_or_recover(&replay_path).is_empty());
         let tracker = std::collections::BTreeMap::from([(
             "dev-a".to_string(),
             crate::owner_state_types::Hlc {
@@ -456,12 +512,72 @@ mod tests {
             replay_path: replay_path.clone(),
         };
         crate::fleet_sync::FleetPersist::persist(&persist, &doc, &tracker).expect("persist");
-        assert_eq!(load_doc_or_recover(&doc_path), doc);
+        assert_eq!(load_doc_or_recover(&doc_path, &owner_id), doc);
         assert_eq!(load_replay_or_recover(&replay_path), tracker);
 
         // Corrupt doc recovers to default rather than failing the boot.
         std::fs::write(&doc_path, [0xFF, 0x00]).expect("corrupt");
-        assert_eq!(load_doc_or_recover(&doc_path), FleetKeyEpochDoc::default());
+        assert_eq!(
+            load_doc_or_recover(&doc_path, &owner_id),
+            FleetKeyEpochDoc::default()
+        );
+
+        // PR #455 round 1 (Qodo bug 2): a decodable-but-UNVERIFIED doc with
+        // a spuriously high epoch must NOT load — it would stall adoption of
+        // every legitimate carrier doc below its epoch.
+        let mut forged = doc.clone();
+        forged.epoch = 99;
+        crate::fleet_sync::FleetPersist::persist(&persist, &forged, &tracker).expect("persist");
+        assert_eq!(
+            load_doc_or_recover(&doc_path, &owner_id),
+            FleetKeyEpochDoc::default(),
+            "tampered persisted doc must degrade to default"
+        );
+    }
+
+    /// PR #455 round 1 (Qodo bug 1): the vault rewrite must never drop the
+    /// epoch-0 carrier key, even when the data accept set excludes it.
+    #[test]
+    fn persist_vault_material_set_guarantees_epoch0() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = [6u8; 32];
+        let kt0 = std::sync::Arc::new(
+            crate::owner_state_crypto::KeyTree::derive_at_epoch(&seed, 0).expect("kt0"),
+        );
+        let kt2 = std::sync::Arc::new(
+            crate::owner_state_crypto::KeyTree::derive_at_epoch(&seed, 2).expect("kt2"),
+        );
+
+        // Seed the slot with a set that INCLUDES epoch-0.
+        let with_zero = crate::owner_state_crypto::FleetKeySet::new(std::sync::Arc::clone(&kt0));
+        with_zero.install(std::sync::Arc::clone(&kt2));
+        persist_vault_material_set(&None, dir.path(), &with_zero).expect("persist with 0");
+
+        // Now persist from a set WITHOUT epoch-0 (post-window data set):
+        // epoch-0 must be re-read from the existing slot and survive.
+        let without_zero = crate::owner_state_crypto::FleetKeySet::new(kt2);
+        persist_vault_material_set(&None, dir.path(), &without_zero).expect("persist without 0");
+        let bytes = crate::owner_state::load_fleet_keytree(&None, dir.path())
+            .expect("load ok")
+            .expect("slot present");
+        let set = crate::owner_state_crypto::decode_fleet_material_set(&bytes).expect("decode");
+        let mut epochs: Vec<u32> = set.iter().map(|m| m.epoch).collect();
+        epochs.sort_unstable();
+        assert_eq!(epochs, vec![0, 2], "epoch-0 must ride along");
+
+        // Empty slot + no epoch-0 in the set → REFUSE rather than brick.
+        let dir2 = tempfile::tempdir().expect("tempdir2");
+        let kt3 = std::sync::Arc::new(
+            crate::owner_state_crypto::KeyTree::derive_at_epoch(&seed, 3).expect("kt3"),
+        );
+        let err = persist_vault_material_set(
+            &None,
+            dir2.path(),
+            &crate::owner_state_crypto::FleetKeySet::new(kt3),
+        )
+        .expect_err("must refuse without epoch-0 anywhere");
+        assert!(err.contains("epoch-0"), "{err}");
     }
 
     #[test]

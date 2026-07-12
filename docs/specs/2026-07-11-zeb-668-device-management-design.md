@@ -276,10 +276,10 @@ amendments below supersede the corresponding bullets above.
    knows the secrets it decrypted before revocation. Residual risk (a
    revoked device that somehow obtains post-revocation CRDT bytes out of
    band could open friend-secret blobs) is accepted and recorded in the
-   §8 ledger; a re-seal migration is a §9 follow-up candidate. All fleet
-   *dataset* engines (owner-state, fleet-net, trust, notes, DM-inbox,
-   DM-outhold, relay-hold, mint, …) rotate — ground truth found nine
-   dataset engines sharing the fleet tree, not the three §6 names.
+   §8 ledger; a re-seal migration is a §9 follow-up candidate. All ten
+   fleet engines sharing the fleet tree rotate — ground truth found
+   owner-state, fleet-net, trust, notes, DM-inbox, DM-outhold, relay-hold,
+   relay-optin, community-device-intro, and mint, not the three §6 names.
 
 ## §7 S6 — "Replace this device" (the rotation answer)
 

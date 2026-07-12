@@ -5657,7 +5657,10 @@ pub async fn start_node_inner(
                     let fleet_keys_replay_path =
                         identity_dir.join(crate::fleet_key_epoch::FLEET_KEYS_REPLAY_FILENAME);
                     let fleet_keys_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::fleet_key_epoch::load_doc_or_recover(&fleet_keys_doc_path),
+                        crate::fleet_key_epoch::load_doc_or_recover(
+                            &fleet_keys_doc_path,
+                            &loaded.state.owner_id,
+                        ),
                     ));
                     let fleet_keys_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                         crate::fleet_key_epoch::load_replay_or_recover(&fleet_keys_replay_path),
@@ -5734,6 +5737,11 @@ pub async fn start_node_inner(
                             ));
                         let apply_identity_dir = identity_dir.clone();
                         let apply_emit = std::sync::Arc::clone(&app);
+                        // ZEB-428 seam (PR #455 round 1): the keychain enters
+                        // the task as an injected factory, never constructed
+                        // at the use sites.
+                        let boot_keychain: crate::owner_commands::KeychainFactory =
+                            crate::owner_commands::prod_keychain;
                         // Boot nudge: the replayed doc may already be ahead of
                         // the booted key set (e.g. seed-holder that bumped and
                         // restarted). Capacity-1 channel: a failed send means a
@@ -5760,10 +5768,8 @@ pub async fn start_node_inner(
                                     let keys = apply_keys.clone();
                                     move || -> Result<u32, String> {
                                         // Seed path: re-derive at the doc's epoch.
-                                        let loaded_now = crate::owner_state::load_owner_state(
-                                            &dir,
-                                            crate::identity::KeychainStore::new().ok(),
-                                        )?;
+                                        let loaded_now =
+                                            crate::owner_state::load_owner_state(&dir, boot_keychain())?;
                                         let seed = loaded_now
                                             .as_ref()
                                             .and_then(|l| l.master_seed.as_ref());
@@ -5787,22 +5793,17 @@ pub async fn start_node_inner(
                                         };
                                         keys.install(std::sync::Arc::new(new_kt));
                                         // Cert-only devices persist the enlarged
-                                        // set (epoch-0 + everything installed);
-                                        // seed-holders never read the slot.
+                                        // set; seed-holders never read the slot.
+                                        // The helper guarantees the epoch-0
+                                        // carrier key rides along even though
+                                        // the data accept set excludes it
+                                        // post-window (PR #455 round 1, Qodo
+                                        // bug 1).
                                         if seed.is_none() {
-                                            let materials: Vec<_> = keys
-                                                .accept_set()
-                                                .iter()
-                                                .map(|k| k.to_fleet_material())
-                                                .collect();
-                                            let bytes =
-                                                crate::owner_state_crypto::encode_fleet_material_set(
-                                                    &materials,
-                                                )?;
-                                            crate::owner_state::save_fleet_keytree(
-                                                &crate::identity::KeychainStore::new().ok(),
+                                            crate::fleet_key_epoch::persist_vault_material_set(
+                                                &boot_keychain(),
                                                 &dir,
-                                                &bytes,
+                                                &keys,
                                             )?;
                                         }
                                         Ok(doc.epoch)
@@ -8439,6 +8440,8 @@ pub async fn start_node_inner(
                         let window_carrier = std::sync::Arc::clone(&fleet_keys_doc);
                         let window_trust = std::sync::Arc::clone(&owner_trust_doc);
                         let window_identity_dir = identity_dir.clone();
+                        let window_keychain: crate::owner_commands::KeychainFactory =
+                            crate::owner_commands::prod_keychain;
                         let window_is_seed_holder = loaded.master_seed.is_some();
                         // ZEB-516: captured so the periodic identity (case-B)
                         // republish reads the persisted discoverable setting.
@@ -8462,6 +8465,7 @@ pub async fn start_node_inner(
                             let window_carrier = std::sync::Arc::clone(&window_carrier);
                             let window_trust = std::sync::Arc::clone(&window_trust);
                             let window_identity_dir = window_identity_dir.clone();
+                            let window_keychain = window_keychain;
                             tokio::spawn(async move {
                                 // 1. Fleet-net self-row re-stamp (fresh
                                 //    seen_at + current relay), mirroring the
@@ -8552,39 +8556,15 @@ pub async fn start_node_inner(
                                             if !window_is_seed_holder {
                                                 let dir = window_identity_dir.clone();
                                                 let keys_for_prune = window_keys.clone();
+                                                // Shared helper (PR #455 round 1):
+                                                // guarantees the epoch-0 carrier
+                                                // key survives the rewrite, via
+                                                // the injected keychain seam.
                                                 let prune = tokio::task::spawn_blocking(move || {
-                                                    let mut materials: Vec<_> = keys_for_prune
-                                                        .accept_set()
-                                                        .iter()
-                                                        .map(|k| k.to_fleet_material())
-                                                        .collect();
-                                                    if !materials.iter().any(|m| m.epoch == 0) {
-                                                        // Re-read epoch-0 from the existing slot.
-                                                        if let Ok(Some(bytes)) =
-                                                            crate::owner_state::load_fleet_keytree(
-                                                                &crate::identity::KeychainStore::new().ok(),
-                                                                &dir,
-                                                            )
-                                                        {
-                                                            if let Ok(old_set) =
-                                                                crate::owner_state_crypto::decode_fleet_material_set(&bytes)
-                                                            {
-                                                                materials.extend(
-                                                                    old_set
-                                                                        .into_iter()
-                                                                        .filter(|m| m.epoch == 0),
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                    let bytes =
-                                                        crate::owner_state_crypto::encode_fleet_material_set(
-                                                            &materials,
-                                                        )?;
-                                                    crate::owner_state::save_fleet_keytree(
-                                                        &crate::identity::KeychainStore::new().ok(),
+                                                    crate::fleet_key_epoch::persist_vault_material_set(
+                                                        &window_keychain(),
                                                         &dir,
-                                                        &bytes,
+                                                        &keys_for_prune,
                                                     )
                                                 })
                                                 .await;
@@ -56312,6 +56292,17 @@ pub(crate) async fn bump_fleet_epoch_impl(
     state: &Mutex<NodeState>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
 ) -> Result<u32, String> {
+    bump_fleet_epoch_inner(state, crate::owner_commands::prod_keychain, sink).await
+}
+
+/// ZEB-668 S5 (PR #455 round 1): keychain-injectable body — the seed load
+/// goes through the factory seam per ZEB-428, never a `KeychainStore::new()`
+/// at the use site.
+pub(crate) async fn bump_fleet_epoch_inner(
+    state: &Mutex<NodeState>,
+    keychain: crate::owner_commands::KeychainFactory,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+) -> Result<u32, String> {
     let (carrier_doc_arc, carrier_sync_arc, keys, trust_doc_arc, identity_dir) = {
         let g = state
             .lock()
@@ -56349,11 +56340,8 @@ pub(crate) async fn bump_fleet_epoch_impl(
     let carrier_snapshot = { carrier_doc_arc.lock().await.clone() };
     let current_data_epoch = keys.newest().epoch;
     let (new_doc, new_kt) = tokio::task::spawn_blocking(move || {
-        let loaded = crate::owner_state::load_owner_state(
-            &identity_dir,
-            crate::identity::KeychainStore::new().ok(),
-        )?
-        .ok_or_else(|| "no owner identity on this device".to_string())?;
+        let loaded = crate::owner_state::load_owner_state(&identity_dir, keychain())?
+            .ok_or_else(|| "no owner identity on this device".to_string())?;
         let seed = loaded.master_seed.as_ref().ok_or_else(|| {
             "notMaster: this device does not hold the master key; only the \
              device with your master key can rotate fleet keys"
