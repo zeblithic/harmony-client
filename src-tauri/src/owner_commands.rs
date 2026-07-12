@@ -703,11 +703,12 @@ pub(crate) async fn revoke_device_inner(
     // must degrade to the documented idempotent no-op, atomically with the
     // insert (CodeRabbit PR #452). The crate's insert is itself a monotonic
     // earliest-wins merge, so this guard is belt-and-suspenders.
+    let now = now_unix();
     crate::owner_trust_sync::mutate_trust_state(access, move |s| {
         if s.is_revoked(cert.target) {
             return Ok(());
         }
-        s.add_revocation(cert)
+        s.add_revocation(cert, now, trust::DEFAULT_ACTIVE_WINDOW_SECS)
     })
     .await?
     .map_err(|e| format!("revocation rejected: {e}"))?;
@@ -1865,7 +1866,9 @@ mod revoke_tests {
             RevocationReason::Lost,
         )
         .expect("revoke c");
-        state.add_revocation(cert).expect("add revocation");
+        state
+            .add_revocation(cert, 1_700_000_020, trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .expect("add revocation");
 
         let carrier = crate::fleet_key_epoch::FleetKeyEpochDoc::default();
         let now_ms = 1_700_000_100_000u64;
@@ -1968,7 +1971,7 @@ mod revoke_tests {
         assert_eq!(planned.cert.reason, RevocationReason::Lost);
         // The cert must be acceptable to the CRDT.
         let mut s2 = state.clone();
-        s2.add_revocation(planned.cert.clone())
+        s2.add_revocation(planned.cert.clone(), now, trust::DEFAULT_ACTIVE_WINDOW_SECS)
             .expect("cert verifies");
         assert!(s2.is_revoked(planned.cert.target));
     }
@@ -1993,7 +1996,8 @@ mod revoke_tests {
             harmony_owner::certs::RevocationIssuer::SelfDevice
         ));
         let mut s2 = state.clone();
-        s2.add_revocation(planned.cert).expect("self cert verifies");
+        s2.add_revocation(planned.cert, 1_700_000_100, trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .expect("self cert verifies");
     }
 
     #[test]
@@ -2308,7 +2312,9 @@ mod revoke_tests {
         .unwrap() else {
             panic!("expected a planned revocation");
         };
-        state.add_revocation(planned.cert).unwrap();
+        state
+            .add_revocation(planned.cert, now_unix(), trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         save_owner_state_atomic(dir.path(), &state, &b_sk, None, None).expect("persist identity");
         let _ = (a_sk, seed);
@@ -2375,7 +2381,9 @@ mod revoke_tests {
         else {
             panic!("expected planned");
         };
-        state.add_revocation(planned.cert).unwrap();
+        state
+            .add_revocation(planned.cert, now, trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
         let loaded = LoadedOwnerState {
             state,
             device_signing_key: a_sk,
@@ -2418,7 +2426,9 @@ mod revoke_tests {
             panic!("expected a planned revocation");
         };
         let target = planned.cert.target;
-        state.add_revocation(planned.cert).unwrap();
+        state
+            .add_revocation(planned.cert, now, trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
         let loaded = LoadedOwnerState {
             state,
             device_signing_key: a_sk,
@@ -2453,7 +2463,9 @@ mod revoke_tests {
         else {
             panic!("expected a planned revocation");
         };
-        state.add_revocation(planned.cert).unwrap();
+        state
+            .add_revocation(planned.cert, now, trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
         let second =
             plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now + 1).unwrap();
         assert!(
