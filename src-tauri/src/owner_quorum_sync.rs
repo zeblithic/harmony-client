@@ -2881,6 +2881,161 @@ mod tests {
         (doc, id)
     }
 
+    /// Like `planned_and_cosigned`, but the request BUNDLES a next-epoch carrier
+    /// doc (`current_fleet_epoch = Some`) so B's co-sign yields both detached
+    /// signatures (ZEB-677 S5).
+    fn planned_and_cosigned_bundle(f: &SweepFleet, fleet_epoch: u32) -> (QuorumReqDoc, String) {
+        let (id, req) = crate::owner_quorum_commands::plan_quorum_revocation_request(
+            &f.trust,
+            &f.a_sk,
+            false,
+            &f.c_vk_hex,
+            "lost",
+            NOW_SECS + 10,
+            NOW_MS + 10_000,
+            [0xce; 16],
+            Some(fleet_epoch),
+        )
+        .expect("plan");
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(id.clone(), req);
+        crate::owner_quorum_commands::cosign_request_core(
+            &mut doc,
+            &f.trust,
+            &f.b_sk,
+            f.b_id,
+            &id,
+            NOW_MS + 20_000,
+        )
+        .expect("cosign");
+        (doc, id)
+    }
+
+    /// A resident fleet-keys carrier (doc + engine + key set) for exercising the
+    /// sweep's quorum epoch install end to end.
+    struct CarrierRig {
+        carrier: super::QuorumSweepCarrier,
+        _dir: tempfile::TempDir,
+    }
+
+    fn carrier_rig() -> CarrierRig {
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine, MergeOutcome};
+        use crate::owner_state_crypto::KeyTree;
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let carrier_doc = Arc::new(tokio::sync::Mutex::new(
+            crate::fleet_key_epoch::FleetKeyEpochDoc::default(),
+        ));
+        let kt0 = Arc::new(KeyTree::derive(&[0x77u8; 32]).expect("kt"));
+        let fleet_keys = crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt0));
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let (c_out, mut c_drain) = mpsc::channel::<Vec<u8>>(64);
+        let (_c_in_tx, c_in) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while c_drain.recv().await.is_some() {} });
+        let carrier_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
+            keys: crate::owner_state_crypto::FleetKeySet::new(kt0),
+            device_id: "dev-a".to_string(),
+            state: Arc::clone(&carrier_doc),
+            merger: Arc::new(|_l: &mut crate::fleet_key_epoch::FleetKeyEpochDoc, _r| {
+                MergeOutcome { changed: false }
+            }),
+            replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            content_store: store,
+            publisher_tx: c_out,
+            subscriber_rx: c_in,
+            persist: Arc::new(crate::fleet_key_epoch::FleetKeyEpochPersist {
+                doc_path: dir.path().join("fleet_keys.cbor"),
+                replay_path: dir.path().join("fleet_keys_replay.cbor"),
+            }),
+            lookup_key_tag: crate::fleet_key_epoch::FLEET_KEYS_LOOKUP_TAG,
+            debounce_ms: 25,
+            publish_seen: false,
+            on_applied: None,
+            sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+        }));
+        CarrierRig {
+            carrier: super::QuorumSweepCarrier {
+                carrier_doc,
+                carrier_engine,
+                fleet_keys,
+            },
+            _dir: dir,
+        }
+    }
+
+    #[test]
+    fn bundled_revocation_assembles_quorum_signed_epoch_doc() {
+        let f = sweep_fleet();
+        let (doc, id) = planned_and_cosigned_bundle(&f, 4);
+        // B's co-signature carries BOTH detached signatures from one approval.
+        let b_hex = hex::encode(f.b_id);
+        let sigs = &doc.requests[&id].signatures[&b_hex];
+        assert!(
+            sigs.epoch_doc_sig_hex.is_some(),
+            "co-signer produced the epoch-doc part"
+        );
+
+        let assembly =
+            super::try_assemble(&f.trust, &f.a_sk, f.a_id, &doc.requests[&id]).expect("assemble");
+        assert!(assembly.cert.is_some(), "revocation cert assembled");
+        let epoch_doc = assembly.epoch_doc.expect("bundled epoch doc assembled");
+        let owner_id = f.trust.owner_id;
+        assert!(
+            epoch_doc.verify_quorum(&owner_id, NOW_SECS + 30),
+            "quorum-signed carrier verifies against its embedded signer bundle"
+        );
+        assert_eq!(epoch_doc.epoch, 5, "epoch bumped to N+1");
+        // The revoked target is excluded from the sealed set; both signers are in.
+        assert!(
+            !epoch_doc.sealed.contains_key(&hex::encode(f.c_id)),
+            "revoked target must not receive new key material"
+        );
+        assert!(epoch_doc.sealed.contains_key(&hex::encode(f.a_id)));
+        assert!(epoch_doc.sealed.contains_key(&b_hex));
+        // The initiator can open its own material at the new epoch.
+        let material =
+            crate::fleet_key_epoch::unseal_own_material(&epoch_doc, &hex::encode(f.a_id), &f.a_sk)
+                .expect("unseal own");
+        assert_eq!(material.epoch, 5);
+    }
+
+    #[tokio::test]
+    async fn sweep_with_carrier_installs_bundled_epoch_bump() {
+        let f = sweep_fleet();
+        let (doc, _id) = planned_and_cosigned_bundle(&f, 4);
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let cr = carrier_rig();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let outcome = run_quorum_sweep_with_carrier(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::clone(&events)),
+            None,
+            NOW_SECS + 30,
+            NOW_MS + 30_000,
+            Some(&cr.carrier),
+        )
+        .await;
+
+        assert_eq!(outcome.revocations_applied, 1, "revoke landed");
+        assert_eq!(outcome.epoch_bumps_installed, 1, "bundled bump installed");
+        assert!(rig.trust_doc.lock().await.is_revoked(f.c_id));
+        assert!(
+            rig.quorum_doc.lock().await.requests.is_empty(),
+            "request pruned"
+        );
+        // The carrier advanced to N+1 and the initiator publishes on the new epoch.
+        assert_eq!(cr.carrier.carrier_doc.lock().await.epoch, 5);
+        assert_eq!(cr.carrier.fleet_keys.newest().epoch, 5);
+    }
+
     #[tokio::test]
     async fn sweep_assembles_applies_prunes_and_is_idempotent() {
         let f = sweep_fleet();
