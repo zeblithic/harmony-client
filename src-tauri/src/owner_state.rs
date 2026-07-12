@@ -2164,6 +2164,10 @@ mod tests {
             "expected selfIsMaster:true, got {json}"
         );
         assert!(
+            json.contains("\"canArmEnrollment\":true"),
+            "expected canArmEnrollment:true, got {json}"
+        );
+        assert!(
             json.contains("\"quorumRemovable\":true"),
             "expected quorumRemovable:true, got {json}"
         );

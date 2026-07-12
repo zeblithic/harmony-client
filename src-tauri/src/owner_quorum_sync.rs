@@ -363,8 +363,10 @@ pub fn quorum_merger() -> Merger<QuorumReqDoc> {
 /// device reaches without an explicit tombstone. Malformed target hex
 /// (cannot ever complete) is settled too. Declined-but-unexpired requests
 /// are RETAINED (UI-dead) so the decline tombstone survives union
-/// re-merges until natural expiry. Expired enrollment arms are dropped.
-/// Returns whether anything was removed.
+/// re-merges until natural expiry. Expired enrollment arms are retained a
+/// full merge horizon past expiry (the single-use tombstone must outlive
+/// any older live arm — see the `retain` below). Returns whether anything
+/// was removed.
 pub fn prune_settled_requests(
     doc: &mut QuorumReqDoc,
     trust: &harmony_owner::state::OwnerState,
@@ -396,8 +398,15 @@ pub fn prune_settled_requests(
             }
         }
     });
+    // Expired arm cells are RETAINED for a full merge horizon past their
+    // expiry — NOT dropped at `armed_until_ms`. A disarm/consume writes a
+    // newer-Hlc but already-expired tombstone (see `stamp_arm_cell`); if we
+    // pruned it the instant it expired, an older live arm re-merging from a
+    // lagging replica would resurrect the single-use window (no tombstone
+    // left to win LWW). By `armed_until_ms + QUORUM_ARM_HORIZON_MS` any such
+    // older arm has itself expired, so resurrecting it is harmless.
     doc.enroll_arms
-        .retain(|_, arm| now_ms <= arm.armed_until_ms);
+        .retain(|_, arm| now_ms <= arm.armed_until_ms.saturating_add(QUORUM_ARM_HORIZON_MS));
     doc.requests.len() != before_reqs || doc.enroll_arms.len() != before_arms
 }
 
@@ -417,7 +426,17 @@ pub(crate) fn stamp_arm_cell(
 ) {
     let self_hex = hex::encode(self_id);
     let (wall_ms, logical) = match doc.enroll_arms.get(&self_hex).map(|a| &a.set_at) {
-        Some(prev) if prev.wall_ms >= now_ms => (prev.wall_ms, prev.logical + 1),
+        Some(prev) if prev.wall_ms >= now_ms => {
+            // Advance strictly past the prior stamp without overflowing the
+            // u32 logical counter: roll the wall clock forward one tick when
+            // it is saturated (astronomically rare, but strict monotonicity
+            // is load-bearing for the arm cell's LWW).
+            if prev.logical == u32::MAX {
+                (prev.wall_ms.saturating_add(1), 0)
+            } else {
+                (prev.wall_ms, prev.logical + 1)
+            }
+        }
         _ => (now_ms, 0),
     };
     doc.enroll_arms.insert(
@@ -1397,6 +1416,68 @@ mod tests {
     }
 
     #[test]
+    fn stamp_arm_cell_advances_past_saturated_logical() {
+        let mut doc = QuorumReqDoc::default();
+        let me = [0x11u8; 16];
+        let me_hex = hex::encode(me);
+        // Prime a cell already at the logical ceiling.
+        doc.enroll_arms.insert(
+            me_hex.clone(),
+            EnrollArm {
+                set_at: Hlc {
+                    wall_ms: NOW_MS,
+                    logical: u32::MAX,
+                    device_id: me_hex.clone(),
+                },
+                armed_until_ms: NOW_MS + ARM_WINDOW_MS,
+            },
+        );
+        // A same-millisecond restamp must still be strictly newer (no u32
+        // overflow panic / wrap) by rolling the wall clock forward a tick.
+        let prev = doc.enroll_arms.get(&me_hex).unwrap().set_at.clone();
+        stamp_arm_cell(&mut doc, me, NOW_MS - 1, NOW_MS);
+        let next = doc.enroll_arms.get(&me_hex).unwrap().set_at.clone();
+        assert!(next.is_strictly_newer_than(&prev));
+        assert_eq!((next.wall_ms, next.logical), (NOW_MS + 1, 0));
+    }
+
+    #[test]
+    fn consumed_arm_tombstone_survives_older_arm_remerge() {
+        let me = [0x11u8; 16];
+        let me_hex = hex::encode(me);
+        let arm_ms = NOW_MS;
+        // Replica X: armed.
+        let mut x = QuorumReqDoc::default();
+        stamp_arm_cell(&mut x, me, arm_ms + ARM_WINDOW_MS, arm_ms);
+        let old_arm = x.clone();
+
+        // Replica Y: same arm, then consumed (fresh-Hlc expired tombstone).
+        let mut y = old_arm.clone();
+        stamp_arm_cell(&mut y, me, arm_ms - 1, arm_ms); // consume
+
+        // Y's sweep runs shortly after: the tombstone is RETAINED (within the
+        // merge horizon), NOT pruned — otherwise the next step resurrects it.
+        let trust = OwnerState::default();
+        prune_settled_requests(&mut y, &trust, arm_ms + 1);
+        assert!(
+            y.enroll_arms
+                .get(&me_hex)
+                .is_some_and(|a| a.armed_until_ms <= arm_ms),
+            "consumed tombstone must survive the immediate post-consume sweep"
+        );
+
+        // The older, still-live arm from X re-merges into Y. LWW must keep Y's
+        // newer tombstone — the single-use window does NOT come back.
+        merge_quorum_remote_into_local(&mut y, old_arm);
+        assert!(
+            y.enroll_arms
+                .get(&me_hex)
+                .is_some_and(|a| a.armed_until_ms <= arm_ms),
+            "an older live arm must not resurrect a consumed single-use window"
+        );
+    }
+
+    #[test]
     fn enrollment_request_kind_round_trips_in_doc() {
         let mut doc = QuorumReqDoc::default();
         doc.requests.insert(
@@ -1668,12 +1749,14 @@ mod tests {
             "dd".repeat(16),
             test_request(&"11".repeat(16), "zz-not-hex"),
         );
-        // Expired arm dropped; live arm kept.
+        // Arm expired PAST the merge horizon is dropped; live arm kept. (A
+        // recently-expired tombstone within the horizon is retained — see
+        // `consumed_arm_tombstone_survives_older_arm_remerge`.)
         doc.enroll_arms.insert(
             "11".repeat(16),
             EnrollArm {
                 set_at: hlc(1, "a"),
-                armed_until_ms: NOW_MS - 1,
+                armed_until_ms: NOW_MS - QUORUM_ARM_HORIZON_MS - 1,
             },
         );
         doc.enroll_arms.insert(

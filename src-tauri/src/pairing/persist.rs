@@ -172,7 +172,10 @@ pub fn install_inviter_state_inner(
         identity_dir,
         &loaded.state,
         &loaded.device_signing_key,    // the EXISTING signing key
-        result.master_seed.as_deref(), // Some: seed-holder keeps master; None: seedless quorum inviter stays cert-only
+        loaded.master_seed.as_deref(), // FRESHEST on-disk seed posture (reloaded
+        // under the write lock) — NOT the SM's pairing-start `result.master_seed`,
+        // so a concurrent recovery (adds a seed) or removal (clears one) is not
+        // silently undone by this enrollment save.
         save_keychain,
     )?;
     Ok(())

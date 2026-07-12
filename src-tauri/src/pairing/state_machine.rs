@@ -906,14 +906,31 @@ async fn maybe_advance_to_enroll(
         let session_id = ctx.session_id;
         let done_tx = quorum_done_tx.clone();
         tokio::spawn(async move {
-            let outcome: Result<EnrollmentCert, String> = async {
+            // Hard outer bound at the SM boundary: the co-sign wait is already
+            // 120s-bounded, but `open_enrollment_request` (write + flush) is
+            // not — a stalled port must never wedge the ceremony past this
+            // ceiling. A small grace over QUORUM_COSIGN_TIMEOUT lets the inner
+            // wait hit its own timeout (which abandons the request) first.
+            let ceremony = async {
                 let request_id = port
                     .open_enrollment_request(joiner_id, joiner_pubkey, now)
                     .await?;
                 port.await_cosign_and_assemble(request_id, QUORUM_COSIGN_TIMEOUT)
                     .await
-            }
-            .await;
+            };
+            let outcome: Result<EnrollmentCert, String> = match tokio::time::timeout(
+                QUORUM_COSIGN_TIMEOUT + std::time::Duration::from_secs(5),
+                ceremony,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(
+                    "cosignTimeout: the co-sign ceremony did not complete in time \
+                               — re-arm and retry"
+                        .to_string(),
+                ),
+            };
             let _ = done_tx.send((session_id, now, outcome)).await;
         });
     } else {
@@ -1054,6 +1071,17 @@ async fn finish_quorum_enroll(
         return;
     };
     let joiner_pubkey = PubKeyBundle::classical_only(joiner_ed25519_verify);
+
+    // Bind the assembled cert to THIS pairing's joiner before we publish or
+    // persist it. The port assembles by request-id, but a stale/cross-request
+    // cert for another device would still pass `add_enrollment` — refuse to
+    // enroll anyone but the device the user is actually pairing with.
+    if cert.device_id != joiner_pubkey.identity_hash() {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: "quorum cert does not match the joining device — aborting enroll".to_string(),
+        });
+        return;
+    }
 
     let fleet_hex = match ctx.fleet_keytree.as_ref() {
         Some(materials) => match build_fleet_handover_hex(

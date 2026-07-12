@@ -79,6 +79,21 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
         if !is_master {
             return Err("master seed not on this device — cannot enroll".to_string());
         }
+        // Fail fast if we cannot hand off the fleet keys: the seedless inviter
+        // ships its RESIDENT epoch-0 material (it has no seed to derive from).
+        // Validating here — before pairing starts — avoids opening a ceremony
+        // that would only fail AFTER a sibling burns its single-use arm on the
+        // co-sign (the handover runs post-assembly in `finish_quorum_enroll`).
+        let has_epoch0 = loaded
+            .fleet_keytree
+            .as_ref()
+            .is_some_and(|ms| ms.iter().any(|m| m.epoch == 0));
+        if !has_epoch0 {
+            return Err(
+                "no resident fleet keys to hand off — cannot quorum-enroll from this device"
+                    .to_string(),
+            );
+        }
         // Build the live co-sign port from the resident quorum + trust docs and
         // the quorum engine. All three are present only once the node is
         // running; without them there is no sibling to reach.

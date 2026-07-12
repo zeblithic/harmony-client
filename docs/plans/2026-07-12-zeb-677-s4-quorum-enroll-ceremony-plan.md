@@ -4,7 +4,7 @@
 
 **Goal:** An owner without their master seed can enroll a NEW device when K=2 active sibling devices (holding Master-issued certs) participate: one sibling pre-arms a 15-minute window, another runs normal SAS pairing as the inviter, and the armed sibling auto-co-signs the quorum enrollment cert — completing the lost-master enrollment story.
 
-**Architecture:** The `owner-quorum-req-v1` FleetSync dataset (S3) already carries the `EnrollArm` cell (storage/merge/expiry done) and the `QuorumRequest` CRDT. S4 adds: (1) `arm`/`disarm` IPCs that write the arm cell; (2) a `QuorumRequestKind::Enrollment` variant; (3) a **B-side auto-co-sign pass** in the sweep (react to an enrollment request while holding a live arm → sign + mint a `VouchingCert{Vouch}` + consume the arm); (4) a narrow **`QuorumEnrollPort`** async trait the pairing SM depends on, whose real impl writes the request and awaits B's co-sign (via an `Arc<Notify>` fired on merge) then assembles the cert; (5) a new bounded pairing-SM state **`AwaitingQuorumCosign`** (120s) at the inviter signing decision point; (6) **joiner-side auto-vouches** minted after ENROLL receipt; (7) a **DevicesPanel arm surface** with countdown + honesty copy.
+**Architecture:** The `owner-quorum-req-v1` FleetSync dataset (S3) already carries the `EnrollArm` cell (storage/merge/expiry done) and the `QuorumRequest` CRDT. S4 adds: (1) `arm`/`disarm` IPCs that write the arm cell; (2) a `QuorumRequestKind::Enrollment` variant; (3) a **B-side auto-co-sign pass** in the sweep (react to an enrollment request while holding a live arm → sign + mint a `VouchingCert{Vouch}` + consume the arm); (4) a narrow **`QuorumEnrollPort`** async trait the pairing SM depends on, whose real impl writes the request and awaits B's co-sign (**bounded polling of the quorum doc** — see the revision note below; the planned `Arc<Notify>` was dropped) then assembles the cert; (5) a new bounded pairing-SM state **`AwaitingQuorumCosign`** (120s) at the inviter signing decision point; (6) **joiner-side auto-vouches** minted after ENROLL receipt; (7) a **DevicesPanel arm surface** with countdown + honesty copy.
 
 **Tech Stack:** Rust (Tauri IPC + tokio + `harmony-owner` crate rev `1ecb4160`), FleetSyncEngine CRDT sync over Zenoh/iroh, Svelte 5 + vitest frontend.
 
@@ -372,7 +372,7 @@ async fn b_auto_cosigns_enrollment_when_armed() {
   Consumed by Task 5 (the SM holds `Arc<dyn QuorumEnrollPort>`).
 - Consumes: crate `EnrollmentCert::{sign_quorum_part, assemble_quorum}`; the `Arc<Notify>` fired on each quorum `on_applied`.
 
-**Apply-signal:** add an `Arc<tokio::sync::Notify>` fired in the quorum `on_applied` hook (alongside the existing nudge). `LiveQuorumEnrollPort` holds a clone; `await_cosign_and_assemble` loops `tokio::select! { _ = notify.notified() => .., _ = sleep(remaining) => timeout }`, re-checking `signatures` count each wake. The sweep task and the port both observe the same signal — no polling.
+**Apply-signal (SUPERSEDED — see revision note):** the plan called for an `Arc<tokio::sync::Notify>` fired in the quorum `on_applied` hook. The implementation instead uses **bounded 150 ms polling** of the quorum doc in `await_cosign_and_assemble` (re-snapshotting trust each poll so a mid-ceremony revoked cosigner is rejected), bounded by the 120 s deadline. This kept the port fully self-contained — no `on_applied`/`NodeState` surgery — at the cost of a sub-second poll during a ceremony that resolves in seconds.
 
 - [ ] **Step 1: Add the `Notify` to the wiring.** In `lib.rs` where the quorum `on_applied` is set (`~:5701`) and the applied task is spawned (`~:5727`), construct `let quorum_applied_notify = Arc::new(tokio::sync::Notify::new());`. In the `on_applied` closure (or in the applied task after each sweep), call `quorum_applied_notify.notify_waiters();`. Store a clone in `NodeState` (or pass to `pairing_commands`) so the port can be built. Verify the exact `on_applied`/`ingest_nudge_on_applied` closure shape at implementation.
 
@@ -521,8 +521,24 @@ async fn port_times_out_without_cosign() {
 ## Open risks resolved (for the reviewer)
 
 1. **SM↔quorum coupling** → narrow `QuorumEnrollPort` trait; SM stays transport+port testable; real impl in `owner_quorum_enroll.rs`.
-2. **Awaiting B's co-sign** → `Arc<Notify>` fired on quorum `on_applied`; port awaits it, no polling.
+2. **Awaiting B's co-sign** → **implemented as bounded 150 ms polling** of the quorum doc (trust re-snapshotted each poll), bounded by the 120 s SM deadline. (The planned `Arc<Notify>` on `on_applied` was dropped to keep the port self-contained — no `NodeState` surgery.)
 3. **`start_inviter` seedless** → branch in `pairing_commands.rs`; genuinely-stuck fleets keep the existing error string.
 4. **New enum variant breaks irrefutable-lets** → Task 1 converts all 3 (+1 view site); clippy `--all-targets` backstops.
 5. **Single-use arm race** → disarm/consume write a fresh-Hlc already-expired cell (never delete); monotonic Hlc wins LWW, defeating resurrection; honors the §8 single-use commitment.
 6. **Countdown honesty** → countdown DISPLAYS remaining from the backend `quorumArmedUntilMs`; backend cell is the authority; `owner-quorum-updated` is the refresh signal.
+
+---
+
+## Round-1 review revisions (post-implementation, PR #460)
+
+Code is authoritative; this records the deltas from the plan above.
+
+- **Co-sign wait = polling, not `Arc<Notify>`** (CodeRabbit): `await_cosign_and_assemble` polls the quorum doc every 150 ms (bounded by the 120 s deadline), **re-snapshotting trust each poll** so a cosigner revoked mid-ceremony is rejected. No `on_applied`/`NodeState` signal wiring.
+- **Single-use tombstone survives the merge horizon** (CodeRabbit 🔴 Critical): `prune_settled_requests` retains an expired arm cell until `armed_until_ms + QUORUM_ARM_HORIZON_MS`, not at expiry — otherwise an older live arm re-merging from a lagging replica resurrects the consumed window.
+- **`stamp_arm_cell` logical-counter overflow** (Qodo 🐞): rolls `wall_ms` forward a tick when `logical` hits `u32::MAX` instead of `+1` (panic/wrap), preserving strict monotonicity.
+- **Arm IPC eligibility gate** (CodeRabbit): `arm_quorum_enrollment` rejects a non-Master-certed / revoked device at the boundary (a direct RPC caller bypasses the UI's `canArmEnrollment`).
+- **Abandon the request on timeout** (CodeRabbit): the port removes its request on co-sign timeout so a delayed sibling doesn't burn its single-use arm on a ceremony the inviter gave up on; the SM spawn adds a hard outer bound over the unbounded `open`.
+- **Bind the cert to the joiner** (CodeRabbit): `finish_quorum_enroll` refuses a cert whose `device_id` ≠ the pairing joiner before publish/persist.
+- **Validate resident fleet material up front** (CodeRabbit): `pairing_commands` fails fast if the seedless inviter has no epoch-0 material, before a sibling co-signs.
+- **Persist the freshest seed posture** (CodeRabbit): the inviter enrollment save uses `loaded.master_seed` (reloaded under the write lock), not the pairing-start `result.master_seed`, so a concurrent recovery/removal isn't undone.
+- **Serde pin** (CodeRabbit): the `OwnerStateView` test asserts `"canArmEnrollment":true`.

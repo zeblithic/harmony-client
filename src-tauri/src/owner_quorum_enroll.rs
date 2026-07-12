@@ -113,11 +113,14 @@ impl QuorumEnrollPort for LiveQuorumEnrollPort {
         request_id: String,
         timeout: Duration,
     ) -> Result<EnrollmentCert, String> {
-        // Signer certs are stable across the ceremony, so snapshot trust
-        // once and poll only the quorum doc (no held-both-locks hazard).
-        let trust_snapshot = self.trust_doc.lock().await.clone();
         let start = std::time::Instant::now();
         loop {
+            // Re-snapshot trust EACH poll: a cosigner revoked mid-ceremony
+            // must be rejected when its co-signature merges in, so
+            // `try_assemble_enrollment`'s `is_revoked` check sees current
+            // state, not a stale pre-loop snapshot. (Clone-then-release, so
+            // the trust and quorum locks are never held together.)
+            let trust_snapshot = self.trust_doc.lock().await.clone();
             let outcome = {
                 let doc = self.quorum_doc.lock().await;
                 if !doc.requests.contains_key(&request_id) {
@@ -140,18 +143,15 @@ impl QuorumEnrollPort for LiveQuorumEnrollPort {
                     )
                 }
                 Some(Some(cert)) => {
-                    {
-                        let mut doc = self.quorum_doc.lock().await;
-                        doc.requests.remove(&request_id);
-                    }
-                    self.quorum_engine.notify_dirty();
-                    if let Err(e) = self.quorum_engine.flush_now().await {
-                        tracing::warn!(error = %e, "await_cosign: quorum flush failed; dirty latch will retry");
-                    }
+                    self.remove_request(&request_id).await;
                     return Ok(cert);
                 }
                 Some(None) => {
                     if start.elapsed() >= timeout {
+                        // Abandon the request so a delayed sibling does not
+                        // later co-sign + vouch + burn its single-use arm on a
+                        // ceremony the inviter has already given up on.
+                        self.remove_request(&request_id).await;
                         return Err(
                             "cosignTimeout: your other device didn't co-sign in time — re-arm \
                              and retry"
@@ -161,6 +161,22 @@ impl QuorumEnrollPort for LiveQuorumEnrollPort {
                     tokio::time::sleep(COSIGN_POLL_INTERVAL).await;
                 }
             }
+        }
+    }
+}
+
+impl LiveQuorumEnrollPort {
+    /// Drop a request from the resident quorum doc and publish the removal
+    /// (best-effort flush — the dirty latch retries). Used on both success
+    /// (the cert is assembled) and timeout (the ceremony is abandoned).
+    async fn remove_request(&self, request_id: &str) {
+        {
+            let mut doc = self.quorum_doc.lock().await;
+            doc.requests.remove(request_id);
+        }
+        self.quorum_engine.notify_dirty();
+        if let Err(e) = self.quorum_engine.flush_now().await {
+            tracing::warn!(error = %e, "quorum enroll: request-removal flush failed; dirty latch will retry");
         }
     }
 }

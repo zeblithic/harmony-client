@@ -521,7 +521,7 @@ pub(crate) async fn arm_quorum_enrollment_inner(
     keychain: KeychainFactory,
     emit: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<u64, String> {
-    let (doc, engine, _trust_doc, dir) = snapshot_handles(state)?;
+    let (doc, engine, trust_doc, dir) = snapshot_handles(state)?;
     let loaded = load_keys(dir, keychain).await?;
     if loaded.master_seed.is_some() {
         return Err(
@@ -530,6 +530,24 @@ pub(crate) async fn arm_quorum_enrollment_inner(
         );
     }
     let self_id = crate::owner_state::device_id_from_signing_key(&loaded.device_signing_key);
+    // Depth-1: a device that is not an active Master-certed member can never
+    // be a quorum signer, so its arm would be dead weight (the sweep and the
+    // enrollment planner both skip it). Reject at the IPC boundary — the UI
+    // gates this via `canArmEnrollment`, but a direct RPC caller does not.
+    {
+        let trust = trust_doc.lock().await;
+        let eligible = trust
+            .enrollments
+            .get(&self_id)
+            .is_some_and(is_master_issued)
+            && !trust.is_revoked(self_id);
+        if !eligible {
+            return Err(
+                "notEligible: this device does not hold an active Master-issued certificate"
+                    .to_string(),
+            );
+        }
+    }
     let now_ms = now_unix_ms();
     let armed_until = now_ms.saturating_add(crate::owner_quorum_sync::ARM_WINDOW_MS);
     write_arm_cell(&doc, &engine, self_id, armed_until, now_ms).await;
