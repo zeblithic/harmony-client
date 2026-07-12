@@ -114,6 +114,19 @@ pub enum QuorumRequestKind {
         #[serde(rename = "t")]
         target_hex: String,
     },
+    /// S4 enrollment ceremony: the initiator asks its armed sibling to
+    /// co-sign a quorum enrollment cert for a newly-paired device. The
+    /// joiner's device id + pubkey bundle are fixed in the payload the
+    /// signers cover (`enrollment_quorum_payload`).
+    #[serde(rename = "n")]
+    Enrollment {
+        /// Hex of the joiner's 16-byte device id.
+        #[serde(rename = "j")]
+        joiner_device_id_hex: String,
+        /// CBOR-hex of the joiner's `PubKeyBundle` (the enrolled key set).
+        #[serde(rename = "b")]
+        joiner_pubkeys_cbor_hex: String,
+    },
 }
 
 /// One device's detached signatures over a request's constituent payloads.
@@ -361,7 +374,12 @@ pub fn prune_settled_requests(
         if now_ms > req.expires_at_ms {
             return false;
         }
-        let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind;
+        // Enrollment requests have no convergent completion signal in the
+        // trust doc (the cert lands via the A-side pairing flow, not the
+        // sweep), so keep them until TTL expiry (handled above).
+        let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind else {
+            return true;
+        };
         match parse_device_id_hex(target_hex) {
             Ok(target) => {
                 if trust.is_revoked(target) {
@@ -430,7 +448,11 @@ pub fn verified_decliners(
     request_id_hex: &str,
     req: &QuorumRequest,
 ) -> std::collections::BTreeSet<String> {
-    let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind;
+    // Enrollment requests carry no decline flow (an armed sibling auto-
+    // co-signs; there is no veto surface), so no declines ever count.
+    let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind else {
+        return std::collections::BTreeSet::new();
+    };
     let payload = decline_signing_payload(trust.owner_id, request_id_hex);
     req.declined_by
         .iter()
@@ -597,7 +619,11 @@ fn try_assemble(
     self_id: [u8; 16],
     req: &QuorumRequest,
 ) -> Option<RevocationCert> {
-    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind;
+    // Revocation completion only: enrollment certs are assembled A-side by
+    // the pairing ceremony (owner_quorum_enroll), never by this sweep.
+    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind else {
+        return None;
+    };
     let target = parse_device_id_hex(target_hex).ok()?;
     let reason = crate::owner_commands::parse_revoke_reason(reason).ok()?;
     for (cosigner_hex, sigs) in &req.signatures {
@@ -899,6 +925,35 @@ mod tests {
             epoch_doc_sig_hex: None,
             primary_sig_hex: sig.to_string(),
         }
+    }
+
+    #[test]
+    fn enrollment_request_kind_round_trips_in_doc() {
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(
+            "ab".repeat(8),
+            QuorumRequest {
+                created_at: hlc(NOW_MS, "aa"),
+                declined_by: BTreeMap::new(),
+                initiator_hex: "aa".repeat(8),
+                kind: QuorumRequestKind::Enrollment {
+                    joiner_device_id_hex: "cc".repeat(8),
+                    joiner_pubkeys_cbor_hex: "dd".repeat(4),
+                },
+                initiator_sigs: BTreeMap::new(),
+                signatures: BTreeMap::new(),
+                issued_at: NOW_SECS,
+                expires_at_ms: FAR_FUTURE_MS,
+            },
+        );
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&doc).expect("encode");
+        let back: QuorumReqDoc =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(doc, back);
+        assert!(matches!(
+            back.requests.values().next().map(|r| &r.kind),
+            Some(QuorumRequestKind::Enrollment { .. })
+        ));
     }
 
     fn test_mint(now: u64) -> (OwnerState, RecoveryArtifact) {

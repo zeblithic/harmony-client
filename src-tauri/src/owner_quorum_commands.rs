@@ -182,7 +182,14 @@ pub(crate) fn cosign_request_core(
         .requests
         .get_mut(request_id)
         .ok_or_else(|| "unknownRequest: no pending request with that id".to_string())?;
-    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind;
+    // Enrollment requests are co-signed automatically by an armed sibling
+    // (the sweep), never through this manual IPC.
+    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind else {
+        return Err(
+            "notRevocation: enrollment requests are co-signed automatically by an armed device"
+                .to_string(),
+        );
+    };
     if now_ms > req.expires_at_ms {
         return Err(
             "expired: this request has expired — ask the other device to retry".to_string(),
@@ -394,12 +401,19 @@ pub(crate) async fn request_quorum_revocation_inner(
         // One live request per target: a duplicate would double the banner
         // on every sibling and complete idempotently anyway. A request
         // dead under a VERIFIED decline doesn't block a retry.
-        let QuorumRequestKind::Revocation { target_hex, .. } = &request.kind;
+        let QuorumRequestKind::Revocation { target_hex, .. } = &request.kind else {
+            return Err("internal: request_quorum_revocation must build a revocation".to_string());
+        };
         let duplicate = g.requests.iter().any(|(rid, r)| {
+            // Only another live revocation for the same target is a duplicate;
+            // enrollment requests never collide with a revocation target.
             let QuorumRequestKind::Revocation {
                 target_hex: existing,
                 ..
-            } = &r.kind;
+            } = &r.kind
+            else {
+                return false;
+            };
             existing == target_hex
                 && now_ms <= r.expires_at_ms
                 && crate::owner_quorum_sync::verified_decliners(&trust_snapshot, rid, r).is_empty()

@@ -445,9 +445,14 @@ fn build_owner_state_view(
         .requests
         .iter()
         .filter(|(_, r)| quorum.now_ms <= r.expires_at_ms)
-        .map(|(id, r)| {
+        .filter_map(|(id, r)| {
+            // Only revocation requests surface as manual co-sign banners;
+            // enrollment requests are auto-co-signed by an armed sibling.
             let crate::owner_quorum_sync::QuorumRequestKind::Revocation { reason, target_hex } =
-                &r.kind;
+                &r.kind
+            else {
+                return None;
+            };
             let initiated_by_me = r.initiator_hex == this_device_hex;
             let signed_by_me = r.signatures.contains_key(&this_device_hex);
             // Only VERIFIED declines surface (an unverifiable entry is
@@ -459,7 +464,7 @@ fn build_owner_state_view(
             let target_revoked = crate::owner_quorum_sync::parse_device_id_hex(target_hex)
                 .map(|t| loaded.state.is_revoked(t))
                 .unwrap_or(true);
-            crate::owner_state::QuorumRequestView {
+            Some(crate::owner_state::QuorumRequestView {
                 request_id: id.clone(),
                 kind: "revocation".to_string(),
                 target_device_id: target_hex.clone(),
@@ -478,7 +483,7 @@ fn build_owner_state_view(
                     && !target_revoked
                     && self_master_certed
                     && r.initiator_sigs.contains_key(&this_device_hex),
-            }
+            })
         })
         .collect();
     let quorum_armed_until_ms = quorum
