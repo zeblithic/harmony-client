@@ -50500,8 +50500,8 @@ pub async fn connectivity_link_friend_iroh_inner(
 ) -> Result<FriendLinkOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
-        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
+        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest,
+        FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -50514,10 +50514,12 @@ pub async fn connectivity_link_friend_iroh_inner(
     //     recover the inviter's enrolled device-#2 key.
     let inviter_device_key = verify_enrolled_device(
         &payload.inviter_enrollment,
+        &payload.inviter_signer_certs,
         payload.inviter_addr,
         crate::iroh_friend_acceptor::wall_now_secs(),
     )
-    .map_err(|e| format!("verify inviter enrollment: {e}"))?;
+    .map_err(|e| format!("verify inviter enrollment: {e}"))?
+    .device_ed25519;
 
     // 1b. Verify the friend token's device-#2 signature against that key (the
     //     token is `InviteToken`-shaped, minted by `mint_friend_token`).
@@ -50671,6 +50673,9 @@ pub async fn connectivity_link_friend_iroh_inner(
         token_sig: Some(payload.token.sig),
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
+        // ZEB-677: bundle threading for a quorum-certed self lands with the
+        // ceremony slices (S4); every self-cert today is Master-issued.
+        signer_certs: Vec::new(),
         sig: req_sig,
         sender_devices: req_bundle.sender_devices,
         device_identity_pubs: req_bundle.device_identity_pubs,
@@ -50785,18 +50790,19 @@ pub async fn connectivity_link_friend_iroh_inner(
 
     // 7. Verify the accept: it must be from the inviter (cert binds
     //    payload.inviter_addr) and signed over the accept preimage.
-    let accept_device_key =
+    let accept_verified =
         // ZEB-378: sample a FRESH clock here — this verify runs after pkarr
         // resolution + the iroh handshake (seconds of I/O), so the `now_ms`
         // captured early for token/pkarr checks would be stale at verification time.
         verify_enrolled_device(
             &accepted.enrollment,
+            &accepted.signer_certs,
             payload.inviter_addr,
             crate::iroh_friend_acceptor::wall_now_secs(),
         )
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
-    let accept_vk =
-        VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    let accept_vk = VerifyingKey::from_bytes(&accept_verified.device_ed25519)
+        .map_err(|_| "accept device key invalid")?;
     // ZEB-461/473: bind the accepter's contact digest (device bundle +
     // reachability + PQ keys, all carried in the accept) into the verified
     // accept preimage.
@@ -50820,10 +50826,10 @@ pub async fn connectivity_link_friend_iroh_inner(
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
 
-    // 8. Extract the inviter's master key (their friend-graph anchor) + apply
-    //    them as an Active/Token friend to local owner-state.
-    let master_ed25519 = master_ed25519_from_cert(&accepted.enrollment)
-        .map_err(|e| format!("extract inviter master key: {e}"))?;
+    // 8. The inviter's master key (their friend-graph anchor) came from the
+    //    chokepoint verification in step 7; apply them as an Active/Token
+    //    friend to local owner-state.
+    let master_ed25519 = accept_verified.master_ed25519;
     let display = accepted.display.clone().or(payload.display_hint.clone());
 
     let wall_now_ms = std::time::SystemTime::now()
@@ -53578,8 +53584,8 @@ pub async fn connectivity_add_friend_by_key_inner(
 ) -> Result<AddFriendOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
-        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
+        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest,
+        FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -53791,6 +53797,8 @@ pub async fn connectivity_add_friend_by_key_inner(
         token_sig: None,
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
+        // ZEB-677: see the token-path build — threading lands with S4.
+        signer_certs: Vec::new(),
         sig: req_sig,
         sender_devices: req_bundle.sender_devices,
         device_identity_pubs: req_bundle.device_identity_pubs,
@@ -53905,17 +53913,18 @@ pub async fn connectivity_add_friend_by_key_inner(
     //    the token-LESS accept preimage. A garbage/forged reply errors here —
     //    never writes a friend.
     let target_addr_master = accepted.from_addr;
-    let accept_device_key =
+    let accept_verified =
         // ZEB-378: fresh clock — this verify runs after pkarr resolution + the iroh
         // handshake, so the early-captured `now_ms` would be stale at verify time.
         verify_enrolled_device(
             &accepted.enrollment,
+            &accepted.signer_certs,
             target_addr_master,
             crate::iroh_friend_acceptor::wall_now_secs(),
         )
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
-    let accept_vk =
-        VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    let accept_vk = VerifyingKey::from_bytes(&accept_verified.device_ed25519)
+        .map_err(|_| "accept device key invalid")?;
     // ZEB-461/473: bind the accepter's contact digest (device bundle +
     // reachability + PQ keys) into the verified preimage.
     let accept_devices_digest = crate::iroh_friend_acceptor::contact_digest(
@@ -53938,10 +53947,10 @@ pub async fn connectivity_add_friend_by_key_inner(
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
 
-    // 9. Extract the target's master key + apply them as an Active/MutualKey
-    //    friend (keyed on their authenticated master owner_id).
-    let master_ed25519 = master_ed25519_from_cert(&accepted.enrollment)
-        .map_err(|e| format!("extract target master key: {e}"))?;
+    // 9. The target's master key came from the chokepoint verification in
+    //    step 8; apply them as an Active/MutualKey friend (keyed on their
+    //    authenticated master owner_id).
+    let master_ed25519 = accept_verified.master_ed25519;
     let display = accepted.display.clone();
 
     let wall_now_ms = std::time::SystemTime::now()

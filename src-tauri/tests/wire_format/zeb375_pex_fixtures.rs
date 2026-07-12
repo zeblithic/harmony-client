@@ -78,6 +78,7 @@ fn fixture_referral_catalog() -> ReferralCatalog {
         entries: vec![fixture_referral_entry()],
         at: hlc(7),
         enrollment: mint_test_owner(CERT_OWNER_SEED).cert,
+        signer_certs: Vec::new(),
         sig: [0x09; 64],
     }
 }
@@ -88,6 +89,7 @@ fn fixture_catalog_request() -> CatalogRequest {
         from_addr: OwnerAddr([0x21; 16]),
         to_addr: OwnerAddr([0x42; 16]),
         enrollment: mint_test_owner(CERT_OWNER_SEED).cert,
+        signer_certs: Vec::new(),
         sig: [0x09; 64],
     }
 }

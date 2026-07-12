@@ -246,6 +246,7 @@ fn friend_token_payload_canonical_cbor() {
     let payload = FriendTokenPayload {
         inviter_addr: owner.owner,
         display_hint: Some("bob".into()),
+        inviter_signer_certs: Vec::new(),
         token: InviteToken {
             inviter: owner.owner,
             invitee_hint: None,
@@ -291,6 +292,7 @@ fn friend_link_request_cbor() {
         token_sig: Some([0x07; 64]),
         eph_x25519_pub: [0x55; 32],
         enrollment: owner.cert,
+        signer_certs: Vec::new(),
         sig: [0x09; 64],
         // ZEB-461: new bundle/reachability/PQ fields. Pinned to EMPTY defaults
         // here so the fixture stays a deterministic known-good payload; the new
@@ -337,6 +339,7 @@ fn friend_link_accepted_cbor() {
         display: Some("bob".into()),
         eph_x25519_pub: [0x55; 32],
         enrollment: owner.cert,
+        signer_certs: Vec::new(),
         sig: [0x0b; 64],
         // ZEB-461: empty bundle/reachability/PQ defaults (see request fixture).
         sender_devices: vec![],
@@ -399,6 +402,7 @@ fn friend_link_response_accepted_cbor() {
         display: Some("bob".into()),
         eph_x25519_pub: [0x55; 32],
         enrollment: owner.cert,
+        signer_certs: Vec::new(),
         sig: [0x0b; 64],
         // ZEB-461: empty bundle/reachability/PQ defaults (see request fixture).
         sender_devices: vec![],

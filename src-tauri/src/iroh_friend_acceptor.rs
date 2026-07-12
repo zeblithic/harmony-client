@@ -6,18 +6,17 @@
 //!
 //! A friend link is authenticated by the requester's **device-#2 Ed25519
 //! signature** plus their **`EnrollmentCert`** (the ZEB-339 model), applied
-//! point-to-point (no `SignedMembershipEvent` wrapper). The verifier:
-//!   1. runs `cert.verify()` (master→device chain + `owner_id` binding),
-//!   2. requires `cert.issuer == Master` (Quorum certs can't be fully verified
-//!      here — mirrors `community_membership::enrolled_key_from_cert`),
-//!   3. checks `cert.owner_id == claimed owner_id`, and
-//!   4. returns `cert.device_pubkeys.classical.ed25519_verify` (the device key
-//!      the handshake signature is verified against).
+//! point-to-point (no `SignedMembershipEvent` wrapper). Verification routes
+//! through the [`crate::enrollment_verify`] chokepoint (ZEB-677): Master certs
+//! verify self-contained; Quorum certs verify against the Master-issued
+//! signer-cert bundle the peer presents (`signer_certs` wire field, depth-1
+//! chain carriage). The cert's `owner_id` is bound to the claimed owner, and
+//! the enrolled device key is what the handshake signature is verified
+//! against. This is [`verify_enrolled_device`].
 //!
-//! This 4-step core is [`verify_enrolled_device`].
-//!
-//! Friends are keyed on the master `owner_id`; a friend's `master_ed25519` is
-//! extracted from their cert's `EnrollmentIssuer::Master { master_pubkey }`.
+//! Friends are keyed on the master `owner_id`; a friend's `master_ed25519`
+//! anchor comes from the cert's `Master` issuer — or, for Quorum-issued
+//! certs, from the verified signer certs (which all carry the same master).
 //!
 //! ## Wire protocol
 //!
@@ -33,7 +32,7 @@
 use crate::owner_state_types::{
     deserialize_bytes_from_bstr, serialize_bytes_as_bstr, DeviceIdentityHash, OwnerAddr,
 };
-use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
+use harmony_owner::certs::EnrollmentCert;
 use serde::{Deserialize, Serialize};
 
 /// Serde for `Option<[u8; 64]>` as an optional CBOR bstr (None → CBOR null /
@@ -357,6 +356,12 @@ pub struct FriendLinkRequest {
     /// `pq_dsa_pubkey`. Encoded as a CBOR bstr.
     #[serde(rename = "k", default, with = "serde_bytes")]
     pub pq_kem_pubkey: Vec<u8>,
+    /// ZEB-677: Master-issued signer certs backing a Quorum-issued
+    /// `enrollment`. Empty for Master-issued certs (the key is omitted on
+    /// the wire; old peers ignore it and keep rejecting quorum certs).
+    /// Not signature-bound — each cert is independently self-authenticating.
+    #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
+    pub signer_certs: Vec<EnrollmentCert>,
 }
 
 /// The acceptor's reply: "accepted; here is my own proof so you can add me back
@@ -436,6 +441,11 @@ pub struct FriendLinkAccepted {
     /// bstr.
     #[serde(rename = "k", default, with = "serde_bytes")]
     pub pq_kem_pubkey: Vec<u8>,
+    /// ZEB-677: Master-issued signer certs backing a Quorum-issued
+    /// `enrollment`. Empty for Master-issued certs; see
+    /// `FriendLinkRequest.signer_certs`.
+    #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
+    pub signer_certs: Vec<EnrollmentCert>,
 }
 
 /// The acceptor's reply on the `harmony/friend/v1` ALPN. ZEB-371 Task 12:
@@ -760,47 +770,39 @@ fn decode_strict<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Friend
     Ok(val)
 }
 
-/// Point-to-point enrolled-device authentication: the 4-step core of
-/// `community_membership::enrolled_key_from_cert`, applied without the
+/// Point-to-point enrolled-device authentication: the friend-handshake face
+/// of the `enrollment_verify` chokepoint (ZEB-677 §2), applied without the
 /// `SignedMembershipEvent` wrapper.
 ///
-/// Verifies `cert`, requires a `Master` issuer, binds `cert.owner_id ==
-/// claimed_owner.0`, and returns the enrolled device-#2 Ed25519 verify key the
-/// handshake signature must be checked against.
+/// Verifies `cert` (Master self-contained; Quorum against the presented
+/// `signer_certs` bundle, depth-1), binds `cert.owner_id == claimed_owner.0`,
+/// and returns both the enrolled device-#2 Ed25519 verify key (the handshake
+/// signature check) and the owner's master anchor key (the
+/// `FriendEntry.master_ed25519` friend-graph anchor — recovered from the
+/// signer certs when the cert itself is Quorum-issued).
 pub fn verify_enrolled_device(
     cert: &EnrollmentCert,
+    signer_certs: &[EnrollmentCert],
     claimed_owner: OwnerAddr,
     now_secs: u64,
-) -> Result<[u8; 32], FriendHandshakeError> {
-    cert.verify(now_secs).map_err(|e| match e {
-        harmony_owner::OwnerError::EnrollmentCertExpired { .. } => {
+) -> Result<crate::enrollment_verify::VerifiedEnrollment, FriendHandshakeError> {
+    crate::enrollment_verify::verify_enrollment_any_issuer(
+        cert,
+        signer_certs,
+        Some(&claimed_owner.0),
+        now_secs,
+    )
+    .map_err(|e| match e {
+        crate::enrollment_verify::EnrollmentVerifyError::Expired => {
             FriendHandshakeError::EnrollmentCertExpired
         }
-        _ => FriendHandshakeError::EnrollmentCertInvalid,
-    })?;
-    // Reject non-Master issuers: cert.verify() only structurally-checks Quorum
-    // certs (it cannot verify the quorum signatures without an OwnerState walk-
-    // back), so accepting one here would admit unverified signatures. Mirrors
-    // enrolled_key_from_cert.
-    if !matches!(cert.issuer, EnrollmentIssuer::Master { .. }) {
-        return Err(FriendHandshakeError::EnrollmentCertInvalid);
-    }
-    if cert.owner_id != claimed_owner.0 {
-        return Err(FriendHandshakeError::EnrollmentOwnerMismatch);
-    }
-    Ok(cert.device_pubkeys.classical.ed25519_verify)
-}
-
-/// Extract the friend's master Ed25519 verify key from a verified Master
-/// `EnrollmentCert`'s issuer. Used to populate `FriendEntry.master_ed25519` (the
-/// friend-graph key anchor). Returns `EnrollmentCertInvalid` if the issuer is
-/// not `Master` — callers always run `verify_enrolled_device` first, so this is
-/// belt-and-suspenders.
-pub fn master_ed25519_from_cert(cert: &EnrollmentCert) -> Result<[u8; 32], FriendHandshakeError> {
-    match &cert.issuer {
-        EnrollmentIssuer::Master { master_pubkey } => Ok(master_pubkey.classical.ed25519_verify),
-        _ => Err(FriendHandshakeError::EnrollmentCertInvalid),
-    }
+        crate::enrollment_verify::EnrollmentVerifyError::OwnerMismatch => {
+            FriendHandshakeError::EnrollmentOwnerMismatch
+        }
+        crate::enrollment_verify::EnrollmentVerifyError::Invalid(_) => {
+            FriendHandshakeError::EnrollmentCertInvalid
+        }
+    })
 }
 
 // =====================================================================
@@ -960,8 +962,9 @@ pub fn authenticate_friend_request(
     req: &FriendLinkRequest,
     now_secs: u64,
 ) -> Result<(), FriendHandshakeError> {
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
-    let vk = VerifyingKey::from_bytes(&device_key)
+    let verified =
+        verify_enrolled_device(&req.enrollment, &req.signer_certs, req.from_addr, now_secs)?;
+    let vk = VerifyingKey::from_bytes(&verified.device_ed25519)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
     let devices_digest = contact_digest(
         &req.sender_devices,
@@ -987,9 +990,10 @@ pub fn authenticate_friend_request(
 /// `FriendLinkAccepted` for the requester. No I/O.
 ///
 /// Steps (spec §5.2 accept side):
-/// 1. `verify_enrolled_device(&req.enrollment, req.from_addr)` → device key,
+/// 1. `verify_enrolled_device(&req.enrollment, &req.signer_certs,
+///    req.from_addr)` → device key + master anchor,
 /// 2. verify `req.sig` over the request preimage against that device key,
-/// 3. extract the requester's `master_ed25519` from their Master cert,
+/// 3. take the requester's `master_ed25519` anchor from step 1,
 /// 4. build `FriendEntry { master_ed25519, display, Active, Token, referrable:
 ///    false, learned_at }`,
 /// 5. `state.apply_friend_update(req.from_addr, entry)` — must be
@@ -1017,13 +1021,15 @@ pub fn process_friend_request(
     // one. Ignored when `self_statics` is `None` (an empty bundle has no relay).
     home_relay_url: Option<String>,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
-    // 1. Authenticate the requester's cert → enrolled device-#2 key.
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)?;
+    // 1. Authenticate the requester's cert → enrolled device-#2 key (and the
+    // master anchor, recovered from the signer bundle for quorum certs).
+    let verified =
+        verify_enrolled_device(&req.enrollment, &req.signer_certs, req.from_addr, now_secs)?;
 
     // 2. Verify the request signature over the canonical preimage (binds the
     // requester's ephemeral X25519 key + optional token + ZEB-461 device-bundle
     // digest computed from the bundle the request carries).
-    let vk = VerifyingKey::from_bytes(&device_key)
+    let vk = VerifyingKey::from_bytes(&verified.device_ed25519)
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
     let req_devices_digest = contact_digest(
         &req.sender_devices,
@@ -1046,8 +1052,9 @@ pub fn process_friend_request(
     // secret.
     let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
 
-    // 3. Extract the requester's master key (their friend-graph anchor).
-    let master_ed25519 = master_ed25519_from_cert(&req.enrollment)?;
+    // 3. The requester's master key (their friend-graph anchor) came from the
+    // chokepoint verification in step 1.
+    let master_ed25519 = verified.master_ed25519;
 
     // ZEB-371 Task 7: derive the shared friendship secret via ECDH (this side's
     // ephemeral secret + the requester's ephemeral public), then KeyTree-seal it
@@ -1184,6 +1191,9 @@ pub fn process_friend_request(
         display: self_display,
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment.clone(),
+        // ZEB-677: bundle threading for a quorum-certed self lands with the
+        // ceremony slices (S4); every self-cert today is Master-issued.
+        signer_certs: Vec::new(),
         sig,
         sender_devices: accept_devices,
         device_identity_pubs: accept_device_pubs,
@@ -1933,6 +1943,7 @@ mod tests {
             token_sig: Some(token_sig),
             eph_x25519_pub: eph_pub,
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig,
             sender_devices: devices,
             device_identity_pubs: device_pubs,
@@ -2000,6 +2011,7 @@ mod tests {
             display: None,
             eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig: [4u8; 64],
             sender_devices: vec![DeviceIdentityHash([0x11; 16])],
             device_identity_pubs: vec![Some([0x22; 64])],
@@ -2021,6 +2033,7 @@ mod tests {
             display: None,
             eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig: [4u8; 64],
             sender_devices: vec![],
             device_identity_pubs: vec![],
@@ -2082,6 +2095,7 @@ mod tests {
             display: Some("x".repeat(MAX_FRIEND_DISPLAY_LEN + 1)),
             eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig: [4u8; 64],
             sender_devices: vec![],
             device_identity_pubs: vec![],
@@ -2138,6 +2152,7 @@ mod tests {
             display: None,
             eph_x25519_pub: [0x77; 32],
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig: [6u8; 64],
             sender_devices: vec![],
             device_identity_pubs: vec![],
@@ -2166,9 +2181,9 @@ mod tests {
     #[test]
     fn verify_enrolled_device_accepts_valid_cert() {
         let owner = mint_test_owner(0x31);
-        let device_key = verify_enrolled_device(&owner.cert, owner.owner, 0).expect("valid");
+        let verified = verify_enrolled_device(&owner.cert, &[], owner.owner, 0).expect("valid");
         assert_eq!(
-            device_key,
+            verified.device_ed25519,
             owner.cert.device_pubkeys.classical.ed25519_verify
         );
     }
@@ -2178,7 +2193,7 @@ mod tests {
         let owner = mint_test_owner(0x32);
         let other = mint_test_owner(0x33);
         // Cert is owner's, but we claim it belongs to `other` → owner mismatch.
-        match verify_enrolled_device(&owner.cert, other.owner, 0) {
+        match verify_enrolled_device(&owner.cert, &[], other.owner, 0) {
             Err(FriendHandshakeError::EnrollmentOwnerMismatch) => {}
             other => panic!("expected EnrollmentOwnerMismatch, got {other:?}"),
         }
@@ -2191,27 +2206,72 @@ mod tests {
         // Structurally tamper: flip issued_at so the master signature no longer
         // covers the payload → cert.verify() fails.
         cert.issued_at ^= 0xFFFF;
-        match verify_enrolled_device(&cert, owner.owner, 0) {
+        match verify_enrolled_device(&cert, &[], owner.owner, 0) {
             Err(FriendHandshakeError::EnrollmentCertInvalid) => {}
             other => panic!("expected EnrollmentCertInvalid, got {other:?}"),
         }
     }
 
     #[test]
-    fn verify_enrolled_device_rejects_non_master_issuer() {
+    fn verify_enrolled_device_rejects_quorum_without_bundle() {
+        use harmony_owner::certs::EnrollmentIssuer;
         let owner = mint_test_owner(0x35);
         let mut cert = owner.cert.clone();
-        // Swap a Quorum issuer in. cert.verify() will structurally pass the
-        // device-id check but verify_enrolled_device must reject the non-Master
-        // issuer before trusting it.
+        // Swap a Quorum issuer in. A quorum cert presented WITHOUT its
+        // signer-cert bundle cannot have its part signatures verified — the
+        // no-bundle case must stay closed (ZEB-677: this replaces the old
+        // blanket non-Master rejection).
         cert.issuer = EnrollmentIssuer::Quorum {
             signers: vec![[1u8; 16], [2u8; 16]],
             signatures: vec![vec![0u8; 64], vec![0u8; 64]],
         };
-        match verify_enrolled_device(&cert, owner.owner, 0) {
+        cert.signature = Vec::new();
+        match verify_enrolled_device(&cert, &[], owner.owner, 0) {
             Err(FriendHandshakeError::EnrollmentCertInvalid) => {}
             other => panic!("expected EnrollmentCertInvalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_enrolled_device_accepts_quorum_with_bundle() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        // ZEB-677: a Quorum-issued cert presented WITH its Master-issued
+        // signer certs verifies, and the master anchor is recovered from the
+        // bundle (the quorum cert itself carries no master pubkey).
+        let world = mint_quorum_world(0x80);
+        let verified = verify_enrolled_device(
+            &world.c_quorum_cert,
+            &world.bundle,
+            crate::owner_state_types::OwnerAddr(world.owner_id),
+            WORLD_NOW,
+        )
+        .expect("quorum cert with bundle verifies");
+        assert_eq!(
+            verified.device_ed25519,
+            world.c_quorum_cert.device_pubkeys.classical.ed25519_verify
+        );
+        assert_eq!(verified.master_ed25519, world.master_ed25519);
+    }
+
+    /// ZEB-677: the `signer_certs` wire field is additive — an empty bundle
+    /// omits the key entirely (old-decoder byte-compat), and a populated
+    /// bundle round-trips.
+    #[test]
+    fn signer_certs_field_roundtrips_and_defaults_empty() {
+        use crate::enrollment_verify::quorum_fixtures::mint_quorum_world;
+        let token_sig = [7u8; 64];
+        let (req, _dk, _eph) = signed_request(0x38, token_sig);
+        assert!(req.signer_certs.is_empty());
+        let bytes = encode_friend_request(&req).expect("encode");
+        let back = decode_friend_request(&bytes).expect("decode");
+        assert_eq!(req, back, "empty bundle round-trips (key omitted)");
+
+        let world = mint_quorum_world(0x84);
+        let mut with_bundle = req.clone();
+        with_bundle.signer_certs = world.bundle.clone();
+        let bytes = encode_friend_request(&with_bundle).expect("encode with bundle");
+        let back = decode_friend_request(&bytes).expect("decode with bundle");
+        assert_eq!(back.signer_certs, world.bundle, "bundle round-trips");
     }
 
     #[test]
@@ -2253,7 +2313,7 @@ mod tests {
         // Expired: now_ms = 2_001 > expires_at = 2_000 → EnrollmentCertExpired.
         assert!(
             matches!(
-                verify_enrolled_device(&cert, owner, 2_001),
+                verify_enrolled_device(&cert, &[], owner, 2_001),
                 Err(FriendHandshakeError::EnrollmentCertExpired)
             ),
             "a cert past its expires_at must be rejected with EnrollmentCertExpired"
@@ -2261,12 +2321,12 @@ mod tests {
         // At-boundary (now_ms = 2_000, expires_at = 2_000): verify uses >
         // so 2_000 is NOT expired — must succeed.
         assert!(
-            verify_enrolled_device(&cert, owner, 2_000).is_ok(),
+            verify_enrolled_device(&cert, &[], owner, 2_000).is_ok(),
             "a cert at exactly expires_at is NOT expired (> not >=)"
         );
         // Before expiry (now_ms = 1_500): must succeed.
         assert!(
-            verify_enrolled_device(&cert, owner, 1_500).is_ok(),
+            verify_enrolled_device(&cert, &[], owner, 1_500).is_ok(),
             "a cert before expires_at must be accepted"
         );
     }
@@ -2279,8 +2339,9 @@ mod tests {
 
         // The enrolled device key resolved from the cert must verify the sig
         // over the request preimage.
-        let resolved =
-            verify_enrolled_device(&req.enrollment, req.from_addr, 0).expect("valid cert");
+        let resolved = verify_enrolled_device(&req.enrollment, &req.signer_certs, req.from_addr, 0)
+            .expect("valid cert")
+            .device_ed25519;
         assert_eq!(resolved, device_key);
         let vk = VerifyingKey::from_bytes(&resolved).expect("vk");
         let devices_digest = contact_digest(
@@ -2415,6 +2476,7 @@ mod tests {
             token_sig: None,
             eph_x25519_pub: eph_pub,
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig,
             sender_devices: devices,
             device_identity_pubs: pubs,
@@ -2511,8 +2573,10 @@ mod tests {
         // Closure re-runs the accept-verify path (same six-field digest the dialer
         // computes) over a possibly-tampered accept.
         let verify = |acc: &FriendLinkAccepted| -> bool {
-            let device_key = verify_enrolled_device(&acc.enrollment, acc.from_addr, 0)
-                .expect("self cert verifies");
+            let device_key =
+                verify_enrolled_device(&acc.enrollment, &acc.signer_certs, acc.from_addr, 0)
+                    .expect("self cert verifies")
+                    .device_ed25519;
             let vk = VerifyingKey::from_bytes(&device_key).expect("vk");
             let digest = contact_digest(
                 &acc.sender_devices,
@@ -2544,11 +2608,14 @@ mod tests {
     }
 
     #[test]
-    fn master_ed25519_from_cert_matches_owner_id() {
+    fn verified_master_anchor_matches_owner_id() {
         let owner = mint_test_owner(0x37);
-        let master = master_ed25519_from_cert(&owner.cert).expect("master cert");
+        let master = verify_enrolled_device(&owner.cert, &[], owner.owner, 0)
+            .expect("master cert")
+            .master_ed25519;
         // The friend-graph key invariant: owner_id derived from this master key
-        // equals the cert's owner_id.
+        // equals the cert's owner_id. (Pinned for the butler/relay CoMember
+        // admission checks, which re-derive owner ids from the anchor.)
         assert_eq!(
             crate::friend_graph::owner_id_from_master_ed25519(&master),
             owner.owner
@@ -2608,8 +2675,14 @@ mod tests {
         // over the accept preimage (same token_sig, accept domain tag).
         assert_eq!(accepted.from_addr, me.owner);
         assert_eq!(accepted.display.as_deref(), Some("me"));
-        let self_device_key = verify_enrolled_device(&accepted.enrollment, accepted.from_addr, 0)
-            .expect("self cert verifies");
+        let self_device_key = verify_enrolled_device(
+            &accepted.enrollment,
+            &accepted.signer_certs,
+            accepted.from_addr,
+            0,
+        )
+        .expect("self cert verifies")
+        .device_ed25519;
         let vk = VerifyingKey::from_bytes(&self_device_key).expect("vk");
         // The accept binds the accepter's own (randomly-generated) ephemeral key
         // + (ZEB-461) its device-bundle digest, both read back off the accept.
@@ -2654,6 +2727,7 @@ mod tests {
             token_sig: Some(token_sig),
             eph_x25519_pub: req_eph_pub,
             enrollment: requester.cert,
+            signer_certs: Vec::new(),
             sig,
             sender_devices: vec![],
             device_identity_pubs: vec![],
@@ -2753,6 +2827,7 @@ mod tests {
             token_sig: Some(token_sig),
             eph_x25519_pub: eph_pub,
             enrollment: requester.cert, // …but presents requester's cert
+            signer_certs: Vec::new(),
             sig,
             sender_devices: vec![],
             device_identity_pubs: vec![],
@@ -3218,6 +3293,7 @@ mod tests {
             token_sig: None,
             eph_x25519_pub: eph_pub,
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig,
             sender_devices: vec![],
             device_identity_pubs: vec![],
@@ -3250,6 +3326,7 @@ mod tests {
             token_sig: None,
             eph_x25519_pub: eph_pub,
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig,
             sender_devices: devices.clone(),
             device_identity_pubs: pubs,
@@ -3393,6 +3470,7 @@ mod tests {
             display: Some("dave".into()),
             eph_x25519_pub: [0x12; 32],
             enrollment: owner.cert,
+            signer_certs: Vec::new(),
             sig: [0x34; 64],
             sender_devices: vec![],
             device_identity_pubs: vec![],
