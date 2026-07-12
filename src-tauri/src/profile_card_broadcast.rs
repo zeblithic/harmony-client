@@ -88,15 +88,22 @@ pub enum CardError {
     EnrollmentOwnerMismatch,
     #[error("signer does not match enrollment device ed25519 key")]
     SignerKeyMismatch,
+    /// ZEB-677 (Qodo PR #458): a Quorum-issued cert signed without its
+    /// signer-cert bundle would produce a card EVERY verifier rejects —
+    /// fail at sign time instead of emitting an unverifiable card.
+    #[error("quorum-issued cert requires a signer bundle (use sign_card_with_bundle)")]
+    QuorumCertRequiresBundle,
     #[error("canonical CBOR encode failed: {0}")]
     Encode(#[from] CryptoError),
 }
 
 /// Build + Ed25519-sign a card over canonical CBOR with `signature` zeroed.
 /// `signer` MUST be the enrolled device key (pub ==
-/// `enrollment.device_pubkeys.classical.ed25519_verify`). For Master-issued
-/// certs (every self-cert today); a Quorum-issued cert needs
-/// [`sign_card_with_bundle`] so peers can verify it (ZEB-677).
+/// `enrollment.device_pubkeys.classical.ed25519_verify`). Master-issued
+/// certs only — a Quorum-issued cert without its bundle would sign
+/// successfully but fail EVERY peer's verification, so this fails fast
+/// with [`CardError::QuorumCertRequiresBundle`]; use
+/// [`sign_card_with_bundle`] instead (ZEB-677).
 #[allow(clippy::too_many_arguments)]
 pub fn sign_card(
     signer: &SigningKey,
@@ -108,6 +115,12 @@ pub fn sign_card(
     enrollment: EnrollmentCert,
     shared_at: Hlc,
 ) -> Result<ProfileCardBroadcast, CardError> {
+    if matches!(
+        enrollment.issuer,
+        harmony_owner::certs::EnrollmentIssuer::Quorum { .. }
+    ) {
+        return Err(CardError::QuorumCertRequiresBundle);
+    }
     sign_card_with_bundle(
         signer,
         owner_id,
@@ -1213,8 +1226,28 @@ mod tests {
         quorum_cert
             .verify(0)
             .expect("quorum cert passes structural verify");
-        // Build a card with the Quorum cert (sign with device key; owner_id matches cert)
-        let card = sign_card(
+        // sign_card refuses a quorum cert outright — an empty-bundle quorum
+        // card would fail EVERY peer's verification (Qodo PR #458).
+        assert!(matches!(
+            sign_card(
+                &device_sk,
+                owner_id,
+                "n".into(),
+                "".into(),
+                None,
+                None,
+                quorum_cert.clone(),
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            ),
+            Err(CardError::QuorumCertRequiresBundle)
+        ));
+        // A no-bundle quorum card built EXPLICITLY (hostile peer / future
+        // bug) must still fail verification closed.
+        let card = sign_card_with_bundle(
             &device_sk,
             owner_id,
             "n".into(),
@@ -1222,6 +1255,7 @@ mod tests {
             None,
             None,
             quorum_cert,
+            Vec::new(),
             Hlc {
                 wall_ms: 1,
                 logical: 0,

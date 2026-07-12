@@ -19,7 +19,8 @@
 - Depth-1: quorum signer certs must be Master-issued; enforced by the crate (`verify_quorum_with_signers`), never re-implemented client-side.
 - Retire-pair keeps issued-at-time expiry semantics (`enrollment.verify(enrollment.issued_at)` idiom → chokepoint `now_secs = cert.issued_at`).
 - Presenting-side bundle THREADING (DmOutbox etc.) is explicitly deferred to S4 — today no quorum cert can exist locally, every bundle would serialize empty. S2 ships the `own_cert_bundle` helper + wire capability only.
-- Gates per repo CLAUDE.md: `cargo fmt --all -- --check`, `clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, nextest `--locked --workspace --all-targets --features test-fixtures`. Iterative gates via `scripts/test-select --context task`; FINAL gate is the full sweep.
+- Gates per repo CLAUDE.md: `cargo fmt --all -- --check`, `clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, nextest `--locked --workspace --all-targets --features test-fixtures`. Iterative gates via `scripts/test-select --context task` — paste the printed `round=… bucket=…` summary line into the task report so the selection is auditable; FINAL gate is the full sweep.
+- Dependency-graph caveat: Task 1 bumps `src-tauri/Cargo.toml`/`Cargo.lock`, which makes `test-select`'s module mapping unreliable — the script refuses and demands `--full`. From Task 1 until the branch's final sweep, iterative gates on this branch use targeted `cargo nextest -E` filters (as written in each task's gate step) or `scripts/test-select --full`; never `--force` past the dep-graph warning.
 - Commit trailers: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>` + `Claude-Session: https://claude.ai/code/session_01MsT6ZD7kqbpbKoeenyQPtc`.
 
 ---
@@ -82,7 +83,7 @@ Each already has a `now` local and the window constant in scope (survey verified
 
 ```bash
 cd src-tauri && cargo check --locked --all-targets --features test-fixtures
-scripts/test-select --context task   # from repo root
+scripts/test-select --full   # dep-graph changed in Task 1 (Global Constraints); paste the printed round=… bucket=… line into the task report
 git add -A && git commit -m "ZEB-677 S2: bump harmony crates to 1ecb416 (S1 quorum primitives) + add_revocation 3-arg migration"
 ```
 
@@ -300,7 +301,7 @@ Pass the bundle from the struct in hand; take `.device_ed25519` from the result:
 
 ```bash
 cd src-tauri && cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(iroh_friend_acceptor) or test(referral_catalog) or test(friend_token)'
-scripts/test-select --context task
+scripts/test-select --full   # dep-graph changed in Task 1 (Global Constraints); paste the printed round=… bucket=… line into the task report
 git add -A && git commit -m "ZEB-677 S2: friend/PEX/referral seams — quorum cert acceptance via chokepoint + signer-bundle wire fields"
 ```
 
@@ -388,7 +389,7 @@ Replace :1999-2008 verify+gate with chokepoint call (`&payload.inviter_signer_ce
 
 ```bash
 cd src-tauri && cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(community_membership) or test(community_invite) or test(open_join)'
-scripts/test-select --context task
+scripts/test-select --full   # dep-graph changed in Task 1 (Global Constraints); paste the printed round=… bucket=… line into the task report
 git add -A && git commit -m "ZEB-677 S2: membership/invite/open-join/retire seams — event signer-bundle field + chokepoint reroute + retire quorum coverage"
 ```
 
@@ -468,7 +469,7 @@ pub signer_certs: Vec<EnrollmentCert>,
 
 ```bash
 cd src-tauri && cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(butler) or test(relay) or test(profile_card)'
-scripts/test-select --context task
+scripts/test-select --full   # dep-graph changed in Task 1 (Global Constraints); paste the printed round=… bucket=… line into the task report
 git add -A && git commit -m "ZEB-677 S2: butler/relay/profile-card seams — signer-bundle frames + chokepoint reroute"
 ```
 

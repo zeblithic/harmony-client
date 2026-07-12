@@ -37,7 +37,7 @@ The K=2 quorum machinery is **fully implemented and unit-tested in the external 
 
 A quorum-issued cert is meaningless without its signers' certs, so it travels as a **bundle**:
 
-```
+```text
 QuorumSignerCerts = Vec<EnrollmentCert>   // exactly the certs for issuer.signers, each Master-issued
 ```
 
@@ -134,9 +134,9 @@ pub struct QuorumRequestSigs {
 
 Merge: per-request LWW on metadata (`created_at`), **grow-only union** on `signatures` and `declined_by`; `enroll_arms` per-cell LWW (same shape as `FleetNetPetname`). Expired and declined requests are pruned locally by a sweep on apply. Completion is initiator-driven: when the initiator observes ≥ K=2 valid signatures (its own included), it assembles the cert and applies it through the existing authoritative path (`mutate_trust_state` → `add_revocation`/`add_enrollment`), which is idempotent — the request is then pruned. If the initiator dies mid-flow the request expires and the user retries; no orphaned half-certs (the trust doc is the only authority).
 
-IPCs (each `#[tauri::command]` + `_inner` seam + RPC mirror, camelCase args):
+IPCs (each `#[tauri::command]` + `_inner` seam + RPC mirror; Rust params snake_case as below, JS callers pass camelCase — Tauri's IPC layer auto-converts at the boundary, per CLAUDE.md):
 
-```
+```text
 request_quorum_revocation(device_vk_hex: String, reason: String) -> Result<String, String>  // returns request id
 cosign_quorum_request(request_id: String) -> Result<(), String>
 decline_quorum_request(request_id: String) -> Result<(), String>
