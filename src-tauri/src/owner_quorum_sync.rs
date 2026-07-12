@@ -423,6 +423,254 @@ impl FleetPersist<QuorumReqDoc> for QuorumPersist {
     }
 }
 
+/// What one completion sweep did (test observability).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepOutcome {
+    pub doc_changed: bool,
+    pub revocations_applied: usize,
+}
+
+/// One assemblable completion candidate, collected under the quorum-doc
+/// lock and applied after it is released (the trust mutation takes the
+/// trust-doc lock; never hold both).
+struct CompletionCandidate {
+    request_id: String,
+    cert: RevocationCert,
+}
+
+/// Validate a cosigner's entry against the CURRENT trust doc and, when it
+/// verifies, assemble the K=2 cert with a freshly minted initiator part.
+fn try_assemble(
+    trust: &harmony_owner::state::OwnerState,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    self_id: [u8; 16],
+    req: &QuorumRequest,
+) -> Option<RevocationCert> {
+    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind;
+    let target = parse_device_id_hex(target_hex).ok()?;
+    let reason = crate::owner_commands::parse_revoke_reason(reason).ok()?;
+    for (cosigner_hex, sigs) in &req.signatures {
+        let Ok(cosigner) = parse_device_id_hex(cosigner_hex) else {
+            continue;
+        };
+        if cosigner == self_id || cosigner == target || trust.is_revoked(cosigner) {
+            continue;
+        }
+        let Some(cert) = trust.enrollments.get(&cosigner) else {
+            continue;
+        };
+        if !crate::owner_quorum_commands::is_master_issued(cert) {
+            continue;
+        }
+        let Ok(vk) =
+            ed25519_dalek::VerifyingKey::from_bytes(&cert.device_pubkeys.classical.ed25519_verify)
+        else {
+            continue;
+        };
+        let Ok(payload) = revocation_pair_payload(
+            trust.owner_id,
+            target,
+            req.issued_at,
+            &reason,
+            self_id,
+            cosigner,
+        ) else {
+            continue;
+        };
+        let Ok(cosig) = hex::decode(&sigs.primary_sig_hex) else {
+            continue;
+        };
+        if harmony_owner::signing::verify_with_tag(
+            &vk,
+            harmony_owner::signing::tags::REVOCATION,
+            &payload,
+            &cosig,
+            "Revocation-Quorum-Part",
+        )
+        .is_err()
+        {
+            tracing::warn!(cosigner = %cosigner_hex, "quorum sweep: cosigner signature failed verification; skipped");
+            continue;
+        }
+        let own = RevocationCert::sign_quorum_part(device_signing_key, &payload);
+        let mut parts = vec![(self_id, own), (cosigner, cosig)];
+        parts.sort_by_key(|(id, _)| *id);
+        match RevocationCert::assemble_quorum(
+            trust.owner_id,
+            target,
+            req.issued_at,
+            reason.clone(),
+            parts,
+        ) {
+            Ok(cert) => return Some(cert),
+            Err(e) => {
+                tracing::warn!(error = %e, "quorum sweep: assemble failed; skipped");
+                continue;
+            }
+        }
+    }
+    None
+}
+
+/// One completion pass over the quorum doc (spec §3: completion is
+/// initiator-driven). Prunes settled requests, then — for requests THIS
+/// device initiated — assembles the K=2 cert from the first cosigner
+/// signature that verifies and applies it through the trust doc's
+/// validating `add_revocation` (the authority; its quorum arm re-checks
+/// the full signer policy incl. the active-window). A crate-level
+/// rejection leaves the request resident for retry — expiry bounds it.
+///
+/// Lock discipline: candidates are collected under the quorum lock,
+/// applied under the trust lock, then removed under the quorum lock again
+/// — the two locks are never held together.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_quorum_sweep(
+    quorum_doc: &Arc<tokio::sync::Mutex<QuorumReqDoc>>,
+    quorum_engine: &Arc<crate::fleet_sync::FleetSyncEngine<QuorumReqDoc>>,
+    trust_doc: &Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>,
+    trust_engine: &Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    self_device_id: [u8; 16],
+    emit: &Arc<dyn Fn(&str) + Send + Sync>,
+    retire_nudge: Option<&tokio::sync::mpsc::Sender<()>>,
+    now_secs: u64,
+    now_ms: u64,
+) -> SweepOutcome {
+    let self_hex = hex::encode(self_device_id);
+    let trust_snapshot = trust_doc.lock().await.clone();
+
+    // Phase A: prune + collect candidates under the quorum lock.
+    let (pruned, candidates) = {
+        let mut doc = quorum_doc.lock().await;
+        let pruned = prune_settled_requests(&mut doc, &trust_snapshot, now_ms);
+        let mut candidates = Vec::new();
+        for (id, req) in doc.requests.iter() {
+            if req.initiator_hex != self_hex
+                || now_ms > req.expires_at_ms
+                || !req.declined_by.is_empty()
+            {
+                continue;
+            }
+            if let Some(cert) =
+                try_assemble(&trust_snapshot, device_signing_key, self_device_id, req)
+            {
+                candidates.push(CompletionCandidate {
+                    request_id: id.clone(),
+                    cert,
+                });
+            }
+        }
+        (pruned, candidates)
+    };
+    if pruned {
+        quorum_engine.notify_dirty();
+    }
+
+    // Phase B: apply each assembled cert through the authoritative path.
+    let mut completed = Vec::new();
+    for cand in candidates {
+        let cert = cand.cert;
+        let target = cert.target;
+        let applied = crate::owner_trust_sync::mutate_trust_state(
+            crate::owner_trust_sync::TrustStateAccess::Resident {
+                doc: Arc::clone(trust_doc),
+                engine: Arc::clone(trust_engine),
+            },
+            move |s| {
+                if s.is_revoked(target) {
+                    return Ok(());
+                }
+                s.add_revocation(
+                    cert,
+                    now_secs,
+                    harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                )
+            },
+        )
+        .await;
+        match applied {
+            Ok(Ok(())) => {
+                if let Err(e) = trust_engine.flush_now().await {
+                    tracing::warn!(error = %e,
+                        "quorum sweep: trust flush failed; dirty latch will retry");
+                }
+                emit("owner-devices-updated");
+                if let Some(tx) = retire_nudge {
+                    let _ = tx.try_send(());
+                }
+                completed.push(cand.request_id);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, request = %cand.request_id,
+                    "quorum sweep: assembled revocation rejected by trust state; request retained");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, request = %cand.request_id,
+                    "quorum sweep: trust mutation failed; request retained");
+            }
+        }
+    }
+
+    // Phase C: drop completed requests from the quorum doc.
+    let applied_count = completed.len();
+    if !completed.is_empty() {
+        {
+            let mut doc = quorum_doc.lock().await;
+            for id in &completed {
+                doc.requests.remove(id);
+            }
+        }
+        quorum_engine.notify_dirty();
+        if let Err(e) = quorum_engine.flush_now().await {
+            tracing::warn!(error = %e,
+                "quorum sweep: quorum flush failed; dirty latch will retry");
+        }
+    }
+    SweepOutcome {
+        doc_changed: pruned || applied_count > 0,
+        revocations_applied: applied_count,
+    }
+}
+
+/// The quorum engine's `on_applied` consumer: each nudge (an inbound merge
+/// that changed the doc, or the one boot tick) runs a completion sweep and
+/// then tells the UI the pending-request surface changed. The boot tick
+/// covers signatures that accumulated while this device was offline.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_quorum_applied_task(
+    mut nudge_rx: tokio::sync::mpsc::Receiver<()>,
+    quorum_doc: Arc<tokio::sync::Mutex<QuorumReqDoc>>,
+    quorum_engine: Arc<crate::fleet_sync::FleetSyncEngine<QuorumReqDoc>>,
+    trust_doc: Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>,
+    trust_engine: Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+    device_signing_key: ed25519_dalek::SigningKey,
+    self_device_id: [u8; 16],
+    emit: Arc<dyn Fn(&str) + Send + Sync>,
+    retire_nudge: Option<tokio::sync::mpsc::Sender<()>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while nudge_rx.recv().await.is_some() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            run_quorum_sweep(
+                &quorum_doc,
+                &quorum_engine,
+                &trust_doc,
+                &trust_engine,
+                &device_signing_key,
+                self_device_id,
+                &emit,
+                retire_nudge.as_ref(),
+                now.as_secs(),
+                now.as_millis() as u64,
+            )
+            .await;
+            emit("owner-quorum-updated");
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +992,347 @@ mod tests {
         )
         .unwrap();
         assert_ne!(p1, p3);
+    }
+
+    // ── Task 3: completion-sweep tests ──────────────────────────────────
+
+    struct SweepFleet {
+        trust: OwnerState,
+        a_sk: ed25519_dalek::SigningKey,
+        a_id: [u8; 16],
+        b_sk: ed25519_dalek::SigningKey,
+        b_id: [u8; 16],
+        c_id: [u8; 16],
+        c_vk_hex: String,
+    }
+
+    /// Three master-enrolled devices with fresh liveness: A (initiator),
+    /// B (cosigner), C (target).
+    fn sweep_fleet() -> SweepFleet {
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key: a_sk,
+        } = mint_owner(NOW_SECS).expect("mint");
+        let a_id = crate::owner_state::device_id_from_signing_key(&a_sk);
+        let owner_id = state.owner_id;
+        let mut enroll = |now: u64| {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let res = enroll_via_master(
+                &state,
+                &recovery_artifact,
+                &sk,
+                PubKeyBundle::classical_only(sk.verifying_key().to_bytes()),
+                now,
+                DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .expect("enroll");
+            let id = res.enrollment_cert.device_id;
+            state
+                .add_enrollment(res.enrollment_cert, now, DEFAULT_ACTIVE_WINDOW_SECS)
+                .expect("add enrollment");
+            (sk, id)
+        };
+        let (b_sk, b_id) = enroll(NOW_SECS + 1);
+        let (c_sk, c_id) = enroll(NOW_SECS + 2);
+        let c_vk_hex = hex::encode(c_sk.verifying_key().to_bytes());
+        for sk in [&a_sk, &b_sk, &c_sk] {
+            state
+                .add_liveness(
+                    harmony_owner::certs::LivenessCert::sign(sk, owner_id, NOW_SECS + 3).unwrap(),
+                )
+                .expect("liveness");
+        }
+        SweepFleet {
+            trust: state,
+            a_sk,
+            a_id,
+            b_sk,
+            b_id,
+            c_id,
+            c_vk_hex,
+        }
+    }
+
+    type TrustEngine = crate::fleet_sync::FleetSyncEngine<OwnerState>;
+    type QuorumEngine = crate::fleet_sync::FleetSyncEngine<QuorumReqDoc>;
+
+    struct SweepRig {
+        quorum_doc: Arc<tokio::sync::Mutex<QuorumReqDoc>>,
+        quorum_engine: Arc<QuorumEngine>,
+        trust_doc: Arc<tokio::sync::Mutex<OwnerState>>,
+        trust_engine: Arc<TrustEngine>,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Single-device engine rig with drained publish channels — enough for
+    /// sweep tests (replication itself is the two-engine tests below).
+    fn sweep_rig(trust: OwnerState, quorum: QuorumReqDoc) -> SweepRig {
+        use crate::content_store::{ContentStore, InMemoryStub};
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine};
+        use crate::owner_state_crypto::KeyTree;
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("trust")).unwrap();
+        let kt = Arc::new(KeyTree::derive(&[0x55u8; 32]).expect("kt"));
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let trust_doc = Arc::new(tokio::sync::Mutex::new(trust));
+        let quorum_doc = Arc::new(tokio::sync::Mutex::new(quorum));
+
+        let (t_out, mut t_drain) = mpsc::channel::<Vec<u8>>(64);
+        let (_t_in_tx, t_in) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while t_drain.recv().await.is_some() {} });
+        let trust_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
+            keys: crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt)),
+            device_id: "dev-a".to_string(),
+            state: Arc::clone(&trust_doc),
+            merger: crate::owner_trust_sync::trust_merger(),
+            replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            content_store: Arc::clone(&store),
+            publisher_tx: t_out,
+            subscriber_rx: t_in,
+            persist: Arc::new(crate::owner_trust_sync::TrustPersist {
+                identity_dir: dir.path().join("trust"),
+                replay_path: dir.path().join("trust-replay.cbor"),
+            }),
+            lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
+            debounce_ms: 25,
+            publish_seen: true,
+            on_applied: None,
+            sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+        }));
+
+        let (q_out, mut q_drain) = mpsc::channel::<Vec<u8>>(64);
+        let (_q_in_tx, q_in) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while q_drain.recv().await.is_some() {} });
+        let quorum_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
+            keys: crate::owner_state_crypto::FleetKeySet::new(kt),
+            device_id: "dev-a".to_string(),
+            state: Arc::clone(&quorum_doc),
+            merger: quorum_merger(),
+            replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            content_store: store,
+            publisher_tx: q_out,
+            subscriber_rx: q_in,
+            persist: Arc::new(QuorumPersist {
+                doc_path: dir.path().join(OWNER_QUORUM_DOC_FILENAME),
+                replay_path: dir.path().join(OWNER_QUORUM_REPLAY_FILENAME),
+            }),
+            lookup_key_tag: OWNER_QUORUM_LOOKUP_TAG,
+            debounce_ms: 25,
+            publish_seen: true,
+            on_applied: None,
+            sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+        }));
+
+        SweepRig {
+            quorum_doc,
+            quorum_engine,
+            trust_doc,
+            trust_engine,
+            _dir: dir,
+        }
+    }
+
+    fn collecting_emit(
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Arc<dyn Fn(&str) + Send + Sync> {
+        Arc::new(move |name: &str| events.lock().unwrap().push(name.to_string()))
+    }
+
+    /// Plan A's request + B's co-signature into a doc (the state the
+    /// initiator's sweep sees after B's signature merges back).
+    fn planned_and_cosigned(f: &SweepFleet) -> (QuorumReqDoc, String) {
+        let (id, req) = crate::owner_quorum_commands::plan_quorum_revocation_request(
+            &f.trust,
+            &f.a_sk,
+            false,
+            &f.c_vk_hex,
+            "lost",
+            NOW_SECS + 10,
+            NOW_MS + 10_000,
+            [0xcd; 16],
+        )
+        .expect("plan");
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(id.clone(), req);
+        crate::owner_quorum_commands::cosign_request_core(
+            &mut doc,
+            &f.trust,
+            &f.b_sk,
+            f.b_id,
+            &id,
+            NOW_MS + 20_000,
+        )
+        .expect("cosign");
+        (doc, id)
+    }
+
+    #[tokio::test]
+    async fn sweep_assembles_applies_prunes_and_is_idempotent() {
+        let f = sweep_fleet();
+        let (doc, _id) = planned_and_cosigned(&f);
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (retire_tx, mut retire_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::clone(&events)),
+            Some(&retire_tx),
+            NOW_SECS + 30,
+            NOW_MS + 30_000,
+        )
+        .await;
+        assert_eq!(outcome.revocations_applied, 1);
+        assert!(outcome.doc_changed);
+        assert!(rig.trust_doc.lock().await.is_revoked(f.c_id));
+        assert!(rig.quorum_doc.lock().await.requests.is_empty());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["owner-devices-updated"],
+            "sweep emits the device-set change; the task loop adds owner-quorum-updated"
+        );
+        assert!(retire_rx.try_recv().is_ok(), "retire sweeper nudged");
+
+        // Second sweep: nothing left to do.
+        let outcome2 = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            NOW_SECS + 31,
+            NOW_MS + 31_000,
+        )
+        .await;
+        assert_eq!(outcome2, SweepOutcome::default());
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_tampered_cosigner_sig_and_retains_request() {
+        let f = sweep_fleet();
+        let (mut doc, id) = planned_and_cosigned(&f);
+        {
+            let req = doc.requests.get_mut(&id).unwrap();
+            let entry = req.signatures.get_mut(&hex::encode(f.b_id)).unwrap();
+            entry.primary_sig_hex = "00".repeat(64);
+        }
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            NOW_SECS + 30,
+            NOW_MS + 30_000,
+        )
+        .await;
+        assert_eq!(outcome, SweepOutcome::default());
+        assert!(!rig.trust_doc.lock().await.is_revoked(f.c_id));
+        assert!(rig.quorum_doc.lock().await.requests.contains_key(&id));
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sweep_never_assembles_foreign_declined_or_expired_requests() {
+        let f = sweep_fleet();
+        let (mut doc, id) = planned_and_cosigned(&f);
+        // Declined: tombstoned even with a valid signature present.
+        doc.requests
+            .get_mut(&id)
+            .unwrap()
+            .declined_by
+            .insert(hex::encode(f.b_id));
+        // Expired copy under another id: pruned without assembly.
+        let mut expired = doc.requests[&id].clone();
+        expired.declined_by.clear();
+        expired.expires_at_ms = NOW_MS;
+        doc.requests.insert("ee".repeat(16), expired);
+        let rig = sweep_rig(f.trust.clone(), doc);
+
+        // Run as B (not the initiator): B must never assemble A's request.
+        let outcome_b = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.b_sk,
+            f.b_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            NOW_SECS + 40,
+            NOW_MS + 40_000,
+        )
+        .await;
+        assert_eq!(outcome_b.revocations_applied, 0);
+        assert!(outcome_b.doc_changed, "expired copy pruned");
+        // Run as A: the declined request must still never assemble.
+        let outcome_a = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            NOW_SECS + 41,
+            NOW_MS + 41_000,
+        )
+        .await;
+        assert_eq!(outcome_a.revocations_applied, 0);
+        assert!(!rig.trust_doc.lock().await.is_revoked(f.c_id));
+        assert!(rig.quorum_doc.lock().await.requests.contains_key(&id));
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sweep_retains_request_when_trust_state_rejects_the_cert() {
+        // The cosigner is master-certed with a valid signature, but the
+        // sweep's trust doc has NO liveness for it — `add_revocation`'s
+        // quorum arm (active-window policy) rejects the assembled cert and
+        // the request stays resident for retry.
+        let f = sweep_fleet();
+        let (doc, id) = planned_and_cosigned(&f);
+        let mut inactive_trust = f.trust.clone();
+        inactive_trust.liveness.remove(&f.b_id);
+        let rig = sweep_rig(inactive_trust, doc);
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            None,
+            NOW_SECS + 30,
+            NOW_MS + 30_000,
+        )
+        .await;
+        assert_eq!(outcome.revocations_applied, 0);
+        assert!(!rig.trust_doc.lock().await.is_revoked(f.c_id));
+        assert!(rig.quorum_doc.lock().await.requests.contains_key(&id));
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
     }
 
     #[test]
