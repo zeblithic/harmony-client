@@ -219,6 +219,70 @@ impl KeyTree {
     }
 }
 
+/// Runtime-swappable set of installed fleet KeyTrees (ZEB-668 S5).
+///
+/// The dual-epoch read window means an engine may need to decrypt inbound
+/// publishes under either the previous or the newest epoch while always
+/// publishing on the newest. Cloning is cheap (shared inner); every fleet
+/// engine holds a clone of the same set, so an epoch install/prune applies
+/// to all of them at once without restarts.
+///
+/// Non-empty by construction: `new` seeds the set and `retain_newest_only`
+/// keeps one entry, so `newest()` cannot observe an empty set.
+#[derive(Clone)]
+pub struct FleetKeySet {
+    /// Sorted descending by epoch; index 0 is the publish key.
+    inner: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<KeyTree>>>>,
+}
+
+impl FleetKeySet {
+    pub fn new(first: std::sync::Arc<KeyTree>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(vec![first])),
+        }
+    }
+
+    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<std::sync::Arc<KeyTree>>> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Highest installed epoch — the publish key.
+    pub fn newest(&self) -> std::sync::Arc<KeyTree> {
+        std::sync::Arc::clone(&self.lock_read()[0])
+    }
+
+    /// Decrypt candidates, newest first. A publish is entirely single-epoch,
+    /// so callers bind whichever tree decrypts the root for the rest of the
+    /// message.
+    pub fn accept_set(&self) -> Vec<std::sync::Arc<KeyTree>> {
+        self.lock_read().clone()
+    }
+
+    /// Install a tree; idempotent by epoch (an already-installed epoch is
+    /// left untouched). Keeps the descending sort.
+    pub fn install(&self, kt: std::sync::Arc<KeyTree>) {
+        let mut set = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if set.iter().any(|k| k.epoch == kt.epoch) {
+            return;
+        }
+        set.push(kt);
+        set.sort_by(|a, b| b.epoch.cmp(&a.epoch));
+    }
+
+    /// Window close: drop everything but the newest epoch from the accept
+    /// set. (Epoch-0 material persisted for the fleet-keys carrier lives
+    /// outside this set — the carrier engine holds its own fixed tree.)
+    pub fn retain_newest_only(&self) {
+        let mut set = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        set.truncate(1);
+    }
+
+    /// Installed epochs, descending.
+    pub fn epochs(&self) -> Vec<u32> {
+        self.lock_read().iter().map(|k| k.epoch).collect()
+    }
+}
+
 /// Serializable export of a `KeyTree`'s raw key material, for sealed
 /// distribution to cert-only enrolled devices (ZEB-492). Carries an explicit
 /// `epoch` so a future KeyTree rotation is non-breaking (rotation itself is
@@ -238,6 +302,35 @@ pub struct FleetKeyMaterial {
     lookup: [u8; 32],
     nonce: [u8; 32],
     friend_aead: [u8; 32],
+}
+
+/// Encode a set of fleet materials for the vault `fleet_keytree` slot
+/// (ZEB-668 S5). Always writes the multi-epoch CBOR-array format; the vault
+/// invariant is "epoch-0 + current (+ previous during a bump window)".
+/// `Zeroizing`: the buffer holds raw key material.
+pub fn encode_fleet_material_set(
+    materials: &[FleetKeyMaterial],
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut buf = Zeroizing::new(Vec::new());
+    ciborium::into_writer(&materials, &mut *buf)
+        .map_err(|e| format!("encode material set: {e}"))?;
+    Ok(buf)
+}
+
+/// Decode the vault `fleet_keytree` slot. Post-S5 slots hold a CBOR array of
+/// `FleetKeyMaterial`; pre-S5 slots hold a single CBOR map — decoded as a
+/// one-element set (its material is epoch 0 by construction). Discrimination
+/// is structural (CBOR array vs map major type), no version byte needed.
+pub fn decode_fleet_material_set(bytes: &[u8]) -> Result<Vec<FleetKeyMaterial>, String> {
+    if let Ok(set) = ciborium::from_reader::<Vec<FleetKeyMaterial>, _>(bytes) {
+        if set.is_empty() {
+            return Err("fleet material set is empty".to_string());
+        }
+        return Ok(set);
+    }
+    ciborium::from_reader::<FleetKeyMaterial, _>(bytes)
+        .map(|single| vec![single])
+        .map_err(|e| format!("decode fleet_keytree (neither set nor legacy single): {e}"))
 }
 
 /// Derive the per-space Prolly Tree lookup key.
@@ -1200,6 +1293,70 @@ mod tests {
         assert_ne!(e0.lookup.as_ref(), e1.lookup.as_ref());
         assert_ne!(e0.nonce.as_ref(), e1.nonce.as_ref());
         assert_ne!(e0.friend_aead.as_ref(), e1.friend_aead.as_ref());
+    }
+
+    fn arc_tree(epoch: u32) -> std::sync::Arc<KeyTree> {
+        std::sync::Arc::new(KeyTree::derive_at_epoch(&[5u8; 32], epoch).expect("derive"))
+    }
+
+    #[test]
+    fn fleet_material_set_round_trips_and_legacy_single_decodes() {
+        let kt0 = KeyTree::derive_at_epoch(&[5u8; 32], 0).expect("e0");
+        let kt2 = KeyTree::derive_at_epoch(&[5u8; 32], 2).expect("e2");
+        let set = vec![kt0.to_fleet_material(), kt2.to_fleet_material()];
+        let bytes = encode_fleet_material_set(&set).expect("encode");
+        let back = decode_fleet_material_set(&bytes).expect("decode set");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].epoch, 0);
+        assert_eq!(back[1].epoch, 2);
+
+        // Legacy pre-S5 slot: a single bare FleetKeyMaterial map.
+        let mut legacy = Vec::new();
+        ciborium::into_writer(&kt0.to_fleet_material(), &mut legacy).expect("legacy encode");
+        let migrated = decode_fleet_material_set(&legacy).expect("decode legacy");
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].epoch, 0);
+
+        // Empty sets are corrupt, not "no material".
+        let mut empty = Vec::new();
+        ciborium::into_writer(&Vec::<FleetKeyMaterial>::new(), &mut empty).expect("empty encode");
+        assert!(decode_fleet_material_set(&empty).is_err());
+    }
+
+    #[test]
+    fn fleet_key_set_newest_picks_highest_epoch() {
+        let set = FleetKeySet::new(arc_tree(1));
+        set.install(arc_tree(0));
+        set.install(arc_tree(3));
+        assert_eq!(set.newest().epoch, 3);
+        assert_eq!(set.epochs(), vec![3, 1, 0]);
+    }
+
+    #[test]
+    fn fleet_key_set_install_is_idempotent_by_epoch() {
+        let set = FleetKeySet::new(arc_tree(2));
+        set.install(arc_tree(2));
+        set.install(arc_tree(2));
+        assert_eq!(set.epochs(), vec![2]);
+        assert_eq!(set.accept_set().len(), 1);
+    }
+
+    #[test]
+    fn fleet_key_set_accept_set_is_descending() {
+        let set = FleetKeySet::new(arc_tree(0));
+        set.install(arc_tree(2));
+        set.install(arc_tree(1));
+        let epochs: Vec<u32> = set.accept_set().iter().map(|k| k.epoch).collect();
+        assert_eq!(epochs, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn fleet_key_set_retain_newest_only_keeps_one() {
+        let set = FleetKeySet::new(arc_tree(0));
+        set.install(arc_tree(1));
+        set.retain_newest_only();
+        assert_eq!(set.epochs(), vec![1]);
+        assert_eq!(set.newest().epoch, 1);
     }
 
     #[test]

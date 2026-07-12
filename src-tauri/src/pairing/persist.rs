@@ -77,9 +77,12 @@ pub fn install_joiner_state_inner(
     // the held OWNER_STATE_WRITE_LOCK, same as the owner_state write below.
     match result.fleet_keytree.as_ref() {
         Some(material) => {
-            let mut buf = zeroize::Zeroizing::new(Vec::new());
-            ciborium::into_writer(material, &mut *buf)
-                .map_err(|e| format!("encode fleet keytree for persist: {e}"))?;
+            // ZEB-668 S5: the slot always persists the multi-epoch set
+            // encoding (a pairing handover carries one epoch → a 1-set).
+            let buf = crate::owner_state_crypto::encode_fleet_material_set(std::slice::from_ref(
+                material,
+            ))
+            .map_err(|e| format!("encode fleet keytree for persist: {e}"))?;
             crate::owner_state::save_fleet_keytree(&fleet_keychain, identity_dir, &buf)?;
         }
         None => {
@@ -291,9 +294,11 @@ mod tests {
         let loaded = crate::owner_state::load_fleet_keytree(&None, dir.path())
             .unwrap()
             .expect("fleet keytree present after install");
-        let m: crate::owner_state_crypto::FleetKeyMaterial =
-            ciborium::from_reader(loaded.as_slice()).unwrap();
-        let kt2 = KeyTree::from_fleet_material(&m).unwrap();
+        // ZEB-668 S5: the slot persists the multi-epoch set encoding; a
+        // pairing handover installs a 1-set.
+        let set = crate::owner_state_crypto::decode_fleet_material_set(loaded.as_slice()).unwrap();
+        assert_eq!(set.len(), 1, "pairing handover installs exactly one epoch");
+        let kt2 = KeyTree::from_fleet_material(&set[0]).unwrap();
         let lk2 = space_lookup_key(&kt2, b"dm-inbox-v1");
         assert_eq!(
             decrypt_entry(&kt2, &lk2, &ciphertext).unwrap(),

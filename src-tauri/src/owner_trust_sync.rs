@@ -600,7 +600,7 @@ mod tests {
                   pub_tx: mpsc::Sender<Vec<u8>>,
                   sub_rx: mpsc::Receiver<Vec<u8>>| {
             Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-                kt: Arc::clone(&kt),
+                keys: crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt)),
                 device_id: name.to_string(),
                 state: Arc::clone(doc),
                 merger: trust_merger(),

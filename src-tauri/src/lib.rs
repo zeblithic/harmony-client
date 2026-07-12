@@ -4337,39 +4337,84 @@ pub async fn start_node_inner(
         // (graceful fallback: pre-ZEB-492 paired devices, or material delivery
         // failed). No seed-only capability lives in the engine block, so a
         // cert-only device building engines here cannot mint/sign-certs/recover.
-        let fleet_kt: Option<std::sync::Arc<crate::owner_state_crypto::KeyTree>> =
-            match owner_loaded.as_ref() {
-                Some(loaded) => {
-                    if let Some(seed) = loaded.master_seed.as_ref() {
-                        Some(std::sync::Arc::new(
-                            crate::owner_state_crypto::KeyTree::derive(seed)
-                                .map_err(|e| format!("KeyTree::derive: {e}"))?,
-                        ))
-                    } else {
-                        // ZEB-492 (Qodo/CodeAnt round 1, FIX E): `from_fleet_material`
-                        // is now fallible (rejects corrupt/future-epoch material). A
-                        // rejection is a graceful no-fleet boot, NOT a hard boot
-                        // failure — keep the seed-first precedence and degrade like
-                        // the "no material at all" case rather than crashing.
-                        loaded.fleet_keytree.as_ref().and_then(|material| {
-                            match crate::owner_state_crypto::KeyTree::from_fleet_material(material) {
-                                Ok(kt) => Some(std::sync::Arc::new(kt)),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "fleet KeyTree unusable ({e}); booting without fleet engines"
-                                    );
-                                    None
-                                }
+        //
+        // ZEB-668 S5: two artifacts come out of this gate.
+        //  - The PINNED tree (`.0`): the lowest-epoch installed tree — epoch 0
+        //    by the vault invariant. It keys the epoch-independent surfaces:
+        //    the friend-secret domain (blobs sealed once and stored durably in
+        //    the CRDT — rotating them would orphan every stored secret) and
+        //    the fleet-keys carrier dataset (every enrolled device must always
+        //    be able to read it to LEARN of newer epochs).
+        //  - The swappable `FleetKeySet` (`.1`): all installed epochs, threaded
+        //    into every fleet dataset engine (publish newest / decrypt across
+        //    the dual-epoch window). A seed-holder boots with {0} and catches
+        //    up to the current epoch from the carrier replay; a cert-only
+        //    device installs every epoch its vault slot holds.
+        let fleet_crypto: Option<(
+            std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+            crate::owner_state_crypto::FleetKeySet,
+        )> = match owner_loaded.as_ref() {
+            Some(loaded) => {
+                if let Some(seed) = loaded.master_seed.as_ref() {
+                    let kt0 = std::sync::Arc::new(
+                        crate::owner_state_crypto::KeyTree::derive(seed)
+                            .map_err(|e| format!("KeyTree::derive: {e}"))?,
+                    );
+                    let keys =
+                        crate::owner_state_crypto::FleetKeySet::new(std::sync::Arc::clone(&kt0));
+                    Some((kt0, keys))
+                } else {
+                    // ZEB-492 (Qodo/CodeAnt round 1, FIX E): `from_fleet_material`
+                    // is fallible (rejects corrupt material). A rejection is a
+                    // graceful no-fleet boot, NOT a hard boot failure — keep the
+                    // seed-first precedence and degrade like the "no material at
+                    // all" case rather than crashing. With a multi-epoch slot a
+                    // single bad entry only drops that epoch.
+                    loaded.fleet_keytree.as_ref().and_then(|materials| {
+                        let mut trees: Vec<std::sync::Arc<crate::owner_state_crypto::KeyTree>> =
+                            Vec::new();
+                        for material in materials {
+                            match crate::owner_state_crypto::KeyTree::from_fleet_material(material)
+                            {
+                                Ok(kt) => trees.push(std::sync::Arc::new(kt)),
+                                Err(e) => tracing::warn!(
+                                    "fleet KeyTree material unusable ({e}); skipping that epoch"
+                                ),
                             }
-                        })
-                    }
+                        }
+                        // Pinned = lowest epoch (epoch 0 by the vault invariant:
+                        // epoch-0 material is never pruned).
+                        let kt0 = trees
+                            .iter()
+                            .min_by_key(|k| k.epoch)
+                            .map(std::sync::Arc::clone);
+                        match kt0 {
+                            Some(kt0) => {
+                                let mut iter = trees.into_iter();
+                                let keys = crate::owner_state_crypto::FleetKeySet::new(
+                                    iter.next().expect("trees non-empty"),
+                                );
+                                for kt in iter {
+                                    keys.install(kt);
+                                }
+                                Some((kt0, keys))
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "no usable fleet KeyTree material; booting without fleet engines"
+                                );
+                                None
+                            }
+                        }
+                    })
                 }
-                None => None,
-            };
+            }
+            None => None,
+        };
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
-                if let Some(kt) = fleet_kt.clone() {
+                if let Some((kt, keys)) = fleet_crypto.clone() {
                     let device_id = loaded
                         .device_signing_key
                         .verifying_key()
@@ -4524,7 +4569,7 @@ pub async fn start_node_inner(
                         std::sync::Arc::new(crate::dm_outbox::DepositOnlyDmTransport);
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
-                        std::sync::Arc::clone(&kt),
+                        keys.clone(),
                         device_id.clone(),
                         std::sync::Arc::clone(&crdt_state),
                         std::sync::Arc::clone(&tracker),
@@ -4663,7 +4708,7 @@ pub async fn start_node_inner(
                             }
                         };
                         let (mint_engine, _mint_handle) = crate::mint_sync::MintSyncEngine::new(
-                            std::sync::Arc::clone(&kt),
+                            keys.clone(),
                             device_id.clone(),
                             mint_db_for_engine,
                             std::sync::Arc::clone(&content_store),
@@ -4731,7 +4776,7 @@ pub async fn start_node_inner(
                     let notes_app = app.clone();
                     let notes_sync = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                         crate::fleet_sync::FleetSyncConfig {
-                            kt: std::sync::Arc::clone(&kt),
+                            keys: keys.clone(),
                             device_id: device_id.clone(),
                             state: std::sync::Arc::clone(&notes_doc),
                             merger: notes_merger,
@@ -4808,7 +4853,7 @@ pub async fn start_node_inner(
                     let dm_inbox_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                kt: std::sync::Arc::clone(&kt),
+                                keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&dm_inbox_doc),
                                 merger: dm_inbox_merger,
@@ -4934,7 +4979,7 @@ pub async fn start_node_inner(
                     let community_device_intro_sync = std::sync::Arc::new(
                         crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                kt: std::sync::Arc::clone(&kt),
+                                keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&community_device_intro_doc),
                                 merger: community_device_intro_merger,
@@ -5026,7 +5071,7 @@ pub async fn start_node_inner(
                     let relay_hold_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                kt: std::sync::Arc::clone(&kt),
+                                keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&relay_hold_doc),
                                 merger: relay_hold_merger,
@@ -5073,7 +5118,7 @@ pub async fn start_node_inner(
                     let relay_optin_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                kt: std::sync::Arc::clone(&kt),
+                                keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&relay_optin_doc),
                                 merger: relay_optin_merger,
@@ -5159,7 +5204,7 @@ pub async fn start_node_inner(
                     let dm_outhold_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                kt: std::sync::Arc::clone(&kt),
+                                keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&dm_outhold_doc),
                                 merger: dm_outhold_merger,
@@ -5265,7 +5310,7 @@ pub async fn start_node_inner(
                     let fleet_net_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                kt: std::sync::Arc::clone(&kt),
+                                keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&fleet_net_doc),
                                 merger: fleet_net_merger,
@@ -5422,7 +5467,7 @@ pub async fn start_node_inner(
                     let owner_trust_sync = std::sync::Arc::new(
                         crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                kt: std::sync::Arc::clone(&kt),
+                                keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&owner_trust_doc),
                                 merger: crate::owner_trust_sync::trust_merger(),
@@ -36933,7 +36978,7 @@ mod zeb427_leave_left_at_tests {
         }
 
         let engine = crate::owner_state_sync::SyncEngine::new(
-            kt,
+            crate::owner_state_crypto::FleetKeySet::new(kt),
             "left-at-test-dev".into(),
             std::sync::Arc::clone(&state),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
@@ -48817,7 +48862,7 @@ mod zeb427_fence_tests {
         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let engine = crate::owner_state_sync::SyncEngine::new(
-            kt,
+            crate::owner_state_crypto::FleetKeySet::new(kt),
             "fence-test-dev".into(),
             std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::owner_state_crdt::OwnerState::default(),

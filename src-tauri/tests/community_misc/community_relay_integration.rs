@@ -185,7 +185,7 @@ fn build_relay_engine(device_id: &str, persist: Arc<dyn FleetPersist<RelayHoldDo
     let kt = Arc::new(KeyTree::derive(&[0xAA; 32]).expect("kt"));
     let merger: Merger<RelayHoldDoc> = Arc::new(|l: &mut RelayHoldDoc, r| l.merge_from(r));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-        kt,
+        keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
         device_id: device_id.to_string(),
         state: Arc::clone(&doc),
         merger,
@@ -222,7 +222,7 @@ fn build_relay_engine_from_doc(
     let kt = Arc::new(KeyTree::derive(&[0xAA; 32]).expect("kt"));
     let merger: Merger<RelayHoldDoc> = Arc::new(|l: &mut RelayHoldDoc, r| l.merge_from(r));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-        kt,
+        keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
         device_id: device_id.to_string(),
         state: Arc::clone(&doc),
         merger,

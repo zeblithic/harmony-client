@@ -2,7 +2,7 @@
 
 use crate::mint_sync_types::MintSyncState;
 use crate::mint_sync_types::{AccountRow, MintSnapshot, MintSyncError, SettingRow, TransactionRow};
-use crate::owner_state_crypto::KeyTree;
+use crate::owner_state_crypto::FleetKeySet;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -415,7 +415,7 @@ impl MintSyncEngine {
     ///   encrypted snapshot blobs. In production this is RuntimeContentStore.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        kt: Arc<KeyTree>,
+        keys: FleetKeySet,
         device_id: String,
         mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
         content_store: Arc<dyn crate::content_store::ContentStore>,
@@ -440,7 +440,7 @@ impl MintSyncEngine {
         let handle = tokio::spawn(internal_task_zenoh(
             shared.clone(),
             sync_state_path,
-            kt,
+            keys,
             device_id,
             dirty_for_task,
             flush_rx,
@@ -713,7 +713,7 @@ async fn publish_root_now(
 async fn internal_task_zenoh(
     shared: EngineShared,
     sync_state_path: std::path::PathBuf,
-    kt: Arc<KeyTree>,
+    keys: FleetKeySet,
     device_id: String,
     dirty: Arc<Notify>,
     mut flush_rx: mpsc::Receiver<()>,
@@ -759,7 +759,7 @@ async fn internal_task_zenoh(
                     &content_store,
                     &sync_state,
                     &sync_state_path,
-                    &kt,
+                    &keys,
                     &device_id,
                     &publisher_tx,
                 )
@@ -775,7 +775,7 @@ async fn internal_task_zenoh(
                     &content_store,
                     &sync_state,
                     &sync_state_path,
-                    &kt,
+                    &keys,
                     &device_id,
                     &publisher_tx,
                 )
@@ -796,7 +796,7 @@ async fn internal_task_zenoh(
                 if let Err(e) = handle_incoming_publish_zenoh(
                     &bytes,
                     &shared,
-                    &kt,
+                    &keys,
                     &device_id,
                     &sync_state_path,
                 )
@@ -812,7 +812,7 @@ async fn internal_task_zenoh(
                     &content_store,
                     &sync_state,
                     &sync_state_path,
-                    &kt,
+                    &keys,
                     &device_id,
                     &publisher_tx,
                 )
@@ -862,7 +862,7 @@ async fn publish_root_now_zenoh(
     content_store: &Arc<dyn crate::content_store::ContentStore>,
     sync_state: &Arc<TokioMutex<MintSyncState>>,
     sync_state_path: &std::path::Path,
-    kt: &Arc<KeyTree>,
+    keys: &FleetKeySet,
     device_id: &str,
     publisher_tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), MintSyncError> {
@@ -899,8 +899,10 @@ async fn publish_root_now_zenoh(
         .map_err(|e| MintSyncError::Cbor(format!("zenoh publish encode: {e}")))?;
 
     // 3. Encrypt the snapshot blob (deterministic nonce, for CID stability).
-    let lookup = crate::owner_state_crypto::space_lookup_key(kt, b"mint-ledger-v1");
-    let ciphertext = crate::owner_state_crypto::encrypt_entry(kt, &lookup, &cbor)
+    //    Publish always uses the newest installed epoch (ZEB-668 S5).
+    let kt = keys.newest();
+    let lookup = crate::owner_state_crypto::space_lookup_key(&kt, b"mint-ledger-v1");
+    let ciphertext = crate::owner_state_crypto::encrypt_entry(&kt, &lookup, &cbor)
         .map_err(|e| MintSyncError::Crypto(format!("encrypt_entry: {e}")))?;
 
     // 4. Derive CID from ciphertext (not cleartext — mirrors decrypt side).
@@ -920,8 +922,8 @@ async fn publish_root_now_zenoh(
     ciborium::into_writer(&payload, &mut payload_bytes)
         .map_err(|e| MintSyncError::Cbor(format!("zenoh payload encode: {e}")))?;
 
-    // 7. Encrypt the envelope (random nonce).
-    let wire = crate::owner_state_crypto::encrypt_root_publish(kt, &payload_bytes)
+    // 7. Encrypt the envelope (random nonce; same epoch as the blob).
+    let wire = crate::owner_state_crypto::encrypt_root_publish(&kt, &payload_bytes)
         .map_err(|e| MintSyncError::Crypto(format!("encrypt_root_publish: {e}")))?;
 
     // 8. Forward to event_loop's Zenoh bridge.
@@ -967,16 +969,30 @@ async fn publish_root_now_zenoh(
 async fn handle_incoming_publish_zenoh(
     wire: &[u8],
     shared: &EngineShared,
-    kt: &Arc<KeyTree>,
+    keys: &FleetKeySet,
     device_id: &str,
     sync_state_path: &std::path::Path,
 ) -> Result<(), MintSyncError> {
     let sync_state = &shared.sync_state;
     let content_store = &shared.content_store;
 
-    // 1. Decrypt the root-publish envelope.
-    let payload_bytes = crate::owner_state_crypto::decrypt_root_publish(kt, wire)
-        .map_err(|e| MintSyncError::Crypto(format!("decrypt_root_publish: {e}")))?;
+    // 1. Decrypt the root-publish envelope, trying every installed epoch
+    //    newest-first (ZEB-668 S5 dual-epoch read window). The winner is
+    //    bound for the blob decrypt below — a publish is single-epoch.
+    let (kt, payload_bytes) = keys
+        .accept_set()
+        .into_iter()
+        .find_map(|candidate| {
+            crate::owner_state_crypto::decrypt_root_publish(&candidate, wire)
+                .ok()
+                .map(|b| (candidate, b))
+        })
+        .ok_or_else(|| {
+            MintSyncError::Crypto(format!(
+                "decrypt_root_publish: no installed epoch opened it (epochs {:?})",
+                keys.epochs()
+            ))
+        })?;
     let payload: crate::mint_sync_types::MintRootPublishPayload =
         ciborium::from_reader(&payload_bytes[..])
             .map_err(|e| MintSyncError::Cbor(format!("envelope decode: {e}")))?;
@@ -1020,8 +1036,8 @@ async fn handle_incoming_publish_zenoh(
     };
 
     // 5a. Decrypt the blob.
-    let lookup = crate::owner_state_crypto::space_lookup_key(kt, b"mint-ledger-v1");
-    let blob_cleartext = crate::owner_state_crypto::decrypt_entry(kt, &lookup, &blob_ciphertext)
+    let lookup = crate::owner_state_crypto::space_lookup_key(&kt, b"mint-ledger-v1");
+    let blob_cleartext = crate::owner_state_crypto::decrypt_entry(&kt, &lookup, &blob_ciphertext)
         .map_err(|e| MintSyncError::Crypto(format!("decrypt_entry: {e}")))?;
 
     // 5b. Decode the snapshot.

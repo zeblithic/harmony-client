@@ -28,10 +28,12 @@
 //!     publishing recently); SP2 refines "online" with liveness/presence.
 
 use crate::content_store::{ContentStore, ContentStoreError};
+#[cfg(test)]
+use crate::owner_state_crypto::KeyTree;
 use crate::owner_state_crypto::{
     canonical_cbor_decode, canonical_cbor_encode, decrypt_entry, decrypt_root_publish,
     encrypt_entry, encrypt_root_publish, sealed::CanonicalPayloadSealed, space_lookup_key,
-    CanonicalPayload, KeyTree,
+    CanonicalPayload, FleetKeySet,
 };
 use crate::owner_state_types::Hlc;
 use harmony_content::cid::ContentId;
@@ -116,8 +118,12 @@ pub trait FleetPersist<S>: Send + Sync {
 /// collaborator (state, merger, durability sink, transport channels,
 /// CAS) is injected so the engine itself is consumer-agnostic.
 pub struct FleetSyncConfig<S> {
-    /// AEAD key tree (derives entry + root keys).
-    pub kt: Arc<KeyTree>,
+    /// Installed fleet KeyTrees (ZEB-668 S5). Publishes use the newest
+    /// epoch; inbound decrypts try every installed epoch (dual-epoch read
+    /// window during a fleet key rotation). Engines whose dataset never
+    /// rotates (the fleet-keys carrier itself) pass a 1-set that is never
+    /// swapped.
+    pub keys: FleetKeySet,
     /// Local device id — the HLC source for our own publishes.
     pub device_id: String,
     /// Shared replicated dataset.
@@ -205,7 +211,7 @@ where
         let device_id = config.device_id.clone();
 
         let task = tokio::spawn(internal_task(Ctx {
-            kt: config.kt,
+            keys: config.keys,
             device_id: config.device_id,
             state: config.state,
             merger: config.merger,
@@ -363,7 +369,7 @@ where
 /// injected `merger`, `persist`, `lookup_key_tag`, `publish_seen`,
 /// `on_applied`, and `sibling_acks` plus the generic dataset `S`.
 struct Ctx<S> {
-    kt: Arc<KeyTree>,
+    keys: FleetKeySet,
     device_id: String,
     state: Arc<Mutex<S>>,
     merger: Merger<S>,
@@ -570,9 +576,12 @@ where
 
     // 2. Encrypt with deterministic per-entry AEAD using the fixed
     //    root-blob lookup key, so the cipher CID is reproducible across
-    //    two devices encrypting the same state.
-    let lookup = space_lookup_key(&ctx.kt, ctx.lookup_key_tag);
-    let blob_ciphertext = encrypt_entry(&ctx.kt, &lookup, &blob_cleartext)
+    //    two devices encrypting the same state. Publish always uses the
+    //    newest installed epoch (ZEB-668 S5); the whole publish (entry +
+    //    root envelope) is single-epoch by construction.
+    let kt = ctx.keys.newest();
+    let lookup = space_lookup_key(&kt, ctx.lookup_key_tag);
+    let blob_ciphertext = encrypt_entry(&kt, &lookup, &blob_cleartext)
         .map_err(|e| SyncError::Crypto(e.to_string()))?;
 
     // 3. cipher CID = structured ContentId over the ciphertext. The
@@ -614,9 +623,9 @@ where
     let payload_bytes =
         canonical_cbor_encode(&payload).map_err(|e| SyncError::CborEncode(e.to_string()))?;
 
-    // 6. Encrypt with random-nonce root AEAD.
-    let wire = encrypt_root_publish(&ctx.kt, &payload_bytes)
-        .map_err(|e| SyncError::Crypto(e.to_string()))?;
+    // 6. Encrypt with random-nonce root AEAD (same epoch as the entry).
+    let wire =
+        encrypt_root_publish(&kt, &payload_bytes).map_err(|e| SyncError::Crypto(e.to_string()))?;
 
     // 7. Send onto the outbound channel.
     ctx.publisher_tx
@@ -721,12 +730,34 @@ async fn handle_incoming_publish<S>(ctx: &mut Ctx<S>, wire: Vec<u8>) -> Inbound
 where
     S: CanonicalPayload + serde::de::DeserializeOwned + Clone + Send + 'static,
 {
-    // 1. Decrypt the wire payload.
-    let payload_bytes = match decrypt_root_publish(&ctx.kt, &wire) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(error = %e, "incoming publish dropped: decrypt_root_publish");
-            return Inbound::Dropped;
+    // 1. Decrypt the wire payload, trying every installed epoch newest-first
+    //    (ZEB-668 S5 dual-epoch read window). A publish is entirely
+    //    single-epoch, so whichever tree opens the root envelope is bound
+    //    for the entry decrypt below.
+    let (kt, payload_bytes) = {
+        let mut opened = None;
+        let mut last_err = None;
+        for candidate in ctx.keys.accept_set() {
+            match decrypt_root_publish(&candidate, &wire) {
+                Ok(b) => {
+                    opened = Some((candidate, b));
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match opened {
+            Some(pair) => pair,
+            None => {
+                // One log for the whole accept set — per-candidate failures
+                // are expected during a rotation window, not noteworthy.
+                tracing::warn!(
+                    error = %last_err.map(|e| e.to_string()).unwrap_or_default(),
+                    epochs = ?ctx.keys.epochs(),
+                    "incoming publish dropped: decrypt_root_publish (no installed epoch opened it)"
+                );
+                return Inbound::Dropped;
+            }
         }
     };
     // 2. Decode the envelope.
@@ -776,9 +807,10 @@ where
         }
     };
 
-    // 6. Decrypt with the same lookup key the publisher used.
-    let lookup = space_lookup_key(&ctx.kt, ctx.lookup_key_tag);
-    let blob_cleartext = match decrypt_entry(&ctx.kt, &lookup, &blob_ciphertext) {
+    // 6. Decrypt with the same lookup key the publisher used — under the
+    //    epoch that opened the root envelope in step 1.
+    let lookup = space_lookup_key(&kt, ctx.lookup_key_tag);
+    let blob_cleartext = match decrypt_entry(&kt, &lookup, &blob_ciphertext) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "incoming publish dropped: blob decrypt");
@@ -968,12 +1000,21 @@ mod engine_tests {
     }
 
     fn build_engine(device_id: &str, cas: Arc<dyn ContentStore>, publish_seen: bool) -> Built {
+        build_engine_with_keys(device_id, cas, publish_seen, FleetKeySet::new(make_kt()))
+    }
+
+    fn build_engine_with_keys(
+        device_id: &str,
+        cas: Arc<dyn ContentStore>,
+        publish_seen: bool,
+        keys: FleetKeySet,
+    ) -> Built {
         let (out_tx, out_rx) = mpsc::channel(64);
         let (in_tx, in_rx) = mpsc::channel(64);
         let state = Arc::new(Mutex::new(ToyDoc::default()));
         let tracker = Arc::new(Mutex::new(BTreeMap::new()));
         let engine = FleetSyncEngine::new(FleetSyncConfig {
-            kt: make_kt(),
+            keys,
             device_id: device_id.to_string(),
             state: Arc::clone(&state),
             merger: Arc::new(|local: &mut ToyDoc, remote: ToyDoc| toy_merge(local, remote)),
@@ -1051,7 +1092,7 @@ mod engine_tests {
         let tracker = Arc::new(Mutex::new(BTreeMap::new()));
         let persist = RecordingPersist::default();
         let engine = FleetSyncEngine::new(FleetSyncConfig {
-            kt: make_kt(),
+            keys: FleetKeySet::new(make_kt()),
             device_id: device_id.to_string(),
             state: Arc::clone(&state),
             merger: Arc::new(|local: &mut ToyDoc, remote: ToyDoc| toy_merge(local, remote)),
@@ -1242,6 +1283,78 @@ mod engine_tests {
             released,
             "internal task was not aborted on drop — its state clone leaked"
         );
+    }
+
+    /// ZEB-668 S5: a publish encrypted under epoch-1 keys converges on a
+    /// receiver whose accept set holds {0, 1}, and is dropped by a receiver
+    /// holding only {0} (post-rotation exclusion — the revoked-device case).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dual_epoch_window_accepts_newer_epoch_and_old_only_set_drops_it() {
+        let seed = [0u8; 32];
+        let e0 = || Arc::new(KeyTree::derive_at_epoch(&seed, 0).expect("e0"));
+        let e1 = || Arc::new(KeyTree::derive_at_epoch(&seed, 1).expect("e1"));
+
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        // Publisher on epoch 1 only.
+        let a = build_engine_with_keys("dev-A", Arc::clone(&cas), false, FleetKeySet::new(e1()));
+        // Receiver B: dual-epoch window {1, 0}.
+        let b_keys = FleetKeySet::new(e0());
+        b_keys.install(e1());
+        let b = build_engine_with_keys("dev-B", Arc::clone(&cas), false, b_keys);
+        // Receiver C: epoch 0 only (e.g. a device that never installed the bump).
+        let c = build_engine_with_keys("dev-C", Arc::clone(&cas), false, FleetKeySet::new(e0()));
+
+        // Fan A's publishes out to BOTH receivers.
+        let mut a = a;
+        let b_in = b.in_tx.clone();
+        let c_in = c.in_tx.clone();
+        let mut a_out = std::mem::replace(&mut a.out_rx, mpsc::channel(1).1);
+        let forwarder = tokio::spawn(async move {
+            while let Some(frame) = a_out.recv().await {
+                let _ = b_in.send(frame.clone()).await;
+                let _ = c_in.send(frame).await;
+            }
+        });
+
+        {
+            let mut doc = a.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "rotated".into(),
+                },
+            );
+        }
+        a.engine.flush_now().await.expect("flush A");
+
+        let b_state = Arc::clone(&b.state);
+        let converged = wait_until(
+            || {
+                let b_state = Arc::clone(&b_state);
+                async move {
+                    let doc = b_state.lock().await;
+                    doc.entries.get("k1").is_some_and(|e| e.val == "rotated")
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(converged, "dual-epoch receiver did not converge within 5s");
+
+        // C (epoch 0 only) must NOT have applied the epoch-1 publish. B has
+        // already converged on the same frames, so C has had its chance.
+        let c_doc = c.state.lock().await;
+        assert!(
+            c_doc.entries.is_empty(),
+            "old-only key set must drop an epoch-1 publish"
+        );
+        drop(c_doc);
+
+        let _ = a.engine.shutdown().await;
+        let _ = b.engine.shutdown().await;
+        let _ = c.engine.shutdown().await;
+        forwarder.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

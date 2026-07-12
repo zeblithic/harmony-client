@@ -401,9 +401,11 @@ pub struct LoadedOwnerState {
     /// Wrapped in `Zeroizing` so the seed is wiped on drop — matches the
     /// token cache's `Zeroizing<[u8; 32]>` discipline.
     pub master_seed: Option<Zeroizing<[u8; 32]>>,
-    /// Distributed fleet KeyTree (ZEB-492). `Some` on a cert-only enrolled device
-    /// given the KeyTree at pairing; `None` on the minting device + pre-ZEB-492 devices.
-    pub fleet_keytree: Option<crate::owner_state_crypto::FleetKeyMaterial>,
+    /// Distributed fleet KeyTree material set (ZEB-492; multi-epoch since
+    /// ZEB-668 S5 — epoch-0 + current, + previous during a bump window).
+    /// `Some` (non-empty) on a cert-only enrolled device given the KeyTree at
+    /// pairing; `None` on the minting device + pre-ZEB-492 devices.
+    pub fleet_keytree: Option<Vec<crate::owner_state_crypto::FleetKeyMaterial>>,
 }
 
 // Manual Debug so test assertions can use `.expect()` / `.expect_err()` WITHOUT
@@ -421,10 +423,12 @@ impl std::fmt::Debug for LoadedOwnerState {
             )
             .field(
                 "fleet_keytree",
-                &self
-                    .fleet_keytree
-                    .as_ref()
-                    .map(|m| format!("<redacted epoch={}>", m.epoch)),
+                &self.fleet_keytree.as_ref().map(|set| {
+                    format!(
+                        "<redacted epochs={:?}>",
+                        set.iter().map(|m| m.epoch).collect::<Vec<_>>()
+                    )
+                }),
             )
             .finish()
     }
@@ -484,10 +488,8 @@ pub fn load_owner_state(
     } else {
         match load_fleet_keytree(&keychain, identity_dir)? {
             Some(bytes) => Some(
-                ciborium::from_reader::<crate::owner_state_crypto::FleetKeyMaterial, _>(
-                    bytes.as_slice(),
-                )
-                .map_err(|e| format!("decode fleet_keytree: {e}"))?,
+                crate::owner_state_crypto::decode_fleet_material_set(bytes.as_slice())
+                    .map_err(|e| format!("decode fleet_keytree: {e}"))?,
             ),
             None => None,
         }

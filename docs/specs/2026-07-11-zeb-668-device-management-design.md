@@ -267,6 +267,19 @@ amendments below supersede the corresponding bullets above.
    (pre-S5 revocations included — those devices really can still decrypt,
    so showing stale is the honest state). Seed-holder panel offers the
    manual bump; other devices show a passive note.
+6. **The friend-secret domain stays pinned to the epoch-0 tree**
+   (implementation-time amendment). Friend secrets are sealed once and
+   stored durably in the owner-state CRDT; rotating `friend_aead` would
+   orphan every stored secret at window close unless the bump re-sealed
+   them all. Rotation buys nothing there: a revoked device cannot RECEIVE
+   new CRDT states post-rotation (the wire keys rotate), and it already
+   knows the secrets it decrypted before revocation. Residual risk (a
+   revoked device that somehow obtains post-revocation CRDT bytes out of
+   band could open friend-secret blobs) is accepted and recorded in the
+   §8 ledger; a re-seal migration is a §9 follow-up candidate. All fleet
+   *dataset* engines (owner-state, fleet-net, trust, notes, DM-inbox,
+   DM-outhold, relay-hold, mint, …) rotate — ground truth found nine
+   dataset engines sharing the fleet tree, not the three §6 names.
 
 ## §7 S6 — "Replace this device" (the rotation answer)
 
@@ -287,6 +300,7 @@ out of scope and the spec says so in UI-adjacent docs.
 | Removed device's data is gone | Local data on that device persists until its owner wipes it | Terminal-state copy on the revoked device says so |
 | Enrollment is quorum-protected | N=1 master-signed today | Recorded here for the quorum follow-up; no UI claim made |
 | Epoch bump cuts a revoked device off completely | It still reads the epoch-0 `fleet-keys-v1` carrier: epoch counter, bump times, device-id list, sealed blobs it cannot open. No key material, trust state, or content | §6.1 amendment 1; accepted metadata leak, documented here |
+| Epoch bump rotates every fleet key | The friend-secret domain (`friend_aead`) stays on the epoch-0 tree — stored blobs would otherwise be orphaned. A revoked device that obtains post-rotation CRDT bytes out of band could open friend-secret blobs (it cannot receive them via sync) | §6.1 amendment 6; re-seal migration is a follow-up candidate |
 
 ## §9 Follow-up tickets (file at implementation end, use assigned IDs)
 
