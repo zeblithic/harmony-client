@@ -4457,11 +4457,25 @@ pub async fn start_node_inner(
                             .map(std::sync::Arc::clone);
                         match kt0 {
                             Some(kt0) => {
-                                let mut iter = trees.into_iter();
+                                // Data accept set: epoch-0 participates ONLY
+                                // when it is the sole epoch (pre-bump fleet).
+                                // Once any higher epoch exists in the vault, a
+                                // reboot must not re-admit epoch-0 data
+                                // publishes — a revoked device holds epoch-0
+                                // forever; the post-close prune keeps epoch-0
+                                // purely as the carrier key. (First-bump
+                                // stragglers mid-window degrade to CRDT
+                                // catch-up once they install N+1.)
+                                let max_epoch = trees.iter().map(|k| k.epoch).max().unwrap_or(0);
+                                let mut data_trees = trees
+                                    .into_iter()
+                                    .filter(|k| k.epoch != 0 || max_epoch == 0);
                                 let keys = crate::owner_state_crypto::FleetKeySet::new(
-                                    iter.next().expect("trees non-empty"),
+                                    data_trees
+                                        .next()
+                                        .expect("vault holds at least one non-excluded epoch"),
                                 );
-                                for kt in iter {
+                                for kt in data_trees {
                                     keys.install(kt);
                                 }
                                 Some((kt0, keys))
@@ -8420,6 +8434,12 @@ pub async fn start_node_inner(
                         let hlc_tracker = std::sync::Arc::clone(&tracker);
                         let republish_device_id = device_id.clone();
                         let ep_opt = iroh_endpoint_arc.clone();
+                        // ZEB-668 S5: window-close check handles.
+                        let window_keys = keys.clone();
+                        let window_carrier = std::sync::Arc::clone(&fleet_keys_doc);
+                        let window_trust = std::sync::Arc::clone(&owner_trust_doc);
+                        let window_identity_dir = identity_dir.clone();
+                        let window_is_seed_holder = loaded.master_seed.is_some();
                         // ZEB-516: captured so the periodic identity (case-B)
                         // republish reads the persisted discoverable setting.
                         let connectivity_settings_path = connectivity_settings_path.clone();
@@ -8438,6 +8458,10 @@ pub async fn start_node_inner(
                             let device_id = republish_device_id.clone();
                             let ep_opt = ep_opt.clone();
                             let connectivity_settings_path = connectivity_settings_path.clone();
+                            let window_keys = window_keys.clone();
+                            let window_carrier = std::sync::Arc::clone(&window_carrier);
+                            let window_trust = std::sync::Arc::clone(&window_trust);
+                            let window_identity_dir = window_identity_dir.clone();
                             tokio::spawn(async move {
                                 // 1. Fleet-net self-row re-stamp (fresh
                                 //    seen_at + current relay), mirroring the
@@ -8475,6 +8499,109 @@ pub async fn start_node_inner(
                                             .unwrap_or_else(|p| p.into_inner()) = doc.clone();
                                     }
                                     fleet_engine.notify_dirty();
+                                }
+                                // 1b. ZEB-668 S5: dual-epoch window close. When
+                                //     more than one epoch is installed, drop the
+                                //     old one once every surviving device's
+                                //     fleet-net seen_at postdates the bump, or
+                                //     after 7 days — whichever comes first.
+                                if window_keys.epochs().len() > 1 {
+                                    let (bump_ms, _carrier_epoch) = {
+                                        let doc = window_carrier.lock().await;
+                                        (doc.bump_wall_ms, doc.epoch)
+                                    };
+                                    if bump_ms > 0 {
+                                        let survivor_seen: Vec<Option<u64>> = {
+                                            let trust = window_trust.lock().await;
+                                            let rows = fleet_doc.lock().await;
+                                            trust
+                                                .enrollments
+                                                .iter()
+                                                .filter(|(id, _)| !trust.is_revoked(**id))
+                                                .map(|(_, cert)| {
+                                                    let vk_hex = hex::encode(
+                                                        cert.device_pubkeys
+                                                            .classical
+                                                            .ed25519_verify,
+                                                    );
+                                                    rows.devices
+                                                        .get(&vk_hex)
+                                                        .map(|r| r.seen_at.wall_ms)
+                                                })
+                                                .collect()
+                                        };
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                            as u64;
+                                        if crate::owner_commands::fleet_epoch_window_should_close(
+                                            bump_ms,
+                                            now_ms,
+                                            &survivor_seen,
+                                        ) {
+                                            window_keys.retain_newest_only();
+                                            tracing::info!(
+                                                epoch = window_keys.newest().epoch,
+                                                "fleet epoch window closed; old epoch dropped from accept set"
+                                            );
+                                            // Cert-only devices rewrite the vault
+                                            // to {epoch-0, current} (epoch-0 keys
+                                            // the carrier forever; seed-holders
+                                            // never read the slot).
+                                            if !window_is_seed_holder {
+                                                let dir = window_identity_dir.clone();
+                                                let keys_for_prune = window_keys.clone();
+                                                let prune = tokio::task::spawn_blocking(move || {
+                                                    let mut materials: Vec<_> = keys_for_prune
+                                                        .accept_set()
+                                                        .iter()
+                                                        .map(|k| k.to_fleet_material())
+                                                        .collect();
+                                                    if !materials.iter().any(|m| m.epoch == 0) {
+                                                        // Re-read epoch-0 from the existing slot.
+                                                        if let Ok(Some(bytes)) =
+                                                            crate::owner_state::load_fleet_keytree(
+                                                                &crate::identity::KeychainStore::new().ok(),
+                                                                &dir,
+                                                            )
+                                                        {
+                                                            if let Ok(old_set) =
+                                                                crate::owner_state_crypto::decode_fleet_material_set(&bytes)
+                                                            {
+                                                                materials.extend(
+                                                                    old_set
+                                                                        .into_iter()
+                                                                        .filter(|m| m.epoch == 0),
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    let bytes =
+                                                        crate::owner_state_crypto::encode_fleet_material_set(
+                                                            &materials,
+                                                        )?;
+                                                    crate::owner_state::save_fleet_keytree(
+                                                        &crate::identity::KeychainStore::new().ok(),
+                                                        &dir,
+                                                        &bytes,
+                                                    )
+                                                })
+                                                .await;
+                                                match prune {
+                                                    Ok(Ok(())) => {}
+                                                    Ok(Err(e)) => tracing::warn!(
+                                                        error = %e,
+                                                        "fleet epoch window: vault prune failed (retries next tick)"
+                                                    ),
+                                                    Err(e) => tracing::warn!(
+                                                        error = %e,
+                                                        "fleet epoch window: vault prune task panicked"
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 // 2. Identity (case B) — re-publish whenever the
                                 //    user has opted in, read from the PERSISTED
@@ -56175,6 +56302,113 @@ async fn set_device_petname(
     .await
 }
 
+/// ZEB-668 S5: NodeState-level core of the fleet-epoch bump (GUI +
+/// headless RPC share it). Seed-holder only ("notMaster:" otherwise):
+/// loads the seed, plans epoch N+1 against the resident trust doc +
+/// carrier, adopts the signed doc into the resident carrier, installs the
+/// new tree into the shared key set, and flushes the carrier engine.
+/// Returns the new epoch.
+pub(crate) async fn bump_fleet_epoch_impl(
+    state: &Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+) -> Result<u32, String> {
+    let (carrier_doc_arc, carrier_sync_arc, keys, trust_doc_arc, identity_dir) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let doc = g.fleet_key_epoch_doc.clone().ok_or_else(|| {
+            "bump_fleet_epoch: fleet-keys carrier not running (node not started)".to_string()
+        })?;
+        let sync = g
+            .fleet_key_epoch_sync
+            .clone()
+            .ok_or_else(|| "bump_fleet_epoch: fleet-keys engine not running".to_string())?;
+        let keys = g
+            .fleet_keys
+            .clone()
+            .ok_or_else(|| "bump_fleet_epoch: fleet key set not available".to_string())?;
+        let trust = g
+            .owner_trust_doc
+            .clone()
+            .ok_or_else(|| "bump_fleet_epoch: trust doc not available".to_string())?;
+        let dir = g
+            .identity_dir
+            .clone()
+            .ok_or_else(|| "bump_fleet_epoch: identity dir not resolved".to_string())?;
+        (doc, sync, keys, trust, dir)
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Snapshot the resident docs, then plan on a blocking thread (seed load
+    // touches keychain/disk; sealing is CPU crypto).
+    let trust_snapshot = { trust_doc_arc.lock().await.clone() };
+    let carrier_snapshot = { carrier_doc_arc.lock().await.clone() };
+    let current_data_epoch = keys.newest().epoch;
+    let (new_doc, new_kt) = tokio::task::spawn_blocking(move || {
+        let loaded = crate::owner_state::load_owner_state(
+            &identity_dir,
+            crate::identity::KeychainStore::new().ok(),
+        )?
+        .ok_or_else(|| "no owner identity on this device".to_string())?;
+        let seed = loaded.master_seed.as_ref().ok_or_else(|| {
+            "notMaster: this device does not hold the master key; only the \
+             device with your master key can rotate fleet keys"
+                .to_string()
+        })?;
+        crate::owner_commands::plan_fleet_epoch_bump(
+            &trust_snapshot,
+            &carrier_snapshot,
+            current_data_epoch,
+            seed,
+            now_ms,
+        )
+    })
+    .await
+    .map_err(|e| format!("bump task join: {e}"))??;
+
+    let new_epoch = new_doc.epoch;
+
+    // Adopt locally: doc first (monotonic guard re-checked under the lock —
+    // a concurrent remote merge to a higher epoch wins), then the key set.
+    {
+        let mut doc = carrier_doc_arc.lock().await;
+        if new_doc.epoch <= doc.epoch {
+            return Err(format!(
+                "bump raced a newer epoch ({} <= {}); retry from the panel",
+                new_doc.epoch, doc.epoch
+            ));
+        }
+        *doc = new_doc;
+    }
+    keys.install(std::sync::Arc::new(new_kt));
+
+    carrier_sync_arc.notify_dirty();
+    if let Err(e) = carrier_sync_arc.flush_now().await {
+        tracing::warn!(
+            error = %e,
+            "bump_fleet_epoch: carrier flush failed; dirty latch will retry on next cycle"
+        );
+    }
+
+    crate::node_event_sink::emit_ser(&*sink, "owner-devices-updated", &serde_json::Value::Null);
+    tracing::info!(epoch = new_epoch, "fleet KeyTree epoch bumped");
+    Ok(new_epoch)
+}
+
+/// ZEB-668 S5: IPC to rotate the fleet KeyTree to the next epoch
+/// (seed-holder only). Thin wrapper over `bump_fleet_epoch_impl`.
+#[tauri::command]
+async fn bump_fleet_epoch(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<u32, String> {
+    bump_fleet_epoch_impl(state.inner(), std::sync::Arc::new(app)).await
+}
+
 /// ZEB-489: NodeState-level core of the headless `get_butler_pin` RPC.
 /// Read-only report of this fleet's currently pinned butler device (none →
 /// `pinned_device_id: None`). Headless-only — the GUI reads `fleet_net_doc`
@@ -56873,6 +57107,7 @@ pub fn run() {
             set_butler_pin,
             // ZEB-668 S4: fleet-synced device petname IPC.
             set_device_petname,
+            bump_fleet_epoch,
             // ZEB-458 P4 Phase B D43: community-relay opt-in IPCs.
             set_community_relay_opt_in,
             get_community_relay_status,

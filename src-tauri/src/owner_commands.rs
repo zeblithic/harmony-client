@@ -179,6 +179,106 @@ pub(crate) fn plan_revocation(
     })))
 }
 
+/// ZEB-668 S5: pure fleet-epoch-bump planner. Derives epoch
+/// `max(carrier, current) + 1`, seals the new material to every surviving
+/// (enrolled, non-revoked) device's enrollment x25519, and master-signs the
+/// carrier doc. No I/O, no locks — unit-testable from mint fixtures.
+///
+/// Errors: `notMaster:` (seed absent is the CALLER's check — this one fires
+/// when the seed doesn't match the owner), `sealFailed:<device_id_hex>`
+/// (unusable x25519 even after recomputing from the ed25519 key — the bump
+/// ABORTS rather than silently orphaning a surviving device).
+pub(crate) fn plan_fleet_epoch_bump(
+    trust: &harmony_owner::state::OwnerState,
+    carrier: &crate::fleet_key_epoch::FleetKeyEpochDoc,
+    current_data_epoch: u32,
+    master_seed: &[u8; 32],
+    now_ms: u64,
+) -> Result<
+    (
+        crate::fleet_key_epoch::FleetKeyEpochDoc,
+        crate::owner_state_crypto::KeyTree,
+    ),
+    String,
+> {
+    let artifact = RecoveryArtifact::from_seed(*master_seed);
+    let master_pubkey = artifact.master_pubkey_bundle();
+    if master_pubkey.identity_hash() != trust.owner_id {
+        return Err("notMaster: master seed does not match this owner".to_string());
+    }
+
+    let new_epoch = carrier
+        .epoch
+        .max(current_data_epoch)
+        .checked_add(1)
+        .ok_or_else(|| "fleet epoch counter overflow".to_string())?;
+    let new_kt = crate::owner_state_crypto::KeyTree::derive_at_epoch(master_seed, new_epoch)
+        .map_err(|e| format!("derive_at_epoch({new_epoch}): {e}"))?;
+    let material_cbor = {
+        let mut buf = Zeroizing::new(Vec::new());
+        ciborium::into_writer(&new_kt.to_fleet_material(), &mut *buf)
+            .map_err(|e| format!("encode new material: {e}"))?;
+        buf
+    };
+
+    // Survivors = enrolled minus revoked. Deliberately NOT `active_devices`
+    // (liveness-windowed): a temporarily-offline, non-revoked device must
+    // still get a blob or it is orphaned at window close.
+    let mut sealed = std::collections::BTreeMap::new();
+    for (device_id, cert) in trust.enrollments.iter() {
+        if trust.is_revoked(*device_id) {
+            continue;
+        }
+        let id_hex = hex::encode(device_id);
+        let mut x_pub = cert.device_pubkeys.classical.x25519_pub;
+        if x_pub == [0u8; 32] {
+            // `classical_only` zero-fills the x25519 slot when the ed25519
+            // bytes don't map — retry the birational map explicitly so the
+            // error names the device instead of sealing to a dead key.
+            x_pub = crate::dm_signing::ed25519_pub_to_x25519(
+                &cert.device_pubkeys.classical.ed25519_verify,
+            )
+            .map_err(|e| format!("sealFailed:{id_hex}: no usable x25519 ({e})"))?;
+        }
+        let blob = crate::dm_signing::seal_to_owner_with_info(
+            &x_pub,
+            &material_cbor,
+            crate::fleet_key_epoch::FLEET_EPOCH_SEAL_INFO,
+        )
+        .map_err(|e| format!("sealFailed:{id_hex}: {e}"))?;
+        sealed.insert(id_hex, blob);
+    }
+
+    let mut doc = crate::fleet_key_epoch::FleetKeyEpochDoc {
+        epoch: new_epoch,
+        bump_wall_ms: now_ms,
+        sealed,
+        master_pubkey: None,
+        master_sig: Vec::new(),
+    };
+    doc.sign(&artifact.master_signing_key(), master_pubkey)?;
+    Ok((doc, new_kt))
+}
+
+/// ZEB-668 S5: pure window-close decision for the dual-epoch read window.
+/// `survivor_seen_ms` carries each surviving device's fleet-net
+/// `seen_at.wall_ms` (`None` = no row yet). Close when EVERY survivor has
+/// been seen after the bump, or when the 7-day window has elapsed —
+/// whichever comes first.
+pub(crate) fn fleet_epoch_window_should_close(
+    bump_wall_ms: u64,
+    now_ms: u64,
+    survivor_seen_ms: &[Option<u64>],
+) -> bool {
+    if now_ms >= bump_wall_ms.saturating_add(crate::fleet_key_epoch::FLEET_EPOCH_WINDOW_MS) {
+        return true;
+    }
+    !survivor_seen_ms.is_empty()
+        && survivor_seen_ms
+            .iter()
+            .all(|seen| seen.is_some_and(|ms| ms > bump_wall_ms))
+}
+
 /// ZEB-668 S4: everything `build_owner_state_view` joins from the fleet-net
 /// doc + peer liveness, snapshotted in async context before the blocking
 /// task. `Default` = fleet-net cold / node not running — every joined field
@@ -485,6 +585,18 @@ pub(crate) async fn revoke_device_inner(
             g.community_device_retire_nudge.clone(),
         )
     };
+    // ZEB-668 S5: carrier handles for the post-revoke epoch bump (master
+    // path only). Snapshotted separately to keep the tuple readable.
+    let (carrier_doc, carrier_engine, fleet_keys) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.fleet_key_epoch_doc.clone(),
+            g.fleet_key_epoch_sync.clone(),
+            g.fleet_keys.clone(),
+        )
+    };
     // Fall back to the resolved default identity dir when the node has not
     // populated NodeState (same source get_owner_state uses).
     let dir = match identity_dir {
@@ -585,6 +697,76 @@ pub(crate) async fn revoke_device_inner(
                 ));
             }
             tracing::warn!(error = %e, "revoke_device: trust flush failed; dirty latch will retry");
+        }
+    }
+
+    // ZEB-668 S5: a master-issued revoke immediately rotates the fleet
+    // KeyTree so the revoked device's retained epoch material goes stale
+    // (spec §6: master-revoke always bumps; self-revoke never does — no
+    // seed on cert-only devices). Failure does NOT roll back the
+    // revocation: the panel's `fleetEpochStale` banner is the retry
+    // surface, which is the same UX the self-revoke case lands on.
+    if !is_self {
+        if let (Some(seed), Some(c_doc), Some(c_engine), Some(keys)) = (
+            loaded.master_seed.as_deref(),
+            &carrier_doc,
+            &carrier_engine,
+            &fleet_keys,
+        ) {
+            // Re-snapshot the RESIDENT trust doc — the revocation just
+            // landed in it, and the survivor enumeration must exclude the
+            // freshly-revoked device. (`trust_snapshot` above predates the
+            // mutation.)
+            let bump = async {
+                let trust_now = match &trust_doc {
+                    Some(doc) => doc.lock().await.clone(),
+                    None => return Err("carrier running without trust doc".to_string()),
+                };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let carrier_snapshot = { c_doc.lock().await.clone() };
+                let (new_doc, new_kt) = plan_fleet_epoch_bump(
+                    &trust_now,
+                    &carrier_snapshot,
+                    keys.newest().epoch,
+                    seed,
+                    now_ms,
+                )?;
+                let new_epoch = new_doc.epoch;
+                {
+                    let mut doc = c_doc.lock().await;
+                    if new_doc.epoch <= doc.epoch {
+                        return Err(format!(
+                            "bump raced a newer epoch ({} <= {})",
+                            new_doc.epoch, doc.epoch
+                        ));
+                    }
+                    *doc = new_doc;
+                }
+                keys.install(std::sync::Arc::new(new_kt));
+                c_engine.notify_dirty();
+                if let Err(e) = c_engine.flush_now().await {
+                    tracing::warn!(
+                        error = %e,
+                        "post-revoke epoch bump: carrier flush failed; dirty latch will retry"
+                    );
+                }
+                Ok::<u32, String>(new_epoch)
+            };
+            match bump.await {
+                Ok(epoch) => tracing::info!(epoch, "fleet KeyTree epoch bumped after revoke"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "post-revoke fleet epoch bump failed — panel staleness banner is the retry surface"
+                ),
+            }
+        } else if loaded.master_seed.is_some() {
+            tracing::warn!(
+                "post-revoke fleet epoch bump skipped: node not running — \
+                 panel staleness banner offers the manual rotate"
+            );
         }
     }
 
@@ -1624,6 +1806,124 @@ mod revoke_tests {
     }
 
     #[test]
+    fn plan_bump_seals_to_survivors_only_and_signs() {
+        let (mut state, a_sk, seed, b_sk, b_vk_hex) = two_device_fixture(1_700_000_000);
+        // Third device C, enrolled then revoked — must get NO blob.
+        let c_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let c_vk = c_sk.verifying_key().to_bytes();
+        let artifact = RecoveryArtifact::from_seed(seed);
+        let enroll = harmony_owner::lifecycle::enroll_via_master(
+            &state,
+            &artifact,
+            &c_sk,
+            PubKeyBundle::classical_only(c_vk),
+            1_700_000_010,
+            trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .expect("enroll c");
+        state
+            .add_enrollment(
+                enroll.enrollment_cert,
+                1_700_000_010,
+                trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .expect("add c");
+        let c_id = PubKeyBundle::classical_only(c_vk).identity_hash();
+        let cert = RevocationCert::sign_master(
+            &artifact.master_signing_key(),
+            artifact.master_pubkey_bundle(),
+            c_id,
+            1_700_000_020,
+            RevocationReason::Lost,
+        )
+        .expect("revoke c");
+        state.add_revocation(cert).expect("add revocation");
+
+        let carrier = crate::fleet_key_epoch::FleetKeyEpochDoc::default();
+        let now_ms = 1_700_000_100_000u64;
+        let (doc, new_kt) =
+            plan_fleet_epoch_bump(&state, &carrier, 0, &seed, now_ms).expect("bump");
+
+        assert_eq!(doc.epoch, 1);
+        assert_eq!(new_kt.epoch, 1);
+        assert_eq!(doc.bump_wall_ms, now_ms);
+        // Survivors = A (seed-holder) + B; revoked C absent.
+        let a_id_hex = hex::encode(
+            PubKeyBundle::classical_only(a_sk.verifying_key().to_bytes()).identity_hash(),
+        );
+        let b_id_hex = hex::encode(
+            PubKeyBundle::classical_only(
+                <[u8; 32]>::try_from(hex::decode(&b_vk_hex).unwrap().as_slice()).unwrap(),
+            )
+            .identity_hash(),
+        );
+        let c_id_hex = hex::encode(c_id);
+        assert!(doc.sealed.contains_key(&a_id_hex), "seed-holder sealed");
+        assert!(doc.sealed.contains_key(&b_id_hex), "sibling sealed");
+        assert!(!doc.sealed.contains_key(&c_id_hex), "revoked device absent");
+        assert_eq!(doc.sealed.len(), 2);
+
+        // The doc verifies against this owner.
+        assert!(doc.verify(&state.owner_id));
+
+        // B can open its blob and gets material at the new epoch that
+        // reconstructs the same tree the planner derived.
+        let opened =
+            crate::fleet_key_epoch::unseal_own_material(&doc, &b_id_hex, &b_sk).expect("unseal");
+        assert_eq!(opened.epoch, 1);
+        let back = crate::owner_state_crypto::KeyTree::from_fleet_material(&opened).unwrap();
+        assert_eq!(back.epoch, new_kt.epoch);
+
+        // Chained bump: next epoch is max+1 even if data epoch lags.
+        let (doc2, _) = plan_fleet_epoch_bump(&state, &doc, 0, &seed, now_ms + 1).expect("bump2");
+        assert_eq!(doc2.epoch, 2);
+    }
+
+    #[test]
+    fn plan_bump_rejects_foreign_seed() {
+        let (state, _a_sk, _seed, _b_sk, _b_vk_hex) = two_device_fixture(1_700_000_000);
+        let carrier = crate::fleet_key_epoch::FleetKeyEpochDoc::default();
+        // `KeyTree` has no `Debug` (key material), so `expect_err` (which
+        // formats the Ok value) won't compile — match on the result.
+        match plan_fleet_epoch_bump(&state, &carrier, 0, &[0x77u8; 32], 1_000) {
+            Err(err) => assert!(err.starts_with("notMaster:"), "{err}"),
+            Ok(_) => panic!("foreign seed must fail"),
+        }
+    }
+
+    #[test]
+    fn fleet_epoch_window_close_decision() {
+        let bump = 1_000_000u64;
+        let week = crate::fleet_key_epoch::FLEET_EPOCH_WINDOW_MS;
+        // All survivors postdate the bump → close.
+        assert!(fleet_epoch_window_should_close(
+            bump,
+            bump + 10,
+            &[Some(bump + 5), Some(bump + 7)]
+        ));
+        // One stale survivor holds the window open.
+        assert!(!fleet_epoch_window_should_close(
+            bump,
+            bump + 10,
+            &[Some(bump + 5), Some(bump - 1)]
+        ));
+        // A missing row holds it open.
+        assert!(!fleet_epoch_window_should_close(
+            bump,
+            bump + 10,
+            &[Some(bump + 5), None]
+        ));
+        // No survivors listed: hold (never close on an empty read).
+        assert!(!fleet_epoch_window_should_close(bump, bump + 10, &[]));
+        // 7-day timeout closes regardless of stragglers.
+        assert!(fleet_epoch_window_should_close(
+            bump,
+            bump + week,
+            &[Some(bump - 1), None]
+        ));
+    }
+
+    #[test]
     fn plan_master_revoke_of_sibling_produces_master_cert() {
         let (state, a_sk, seed, _b_sk, b_vk_hex) = two_device_fixture(1_700_000_000);
         let now = 1_700_000_100u64;
@@ -1723,6 +2023,158 @@ mod revoke_tests {
         let err =
             plan_revocation(&state, &a_sk, Some(&seed), "zz", "lost", 1_700_000_100).unwrap_err();
         assert!(err.starts_with("badDeviceVk:"), "{err}");
+    }
+
+    /// ZEB-668 S5: a master revoke with a RESIDENT carrier bumps the fleet
+    /// epoch — signed doc at epoch 1 whose sealed map excludes the revoked
+    /// device, and the shared key set publishes on the new epoch. A SELF
+    /// revoke leaves the carrier untouched.
+    #[tokio::test]
+    async fn revoke_device_inner_master_path_bumps_fleet_epoch() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let (state, a_sk, seed, _b, b_vk_hex) = two_device_fixture(now_unix() - 60);
+        let dir = tempfile::tempdir().unwrap();
+        save_owner_state_atomic(dir.path(), &state, &a_sk, Some(&seed), None)
+            .expect("persist identity");
+
+        // Resident carrier: real engine over an in-memory CAS, plus the
+        // resident trust doc the hook re-snapshots after the mutation.
+        let kt0 =
+            std::sync::Arc::new(crate::owner_state_crypto::KeyTree::derive(&seed).expect("kt0"));
+        let keys = crate::owner_state_crypto::FleetKeySet::new(std::sync::Arc::clone(&kt0));
+        let carrier_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::fleet_key_epoch::FleetKeyEpochDoc::default(),
+        ));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let drain = tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
+        let persist_dir = tempfile::tempdir().unwrap();
+        let owner_id = state.owner_id;
+        let carrier_engine = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+            crate::fleet_sync::FleetSyncConfig {
+                keys: crate::owner_state_crypto::FleetKeySet::new(kt0),
+                device_id: "dev-a".to_string(),
+                state: std::sync::Arc::clone(&carrier_doc),
+                merger: std::sync::Arc::new(
+                    move |l: &mut crate::fleet_key_epoch::FleetKeyEpochDoc, r| {
+                        crate::fleet_sync::MergeOutcome {
+                            changed: crate::fleet_key_epoch::merge_fleet_keys_remote(
+                                l, r, &owner_id,
+                            ),
+                        }
+                    },
+                ),
+                replay_tracker: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+                content_store: std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
+                publisher_tx: out_tx,
+                subscriber_rx: in_rx,
+                persist: std::sync::Arc::new(crate::fleet_key_epoch::FleetKeyEpochPersist {
+                    doc_path: persist_dir.path().join("fleet_keys.cbor"),
+                    replay_path: persist_dir.path().join("fleet_keys_replay.cbor"),
+                }),
+                lookup_key_tag: crate::fleet_key_epoch::FLEET_KEYS_LOOKUP_TAG,
+                debounce_ms: 25,
+                publish_seen: false,
+                on_applied: None,
+                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+            },
+        ));
+        let trust_doc_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state.clone()));
+        // Resident trust engine too — prod invariant: doc + engine are
+        // Some/None together, and the mutation path picks Resident only
+        // when both exist (FileOnly would leave the resident doc stale and
+        // the hook's survivor enumeration wrong).
+        let (t_out_tx, mut t_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_t_in_tx, t_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let t_drain = tokio::spawn(async move { while t_out_rx.recv().await.is_some() {} });
+        let trust_engine = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+            crate::fleet_sync::FleetSyncConfig {
+                keys: keys.clone(),
+                device_id: "dev-a".to_string(),
+                state: std::sync::Arc::clone(&trust_doc_arc),
+                merger: crate::owner_trust_sync::trust_merger(),
+                replay_tracker: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+                content_store: std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
+                publisher_tx: t_out_tx,
+                subscriber_rx: t_in_rx,
+                persist: std::sync::Arc::new(crate::owner_trust_sync::TrustPersist {
+                    identity_dir: dir.path().to_path_buf(),
+                    replay_path: persist_dir.path().join("trust_replay.cbor"),
+                }),
+                lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
+                debounce_ms: 25,
+                publish_seen: true,
+                on_applied: None,
+                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+            },
+        ));
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            owner_trust_doc: Some(std::sync::Arc::clone(&trust_doc_arc)),
+            owner_trust_sync: Some(std::sync::Arc::clone(&trust_engine)),
+            fleet_key_epoch_doc: Some(std::sync::Arc::clone(&carrier_doc)),
+            fleet_key_epoch_sync: Some(std::sync::Arc::clone(&carrier_engine)),
+            fleet_keys: Some(keys.clone()),
+            ..crate::NodeState::default()
+        });
+        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> = std::sync::Arc::new(|_| {});
+
+        revoke_device_inner(&node, || None, emit, b_vk_hex.clone(), "lost".into())
+            .await
+            .expect("revoke ok");
+
+        let doc = carrier_doc.lock().await.clone();
+        assert_eq!(doc.epoch, 1, "master revoke bumps to epoch 1");
+        assert!(doc.verify(&owner_id), "bumped doc is master-signed");
+        let b_id_hex = {
+            let g = trust_doc_arc.lock().await;
+            hex::encode(
+                g.enrollments
+                    .values()
+                    .find(|c| hex::encode(c.device_pubkeys.classical.ed25519_verify) == b_vk_hex)
+                    .map(|c| c.device_id)
+                    .unwrap(),
+            )
+        };
+        assert!(
+            !doc.sealed.contains_key(&b_id_hex),
+            "revoked device gets no blob"
+        );
+        assert_eq!(doc.sealed.len(), 1, "only the seed-holder survives");
+        assert_eq!(keys.newest().epoch, 1, "key set publishes on the new epoch");
+
+        let _ = carrier_engine.shutdown().await;
+        let _ = trust_engine.shutdown().await;
+        drain.abort();
+        t_drain.abort();
+    }
+
+    /// ZEB-668 S5: self-revoke never bumps (no seed reachable on the
+    /// cert-only device; spec §6). Carrier stays at the default doc.
+    #[tokio::test]
+    async fn revoke_device_inner_self_revoke_does_not_bump_epoch() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let (state, _a_sk, _seed, b_sk, b_vk_hex) = two_device_fixture(now_unix() - 60);
+        let dir = tempfile::tempdir().unwrap();
+        // Persist as device B: cert-only (no master seed on disk).
+        save_owner_state_atomic(dir.path(), &state, &b_sk, None, None).expect("persist identity");
+        let carrier_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::fleet_key_epoch::FleetKeyEpochDoc::default(),
+        ));
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            fleet_key_epoch_doc: Some(std::sync::Arc::clone(&carrier_doc)),
+            ..crate::NodeState::default()
+        });
+        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> = std::sync::Arc::new(|_| {});
+        revoke_device_inner(&node, || None, emit, b_vk_hex, "decommissioned".into())
+            .await
+            .expect("self revoke ok");
+        assert_eq!(
+            carrier_doc.lock().await.epoch,
+            0,
+            "self-revoke must not bump the fleet epoch"
+        );
     }
 
     #[tokio::test]
