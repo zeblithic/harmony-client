@@ -216,6 +216,7 @@ pub mod open_join_auth;
 pub mod open_join_dial;
 pub mod owner_commands;
 pub mod owner_loaded;
+pub mod owner_quorum_sync;
 pub mod owner_state;
 pub mod owner_state_crdt;
 pub mod owner_state_crypto;
