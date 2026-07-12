@@ -2,7 +2,7 @@
 //! co-sign requests (revocation now; enrollment arms in S4) replicated
 //! between the owner's devices as the next `FleetSyncEngine` dataset.
 //! Donor pattern: `owner_trust_sync.rs` (merge/persist/applied-task shape)
-//! + `fleet_key_epoch.rs` (own-doc-file persistence recipe). Spec:
+//! and `fleet_key_epoch.rs` (own-doc-file persistence recipe). Spec:
 //! `docs/specs/2026-07-12-zeb-677-quorum-wiring-design.md` §3/§4.
 //!
 //! ## Ceremony data flow
@@ -331,7 +331,7 @@ pub fn load_quorum_doc_or_recover(path: &Path) -> QuorumReqDoc {
 }
 
 /// Replay-tracker file body (schema byte precedes this on disk).
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct QuorumReplayFileV1(BTreeMap<String, Hlc>);
 
 /// Save the replay tracker atomically (schema byte + canonical CBOR).
@@ -380,12 +380,6 @@ fn load_schema_v1_or_recover<T: serde::de::DeserializeOwned + Default>(
 }
 
 // `load_schema_v1_or_recover::<QuorumReplayFileV1>` needs a Default.
-impl Default for QuorumReplayFileV1 {
-    fn default() -> Self {
-        QuorumReplayFileV1(BTreeMap::new())
-    }
-}
-
 /// Rename a corrupt file aside with a timestamped suffix (never clobbers a
 /// prior quarantine or the live file; preserves bytes for recovery).
 fn quarantine(path: &Path, what: &str, err: &str) {
@@ -1026,7 +1020,7 @@ mod tests {
         // Crossed channel pair builder: returns (a_pub_tx, a_sub_rx,
         // b_pub_tx, b_sub_rx) where a's publishes feed b's subscriber and
         // vice versa.
-        let mut crossed = || {
+        let crossed = || {
             let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
             let (a_to_b_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
             tokio::spawn(async move {
