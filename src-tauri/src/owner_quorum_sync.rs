@@ -2023,6 +2023,123 @@ mod tests {
         shutdown_pair(pair).await;
     }
 
+    /// Full enrollment ceremony across two real engines: B arms, A opens the
+    /// request through the LIVE `LiveQuorumEnrollPort`, the request replicates,
+    /// B's sweep auto-co-signs + vouches + consumes its arm, the co-signature
+    /// replicates back, and A's port assembles a valid K=2 cert. Exercises the
+    /// production port + sweep wiring (not just the pure helpers).
+    #[tokio::test]
+    async fn two_engines_full_ceremony_enrollment_lands() {
+        use crate::owner_quorum_enroll::QuorumEnrollPort;
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 60;
+        let base_ms = base * 1000;
+        let f = sweep_fleet_at(base);
+        let pair = spawn_quorum_pair(f.trust.clone());
+
+        let joiner_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_id = joiner_pk.identity_hash();
+
+        // B arms; the arm replicates to A.
+        {
+            let mut doc_b = pair.b.quorum_doc.lock().await;
+            stamp_arm_cell(
+                &mut doc_b,
+                f.b_id,
+                base_ms + 10_000 + ARM_WINDOW_MS,
+                base_ms + 10_000,
+            );
+        }
+        pair.b.quorum_engine.notify_dirty();
+        let a_doc = Arc::clone(&pair.a.quorum_doc);
+        let b_hex = hex::encode(f.b_id);
+        wait_for("arm to reach A", move || {
+            let doc = Arc::clone(&a_doc);
+            let b_hex = b_hex.clone();
+            async move { doc.lock().await.enroll_arms.contains_key(&b_hex) }
+        })
+        .await;
+
+        // A opens the enrollment request via the LIVE port.
+        let port = crate::owner_quorum_enroll::LiveQuorumEnrollPort::new(
+            Arc::clone(&pair.a.quorum_doc),
+            Arc::clone(&pair.a.quorum_engine),
+            Arc::clone(&pair.a.trust_doc),
+            f.a_sk.clone(),
+            f.a_id,
+        );
+        let rid = port
+            .open_enrollment_request(joiner_id, joiner_pk.clone(), base + 10)
+            .await
+            .expect("open");
+
+        // The request replicates to B.
+        let b_doc = Arc::clone(&pair.b.quorum_doc);
+        let rid_b = rid.clone();
+        wait_for("request to reach B", move || {
+            let doc = Arc::clone(&b_doc);
+            let rid = rid_b.clone();
+            async move { doc.lock().await.requests.contains_key(&rid) }
+        })
+        .await;
+
+        // B's sweep auto-co-signs (armed), vouches the joiner, consumes the arm.
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let b_outcome = run_quorum_sweep(
+            &pair.b.quorum_doc,
+            &pair.b.quorum_engine,
+            &pair.b.trust_doc,
+            &pair.b.trust_engine,
+            &f.b_sk,
+            f.b_id,
+            &collecting_emit(Arc::clone(&events)),
+            None,
+            base + 11,
+            base_ms + 11_000,
+        )
+        .await;
+        assert_eq!(b_outcome.enrollment_cosigns, 1, "B co-signed");
+
+        // A's port polls until the co-signature replicates, then assembles.
+        let cert = port
+            .await_cosign_and_assemble(rid.clone(), std::time::Duration::from_secs(5))
+            .await
+            .expect("assemble");
+        let a_cert = f.trust.enrollments.get(&f.a_id).unwrap().clone();
+        let b_cert = f.trust.enrollments.get(&f.b_id).unwrap().clone();
+        cert.verify_quorum_with_signers(&[a_cert, b_cert], base + 12)
+            .expect("valid quorum enrollment cert");
+        assert_eq!(cert.device_id, joiner_id);
+
+        // A applies the enrollment; B's vouch (from its sweep) replicates in,
+        // so the joiner reaches Full (N=1 sibling vouch).
+        {
+            let mut trust_a = pair.a.trust_doc.lock().await;
+            trust_a
+                .add_enrollment(cert, base + 12, DEFAULT_ACTIVE_WINDOW_SECS)
+                .expect("enroll joiner");
+        }
+        pair.a.trust_engine.notify_dirty();
+        let a_trust = Arc::clone(&pair.a.trust_doc);
+        wait_for("B's vouch to reach A", move || {
+            let t = Arc::clone(&a_trust);
+            async move {
+                t.lock()
+                    .await
+                    .vouching
+                    .vouches_for(joiner_id)
+                    .any(|v| v.signer == f.b_id)
+            }
+        })
+        .await;
+
+        shutdown_pair(pair).await;
+    }
+
     #[tokio::test]
     async fn two_engines_decline_tombstones_and_expiry_prunes() {
         let base = std::time::SystemTime::now()
