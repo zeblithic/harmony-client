@@ -32,6 +32,7 @@ fn ev(
     kind: MembershipEventKind,
 ) -> SignedMembershipEvent {
     SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id,
         community_id: COM,
         actor,

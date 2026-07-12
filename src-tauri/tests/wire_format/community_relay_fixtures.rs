@@ -46,6 +46,7 @@ fn fixture_community_id() -> SpaceId {
 /// - `sealed_blob`: 3-byte sentinel `[0xAA, 0xBB, 0xCC]`
 fn fixture_relay_deposit_frame() -> RelayDepositFrame {
     RelayDepositFrame {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: [0x11; 16],
         sender_owner: [0x22; 16],
         community_id: fixture_community_id(),
@@ -62,6 +63,7 @@ fn fixture_relay_deposit_frame() -> RelayDepositFrame {
 /// - `sig`: all-0x07 (64 bytes)
 fn fixture_relay_pull_query() -> RelayPullQuery {
     RelayPullQuery {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: [0x11; 16],
         community_id: fixture_community_id(),
         requester_enrollment_cert: vec![0xA1, 0xA2, 0xA3],
@@ -95,6 +97,7 @@ fn fixture_relay_pull_response() -> RelayPullResponse {
 /// - `sig`: all-0x07 (64 bytes)
 fn fixture_relay_pull_ack_frame() -> RelayPullAckFrame {
     RelayPullAckFrame {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: [0x11; 16],
         community_id: fixture_community_id(),
         requester_enrollment_cert: vec![0xA1, 0xA2, 0xA3],

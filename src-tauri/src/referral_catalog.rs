@@ -65,6 +65,11 @@ pub struct ReferralCatalog {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub sig: [u8; 64],
+    /// ZEB-677: Master-issued signer certs backing a Quorum-issued
+    /// `enrollment`. Empty for Master-issued certs; see
+    /// `FriendLinkRequest.signer_certs`.
+    #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
+    pub signer_certs: Vec<EnrollmentCert>,
 }
 
 /// A request to browse a friend's referral catalog. `sig` is the requester's
@@ -85,6 +90,11 @@ pub struct CatalogRequest {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub sig: [u8; 64],
+    /// ZEB-677: Master-issued signer certs backing a Quorum-issued
+    /// `enrollment`. Empty for Master-issued certs; see
+    /// `FriendLinkRequest.signer_certs`.
+    #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
+    pub signer_certs: Vec<EnrollmentCert>,
 }
 
 /// Decode a single CBOR item, bounding the input at [`PEX_MAX_PACKET_LEN`] and
@@ -233,6 +243,9 @@ pub fn sign_catalog_request(
         to_addr,
         enrollment,
         sig,
+        // ZEB-677: bundle threading for quorum-certed requesters lands with
+        // the ceremony slices (S4); every self-cert today is Master-issued.
+        signer_certs: Vec::new(),
     }
 }
 
@@ -241,9 +254,9 @@ pub fn sign_catalog_request(
 /// Order is security-load-bearing:
 /// 1. `req.to_addr == self_owner` (else [`ReferralAuthError::WrongTarget`]) — a
 ///    captured request cannot be re-aimed at a different server.
-/// 2. `verify_enrolled_device(&req.enrollment, req.from_addr)` → device key
-///    (cert err mapped to [`ReferralAuthError::Auth`]; also enforces
-///    `cert.owner_id == from_addr`).
+/// 2. `verify_enrolled_device(&req.enrollment, &req.signer_certs,
+///    req.from_addr)` → device key (cert err mapped to
+///    [`ReferralAuthError::Auth`]; also enforces `cert.owner_id == from_addr`).
 /// 3. `verify_strict` of `req.sig` over [`catalog_request_sig_preimage`] against
 ///    that device key (err → [`ReferralAuthError::SignatureInvalid`]).
 pub fn authenticate_catalog_request(
@@ -254,10 +267,11 @@ pub fn authenticate_catalog_request(
     if req.to_addr != self_owner {
         return Err(ReferralAuthError::WrongTarget);
     }
-    let device_key = verify_enrolled_device(&req.enrollment, req.from_addr, now_secs)
-        .map_err(|_| ReferralAuthError::Auth)?;
-    let vk =
-        VerifyingKey::from_bytes(&device_key).map_err(|_| ReferralAuthError::SignatureInvalid)?;
+    let verified =
+        verify_enrolled_device(&req.enrollment, &req.signer_certs, req.from_addr, now_secs)
+            .map_err(|_| ReferralAuthError::Auth)?;
+    let vk = VerifyingKey::from_bytes(&verified.device_ed25519)
+        .map_err(|_| ReferralAuthError::SignatureInvalid)?;
     let preimage = catalog_request_sig_preimage(req.from_addr, req.to_addr);
     vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
         .map_err(|_| ReferralAuthError::SignatureInvalid)?;
@@ -283,6 +297,8 @@ pub fn sign_referral_catalog(
         at,
         enrollment,
         sig,
+        // ZEB-677: see sign_catalog_request — threading lands with S4.
+        signer_certs: Vec::new(),
     }
 }
 
@@ -291,9 +307,10 @@ pub fn sign_referral_catalog(
 ///
 /// Order is security-load-bearing:
 /// 1. `cat.author == expected_author` (else [`ReferralAuthError::AuthorMismatch`]).
-/// 2. `verify_enrolled_device(&cat.enrollment, cat.author)` → device key (cert
-///    err → [`ReferralAuthError::Auth`]; also enforces `cert.owner_id ==
-///    author`, so a swapped-in cert for a different owner is rejected here).
+/// 2. `verify_enrolled_device(&cat.enrollment, &cat.signer_certs, cat.author)`
+///    → device key (cert err → [`ReferralAuthError::Auth`]; also enforces
+///    `cert.owner_id == author`, so a swapped-in cert for a different owner is
+///    rejected here).
 /// 3. `verify_strict` of `cat.sig` over `referral_catalog_sig_preimage(author,
 ///    expected_subject, entries, at)` (err → [`ReferralAuthError::SignatureInvalid`]).
 ///    Binding `expected_subject` into the preimage means a catalog signed for
@@ -307,10 +324,10 @@ pub fn verify_referral_catalog(
     if cat.author != expected_author {
         return Err(ReferralAuthError::AuthorMismatch);
     }
-    let device_key = verify_enrolled_device(&cat.enrollment, cat.author, now_secs)
+    let verified = verify_enrolled_device(&cat.enrollment, &cat.signer_certs, cat.author, now_secs)
         .map_err(|_| ReferralAuthError::Auth)?;
-    let vk =
-        VerifyingKey::from_bytes(&device_key).map_err(|_| ReferralAuthError::SignatureInvalid)?;
+    let vk = VerifyingKey::from_bytes(&verified.device_ed25519)
+        .map_err(|_| ReferralAuthError::SignatureInvalid)?;
     let preimage =
         referral_catalog_sig_preimage(cat.author, expected_subject, &cat.entries, &cat.at);
     vk.verify_strict(&preimage, &Signature::from_bytes(&cat.sig))
@@ -430,6 +447,7 @@ mod tests {
             from_addr: OwnerAddr([0x11; 16]),
             to_addr: OwnerAddr([0x22; 16]),
             enrollment: mint_test_owner(0x42).cert,
+            signer_certs: Vec::new(),
             sig: [9u8; 64],
         }
     }
@@ -444,6 +462,7 @@ mod tests {
             }],
             at: hlc(7),
             enrollment: mint_test_owner(0x42).cert,
+            signer_certs: Vec::new(),
             sig: [9u8; 64],
         }
     }
@@ -500,6 +519,7 @@ mod tests {
             entries,
             at: hlc(7),
             enrollment: mint_test_owner(0x42).cert,
+            signer_certs: Vec::new(),
             sig: [9u8; 64],
         };
         let bytes = encode_referral_catalog(&cat).expect("encode has no cap");
@@ -763,6 +783,7 @@ mod tests {
             ],
             at: hlc(7),
             enrollment: mint_test_owner(0x42).cert,
+            signer_certs: Vec::new(),
             sig: [9u8; 64],
         };
 

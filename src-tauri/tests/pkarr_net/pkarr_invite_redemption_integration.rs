@@ -48,6 +48,7 @@ fn fixture_invite_token(inviter: OwnerAddr) -> InviteToken {
 
 fn fixture_invite_payload(inviter: OwnerAddr) -> CommunityInvitePayload {
     CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0x11; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,

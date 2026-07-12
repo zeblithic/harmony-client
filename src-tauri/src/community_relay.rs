@@ -172,6 +172,16 @@ pub struct RelayDepositFrame {
     /// birational X25519 key with [`COMMUNITY_RELAY_SEAL_INFO`].
     #[serde(rename = "sb", with = "serde_bytes")]
     pub sealed_blob: Vec<u8>,
+    /// ZEB-677: canonical CBOR of `Vec<EnrollmentCert>` — the Master-issued
+    /// signer certs backing a Quorum-issued `sender_enrollment_cert`. Empty
+    /// when the cert is Master-issued (key omitted on the wire).
+    #[serde(
+        rename = "sc",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "serde_bytes"
+    )]
+    pub signer_certs_cbor: Vec<u8>,
 }
 
 /// Relay → sender acknowledgement, returned after the blob is persisted.
@@ -207,6 +217,16 @@ pub struct RelayPullQuery {
     /// 64-byte device ed25519 signature over [`relay_pull_sig_payload`].
     #[serde(rename = "sg", with = "serde_bytes")]
     pub sig: Vec<u8>,
+    /// ZEB-677: canonical CBOR of `Vec<EnrollmentCert>` — the Master-issued
+    /// signer certs backing a Quorum-issued `requester_enrollment_cert`.
+    /// Empty when the cert is Master-issued (key omitted on the wire).
+    #[serde(
+        rename = "sc",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "serde_bytes"
+    )]
+    pub signer_certs_cbor: Vec<u8>,
 }
 
 /// One held blob entry returned in a [`RelayPullResponse`].
@@ -269,6 +289,16 @@ pub struct RelayPullAckFrame {
     /// 64-byte device ed25519 signature over [`relay_pull_ack_sig_payload`].
     #[serde(rename = "sg", with = "serde_bytes")]
     pub sig: Vec<u8>,
+    /// ZEB-677: canonical CBOR of `Vec<EnrollmentCert>` — the Master-issued
+    /// signer certs backing a Quorum-issued `requester_enrollment_cert`.
+    /// Empty when the cert is Master-issued (key omitted on the wire).
+    #[serde(
+        rename = "sc",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "serde_bytes"
+    )]
+    pub signer_certs_cbor: Vec<u8>,
 }
 
 // Manual CanonicalPayload registrations (mirrors butler_deposit.rs).
@@ -472,6 +502,7 @@ pub fn build_relay_deposit_frame(
         .to_bytes()
         .to_vec();
     Ok(RelayDepositFrame {
+        signer_certs_cbor: Vec::new(),
         recipient_owner,
         sender_owner,
         community_id,
@@ -564,6 +595,7 @@ mod tests {
 
     fn fixture_deposit_frame() -> RelayDepositFrame {
         RelayDepositFrame {
+            signer_certs_cbor: Vec::new(),
             recipient_owner: [0x11; 16],
             sender_owner: [0x22; 16],
             community_id: fixture_space_id(),
@@ -575,6 +607,7 @@ mod tests {
 
     fn fixture_pull_query() -> RelayPullQuery {
         RelayPullQuery {
+            signer_certs_cbor: Vec::new(),
             recipient_owner: [0x11; 16],
             community_id: fixture_space_id(),
             requester_enrollment_cert: vec![0xA1, 0xA2],
@@ -605,6 +638,7 @@ mod tests {
 
     fn fixture_pull_ack_frame() -> RelayPullAckFrame {
         RelayPullAckFrame {
+            signer_certs_cbor: Vec::new(),
             recipient_owner: [0x11; 16],
             community_id: fixture_space_id(),
             requester_enrollment_cert: vec![0xA1, 0xA2, 0xA3],

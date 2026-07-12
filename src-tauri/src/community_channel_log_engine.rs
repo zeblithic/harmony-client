@@ -5795,6 +5795,7 @@ mod tests {
         // apply path emits this delta on Inserted.
         let new_chid = ChannelId([0xee; 16]);
         let create_event = crate::community_membership::SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x0e; 16],
             community_id: cid,
             kind: crate::community_membership::MembershipEventKind::ChannelCreate {

@@ -197,6 +197,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     // Pre-seed Bob and Carol as members via mint_redemption so they
     // appear in prior_state.members (required for kick validation).
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
             epoch: 0,

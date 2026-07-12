@@ -88,7 +88,7 @@ pub fn merge_trust_remote_into_local(local: &mut OwnerState, remote: OwnerState)
         if local.is_revoked(cert.target) {
             continue;
         }
-        if let Err(e) = local.add_revocation(cert.clone()) {
+        if let Err(e) = local.add_revocation(cert.clone(), now, DEFAULT_ACTIVE_WINDOW_SECS) {
             tracing::warn!(error = %e, "trust merge: revocation dropped");
         }
     }
@@ -462,7 +462,9 @@ mod tests {
 
         let mut remote_revoked = local.clone();
         let rev = test_master_revocation(&artifact, d2, now + 20);
-        remote_revoked.add_revocation(rev).unwrap();
+        remote_revoked
+            .add_revocation(rev, now + 20, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
 
         let mut remote_liveness = local.clone();
         remote_liveness
@@ -654,7 +656,10 @@ mod tests {
                 doc: Arc::clone(&pair.a_doc),
                 engine: Arc::clone(&pair.a_engine),
             },
-            move |s| s.add_revocation(rev).unwrap(),
+            move |s| {
+                s.add_revocation(rev, now + 20, DEFAULT_ACTIVE_WINDOW_SECS)
+                    .unwrap()
+            },
         )
         .await
         .unwrap();
@@ -769,7 +774,10 @@ mod tests {
 
         // The revocation arrives AFTER the baseline (as a real merge would).
         let rev = test_master_revocation(&artifact, self_id, now + 10);
-        doc.lock().await.add_revocation(rev).unwrap();
+        doc.lock()
+            .await
+            .add_revocation(rev, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
         // Two nudges: the second must NOT re-fire device-revoked-self.
         tx.send(()).await.unwrap();
         tx.send(()).await.unwrap();

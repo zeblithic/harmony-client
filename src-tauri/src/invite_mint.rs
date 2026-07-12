@@ -184,6 +184,7 @@ mod tests {
         let cid = SpaceId([0x11u8; 16]);
         let owner = crate::community_membership::mint_test_owner(0x6E);
         let admin_join = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [1u8; 16],
             community_id: cid,
             kind: MembershipEventKind::Join,
@@ -222,6 +223,7 @@ mod tests {
         let cid = SpaceId([0x11u8; 16]);
         let owner = crate::community_membership::mint_test_owner(0x6E);
         let earlier = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [1u8; 16],
             community_id: cid,
             kind: MembershipEventKind::Join,

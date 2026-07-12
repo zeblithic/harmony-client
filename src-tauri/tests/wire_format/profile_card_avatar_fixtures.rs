@@ -13,6 +13,7 @@ use harmony_app::profile_card_broadcast::ProfileCardBroadcast;
 fn profile_card_with_avatar_pins_seven_keys_incl_av() {
     let owner = harmony_app::community_membership::mint_test_owner(0x7E);
     let card = ProfileCardBroadcast {
+        signer_certs: Vec::new(),
         owner_id: owner.owner.0,
         display_name: "Ann".into(),
         status_text: "hi".into(),
@@ -59,6 +60,7 @@ fn profile_card_with_page_root_only_pins_seven_keys_incl_pp() {
     // keys include "pp" but NOT "av" (different key-set, same arity as avatar-only).
     let owner = harmony_app::community_membership::mint_test_owner(0x8E);
     let card = ProfileCardBroadcast {
+        signer_certs: Vec::new(),
         owner_id: owner.owner.0,
         display_name: "Ann".into(),
         status_text: "hi".into(),
@@ -106,6 +108,7 @@ fn profile_card_with_avatar_and_page_root_pins_eight_keys() {
     // keys include both "av" and "pp".
     let owner = harmony_app::community_membership::mint_test_owner(0x9E);
     let card = ProfileCardBroadcast {
+        signer_certs: Vec::new(),
         owner_id: owner.owner.0,
         display_name: "Ann".into(),
         status_text: "hi".into(),

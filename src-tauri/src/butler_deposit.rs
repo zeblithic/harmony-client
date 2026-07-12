@@ -166,6 +166,17 @@ pub struct DepositFrame {
     /// birational X25519 key with [`BUTLER_DEPOSIT_SEAL_INFO`].
     #[serde(rename = "sb", with = "serde_bytes")]
     pub sealed_blob: Vec<u8>,
+    /// ZEB-677: canonical CBOR of `Vec<EnrollmentCert>` — the Master-issued
+    /// signer certs backing a Quorum-issued `sender_enrollment_cert`. Empty
+    /// when the cert is Master-issued (key omitted on the wire; old butlers
+    /// ignore it and keep rejecting quorum certs).
+    #[serde(
+        rename = "sc",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "serde_bytes"
+    )]
+    pub signer_certs_cbor: Vec<u8>,
 }
 
 /// The butler → sender acknowledgement, returned only AFTER the deposit is
@@ -458,6 +469,9 @@ pub fn build_deposit_frame(
         sender_enrollment_cert: sender_enrollment_cert.to_vec(),
         sig,
         sealed_blob,
+        // ZEB-677: bundle threading for quorum-certed senders lands with the
+        // ceremony slices (S4); every self-cert today is Master-issued.
+        signer_certs_cbor: Vec::new(),
     })
 }
 
@@ -700,6 +714,7 @@ mod tests {
     /// mirrors the wire_format_zeb375 fixture discipline).
     fn fixture_frame() -> DepositFrame {
         DepositFrame {
+            signer_certs_cbor: Vec::new(),
             recipient_owner: [0x11; 16],
             sender_owner: [0x22; 16],
             sender_enrollment_cert: vec![0xE1, 0xE2, 0xE3, 0xE4],

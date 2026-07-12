@@ -24,6 +24,7 @@ fn fixture_hlc() -> Hlc {
 
 fn fixture_signed_event(kind: MembershipEventKind) -> SignedMembershipEvent {
     SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x42; 16],
         community_id: SpaceId([0x37; 16]),
         kind,
@@ -177,6 +178,7 @@ fn countersignature_wire_bytes_pinned() {
 #[test]
 fn community_invite_payload_open_wire_bytes_pinned() {
     let p = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0x37; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -225,6 +227,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
     // encoded payload is reproducible. NOT a real signature — this test
     // pins canonical wire bytes only.
     let admin_bootstrap = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0xCC; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::Join,
@@ -236,6 +239,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
     };
 
     let p = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0x37; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,

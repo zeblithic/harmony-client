@@ -511,6 +511,16 @@ pub struct SignedMembershipEvent {
     /// cert.device_pubkeys.
     #[serde(rename = "en", skip_serializing_if = "Option::is_none", default)]
     pub enrollment: Option<EnrollmentCert>,
+
+    /// ZEB-677: Master-issued signer certs backing a Quorum-issued cert —
+    /// either `enrollment` above or a cert inside a `DeviceRetire` payload
+    /// (both positions). Empty for Master-issued certs (the key is omitted
+    /// on the wire; old peers ignore it and keep rejecting quorum certs).
+    /// Sits OUTSIDE the signed EventPayload like `enrollment` — safe for
+    /// the same reason: each signer cert is independently master-signed
+    /// and the chokepoint verifies the full chain.
+    #[serde(rename = "eb", default, skip_serializing_if = "Vec::is_empty")]
+    pub signer_certs: Vec<EnrollmentCert>,
 }
 
 /// Counter-signature appended by an existing community member to vouch
@@ -624,6 +634,7 @@ pub fn sign_event(
     let bytes = canonical_cbor_encode(payload)?;
     let sig = signing_key.sign(&bytes).to_bytes();
     Ok(SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: payload.id,
         community_id: payload.community_id,
         kind: payload.kind.clone(),
@@ -651,6 +662,7 @@ pub fn sign_event_with_identity(
     let bytes = canonical_cbor_encode(payload)?;
     let sig = private.sign(&bytes);
     Ok(SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: payload.id,
         community_id: payload.community_id,
         kind: payload.kind.clone(),
@@ -909,11 +921,11 @@ pub enum VerifyError {
     // ── ZEB-339 enrolled-device cert error taxonomy ────────────────────────
     /// ZEB-339: Join/PendingJoin/bootstrap arrived with no `enrollment` cert.
     MissingEnrollmentCert,
-    /// ZEB-339: `cert.verify()` failed (bad master sig / hash(master)!=owner_id
-    /// / device-id mismatch / unknown version), OR a non-`Master` issuer
-    /// (e.g. `Quorum`) was carried — the community path cannot fully verify
-    /// quorum signatures (that needs `OwnerState` walk-back), so it rejects
-    /// them rather than accept on structural-checks-only (spec §10).
+    /// ZEB-339: cert verification failed (bad master sig /
+    /// hash(master)!=owner_id / device-id mismatch / unknown version).
+    /// ZEB-677: Quorum-issued certs verify via the `enrollment_verify`
+    /// chokepoint against the event's carried `signer_certs` bundle; a
+    /// quorum cert with a missing/short/invalid bundle lands here.
     EnrollmentCertInvalid,
     /// ZEB-339: `cert.owner_id != event.actor.0`.
     EnrollmentOwnerMismatch,
@@ -954,11 +966,10 @@ pub enum VerifyError {
     DeviceRetireForNonMember,
     /// ZEB-668 S3: a `DeviceRetire` whose carried cert pair fails
     /// verification or doesn't bind: owner_id ≠ actor on either cert,
-    /// revocation target ≠ enrollment device_id, non-Master enrollment
-    /// issuer, bad signature on either cert, Quorum revocation issuer
-    /// (unverifiable community-side, same posture as
-    /// `EnrollmentCertInvalid`'s non-Master rule), or an oversize
-    /// `Other(reason)` string.
+    /// revocation target ≠ enrollment device_id, bad signature on either
+    /// cert, a Quorum-issued cert (either position) whose carried
+    /// `signer_certs` bundle is missing or fails depth-1 verification
+    /// (ZEB-677), or an oversize `Other(reason)` string.
     DeviceRetireCertInvalid,
 
     // ── ZEB-458 P4B CommunityRelayAnnounce verify rules ───────────────────────
@@ -1399,16 +1410,13 @@ pub fn verify_membership_signer(
 /// key.
 ///
 /// Returns `Err(MissingEnrollmentCert)` if `enrollment` is `None`.
-/// Returns `Err(EnrollmentCertInvalid)` if `cert.verify()` fails OR the issuer
-/// is non-`Master` (see below).
+/// Returns `Err(EnrollmentCertInvalid)` if verification fails.
 /// Returns `Err(EnrollmentOwnerMismatch)` if `cert.owner_id != event.actor.0`.
 ///
-/// Issuer policy (spec §10): only `EnrollmentIssuer::Master` certs are accepted
-/// here. `cert.verify()` performs only STRUCTURAL checks for `Quorum` issuers
-/// (it does not verify the quorum signatures — that requires an `OwnerState`
-/// walk-back the community path does not have). Alpha mints Master certs only,
-/// so we reject `Quorum` gracefully rather than accept one on structural checks
-/// alone, which would admit unverified signatures.
+/// Issuer policy (ZEB-677): routes through the `enrollment_verify`
+/// chokepoint — Master certs verify self-contained; Quorum certs verify
+/// against the event's carried `signer_certs` bundle (depth-1 chain
+/// carriage). A quorum cert without its bundle still fails closed.
 pub fn enrolled_key_from_cert(
     event: &SignedMembershipEvent,
 ) -> Result<EnrolledDeviceKey, VerifyError> {
@@ -1418,30 +1426,28 @@ pub fn enrolled_key_from_cert(
         .ok_or(VerifyError::MissingEnrollmentCert)?;
     // Divide by 1000: EnrollmentCert expiry is Unix seconds; event.at.wall_ms is
     // milliseconds. Still deterministic — a pure function of event.at.wall_ms. (ZEB-378)
-    cert.verify(event.at.wall_ms / 1000)
-        .map_err(|_| VerifyError::EnrollmentCertInvalid)?;
-    // Reject non-Master issuers: the community path cannot fully verify Quorum
-    // signatures, and cert.verify() only structurally-checks them (spec §10).
-    if !matches!(
-        cert.issuer,
-        harmony_owner::certs::EnrollmentIssuer::Master { .. }
-    ) {
-        return Err(VerifyError::EnrollmentCertInvalid);
-    }
-    if cert.owner_id != event.actor.0 {
-        return Err(VerifyError::EnrollmentOwnerMismatch);
-    }
+    let verified = crate::enrollment_verify::verify_enrollment_any_issuer(
+        cert,
+        &event.signer_certs,
+        Some(&event.actor.0),
+        event.at.wall_ms / 1000,
+    )
+    .map_err(|e| match e {
+        crate::enrollment_verify::EnrollmentVerifyError::OwnerMismatch => {
+            VerifyError::EnrollmentOwnerMismatch
+        }
+        _ => VerifyError::EnrollmentCertInvalid,
+    })?;
     Ok(EnrolledDeviceKey {
         owner: event.actor,
-        device_ed25519: cert.device_pubkeys.classical.ed25519_verify,
+        device_ed25519: verified.device_ed25519,
     })
 }
 
 /// ZEB-668 S3: validate the cert pair carried by a `DeviceRetire`, proving —
 /// with no communal state beyond the actor's OwnerAddr — that:
 ///
-/// 1. `enrollment` is a genuine Master-issued cert for the actor's owner
-///    (embedded master key hashes to `owner_id == actor.0`), binding the
+/// 1. `enrollment` is a genuine cert for the actor's owner, binding the
 ///    16-byte `device_id` to the 32-byte ed25519 key communities store.
 ///    Verified at the cert's own `issued_at`, NOT event time (unlike
 ///    `enrolled_key_from_cert`): retire must work for certs that have since
@@ -1449,30 +1455,38 @@ pub fn enrolled_key_from_cert(
 ///    to removing it; the signature binding is what's load-bearing here.
 /// 2. `revocation` targets exactly that device (`target == device_id`),
 ///    names the same owner, and its signature verifies: Master-issued certs
-///    are self-contained (`verify(None)` checks the embedded master key
-///    hashes to `owner_id`); SelfDevice certs verify under the retired
-///    device's own ed25519 key taken from the enrollment cert. Quorum
-///    issuers are rejected — unverifiable community-side, same posture as
-///    `enrolled_key_from_cert`'s non-Master rule.
+///    are self-contained; SelfDevice certs verify under the retired
+///    device's own ed25519 key taken from the enrollment cert.
 /// 3. An `Other(reason)` string is capped — same DoS posture as moderation
 ///    reasons (a malicious peer must not persist a giant string on every
 ///    replica).
+///
+/// ZEB-677: both positions route through the `enrollment_verify`
+/// chokepoint, so Quorum-issued certs (either position) verify against the
+/// event's carried `signer_certs` bundle — as-of their own `issued_at`,
+/// consistent with rule 1's expiry semantics. Without a bundle they fail
+/// closed as before.
 fn verify_device_retire_certs(
     actor: &OwnerAddr,
     revocation: &RevocationCert,
     enrollment: &EnrollmentCert,
+    signer_certs: &[EnrollmentCert],
 ) -> Result<(), VerifyError> {
-    use harmony_owner::certs::{EnrollmentIssuer, RevocationIssuer, RevocationReason};
+    use harmony_owner::certs::RevocationReason;
     if enrollment.owner_id != actor.0
         || revocation.owner_id != actor.0
         || revocation.target != enrollment.device_id
     {
         return Err(VerifyError::DeviceRetireCertInvalid);
     }
-    if !matches!(enrollment.issuer, EnrollmentIssuer::Master { .. }) {
-        return Err(VerifyError::DeviceRetireCertInvalid);
-    }
-    if enrollment.verify(enrollment.issued_at).is_err() {
+    if crate::enrollment_verify::verify_enrollment_any_issuer(
+        enrollment,
+        signer_certs,
+        Some(&actor.0),
+        enrollment.issued_at,
+    )
+    .is_err()
+    {
         return Err(VerifyError::DeviceRetireCertInvalid);
     }
     if let RevocationReason::Other(s) = &revocation.reason {
@@ -1480,22 +1494,17 @@ fn verify_device_retire_certs(
             return Err(VerifyError::DeviceRetireCertInvalid);
         }
     }
-    let ok = match &revocation.issuer {
-        RevocationIssuer::Master { .. } => revocation.verify(None).is_ok(),
-        RevocationIssuer::SelfDevice => {
-            let retired_vk = enrollment.device_pubkeys.classical.ed25519_verify;
-            match ed25519_dalek::VerifyingKey::from_bytes(&retired_vk) {
-                Ok(vk) => revocation.verify(Some(&vk)).is_ok(),
-                Err(_) => false,
-            }
-        }
-        RevocationIssuer::Quorum { .. } => false,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(VerifyError::DeviceRetireCertInvalid)
+    if crate::enrollment_verify::verify_revocation_any_issuer(
+        revocation,
+        enrollment,
+        signer_certs,
+        revocation.issued_at,
+    )
+    .is_err()
+    {
+        return Err(VerifyError::DeviceRetireCertInvalid);
     }
+    Ok(())
 }
 
 /// Steady-state signer resolution: find the actor's enrolled device key (from
@@ -3404,7 +3413,7 @@ pub fn verify_event(
             if !prior_state.members.contains_key(&event.actor) {
                 return Err(VerifyError::DeviceRetireForNonMember);
             }
-            verify_device_retire_certs(&event.actor, revocation, enrollment)?;
+            verify_device_retire_certs(&event.actor, revocation, enrollment, &event.signer_certs)?;
         }
     }
 
@@ -5054,6 +5063,7 @@ mod tests {
         let mut id = [0xfa; 16];
         id[15] = id_byte;
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::Kick {
@@ -5090,6 +5100,7 @@ mod tests {
             })
             .collect();
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::EpochRotation {
@@ -5113,6 +5124,7 @@ mod tests {
         let mut id = [0xfc; 16];
         id[15] = id_byte;
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::Leave,
@@ -5134,6 +5146,7 @@ mod tests {
         let mut id = [0xfd; 16];
         id[15] = id_byte;
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::Join,
@@ -5196,6 +5209,7 @@ mod tests {
             })
             .collect();
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::EpochCatchup {
@@ -5223,6 +5237,7 @@ mod tests {
         let mut id = [0xff; 16];
         id[15] = id_byte;
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::Join,
@@ -5357,6 +5372,7 @@ mod tests {
         let dave = OwnerAddr([0xd1; 16]);
 
         let setpwr_admin2 = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x05; 16],
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::SetPower {
@@ -5535,6 +5551,7 @@ mod tests {
         let bob = OwnerAddr([0xb2; 16]);
         // Promote admin2 to admin power via SetPower from admin1.
         let setpwr = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x05; 16],
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::SetPower {
@@ -5790,6 +5807,7 @@ mod tests {
 
         // Give bob admin power so he can kick.
         let setpwr_bob = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::SetPower {
@@ -5852,6 +5870,7 @@ mod tests {
 
         // Give bob admin power.
         let setpwr_bob = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::SetPower {
@@ -5981,6 +6000,7 @@ mod tests {
         let mut id = [0xf0; 16];
         id[15] = id_byte;
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::Unban { target, reason },
@@ -6005,6 +6025,7 @@ mod tests {
         let mut id = [0xef; 16];
         id[15] = id_byte;
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::Invite { target },
@@ -6090,6 +6111,7 @@ mod tests {
         let mod_join = make_enrolled_join(0x02, &mod_priv, 2);
         let target_join = make_join_event(0x03, target_addr, 3);
         let setpwr_mod = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x04; 16],
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::SetPower {
@@ -6384,6 +6406,7 @@ mod tests {
         // a member at rotation time). Then carol joins at wall_ms=200 with prior
         // status Invited — this is the M9 scenario: Invited→Joined after epoch bump.
         let invite_carol = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x10; 16],
             community_id: SpaceId([0xc0; 16]),
             kind: MembershipEventKind::Invite { target: carol },
@@ -6879,6 +6902,7 @@ mod tests {
         let before = materialize(std::slice::from_ref(&admin_join), admin);
 
         let fork = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x02; 16],
             community_id,
             kind: MembershipEventKind::Fork {
@@ -6925,6 +6949,7 @@ mod tests {
 
         let admin_join = make_join_event(0x01, admin, 1);
         let fork = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x02; 16],
             community_id,
             kind: MembershipEventKind::Fork {
@@ -7300,6 +7325,7 @@ mod tests {
         use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 
         let ev = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [1u8; 16],
             community_id: SpaceId([2u8; 16]),
             kind: MembershipEventKind::Leave,
@@ -7984,6 +8010,7 @@ mod zeb_254_pending_join_verify_tests {
         let mut id = [0u8; 16];
         id[15] = id_byte;
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xcc; 16]),
             kind,
@@ -10373,6 +10400,7 @@ mod zeb_250_materialize_prepass_tests {
         let prop_id = [0xAA; 16];
         let events = vec![
             SignedMembershipEvent {
+                signer_certs: Vec::new(),
                 id: prop_id,
                 community_id: SpaceId([0xc0; 16]),
                 actor: admin1,
@@ -10389,6 +10417,7 @@ mod zeb_250_materialize_prepass_tests {
                 enrollment: None,
             },
             SignedMembershipEvent {
+                signer_certs: Vec::new(),
                 id: [0xBB; 16],
                 community_id: SpaceId([0xc0; 16]),
                 actor: admin2,
@@ -10427,6 +10456,7 @@ mod zeb_250_admin_proposal_materialize_tests {
         kind: MembershipEventKind,
     ) -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: COM,
             actor,
@@ -12275,12 +12305,13 @@ mod zeb_339_signer_verify_tests {
         );
     }
 
-    /// ZEB-339 (spec §10): a `Quorum`-issued cert is rejected by the community
-    /// path even when it passes `cert.verify()`'s STRUCTURAL checks, because
-    /// quorum signatures cannot be verified here (no OwnerState walk-back).
-    /// Construct a structurally-valid Quorum cert by hand and confirm rejection.
+    /// ZEB-339/ZEB-677: a `Quorum`-issued cert presented WITHOUT its
+    /// signer-cert bundle is rejected even when it passes `cert.verify()`'s
+    /// STRUCTURAL checks — the quorum part signatures cannot be verified
+    /// without the bundle. (The old blanket non-Master rejection narrowed to
+    /// the no-bundle case; see `enrollment_cert_quorum_accepted_with_bundle`.)
     #[test]
-    fn enrollment_cert_quorum_issuer_rejected() {
+    fn enrollment_cert_quorum_issuer_rejected_without_bundle() {
         use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
         use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
 
@@ -12333,12 +12364,90 @@ mod zeb_339_signer_verify_tests {
             enrollment: Some(quorum_cert),
             ..ev
         };
-        // Despite passing structural verify() AND owner_id == actor, the Quorum
-        // issuer is rejected before the owner check.
+        // Despite passing structural verify() AND owner_id == actor, a quorum
+        // cert with no signer-cert bundle must be rejected.
+        assert!(ev.signer_certs.is_empty());
         assert_eq!(
             enrolled_key_from_cert(&ev),
             Err(VerifyError::EnrollmentCertInvalid)
         );
+    }
+
+    /// ZEB-677: a genuine Quorum-issued cert presented WITH its Master-issued
+    /// signer certs resolves to the enrolled device key, exactly like a
+    /// Master cert (depth-1 chain carriage through the chokepoint).
+    #[test]
+    fn enrollment_cert_quorum_accepted_with_bundle() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0x90);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: OwnerAddr(world.owner_id),
+                at: Hlc {
+                    // Chokepoint gets wall_ms / 1000 — scale WORLD_NOW up so
+                    // every cert in the world is valid at event time.
+                    wall_ms: WORLD_NOW * 1000,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &world.c_sk,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(world.c_quorum_cert.clone()),
+            signer_certs: world.bundle.clone(),
+            ..ev
+        };
+        let resolved = enrolled_key_from_cert(&ev).expect("quorum cert with bundle resolves");
+        assert_eq!(resolved.owner, OwnerAddr(world.owner_id));
+        assert_eq!(
+            resolved.device_ed25519,
+            world.c_quorum_cert.device_pubkeys.classical.ed25519_verify
+        );
+        // And the full event signature path accepts it too.
+        verify_membership_signer(&ev, &resolved).expect("event signed by quorum-enrolled device");
+    }
+
+    /// ZEB-677: the event's `signer_certs` wire field is additive — absent
+    /// key decodes to empty (old encoders), populated bundle round-trips.
+    #[test]
+    fn event_signer_certs_field_roundtrips_and_defaults_empty() {
+        use crate::enrollment_verify::quorum_fixtures::mint_quorum_world;
+        let owner = mint_test_owner(0x26);
+        let ev = sign_event(
+            &EventPayload {
+                id: [2u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: owner.owner,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &owner.device_key,
+        )
+        .unwrap();
+        assert!(ev.signer_certs.is_empty());
+        let bytes = canonical_cbor_encode(&ev).expect("encode");
+        let back: SignedMembershipEvent =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(ev, back, "empty bundle round-trips (key omitted)");
+
+        let world = mint_quorum_world(0x94);
+        let with_bundle = SignedMembershipEvent {
+            signer_certs: world.bundle.clone(),
+            ..ev
+        };
+        let bytes = canonical_cbor_encode(&with_bundle).expect("encode with bundle");
+        let back: SignedMembershipEvent =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).expect("decode with bundle");
+        assert_eq!(back.signer_certs, world.bundle, "bundle round-trips");
     }
 
     // ── ZEB-495 (ZEB-340 Part 2) DeviceAnnounce tests ─────────────────────────
@@ -13060,6 +13169,156 @@ mod zeb_339_signer_verify_tests {
 
         verify_event(&retire, &prior, &retire_ctx(community_id, owner.owner))
             .expect("self-signed DeviceRetire (retired device's own cert) must verify");
+    }
+
+    // ── ZEB-677: Quorum certs in DeviceRetire (both positions) ──────────────
+
+    /// Prior state + retire event for the quorum world: the actor is Joined
+    /// with signer-device A's key enrolled (A signs the retire event), and
+    /// the event carries the world's signer-cert bundle.
+    fn quorum_world_retire(
+        world: &crate::enrollment_verify::quorum_fixtures::QuorumWorld,
+        community_id: SpaceId,
+        revocation: RevocationCert,
+        retired: &EnrollmentCert,
+    ) -> (SignedMembershipEvent, MaterializedMembership) {
+        let actor = OwnerAddr(world.owner_id);
+        let mut keys = BTreeSet::new();
+        keys.insert(world.a_cert.device_pubkeys.classical.ed25519_verify);
+        keys.insert(retired.device_pubkeys.classical.ed25519_verify);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            actor,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: keys,
+                revoked_device_keys: BTreeSet::new(),
+            },
+        );
+        let payload = EventPayload {
+            id: [0xDF; 16],
+            community_id,
+            kind: MembershipEventKind::DeviceRetire {
+                revocation,
+                enrollment: Box::new(retired.clone()),
+            },
+            actor,
+            at: Hlc {
+                wall_ms: 2_000,
+                logical: 0,
+                device_id: "device-a".into(),
+            },
+        };
+        let ev = sign_event(&payload, &world.a_sk).expect("sign DeviceRetire");
+        let ev = SignedMembershipEvent {
+            signer_certs: world.bundle.clone(),
+            ..ev
+        };
+        (ev, prior)
+    }
+
+    /// A Quorum-issued REVOCATION (signers A+B) retiring the Master-certed
+    /// device B verifies when the event carries the signer-cert bundle —
+    /// the lost-master story's community-visible half.
+    #[test]
+    fn verify_event_accepts_quorum_revocation_device_retire() {
+        use crate::enrollment_verify::quorum_fixtures::{
+            mint_quorum_revocation, mint_quorum_world, WORLD_NOW,
+        };
+        let world = mint_quorum_world(0x98);
+        let community_id = SpaceId([0xe6; 16]);
+        let rc = mint_quorum_revocation(&world, world.b_cert.device_id, WORLD_NOW);
+        let (retire, prior) = quorum_world_retire(&world, community_id, rc, &world.b_cert.clone());
+        verify_event(
+            &retire,
+            &prior,
+            &retire_ctx(community_id, OwnerAddr(world.owner_id)),
+        )
+        .expect("quorum-signed DeviceRetire with bundle must verify");
+    }
+
+    /// A Master-signed revocation retiring the QUORUM-enrolled device C
+    /// verifies when the event carries the signer-cert bundle (the retired
+    /// cert's quorum enrollment needs the bundle to verify).
+    #[test]
+    fn verify_event_accepts_quorum_enrollment_device_retire() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        use harmony_owner::certs::RevocationReason;
+        let world = mint_quorum_world(0x9C);
+        let community_id = SpaceId([0xe7; 16]);
+        let rc = RevocationCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.c_quorum_cert.device_id,
+            WORLD_NOW,
+            RevocationReason::Lost,
+        )
+        .expect("master revocation of quorum-enrolled device");
+        let (retire, prior) =
+            quorum_world_retire(&world, community_id, rc, &world.c_quorum_cert.clone());
+        verify_event(
+            &retire,
+            &prior,
+            &retire_ctx(community_id, OwnerAddr(world.owner_id)),
+        )
+        .expect("DeviceRetire of a quorum-enrolled device with bundle must verify");
+    }
+
+    /// Both quorum positions FAIL CLOSED when the bundle is stripped.
+    #[test]
+    fn verify_event_rejects_quorum_device_retire_without_bundle() {
+        use crate::enrollment_verify::quorum_fixtures::{
+            mint_quorum_revocation, mint_quorum_world, WORLD_NOW,
+        };
+        use harmony_owner::certs::RevocationReason;
+
+        // Quorum revocation position.
+        let world = mint_quorum_world(0xA0);
+        let community_id = SpaceId([0xe8; 16]);
+        let rc = mint_quorum_revocation(&world, world.b_cert.device_id, WORLD_NOW);
+        let (retire, prior) = quorum_world_retire(&world, community_id, rc, &world.b_cert.clone());
+        let stripped = SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            ..retire
+        };
+        let err = verify_event(
+            &stripped,
+            &prior,
+            &retire_ctx(community_id, OwnerAddr(world.owner_id)),
+        )
+        .expect_err("quorum revocation without bundle must be rejected");
+        assert_eq!(err, VerifyError::DeviceRetireCertInvalid);
+
+        // Quorum enrollment position.
+        let world = mint_quorum_world(0xA4);
+        let community_id = SpaceId([0xe9; 16]);
+        let rc = RevocationCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.c_quorum_cert.device_id,
+            WORLD_NOW,
+            RevocationReason::Lost,
+        )
+        .expect("master revocation");
+        let (retire, prior) =
+            quorum_world_retire(&world, community_id, rc, &world.c_quorum_cert.clone());
+        let stripped = SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            ..retire
+        };
+        let err = verify_event(
+            &stripped,
+            &prior,
+            &retire_ctx(community_id, OwnerAddr(world.owner_id)),
+        )
+        .expect_err("quorum enrollment position without bundle must be rejected");
+        assert_eq!(err, VerifyError::DeviceRetireCertInvalid);
     }
 
     #[test]

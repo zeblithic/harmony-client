@@ -752,7 +752,9 @@ mod tests {
             RevocationReason::Lost,
         )
         .unwrap();
-        state.add_revocation(rc).unwrap();
+        state
+            .add_revocation(rc, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
 
         let after = live_enrolled_intro_ids(&state);
         assert_eq!(after.len(), 1, "revoked device leaves the coverage set");

@@ -201,6 +201,7 @@ fn encrypted_envelope_wire_bytes_pinned_v3_with_ratchet() {
 #[test]
 fn invite_payload_with_epoch_snapshot_wire_bytes_pinned() {
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0xc0; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,

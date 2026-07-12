@@ -410,6 +410,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         .expect("seal epoch key to bob");
 
     let invite_url = community_invite::encode_invite_url(&CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -649,6 +650,7 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
     // not the key content. Use a valid-length vector of 0xDD bytes.
     // ZEB-249 PR #106 R5: encode_invite_url now enforces this length.
     let invite_url = encode_invite_url(&CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,

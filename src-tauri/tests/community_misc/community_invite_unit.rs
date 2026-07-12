@@ -51,6 +51,7 @@ fn assert_cbor_top_level_keys(bytes: &[u8], present: &[&str], absent: &[&str], l
 #[test]
 fn community_invite_payload_round_trips_open_form() {
     let p = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([1u8; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -95,6 +96,7 @@ fn community_invite_payload_round_trips_invite_only_form() {
     };
 
     let p = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([1u8; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -171,6 +173,7 @@ fn invite_url_round_trips_open_payload() {
     use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0xab; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -248,6 +251,7 @@ fn decode_trims_whitespace() {
     };
     use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0xab; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -313,6 +317,7 @@ fn encode_rejects_open_community_with_admin_identity_pub_set() {
     };
     use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0xab; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -368,6 +373,7 @@ fn encode_rejects_open_community_with_admin_bootstrap_set() {
     )
     .expect("sign");
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -1245,6 +1251,7 @@ mod admin_bootstrap_helpers {
         let bootstrap = admin_bootstrap_event(community_id, &admin);
 
         CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -1416,6 +1423,7 @@ mod verify_admin_bootstrap_tests {
         };
 
         let p = harmony_app::community_invite::CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
                 epoch: 0,

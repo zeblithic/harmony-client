@@ -7,6 +7,7 @@ use harmony_app::profile_card_broadcast::ProfileCardBroadcast;
 fn profile_card_canonical_cbor_pins_field_codes() {
     let owner = harmony_app::community_membership::mint_test_owner(0x7C);
     let card = ProfileCardBroadcast {
+        signer_certs: Vec::new(),
         owner_id: owner.owner.0,
         display_name: "Ann".into(),
         status_text: "hi".into(),
@@ -48,6 +49,7 @@ fn profile_card_canonical_cbor_pins_field_codes() {
 fn profile_card_round_trips_through_canonical_cbor() {
     let owner = harmony_app::community_membership::mint_test_owner(0x7D);
     let card = ProfileCardBroadcast {
+        signer_certs: Vec::new(),
         owner_id: owner.owner.0,
         display_name: "Bo".into(),
         status_text: "".into(),

@@ -627,6 +627,7 @@ async fn relay_happy_path_full_round_trip() {
         .to_bytes()
         .to_vec();
     let query = RelayPullQuery {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: fx.recipient.owner.0,
         community_id: community_id(),
         requester_enrollment_cert: cert_bytes.clone(),
@@ -692,6 +693,7 @@ async fn relay_happy_path_full_round_trip() {
         &community_id(),
         &ack_msg,
         &cert_bytes,
+        &[],
         &pull_ack_sig,
         &relay_ctx,
     )
@@ -809,6 +811,7 @@ async fn relay_wrong_owner_pull_cert_rejected() {
         .to_bytes()
         .to_vec();
     let bad_query = RelayPullQuery {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: fx.recipient.owner.0,
         community_id: community_id(),
         requester_enrollment_cert: other_cert_bytes,
@@ -917,6 +920,7 @@ async fn relay_restart_durability_blob_survives_engine_drop() {
         .to_bytes()
         .to_vec();
     let query = RelayPullQuery {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: fx.recipient.owner.0,
         community_id: community_id(),
         requester_enrollment_cert: cert_bytes,
@@ -1159,6 +1163,7 @@ async fn relay_prod_ctx_happy_path_full_round_trip() {
         .to_bytes()
         .to_vec();
     let query = RelayPullQuery {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: fx.recipient.owner.0,
         community_id: community_id(),
         requester_enrollment_cert: cert_bytes.clone(),
@@ -1206,6 +1211,7 @@ async fn relay_prod_ctx_happy_path_full_round_trip() {
         &community_id(),
         &ack_msg,
         &cert_bytes,
+        &[],
         &pull_ack_sig,
         &pull_ctx,
     )
@@ -1355,6 +1361,7 @@ async fn relay_prod_ctx_restart_durability_pull_via_prod_ctx() {
         .to_bytes()
         .to_vec();
     let query = RelayPullQuery {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: fx.recipient.owner.0,
         community_id: community_id(),
         requester_enrollment_cert: cert_bytes,
@@ -1454,6 +1461,7 @@ async fn relay_prod_ctx_multi_blob_drain_no_reserve_after_ack() {
         .to_bytes()
         .to_vec();
     let query = RelayPullQuery {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: recipient.owner.0,
         community_id: community_id(),
         requester_enrollment_cert: cert_bytes.clone(),
@@ -1488,6 +1496,7 @@ async fn relay_prod_ctx_multi_blob_drain_no_reserve_after_ack() {
         &community_id(),
         &ack_msg,
         &cert_bytes,
+        &[],
         &ack_sig,
         &pull_ctx,
     )
@@ -1510,6 +1519,7 @@ async fn relay_prod_ctx_multi_blob_drain_no_reserve_after_ack() {
 
     // ----- (4) Second pull (SAME device) returns EMPTY — none re-served -----
     let query2 = RelayPullQuery {
+        signer_certs_cbor: Vec::new(),
         recipient_owner: recipient.owner.0,
         community_id: community_id(),
         requester_enrollment_cert: cert_bytes,

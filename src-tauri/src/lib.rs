@@ -173,6 +173,7 @@ pub mod dm_outhold_persist;
 pub mod dm_signing;
 pub mod dm_tunnel_contact;
 pub mod emoji_names;
+pub mod enrollment_verify;
 pub mod event_loop;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
@@ -24028,6 +24029,7 @@ mod list_community_forks_tests {
         wall_ms: u64,
     ) -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [id_byte; 16],
             community_id,
             kind,
@@ -24374,6 +24376,7 @@ mod list_community_forks_tests {
         events.insert(
             [0x01; 16],
             SignedMembershipEvent {
+                signer_certs: Vec::new(),
                 id: [0x01; 16],
                 community_id: cid,
                 kind: MembershipEventKind::Fork {
@@ -24394,6 +24397,7 @@ mod list_community_forks_tests {
         events.insert(
             [0x02; 16],
             SignedMembershipEvent {
+                signer_certs: Vec::new(),
                 id: [0x02; 16],
                 community_id: cid,
                 kind: MembershipEventKind::Fork {
@@ -27495,6 +27499,7 @@ pub(crate) async fn generate_invite_impl(
     };
 
     let mut payload = crate::community_invite::CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: space_id,
         epoch_snapshot,
         admin_addr: admin,
@@ -30836,6 +30841,7 @@ mod preview_invite_tests {
 
     fn open_payload() -> CommunityInvitePayload {
         CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([7; 16]),
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -30876,6 +30882,7 @@ mod preview_invite_tests {
         )
         .expect("mint token");
         let admin_bootstrap = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0u8; 16],
             community_id: SpaceId([9; 16]),
             kind: MembershipEventKind::Join,
@@ -30890,6 +30897,7 @@ mod preview_invite_tests {
             enrollment: Some(mint_test_owner(0x6E).cert),
         };
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([9; 16]),
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -33366,6 +33374,7 @@ mod redeem_invite_inner_tests {
         let membership_key = EpochKey::new([0x42; 32]);
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33436,6 +33445,7 @@ mod redeem_invite_inner_tests {
         let enrollment_cert = owner.cert.clone();
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([0xee; 16]),
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33533,6 +33543,7 @@ mod redeem_invite_inner_tests {
         };
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33665,6 +33676,7 @@ mod redeem_invite_inner_tests {
         };
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33779,6 +33791,7 @@ mod redeem_invite_inner_tests {
         };
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33873,6 +33886,7 @@ mod redeem_invite_inner_tests {
         };
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -33948,6 +33962,7 @@ mod redeem_invite_inner_tests {
         };
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -34016,6 +34031,7 @@ mod redeem_invite_inner_tests {
             InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
         };
         CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -34148,6 +34164,7 @@ mod redeem_invite_inner_tests {
             .expect("seal to ephemeral");
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -34230,6 +34247,7 @@ mod redeem_invite_inner_tests {
 
         let raw_key = [0x44u8; 32];
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -34293,6 +34311,7 @@ mod zeb436_orphan_adoption_tests {
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
         let membership_key = EpochKey::new([key_byte; 32]);
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -34811,6 +34830,7 @@ mod zeb436_orphan_adoption_tests {
                 .expect("seal epoch key")
         };
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -35105,6 +35125,7 @@ mod join_open_community_tests {
     ) -> AggregatedEntry {
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -50499,8 +50520,8 @@ pub async fn connectivity_link_friend_iroh_inner(
 ) -> Result<FriendLinkOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
-        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
+        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
+        FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -50513,10 +50534,12 @@ pub async fn connectivity_link_friend_iroh_inner(
     //     recover the inviter's enrolled device-#2 key.
     let inviter_device_key = verify_enrolled_device(
         &payload.inviter_enrollment,
+        &payload.inviter_signer_certs,
         payload.inviter_addr,
         crate::iroh_friend_acceptor::wall_now_secs(),
     )
-    .map_err(|e| format!("verify inviter enrollment: {e}"))?;
+    .map_err(|e| format!("verify inviter enrollment: {e}"))?
+    .device_ed25519;
 
     // 1b. Verify the friend token's device-#2 signature against that key (the
     //     token is `InviteToken`-shaped, minted by `mint_friend_token`).
@@ -50670,6 +50693,9 @@ pub async fn connectivity_link_friend_iroh_inner(
         token_sig: Some(payload.token.sig),
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
+        // ZEB-677: bundle threading for a quorum-certed self lands with the
+        // ceremony slices (S4); every self-cert today is Master-issued.
+        signer_certs: Vec::new(),
         sig: req_sig,
         sender_devices: req_bundle.sender_devices,
         device_identity_pubs: req_bundle.device_identity_pubs,
@@ -50784,18 +50810,19 @@ pub async fn connectivity_link_friend_iroh_inner(
 
     // 7. Verify the accept: it must be from the inviter (cert binds
     //    payload.inviter_addr) and signed over the accept preimage.
-    let accept_device_key =
+    let accept_verified =
         // ZEB-378: sample a FRESH clock here — this verify runs after pkarr
         // resolution + the iroh handshake (seconds of I/O), so the `now_ms`
         // captured early for token/pkarr checks would be stale at verification time.
         verify_enrolled_device(
             &accepted.enrollment,
+            &accepted.signer_certs,
             payload.inviter_addr,
             crate::iroh_friend_acceptor::wall_now_secs(),
         )
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
-    let accept_vk =
-        VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    let accept_vk = VerifyingKey::from_bytes(&accept_verified.device_ed25519)
+        .map_err(|_| "accept device key invalid")?;
     // ZEB-461/473: bind the accepter's contact digest (device bundle +
     // reachability + PQ keys, all carried in the accept) into the verified
     // accept preimage.
@@ -50819,10 +50846,10 @@ pub async fn connectivity_link_friend_iroh_inner(
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
 
-    // 8. Extract the inviter's master key (their friend-graph anchor) + apply
-    //    them as an Active/Token friend to local owner-state.
-    let master_ed25519 = master_ed25519_from_cert(&accepted.enrollment)
-        .map_err(|e| format!("extract inviter master key: {e}"))?;
+    // 8. The inviter's master key (their friend-graph anchor) came from the
+    //    chokepoint verification in step 7; apply them as an Active/Token
+    //    friend to local owner-state.
+    let master_ed25519 = accept_verified.master_ed25519;
     let display = accepted.display.clone().or(payload.display_hint.clone());
 
     let wall_now_ms = std::time::SystemTime::now()
@@ -53577,8 +53604,8 @@ pub async fn connectivity_add_friend_by_key_inner(
 ) -> Result<AddFriendOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, master_ed25519_from_cert, verify_enrolled_device,
-        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
+        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
+        FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -53790,6 +53817,8 @@ pub async fn connectivity_add_friend_by_key_inner(
         token_sig: None,
         eph_x25519_pub: self_eph_pub,
         enrollment: self_enrollment,
+        // ZEB-677: see the token-path build — threading lands with S4.
+        signer_certs: Vec::new(),
         sig: req_sig,
         sender_devices: req_bundle.sender_devices,
         device_identity_pubs: req_bundle.device_identity_pubs,
@@ -53904,17 +53933,18 @@ pub async fn connectivity_add_friend_by_key_inner(
     //    the token-LESS accept preimage. A garbage/forged reply errors here —
     //    never writes a friend.
     let target_addr_master = accepted.from_addr;
-    let accept_device_key =
+    let accept_verified =
         // ZEB-378: fresh clock — this verify runs after pkarr resolution + the iroh
         // handshake, so the early-captured `now_ms` would be stale at verify time.
         verify_enrolled_device(
             &accepted.enrollment,
+            &accepted.signer_certs,
             target_addr_master,
             crate::iroh_friend_acceptor::wall_now_secs(),
         )
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
-    let accept_vk =
-        VerifyingKey::from_bytes(&accept_device_key).map_err(|_| "accept device key invalid")?;
+    let accept_vk = VerifyingKey::from_bytes(&accept_verified.device_ed25519)
+        .map_err(|_| "accept device key invalid")?;
     // ZEB-461/473: bind the accepter's contact digest (device bundle +
     // reachability + PQ keys) into the verified preimage.
     let accept_devices_digest = crate::iroh_friend_acceptor::contact_digest(
@@ -53937,10 +53967,10 @@ pub async fn connectivity_add_friend_by_key_inner(
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
 
-    // 9. Extract the target's master key + apply them as an Active/MutualKey
-    //    friend (keyed on their authenticated master owner_id).
-    let master_ed25519 = master_ed25519_from_cert(&accepted.enrollment)
-        .map_err(|e| format!("extract target master key: {e}"))?;
+    // 9. The target's master key came from the chokepoint verification in
+    //    step 8; apply them as an Active/MutualKey friend (keyed on their
+    //    authenticated master owner_id).
+    let master_ed25519 = accept_verified.master_ed25519;
     let display = accepted.display.clone();
 
     let wall_now_ms = std::time::SystemTime::now()
@@ -59142,6 +59172,7 @@ mod generate_invite_helper_tests {
     #[test]
     fn build_open_invite_payload_round_trips_via_url() {
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([7; 16]),
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -59201,6 +59232,7 @@ mod generate_invite_helper_tests {
         };
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: fork_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -59437,6 +59469,7 @@ mod create_channel_delta_tests {
 
         // Create.
         let create_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::ChannelCreate {
@@ -59469,6 +59502,7 @@ mod create_channel_delta_tests {
 
         // Modify (name only — write_power None means unchanged).
         let modify_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x02; 16],
             community_id,
             kind: MembershipEventKind::ChannelModify {
@@ -59497,6 +59531,7 @@ mod create_channel_delta_tests {
 
         // Delete.
         let delete_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x03; 16],
             community_id,
             kind: MembershipEventKind::ChannelDelete { channel_id: ch_id },
@@ -59528,6 +59563,7 @@ mod create_channel_delta_tests {
         let community_id = SpaceId([0x37; 16]);
         let actor = OwnerAddr([0x10; 16]);
         let create_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::ChannelCreate {
@@ -59592,6 +59628,7 @@ mod create_channel_delta_tests {
 
         let community_id = SpaceId([0x37; 16]);
         let create_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::ChannelCreate {
@@ -61629,6 +61666,7 @@ mod pending_join_audit_feed_tests {
         community_id: SpaceId,
     ) -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id,
             kind,
@@ -62774,6 +62812,7 @@ mod list_pending_admin_proposals_tests {
         kind: MembershipEventKind,
     ) -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xaa; 16]),
             kind,

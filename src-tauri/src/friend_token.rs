@@ -46,9 +46,10 @@ pub const MAX_FRIEND_BODY_B64_CHARS: usize = crate::community_invite::MAX_INVITE
 /// [`decode_friend_token_url`]; the full crypto verification of the cert happens
 /// later at handshake time).
 ///
-/// Wire format: up to 4-key map; `dn` is skipped when `None`. Field codes are
-/// 2 chars (3-byte encoded) to satisfy the canonical-CBOR same-length-key rule
-/// at this nesting level (matching `CommunityInvitePayload`).
+/// Wire format: up to 5-key map; `dn` is skipped when `None`, `ib` when empty.
+/// Field codes are 2 chars (3-byte encoded) to satisfy the canonical-CBOR
+/// same-length-key rule at this nesting level (matching
+/// `CommunityInvitePayload`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FriendTokenPayload {
     /// The inviter's 16-byte master owner address (their `owner_id`; matches
@@ -83,6 +84,13 @@ pub struct FriendTokenPayload {
     /// the inviter solely from this cert under the device-#2 + `owner_id` model.
     #[serde(rename = "ie")]
     pub inviter_enrollment: EnrollmentCert,
+
+    /// ZEB-677: Master-issued signer certs backing a Quorum-issued
+    /// `inviter_enrollment`. Empty for Master-issued certs (the key is
+    /// omitted on the wire; old redeemers ignore it and keep rejecting
+    /// quorum-certed inviters at handshake time).
+    #[serde(rename = "ib", default, skip_serializing_if = "Vec::is_empty")]
+    pub inviter_signer_certs: Vec<EnrollmentCert>,
 }
 
 // `FriendTokenPayload`'s `CanonicalPayload`/`CanonicalPayloadSealed` impls are
@@ -201,6 +209,9 @@ pub fn mint_friend_token(
         display_hint,
         token,
         inviter_enrollment,
+        // ZEB-677: bundle threading for quorum-certed inviters lands with the
+        // ceremony slices (S4); every self-cert today is Master-issued.
+        inviter_signer_certs: Vec::new(),
     })
 }
 
@@ -238,6 +249,7 @@ mod tests {
         FriendTokenPayload {
             inviter_addr: owner.owner,
             display_hint: Some("bob".into()),
+            inviter_signer_certs: Vec::new(),
             token: InviteToken {
                 inviter: owner.owner,
                 invitee_hint: None,
