@@ -69,9 +69,10 @@ async fn run_inner() {
         .await
         .expect("declare DM media subscriber");
     // ZEB-502: deterministically wait until A's session has discovered B's REMOTE
-    // media subscriber before the one-shot put, rather than a fixed 1s settle. The
-    // frame goes out live (no replay); a put that races B's subscriber declaration
-    // is silently dropped and the recv loop below stalls to its 10s ceiling. A
+    // media subscriber before publishing, rather than a fixed 1s settle. Frames go
+    // out live (no replay); a put that races B's subscriber declaration is silently
+    // dropped — under the ZEB-675 delivery loop below that costs a 2s re-put round
+    // trip, so the barrier still pays for itself by making the first put land. A
     // concrete-key publisher on `…/{deviceA}` intersects B's wildcard subscriber, so
     // a `matching_status(Locality::Remote)` barrier is well-defined (mirrors
     // `voice_presence_two_engine_integration.rs`).
@@ -101,7 +102,7 @@ async fn run_inner() {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "A never matched B's remote media subscriber within 10s"
+                "A never matched B's remote media subscriber within 30s"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
