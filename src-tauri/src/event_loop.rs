@@ -1035,6 +1035,10 @@ pub async fn run(
     // Zenoh on `harmony/owner/{addr_hex}/ds/owner-trust-v1`. `None` when no
     // owner identity is loaded (and in test callers that bypass `start_node`).
     mut trust_sync_handles: Option<DatasetSyncHandles>,
+    // ZEB-668 S5: the fleet-keys carrier dataset channel pair
+    // (fleet-keys-v1) — epoch bump distribution across the owner's fleet.
+    // `None` when no owner identity is loaded.
+    mut fleet_keys_sync_handles: Option<DatasetSyncHandles>,
     // ZEB-495 (ZEB-340 Part 2): channel pair bridging the
     // community-device-intro FleetSyncEngine to Zenoh on
     // `harmony/owner/{addr_hex}/ds/community-device-intro-v1`. `None` when no
@@ -1936,6 +1940,23 @@ pub async fn run(
             crate::owner_trust_sync::OWNER_TRUST_DATASET,
             "owner-trust-sync-degraded",
             crate::owner_trust_sync::OWNER_TRUST_DATASET_MAX_BYTES,
+        )
+        .await;
+    }
+
+    // ── ZEB-668 S5: fleet-keys carrier Zenoh adapter ─────────────────────
+    // Distributes the master-signed epoch doc (sealed per-device material)
+    // across the owner's fleet. Keyed by the pinned epoch-0 KeyTree inside
+    // the engine; this adapter is plumbing only.
+    if let Some(fkeys) = fleet_keys_sync_handles.take() {
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            fkeys,
+            crate::fleet_key_epoch::FLEET_KEYS_DATASET,
+            "fleet-keys-sync-degraded",
+            crate::fleet_key_epoch::FLEET_KEYS_DATASET_MAX_BYTES,
         )
         .await;
     }

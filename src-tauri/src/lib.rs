@@ -174,6 +174,7 @@ pub mod dm_signing;
 pub mod dm_tunnel_contact;
 pub mod emoji_names;
 pub mod event_loop;
+pub mod fleet_key_epoch;
 pub mod fleet_net;
 pub mod fleet_net_persist;
 pub mod fleet_sync;
@@ -1380,6 +1381,18 @@ pub struct NodeState {
     /// cleared at stop_node — revocation is permanent; boot re-derives it
     /// from `owner_state.cbor`.
     pub owner_trust_revoked_self: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// ZEB-668 S5: resident fleet-keys carrier doc (`fleet-keys-v1`) + its
+    /// engine, and the swappable key set shared by every fleet dataset
+    /// engine. The bump IPC mutates the doc + installs into `fleet_keys`;
+    /// the applied task installs on remote merges.
+    pub fleet_key_epoch_doc:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::fleet_key_epoch::FleetKeyEpochDoc>>>,
+    pub fleet_key_epoch_sync: Option<
+        std::sync::Arc<
+            crate::fleet_sync::FleetSyncEngine<crate::fleet_key_epoch::FleetKeyEpochDoc>,
+        >,
+    >,
+    pub fleet_keys: Option<crate::owner_state_crypto::FleetKeySet>,
     /// ZEB-491 (secondary): the resolved identity directory for this node run,
     /// stored so `set_butler_pin` can re-read the LIVE enrolled-device set from
     /// `owner_state.cbor` (via `owner_state::read_enrolled_device_vk_hex`) rather
@@ -1856,6 +1869,9 @@ impl Default for NodeState {
             owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            fleet_key_epoch_doc: None,
+            fleet_key_epoch_sync: None,
+            fleet_keys: None,
             identity_dir: None,
             routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
@@ -2148,6 +2164,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let owner_trust_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
     >;
+    // ZEB-668 S5: fleet-keys carrier engine, same shutdown pattern.
+    let fleet_key_epoch_sync_for_shutdown: Option<
+        std::sync::Arc<
+            crate::fleet_sync::FleetSyncEngine<crate::fleet_key_epoch::FleetKeyEpochDoc>,
+        >,
+    >;
     // ZEB-458 P4 Phase B: relay-hold + relay-optin fleet-sync engines, taken
     // outside the lock for the same ephemeral-runtime shutdown pattern.
     let relay_hold_sync_for_shutdown: Option<
@@ -2403,6 +2425,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // revoked-self latch deliberately survives (permanent state).
         owner_trust_sync_for_shutdown = guard.owner_trust_sync.take();
         guard.owner_trust_doc = None;
+        // ZEB-668 S5: carrier engine dies with the node too.
+        fleet_key_epoch_sync_for_shutdown = guard.fleet_key_epoch_sync.take();
+        guard.fleet_key_epoch_doc = None;
+        guard.fleet_keys = None;
         guard.identity_dir = None;
         // ZEB-418 P2: drop the republish trigger with the rest of the
         // fleet-net handles — it captures the pkarr publishers and the
@@ -2917,6 +2943,35 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for owner-trust \
+                             FleetSyncEngine shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-668 S5: shut down the fleet-keys carrier engine the same way, so a
+    // just-issued bump's final publish + doc persist land before the zenoh
+    // session dies.
+    if let Some(carrier_engine) = fleet_key_epoch_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(carrier_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "fleet-keys FleetSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for fleet-keys \
                              FleetSyncEngine shutdown — final flush skipped"
                         );
                     }
@@ -3782,6 +3837,18 @@ pub async fn start_node_inner(
             std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
         > = None;
         let mut trust_sync_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
+        // ZEB-668 S5: fleet-keys carrier engine + handles + the shared key
+        // set, lifted for the NodeState assignment and event_loop::run.
+        let mut fleet_keys_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::fleet_key_epoch::FleetKeyEpochDoc>>,
+        > = None;
+        let mut fleet_keys_sync_engine_opt: Option<
+            std::sync::Arc<
+                crate::fleet_sync::FleetSyncEngine<crate::fleet_key_epoch::FleetKeyEpochDoc>,
+            >,
+        > = None;
+        let mut fleet_keys_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
+        let mut fleet_keys_set_opt: Option<crate::owner_state_crypto::FleetKeySet> = None;
         // ZEB-495 (ZEB-340 Part 2): community-device-intro fleet-sync engine +
         // its NodeState/run handles. Built alongside the dm-inbox engine when an
         // owner identity loads; lifted to outer scope so the NodeState
@@ -5563,6 +5630,194 @@ pub async fn start_node_inner(
                         );
                     }
                     tracing::info!("BOOT-PROBE 08-trust: owner-trust engine constructed");
+                    // ── ZEB-668 S5: fleet-keys carrier engine ──────────────
+                    // The ninth fleet dataset. Permanently keyed by the
+                    // PINNED epoch-0 tree (`kt`) — never the swappable set —
+                    // so any enrolled device, however many epochs behind,
+                    // can read it to learn of newer epochs. Authenticity
+                    // comes from the master signature + monotonic-epoch
+                    // merge, not from the dataset encryption (a revoked
+                    // device still holds epoch-0). See fleet_key_epoch.rs.
+                    let fleet_keys_doc_path =
+                        identity_dir.join(crate::fleet_key_epoch::FLEET_KEYS_FILENAME);
+                    let fleet_keys_replay_path =
+                        identity_dir.join(crate::fleet_key_epoch::FLEET_KEYS_REPLAY_FILENAME);
+                    let fleet_keys_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::fleet_key_epoch::load_doc_or_recover(&fleet_keys_doc_path),
+                    ));
+                    let fleet_keys_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::fleet_key_epoch::load_replay_or_recover(&fleet_keys_replay_path),
+                    ));
+                    let (fkeys_out_tx, fkeys_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+                    let (fkeys_in_tx, fkeys_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+                    let (fkeys_nudge_tx, mut fkeys_nudge_rx) = tokio::sync::mpsc::channel::<()>(1);
+                    let fkeys_nudge_tx_boot = fkeys_nudge_tx.clone();
+                    let fleet_keys_owner_id = loaded.state.owner_id;
+                    let fleet_keys_sync =
+                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                            crate::fleet_sync::FleetSyncConfig {
+                                keys: crate::owner_state_crypto::FleetKeySet::new(
+                                    std::sync::Arc::clone(&kt),
+                                ),
+                                device_id: device_id.clone(),
+                                state: std::sync::Arc::clone(&fleet_keys_doc),
+                                merger: std::sync::Arc::new(
+                                    move |local: &mut crate::fleet_key_epoch::FleetKeyEpochDoc,
+                                          remote| {
+                                        crate::fleet_sync::MergeOutcome {
+                                            changed:
+                                                crate::fleet_key_epoch::merge_fleet_keys_remote(
+                                                    local,
+                                                    remote,
+                                                    &fleet_keys_owner_id,
+                                                ),
+                                        }
+                                    },
+                                ),
+                                replay_tracker: fleet_keys_tracker,
+                                content_store: std::sync::Arc::clone(&content_store),
+                                publisher_tx: fkeys_out_tx,
+                                subscriber_rx: fkeys_in_rx,
+                                persist: std::sync::Arc::new(
+                                    crate::fleet_key_epoch::FleetKeyEpochPersist {
+                                        doc_path: fleet_keys_doc_path,
+                                        replay_path: fleet_keys_replay_path,
+                                    },
+                                ),
+                                lookup_key_tag: crate::fleet_key_epoch::FLEET_KEYS_LOOKUP_TAG,
+                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                publish_seen: false,
+                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                    fkeys_nudge_tx,
+                                )),
+                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                )),
+                            },
+                        ));
+                    fleet_keys_doc_opt = Some(std::sync::Arc::clone(&fleet_keys_doc));
+                    fleet_keys_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_keys_sync));
+                    fleet_keys_set_opt = Some(keys.clone());
+                    fleet_keys_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
+                        addr_hex: owner_addr_hex.clone(),
+                        outbound_rx: fkeys_out_rx,
+                        inbound_tx: fkeys_in_tx,
+                    });
+                    // Install task: each applied carrier merge (and one boot
+                    // nudge for the replayed doc) installs the doc's epoch
+                    // into the shared key set — seed path re-derives, cert
+                    // path unseals its blob and persists the enlarged vault
+                    // set. Failures are logged and re-tried on the next
+                    // applied merge; the device keeps running on its current
+                    // epochs meanwhile.
+                    {
+                        let apply_doc = std::sync::Arc::clone(&fleet_keys_doc);
+                        let apply_keys = keys.clone();
+                        let apply_device_sk = loaded.device_signing_key.clone();
+                        let apply_device_id16_hex =
+                            hex::encode(crate::owner_state::device_id_from_signing_key(
+                                &loaded.device_signing_key,
+                            ));
+                        let apply_identity_dir = identity_dir.clone();
+                        let apply_emit = std::sync::Arc::clone(&app);
+                        // Boot nudge: the replayed doc may already be ahead of
+                        // the booted key set (e.g. seed-holder that bumped and
+                        // restarted). Capacity-1 channel: a failed send means a
+                        // nudge is already pending, which is exactly right.
+                        let boot_nudge = fkeys_nudge_tx_boot;
+                        let _ = boot_nudge.try_send(());
+                        tokio::spawn(async move {
+                            while fkeys_nudge_rx.recv().await.is_some() {
+                                let doc_snapshot = { apply_doc.lock().await.clone() };
+                                if doc_snapshot.epoch <= apply_keys.newest().epoch {
+                                    continue;
+                                }
+                                if !doc_snapshot.verify(&fleet_keys_owner_id) {
+                                    tracing::warn!(
+                                        "fleet-keys applied doc failed verification; ignoring"
+                                    );
+                                    continue;
+                                }
+                                let installed = tokio::task::spawn_blocking({
+                                    let doc = doc_snapshot.clone();
+                                    let device_sk = apply_device_sk.clone();
+                                    let device_id16_hex = apply_device_id16_hex.clone();
+                                    let dir = apply_identity_dir.clone();
+                                    let keys = apply_keys.clone();
+                                    move || -> Result<u32, String> {
+                                        // Seed path: re-derive at the doc's epoch.
+                                        let loaded_now = crate::owner_state::load_owner_state(
+                                            &dir,
+                                            crate::identity::KeychainStore::new().ok(),
+                                        )?;
+                                        let seed = loaded_now
+                                            .as_ref()
+                                            .and_then(|l| l.master_seed.as_ref());
+                                        let new_kt = if let Some(seed) = seed {
+                                            crate::owner_state_crypto::KeyTree::derive_at_epoch(
+                                                seed, doc.epoch,
+                                            )
+                                            .map_err(|e| format!("derive_at_epoch: {e}"))?
+                                        } else {
+                                            let material = crate::fleet_key_epoch::unseal_own_material(
+                                                &doc,
+                                                &device_id16_hex,
+                                                &device_sk,
+                                            )?;
+                                            let kt =
+                                                crate::owner_state_crypto::KeyTree::from_fleet_material(
+                                                    &material,
+                                                )
+                                                .map_err(|e| format!("from_fleet_material: {e}"))?;
+                                            kt
+                                        };
+                                        keys.install(std::sync::Arc::new(new_kt));
+                                        // Cert-only devices persist the enlarged
+                                        // set (epoch-0 + everything installed);
+                                        // seed-holders never read the slot.
+                                        if seed.is_none() {
+                                            let materials: Vec<_> = keys
+                                                .accept_set()
+                                                .iter()
+                                                .map(|k| k.to_fleet_material())
+                                                .collect();
+                                            let bytes =
+                                                crate::owner_state_crypto::encode_fleet_material_set(
+                                                    &materials,
+                                                )?;
+                                            crate::owner_state::save_fleet_keytree(
+                                                &crate::identity::KeychainStore::new().ok(),
+                                                &dir,
+                                                &bytes,
+                                            )?;
+                                        }
+                                        Ok(doc.epoch)
+                                    }
+                                })
+                                .await
+                                .map_err(|e| format!("install task join: {e}"))
+                                .and_then(|r| r);
+                                match installed {
+                                    Ok(epoch) => {
+                                        tracing::info!(
+                                            epoch,
+                                            "fleet-keys: installed new fleet epoch"
+                                        );
+                                        crate::node_event_sink::emit_ser(
+                                            &*apply_emit,
+                                            "owner-devices-updated",
+                                            &serde_json::Value::Null,
+                                        );
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "fleet-keys: could not install applied epoch; will retry on next merge"
+                                    ),
+                                }
+                            }
+                        });
+                    }
+                    tracing::info!("BOOT-PROBE 08-fleet-keys: carrier engine constructed");
 
                     tracing::info!("BOOT-PROBE 08: fleet-net self-row staged (flush deferred), entering per-community CRDT sync");
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
@@ -9840,6 +10095,9 @@ pub async fn start_node_inner(
                 // ZEB-668 S1: thread the owner-trust adapter handles into
                 // event_loop::run (mirrors relay).
                 let trust_sync_handles_for_loop = trust_sync_handles_opt;
+                // ZEB-668 S5: thread the fleet-keys carrier adapter handles
+                // into event_loop::run (mirrors trust).
+                let fleet_keys_sync_handles_for_loop = fleet_keys_handles_opt;
                 // ZEB-495 (ZEB-340 Part 2): thread the community-device-intro
                 // adapter handles into event_loop::run (mirrors relay).
                 let community_device_intro_sync_handles_for_loop =
@@ -9954,6 +10212,7 @@ pub async fn start_node_inner(
                                 p2_sync_handles_for_loop,
                                 relay_sync_handles_for_loop,
                                 trust_sync_handles_for_loop,
+                                fleet_keys_sync_handles_for_loop,
                                 community_device_intro_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
@@ -10271,6 +10530,11 @@ pub async fn start_node_inner(
                         // IPC-side TrustStateAccess::Resident path.
                         guard.owner_trust_doc = owner_trust_doc_opt.clone();
                         guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();
+                        // ZEB-668 S5: carrier doc/engine + the shared key set
+                        // (bump IPC + window-close both reach them here).
+                        guard.fleet_key_epoch_doc = fleet_keys_doc_opt.clone();
+                        guard.fleet_key_epoch_sync = fleet_keys_sync_engine_opt.clone();
+                        guard.fleet_keys = fleet_keys_set_opt.clone();
                         // ZEB-491 (secondary): stash the identity dir so
                         // set_butler_pin can re-read the LIVE enrolled set
                         // (a device paired this session is absent from the
@@ -61656,6 +61920,9 @@ mod start_node_race_tests {
             owner_trust_revoked_self: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            fleet_key_epoch_doc: None,
+            fleet_key_epoch_sync: None,
+            fleet_keys: None,
             identity_dir: None,
             routing_republish: None,
             // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.

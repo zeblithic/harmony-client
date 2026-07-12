@@ -76,13 +76,12 @@ pub fn install_joiner_state_inner(
     // (mirrors save_owner_state_atomic's master_seed == None clear). Runs inside
     // the held OWNER_STATE_WRITE_LOCK, same as the owner_state write below.
     match result.fleet_keytree.as_ref() {
-        Some(material) => {
-            // ZEB-668 S5: the slot always persists the multi-epoch set
-            // encoding (a pairing handover carries one epoch → a 1-set).
-            let buf = crate::owner_state_crypto::encode_fleet_material_set(std::slice::from_ref(
-                material,
-            ))
-            .map_err(|e| format!("encode fleet keytree for persist: {e}"))?;
+        Some(materials) => {
+            // ZEB-668 S5: the slot persists the multi-epoch set encoding —
+            // a pre-bump handover carries one epoch, a post-bump one two
+            // (epoch-0 + current).
+            let buf = crate::owner_state_crypto::encode_fleet_material_set(materials)
+                .map_err(|e| format!("encode fleet keytree for persist: {e}"))?;
             crate::owner_state::save_fleet_keytree(&fleet_keychain, identity_dir, &buf)?;
         }
         None => {
@@ -279,7 +278,7 @@ mod tests {
             our_signing_key: joiner_sk,
             owner_state: state,
             our_device_id: joiner_id,
-            fleet_keytree: Some(material),
+            fleet_keytree: Some(vec![material]),
         };
         install_joiner_state_inner(dir.path(), result, None, None).unwrap();
 
@@ -336,7 +335,8 @@ mod tests {
 
         // First install: WITH material → fleet_keytree.enc lands on disk.
         let material = KeyTree::derive(&[0x11u8; 32]).unwrap().to_fleet_material();
-        install_joiner_state_inner(dir.path(), mk_result(Some(material)), None, None).unwrap();
+        install_joiner_state_inner(dir.path(), mk_result(Some(vec![material])), None, None)
+            .unwrap();
         assert!(
             dir.path().join("fleet_keytree.enc").exists(),
             "precondition: fleet_keytree.enc written by the WITH-material install"

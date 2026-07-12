@@ -122,6 +122,14 @@ pub enum EncryptedPayload {
         /// payload backward/forward-compatible (pre-ZEB-492 inviters omit it).
         #[serde(default)]
         fleet_keytree_cbor_hex: Option<String>,
+        /// ZEB-668 S5: CBOR-of-`Vec<FleetKeyMaterial>`, hex-encoded — the
+        /// multi-epoch set (epoch-0 + current) for joiners enrolled after a
+        /// fleet epoch bump. `#[serde(default)]` keeps pre-S5 payloads
+        /// decodable; pre-S5 joiners ignore the unknown field and fall back
+        /// to the single-material field above (epoch-0 only — such a build
+        /// cannot follow a bumped fleet anyway, release-noted).
+        #[serde(default)]
+        fleet_keytree_set_cbor_hex: Option<String>,
     },
 }
 

@@ -37,6 +37,9 @@ pub enum PairingCommand {
         display_name: String,
         owner_state: OwnerState,
         master_seed: Zeroizing<[u8; 32]>,
+        /// ZEB-668 S5: the fleet's current KeyTree epoch (0 = never bumped).
+        /// When > 0 the ENROLL payload carries the multi-epoch material set.
+        fleet_current_epoch: u32,
     },
     StartJoiner {
         display_name: String,
@@ -59,7 +62,7 @@ pub struct JoinerEnrollResult {
     /// sealed it into the ENROLL payload. `install_joiner_state` persists it so
     /// this cert-only device can build the fleet engines on next boot. `None`
     /// when paired with a pre-ZEB-492 inviter that didn't send it.
-    pub fleet_keytree: Option<crate::owner_state_crypto::FleetKeyMaterial>,
+    pub fleet_keytree: Option<Vec<crate::owner_state_crypto::FleetKeyMaterial>>,
 }
 
 /// Output from the state machine for the Inviter side, when enrollment of a
@@ -182,10 +185,10 @@ async fn run_state_machine(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return; };
                 match cmd {
-                    PairingCommand::StartInviter { display_name, owner_state, master_seed } => {
+                    PairingCommand::StartInviter { display_name, owner_state, master_seed, fleet_current_epoch } => {
                         // start_inviter returns None on publish failure (state already
                         // pushed to Failed); leave ctx as None so the user must Cancel.
-                        ctx = start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, &now_fn).await;
+                        ctx = start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, fleet_current_epoch, &now_fn).await;
                     }
                     PairingCommand::StartJoiner { display_name, signing_key } => {
                         ctx = start_joiner(&transport, &state_tx, display_name, signing_key, &now_fn).await;
@@ -321,6 +324,8 @@ struct SessionCtx {
     // Inviter-only:
     owner_state: Option<OwnerState>,
     master_seed: Option<Zeroizing<[u8; 32]>>,
+    /// ZEB-668 S5 (inviter-only): fleet's current KeyTree epoch at start.
+    fleet_current_epoch: u32,
 
     // After Discovery:
     discovered_peers: Vec<DiscoveredPeer>,
@@ -379,6 +384,7 @@ impl SessionCtx {
             our_pubkey: None,
             owner_state: None,
             master_seed: None,
+            fleet_current_epoch: 0,
             discovered_peers: Vec::new(),
             selected_peer_session_id: None,
             selected_peer_pubkey: None,
@@ -403,11 +409,13 @@ async fn start_inviter(
     display_name: String,
     owner_state: OwnerState,
     master_seed: Zeroizing<[u8; 32]>,
+    fleet_current_epoch: u32,
     _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Option<SessionCtx> {
     let mut ctx = SessionCtx::new(PairingRole::Inviter, display_name);
     ctx.owner_state = Some(owner_state);
     ctx.master_seed = Some(master_seed);
+    ctx.fleet_current_epoch = fleet_current_epoch;
 
     let _ = state_tx.send(PairingState::Discovering {
         role: PairingRole::Inviter,
@@ -815,11 +823,41 @@ async fn maybe_advance_to_enroll(
             return;
         }
     };
+    // ZEB-668 S5: when the fleet has bumped past epoch 0, ALSO ship the
+    // multi-epoch set (epoch-0 for carrier access + the current epoch for
+    // live datasets). The legacy field keeps carrying epoch-0 alone so a
+    // pre-S5 joiner still decodes the payload.
+    let fleet_keytree_set_cbor_hex = if ctx.fleet_current_epoch > 0 {
+        let build = || -> Result<String, String> {
+            let kt0 = crate::owner_state_crypto::KeyTree::derive(master_seed)
+                .map_err(|e| format!("derive epoch-0: {e}"))?;
+            let ktn = crate::owner_state_crypto::KeyTree::derive_at_epoch(
+                master_seed,
+                ctx.fleet_current_epoch,
+            )
+            .map_err(|e| format!("derive epoch-{}: {e}", ctx.fleet_current_epoch))?;
+            let materials = vec![kt0.to_fleet_material(), ktn.to_fleet_material()];
+            let bytes = crate::owner_state_crypto::encode_fleet_material_set(&materials)?;
+            Ok(hex::encode(&**bytes))
+        };
+        match build() {
+            Ok(hexs) => Some(hexs),
+            Err(e) => {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: format!("encode fleet keytree set: {e}"),
+                });
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let payload = EncryptedPayload::Enroll {
         enrollment_cert_cbor_hex: hex::encode(&cert_cbor),
         owner_state_cbor_hex: hex::encode(&state_cbor),
         joiner_advisory_display_name: ctx.selected_peer_display_name.clone().unwrap_or_default(),
         fleet_keytree_cbor_hex,
+        fleet_keytree_set_cbor_hex,
     };
     // ZEB-492 (Qodo/CodeAnt round 1, FIX F): the serialized payload `pt` holds
     // the fleet KeyTree key material (hex of the `Zeroizing` CBOR buffer) in a
@@ -1191,6 +1229,7 @@ async fn on_encrypted_payload(
             enrollment_cert_cbor_hex,
             owner_state_cbor_hex,
             fleet_keytree_cbor_hex,
+            fleet_keytree_set_cbor_hex,
             ..
         } => {
             // Joiner-side: install the cert and state.
@@ -1300,13 +1339,43 @@ async fn on_encrypted_payload(
             // fail it exactly like the cert/state decode failures above, rather
             // than silently dropping it (which would strand a cert-only device
             // with no fleet engines and no signal that it should have had them).
-            let fleet_keytree = match fleet_keytree_cbor_hex {
-                Some(hexs) => {
+            // ZEB-668 S5: prefer the multi-epoch set field (present when the
+            // inviter's fleet has bumped past epoch 0); fall back to the
+            // legacy single-material field (a 1-set). Both ride the same
+            // authenticated SAS envelope.
+            let fleet_keytree = match (fleet_keytree_set_cbor_hex, fleet_keytree_cbor_hex) {
+                (Some(hexs), _) => {
                     // ZEB-492 (Qodo/CodeAnt round 1, FIX F): the hex-decoded `bytes`
-                    // are the raw CBOR of the fleet KeyTree key material. Zeroize
+                    // are the raw CBOR of fleet KeyTree key material. Zeroize
                     // them once the CBOR decode has consumed them (the decoded
-                    // `FleetKeyMaterial` is `ZeroizeOnDrop`, so the key bytes stay
-                    // protected from here on).
+                    // `FleetKeyMaterial`s are `ZeroizeOnDrop`, so the key bytes
+                    // stay protected from here on).
+                    let mut bytes = match hex::decode(&hexs) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = state_tx.send(PairingState::Failed {
+                                reason: format!("fleet keytree set hex: {e}"),
+                            });
+                            return;
+                        }
+                    };
+                    let decoded =
+                        crate::owner_state_crypto::decode_fleet_material_set(bytes.as_slice());
+                    {
+                        use zeroize::Zeroize;
+                        bytes.zeroize();
+                    }
+                    match decoded {
+                        Ok(set) => Some(set),
+                        Err(e) => {
+                            let _ = state_tx.send(PairingState::Failed {
+                                reason: format!("fleet keytree set decode: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                (None, Some(hexs)) => {
                     let mut bytes = match hex::decode(&hexs) {
                         Ok(b) => b,
                         Err(e) => {
@@ -1325,7 +1394,7 @@ async fn on_encrypted_payload(
                         bytes.zeroize();
                     }
                     match decoded {
-                        Ok(m) => Some(m),
+                        Ok(m) => Some(vec![m]),
                         Err(e) => {
                             let _ = state_tx.send(PairingState::Failed {
                                 reason: format!("fleet keytree decode: {e}"),
@@ -1334,7 +1403,7 @@ async fn on_encrypted_payload(
                         }
                     }
                 }
-                None => None,
+                (None, None) => None,
             };
 
             let our_sk = ctx.our_signing_key.take().expect("joiner has signing key");
@@ -1439,6 +1508,7 @@ mod tests {
                 display_name: "KRILE".to_string(),
                 owner_state: state.clone(),
                 master_seed,
+                fleet_current_epoch: 0,
             })
             .await
             .unwrap();
@@ -1602,6 +1672,7 @@ mod tests {
                 display_name: "KRILE".to_string(),
                 owner_state: state.clone(),
                 master_seed,
+                fleet_current_epoch: 0,
             })
             .await
             .unwrap();
@@ -1834,6 +1905,7 @@ mod tests {
                 display_name: "krile".to_string(),
                 owner_state: state,
                 master_seed,
+                fleet_current_epoch: 0,
             })
             .await
             .unwrap();
@@ -1982,6 +2054,7 @@ mod tests {
                 display_name: "KRILE".to_string(),
                 owner_state: state,
                 master_seed,
+                fleet_current_epoch: 0,
             })
             .await
             .unwrap();
@@ -2091,6 +2164,7 @@ mod tests {
                 display_name: "krile".to_string(),
                 owner_state: state,
                 master_seed,
+                fleet_current_epoch: 0,
             })
             .await
             .unwrap();
@@ -2211,6 +2285,7 @@ mod tests {
                 display_name: "krile".to_string(),
                 owner_state: state,
                 master_seed,
+                fleet_current_epoch: 0,
             })
             .await
             .unwrap();
@@ -2413,6 +2488,7 @@ mod tests {
                     display_name: "krile".to_string(),
                     owner_state: state,
                     master_seed,
+                    fleet_current_epoch: 0,
                 })
                 .await
                 .unwrap();
@@ -2463,6 +2539,7 @@ mod tests {
                     display_name: "krile".to_string(),
                     owner_state: state,
                     master_seed,
+                    fleet_current_epoch: 0,
                 })
                 .await
                 .unwrap();
@@ -2521,6 +2598,7 @@ mod tests {
                     display_name: "krile".to_string(),
                     owner_state: state,
                     master_seed,
+                    fleet_current_epoch: 0,
                 })
                 .await
                 .unwrap();
@@ -2620,6 +2698,7 @@ mod tests {
                     display_name: "krile".to_string(),
                     owner_state: state,
                     master_seed,
+                    fleet_current_epoch: 0,
                 })
                 .await
                 .unwrap();
@@ -2771,6 +2850,7 @@ mod tests {
                     display_name: "krile".to_string(),
                     owner_state: state,
                     master_seed,
+                    fleet_current_epoch: 0,
                 })
                 .await
                 .unwrap();
@@ -2928,6 +3008,7 @@ mod tests {
                             display_name: "krile".to_string(),
                             owner_state: state,
                             master_seed,
+                            fleet_current_epoch: 0,
                         })
                         .await
                         .unwrap();
