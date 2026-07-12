@@ -184,6 +184,29 @@ impl FleetKeyEpochDoc {
         sk.sign(signing_bytes).to_bytes().to_vec()
     }
 
+    /// ZEB-677 S5 — sign THIS (unsigned) doc's own signing bytes as one quorum
+    /// part. The co-sign ceremony calls this on the request-carried unsigned
+    /// doc so B and A cover byte-identical content (canonical CBOR is
+    /// deterministic).
+    pub fn quorum_part_over(&self, sk: &ed25519_dalek::SigningKey) -> Result<Vec<u8>, String> {
+        let bytes = self.signing_bytes()?;
+        Ok(Self::sign_quorum_part(sk, &bytes))
+    }
+
+    /// ZEB-677 S5 — verify one quorum part (a detached signature) over this
+    /// doc's signing bytes, against `vk`. Used A-side to validate a co-signer's
+    /// epoch-doc part before assembling.
+    pub fn verify_quorum_part(&self, vk: &ed25519_dalek::VerifyingKey, sig: &[u8]) -> bool {
+        let Ok(bytes) = self.signing_bytes() else {
+            return false;
+        };
+        let Ok(arr) = <[u8; 64]>::try_from(sig) else {
+            return false;
+        };
+        vk.verify_strict(&bytes, &ed25519_dalek::Signature::from_bytes(&arr))
+            .is_ok()
+    }
+
     /// ZEB-677 S5 — stamp a K=2 quorum signature (+ its depth-1 signer bundle)
     /// onto an otherwise-unsigned doc. Clears the master-signature fields:
     /// a quorum doc is verified against its embedded signer certs, never a

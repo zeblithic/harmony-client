@@ -78,6 +78,10 @@ pub(crate) fn plan_quorum_revocation_request(
     now_secs: u64,
     now_ms: u64,
     request_id: [u8; 16],
+    // ZEB-677 S5 — the fleet's current KeyTree epoch, so the request can carry
+    // the pre-built next-epoch carrier doc (bundled crypto cutoff, §7). `None`
+    // when the node isn't carrying fleet keys → revoke-only.
+    current_fleet_epoch: Option<u32>,
 ) -> Result<(String, QuorumRequest), String> {
     if master_seed_present {
         return Err(
@@ -144,6 +148,24 @@ pub(crate) fn plan_quorum_revocation_request(
             )),
         );
     }
+    // ZEB-677 S5 — bundle the pre-built UNSIGNED next-epoch carrier doc (target
+    // excluded from the sealed set) when the node is carrying fleet keys. The
+    // co-signer signs its hash too, so a single approval yields both the
+    // RevocationCert quorum and the crypto cutoff.
+    let epoch_doc_cbor_hex = match current_fleet_epoch {
+        Some(epoch) => {
+            let (unsigned, _kt) = crate::owner_commands::plan_fleet_epoch_bump_quorum(
+                trust,
+                epoch,
+                now_ms,
+                Some(target),
+            )?;
+            let bytes = crate::owner_state_crypto::canonical_cbor_encode(&unsigned)
+                .map_err(|e| format!("encode bundled epoch doc: {e}"))?;
+            Some(hex::encode(bytes))
+        }
+        None => None,
+    };
     let self_hex = hex::encode(self_id);
     let request = QuorumRequest {
         created_at: Hlc {
@@ -156,6 +178,7 @@ pub(crate) fn plan_quorum_revocation_request(
         kind: QuorumRequestKind::Revocation {
             reason: reason_str.to_string(),
             target_hex: hex::encode(target),
+            epoch_doc_cbor_hex,
         },
         initiator_sigs,
         signatures: Default::default(),
@@ -184,12 +207,20 @@ pub(crate) fn cosign_request_core(
         .ok_or_else(|| "unknownRequest: no pending request with that id".to_string())?;
     // Enrollment requests are co-signed automatically by an armed sibling
     // (the sweep), never through this manual IPC.
-    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind else {
+    let QuorumRequestKind::Revocation {
+        reason,
+        target_hex,
+        epoch_doc_cbor_hex,
+    } = &req.kind
+    else {
         return Err(
             "notRevocation: enrollment requests are co-signed automatically by an armed device"
                 .to_string(),
         );
     };
+    // ZEB-677 S5 — clone the optional bundled epoch doc up front so its later
+    // use doesn't hold an immutable borrow of `req` across the signature insert.
+    let epoch_doc_hex = epoch_doc_cbor_hex.clone();
     if now_ms > req.expires_at_ms {
         return Err(
             "expired: this request has expired — ask the other device to retry".to_string(),
@@ -273,10 +304,25 @@ pub(crate) fn cosign_request_core(
     )
     .map_err(|e| format!("badInitiatorSig: {e}"))?;
     let own_sig = RevocationCert::sign_quorum_part(device_signing_key, &payload);
+    // ZEB-677 S5 — if the request bundles a next-epoch carrier doc, produce the
+    // SECOND detached signature over its hash. One approval → revoke + cutoff.
+    let epoch_doc_sig_hex = match &epoch_doc_hex {
+        Some(hex_doc) => {
+            let bytes = hex::decode(hex_doc).map_err(|e| format!("badEpochDoc: not hex ({e})"))?;
+            let unsigned: crate::fleet_key_epoch::FleetKeyEpochDoc =
+                crate::owner_state_crypto::canonical_cbor_decode(&bytes)
+                    .map_err(|e| format!("badEpochDoc: decode ({e})"))?;
+            let epoch_sig = unsigned
+                .quorum_part_over(device_signing_key)
+                .map_err(|e| format!("badEpochDoc: sign ({e})"))?;
+            Some(hex::encode(epoch_sig))
+        }
+        None => None,
+    };
     req.signatures.insert(
         self_hex,
         QuorumRequestSigs {
-            epoch_doc_sig_hex: None,
+            epoch_doc_sig_hex,
             primary_sig_hex: hex::encode(own_sig),
         },
     );
@@ -378,6 +424,19 @@ pub(crate) async fn request_quorum_revocation_inner(
     reason: String,
 ) -> Result<String, String> {
     let (doc, engine, trust_doc, dir) = snapshot_handles(state)?;
+    // ZEB-677 S5 — the fleet's current epoch, so the request bundles the
+    // pre-built next-epoch carrier doc (crypto cutoff). `None` when the node
+    // isn't carrying fleet keys → revoke-only.
+    let (carrier_doc_opt, fleet_keys_opt) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (g.fleet_key_epoch_doc.clone(), g.fleet_keys.clone())
+    };
+    let current_fleet_epoch: Option<u32> = match (&carrier_doc_opt, &fleet_keys_opt) {
+        (Some(carrier), Some(keys)) => Some(carrier.lock().await.epoch.max(keys.newest().epoch)),
+        _ => None,
+    };
     let loaded = load_keys(dir, keychain).await?;
     let trust_snapshot = trust_doc.lock().await.clone();
     let mut request_id = [0u8; 16];
@@ -391,6 +450,7 @@ pub(crate) async fn request_quorum_revocation_inner(
         now_unix_secs(),
         now_unix_ms(),
         request_id,
+        current_fleet_epoch,
     )?;
     {
         let mut g = doc.lock().await;
@@ -753,6 +813,7 @@ mod tests {
             NOW + 10,
             NOW_MS + 10_000,
             [0xab; 16],
+            None,
         )
     }
 

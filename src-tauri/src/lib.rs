@@ -3912,6 +3912,12 @@ pub async fn start_node_inner(
         > = None;
         let mut fleet_keys_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
         let mut fleet_keys_set_opt: Option<crate::owner_state_crypto::FleetKeySet> = None;
+        // ZEB-677 S5 — the quorum sweep task's carrier handle. The task spawns
+        // before the fleet-keys carrier is built, so it reads this slot each
+        // sweep; boot fills it once the carrier exists (empty → revoke-only).
+        let quorum_carrier_slot: std::sync::Arc<
+            tokio::sync::Mutex<Option<crate::owner_quorum_sync::QuorumSweepCarrier>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         // ZEB-495 (ZEB-340 Part 2): community-device-intro fleet-sync engine +
         // its NodeState/run handles. Built alongside the dm-inbox engine when an
         // owner identity loads; lifted to outer scope so the NodeState
@@ -5737,6 +5743,7 @@ pub async fn start_node_inner(
                             ),
                             emit,
                             Some(retire_deposit_nudge_tx.clone()),
+                            std::sync::Arc::clone(&quorum_carrier_slot),
                         );
                         // Boot tick: complete ceremonies whose co-signatures
                         // arrived while this device was offline.
@@ -5872,6 +5879,15 @@ pub async fn start_node_inner(
                     fleet_keys_doc_opt = Some(std::sync::Arc::clone(&fleet_keys_doc));
                     fleet_keys_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_keys_sync));
                     fleet_keys_set_opt = Some(keys.clone());
+                    // ZEB-677 S5 — hand the carrier to the running quorum sweep
+                    // task so it can install quorum-signed epoch bumps (bundled
+                    // with a revocation or a standalone rotation).
+                    *quorum_carrier_slot.lock().await =
+                        Some(crate::owner_quorum_sync::QuorumSweepCarrier {
+                            carrier_doc: std::sync::Arc::clone(&fleet_keys_doc),
+                            carrier_engine: std::sync::Arc::clone(&fleet_keys_sync),
+                            fleet_keys: keys.clone(),
+                        });
                     fleet_keys_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
                         addr_hex: owner_addr_hex.clone(),
                         outbound_rx: fkeys_out_rx,

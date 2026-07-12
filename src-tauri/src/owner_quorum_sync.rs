@@ -102,8 +102,9 @@ pub const ARM_WINDOW_MS: u64 = 15 * 60 * 1000;
 pub const QUORUM_ARM_HORIZON_MS: u64 = ARM_WINDOW_MS + QUORUM_CLOCK_SKEW_MS;
 
 /// What a pending request asks the fleet to co-sign. Revocation only in
-/// S3; the S4 enrollment ceremony adds its variant, and S5 threads the
-/// bundled next-epoch doc through `QuorumRequestSigs::epoch_doc_sig_hex`.
+/// S3; the S4 enrollment ceremony adds its variant; S5 bundles the next-epoch
+/// carrier doc (full crypto cutoff) into `Revocation` + adds `EpochBump`, and
+/// the co-signer's second detached signature rides `epoch_doc_sig_hex`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum QuorumRequestKind {
     #[serde(rename = "r")]
@@ -115,6 +116,24 @@ pub enum QuorumRequestKind {
         /// Hex of the target's 16-byte device id.
         #[serde(rename = "t")]
         target_hex: String,
+        /// ZEB-677 S5 — canonical-CBOR hex of the UNSIGNED next-epoch carrier
+        /// doc bundled with this revocation (full crypto cutoff, §7). The
+        /// co-signer signs its `signing_bytes` into `epoch_doc_sig_hex`; A
+        /// assembles the quorum-signed carrier on completion. `None` when the
+        /// initiator's node isn't carrying fleet keys — revoke-only, and the
+        /// `fleetEpochStale` banner offers a manual rotate.
+        #[serde(rename = "d", default, skip_serializing_if = "Option::is_none")]
+        epoch_doc_cbor_hex: Option<String>,
+    },
+    /// ZEB-677 S5 — a standalone quorum fleet-epoch rotation (no revocation),
+    /// for the `fleetEpochStale` retry surface on a master-less fleet. The
+    /// co-signer signs the carrier `signing_bytes` into `primary_sig_hex`
+    /// (there is no revocation payload for this kind).
+    #[serde(rename = "m")]
+    EpochBump {
+        /// Canonical-CBOR hex of the UNSIGNED next-epoch carrier doc.
+        #[serde(rename = "d")]
+        epoch_doc_cbor_hex: String,
     },
     /// S4 enrollment ceremony: the initiator asks its armed sibling to
     /// co-sign a quorum enrollment cert for a newly-paired device. The
@@ -697,6 +716,17 @@ pub struct SweepOutcome {
     pub revocations_applied: usize,
     /// B-side enrollment co-signs applied this sweep (0 or 1 — single-use arm).
     pub enrollment_cosigns: usize,
+    /// ZEB-677 S5 — quorum fleet-epoch bumps installed this sweep (bundled with
+    /// a revocation or standalone `EpochBump`).
+    pub epoch_bumps_installed: usize,
+}
+
+/// ZEB-677 S5 — the artifacts a completed quorum request yields. A revocation
+/// yields a `RevocationCert` and (when bundled) a quorum-signed carrier doc;
+/// a standalone `EpochBump` yields only the carrier doc (`cert: None`).
+struct QuorumAssembly {
+    cert: Option<RevocationCert>,
+    epoch_doc: Option<crate::fleet_key_epoch::FleetKeyEpochDoc>,
 }
 
 /// One assemblable completion candidate, collected under the quorum-doc
@@ -704,85 +734,182 @@ pub struct SweepOutcome {
 /// trust-doc lock; never hold both).
 struct CompletionCandidate {
     request_id: String,
-    cert: RevocationCert,
+    assembly: QuorumAssembly,
+}
+
+/// ZEB-677 S5 — assemble the quorum-signed next-epoch carrier doc from the
+/// request-carried UNSIGNED doc + a co-signer's detached epoch-doc part.
+/// Verifies both signers are Master-issued (depth-1) and the co-signer's part
+/// is valid before minting A's own part and stamping the K=2 signature.
+/// Returns `None` (revoke/bump still proceeds; banner offers a retry) on any
+/// missing/invalid input.
+fn assemble_quorum_epoch_doc(
+    trust: &harmony_owner::state::OwnerState,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    self_id: [u8; 16],
+    unsigned_hex: &str,
+    cosigner: [u8; 16],
+    cosigner_epoch_sig_hex: &str,
+) -> Option<crate::fleet_key_epoch::FleetKeyEpochDoc> {
+    let bytes = hex::decode(unsigned_hex).ok()?;
+    let mut doc: crate::fleet_key_epoch::FleetKeyEpochDoc =
+        crate::owner_state_crypto::canonical_cbor_decode(&bytes).ok()?;
+    let self_cert = trust.enrollments.get(&self_id)?;
+    if !crate::owner_quorum_commands::is_master_issued(self_cert) {
+        return None;
+    }
+    let cosigner_cert = trust.enrollments.get(&cosigner)?;
+    if !crate::owner_quorum_commands::is_master_issued(cosigner_cert) {
+        return None;
+    }
+    let cosigner_epoch_sig = hex::decode(cosigner_epoch_sig_hex).ok()?;
+    let cosigner_vk = ed25519_dalek::VerifyingKey::from_bytes(
+        &cosigner_cert.device_pubkeys.classical.ed25519_verify,
+    )
+    .ok()?;
+    if !doc.verify_quorum_part(&cosigner_vk, &cosigner_epoch_sig) {
+        tracing::warn!(cosigner = %hex::encode(cosigner),
+            "quorum sweep: co-signer epoch-doc part failed verification; bump skipped");
+        return None;
+    }
+    let own_epoch_sig = doc.quorum_part_over(device_signing_key).ok()?;
+    let mut parts: Vec<([u8; 16], Vec<u8>)> =
+        vec![(self_id, own_epoch_sig), (cosigner, cosigner_epoch_sig)];
+    parts.sort_by_key(|(id, _)| *id);
+    let signers: Vec<[u8; 16]> = parts.iter().map(|(id, _)| *id).collect();
+    let signatures: Vec<Vec<u8>> = parts.into_iter().map(|(_, s)| s).collect();
+    let signer_certs = vec![self_cert.clone(), cosigner_cert.clone()];
+    doc.assemble_quorum(signers, signatures, signer_certs);
+    Some(doc)
 }
 
 /// Validate a cosigner's entry against the CURRENT trust doc and, when it
-/// verifies, assemble the K=2 cert with a freshly minted initiator part.
+/// verifies, assemble the K=2 revocation cert (+ bundled quorum epoch doc) or
+/// a standalone quorum epoch bump.
 fn try_assemble(
     trust: &harmony_owner::state::OwnerState,
     device_signing_key: &ed25519_dalek::SigningKey,
     self_id: [u8; 16],
     req: &QuorumRequest,
-) -> Option<RevocationCert> {
-    // Revocation completion only: enrollment certs are assembled A-side by
-    // the pairing ceremony (owner_quorum_enroll), never by this sweep.
-    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind else {
-        return None;
-    };
-    let target = parse_device_id_hex(target_hex).ok()?;
-    let reason = crate::owner_commands::parse_revoke_reason(reason).ok()?;
-    for (cosigner_hex, sigs) in &req.signatures {
-        let Ok(cosigner) = parse_device_id_hex(cosigner_hex) else {
-            continue;
-        };
-        if cosigner == self_id || cosigner == target || trust.is_revoked(cosigner) {
-            continue;
-        }
-        let Some(cert) = trust.enrollments.get(&cosigner) else {
-            continue;
-        };
-        if !crate::owner_quorum_commands::is_master_issued(cert) {
-            continue;
-        }
-        let Ok(vk) =
-            ed25519_dalek::VerifyingKey::from_bytes(&cert.device_pubkeys.classical.ed25519_verify)
-        else {
-            continue;
-        };
-        let Ok(payload) = revocation_pair_payload(
-            trust.owner_id,
-            target,
-            req.issued_at,
-            &reason,
-            self_id,
-            cosigner,
-        ) else {
-            continue;
-        };
-        let Ok(cosig) = hex::decode(&sigs.primary_sig_hex) else {
-            continue;
-        };
-        if harmony_owner::signing::verify_with_tag(
-            &vk,
-            harmony_owner::signing::tags::REVOCATION,
-            &payload,
-            &cosig,
-            "Revocation-Quorum-Part",
-        )
-        .is_err()
-        {
-            tracing::warn!(cosigner = %cosigner_hex, "quorum sweep: cosigner signature failed verification; skipped");
-            continue;
-        }
-        let own = RevocationCert::sign_quorum_part(device_signing_key, &payload);
-        let mut parts = vec![(self_id, own), (cosigner, cosig)];
-        parts.sort_by_key(|(id, _)| *id);
-        match RevocationCert::assemble_quorum(
-            trust.owner_id,
-            target,
-            req.issued_at,
-            reason.clone(),
-            parts,
-        ) {
-            Ok(cert) => return Some(cert),
-            Err(e) => {
-                tracing::warn!(error = %e, "quorum sweep: assemble failed; skipped");
-                continue;
+) -> Option<QuorumAssembly> {
+    match &req.kind {
+        // Enrollment certs are assembled A-side by the pairing ceremony
+        // (owner_quorum_enroll), never by this sweep.
+        QuorumRequestKind::Enrollment { .. } => None,
+        QuorumRequestKind::EpochBump { epoch_doc_cbor_hex } => {
+            // Standalone rotation: the co-signer's `primary_sig_hex` IS its
+            // epoch-doc part (there is no revocation payload for this kind).
+            for (cosigner_hex, sigs) in &req.signatures {
+                let Ok(cosigner) = parse_device_id_hex(cosigner_hex) else {
+                    continue;
+                };
+                if cosigner == self_id || trust.is_revoked(cosigner) {
+                    continue;
+                }
+                if let Some(doc) = assemble_quorum_epoch_doc(
+                    trust,
+                    device_signing_key,
+                    self_id,
+                    epoch_doc_cbor_hex,
+                    cosigner,
+                    &sigs.primary_sig_hex,
+                ) {
+                    return Some(QuorumAssembly {
+                        cert: None,
+                        epoch_doc: Some(doc),
+                    });
+                }
             }
+            None
+        }
+        QuorumRequestKind::Revocation {
+            reason,
+            target_hex,
+            epoch_doc_cbor_hex,
+        } => {
+            let target = parse_device_id_hex(target_hex).ok()?;
+            let reason = crate::owner_commands::parse_revoke_reason(reason).ok()?;
+            for (cosigner_hex, sigs) in &req.signatures {
+                let Ok(cosigner) = parse_device_id_hex(cosigner_hex) else {
+                    continue;
+                };
+                if cosigner == self_id || cosigner == target || trust.is_revoked(cosigner) {
+                    continue;
+                }
+                let Some(cert) = trust.enrollments.get(&cosigner) else {
+                    continue;
+                };
+                if !crate::owner_quorum_commands::is_master_issued(cert) {
+                    continue;
+                }
+                let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(
+                    &cert.device_pubkeys.classical.ed25519_verify,
+                ) else {
+                    continue;
+                };
+                let Ok(payload) = revocation_pair_payload(
+                    trust.owner_id,
+                    target,
+                    req.issued_at,
+                    &reason,
+                    self_id,
+                    cosigner,
+                ) else {
+                    continue;
+                };
+                let Ok(cosig) = hex::decode(&sigs.primary_sig_hex) else {
+                    continue;
+                };
+                if harmony_owner::signing::verify_with_tag(
+                    &vk,
+                    harmony_owner::signing::tags::REVOCATION,
+                    &payload,
+                    &cosig,
+                    "Revocation-Quorum-Part",
+                )
+                .is_err()
+                {
+                    tracing::warn!(cosigner = %cosigner_hex, "quorum sweep: cosigner signature failed verification; skipped");
+                    continue;
+                }
+                let own = RevocationCert::sign_quorum_part(device_signing_key, &payload);
+                let mut parts = vec![(self_id, own), (cosigner, cosig)];
+                parts.sort_by_key(|(id, _)| *id);
+                let cert = match RevocationCert::assemble_quorum(
+                    trust.owner_id,
+                    target,
+                    req.issued_at,
+                    reason.clone(),
+                    parts,
+                ) {
+                    Ok(cert) => cert,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "quorum sweep: assemble failed; skipped");
+                        continue;
+                    }
+                };
+                // ZEB-677 S5 — same co-signer's second part assembles the
+                // bundled crypto cutoff (if present). Revoke stands even if the
+                // bump can't assemble.
+                let epoch_doc = match (epoch_doc_cbor_hex, &sigs.epoch_doc_sig_hex) {
+                    (Some(unsigned_hex), Some(epoch_sig_hex)) => assemble_quorum_epoch_doc(
+                        trust,
+                        device_signing_key,
+                        self_id,
+                        unsigned_hex,
+                        cosigner,
+                        epoch_sig_hex,
+                    ),
+                    _ => None,
+                };
+                return Some(QuorumAssembly {
+                    cert: Some(cert),
+                    epoch_doc,
+                });
+            }
+            None
         }
     }
-    None
 }
 
 /// Canonical bytes both quorum signers cover for an enrollment cert. For
@@ -1146,6 +1273,66 @@ pub(crate) fn try_assemble_enrollment(
 /// applied under the trust lock, then removed under the quorum lock again
 /// — the two locks are never held together.
 #[allow(clippy::too_many_arguments)]
+/// ZEB-677 S5 — the resident fleet-keys carrier handles the sweep needs to
+/// install a quorum-signed epoch bump (bundled with a revocation or standalone).
+/// All fields are cheap-clone handles, so the applied task can pull a snapshot
+/// from a fillable slot each sweep (the carrier is built later in boot than the
+/// task spawns).
+#[derive(Clone)]
+pub struct QuorumSweepCarrier {
+    pub carrier_doc: Arc<tokio::sync::Mutex<crate::fleet_key_epoch::FleetKeyEpochDoc>>,
+    pub carrier_engine:
+        Arc<crate::fleet_sync::FleetSyncEngine<crate::fleet_key_epoch::FleetKeyEpochDoc>>,
+    pub fleet_keys: crate::owner_state_crypto::FleetKeySet,
+}
+
+/// ZEB-677 S5 — install an assembled quorum-signed carrier doc under the
+/// monotonic no-rollback rule (mirrors `revoke_device_inner`'s master-path
+/// bump): adopt only if strictly newer, then install THIS device's own KeyTree
+/// from its sealed blob and flush best-effort. Returns whether the doc was
+/// adopted (the ceremony can then prune its request).
+async fn install_quorum_epoch_doc(
+    carrier: &QuorumSweepCarrier,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    self_device_id: [u8; 16],
+    doc: crate::fleet_key_epoch::FleetKeyEpochDoc,
+) -> bool {
+    {
+        let mut cur = carrier.carrier_doc.lock().await;
+        if doc.epoch <= cur.epoch {
+            tracing::warn!(
+                new = doc.epoch,
+                current = cur.epoch,
+                "quorum epoch install: assembled doc not newer than resident; skipped"
+            );
+            return false;
+        }
+        *cur = doc.clone();
+    }
+    // Install this device's own KeyTree from its sealed blob (like any
+    // survivor). A missing/failed blob is non-fatal — the doc still published
+    // for the other survivors; this device catches up on the next adoption.
+    let self_hex = hex::encode(self_device_id);
+    match crate::fleet_key_epoch::unseal_own_material(&doc, &self_hex, device_signing_key) {
+        Ok(material) => match crate::owner_state_crypto::KeyTree::from_fleet_material(&material) {
+            Ok(kt) => carrier.fleet_keys.install(Arc::new(kt)),
+            Err(e) => tracing::warn!(error = %e,
+                    "quorum epoch install: from_fleet_material failed"),
+        },
+        Err(e) => tracing::warn!(error = %e,
+            "quorum epoch install: unseal own material failed (doc still published for survivors)"),
+    }
+    carrier.carrier_engine.notify_dirty();
+    if let Err(e) = carrier.carrier_engine.flush_now().await {
+        tracing::warn!(error = %e,
+            "quorum epoch install: carrier flush failed; dirty latch will retry");
+    }
+    true
+}
+
+/// Thin wrapper: run a sweep with NO fleet-keys carrier (revoke-only; the
+/// bundled/standalone epoch bump is skipped). Production and the S5 integration
+/// test call [`run_quorum_sweep_with_carrier`].
 pub async fn run_quorum_sweep(
     quorum_doc: &Arc<tokio::sync::Mutex<QuorumReqDoc>>,
     quorum_engine: &Arc<crate::fleet_sync::FleetSyncEngine<QuorumReqDoc>>,
@@ -1157,6 +1344,36 @@ pub async fn run_quorum_sweep(
     retire_nudge: Option<&tokio::sync::mpsc::Sender<()>>,
     now_secs: u64,
     now_ms: u64,
+) -> SweepOutcome {
+    run_quorum_sweep_with_carrier(
+        quorum_doc,
+        quorum_engine,
+        trust_doc,
+        trust_engine,
+        device_signing_key,
+        self_device_id,
+        emit,
+        retire_nudge,
+        now_secs,
+        now_ms,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_quorum_sweep_with_carrier(
+    quorum_doc: &Arc<tokio::sync::Mutex<QuorumReqDoc>>,
+    quorum_engine: &Arc<crate::fleet_sync::FleetSyncEngine<QuorumReqDoc>>,
+    trust_doc: &Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>,
+    trust_engine: &Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    self_device_id: [u8; 16],
+    emit: &Arc<dyn Fn(&str) + Send + Sync>,
+    retire_nudge: Option<&tokio::sync::mpsc::Sender<()>>,
+    now_secs: u64,
+    now_ms: u64,
+    carrier: Option<&QuorumSweepCarrier>,
 ) -> SweepOutcome {
     let self_hex = hex::encode(self_device_id);
     let trust_snapshot = trust_doc.lock().await.clone();
@@ -1176,12 +1393,12 @@ pub async fn run_quorum_sweep(
             if !verified_decliners(&trust_snapshot, id, req).is_empty() {
                 continue;
             }
-            if let Some(cert) =
+            if let Some(assembly) =
                 try_assemble(&trust_snapshot, device_signing_key, self_device_id, req)
             {
                 candidates.push(CompletionCandidate {
                     request_id: id.clone(),
-                    cert,
+                    assembly,
                 });
             }
         }
@@ -1200,57 +1417,102 @@ pub async fn run_quorum_sweep(
         quorum_engine.notify_dirty();
     }
 
-    // Phase B: apply each assembled cert through the authoritative path.
+    // Phase B: apply each completed request through the authoritative path.
     let mut completed = Vec::new();
+    let mut epoch_bumps_installed = 0usize;
     for cand in candidates {
-        let cert = cand.cert;
-        let target = cert.target;
-        let applied = crate::owner_trust_sync::mutate_trust_state(
-            crate::owner_trust_sync::TrustStateAccess::Resident {
-                doc: Arc::clone(trust_doc),
-                engine: Arc::clone(trust_engine),
-            },
-            move |s| {
-                if s.is_revoked(target) {
-                    return Ok(());
-                }
-                s.add_revocation(
-                    cert,
-                    now_secs,
-                    harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        let CompletionCandidate {
+            request_id,
+            assembly,
+        } = cand;
+        let QuorumAssembly { cert, epoch_doc } = assembly;
+        match cert {
+            // Revocation (possibly + bundled crypto cutoff).
+            Some(cert) => {
+                let target = cert.target;
+                let applied = crate::owner_trust_sync::mutate_trust_state(
+                    crate::owner_trust_sync::TrustStateAccess::Resident {
+                        doc: Arc::clone(trust_doc),
+                        engine: Arc::clone(trust_engine),
+                    },
+                    move |s| {
+                        if s.is_revoked(target) {
+                            return Ok(());
+                        }
+                        s.add_revocation(
+                            cert,
+                            now_secs,
+                            harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                        )
+                    },
                 )
-            },
-        )
-        .await;
-        match applied {
-            Ok(Ok(())) => {
-                emit("owner-devices-updated");
-                if let Some(tx) = retire_nudge {
-                    let _ = tx.try_send(());
-                }
-                // The request is the ceremony's only retry source — retire
-                // it ONLY once the revocation is durably flushed. On flush
-                // failure the request stays resident; the dirty latch
-                // retries the publish+persist, and the next sweep prunes
-                // via the revoked-target predicate once the trust doc
-                // carries the revocation durably.
-                match trust_engine.flush_now().await {
-                    Ok(()) => completed.push(cand.request_id),
+                .await;
+                match applied {
+                    Ok(Ok(())) => {
+                        emit("owner-devices-updated");
+                        if let Some(tx) = retire_nudge {
+                            let _ = tx.try_send(());
+                        }
+                        // The request is the ceremony's only retry source —
+                        // retire it ONLY once the revocation is durably
+                        // flushed. On flush failure the request stays resident;
+                        // the dirty latch retries the publish+persist, and the
+                        // next sweep prunes via the revoked-target predicate
+                        // once the trust doc carries the revocation durably.
+                        match trust_engine.flush_now().await {
+                            Ok(()) => {
+                                completed.push(request_id);
+                                // NO-ROLLBACK: install the bundled crypto cutoff
+                                // AFTER the revoke is durable. A failed bump
+                                // leaves the revoke standing; the fleetEpochStale
+                                // banner is the retry surface.
+                                if let (Some(doc), Some(c)) = (epoch_doc, carrier) {
+                                    if install_quorum_epoch_doc(
+                                        c,
+                                        device_signing_key,
+                                        self_device_id,
+                                        doc,
+                                    )
+                                    .await
+                                    {
+                                        epoch_bumps_installed += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, request = %request_id,
+                                    "quorum sweep: trust flush failed; request retained until the \
+                                     revocation is durable (dirty latch retries)");
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, request = %request_id,
+                            "quorum sweep: assembled revocation rejected by trust state; request retained");
+                    }
                     Err(e) => {
-                        tracing::warn!(error = %e, request = %cand.request_id,
-                            "quorum sweep: trust flush failed; request retained until the \
-                             revocation is durable (dirty latch retries)");
+                        tracing::warn!(error = %e, request = %request_id,
+                            "quorum sweep: trust mutation failed; request retained");
                     }
                 }
             }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, request = %cand.request_id,
-                    "quorum sweep: assembled revocation rejected by trust state; request retained");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, request = %cand.request_id,
-                    "quorum sweep: trust mutation failed; request retained");
-            }
+            // Standalone quorum epoch bump (no revocation). Complete only on a
+            // successful install; a failed install retains the request to retry.
+            None => match (epoch_doc, carrier) {
+                (Some(doc), Some(c)) => {
+                    if install_quorum_epoch_doc(c, device_signing_key, self_device_id, doc).await {
+                        completed.push(request_id);
+                        epoch_bumps_installed += 1;
+                        emit("owner-devices-updated");
+                    }
+                }
+                _ => {
+                    // No carrier to install into (never happens in production —
+                    // the node always carries fleet keys when it can co-sign).
+                    tracing::warn!(request = %request_id,
+                        "quorum sweep: epoch-bump request assembled without a carrier; retained");
+                }
+            },
         }
     }
 
@@ -1328,9 +1590,10 @@ pub async fn run_quorum_sweep(
     }
 
     SweepOutcome {
-        doc_changed: pruned || applied_count > 0 || enroll_cosigns > 0,
+        doc_changed: pruned || applied_count > 0 || enroll_cosigns > 0 || epoch_bumps_installed > 0,
         revocations_applied: applied_count,
         enrollment_cosigns: enroll_cosigns,
+        epoch_bumps_installed,
     }
 }
 
@@ -1358,6 +1621,9 @@ pub fn spawn_quorum_applied_task(
     self_device_id: [u8; 16],
     emit: Arc<dyn Fn(&str) + Send + Sync>,
     retire_nudge: Option<tokio::sync::mpsc::Sender<()>>,
+    // ZEB-677 S5 — the fleet-keys carrier, filled AFTER this task spawns (the
+    // carrier is built later in boot). Empty until then → revoke-only sweeps.
+    carrier_slot: Arc<tokio::sync::Mutex<Option<QuorumSweepCarrier>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick =
@@ -1374,7 +1640,8 @@ pub fn spawn_quorum_applied_task(
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-            let outcome = run_quorum_sweep(
+            let carrier = carrier_slot.lock().await.clone();
+            let outcome = run_quorum_sweep_with_carrier(
                 &quorum_doc,
                 &quorum_engine,
                 &trust_doc,
@@ -1385,6 +1652,7 @@ pub fn spawn_quorum_applied_task(
                 retire_nudge.as_ref(),
                 now.as_secs(),
                 now.as_millis() as u64,
+                carrier.as_ref(),
             )
             .await;
             if from_nudge || outcome.doc_changed {
@@ -1425,6 +1693,7 @@ mod tests {
             kind: QuorumRequestKind::Revocation {
                 reason: "lost".to_string(),
                 target_hex: target.to_string(),
+                epoch_doc_cbor_hex: None,
             },
             initiator_sigs: BTreeMap::new(),
             signatures: BTreeMap::new(),
@@ -1681,6 +1950,7 @@ mod tests {
         req.kind = QuorumRequestKind::Revocation {
             reason: "compromised".to_string(),
             target_hex: "33".repeat(16),
+            epoch_doc_cbor_hex: None,
         };
         req.signatures.insert("bb".repeat(16), sigs("sig"));
         remote.requests.insert(id.clone(), req);
@@ -2052,6 +2322,7 @@ mod tests {
             base + 10,
             base_ms + 10_000,
             [0xaa; 16],
+            None,
         )
         .expect("plan");
         pair.a
@@ -2292,6 +2563,7 @@ mod tests {
             base + 10,
             base_ms + 10_000,
             [0xbb; 16],
+            None,
         )
         .expect("plan");
         let expires_at_ms = req.expires_at_ms;
@@ -2389,8 +2661,10 @@ mod tests {
         // Complete the ceremony out-of-band: assemble the pending request
         // and apply it to the trust state the sweep will see.
         let mut trust_revoked = f.trust.clone();
-        let assembled =
-            super::try_assemble(&f.trust, &f.a_sk, f.a_id, &doc.requests[&id]).expect("assemble");
+        let assembled = super::try_assemble(&f.trust, &f.a_sk, f.a_id, &doc.requests[&id])
+            .expect("assemble")
+            .cert
+            .expect("revocation cert");
         trust_revoked
             .add_revocation(assembled, NOW_SECS + 30, DEFAULT_ACTIVE_WINDOW_SECS)
             .expect("apply");
@@ -2590,6 +2864,7 @@ mod tests {
             NOW_SECS + 10,
             NOW_MS + 10_000,
             [0xcd; 16],
+            None,
         )
         .expect("plan");
         let mut doc = QuorumReqDoc::default();
