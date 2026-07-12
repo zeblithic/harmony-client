@@ -47,9 +47,6 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
     let identity_dir = crate::owner_commands::resolve_identity_dir()?;
     let loaded = load_owner_state(&identity_dir, keychain)?
         .ok_or_else(|| "no owner identity on this device".to_string())?;
-    let master_seed = loaded
-        .master_seed
-        .ok_or_else(|| "master seed not on this device — cannot enroll".to_string())?;
     // ZEB-668 S5: a joiner enrolled after a fleet epoch bump needs BOTH the
     // epoch-0 material (fleet-keys carrier access) and the current epoch's
     // (live datasets). The resident key set knows the current epoch.
@@ -57,13 +54,68 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
         let guard = state.lock().unwrap_or_else(|p| p.into_inner());
         guard.fleet_keys.as_ref().map_or(0, |k| k.newest().epoch)
     };
-    cmd_tx
-        .send(PairingCommand::StartInviter {
+
+    let command = if let Some(master_seed) = loaded.master_seed {
+        // Seed-holding inviter — the classic path (unchanged behavior).
+        PairingCommand::StartInviter {
             display_name,
             owner_state: loaded.state,
-            master_seed,
+            master_seed: Some(master_seed),
+            fleet_keytree: None,
+            quorum_ctx: None,
             fleet_current_epoch,
-        })
+        }
+    } else {
+        // ZEB-677 S4: a seedless device can still be the pairing inviter IFF
+        // it is Master-certed — it drives a K=2 quorum enrollment via an armed
+        // sibling. A device that can NEVER quorum (non-Master-certed) stays
+        // blocked with the same error a pre-S4 seedless inviter got.
+        let self_id = crate::owner_state::device_id_from_signing_key(&loaded.device_signing_key);
+        let is_master = loaded
+            .state
+            .enrollments
+            .get(&self_id)
+            .is_some_and(crate::owner_quorum_commands::is_master_issued);
+        if !is_master {
+            return Err("master seed not on this device — cannot enroll".to_string());
+        }
+        // Build the live co-sign port from the resident quorum + trust docs and
+        // the quorum engine. All three are present only once the node is
+        // running; without them there is no sibling to reach.
+        let (quorum_doc, quorum_engine, trust_doc) = {
+            let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+            match (
+                guard.owner_quorum_doc.clone(),
+                guard.owner_quorum_sync.clone(),
+                guard.owner_trust_doc.clone(),
+            ) {
+                (Some(qd), Some(qe), Some(td)) => (qd, qe, td),
+                _ => {
+                    return Err(
+                        "quorum enrollment needs a running node — start the node first".to_string(),
+                    )
+                }
+            }
+        };
+        let port = crate::owner_quorum_enroll::LiveQuorumEnrollPort::new(
+            quorum_doc,
+            quorum_engine,
+            trust_doc,
+            loaded.device_signing_key,
+            self_id,
+        );
+        PairingCommand::StartInviter {
+            display_name,
+            owner_state: loaded.state,
+            master_seed: None,
+            fleet_keytree: loaded.fleet_keytree,
+            quorum_ctx: Some(std::sync::Arc::new(port)),
+            fleet_current_epoch,
+        }
+    };
+
+    cmd_tx
+        .send(command)
         .await
         .map_err(|_| "pairing state machine not running".to_string())?;
     Ok(())

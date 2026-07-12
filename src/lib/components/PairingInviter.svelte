@@ -115,6 +115,11 @@
     <div class="modal-actions">
       <button class="secondary" onclick={handleCancel}>Cancel</button>
     </div>
+  {:else if state.kind === 'awaitingQuorumCosign'}
+    <p>Waiting for your other device to approve…</p>
+    <div class="modal-actions">
+      <button class="secondary" onclick={handleCancel}>Cancel</button>
+    </div>
   {:else if state.kind === 'enrolling'}
     <p>Enrolling the new device…</p>
     <div class="modal-actions">
