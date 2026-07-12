@@ -57,6 +57,7 @@ fn fixture_payload_with_butler_set() -> ReachabilityAnnouncePayload {
 
 fn fixture_signed_event(kind: MembershipEventKind) -> SignedMembershipEvent {
     SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x42; 16],
         community_id: SpaceId([0x37; 16]),
         kind,

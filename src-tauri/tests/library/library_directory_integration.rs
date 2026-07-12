@@ -56,6 +56,7 @@ fn open_invite_url_for(community_id: SpaceId, admin_seed: [u8; 32]) -> String {
             .address_hash,
     );
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -89,6 +90,7 @@ fn invite_only_url() -> String {
     let admin_addr = OwnerAddr([0u8; 16]);
     let community_id = SpaceId([0u8; 16]);
     let admin_bootstrap = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0u8; 16],
         community_id,
         kind: MembershipEventKind::Join,
@@ -104,6 +106,7 @@ fn invite_only_url() -> String {
         enrollment: Some(harmony_app::community_membership::mint_test_owner(0xC2).cert),
     };
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
@@ -683,6 +686,7 @@ async fn click_to_join_redeem_invite_smoke() {
     let membership_key = EpochKey::new([0xEC; 32]);
 
     let invite_payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,

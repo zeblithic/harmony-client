@@ -279,6 +279,7 @@ async fn open_community_create_redeem_leave_round_trip() {
 
     // ── Step 2: B redeems an invite for the same community. ────────────
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
             epoch: 0,
@@ -616,6 +617,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
 
     // ── First redemption: B mints + inserts ───────────────────────────
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
             epoch: 0,
@@ -833,6 +835,7 @@ mod bootstrap_admit_open_publisher_tests {
         let (admin, community_id, _admin_join) = mint_open_admin_join(0xC2);
         let joiner = harmony_app::community_membership::mint_test_owner(0xD3);
         let invite = harmony_app::community_invite::CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -1083,6 +1086,7 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
     // B redeems the open invite + inserts ONLY its own Join → publishes.
     // NO manual cross-seed of A's Join into B, and NO seed of B's Join into A.
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
             epoch: 0,
@@ -1417,6 +1421,7 @@ async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
             .expect("seal epoch key to B");
 
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
             epoch: 0,

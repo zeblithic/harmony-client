@@ -792,6 +792,7 @@ mod tests {
 
     fn sample_join_event() -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0u8; 16],
             community_id: SpaceId([1u8; 16]),
             kind: MembershipEventKind::Join,

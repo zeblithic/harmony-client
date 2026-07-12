@@ -821,6 +821,7 @@ async fn fork_invite_carries_snapshot_to_invitee() {
         },
     };
     let payload = harmony_app::community_invite::CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: fork_space_id,
         epoch_snapshot,
         admin_addr: a_addr,

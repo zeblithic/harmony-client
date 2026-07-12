@@ -61,6 +61,7 @@ use harmony_app::owner_state_types::{Hlc, SpaceId};
 #[test]
 fn signed_event_round_trips_through_canonical_cbor() {
     let event = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [9u8; 16],
         community_id: SpaceId([3u8; 16]),
         kind: MembershipEventKind::Join,
@@ -88,6 +89,7 @@ fn signed_event_with_countersig_round_trips() {
     };
 
     let event = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [9u8; 16],
         community_id: SpaceId([3u8; 16]),
         kind: MembershipEventKind::Join,
@@ -2731,6 +2733,7 @@ fn materialize_channel_create_adds_to_map() {
     // Build admin's bootstrap Join + a ChannelCreate by admin.
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x01; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::Join,
@@ -2746,6 +2749,7 @@ fn materialize_channel_create_adds_to_map() {
     };
     let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
@@ -2782,6 +2786,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
     // emphasises (preventing duplicate-emit from refreshing created_at).
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x01; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::Join,
@@ -2797,6 +2802,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
     };
     let ch_id = ChannelId([0xAB; 16]);
     let ch_first = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
@@ -2816,6 +2822,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
         enrollment: None,
     };
     let ch_second = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x03; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
@@ -2849,6 +2856,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
 fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x01; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::Join,
@@ -2864,6 +2872,7 @@ fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
     };
     let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
@@ -2884,6 +2893,7 @@ fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
     };
     // Only modify name — write_power should stay at 0.
     let ch_modify = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x03; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelModify {
@@ -2916,6 +2926,7 @@ fn materialize_channel_create_records_kind() {
     // (default) ChannelCreate materializes kind == Text. (ZEB-349.)
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x01; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::Join,
@@ -2931,6 +2942,7 @@ fn materialize_channel_create_records_kind() {
     };
     let ch_voice = ChannelId([0x42; 16]);
     let voice_create = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
@@ -2951,6 +2963,7 @@ fn materialize_channel_create_records_kind() {
     };
     let ch_text = ChannelId([0x43; 16]);
     let text_create = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x03; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
@@ -2987,6 +3000,7 @@ fn channel_modify_cannot_change_kind() {
     // modify on a Voice channel leaves kind == Voice. (ZEB-349.)
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x01; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::Join,
@@ -3002,6 +3016,7 @@ fn channel_modify_cannot_change_kind() {
     };
     let ch_id = ChannelId([0x42; 16]);
     let voice_create = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
@@ -3021,6 +3036,7 @@ fn channel_modify_cannot_change_kind() {
         enrollment: None,
     };
     let modify = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x03; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelModify {
@@ -3050,6 +3066,7 @@ fn channel_modify_cannot_change_kind() {
 fn materialize_channel_delete_tombstones_in_place() {
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x01; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::Join,
@@ -3065,6 +3082,7 @@ fn materialize_channel_delete_tombstones_in_place() {
     };
     let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
@@ -3084,6 +3102,7 @@ fn materialize_channel_delete_tombstones_in_place() {
         enrollment: None,
     };
     let ch_delete = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x03; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelDelete { channel_id: ch_id },
@@ -3117,6 +3136,7 @@ fn materialize_channel_modify_on_unknown_channel_is_noop() {
     // create shows up in a later replay.
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x01; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::Join,
@@ -3131,6 +3151,7 @@ fn materialize_channel_modify_on_unknown_channel_is_noop() {
         enrollment: None,
     };
     let ch_modify = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelModify {

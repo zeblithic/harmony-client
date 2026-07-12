@@ -1336,6 +1336,7 @@ mod tests {
     /// where the binding isn't load-bearing.
     fn build_open_invite_url_for(community_id: SpaceId, admin_addr: OwnerAddr) -> String {
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -1390,6 +1391,7 @@ mod tests {
         let admin_addr = OwnerAddr([0u8; 16]);
         let community_id = SpaceId([0u8; 16]);
         let admin_bootstrap = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0u8; 16],
             community_id,
             kind: MembershipEventKind::Join,
@@ -1405,6 +1407,7 @@ mod tests {
             enrollment: Some(crate::community_membership::mint_test_owner(0xC3).cert),
         };
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -2650,6 +2653,7 @@ mod tests {
         let community_id = SpaceId([0xf1; 16]);
 
         let admin_bootstrap = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0u8; 16],
             community_id,
             kind: MembershipEventKind::Join,
@@ -2666,6 +2670,7 @@ mod tests {
         };
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -2745,6 +2750,7 @@ mod tests {
         let community_id = SpaceId([0xf2; 16]);
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -2818,6 +2824,7 @@ mod tests {
 
         // Build the invite URL pointing at community B (0xf2).
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: payload_community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,

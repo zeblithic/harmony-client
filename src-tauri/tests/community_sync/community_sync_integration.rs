@@ -2418,6 +2418,7 @@ mod task3_kick_setpower_round_trip {
 
         // Step 2: B redeems an open invite for the same community.
         let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -2796,6 +2797,7 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
         "sealed_epoch_key for invite-only must be 92 bytes"
     );
     let url = encode_invite_url(&CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,

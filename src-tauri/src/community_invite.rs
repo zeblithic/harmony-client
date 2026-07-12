@@ -202,6 +202,14 @@ pub struct CommunityInvitePayload {
         deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
     )]
     pub untargeted_decrypt_key: Option<[u8; 32]>,
+
+    /// ZEB-677: Master-issued signer certs backing a Quorum-issued
+    /// `inviter_enrollment`. Empty for Master-issued certs (key omitted on
+    /// the wire; old redeemers ignore it and keep rejecting quorum-certed
+    /// inviters). The admin-bootstrap and join-event bundles ride inside
+    /// their own `SignedMembershipEvent.signer_certs` instead.
+    #[serde(rename = "eb", default, skip_serializing_if = "Vec::is_empty")]
+    pub inviter_signer_certs: Vec<harmony_owner::certs::EnrollmentCert>,
 }
 
 /// The inviter's pre-signed authorization, embedded in the invite link
@@ -1993,22 +2001,23 @@ pub fn verify_inviter_enrollment(
         .invite_token
         .as_ref()
         .ok_or(CommunityInviteVerifyError::InviteTokenSigInvalid)?;
-    // Recover the inviter's enrolled device key from the bare cert (master-sig +
-    // expiry, then reject non-Master issuers — quorum certs are only
-    // structurally checked by cert.verify and would admit unverified sigs).
-    cert.verify(now_secs)
-        .map_err(|_| CommunityInviteVerifyError::InviterEnrollmentCertInvalid)?;
-    if !matches!(
-        cert.issuer,
-        harmony_owner::certs::EnrollmentIssuer::Master { .. }
-    ) {
-        return Err(CommunityInviteVerifyError::InviterEnrollmentCertInvalid);
-    }
-    if cert.owner_id != token.inviter.0 {
-        return Err(CommunityInviteVerifyError::InviterEnrollmentOwnerMismatch);
-    }
-    let device_key = cert.device_pubkeys.classical.ed25519_verify;
-    verify_invite_token_sig_device_key(token, &device_key)
+    // Recover the inviter's enrolled device key via the ZEB-677 chokepoint:
+    // Master certs verify self-contained; Quorum certs verify against the
+    // payload's inviter_signer_certs bundle (depth-1). No-bundle quorum
+    // certs still fail closed.
+    let verified = crate::enrollment_verify::verify_enrollment_any_issuer(
+        cert,
+        &payload.inviter_signer_certs,
+        Some(&token.inviter.0),
+        now_secs,
+    )
+    .map_err(|e| match e {
+        crate::enrollment_verify::EnrollmentVerifyError::OwnerMismatch => {
+            CommunityInviteVerifyError::InviterEnrollmentOwnerMismatch
+        }
+        _ => CommunityInviteVerifyError::InviterEnrollmentCertInvalid,
+    })?;
+    verify_invite_token_sig_device_key(token, &verified.device_ed25519)
 }
 
 // =====================================================================
@@ -2362,6 +2371,7 @@ mod tests {
     /// `sealed_epoch_key`. Use as a baseline; mutate the field under test.
     fn make_open_payload_correct() -> CommunityInvitePayload {
         CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([0u8; 16]),
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -2396,6 +2406,7 @@ mod tests {
         let community_id = SpaceId([0u8; 16]);
 
         let admin_bootstrap = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0u8; 16],
             community_id,
             kind: MembershipEventKind::Join,
@@ -2412,6 +2423,7 @@ mod tests {
         };
 
         CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -2824,6 +2836,7 @@ mod tests {
         // Construct a stub signed Join event (sig is all-zeros, no crypto needed
         // for the roundtrip test — only structure matters).
         let admin_join = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id: original_id,
             kind: MembershipEventKind::Join,
@@ -2887,6 +2900,7 @@ mod tests {
         let cid = SpaceId([0xc0; 16]);
         let admin = OwnerAddr([0xaa; 16]);
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: cid,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -2936,6 +2950,7 @@ mod tests {
         let admin = OwnerAddr([0xaa; 16]);
 
         let admin_join = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id: snapshot_original_id,
             kind: MembershipEventKind::Join,
@@ -2969,6 +2984,7 @@ mod tests {
         };
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: cid,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -3208,6 +3224,7 @@ mod open_join_packet_tests {
     /// this file); the enrollment cert comes from `mint_test_owner`.
     fn sample_join_event() -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0u8; 16],
             community_id: SpaceId([1u8; 16]),
             kind: MembershipEventKind::Join,

@@ -24029,6 +24029,7 @@ mod list_community_forks_tests {
         wall_ms: u64,
     ) -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [id_byte; 16],
             community_id,
             kind,
@@ -24375,6 +24376,7 @@ mod list_community_forks_tests {
         events.insert(
             [0x01; 16],
             SignedMembershipEvent {
+                signer_certs: Vec::new(),
                 id: [0x01; 16],
                 community_id: cid,
                 kind: MembershipEventKind::Fork {
@@ -24395,6 +24397,7 @@ mod list_community_forks_tests {
         events.insert(
             [0x02; 16],
             SignedMembershipEvent {
+                signer_certs: Vec::new(),
                 id: [0x02; 16],
                 community_id: cid,
                 kind: MembershipEventKind::Fork {
@@ -27496,6 +27499,7 @@ pub(crate) async fn generate_invite_impl(
     };
 
     let mut payload = crate::community_invite::CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: space_id,
         epoch_snapshot,
         admin_addr: admin,
@@ -30837,6 +30841,7 @@ mod preview_invite_tests {
 
     fn open_payload() -> CommunityInvitePayload {
         CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([7; 16]),
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -30877,6 +30882,7 @@ mod preview_invite_tests {
         )
         .expect("mint token");
         let admin_bootstrap = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0u8; 16],
             community_id: SpaceId([9; 16]),
             kind: MembershipEventKind::Join,
@@ -30891,6 +30897,7 @@ mod preview_invite_tests {
             enrollment: Some(mint_test_owner(0x6E).cert),
         };
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([9; 16]),
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -33367,6 +33374,7 @@ mod redeem_invite_inner_tests {
         let membership_key = EpochKey::new([0x42; 32]);
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33437,6 +33445,7 @@ mod redeem_invite_inner_tests {
         let enrollment_cert = owner.cert.clone();
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([0xee; 16]),
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33534,6 +33543,7 @@ mod redeem_invite_inner_tests {
         };
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33666,6 +33676,7 @@ mod redeem_invite_inner_tests {
         };
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33780,6 +33791,7 @@ mod redeem_invite_inner_tests {
         };
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -33874,6 +33886,7 @@ mod redeem_invite_inner_tests {
         };
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -33949,6 +33962,7 @@ mod redeem_invite_inner_tests {
         };
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -34017,6 +34031,7 @@ mod redeem_invite_inner_tests {
             InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
         };
         CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -34149,6 +34164,7 @@ mod redeem_invite_inner_tests {
             .expect("seal to ephemeral");
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -34231,6 +34247,7 @@ mod redeem_invite_inner_tests {
 
         let raw_key = [0x44u8; 32];
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -34294,6 +34311,7 @@ mod zeb436_orphan_adoption_tests {
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
         let membership_key = EpochKey::new([key_byte; 32]);
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -34812,6 +34830,7 @@ mod zeb436_orphan_adoption_tests {
                 .expect("seal epoch key")
         };
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -35106,6 +35125,7 @@ mod join_open_community_tests {
     ) -> AggregatedEntry {
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -59152,6 +59172,7 @@ mod generate_invite_helper_tests {
     #[test]
     fn build_open_invite_payload_round_trips_via_url() {
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: SpaceId([7; 16]),
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -59211,6 +59232,7 @@ mod generate_invite_helper_tests {
         };
 
         let payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: fork_id,
             epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
                 epoch: 0,
@@ -59447,6 +59469,7 @@ mod create_channel_delta_tests {
 
         // Create.
         let create_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::ChannelCreate {
@@ -59479,6 +59502,7 @@ mod create_channel_delta_tests {
 
         // Modify (name only — write_power None means unchanged).
         let modify_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x02; 16],
             community_id,
             kind: MembershipEventKind::ChannelModify {
@@ -59507,6 +59531,7 @@ mod create_channel_delta_tests {
 
         // Delete.
         let delete_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x03; 16],
             community_id,
             kind: MembershipEventKind::ChannelDelete { channel_id: ch_id },
@@ -59538,6 +59563,7 @@ mod create_channel_delta_tests {
         let community_id = SpaceId([0x37; 16]);
         let actor = OwnerAddr([0x10; 16]);
         let create_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::ChannelCreate {
@@ -59602,6 +59628,7 @@ mod create_channel_delta_tests {
 
         let community_id = SpaceId([0x37; 16]);
         let create_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::ChannelCreate {
@@ -61639,6 +61666,7 @@ mod pending_join_audit_feed_tests {
         community_id: SpaceId,
     ) -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id,
             kind,
@@ -62784,6 +62812,7 @@ mod list_pending_admin_proposals_tests {
         kind: MembershipEventKind,
     ) -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id,
             community_id: SpaceId([0xaa; 16]),
             kind,

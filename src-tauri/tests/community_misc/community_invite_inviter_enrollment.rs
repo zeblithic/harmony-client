@@ -35,6 +35,7 @@ fn invite_only_payload(
     let sig: [u8; 64] = signer.sign(&bytes).to_bytes();
     let token = InviteToken { sig, ..unsigned };
     CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0x11; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,

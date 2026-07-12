@@ -1137,6 +1137,7 @@ async fn build_open_invite_url_for_alice(s: &OpenJoinSetup) -> String {
     let mat = materialize(&events, s.alice_addr);
 
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: s.community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,

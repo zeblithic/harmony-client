@@ -610,6 +610,7 @@ fn offline_catchup_through_multiple_rotations() {
             })
             .collect();
         let rotation_event = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: {
                 let mut id = [0u8; 16];
                 id[0] = 0x10 + i as u8;
@@ -670,6 +671,7 @@ fn offline_catchup_through_multiple_rotations() {
         })
         .collect();
     let catchup_event = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0xCA; 16],
         community_id,
         kind: MembershipEventKind::EpochCatchup {
@@ -1554,6 +1556,7 @@ fn concurrent_kicks_self_heal_end_to_end() {
         &admin_signing_key,
     );
     let join_x = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x11; 16],
         community_id,
         kind: MembershipEventKind::Join,
@@ -1564,6 +1567,7 @@ fn concurrent_kicks_self_heal_end_to_end() {
         enrollment: None,
     };
     let join_y = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x12; 16],
         community_id,
         kind: MembershipEventKind::Join,
@@ -1574,6 +1578,7 @@ fn concurrent_kicks_self_heal_end_to_end() {
         enrollment: None,
     };
     let join_z = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x13; 16],
         community_id,
         kind: MembershipEventKind::Join,
@@ -1745,6 +1750,7 @@ fn leaver_cooperative_rotation() {
         &admin_signing_key,
     );
     let join_b = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id,
         kind: MembershipEventKind::Join,
@@ -1825,6 +1831,7 @@ fn leaver_cooperative_rotation() {
             })
             .collect();
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x12; 16],
             community_id,
             kind: MembershipEventKind::EpochRotation {
@@ -1897,6 +1904,7 @@ fn leaver_malicious_self_include_rejected_admin_self_heals() {
         &admin_signing_key,
     );
     let join_b = SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x02; 16],
         community_id,
         kind: MembershipEventKind::Join,
@@ -2011,6 +2019,7 @@ fn leaver_malicious_self_include_rejected_admin_self_heals() {
             })
             .collect();
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0x13; 16],
             community_id,
             kind: MembershipEventKind::EpochRotation {

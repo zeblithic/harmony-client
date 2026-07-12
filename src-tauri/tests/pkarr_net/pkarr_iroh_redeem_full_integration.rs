@@ -789,6 +789,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // because pkarr step 6 (verify_identity_match) checks it against the
         // pkarr record's harmony_identity_pub, which is signed by alice_sk.
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: s.community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -1104,6 +1105,7 @@ async fn targeted_invite_only_generate_then_redeem_roundtrip() {
 
         // ZEB-369 targeted shape: single envelope in sealed_epoch_keys, empty blob.
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: s.community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -1270,6 +1272,7 @@ async fn targeted_invite_only_multi_device_redeem_opens_correct_envelope() {
 
         // Bob's envelope is SECOND — try-all must skip #1 and open #2.
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: s.community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -1441,6 +1444,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
         );
 
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: s.community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
@@ -1695,6 +1699,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
         )
         .expect("seal epoch key to bob");
         let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
             community_id: s.community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,

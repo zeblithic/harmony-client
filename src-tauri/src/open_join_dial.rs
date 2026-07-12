@@ -544,6 +544,7 @@ mod tests {
 
     fn sample_bootstrap_join() -> SignedMembershipEvent {
         SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [1u8; 16],
             community_id: SpaceId([2u8; 16]),
             kind: MembershipEventKind::Join,
@@ -634,6 +635,7 @@ mod tests {
         let admin = OwnerAddr([0x21; 16]);
         let community = SpaceId([0x42; 16]);
         let admin_join = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0xA0; 16],
             community_id: community,
             kind: MembershipEventKind::Join,
@@ -648,6 +650,7 @@ mod tests {
             enrollment: None,
         };
         let channel_create = SignedMembershipEvent {
+            signer_certs: Vec::new(),
             id: [0xC0; 16],
             community_id: community,
             kind: MembershipEventKind::ChannelCreate {

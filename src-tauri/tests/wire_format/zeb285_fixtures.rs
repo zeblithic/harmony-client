@@ -70,6 +70,7 @@ fn fixture_hlc() -> Hlc {
 /// The sig is all-0xBB (not a valid signature — wire-format pin only).
 fn fixture_signed_event_zeb285(kind: MembershipEventKind) -> SignedMembershipEvent {
     SignedMembershipEvent {
+        signer_certs: Vec::new(),
         id: [0x42; 16],
         community_id: SpaceId([0xc0; 16]),
         kind,
@@ -252,6 +253,7 @@ fn community_invite_with_fork_fields_pinned() {
     };
 
     let payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
         community_id: SpaceId([0xc0; 16]),
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
