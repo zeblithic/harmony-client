@@ -5,6 +5,14 @@ export interface OwnerStateView {
   ownerDisplayName: string;
   devices: DeviceView[];
   canBackUp: boolean;
+  /** ZEB-668 S5: the fleet's current KeyTree epoch (0 = never rotated). */
+  fleetEpoch: number;
+  /**
+   * ZEB-668 S5: true when any device removal postdates the last key
+   * rotation — the removed device still holds decryptable fleet material.
+   * Seed-holders (`canBackUp`) get the rotate action; others a passive note.
+   */
+  fleetEpochStale: boolean;
 }
 
 export interface DeviceView {

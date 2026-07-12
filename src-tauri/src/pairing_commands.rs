@@ -50,11 +50,19 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
     let master_seed = loaded
         .master_seed
         .ok_or_else(|| "master seed not on this device — cannot enroll".to_string())?;
+    // ZEB-668 S5: a joiner enrolled after a fleet epoch bump needs BOTH the
+    // epoch-0 material (fleet-keys carrier access) and the current epoch's
+    // (live datasets). The resident key set knows the current epoch.
+    let fleet_current_epoch = {
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.fleet_keys.as_ref().map_or(0, |k| k.newest().epoch)
+    };
     cmd_tx
         .send(PairingCommand::StartInviter {
             display_name,
             owner_state: loaded.state,
             master_seed,
+            fleet_current_epoch,
         })
         .await
         .map_err(|_| "pairing state machine not running".to_string())?;

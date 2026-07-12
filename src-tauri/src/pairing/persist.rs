@@ -76,9 +76,11 @@ pub fn install_joiner_state_inner(
     // (mirrors save_owner_state_atomic's master_seed == None clear). Runs inside
     // the held OWNER_STATE_WRITE_LOCK, same as the owner_state write below.
     match result.fleet_keytree.as_ref() {
-        Some(material) => {
-            let mut buf = zeroize::Zeroizing::new(Vec::new());
-            ciborium::into_writer(material, &mut *buf)
+        Some(materials) => {
+            // ZEB-668 S5: the slot persists the multi-epoch set encoding —
+            // a pre-bump handover carries one epoch, a post-bump one two
+            // (epoch-0 + current).
+            let buf = crate::owner_state_crypto::encode_fleet_material_set(materials)
                 .map_err(|e| format!("encode fleet keytree for persist: {e}"))?;
             crate::owner_state::save_fleet_keytree(&fleet_keychain, identity_dir, &buf)?;
         }
@@ -276,7 +278,7 @@ mod tests {
             our_signing_key: joiner_sk,
             owner_state: state,
             our_device_id: joiner_id,
-            fleet_keytree: Some(material),
+            fleet_keytree: Some(vec![material]),
         };
         install_joiner_state_inner(dir.path(), result, None, None).unwrap();
 
@@ -291,9 +293,11 @@ mod tests {
         let loaded = crate::owner_state::load_fleet_keytree(&None, dir.path())
             .unwrap()
             .expect("fleet keytree present after install");
-        let m: crate::owner_state_crypto::FleetKeyMaterial =
-            ciborium::from_reader(loaded.as_slice()).unwrap();
-        let kt2 = KeyTree::from_fleet_material(&m).unwrap();
+        // ZEB-668 S5: the slot persists the multi-epoch set encoding; a
+        // pairing handover installs a 1-set.
+        let set = crate::owner_state_crypto::decode_fleet_material_set(loaded.as_slice()).unwrap();
+        assert_eq!(set.len(), 1, "pairing handover installs exactly one epoch");
+        let kt2 = KeyTree::from_fleet_material(&set[0]).unwrap();
         let lk2 = space_lookup_key(&kt2, b"dm-inbox-v1");
         assert_eq!(
             decrypt_entry(&kt2, &lk2, &ciphertext).unwrap(),
@@ -331,7 +335,8 @@ mod tests {
 
         // First install: WITH material → fleet_keytree.enc lands on disk.
         let material = KeyTree::derive(&[0x11u8; 32]).unwrap().to_fleet_material();
-        install_joiner_state_inner(dir.path(), mk_result(Some(material)), None, None).unwrap();
+        install_joiner_state_inner(dir.path(), mk_result(Some(vec![material])), None, None)
+            .unwrap();
         assert!(
             dir.path().join("fleet_keytree.enc").exists(),
             "precondition: fleet_keytree.enc written by the WITH-material install"

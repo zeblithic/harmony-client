@@ -262,7 +262,7 @@ fn build_outhold_engine(
     let tracker = Arc::new(Mutex::new(BTreeMap::new()));
     let merger: Merger<DmOutholdDoc> = Arc::new(|local, remote| local.merge_from(remote));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-        kt,
+        keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
         device_id: device_id.to_string(),
         state: Arc::clone(&doc),
         merger,
@@ -303,7 +303,7 @@ fn build_inbox_engine(
     let tracker = Arc::new(Mutex::new(BTreeMap::new()));
     let merger: Merger<DmInboxDoc> = Arc::new(|local, remote| local.merge_from(remote));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-        kt,
+        keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
         device_id: device_id.to_string(),
         state: Arc::clone(&doc),
         merger,

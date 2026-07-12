@@ -223,6 +223,64 @@ revoke, the fleet moves to epoch N+1:
   panel notes stale fleet keys and offers "bump from this device" copy on
   the seed-holder. Master-revoke always bumps.
 
+### §6.1 S5 ground-truth amendments (plan-time, 2026-07-11)
+
+The pre-implementation seam survey invalidated two §6 mechanisms; the
+amendments below supersede the corresponding bullets above.
+
+1. **Sealed blobs do NOT travel through the trust doc.** The trust doc's
+   wire type is the crate-owned `harmony_owner::state::OwnerState`
+   (git-pinned rev, exhaustively destructured in
+   `merge_trust_remote_into_local`) — not a client-local struct, so the
+   additive `#[serde(default)]` trick (FleetNetDoc `pt`) cannot apply
+   without a cross-repo crate bump. Worse, any carrier that itself rotates
+   epochs deadlocks bootstrap: blobs published under epoch N+1 encryption
+   can never be read by the survivors that need them to *reach* N+1.
+   **Amendment:** a new client-local `FleetSyncEngine` dataset
+   `fleet-keys-v1` (ninth engine instance, same donor pattern as
+   `owner-trust-v1`) carries `FleetKeyEpochDoc { epoch, bump_wall_ms,
+   sealed: BTreeMap<device_id_hex, sealed_blob>, master_sig }`. The
+   carrier is **permanently encrypted under the epoch-0 KeyTree** (every
+   enrolled device holds epoch-0 from pairing), which resolves bootstrap
+   and makes chained bumps safe (a device offline across two bumps
+   installs the current epoch directly). Because revoked devices retain
+   epoch-0 and could forge carrier publishes, the doc payload is
+   **master-signed** and receivers accept only strictly-higher epochs with
+   a valid signature (rollback- and forgery-proof). Leak surface to a
+   revoked device: epoch counter, bump time, device-id list, unopenable
+   sealed blobs — recorded in the §8 honesty ledger.
+2. **Transition-window liveness source is `FleetNetRow.seen_at`, not
+   trust-doc liveness.** `LivenessCert` refreshes on a ~15-day cadence —
+   unusable for a 7-day window. Fleet-net rows self-stamp every ~7.5 min.
+3. **Epoch-0 material is never pruned.** It keys the carrier forever. The
+   data engines' decrypt accept set still narrows {N, N+1} → {N+1} at
+   window close; the vault invariant is "epoch-0 + current (+ previous
+   during the window)".
+4. **Pairing hands over a material set.** The ENROLL payload gains an
+   additive optional `fleet_keytree_set_cbor_hex` (epoch-0 + current), so
+   a device enrolled after a bump can read both the carrier and current
+   traffic. The legacy single-material field keeps carrying epoch-0 for
+   old builds; an old-build joiner into a bumped fleet falls out of fleet
+   sync (same no-version-gate posture as the §6 decision, release-noted).
+5. **Staleness signal covers all revocations, not just self-revokes.**
+   `fleetEpochStale` = any revocation cert newer than the last bump
+   (pre-S5 revocations included — those devices really can still decrypt,
+   so showing stale is the honest state). Seed-holder panel offers the
+   manual bump; other devices show a passive note.
+6. **The friend-secret domain stays pinned to the epoch-0 tree**
+   (implementation-time amendment). Friend secrets are sealed once and
+   stored durably in the owner-state CRDT; rotating `friend_aead` would
+   orphan every stored secret at window close unless the bump re-sealed
+   them all. Rotation buys nothing there: a revoked device cannot RECEIVE
+   new CRDT states post-rotation (the wire keys rotate), and it already
+   knows the secrets it decrypted before revocation. Residual risk (a
+   revoked device that somehow obtains post-revocation CRDT bytes out of
+   band could open friend-secret blobs) is accepted and recorded in the
+   §8 ledger; a re-seal migration is a §9 follow-up candidate. All ten
+   fleet engines sharing the fleet tree rotate — ground truth found
+   owner-state, fleet-net, trust, notes, DM-inbox, DM-outhold, relay-hold,
+   relay-optin, community-device-intro, and mint, not the three §6 names.
+
 ## §7 S6 — "Replace this device" (the rotation answer)
 
 Pure composition, no new cert types: on the seed-holder, **Replace…** on a
@@ -241,6 +299,8 @@ out of scope and the spec says so in UI-adjacent docs.
 | Last seen = live presence | It is the last fleet heartbeat (~7.5 min cadence, HLC wall time) | Copy + tolerance; null renders nothing |
 | Removed device's data is gone | Local data on that device persists until its owner wipes it | Terminal-state copy on the revoked device says so |
 | Enrollment is quorum-protected | N=1 master-signed today | Recorded here for the quorum follow-up; no UI claim made |
+| Epoch bump cuts a revoked device off completely | It still reads the epoch-0 `fleet-keys-v1` carrier: epoch counter, bump times, device-id list, sealed blobs it cannot open. No key material, trust state, or content | §6.1 amendment 1; accepted metadata leak, documented here |
+| Epoch bump rotates every fleet key | The friend-secret domain (`friend_aead`) stays on the epoch-0 tree — stored blobs would otherwise be orphaned. A revoked device that obtains post-rotation CRDT bytes out of band could open friend-secret blobs (it cannot receive them via sync) | §6.1 amendment 6; re-seal migration is a follow-up candidate |
 
 ## §9 Follow-up tickets (file at implementation end, use assigned IDs)
 

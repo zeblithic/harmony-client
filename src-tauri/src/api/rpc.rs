@@ -970,6 +970,12 @@ pub fn build_registry() -> RpcRegistry {
             crate::set_device_petname_impl(state, sink, a.device_vk_hex, a.petname).await
         }
     );
+    rpc!(
+        m,
+        "bump_fleet_epoch",
+        EmptyArgs,
+        |state, sink, _a| async move { crate::bump_fleet_epoch_impl(state, sink).await }
+    );
 
     // Connectivity.
     rpc!(
@@ -1321,6 +1327,37 @@ mod tests {
                 );
             }
             Ok(v) => panic!("expected noOwner error on an empty identity dir, got {v:?}"),
+        }
+    }
+
+    /// ZEB-668 S5: dispatch proof for `bump_fleet_epoch` (no args). A
+    /// default NodeState has no fleet-keys carrier, so the seam
+    /// deterministically answers "carrier not running" without any
+    /// identity/keychain access.
+    #[tokio::test]
+    async fn bump_fleet_epoch_rpc_is_registered_and_wired() {
+        let reg = build_registry();
+        let state = Arc::new(Mutex::new(NodeState::default()));
+        match reg
+            .dispatch(
+                "bump_fleet_epoch",
+                state,
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+        {
+            Err(RpcError::UnknownCommand) => panic!("bump_fleet_epoch must be registered"),
+            Err(RpcError::BadArgs(msg)) => {
+                panic!("bump_fleet_epoch: EmptyArgs rejected the wrapper shape: {msg}")
+            }
+            Err(RpcError::Command(msg)) => {
+                assert!(
+                    msg.contains("fleet-keys carrier not running"),
+                    "expected the node-not-started seam error, got: {msg}"
+                );
+            }
+            Ok(v) => panic!("expected node-not-started error on a default NodeState, got {v:?}"),
         }
     }
 
@@ -1869,9 +1906,10 @@ mod tests {
             "set_butler_pin",
             "get_butler_pin",
             "get_butler_held",
-            // device management (ZEB-668 S2/S4)
+            // device management (ZEB-668 S2/S4/S5)
             "revoke_device",
             "set_device_petname",
+            "bump_fleet_epoch",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",

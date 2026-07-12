@@ -100,10 +100,14 @@ pub enum CryptoError {
     UnsupportedEpoch(u32),
 }
 
-/// Salt versioning: bump `v1` if the encryption scheme itself changes;
-/// bump `epoch-N` to rotate keys (after the future "wipe master from
-/// device" action lands per ZEB-197 follow-on). v1 hard-codes epoch-0.
-const HKDF_SALT: &[u8] = b"harmony-owner-state-v1-epoch-0";
+/// Per-epoch HKDF salt (ZEB-668 S5). Salt versioning: bump `v1` if the
+/// encryption scheme itself changes; the epoch suffix rotates keys on a
+/// fleet KeyTree epoch bump. Epoch 0 is byte-identical to the pre-S5 fixed
+/// constant `harmony-owner-state-v1-epoch-0` — pinned by
+/// `epoch_salt_zero_matches_legacy_constant` and the golden-vector test.
+fn epoch_salt(epoch: u32) -> Vec<u8> {
+    format!("harmony-owner-state-v1-epoch-{epoch}").into_bytes()
+}
 
 const INFO_ENTRY_AEAD: &[u8] = b"entry-aead-key";
 const INFO_ROOT_AEAD: &[u8] = b"root-aead-key";
@@ -122,6 +126,10 @@ const INFO_FRIEND_AEAD: &[u8] = b"friend-secret-aead-key";
 /// debug formatting, or accidental copies — `Zeroizing` only protects
 /// the memory at drop time, not against unintended use.
 pub struct KeyTree {
+    /// Fleet KeyTree epoch this tree was derived at (ZEB-668 S5). Not key
+    /// material — plain copy, no zeroize. Distinct from transport/tunnel/
+    /// community epochs.
+    pub(crate) epoch: u32,
     entry_aead: Zeroizing<[u8; 32]>,
     root_aead: Zeroizing<[u8; 32]>,
     lookup: Zeroizing<[u8; 32]>,
@@ -130,9 +138,17 @@ pub struct KeyTree {
 }
 
 impl KeyTree {
-    /// Derive all four keys via HKDF-SHA256 with domain separation.
+    /// Derive all keys at epoch 0 — the pre-rotation tree every fleet starts
+    /// on. Byte-identical to the pre-S5 derivation (golden-pinned).
     pub fn derive(master_seed: &[u8; 32]) -> Result<Self, CryptoError> {
-        let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), master_seed);
+        Self::derive_at_epoch(master_seed, 0)
+    }
+
+    /// Derive all keys via HKDF-SHA256 with domain separation, at the given
+    /// fleet KeyTree epoch (ZEB-668 S5). Same seed + same epoch → identical
+    /// keys on every device; different epochs share no key material.
+    pub fn derive_at_epoch(master_seed: &[u8; 32], epoch: u32) -> Result<Self, CryptoError> {
+        let hk = Hkdf::<Sha256>::new(Some(&epoch_salt(epoch)), master_seed);
 
         let mut entry_aead = Zeroizing::new([0u8; 32]);
         hk.expand(INFO_ENTRY_AEAD, entry_aead.as_mut())
@@ -155,6 +171,7 @@ impl KeyTree {
             .map_err(|e| CryptoError::Hkdf(format!("friend-aead: {e}")))?;
 
         Ok(Self {
+            epoch,
             entry_aead,
             root_aead,
             lookup,
@@ -166,15 +183,13 @@ impl KeyTree {
     /// Export this KeyTree's key material for sealed distribution to an
     /// enrolled device. Only the seed-holding (inviter) device calls this.
     ///
-    /// Stamps `epoch: 0` unconditionally — the only epoch the current KeyTree
-    /// derivation produces, and the only one `from_fleet_material` accepts
-    /// (ZEB-492 round 1, FIX E). Taking an `epoch` parameter was a footgun: a
-    /// caller could mint `epoch != 0` material that this same build's import side
-    /// immediately refuses. KeyTree rotation (a future, non-zero epoch) will
-    /// revisit this — see the ZEB-492 spec.
+    /// Stamps the tree's own `epoch` (ZEB-668 S5). The ZEB-492 "epoch
+    /// parameter footgun" (a caller minting material the import side
+    /// refuses) is gone by construction: the epoch comes from the tree the
+    /// material was derived as, never from a caller.
     pub fn to_fleet_material(&self) -> FleetKeyMaterial {
         FleetKeyMaterial {
-            epoch: 0,
+            epoch: self.epoch,
             entry_aead: *self.entry_aead,
             root_aead: *self.root_aead,
             lookup: *self.lookup,
@@ -185,26 +200,98 @@ impl KeyTree {
 
     /// Reconstruct a KeyTree from distributed material (cert-only device, which
     /// has no master seed to re-derive from). Produces a KeyTree byte-identical
-    /// to the originating seed-holder's.
+    /// to the originating seed-holder's, at the material's epoch.
     ///
-    /// Fallible (ZEB-492 Qodo/CodeAnt round 1, FIX E): rejects unsupported
-    /// material at the cert-only boot boundary so corrupt/future-version material
-    /// can't be silently accepted. Today only `epoch == 0` is supported (KeyTree
-    /// rotation is out of scope — see the ZEB-492 spec); a non-zero epoch returns
-    /// [`CryptoError::UnsupportedEpoch`] so the boot gate can fall back to no
-    /// fleet engines rather than building a KeyTree from material it can't
-    /// interpret.
+    /// Accepts any epoch (ZEB-668 S5 — rotation-era material carries the
+    /// epoch it was derived at; the pre-S5 `epoch != 0` rejection existed
+    /// only because no rotation could mint such material yet). Kept fallible
+    /// so a future material-format bump can gate here again
+    /// ([`CryptoError::UnsupportedEpoch`] stays reserved for that).
     pub fn from_fleet_material(m: &FleetKeyMaterial) -> Result<Self, CryptoError> {
-        if m.epoch != 0 {
-            return Err(CryptoError::UnsupportedEpoch(m.epoch));
-        }
         Ok(Self {
+            epoch: m.epoch,
             entry_aead: Zeroizing::new(m.entry_aead),
             root_aead: Zeroizing::new(m.root_aead),
             lookup: Zeroizing::new(m.lookup),
             nonce: Zeroizing::new(m.nonce),
             friend_aead: Zeroizing::new(m.friend_aead),
         })
+    }
+}
+
+/// Runtime-swappable set of installed fleet KeyTrees (ZEB-668 S5).
+///
+/// The dual-epoch read window means an engine may need to decrypt inbound
+/// publishes under either the previous or the newest epoch while always
+/// publishing on the newest. Cloning is cheap (shared inner); every fleet
+/// engine holds a clone of the same set, so an epoch install/prune applies
+/// to all of them at once without restarts.
+///
+/// Non-empty by construction: `new` seeds the set and `retain_newest_only`
+/// keeps one entry, so `newest()` cannot observe an empty set.
+#[derive(Clone)]
+pub struct FleetKeySet {
+    /// Sorted descending by epoch; index 0 is the publish key.
+    inner: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<KeyTree>>>>,
+}
+
+impl FleetKeySet {
+    pub fn new(first: std::sync::Arc<KeyTree>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(vec![first])),
+        }
+    }
+
+    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<std::sync::Arc<KeyTree>>> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Highest installed epoch — the publish key.
+    pub fn newest(&self) -> std::sync::Arc<KeyTree> {
+        std::sync::Arc::clone(&self.lock_read()[0])
+    }
+
+    /// Decrypt candidates, newest first. A publish is entirely single-epoch,
+    /// so callers bind whichever tree decrypts the root for the rest of the
+    /// message.
+    pub fn accept_set(&self) -> Vec<std::sync::Arc<KeyTree>> {
+        self.lock_read().clone()
+    }
+
+    /// Install a tree; idempotent by epoch (an already-installed epoch is
+    /// left untouched). Keeps the descending sort.
+    pub fn install(&self, kt: std::sync::Arc<KeyTree>) {
+        let mut set = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if set.iter().any(|k| k.epoch == kt.epoch) {
+            return;
+        }
+        set.push(kt);
+        set.sort_by(|a, b| b.epoch.cmp(&a.epoch));
+    }
+
+    /// Window close: drop everything but the newest epoch from the accept
+    /// set. (Epoch-0 material persisted for the fleet-keys carrier lives
+    /// outside this set — the carrier engine holds its own fixed tree.)
+    pub fn retain_newest_only(&self) {
+        let mut set = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        set.truncate(1);
+    }
+
+    /// Drop every epoch strictly below `min_epoch` (PR #455 round 2,
+    /// Greptile P1): a replay-driven install must evict stale epochs the
+    /// boot set carried (a restarted seed-holder boots at epoch 0), not
+    /// merely add the new epoch beside them. Never empties the set — the
+    /// newest epoch always survives even when `min_epoch` overshoots it.
+    pub fn retain_min_epoch(&self, min_epoch: u32) {
+        let mut set = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let newest = set[0].epoch;
+        let floor = min_epoch.min(newest);
+        set.retain(|k| k.epoch >= floor);
+    }
+
+    /// Installed epochs, descending.
+    pub fn epochs(&self) -> Vec<u32> {
+        self.lock_read().iter().map(|k| k.epoch).collect()
     }
 }
 
@@ -227,6 +314,35 @@ pub struct FleetKeyMaterial {
     lookup: [u8; 32],
     nonce: [u8; 32],
     friend_aead: [u8; 32],
+}
+
+/// Encode a set of fleet materials for the vault `fleet_keytree` slot
+/// (ZEB-668 S5). Always writes the multi-epoch CBOR-array format; the vault
+/// invariant is "epoch-0 + current (+ previous during a bump window)".
+/// `Zeroizing`: the buffer holds raw key material.
+pub fn encode_fleet_material_set(
+    materials: &[FleetKeyMaterial],
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut buf = Zeroizing::new(Vec::new());
+    ciborium::into_writer(&materials, &mut *buf)
+        .map_err(|e| format!("encode material set: {e}"))?;
+    Ok(buf)
+}
+
+/// Decode the vault `fleet_keytree` slot. Post-S5 slots hold a CBOR array of
+/// `FleetKeyMaterial`; pre-S5 slots hold a single CBOR map — decoded as a
+/// one-element set (its material is epoch 0 by construction). Discrimination
+/// is structural (CBOR array vs map major type), no version byte needed.
+pub fn decode_fleet_material_set(bytes: &[u8]) -> Result<Vec<FleetKeyMaterial>, String> {
+    if let Ok(set) = ciborium::from_reader::<Vec<FleetKeyMaterial>, _>(bytes) {
+        if set.is_empty() {
+            return Err("fleet material set is empty".to_string());
+        }
+        return Ok(set);
+    }
+    ciborium::from_reader::<FleetKeyMaterial, _>(bytes)
+        .map(|single| vec![single])
+        .map_err(|e| format!("decode fleet_keytree (neither set nor legacy single): {e}"))
 }
 
 /// Derive the per-space Prolly Tree lookup key.
@@ -608,6 +724,36 @@ mod tests {
         assert_ne!(kt1.root_aead.as_ref(), kt1.lookup.as_ref());
         assert_ne!(kt1.root_aead.as_ref(), kt1.nonce.as_ref());
         assert_ne!(kt1.lookup.as_ref(), kt1.nonce.as_ref());
+    }
+
+    /// ZEB-668 S5: epoch-0 derivation is pinned byte-for-byte. These vectors
+    /// were captured from the pre-S5 implementation (the fixed
+    /// `harmony-owner-state-v1-epoch-0` HKDF salt) and MUST NEVER be
+    /// regenerated — a mismatch means every existing fleet's keys broke.
+    #[test]
+    fn epoch0_derivation_matches_golden_vectors() {
+        let seed = [7u8; 32];
+        let kt = KeyTree::derive(&seed).expect("derive");
+        assert_eq!(
+            hex::encode(kt.entry_aead.as_ref()),
+            "3433d952f6018567e5c317a2f11ae19aacee303d458f5ff36efdb9a87d1bfb69"
+        );
+        assert_eq!(
+            hex::encode(kt.root_aead.as_ref()),
+            "03af1ea8b6aa773c5d0c5522eed5d67a87e59406b3fc9596fefb5058db54faca"
+        );
+        assert_eq!(
+            hex::encode(kt.lookup.as_ref()),
+            "815e90de81cb899bb1dd2f3a2632c54612ff76d7d0ddaecf957ddb0c5eceb454"
+        );
+        assert_eq!(
+            hex::encode(kt.nonce.as_ref()),
+            "aba43be2af6d80a96b54cf3ad47baea7cb4dd90df35b9cfd7da35316e17c7dce"
+        );
+        assert_eq!(
+            hex::encode(kt.friend_aead.as_ref()),
+            "8a2d15a00d95c68bfa4e314f1acb80a348c1644769696371dddcf6247c020513"
+        );
     }
 
     #[test]
@@ -1140,21 +1286,119 @@ mod tests {
     /// silently reconstructed. Only epoch 0 is supported today (rotation is out
     /// of scope).
     #[test]
-    fn fleet_material_unsupported_epoch_rejected() {
-        let kt = KeyTree::derive(&[0x42u8; 32]).unwrap();
-        // `to_fleet_material` only ever stamps epoch 0, so forge a future-epoch
-        // blob by overriding the `epoch` field on exported material — this is the
-        // only way a non-zero epoch can reach `from_fleet_material` (e.g. a future
-        // rotation-aware peer, or a corrupt/tampered blob).
-        let mut material = kt.to_fleet_material();
-        material.epoch = 1;
-        assert_eq!(material.epoch, 1);
-        // `KeyTree` deliberately has no `Debug` (key material), so `expect_err`
-        // (which formats the Ok value) won't compile — match on the result.
-        match KeyTree::from_fleet_material(&material) {
-            Err(CryptoError::UnsupportedEpoch(1)) => {}
-            Err(other) => panic!("expected UnsupportedEpoch(1), got: {other}"),
-            Ok(_) => panic!("epoch 1 material must be rejected, not reconstructed"),
-        }
+    fn epoch_salt_zero_matches_legacy_constant() {
+        // ZEB-668 S5: the pre-S5 salt was the fixed constant below. Epoch 0
+        // must keep producing byte-identical salts (and therefore keys — see
+        // `epoch0_derivation_matches_golden_vectors`).
+        assert_eq!(epoch_salt(0).as_slice(), b"harmony-owner-state-v1-epoch-0");
+    }
+
+    #[test]
+    fn distinct_epochs_derive_pairwise_distinct_keys() {
+        let seed = [7u8; 32];
+        let e0 = KeyTree::derive_at_epoch(&seed, 0).expect("e0");
+        let e1 = KeyTree::derive_at_epoch(&seed, 1).expect("e1");
+        assert_eq!(e0.epoch, 0);
+        assert_eq!(e1.epoch, 1);
+        assert_ne!(e0.entry_aead.as_ref(), e1.entry_aead.as_ref());
+        assert_ne!(e0.root_aead.as_ref(), e1.root_aead.as_ref());
+        assert_ne!(e0.lookup.as_ref(), e1.lookup.as_ref());
+        assert_ne!(e0.nonce.as_ref(), e1.nonce.as_ref());
+        assert_ne!(e0.friend_aead.as_ref(), e1.friend_aead.as_ref());
+    }
+
+    fn arc_tree(epoch: u32) -> std::sync::Arc<KeyTree> {
+        std::sync::Arc::new(KeyTree::derive_at_epoch(&[5u8; 32], epoch).expect("derive"))
+    }
+
+    #[test]
+    fn fleet_material_set_round_trips_and_legacy_single_decodes() {
+        let kt0 = KeyTree::derive_at_epoch(&[5u8; 32], 0).expect("e0");
+        let kt2 = KeyTree::derive_at_epoch(&[5u8; 32], 2).expect("e2");
+        let set = vec![kt0.to_fleet_material(), kt2.to_fleet_material()];
+        let bytes = encode_fleet_material_set(&set).expect("encode");
+        let back = decode_fleet_material_set(&bytes).expect("decode set");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].epoch, 0);
+        assert_eq!(back[1].epoch, 2);
+
+        // Legacy pre-S5 slot: a single bare FleetKeyMaterial map.
+        let mut legacy = Vec::new();
+        ciborium::into_writer(&kt0.to_fleet_material(), &mut legacy).expect("legacy encode");
+        let migrated = decode_fleet_material_set(&legacy).expect("decode legacy");
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].epoch, 0);
+
+        // Empty sets are corrupt, not "no material".
+        let mut empty = Vec::new();
+        ciborium::into_writer(&Vec::<FleetKeyMaterial>::new(), &mut empty).expect("empty encode");
+        assert!(decode_fleet_material_set(&empty).is_err());
+    }
+
+    #[test]
+    fn fleet_key_set_newest_picks_highest_epoch() {
+        let set = FleetKeySet::new(arc_tree(1));
+        set.install(arc_tree(0));
+        set.install(arc_tree(3));
+        assert_eq!(set.newest().epoch, 3);
+        assert_eq!(set.epochs(), vec![3, 1, 0]);
+    }
+
+    #[test]
+    fn fleet_key_set_install_is_idempotent_by_epoch() {
+        let set = FleetKeySet::new(arc_tree(2));
+        set.install(arc_tree(2));
+        set.install(arc_tree(2));
+        assert_eq!(set.epochs(), vec![2]);
+        assert_eq!(set.accept_set().len(), 1);
+    }
+
+    #[test]
+    fn fleet_key_set_accept_set_is_descending() {
+        let set = FleetKeySet::new(arc_tree(0));
+        set.install(arc_tree(2));
+        set.install(arc_tree(1));
+        let epochs: Vec<u32> = set.accept_set().iter().map(|k| k.epoch).collect();
+        assert_eq!(epochs, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn fleet_key_set_retain_min_epoch_evicts_stale_but_never_empties() {
+        let set = FleetKeySet::new(arc_tree(0));
+        set.install(arc_tree(3));
+        set.install(arc_tree(4));
+        set.retain_min_epoch(3);
+        assert_eq!(
+            set.epochs(),
+            vec![4, 3],
+            "epoch 0 evicted, window pair kept"
+        );
+        // Overshooting min clamps to the newest epoch instead of emptying.
+        set.retain_min_epoch(99);
+        assert_eq!(set.epochs(), vec![4]);
+    }
+
+    #[test]
+    fn fleet_key_set_retain_newest_only_keeps_one() {
+        let set = FleetKeySet::new(arc_tree(0));
+        set.install(arc_tree(1));
+        set.retain_newest_only();
+        assert_eq!(set.epochs(), vec![1]);
+        assert_eq!(set.newest().epoch, 1);
+    }
+
+    #[test]
+    fn fleet_material_any_epoch_round_trips() {
+        // ZEB-668 S5 replaces `fleet_material_unsupported_epoch_rejected`:
+        // rotation-era material carries the epoch it was derived at, and the
+        // import side reconstructs a tree at that same epoch.
+        let seed = [9u8; 32];
+        let kt = KeyTree::derive_at_epoch(&seed, 3).expect("derive");
+        let m = kt.to_fleet_material();
+        assert_eq!(m.epoch, 3);
+        let back = KeyTree::from_fleet_material(&m).expect("epoch 3 must import post-S5");
+        assert_eq!(back.epoch, 3);
+        assert_eq!(back.entry_aead.as_ref(), kt.entry_aead.as_ref());
+        assert_eq!(back.friend_aead.as_ref(), kt.friend_aead.as_ref());
     }
 }

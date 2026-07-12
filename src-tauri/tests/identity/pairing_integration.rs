@@ -100,6 +100,7 @@ async fn end_to_end_pair_two_devices() {
             display_name: "KRILE".to_string(),
             owner_state: state.clone(),
             master_seed,
+            fleet_current_epoch: 0,
         })
         .await
         .unwrap();
@@ -294,6 +295,7 @@ async fn end_to_end_persists_state_to_disk() {
             display_name: "KRILE".to_string(),
             owner_state: original_state.clone(),
             master_seed,
+            fleet_current_epoch: 0,
         })
         .await
         .unwrap();
@@ -539,6 +541,7 @@ async fn network_drop_during_enroll() {
             display_name: "KRILE".to_string(),
             owner_state: original_state.clone(),
             master_seed,
+            fleet_current_epoch: 0,
         })
         .await
         .unwrap();

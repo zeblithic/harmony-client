@@ -1034,7 +1034,7 @@ mod tests {
         let merger: Merger<FleetNetDoc> = Arc::new(|local, remote| local.merge_from(remote));
 
         let engine = FleetSyncEngine::<FleetNetDoc>::new(FleetSyncConfig {
-            kt,
+            keys: crate::owner_state_crypto::FleetKeySet::new(kt),
             device_id: "dev-A".to_string(),
             state: Arc::clone(&doc),
             merger,

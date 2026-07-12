@@ -28,6 +28,8 @@
 use crate::content_store::ContentStore;
 use crate::fleet_sync::{FleetPersist, FleetSyncConfig, FleetSyncEngine, MergeOutcome, Merger};
 use crate::owner_state_crdt::OwnerState;
+use crate::owner_state_crypto::FleetKeySet;
+#[cfg(test)]
 use crate::owner_state_crypto::KeyTree;
 use crate::owner_state_types::Hlc;
 use std::collections::BTreeMap;
@@ -102,15 +104,17 @@ pub struct SyncEngine {
 impl SyncEngine {
     /// Construct the engine and spawn its internal task.
     ///
-    /// `kt` derives the AEAD keys; `device_id` is the local device's
-    /// HLC source; `state` and `tracker` are shared with the rest
-    /// of the app via the same `Arc<Mutex<_>>`s.
+    /// `keys` holds the installed fleet KeyTrees (ZEB-668 S5 — publish on
+    /// newest, decrypt across the dual-epoch window); `device_id` is the
+    /// local device's HLC source; `state` and `tracker` are shared with the
+    /// rest of the app via the same `Arc<Mutex<_>>`s.
     ///
-    /// PUBLIC SIGNATURE — preserved byte-for-byte across the ZEB-417
-    /// migration so the lib.rs boot call site compiles unchanged.
+    /// (The ZEB-417 "signature preserved byte-for-byte" note is retired:
+    /// ZEB-668 S5 deliberately widened `kt: Arc<KeyTree>` to the swappable
+    /// key set.)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        kt: Arc<KeyTree>,
+        keys: FleetKeySet,
         device_id: String,
         state: Arc<Mutex<OwnerState>>,
         tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
@@ -134,7 +138,7 @@ impl SyncEngine {
         });
 
         let inner = FleetSyncEngine::new(FleetSyncConfig {
-            kt,
+            keys,
             device_id,
             state,
             merger,
@@ -395,7 +399,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            make_kt(),
+            FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -424,7 +428,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            make_kt(),
+            FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -457,7 +461,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            make_kt(),
+            FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -495,7 +499,7 @@ mod debounce_tests {
         let crdt_path = paths.crdt.clone(); // capture before `paths` is moved into new()
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            make_kt(),
+            FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::clone(&state),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -558,7 +562,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            make_kt(),
+            FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -589,7 +593,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            make_kt(),
+            FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -613,7 +617,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            make_kt(),
+            FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -649,7 +653,7 @@ mod skeleton_tests {
             replay: dir.path().join("replay.cbor"),
         };
         let engine = SyncEngine::new(
-            make_kt(),
+            FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -740,7 +744,7 @@ mod wire_identity_tests {
         }
 
         let engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "owner-dev".into(),
             Arc::new(Mutex::new(state)),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -876,7 +880,7 @@ mod subscriber_tests {
         let tracker = Arc::new(Mutex::new(BTreeMap::new()));
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&state),
             Arc::clone(&tracker),
@@ -922,7 +926,7 @@ mod subscriber_tests {
         let tracker = Arc::new(Mutex::new(BTreeMap::new()));
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&state),
             Arc::clone(&tracker),
@@ -1022,7 +1026,7 @@ mod subscriber_tests {
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let local_state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&local_state),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -1069,7 +1073,7 @@ mod subscriber_tests {
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let local_state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&local_state),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -1147,7 +1151,7 @@ mod subscriber_tests {
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let local_state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&local_state),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -1237,7 +1241,7 @@ mod subscriber_tests {
         let local_state = Arc::new(Mutex::new(OwnerState::default()));
         let tracker = Arc::new(Mutex::new(BTreeMap::new()));
         let engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&local_state),
             Arc::clone(&tracker),
@@ -1302,7 +1306,7 @@ mod subscriber_tests {
             let tracker = Arc::new(Mutex::new(BTreeMap::new()));
             let state = Arc::new(Mutex::new(OwnerState::default()));
             let engine = SyncEngine::new(
-                Arc::clone(&kt),
+                FleetKeySet::new(Arc::clone(&kt)),
                 "self-device".into(),
                 Arc::clone(&state),
                 Arc::clone(&tracker),
@@ -1342,7 +1346,7 @@ mod subscriber_tests {
         let tracker2 = Arc::new(Mutex::new(tracker_loaded));
         let state2 = Arc::new(Mutex::new(OwnerState::default()));
         let engine2 = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&state2),
             Arc::clone(&tracker2),
@@ -1409,7 +1413,7 @@ mod publisher_tests {
         let store = Arc::new(InMemoryStub::default());
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "alice-device".into(),
             Arc::clone(&state),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -1560,7 +1564,7 @@ mod integration_tests {
         });
 
         let a_engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "device-a".into(),
             Arc::clone(&a_state),
             a_tracker,
@@ -1571,7 +1575,7 @@ mod integration_tests {
             50,
         );
         let b_engine = SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "device-b".into(),
             Arc::clone(&b_state),
             b_tracker,
@@ -2405,7 +2409,7 @@ mod cas_op_protocol_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::owner_state_sync::SyncEngine::new(
-            Arc::clone(&kt),
+            FleetKeySet::new(Arc::clone(&kt)),
             "device-sub".into(),
             Arc::clone(&state),
             Arc::clone(&tracker),

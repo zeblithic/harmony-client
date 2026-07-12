@@ -16,6 +16,7 @@
     resolveDefaultDeviceLabel,
   } from '../device-label-service';
   import { setDevicePetname, MAX_DEVICE_PETNAME_CHARS } from '../device-petname-service';
+  import { bumpFleetEpoch } from '../fleet-epoch-service';
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
   import { fetchCommunitiesCount } from '../owner-meta';
   import {
@@ -215,6 +216,26 @@
 
   let renameError = $state<string | null>(null);
   let renameInFlight = $state(false);
+
+  // ZEB-668 S5: fleet key rotation (seed-holder action; the staleness
+  // signal itself is backend-proven — any device removal newer than the
+  // last rotation).
+  let rotateInFlight = $state(false);
+  let rotateError = $state<string | null>(null);
+
+  async function rotateFleetKeys() {
+    if (rotateInFlight) return;
+    rotateError = null;
+    rotateInFlight = true;
+    try {
+      await bumpFleetEpoch();
+      await svc.refresh();
+    } catch (e) {
+      rotateError = extractError(e);
+    } finally {
+      rotateInFlight = false;
+    }
+  }
 
   // ZEB-668 S4: rename any row via the fleet-synced petname IPC. Empty
   // input is an explicit CLEAR (backend LWW tombstone `name: ""` — PR #454
@@ -637,6 +658,36 @@
           onRestored={() => location.reload()}
           onCancel={() => { restoreOpen = false; }}
         />
+      {/if}
+
+      <!-- ZEB-668 S5: fleet-key staleness. Rendered only on the backend's
+           proof (a removal newer than the last rotation); the button only
+           where the bump IPC can succeed (seed present) — honesty rule. -->
+      {#if state.fleetEpochStale}
+        <div class="epoch-banner" data-testid="fleet-epoch-banner">
+          {#if state.canBackUp}
+            <p class="epoch-text">
+              Fleet keys predate the last device removal. Removed devices can
+              still read fleet data until you rotate.
+            </p>
+            <button
+              class="secondary"
+              data-testid="rotate-fleet-keys"
+              disabled={rotateInFlight}
+              onclick={rotateFleetKeys}
+            >
+              {rotateInFlight ? 'Rotating…' : 'Rotate fleet keys'}
+            </button>
+            {#if rotateError}
+              <p class="error" role="alert">{rotateError}</p>
+            {/if}
+          {:else}
+            <p class="epoch-text">
+              Fleet keys predate the last device removal. Rotate them from the
+              device that holds your master key.
+            </p>
+          {/if}
+        </div>
       {/if}
 
       <!-- ② Devices list -->
@@ -1260,5 +1311,22 @@
   .butler-label-text {
     font-size: 12px;
     color: var(--text-secondary);
+  }
+  /* ZEB-668 S5: fleet-key staleness banner. */
+  .epoch-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    align-items: flex-start;
+    padding: 0.75rem 1rem;
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    border-radius: 6px;
+  }
+
+  .epoch-text {
+    margin: 0;
+    color: var(--warning);
+    font-size: 0.9rem;
   }
 </style>
