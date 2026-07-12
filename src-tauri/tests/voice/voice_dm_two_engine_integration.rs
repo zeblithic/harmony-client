@@ -8,10 +8,16 @@
 //!
 //! This test exercises a Zenoh loopback relay and belongs to the same known
 //! transport-flake class as `voice_presence_two_engine_integration` and the
-//! iroh-zenoh loopback tests. It passes on CI; it may flake on a
-//! loopback-restricted local box. Do NOT add retries that mask real failures.
-//! If the test fails locally but the seal/open assertion path is sound, note
-//! it and let CI be authoritative.
+//! iroh-zenoh loopback tests. It may flake on a loopback-restricted local
+//! box. Do NOT add retries that mask real failures. If the test fails
+//! locally but the seal/open assertion path is sound, note it and let CI be
+//! authoritative.
+//!
+//! ZEB-675: the positive path re-publishes the sealed frame on a cadence
+//! (delivery retry) instead of one put + one recv wait. That is NOT an
+//! assertion retry — the seal/open assertions are unchanged, and no number
+//! of re-puts makes a bad frame decrypt. See the comment at the publish
+//! site for the CI drop-race this closes.
 
 #![cfg(feature = "test-fixtures")]
 
@@ -25,8 +31,10 @@ use harmony_app::voice_crypto::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dm_voice_two_engine_seal_relay_and_negative_call_id() {
-    // Outer timeout: surfaces a hang as a clear failure, not an indefinite stall.
-    tokio::time::timeout(Duration::from_secs(30), run_inner())
+    // Outer timeout: surfaces a hang as a clear failure, not an indefinite
+    // stall. 120s ≫ the 30s discovery + 60s delivery ceilings inside, so an
+    // inner failure always reports its own specific message first (ZEB-675).
+    tokio::time::timeout(Duration::from_secs(120), run_inner())
         .await
         .expect("DM voice two-engine test timed out");
 }
@@ -75,11 +83,13 @@ async fn run_inner() {
             .allowed_destination(zenoh::sample::Locality::Remote)
             .await
             .expect("declare media readiness publisher");
-        // 10s is far above the sub-second loopback subscriber-discovery time but
-        // comfortably under the test's 30s outer timeout, so a genuine discovery
+        // 30s is far above the sub-second loopback subscriber-discovery time but
+        // comfortably under the test's 120s outer timeout, so a genuine discovery
         // failure surfaces as the informative assertion below rather than the
-        // less-specific outer guard (and leaves budget for the 10s recv).
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // less-specific outer guard (and leaves budget for the delivery loop).
+        // Widened from 10s for loaded CI runners (ZEB-675 wall-clock-budget rule:
+        // ceiling ≫ healthy-path time, and this is a wait, not a perf assertion).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if media_ready_pub
                 .matching_status()
@@ -103,24 +113,44 @@ async fn run_inner() {
         encrypt_dm_voice_packet(&k_voice, &call_id, VOICE_DM_PACKET_AAD, &original_frame)
             .expect("seal DM media frame");
 
-    session_a
-        .put(&media_topic_a, sealed_frame)
-        .await
-        .expect("publish sealed DM media frame");
-
-    let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+    // ZEB-675: publish-retry against a one-shot-put drop race. CI run
+    // 29161978730 failed here at exactly the old 10s recv ceiling with
+    // discovery already settled: `matching_status()` had reported B's remote
+    // subscriber, yet the single put never reached B. "Matching" means A's
+    // session knows a matching remote subscriber exists — not that the route
+    // is fully wired end-to-end — and a live put dropped in that window is
+    // gone (no replay on this topic). The sealed frame is idempotent (same
+    // bytes every put; the recv loop ignores anything it cannot open), so
+    // re-publishing is safe: re-put every 2s until B opens a copy, bounded
+    // by a 60s ceiling ≫ the sub-second healthy path (wall-clock-budget
+    // rule). A real seal/open regression still fails loudly — no number of
+    // re-puts makes a bad frame decrypt.
+    let recovered = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let sample = media_sub.recv_async().await.expect("DM media recv");
-            let bytes = sample.payload().to_bytes().to_vec();
-            if let Ok(frame) =
-                decrypt_dm_voice_packet(&k_voice, &call_id, VOICE_DM_PACKET_AAD, &bytes)
-            {
-                break frame;
+            session_a
+                .put(&media_topic_a, sealed_frame.clone())
+                .await
+                .expect("publish sealed DM media frame");
+            let attempt = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let sample = media_sub.recv_async().await.expect("DM media recv");
+                    let bytes = sample.payload().to_bytes().to_vec();
+                    if let Ok(frame) =
+                        decrypt_dm_voice_packet(&k_voice, &call_id, VOICE_DM_PACKET_AAD, &bytes)
+                    {
+                        break frame;
+                    }
+                }
+            })
+            .await;
+            match attempt {
+                Ok(frame) => break frame,
+                Err(_elapsed) => continue, // this copy dropped — re-put and keep listening
             }
         }
     })
     .await
-    .expect("B should receive + open the sealed DM media frame");
+    .expect("B should receive + open the sealed DM media frame within 60s of 2s re-puts");
 
     assert_eq!(
         recovered, original_frame,
