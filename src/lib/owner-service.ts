@@ -30,6 +30,14 @@ export interface OwnerStateView {
    * Optional: a stale backend omits it.
    */
   quorumArmedUntilMs?: number | null;
+  /**
+   * ZEB-677 S4: whether this device may arm quorum enrollment — true only
+   * when the fleet has ≥2 active Master-certed devices (server-computed).
+   * Gates the arm affordance entirely: a fleet that can't co-sign an
+   * enrollment must show no false promise. Optional: a stale backend
+   * predating S4 omits it (read as `=== true`).
+   */
+  canArmEnrollment?: boolean;
 }
 
 /**
@@ -169,6 +177,21 @@ export class OwnerService {
   /** ZEB-677 S3: decline a sibling's pending co-sign request (tombstones it). */
   async declineQuorumRequest(requestId: string): Promise<void> {
     await invoke('decline_quorum_request', { requestId });
+  }
+
+  /**
+   * ZEB-677 S4: arm this device to co-sign one new-device enrollment started
+   * from a sibling. Returns the wall-ms the 15-minute window closes
+   * (`armedUntilMs`). Callers refresh on success (the owner-quorum-updated
+   * event also fires).
+   */
+  async armEnrollment(): Promise<number> {
+    return invoke<number>('arm_quorum_enrollment');
+  }
+
+  /** ZEB-677 S4: cancel an armed enrollment window before it expires. */
+  async disarmEnrollment(): Promise<void> {
+    await invoke('disarm_quorum_enrollment');
   }
 
   async mint(): Promise<MintIpcResult> {

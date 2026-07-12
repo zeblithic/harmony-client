@@ -19,6 +19,7 @@ export type PairingState =
   | { kind: 'discovered'; peers: DiscoveredPeer[] }
   | { kind: 'handshaking'; peerSessionId: string; sasDigits: string }
   | { kind: 'waitingPeerConfirm'; peerSessionId: string }
+  | { kind: 'awaitingQuorumCosign' }
   | { kind: 'enrolling' }
   | { kind: 'complete'; deviceIdHex: string }
   | { kind: 'failed'; reason: string };

@@ -171,8 +171,11 @@ pub fn install_inviter_state_inner(
     crate::owner_state::save_owner_state_atomic(
         identity_dir,
         &loaded.state,
-        &loaded.device_signing_key, // the EXISTING signing key
-        Some(&*result.master_seed), // Inviter keeps master
+        &loaded.device_signing_key,    // the EXISTING signing key
+        loaded.master_seed.as_deref(), // FRESHEST on-disk seed posture (reloaded
+        // under the write lock) — NOT the SM's pairing-start `result.master_seed`,
+        // so a concurrent recovery (adds a seed) or removal (clears one) is not
+        // silently undone by this enrollment save.
         save_keychain,
     )?;
     Ok(())
@@ -417,7 +420,7 @@ mod tests {
         let result = InviterEnrollResult {
             cert,
             now,
-            master_seed: Zeroizing::new(master_seed_bytes),
+            master_seed: Some(Zeroizing::new(master_seed_bytes)),
         };
         // Use the inner variant — see install_writes_owner_state_cbor for why.
         install_inviter_state_inner(dir.path(), result, None, None).unwrap();
@@ -515,12 +518,12 @@ mod tests {
         let result_a = InviterEnrollResult {
             cert: cert_a,
             now: 1_700_000_001,
-            master_seed: Zeroizing::new(master_seed_bytes),
+            master_seed: Some(Zeroizing::new(master_seed_bytes)),
         };
         let result_b = InviterEnrollResult {
             cert: cert_b,
             now: 1_700_000_002,
-            master_seed: Zeroizing::new(master_seed_bytes),
+            master_seed: Some(Zeroizing::new(master_seed_bytes)),
         };
 
         // Synchronize the two threads so they enter install_inviter_state_inner
@@ -593,7 +596,7 @@ mod tests {
         let result = InviterEnrollResult {
             cert,
             now: 1_700_000_001,
-            master_seed: Zeroizing::new(master_seed_bytes),
+            master_seed: Some(Zeroizing::new(master_seed_bytes)),
         };
         let err =
             install_inviter_state_inner(dir.path(), result, None, None).expect_err("must error");

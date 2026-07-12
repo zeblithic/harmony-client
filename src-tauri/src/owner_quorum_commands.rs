@@ -182,7 +182,14 @@ pub(crate) fn cosign_request_core(
         .requests
         .get_mut(request_id)
         .ok_or_else(|| "unknownRequest: no pending request with that id".to_string())?;
-    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind;
+    // Enrollment requests are co-signed automatically by an armed sibling
+    // (the sweep), never through this manual IPC.
+    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind else {
+        return Err(
+            "notRevocation: enrollment requests are co-signed automatically by an armed device"
+                .to_string(),
+        );
+    };
     if now_ms > req.expires_at_ms {
         return Err(
             "expired: this request has expired — ask the other device to retry".to_string(),
@@ -394,12 +401,19 @@ pub(crate) async fn request_quorum_revocation_inner(
         // One live request per target: a duplicate would double the banner
         // on every sibling and complete idempotently anyway. A request
         // dead under a VERIFIED decline doesn't block a retry.
-        let QuorumRequestKind::Revocation { target_hex, .. } = &request.kind;
+        let QuorumRequestKind::Revocation { target_hex, .. } = &request.kind else {
+            return Err("internal: request_quorum_revocation must build a revocation".to_string());
+        };
         let duplicate = g.requests.iter().any(|(rid, r)| {
+            // Only another live revocation for the same target is a duplicate;
+            // enrollment requests never collide with a revocation target.
             let QuorumRequestKind::Revocation {
                 target_hex: existing,
                 ..
-            } = &r.kind;
+            } = &r.kind
+            else {
+                return false;
+            };
             existing == target_hex
                 && now_ms <= r.expires_at_ms
                 && crate::owner_quorum_sync::verified_decliners(&trust_snapshot, rid, r).is_empty()
@@ -481,6 +495,82 @@ pub(crate) async fn decline_quorum_request_inner(
     Ok(())
 }
 
+/// Write (or supersede) THIS device's arm cell, then publish. Flush is
+/// best-effort — the replicated doc + dirty latch is the durability
+/// boundary (same as every other quorum write path).
+async fn write_arm_cell(
+    doc: &std::sync::Arc<tokio::sync::Mutex<QuorumReqDoc>>,
+    engine: &crate::fleet_sync::FleetSyncEngine<QuorumReqDoc>,
+    self_id: [u8; 16],
+    armed_until_ms: u64,
+    now_ms: u64,
+) {
+    {
+        let mut g = doc.lock().await;
+        crate::owner_quorum_sync::stamp_arm_cell(&mut g, self_id, armed_until_ms, now_ms);
+    }
+    engine.notify_dirty();
+    flush_warn_only(engine, "arm_quorum_enrollment").await;
+}
+
+/// Arm a 15-minute single-use enrollment co-sign window on THIS device
+/// (spec §5.1). Only a master-less device arms — a master-holding device
+/// adds devices through normal pairing.
+pub(crate) async fn arm_quorum_enrollment_inner(
+    state: &Mutex<crate::NodeState>,
+    keychain: KeychainFactory,
+    emit: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<u64, String> {
+    let (doc, engine, trust_doc, dir) = snapshot_handles(state)?;
+    let loaded = load_keys(dir, keychain).await?;
+    if loaded.master_seed.is_some() {
+        return Err(
+            "hasMaster: this device holds the master key — use normal pairing to add a device"
+                .to_string(),
+        );
+    }
+    let self_id = crate::owner_state::device_id_from_signing_key(&loaded.device_signing_key);
+    // Depth-1: a device that is not an active Master-certed member can never
+    // be a quorum signer, so its arm would be dead weight (the sweep and the
+    // enrollment planner both skip it). Reject at the IPC boundary — the UI
+    // gates this via `canArmEnrollment`, but a direct RPC caller does not.
+    {
+        let trust = trust_doc.lock().await;
+        let eligible = trust
+            .enrollments
+            .get(&self_id)
+            .is_some_and(is_master_issued)
+            && !trust.is_revoked(self_id);
+        if !eligible {
+            return Err(
+                "notEligible: this device does not hold an active Master-issued certificate"
+                    .to_string(),
+            );
+        }
+    }
+    let now_ms = now_unix_ms();
+    let armed_until = now_ms.saturating_add(crate::owner_quorum_sync::ARM_WINDOW_MS);
+    write_arm_cell(&doc, &engine, self_id, armed_until, now_ms).await;
+    emit("owner-quorum-updated");
+    Ok(armed_until)
+}
+
+/// Disarm THIS device's enrollment window early (spec §5.1 Cancel). Writes
+/// an already-expired cell (never deletes — see `stamp_arm_cell`).
+pub(crate) async fn disarm_quorum_enrollment_inner(
+    state: &Mutex<crate::NodeState>,
+    keychain: KeychainFactory,
+    emit: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<(), String> {
+    let (doc, engine, _trust_doc, dir) = snapshot_handles(state)?;
+    let loaded = load_keys(dir, keychain).await?;
+    let self_id = crate::owner_state::device_id_from_signing_key(&loaded.device_signing_key);
+    let now_ms = now_unix_ms();
+    write_arm_cell(&doc, &engine, self_id, now_ms.saturating_sub(1), now_ms).await;
+    emit("owner-quorum-updated");
+    Ok(())
+}
+
 fn sink_emit(
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
 ) -> std::sync::Arc<dyn Fn(&str) + Send + Sync> {
@@ -516,6 +606,20 @@ pub(crate) async fn decline_quorum_request_impl(
     decline_quorum_request_inner(state, prod_keychain, sink_emit(sink), request_id).await
 }
 
+pub(crate) async fn arm_quorum_enrollment_impl(
+    state: &Mutex<crate::NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+) -> Result<u64, String> {
+    arm_quorum_enrollment_inner(state, prod_keychain, sink_emit(sink)).await
+}
+
+pub(crate) async fn disarm_quorum_enrollment_impl(
+    state: &Mutex<crate::NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+) -> Result<(), String> {
+    disarm_quorum_enrollment_inner(state, prod_keychain, sink_emit(sink)).await
+}
+
 #[tauri::command]
 pub async fn request_quorum_revocation(
     app: tauri::AppHandle,
@@ -548,6 +652,22 @@ pub async fn decline_quorum_request(
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
     decline_quorum_request_impl(state.inner(), std::sync::Arc::new(app), request_id).await
+}
+
+#[tauri::command]
+pub async fn arm_quorum_enrollment(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<crate::NodeState>>,
+) -> Result<u64, String> {
+    arm_quorum_enrollment_impl(state.inner(), std::sync::Arc::new(app)).await
+}
+
+#[tauri::command]
+pub async fn disarm_quorum_enrollment(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<crate::NodeState>>,
+) -> Result<(), String> {
+    disarm_quorum_enrollment_impl(state.inner(), std::sync::Arc::new(app)).await
 }
 
 #[cfg(test)]

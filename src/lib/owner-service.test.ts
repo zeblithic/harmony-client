@@ -127,3 +127,21 @@ describe('OwnerService.revoke (ZEB-668 S2)', () => {
     await expect(svc.revoke('cd'.repeat(32), 'compromised')).rejects.toThrow(/notMaster:/);
   });
 });
+
+describe('OwnerService quorum enrollment (ZEB-677 S4)', () => {
+  it('armEnrollment invokes arm_quorum_enrollment with no args and returns armedUntilMs', async () => {
+    const armedUntil = 1_900_000_000_000;
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(armedUntil);
+    const svc = new OwnerService();
+    const got = await svc.armEnrollment();
+    expect(got).toBe(armedUntil);
+    expect(invoke).toHaveBeenCalledWith('arm_quorum_enrollment');
+  });
+
+  it('disarmEnrollment invokes disarm_quorum_enrollment with no args', async () => {
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined);
+    const svc = new OwnerService();
+    await svc.disarmEnrollment();
+    expect(invoke).toHaveBeenCalledWith('disarm_quorum_enrollment');
+  });
+});

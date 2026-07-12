@@ -376,6 +376,85 @@
     }
   }
 
+  // ZEB-677 S4: quorum-enrollment arm surface. Shares the S3 in-flight/error
+  // channels. The sentinel id occupies quorumActionInFlight the same way a
+  // requestId does — one ceremony action at a time. It can never collide with
+  // a real requestId (which is hex).
+  const ARM_ENROLLMENT_ACTION = 'arm-enrollment';
+
+  // Live-ticking clock for the arm countdown. The DEADLINE is the backend
+  // `quorumArmedUntilMs` cell (the authority); `now` only drives the display's
+  // per-second recompute. Interval is created/cleared by the $effect below
+  // (gated on the backend deadline, never on the now-derived flag — reading
+  // `now` inside that effect would loop with the interval's write).
+  let now = $state(Date.now());
+  let armCountdownTimer: ReturnType<typeof setInterval> | null = null;
+
+  function clearArmCountdown() {
+    if (armCountdownTimer !== null) {
+      clearInterval(armCountdownTimer);
+      armCountdownTimer = null;
+    }
+  }
+
+  const enrollmentArmed = $derived(
+    typeof state?.quorumArmedUntilMs === 'number' && state.quorumArmedUntilMs > now,
+  );
+  const armCountdown = $derived(
+    formatCountdown((state?.quorumArmedUntilMs ?? 0) - now),
+  );
+
+  $effect(() => {
+    // Tick only while the backend reports an arm deadline. On disarm/expiry
+    // the cell clears (via the owner-quorum-updated refresh) → interval stops.
+    if (typeof state?.quorumArmedUntilMs === 'number') {
+      now = Date.now();
+      if (armCountdownTimer === null) {
+        armCountdownTimer = setInterval(() => { now = Date.now(); }, 1000);
+      }
+    } else {
+      clearArmCountdown();
+    }
+  });
+  onDestroy(clearArmCountdown);
+
+  function formatCountdown(ms: number): string {
+    const total = Math.max(0, Math.ceil(ms / 1000));
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+
+  async function handleArmEnrollment() {
+    if (quorumActionInFlight) return;
+    quorumError = null;
+    quorumActionInFlight = ARM_ENROLLMENT_ACTION;
+    try {
+      await svc.armEnrollment();
+      // owner-quorum-updated also refreshes; this keeps the panel honest even
+      // if the event is dropped in a headless/test context.
+      await svc.refresh();
+    } catch (e) {
+      quorumError = extractError(e);
+    } finally {
+      quorumActionInFlight = null;
+    }
+  }
+
+  async function handleDisarmEnrollment() {
+    if (quorumActionInFlight) return;
+    quorumError = null;
+    quorumActionInFlight = ARM_ENROLLMENT_ACTION;
+    try {
+      await svc.disarmEnrollment();
+      await svc.refresh();
+    } catch (e) {
+      quorumError = extractError(e);
+    } finally {
+      quorumActionInFlight = null;
+    }
+  }
+
   // ZEB-668 S6: replace = typed-confirm revoke (reason locked to
   // "decommissioned") + immediately launch inviter pairing; the old row's
   // fleet petname carries to the successor at pairing completion.
@@ -886,6 +965,48 @@
           </p>
         </div>
       {/each}
+
+      <!-- ZEB-677 S4: quorum-enrollment arm surface. Rendered ONLY where the
+           backend affirms a ≥2-active-Master fleet (canArmEnrollment) — a
+           fleet that can't co-sign an enrollment must see no false promise
+           (spec §8 honesty rule). Click-confirm tier: arming is reversible. -->
+      {#if state.canArmEnrollment === true}
+        {#if enrollmentArmed}
+          <div class="epoch-banner quorum-banner" data-testid="quorum-arm-active">
+            <p class="epoch-text">
+              This device is approving one new device enrollment —
+              <strong data-testid="quorum-arm-countdown">{armCountdown}</strong> remaining.
+            </p>
+            <div class="quorum-actions">
+              <button
+                class="secondary"
+                data-testid="quorum-arm-cancel"
+                disabled={quorumActionInFlight !== null}
+                onclick={handleDisarmEnrollment}
+              >
+                {quorumActionInFlight === ARM_ENROLLMENT_ACTION ? 'Cancelling…' : 'Cancel'}
+              </button>
+            </div>
+          </div>
+        {:else}
+          <div class="epoch-banner quorum-banner" data-testid="quorum-arm-surface">
+            <p class="epoch-text">
+              For the next 15 minutes this device will approve one new device
+              enrollment started from your other devices.
+            </p>
+            <div class="quorum-actions">
+              <button
+                class="primary"
+                data-testid="quorum-arm-button"
+                disabled={quorumActionInFlight !== null}
+                onclick={handleArmEnrollment}
+              >
+                {quorumActionInFlight === ARM_ENROLLMENT_ACTION ? 'Approving…' : 'Approve adding a device'}
+              </button>
+            </div>
+          </div>
+        {/if}
+      {/if}
       {#if quorumError}
         <p class="error" role="alert">{quorumError}</p>
       {/if}

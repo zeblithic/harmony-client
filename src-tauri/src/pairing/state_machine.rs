@@ -28,6 +28,10 @@ pub const DEFAULT_DISCOVER_REBROADCAST_INTERVAL: Duration = Duration::from_milli
 /// drainer (blocked disk/keychain) surfaces as `Failed` instead of dwelling
 /// at `Enrolling` forever.
 const PERSIST_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// ZEB-677 S4 (spec §5.2–5.5): a seedless inviter waits at most this long for
+/// an armed sibling to co-sign the enrollment before failing the ceremony.
+const QUORUM_COSIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
 use zeroize::Zeroizing;
 
@@ -36,7 +40,19 @@ pub enum PairingCommand {
     StartInviter {
         display_name: String,
         owner_state: OwnerState,
-        master_seed: Zeroizing<[u8; 32]>,
+        /// `Some` on the classic seed-holding inviter; `None` on a seedless
+        /// (master-less) inviter that must quorum-enroll via `quorum_ctx`
+        /// (ZEB-677 S4).
+        master_seed: Option<Zeroizing<[u8; 32]>>,
+        /// ZEB-677 S4: resident fleet KeyTree material for a seedless
+        /// inviter's fleet-key handover — a device with no `master_seed`
+        /// cannot re-derive the tree, so it ships the material it holds on
+        /// disk. `None` on the master path (derived from the seed instead).
+        fleet_keytree: Option<Vec<crate::owner_state_crypto::FleetKeyMaterial>>,
+        /// ZEB-677 S4: quorum co-sign port. `Some` iff this device is
+        /// Master-certed but holds no `master_seed`; the SM drives the K=2
+        /// enrollment ceremony through it at the SAS signing decision point.
+        quorum_ctx: Option<Arc<dyn crate::owner_quorum_enroll::QuorumEnrollPort>>,
         /// ZEB-668 S5: the fleet's current KeyTree epoch (0 = never bumped).
         /// When > 0 the ENROLL payload carries the multi-epoch material set.
         fleet_current_epoch: u32,
@@ -88,9 +104,12 @@ pub struct InviterEnrollResult {
     /// at persist time so `add_enrollment`'s active-window calculation is
     /// consistent with the cert's `issued_at`.
     pub now: u64,
-    /// The master seed — Inviter HAS this (cert-only model only restricts
-    /// the Joiner). Persisting it via `Some(seed)` keeps `canBackUp: true`.
-    pub master_seed: Zeroizing<[u8; 32]>,
+    /// The master seed. `Some` on a seed-holding inviter — persisting it
+    /// keeps `canBackUp: true`. `None` on a ZEB-677 S4 seedless inviter that
+    /// quorum-enrolled the new device: it has no seed to persist, and the
+    /// persist layer must NOT resurrect one (it passes `None` through to
+    /// `save_owner_state_atomic`, leaving the cert-only posture intact).
+    pub master_seed: Option<Zeroizing<[u8; 32]>>,
 }
 
 /// Carries the inviter enrollment to the persistence drainer AND a oneshot
@@ -108,6 +127,14 @@ pub struct InviterEnrollHandoff {
 /// Enrolling→Complete/Failed transition on the main loop (so it can verify the
 /// session is still active and stay responsive while persistence is pending).
 type PersistDoneTx = mpsc::Sender<(Uuid, String, Result<(), String>)>;
+
+/// ZEB-677 S4: (session_id, signing-time `now`, cosign outcome) forwarded from
+/// the detached quorum-ceremony task back to `run_state_machine`, which runs
+/// the shared ENROLL finish (or emits `Failed`) on the main loop — only if
+/// this same seedless-inviter session is still awaiting the co-signature. The
+/// 120 s ceremony runs OFF the main loop so Cancel / wire messages stay
+/// responsive (mirrors the ZEB-491 persist-ack forwarder above).
+type QuorumDoneTx = mpsc::Sender<(Uuid, u64, Result<EnrollmentCert, String>)>;
 
 /// Handle the UI talks to. Drops the state machine on drop.
 pub struct PairingHandle {
@@ -163,6 +190,11 @@ async fn run_state_machine(
     let (persist_done_tx, mut persist_done_rx) =
         mpsc::channel::<(Uuid, String, Result<(), String>)>(1);
 
+    // ZEB-677 S4: detached quorum-cosign ceremony forwarder → main loop.
+    // See QuorumDoneTx.
+    let (quorum_done_tx, mut quorum_done_rx) =
+        mpsc::channel::<(Uuid, u64, Result<EnrollmentCert, String>)>(1);
+
     // Periodic DISCOVER re-broadcast: see DEFAULT_DISCOVER_REBROADCAST_INTERVAL.
     // `tokio::time::interval` fires the first tick immediately by default;
     // we consume that tick before entering the loop because start_inviter /
@@ -185,10 +217,10 @@ async fn run_state_machine(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return; };
                 match cmd {
-                    PairingCommand::StartInviter { display_name, owner_state, master_seed, fleet_current_epoch } => {
+                    PairingCommand::StartInviter { display_name, owner_state, master_seed, fleet_keytree, quorum_ctx, fleet_current_epoch } => {
                         // start_inviter returns None on publish failure (state already
                         // pushed to Failed); leave ctx as None so the user must Cancel.
-                        ctx = start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, fleet_current_epoch, &now_fn).await;
+                        ctx = start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, fleet_keytree, quorum_ctx, fleet_current_epoch, &now_fn).await;
                     }
                     PairingCommand::StartJoiner { display_name, signing_key } => {
                         ctx = start_joiner(&transport, &state_tx, display_name, signing_key, &now_fn).await;
@@ -208,6 +240,7 @@ async fn run_state_machine(
                                 &result_tx,
                                 &inviter_result_tx,
                                 &persist_done_tx,
+                                &quorum_done_tx,
                             )
                             .await;
                         }
@@ -236,6 +269,7 @@ async fn run_state_machine(
                     &result_tx,
                     &inviter_result_tx,
                     &persist_done_tx,
+                    &quorum_done_tx,
                 )
                 .await;
             }
@@ -273,6 +307,43 @@ async fn run_state_machine(
                                 let _ = state_tx.send(PairingState::Failed {
                                     reason: format!("persist enrollment: {e}"),
                                 });
+                            }
+                        }
+                    }
+                }
+            }
+            // ZEB-677 S4: the armed sibling's co-signature (or a
+            // timeout/error) arrived from the detached quorum ceremony. Act
+            // ONLY if we're STILL in the same seedless-inviter session that
+            // opened the request AND still at `AwaitingQuorumCosign` — a
+            // Cancel (which drops ctx / re-emits Idle) or a superseding pair
+            // makes a late cert a safe no-op, exactly like the persist-ack
+            // arm above. On success we run the shared ENROLL finish (seedless
+            // fleet-key handover); on failure we surface `Failed`.
+            done = quorum_done_rx.recv() => {
+                if let Some((session_id, now, outcome)) = done {
+                    let same_session = ctx
+                        .as_ref()
+                        .is_some_and(|c| c.session_id == session_id && !c.cert_sent);
+                    let still_awaiting =
+                        matches!(&*state_tx.borrow(), PairingState::AwaitingQuorumCosign);
+                    if same_session && still_awaiting {
+                        let c = ctx.as_mut().expect("same_session implies ctx is Some");
+                        match outcome {
+                            Ok(cert) => {
+                                finish_quorum_enroll(
+                                    &transport,
+                                    &state_tx,
+                                    c,
+                                    cert,
+                                    now,
+                                    &inviter_result_tx,
+                                    &persist_done_tx,
+                                )
+                                .await;
+                            }
+                            Err(reason) => {
+                                let _ = state_tx.send(PairingState::Failed { reason });
                             }
                         }
                     }
@@ -324,6 +395,17 @@ struct SessionCtx {
     // Inviter-only:
     owner_state: Option<OwnerState>,
     master_seed: Option<Zeroizing<[u8; 32]>>,
+    /// ZEB-677 S4 (seedless inviter): resident fleet KeyTree material to hand
+    /// off to the joiner. A seedless inviter cannot re-derive it from a seed,
+    /// so it ships what it holds on disk. `None` on the master path.
+    fleet_keytree: Option<Vec<crate::owner_state_crypto::FleetKeyMaterial>>,
+    /// ZEB-677 S4 (seedless inviter): quorum co-sign port. `Some` iff this
+    /// device is Master-certed but seedless; drives the K=2 enrollment.
+    quorum_ctx: Option<Arc<dyn crate::owner_quorum_enroll::QuorumEnrollPort>>,
+    /// ZEB-677 S4: set true once the seedless quorum ceremony has been
+    /// spawned, so a duplicate peer-CONFIRM cannot open a second request
+    /// while the first is still awaiting the sibling co-signature.
+    quorum_await_started: bool,
     /// ZEB-668 S5 (inviter-only): fleet's current KeyTree epoch at start.
     fleet_current_epoch: u32,
 
@@ -384,6 +466,9 @@ impl SessionCtx {
             our_pubkey: None,
             owner_state: None,
             master_seed: None,
+            fleet_keytree: None,
+            quorum_ctx: None,
+            quorum_await_started: false,
             fleet_current_epoch: 0,
             discovered_peers: Vec::new(),
             selected_peer_session_id: None,
@@ -403,18 +488,23 @@ impl SessionCtx {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_inviter(
     transport: &Arc<dyn PairingTransport>,
     state_tx: &watch::Sender<PairingState>,
     display_name: String,
     owner_state: OwnerState,
-    master_seed: Zeroizing<[u8; 32]>,
+    master_seed: Option<Zeroizing<[u8; 32]>>,
+    fleet_keytree: Option<Vec<crate::owner_state_crypto::FleetKeyMaterial>>,
+    quorum_ctx: Option<Arc<dyn crate::owner_quorum_enroll::QuorumEnrollPort>>,
     fleet_current_epoch: u32,
     _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Option<SessionCtx> {
     let mut ctx = SessionCtx::new(PairingRole::Inviter, display_name);
     ctx.owner_state = Some(owner_state);
-    ctx.master_seed = Some(master_seed);
+    ctx.master_seed = master_seed;
+    ctx.fleet_keytree = fleet_keytree;
+    ctx.quorum_ctx = quorum_ctx;
     ctx.fleet_current_epoch = fleet_current_epoch;
 
     let _ = state_tx.send(PairingState::Discovering {
@@ -625,6 +715,7 @@ fn maybe_advance_to_handshake(state_tx: &watch::Sender<PairingState>, ctx: &mut 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn on_confirm_sas(
     transport: &Arc<dyn PairingTransport>,
     state_tx: &watch::Sender<PairingState>,
@@ -633,6 +724,7 @@ async fn on_confirm_sas(
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
     inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
     persist_done_tx: &PersistDoneTx,
+    quorum_done_tx: &QuorumDoneTx,
 ) {
     let Some(session_key) = ctx.session_key else {
         return;
@@ -702,6 +794,7 @@ async fn on_confirm_sas(
         now_fn,
         inviter_result_tx,
         persist_done_tx,
+        quorum_done_tx,
     )
     .await;
     // Joiner waits for the ENROLL message; the receive path emits Enrolling and
@@ -710,10 +803,19 @@ async fn on_confirm_sas(
     let _ = result_tx;
 }
 
-/// Inviter-only: once both sides have confirmed the SAS, sign the
-/// EnrollmentCert + ship ENROLL. The Joiner's path through both-confirmed
-/// emits `Enrolling` from the receiving handler and then transitions to
-/// `Complete` when ENROLL arrives.
+/// Inviter-only: once both sides have confirmed the SAS, obtain the
+/// `EnrollmentCert` and ship ENROLL. Two ways to obtain the cert:
+///   - **Master path** (`ctx.master_seed` present): sign it synchronously
+///     with the seed, derive the fleet KeyTree from it, then run the shared
+///     ENROLL finish.
+///   - **Seedless quorum path** (`ctx.quorum_ctx` present, ZEB-677 S4): emit
+///     `AwaitingQuorumCosign` and run the K=2 co-sign ceremony OFF the main
+///     loop (bounded by [`QUORUM_COSIGN_TIMEOUT`]); the cert (or an error)
+///     comes back on `quorum_done_tx` and the `run_state_machine` select arm
+///     runs the shared finish.
+///
+/// The Joiner's path through both-confirmed emits `Enrolling` from the
+/// receiving handler and then transitions to `Complete` when ENROLL arrives.
 async fn maybe_advance_to_enroll(
     transport: &Arc<dyn PairingTransport>,
     state_tx: &watch::Sender<PairingState>,
@@ -721,6 +823,7 @@ async fn maybe_advance_to_enroll(
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
     inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
     persist_done_tx: &PersistDoneTx,
+    quorum_done_tx: &QuorumDoneTx,
 ) {
     if !(ctx.our_confirmed && ctx.peer_confirmed) {
         return;
@@ -731,23 +834,21 @@ async fn maybe_advance_to_enroll(
         let _ = state_tx.send(PairingState::Enrolling);
         return;
     }
-    // Idempotency: if we've already shipped the cert, do not re-enter.
-    // (Once the Inviter has signed + sent ENROLL, owner_state has the new
-    // enrollment installed; arriving late peer-CONFIRM should be a no-op.)
-    if ctx.cert_sent {
+    // Idempotency: if we've already shipped the cert, do not re-enter (an
+    // arriving late peer-CONFIRM must be a no-op once ENROLL is out). The
+    // quorum ceremony is async, so a separate flag guards re-entry while the
+    // co-signature is still pending — `cert_sent` only flips once the cert has
+    // actually been assembled + published.
+    if ctx.cert_sent || ctx.quorum_await_started {
         return;
     }
-    let _ = state_tx.send(PairingState::Enrolling);
 
-    // PR #63 review: build a PROSPECTIVE state on a clone, publish first,
-    // then commit on success. Mutating ctx.owner_state before publish meant
-    // a transport failure left the Inviter persistently bound to a Joiner
-    // device that never received the cert (a "phantom device" on disk).
-    let mut prospective_state = ctx.owner_state.clone().expect("inviter has owner_state");
-    let master_seed = ctx.master_seed.as_ref().expect("inviter has master_seed");
+    // owner_state is required on every inviter path — fail-fast (an inviter
+    // always has it: start_inviter set it, and only Cancel clears the ctx).
+    let _ = ctx.owner_state.as_ref().expect("inviter has owner_state");
 
-    // Caveat 2: real ed25519 verify key from the Joiner's DISCOVER message.
-    // Fail-fast if missing — the Inviter cannot sign without it.
+    // Real ed25519 verify key from the Joiner's DISCOVER message. Fail-fast if
+    // missing — the Inviter cannot sign/enroll without it.
     let Some(joiner_ed25519_verify) = ctx.selected_peer_ed25519_verify else {
         let _ = state_tx.send(PairingState::Failed {
             reason: "missing joiner ed25519 verifying key — cannot sign cert".to_string(),
@@ -755,22 +856,295 @@ async fn maybe_advance_to_enroll(
         return;
     };
     let joiner_pubkey = PubKeyBundle::classical_only(joiner_ed25519_verify);
-
     let now = (now_fn)();
-    let cert = match sign_enrollment_for_joiner(
-        master_seed,
-        &prospective_state,
-        joiner_pubkey.clone(),
-        now,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
+
+    if let Some(seed) = ctx.master_seed.clone() {
+        // Master path: sign synchronously, derive fleet keys from the seed.
+        let _ = state_tx.send(PairingState::Enrolling);
+        let owner_state = ctx.owner_state.clone().expect("inviter has owner_state");
+        let cert = match sign_enrollment_for_joiner(&seed, &owner_state, joiner_pubkey.clone(), now)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: format!("sign cert: {e}"),
+                });
+                return;
+            }
+        };
+        let fleet_hex =
+            match build_fleet_handover_hex(FleetHandover::Seed(&seed), ctx.fleet_current_epoch) {
+                Ok(h) => h,
+                Err(reason) => {
+                    let _ = state_tx.send(PairingState::Failed { reason });
+                    return;
+                }
+            };
+        finish_inviter_enroll(
+            transport,
+            state_tx,
+            ctx,
+            cert,
+            now,
+            joiner_pubkey,
+            fleet_hex,
+            Some(seed),
+            inviter_result_tx,
+            persist_done_tx,
+        )
+        .await;
+    } else if let Some(port) = ctx.quorum_ctx.clone() {
+        // Seedless quorum path (ZEB-677 S4): emit AwaitingQuorumCosign and run
+        // the ceremony OFF the main loop so Cancel / wire messages stay
+        // responsive during the (bounded) wait. The cert (or an error) is
+        // forwarded to the select arm in run_state_machine, which runs the
+        // shared finish only if this session is still awaiting it. A Cancel in
+        // this window drops ctx and re-emits Idle, making a late cert a no-op.
+        let _ = state_tx.send(PairingState::AwaitingQuorumCosign);
+        ctx.quorum_await_started = true;
+        let joiner_id = joiner_pubkey.identity_hash();
+        let session_id = ctx.session_id;
+        let done_tx = quorum_done_tx.clone();
+        tokio::spawn(async move {
+            // Hard outer bound at the SM boundary: the co-sign wait is already
+            // 120s-bounded, but `open_enrollment_request` (write + flush) is
+            // not — a stalled port must never wedge the ceremony past this
+            // ceiling. A small grace over QUORUM_COSIGN_TIMEOUT lets the inner
+            // wait hit its own timeout (which abandons the request) first.
+            let ceremony = async {
+                let request_id = port
+                    .open_enrollment_request(joiner_id, joiner_pubkey, now)
+                    .await?;
+                port.await_cosign_and_assemble(request_id, QUORUM_COSIGN_TIMEOUT)
+                    .await
+            };
+            let outcome: Result<EnrollmentCert, String> = match tokio::time::timeout(
+                QUORUM_COSIGN_TIMEOUT + std::time::Duration::from_secs(5),
+                ceremony,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(
+                    "cosignTimeout: the co-sign ceremony did not complete in time \
+                               — re-arm and retry"
+                        .to_string(),
+                ),
+            };
+            let _ = done_tx.send((session_id, now, outcome)).await;
+        });
+    } else {
+        // Neither a seed nor a co-sign port: a device that can never enroll.
+        let _ = state_tx.send(PairingState::Failed {
+            reason: "master seed not on this device and no co-sign available — cannot enroll"
+                .to_string(),
+        });
+    }
+}
+
+/// Which fleet-KeyTree source the inviter hands off to the joiner in the
+/// ENROLL payload.
+enum FleetHandover<'a> {
+    /// Master path: derive the tree from the seed.
+    Seed(&'a [u8; 32]),
+    /// Seedless quorum path (ZEB-677 S4): ship the resident material the
+    /// device holds on disk (it cannot re-derive from a seed).
+    Resident(&'a [crate::owner_state_crypto::FleetKeyMaterial]),
+}
+
+/// Build the ENROLL payload's two fleet-KeyTree hex fields from whichever
+/// source the inviter has, matching the wire format the joiner decodes
+/// (`fleet_keytree_cbor_hex` = the epoch-0 `FleetKeyMaterial` alone, encoded
+/// as a bare CBOR map; `fleet_keytree_set_cbor_hex` = the full
+/// `Vec<FleetKeyMaterial>` CBOR array, populated only when the fleet has
+/// bumped past epoch 0).
+fn build_fleet_handover_hex(
+    source: FleetHandover<'_>,
+    fleet_current_epoch: u32,
+) -> Result<(Option<String>, Option<String>), String> {
+    use crate::owner_state_crypto::{encode_fleet_material_set, KeyTree};
+    match source {
+        FleetHandover::Seed(seed) => {
+            // Derive epoch-0 (the fleet-keys carrier tree) and encode it as the
+            // single `FleetKeyMaterial` the master path has always shipped.
+            let kt0 = KeyTree::derive(seed).map_err(|e| format!("derive fleet keytree: {e}"))?;
+            let mut buf = Zeroizing::new(Vec::new());
+            ciborium::into_writer(&kt0.to_fleet_material(), &mut *buf)
+                .map_err(|e| format!("encode fleet keytree: {e}"))?;
+            let single = hex::encode(&*buf);
+            let set = if fleet_current_epoch > 0 {
+                let ktn = KeyTree::derive_at_epoch(seed, fleet_current_epoch)
+                    .map_err(|e| format!("derive epoch-{fleet_current_epoch}: {e}"))?;
+                let materials = vec![kt0.to_fleet_material(), ktn.to_fleet_material()];
+                let bytes = encode_fleet_material_set(&materials)?;
+                Some(hex::encode(&**bytes))
+            } else {
+                None
+            };
+            Ok((Some(single), set))
+        }
+        FleetHandover::Resident(materials) => {
+            // A seedless inviter cannot re-derive the tree, so the epoch-0
+            // material (the legacy single field, the fleet-keys carrier) MUST
+            // be resident. Its absence is a hard failure — enrolling without it
+            // would strand the joiner with no carrier access.
+            let epoch0 = materials.iter().find(|m| m.epoch == 0).ok_or_else(|| {
+                "seedless inviter: resident fleet material has no epoch-0 entry — cannot hand \
+                 off fleet keys"
+                    .to_string()
+            })?;
+            let mut buf = Zeroizing::new(Vec::new());
+            ciborium::into_writer(epoch0, &mut *buf)
+                .map_err(|e| format!("encode fleet keytree: {e}"))?;
+            let single = hex::encode(&*buf);
+            // Ship the full resident set when the fleet has bumped past epoch 0
+            // (mirrors the master-path gate). By the S5 vault invariant the
+            // resident set already holds "epoch-0 + current (+ previous during
+            // a bump window)", so it is the exact set to forward.
+            let set = if fleet_current_epoch > 0 {
+                let bytes = encode_fleet_material_set(materials)?;
+                Some(hex::encode(&**bytes))
+            } else {
+                None
+            };
+            Ok((Some(single), set))
+        }
+    }
+}
+
+/// ZEB-677 S4 (spec §5.4): a quorum-enrolled joiner mints its OWN vouches for
+/// each active sibling — the `enroll_via_quorum` direction; only the joiner
+/// holds its signing key, so it is the one to sign them. Added to the joiner's
+/// owner_state before persistence so they ride trust-sync (paired with the
+/// co-signer's reciprocal `Vouch`, they settle the trust graph). No-op unless
+/// the enrollment was quorum-issued (a master-issued cert is self-sufficient).
+fn mint_joiner_auto_vouches(
+    owner_state: &mut OwnerState,
+    our_sk: &SigningKey,
+    our_device_id: [u8; 16],
+    issuer_is_quorum: bool,
+    now: u64,
+) {
+    if !issuer_is_quorum {
+        return;
+    }
+    let owner_id = owner_state.owner_id;
+    for sibling in owner_state.active_devices(now, DEFAULT_ACTIVE_WINDOW_SECS) {
+        if sibling == our_device_id {
+            continue;
+        }
+        match harmony_owner::certs::VouchingCert::sign(
+            our_sk,
+            owner_id,
+            sibling,
+            harmony_owner::certs::Stance::Vouch,
+            now,
+        ) {
+            Ok(v) => {
+                if let Err(e) = owner_state.add_vouching(v) {
+                    tracing::warn!(error = %e, "joiner auto-vouch: add_vouching failed; skipped");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "joiner auto-vouch: sign failed; skipped"),
+        }
+    }
+}
+
+/// ZEB-677 S4: run the shared ENROLL finish for the seedless quorum path once
+/// the co-signed cert has arrived. Recomputes the joiner pubkey + the resident
+/// fleet-key handover from the (still-valid) ctx, then delegates to
+/// [`finish_inviter_enroll`] with `master_seed = None` — a seedless inviter
+/// has no seed to persist.
+async fn finish_quorum_enroll(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    ctx: &mut SessionCtx,
+    cert: EnrollmentCert,
+    now: u64,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
+    persist_done_tx: &PersistDoneTx,
+) {
+    let Some(joiner_ed25519_verify) = ctx.selected_peer_ed25519_verify else {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: "missing joiner ed25519 verifying key — cannot finish enroll".to_string(),
+        });
+        return;
+    };
+    let joiner_pubkey = PubKeyBundle::classical_only(joiner_ed25519_verify);
+
+    // Bind the assembled cert to THIS pairing's joiner before we publish or
+    // persist it. The port assembles by request-id, but a stale/cross-request
+    // cert for another device would still pass `add_enrollment` — refuse to
+    // enroll anyone but the device the user is actually pairing with.
+    if cert.device_id != joiner_pubkey.identity_hash() {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: "quorum cert does not match the joining device — aborting enroll".to_string(),
+        });
+        return;
+    }
+
+    let fleet_hex = match ctx.fleet_keytree.as_ref() {
+        Some(materials) => match build_fleet_handover_hex(
+            FleetHandover::Resident(materials),
+            ctx.fleet_current_epoch,
+        ) {
+            Ok(h) => h,
+            Err(reason) => {
+                let _ = state_tx.send(PairingState::Failed { reason });
+                return;
+            }
+        },
+        None => {
             let _ = state_tx.send(PairingState::Failed {
-                reason: format!("sign cert: {e}"),
+                reason: "seedless inviter has no resident fleet key material to hand off"
+                    .to_string(),
             });
             return;
         }
     };
+
+    finish_inviter_enroll(
+        transport,
+        state_tx,
+        ctx,
+        cert,
+        now,
+        joiner_pubkey,
+        fleet_hex,
+        None,
+        inviter_result_tx,
+        persist_done_tx,
+    )
+    .await;
+}
+
+/// Shared ENROLL tail for BOTH inviter paths (master + seedless quorum): given
+/// an already-obtained `cert` + the joiner's fleet-key handover, apply the
+/// cert to a prospective owner-state clone, seal + publish the ENROLL payload,
+/// hand the enrollment to the persistence drainer, and spawn the ZEB-491
+/// persist-ack forwarder. Emits `Enrolling` first so the persist-ack select
+/// arm's `still_enrolling` guard holds regardless of which path arrived here
+/// (the quorum path was at `AwaitingQuorumCosign`).
+#[allow(clippy::too_many_arguments)]
+async fn finish_inviter_enroll(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    ctx: &mut SessionCtx,
+    cert: EnrollmentCert,
+    now: u64,
+    joiner_pubkey: PubKeyBundle,
+    fleet_hex: (Option<String>, Option<String>),
+    result_master_seed: Option<Zeroizing<[u8; 32]>>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
+    persist_done_tx: &PersistDoneTx,
+) {
+    let _ = state_tx.send(PairingState::Enrolling);
+
+    // PR #63 review: build a PROSPECTIVE state on a clone, publish first,
+    // then commit on success. Mutating ctx.owner_state before publish meant
+    // a transport failure left the Inviter persistently bound to a Joiner
+    // device that never received the cert (a "phantom device" on disk).
+    let mut prospective_state = ctx.owner_state.clone().expect("inviter has owner_state");
 
     if let Err(e) = prospective_state.add_enrollment(cert.clone(), now, DEFAULT_ACTIVE_WINDOW_SECS)
     {
@@ -794,64 +1168,11 @@ async fn maybe_advance_to_enroll(
         });
         return;
     }
-    // ZEB-492: seal the fleet KeyTree to the enrolled (cert-only) device so it
-    // can build the fleet engines + act as a butler. `master_seed` is in scope
-    // here (cert signing above requires it); the joiner never receives the seed
-    // itself. The CBOR buffer holds raw key material → keep it `Zeroizing`.
-    // Rides the same SAS-sealed ENROLL payload as the cert + owner state.
-    let fleet_keytree_cbor_hex = match crate::owner_state_crypto::KeyTree::derive(master_seed) {
-        Ok(kt) => {
-            let mut buf = Zeroizing::new(Vec::new());
-            // `to_fleet_material` stamps epoch 0 internally: KeyTree rotation is
-            // out of scope for ZEB-492 (the tag reserves room for a future
-            // rotation, which `from_fleet_material` will revisit), and minting any
-            // other epoch would produce material this build's import side rejects.
-            match ciborium::into_writer(&kt.to_fleet_material(), &mut *buf) {
-                Ok(()) => Some(hex::encode(&*buf)),
-                Err(e) => {
-                    let _ = state_tx.send(PairingState::Failed {
-                        reason: format!("encode fleet keytree: {e}"),
-                    });
-                    return;
-                }
-            }
-        }
-        Err(e) => {
-            let _ = state_tx.send(PairingState::Failed {
-                reason: format!("derive fleet keytree: {e}"),
-            });
-            return;
-        }
-    };
-    // ZEB-668 S5: when the fleet has bumped past epoch 0, ALSO ship the
-    // multi-epoch set (epoch-0 for carrier access + the current epoch for
-    // live datasets). The legacy field keeps carrying epoch-0 alone so a
-    // pre-S5 joiner still decodes the payload.
-    let fleet_keytree_set_cbor_hex = if ctx.fleet_current_epoch > 0 {
-        let build = || -> Result<String, String> {
-            let kt0 = crate::owner_state_crypto::KeyTree::derive(master_seed)
-                .map_err(|e| format!("derive epoch-0: {e}"))?;
-            let ktn = crate::owner_state_crypto::KeyTree::derive_at_epoch(
-                master_seed,
-                ctx.fleet_current_epoch,
-            )
-            .map_err(|e| format!("derive epoch-{}: {e}", ctx.fleet_current_epoch))?;
-            let materials = vec![kt0.to_fleet_material(), ktn.to_fleet_material()];
-            let bytes = crate::owner_state_crypto::encode_fleet_material_set(&materials)?;
-            Ok(hex::encode(&**bytes))
-        };
-        match build() {
-            Ok(hexs) => Some(hexs),
-            Err(e) => {
-                let _ = state_tx.send(PairingState::Failed {
-                    reason: format!("encode fleet keytree set: {e}"),
-                });
-                return;
-            }
-        }
-    } else {
-        None
-    };
+    // Fleet KeyTree handover, precomputed by the caller from its source
+    // (master seed → derive; seedless → resident material). ZEB-492: sealed to
+    // the enrolled (cert-only) device so it can build the fleet engines + act
+    // as a butler; rides the same SAS-sealed ENROLL payload as the cert + state.
+    let (fleet_keytree_cbor_hex, fleet_keytree_set_cbor_hex) = fleet_hex;
     let payload = EncryptedPayload::Enroll {
         enrollment_cert_cbor_hex: hex::encode(&cert_cbor),
         owner_state_cbor_hex: hex::encode(&state_cbor),
@@ -949,7 +1270,7 @@ async fn maybe_advance_to_enroll(
             result: InviterEnrollResult {
                 cert,
                 now,
-                master_seed: master_seed.clone(),
+                master_seed: result_master_seed,
             },
             persisted_ack: ack_tx,
         })
@@ -999,6 +1320,7 @@ async fn handle_wire_message(
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
     inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
     persist_done_tx: &PersistDoneTx,
+    quorum_done_tx: &QuorumDoneTx,
 ) {
     // Safety: callers only invoke this when ctx.is_some() (enforced by the
     // select! guard), EXCEPT the Cancel arm which explicitly sets ctx to None.
@@ -1152,6 +1474,7 @@ async fn handle_wire_message(
                 result_tx,
                 inviter_result_tx,
                 persist_done_tx,
+                quorum_done_tx,
             )
             .await;
         }
@@ -1196,6 +1519,7 @@ async fn on_encrypted_payload(
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
     inviter_result_tx: &mpsc::Sender<InviterEnrollHandoff>,
     persist_done_tx: &PersistDoneTx,
+    quorum_done_tx: &QuorumDoneTx,
 ) {
     match payload {
         EncryptedPayload::Confirm { sas_digits } => {
@@ -1221,6 +1545,7 @@ async fn on_encrypted_payload(
                     now_fn,
                     inviter_result_tx,
                     persist_done_tx,
+                    quorum_done_tx,
                 )
                 .await;
             }
@@ -1287,7 +1612,7 @@ async fn on_encrypted_payload(
                         return;
                     }
                 };
-            let owner_state: OwnerState = match ciborium::from_reader(state_bytes.as_slice()) {
+            let mut owner_state: OwnerState = match ciborium::from_reader(state_bytes.as_slice()) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = state_tx.send(PairingState::Failed {
@@ -1408,6 +1733,20 @@ async fn on_encrypted_payload(
 
             let our_sk = ctx.our_signing_key.take().expect("joiner has signing key");
             let our_device_id = our_pubkey.identity_hash();
+            // ZEB-677 S4 (spec §5.4): a quorum-enrolled joiner mints its OWN
+            // vouches for each active sibling before persistence, so they ride
+            // trust-sync (only the joiner holds its signing key). No-op for a
+            // master-issued enrollment — the master signature is the authority.
+            mint_joiner_auto_vouches(
+                &mut owner_state,
+                &our_sk,
+                our_device_id,
+                matches!(
+                    cert.issuer,
+                    harmony_owner::certs::EnrollmentIssuer::Quorum { .. }
+                ),
+                now,
+            );
             // See the Inviter side for rationale on send() error → Failed:
             // a closed channel here means the persistence drainer is gone,
             // and reporting Complete would tell the user pairing worked
@@ -1446,6 +1785,86 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
     use tokio::time::timeout;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn joiner_auto_vouches_active_siblings_only_for_quorum() {
+        let now = 1_700_000_000;
+        let MintResult {
+            mut state,
+            recovery_artifact,
+            device_signing_key: a_sk,
+        } = mint_owner(now).unwrap();
+        let owner_id = state.owner_id;
+        let a_id = crate::owner_state::device_id_from_signing_key(&a_sk);
+        // Enroll sibling B via master + give A, B liveness so they are active.
+        let b_sk = SigningKey::generate(&mut OsRng);
+        let b_pk = PubKeyBundle::classical_only(b_sk.verifying_key().to_bytes());
+        let b_res = harmony_owner::lifecycle::enroll_via_master(
+            &state,
+            &recovery_artifact,
+            &b_sk,
+            b_pk,
+            now + 1,
+            DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .unwrap();
+        let b_id = b_res.enrollment_cert.device_id;
+        state
+            .add_enrollment(b_res.enrollment_cert, now + 1, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        for sk in [&a_sk, &b_sk] {
+            state
+                .add_liveness(
+                    harmony_owner::certs::LivenessCert::sign(sk, owner_id, now + 2).unwrap(),
+                )
+                .unwrap();
+        }
+        // The joiner is already enrolled in the owner_state it received (the
+        // inviter installed its cert before shipping) — add_vouching requires
+        // the signer be enrolled. No liveness → it is not an "active sibling".
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_res = harmony_owner::lifecycle::enroll_via_master(
+            &state,
+            &recovery_artifact,
+            &joiner_sk,
+            joiner_pk,
+            now + 1,
+            DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .unwrap();
+        let joiner_id = joiner_res.enrollment_cert.device_id;
+        state
+            .add_enrollment(
+                joiner_res.enrollment_cert,
+                now + 1,
+                DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
+
+        // Master-issued enrollment → no auto-vouches.
+        let mut master_case = state.clone();
+        mint_joiner_auto_vouches(&mut master_case, &joiner_sk, joiner_id, false, now + 3);
+        assert!(master_case.vouching.vouches_for(a_id).next().is_none());
+
+        // Quorum-issued → the joiner vouches each active sibling, never itself.
+        let mut quorum_case = state.clone();
+        mint_joiner_auto_vouches(&mut quorum_case, &joiner_sk, joiner_id, true, now + 3);
+        for sib in [a_id, b_id] {
+            assert!(
+                quorum_case
+                    .vouching
+                    .vouches_for(sib)
+                    .any(|v| v.signer == joiner_id),
+                "joiner should vouch sibling {}",
+                hex::encode(sib)
+            );
+        }
+        assert!(
+            quorum_case.vouching.vouches_for(joiner_id).next().is_none(),
+            "joiner never vouches itself"
+        );
+    }
 
     fn fixed_clock(t: u64) -> Arc<dyn Fn() -> u64 + Send + Sync> {
         Arc::new(move || t)
@@ -1507,7 +1926,9 @@ mod tests {
             .send(PairingCommand::StartInviter {
                 display_name: "KRILE".to_string(),
                 owner_state: state.clone(),
-                master_seed,
+                master_seed: Some(master_seed),
+                fleet_keytree: None,
+                quorum_ctx: None,
                 fleet_current_epoch: 0,
             })
             .await
@@ -1671,7 +2092,9 @@ mod tests {
             .send(PairingCommand::StartInviter {
                 display_name: "KRILE".to_string(),
                 owner_state: state.clone(),
-                master_seed,
+                master_seed: Some(master_seed),
+                fleet_keytree: None,
+                quorum_ctx: None,
                 fleet_current_epoch: 0,
             })
             .await
@@ -1863,6 +2286,360 @@ mod tests {
         }
     }
 
+    // ZEB-677 S4: mock QuorumEnrollPort for the seedless-inviter SM tests. It
+    // exercises the STATE-MACHINE control flow (AwaitingQuorumCosign → finish /
+    // Failed) without a live quorum engine: `open_enrollment_request` returns a
+    // fixed id and `await_cosign_and_assemble` sleeps `delay` then returns the
+    // pre-baked `outcome`. Quorum-cert crypto correctness is covered by the
+    // Task 3/4 tests; here a Master-signed cert good enough for the finish
+    // path's `add_enrollment` is all the control-flow test needs.
+    use crate::owner_quorum_enroll::QuorumEnrollPort;
+
+    struct MockPort {
+        outcome: Result<EnrollmentCert, String>,
+        delay: Duration,
+    }
+    #[async_trait]
+    impl QuorumEnrollPort for MockPort {
+        async fn open_enrollment_request(
+            &self,
+            _joiner_device_id: [u8; 16],
+            _joiner_pubkeys: PubKeyBundle,
+            _issued_at: u64,
+        ) -> Result<String, String> {
+            Ok("mock-request-id".to_string())
+        }
+        async fn await_cosign_and_assemble(
+            &self,
+            _request_id: String,
+            _timeout: Duration,
+        ) -> Result<EnrollmentCert, String> {
+            tokio::time::sleep(self.delay).await;
+            self.outcome.clone()
+        }
+    }
+
+    /// How the mock quorum port resolves for a seedless-inviter drive.
+    enum QuorumScript {
+        /// The armed sibling co-signs — fabricate a Master-signed cert the
+        /// finish path accepts. The port dwells `delay` first so the transient
+        /// `AwaitingQuorumCosign` state is observable.
+        Cosigned,
+        /// The ceremony fails (e.g. cosignTimeout): await returns Err.
+        Fails,
+        /// No co-sign port at all (`StartInviter.quorum_ctx = None`).
+        NoPort,
+        /// The ceremony never resolves within the test — the port stalls far
+        /// past the test's lifetime so the SM dwells at `AwaitingQuorumCosign`
+        /// (used to exercise Cancel from that phase).
+        Stalls,
+    }
+
+    /// Spawn a seedless inviter (`master_seed: None`) + a joiner over an
+    /// in-memory broker and drive them through Discover → Select → Handshake →
+    /// mutual ConfirmSas. The inviter's quorum path is wired per `script`.
+    async fn drive_seedless_inviter(script: QuorumScript) -> (PairingHandle, PairingHandle) {
+        let MintResult {
+            state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_vk = joiner_sk.verifying_key().to_bytes();
+
+        // Resident fleet material (epoch-0) — a seedless inviter ships what it
+        // holds on disk. Derived from the mint seed for the fixture.
+        let kt0 = crate::owner_state_crypto::KeyTree::derive(&master_seed).unwrap();
+        let fleet_keytree = Some(vec![kt0.to_fleet_material()]);
+
+        // Build the co-sign port per the script. For Cosigned, fabricate a
+        // Master-signed cert bound to the joiner's pubkey at the inviter's
+        // fixed signing clock (1_700_000_001) so both `add_enrollment` and the
+        // joiner's `verify_cert_for_self` accept it.
+        let quorum_ctx: Option<Arc<dyn QuorumEnrollPort>> = match script {
+            QuorumScript::Cosigned => {
+                let joiner_pubkey = PubKeyBundle::classical_only(joiner_vk);
+                let cert =
+                    sign_enrollment_for_joiner(&master_seed, &state, joiner_pubkey, 1_700_000_001)
+                        .unwrap();
+                Some(Arc::new(MockPort {
+                    outcome: Ok(cert),
+                    delay: Duration::from_millis(200),
+                }))
+            }
+            QuorumScript::Fails => Some(Arc::new(MockPort {
+                outcome: Err("cosignTimeout: your other device didn't co-sign in time".to_string()),
+                delay: Duration::from_millis(20),
+            })),
+            QuorumScript::NoPort => None,
+            QuorumScript::Stalls => Some(Arc::new(MockPort {
+                outcome: Err("unreached".to_string()),
+                delay: Duration::from_secs(3600),
+            })),
+        };
+
+        let (inviter_t, joiner_t) = InMemoryBroker::pair();
+        let test_interval = Duration::from_secs(60);
+        let inviter_handle = spawn_state_machine(
+            Arc::new(inviter_t),
+            fixed_clock(1_700_000_001),
+            test_interval,
+        );
+        let joiner_handle = spawn_state_machine(
+            Arc::new(joiner_t),
+            fixed_clock(1_700_000_002),
+            test_interval,
+        );
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::StartInviter {
+                display_name: "KRILE".to_string(),
+                owner_state: state,
+                master_seed: None,
+                fleet_keytree,
+                quorum_ctx,
+                fleet_current_epoch: 0,
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::StartJoiner {
+                display_name: "AVALON".to_string(),
+                signing_key: joiner_sk,
+            })
+            .await
+            .unwrap();
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        let mut joiner_state = joiner_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter sees joiner within 2s");
+        timeout(Duration::from_secs(2), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner sees inviter within 2s");
+
+        let inviter_peer_id = match &*inviter_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!(),
+        };
+        let joiner_peer_id = match &*joiner_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!(),
+        };
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: inviter_peer_id,
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: joiner_peer_id,
+            })
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter handshakes within 2s");
+        timeout(Duration::from_secs(2), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner handshakes within 2s");
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::ConfirmSas)
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::ConfirmSas)
+            .await
+            .unwrap();
+
+        (inviter_handle, joiner_handle)
+    }
+
+    /// ZEB-677 S4 (spec §5.2–5.5): a seedless inviter with a co-sign port must
+    /// pass through `AwaitingQuorumCosign`, then — once the armed sibling
+    /// co-signs — finish enrollment exactly like the master path (the joiner
+    /// receives ENROLL and reaches Complete; the inviter ships ENROLL, parks at
+    /// `Enrolling` awaiting the persist ack, and its handoff carries NO seed).
+    #[tokio::test]
+    async fn inviter_enters_awaiting_quorum_then_publishes_with_port() {
+        let (mut inviter_handle, joiner_handle) =
+            drive_seedless_inviter(QuorumScript::Cosigned).await;
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::AwaitingQuorumCosign))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter reaches AwaitingQuorumCosign within 2s");
+
+        // The joiner receives ENROLL and completes.
+        let mut joiner_state = joiner_handle.state_rx.clone();
+        timeout(Duration::from_secs(3), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Complete { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner completes within 3s");
+
+        // Inviter shipped ENROLL and parks at Enrolling awaiting the persist ack.
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Enrolling))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter reaches Enrolling after the co-signature");
+
+        let mut irx = inviter_handle.inviter_result_rx.take().expect("inviter rx");
+        let handoff = timeout(Duration::from_secs(2), irx.recv())
+            .await
+            .expect("inviter handoff arrives")
+            .expect("handoff not None");
+        assert!(
+            handoff.result.master_seed.is_none(),
+            "a seedless quorum inviter must persist NO master seed"
+        );
+
+        // Fire the durability ack → the inviter advances to Complete.
+        handoff
+            .persisted_ack
+            .send(Ok(()))
+            .expect("ack receiver live");
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Complete { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter completes after the persist ack");
+    }
+
+    /// ZEB-677 S4: a co-sign that never lands (the mock's await returns Err —
+    /// modeling a cosignTimeout) must drive the seedless inviter to `Failed`,
+    /// surfacing the ceremony error.
+    #[tokio::test]
+    async fn inviter_fails_on_quorum_timeout() {
+        let (inviter_handle, _joiner_handle) = drive_seedless_inviter(QuorumScript::Fails).await;
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Failed { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter fails after a quorum-cosign error");
+
+        let observed = inviter_handle.state_rx.borrow().clone();
+        match observed {
+            PairingState::Failed { reason } => assert!(
+                reason.contains("cosign"),
+                "Failed reason should surface the cosign failure; got: {reason}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// ZEB-677 S4: a seedless inviter with NO co-sign port (and no seed) cannot
+    /// enroll — it must fail with the master-absent copy at the signing point.
+    #[tokio::test]
+    async fn inviter_fails_seedless_without_port() {
+        let (inviter_handle, _joiner_handle) = drive_seedless_inviter(QuorumScript::NoPort).await;
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Failed { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("seedless inviter with no port fails");
+
+        let observed = inviter_handle.state_rx.borrow().clone();
+        match observed {
+            PairingState::Failed { reason } => assert!(
+                reason.contains("master seed not on this device"),
+                "Failed reason must be the master-absent copy; got: {reason}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// ZEB-677 S4 / ZEB-198: Cancel must clean up from `AwaitingQuorumCosign`
+    /// too. With the ceremony stalled, the inviter dwells at
+    /// AwaitingQuorumCosign; a Cancel drops ctx and re-emits Idle, and a late
+    /// cert (were the stalled port to ever resolve) is a no-op because the
+    /// session is gone. Pins that the 120 s wait runs OFF the main loop (the
+    /// SM stays responsive to Cancel while it is pending).
+    #[tokio::test]
+    async fn cancel_during_awaiting_quorum_returns_to_idle() {
+        let (inviter_handle, _joiner_handle) = drive_seedless_inviter(QuorumScript::Stalls).await;
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::AwaitingQuorumCosign))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter reaches AwaitingQuorumCosign within 2s");
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::Cancel)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Idle))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("Cancel from AwaitingQuorumCosign returns to Idle within 2s");
+    }
+
     /// Multi-peer LAN race regression (PR #63 review): a SELECT addressed to
     /// us from a peer we did NOT select must NOT flip `received_select` and
     /// advance to Handshaking. The bug let peer B's SELECT count toward our
@@ -1904,7 +2681,9 @@ mod tests {
             .send(PairingCommand::StartInviter {
                 display_name: "krile".to_string(),
                 owner_state: state,
-                master_seed,
+                master_seed: Some(master_seed),
+                fleet_keytree: None,
+                quorum_ctx: None,
                 fleet_current_epoch: 0,
             })
             .await
@@ -2053,7 +2832,9 @@ mod tests {
             .send(PairingCommand::StartInviter {
                 display_name: "KRILE".to_string(),
                 owner_state: state,
-                master_seed,
+                master_seed: Some(master_seed),
+                fleet_keytree: None,
+                quorum_ctx: None,
                 fleet_current_epoch: 0,
             })
             .await
@@ -2163,7 +2944,9 @@ mod tests {
             .send(PairingCommand::StartInviter {
                 display_name: "krile".to_string(),
                 owner_state: state,
-                master_seed,
+                master_seed: Some(master_seed),
+                fleet_keytree: None,
+                quorum_ctx: None,
                 fleet_current_epoch: 0,
             })
             .await
@@ -2284,7 +3067,9 @@ mod tests {
             .send(PairingCommand::StartInviter {
                 display_name: "krile".to_string(),
                 owner_state: state,
-                master_seed,
+                master_seed: Some(master_seed),
+                fleet_keytree: None,
+                quorum_ctx: None,
                 fleet_current_epoch: 0,
             })
             .await
@@ -2487,7 +3272,9 @@ mod tests {
                 .send(PairingCommand::StartInviter {
                     display_name: "krile".to_string(),
                     owner_state: state,
-                    master_seed,
+                    master_seed: Some(master_seed),
+                    fleet_keytree: None,
+                    quorum_ctx: None,
                     fleet_current_epoch: 0,
                 })
                 .await
@@ -2538,7 +3325,9 @@ mod tests {
                 .send(PairingCommand::StartInviter {
                     display_name: "krile".to_string(),
                     owner_state: state,
-                    master_seed,
+                    master_seed: Some(master_seed),
+                    fleet_keytree: None,
+                    quorum_ctx: None,
                     fleet_current_epoch: 0,
                 })
                 .await
@@ -2597,7 +3386,9 @@ mod tests {
                 .send(PairingCommand::StartInviter {
                     display_name: "krile".to_string(),
                     owner_state: state,
-                    master_seed,
+                    master_seed: Some(master_seed),
+                    fleet_keytree: None,
+                    quorum_ctx: None,
                     fleet_current_epoch: 0,
                 })
                 .await
@@ -2697,7 +3488,9 @@ mod tests {
                 .send(PairingCommand::StartInviter {
                     display_name: "krile".to_string(),
                     owner_state: state,
-                    master_seed,
+                    master_seed: Some(master_seed),
+                    fleet_keytree: None,
+                    quorum_ctx: None,
                     fleet_current_epoch: 0,
                 })
                 .await
@@ -2849,7 +3642,9 @@ mod tests {
                 .send(PairingCommand::StartInviter {
                     display_name: "krile".to_string(),
                     owner_state: state,
-                    master_seed,
+                    master_seed: Some(master_seed),
+                    fleet_keytree: None,
+                    quorum_ctx: None,
                     fleet_current_epoch: 0,
                 })
                 .await
@@ -3007,7 +3802,9 @@ mod tests {
                         .send(PairingCommand::StartInviter {
                             display_name: "krile".to_string(),
                             owner_state: state,
-                            master_seed,
+                            master_seed: Some(master_seed),
+                            fleet_keytree: None,
+                            quorum_ctx: None,
                             fleet_current_epoch: 0,
                         })
                         .await

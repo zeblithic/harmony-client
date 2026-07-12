@@ -55,6 +55,17 @@ describe('PairingInviter', () => {
     expect(await screen.findByText('AVALON')).toBeInTheDocument();
   });
 
+  // ZEB-677 S4: a seedless (master-less) inviter runs a quorum co-sign
+  // ceremony at the signing point; the UI must surface the wait and keep
+  // Cancel available.
+  it('renders the awaiting-quorum-cosign status line', async () => {
+    mockedInvoke.mockResolvedValueOnce({ kind: 'awaitingQuorumCosign' });
+    mockedInvoke.mockResolvedValueOnce(undefined);
+    render(PairingInviter, { props: { hostname: 'KRILE' } });
+    expect(await screen.findByText(/waiting for your other device to approve/i)).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /cancel/i })).toBeInTheDocument();
+  });
+
   it('Cancel invokes cancel_pairing', async () => {
     mockedInvoke.mockResolvedValueOnce({ kind: 'discovering', role: 'inviter', ephemeralPubkeyHex: '', sessionId: '00000000-0000-0000-0000-000000000004' });
     mockedInvoke.mockResolvedValueOnce(undefined);

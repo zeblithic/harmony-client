@@ -217,6 +217,7 @@ pub mod open_join_dial;
 pub mod owner_commands;
 pub mod owner_loaded;
 pub mod owner_quorum_commands;
+pub mod owner_quorum_enroll;
 pub mod owner_quorum_sync;
 pub mod owner_state;
 pub mod owner_state_crdt;
@@ -57186,6 +57187,8 @@ pub fn run() {
             owner_quorum_commands::request_quorum_revocation,
             owner_quorum_commands::cosign_quorum_request,
             owner_quorum_commands::decline_quorum_request,
+            owner_quorum_commands::arm_quorum_enrollment,
+            owner_quorum_commands::disarm_quorum_enrollment,
             get_backup_staleness,
             save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,

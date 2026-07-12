@@ -50,6 +50,12 @@ pub enum PairingState {
     WaitingPeerConfirm {
         peer_session_id: Uuid,
     },
+    /// ZEB-677 S4: a seedless (master-less) inviter has opened a quorum
+    /// enrollment request and is waiting for an armed sibling to co-sign so
+    /// it can assemble the K=2 `EnrollmentCert`. Bounded by the SM's 120 s
+    /// ceremony deadline; on timeout/error it transitions to `Failed`.
+    /// Serializes as `awaitingQuorumCosign` (unit variant, camelCase tag).
+    AwaitingQuorumCosign,
     Enrolling,
     Complete {
         device_id_hex: String, // 32-hex

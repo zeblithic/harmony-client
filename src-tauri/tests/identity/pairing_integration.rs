@@ -99,7 +99,9 @@ async fn end_to_end_pair_two_devices() {
         .send(PairingCommand::StartInviter {
             display_name: "KRILE".to_string(),
             owner_state: state.clone(),
-            master_seed,
+            master_seed: Some(master_seed),
+            fleet_keytree: None,
+            quorum_ctx: None,
             fleet_current_epoch: 0,
         })
         .await
@@ -294,7 +296,9 @@ async fn end_to_end_persists_state_to_disk() {
         .send(PairingCommand::StartInviter {
             display_name: "KRILE".to_string(),
             owner_state: original_state.clone(),
-            master_seed,
+            master_seed: Some(master_seed),
+            fleet_keytree: None,
+            quorum_ctx: None,
             fleet_current_epoch: 0,
         })
         .await
@@ -540,7 +544,9 @@ async fn network_drop_during_enroll() {
         .send(PairingCommand::StartInviter {
             display_name: "KRILE".to_string(),
             owner_state: original_state.clone(),
-            master_seed,
+            master_seed: Some(master_seed),
+            fleet_keytree: None,
+            quorum_ctx: None,
             fleet_current_epoch: 0,
         })
         .await

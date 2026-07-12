@@ -2233,3 +2233,105 @@ describe('DevicesPanel — quorum co-sign ceremony (ZEB-677 S3)', () => {
     expect(screen.queryByRole('button', { name: /^remove…$/i })).toBeNull();
   });
 });
+
+// ── ZEB-677 S4: quorum-enrollment arm surface + live countdown ────────────────
+
+describe('DevicesPanel — quorum-enrollment arm surface (ZEB-677 S4)', () => {
+  const device = (idByte: string, name: string, self = false) => ({
+    deviceId: idByte.repeat(16),
+    displayName: name,
+    isThisDevice: self,
+    trustDecision: { kind: 'full', reason: null },
+    enrolledAt: 1_700_000_000,
+    fingerprint: `${idByte}${idByte}·xx`,
+    butlerPinned: false,
+    deviceVkHex: idByte.repeat(32),
+    revoked: false,
+    revokedAt: null,
+    revokedReason: null,
+    petName: null,
+    lastSeenMs: null,
+    connectedNow: false,
+    quorumRemovable: !self,
+  });
+
+  /** Master-less fleet with the arm affordance backend-enabled. */
+  const armView = (overrides: Record<string, unknown> = {}) => ({
+    ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+    ownerDisplayName: 'zeblith',
+    devices: [device('aa', 'KRILE', true), { ...device('bb', 'Bramble'), petName: 'Bramble' }],
+    canBackUp: false,
+    selfIsMaster: false,
+    fleetEpoch: 0,
+    fleetEpochStale: false,
+    quorumRequests: [],
+    quorumArmedUntilMs: null,
+    canArmEnrollment: true,
+    ...overrides,
+  });
+
+  const HONESTY_COPY =
+    /for the next 15 minutes this device will approve one new device enrollment started from your other devices/i;
+
+  it('renders the arm button + honesty copy when canArmEnrollment and not armed', async () => {
+    mockedInvoke.mockResolvedValueOnce(armView());
+    render(DevicesPanel);
+    expect(await screen.findByTestId('quorum-arm-button')).toBeInTheDocument();
+    expect(screen.getByText(HONESTY_COPY)).toBeInTheDocument();
+    // No countdown/cancel while un-armed.
+    expect(screen.queryByTestId('quorum-arm-countdown')).toBeNull();
+    expect(screen.queryByTestId('quorum-arm-cancel')).toBeNull();
+  });
+
+  it('treats an expired quorumArmedUntilMs as not armed (shows the arm button)', async () => {
+    mockedInvoke.mockResolvedValueOnce(armView({ quorumArmedUntilMs: Date.now() - 60_000 }));
+    render(DevicesPanel);
+    expect(await screen.findByTestId('quorum-arm-button')).toBeInTheDocument();
+    expect(screen.queryByTestId('quorum-arm-countdown')).toBeNull();
+  });
+
+  it('hides the arm surface entirely when canArmEnrollment is false', async () => {
+    mockedInvoke.mockResolvedValueOnce(armView({ canArmEnrollment: false }));
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.queryByTestId('quorum-arm-button')).toBeNull();
+    expect(screen.queryByText(HONESTY_COPY)).toBeNull();
+  });
+
+  it('hides the arm surface when canArmEnrollment is absent (stale backend)', async () => {
+    const view = armView();
+    delete (view as Record<string, unknown>).canArmEnrollment;
+    mockedInvoke.mockResolvedValueOnce(view);
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.queryByTestId('quorum-arm-button')).toBeNull();
+  });
+
+  it('renders a live countdown + Cancel when armed; Cancel invokes disarm_quorum_enrollment', async () => {
+    const armedUntil = Date.now() + 15 * 60 * 1000; // 15 min out
+    mockedInvoke.mockResolvedValueOnce(armView({ quorumArmedUntilMs: armedUntil }));
+    mockedInvoke.mockResolvedValueOnce(undefined); // disarm_quorum_enrollment
+    mockedInvoke.mockResolvedValueOnce(armView()); // post-disarm refresh (un-armed)
+    render(DevicesPanel);
+    const countdown = await screen.findByTestId('quorum-arm-countdown');
+    // mm:ss derived from the backend deadline, not fabricated client-side.
+    expect(countdown.textContent).toMatch(/^\d{2}:\d{2}$/);
+    // The arm button must not co-render while armed.
+    expect(screen.queryByTestId('quorum-arm-button')).toBeNull();
+    await fireEvent.click(screen.getByTestId('quorum-arm-cancel'));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('disarm_quorum_enrollment');
+  });
+
+  it('Approve adding a device invokes arm_quorum_enrollment', async () => {
+    mockedInvoke.mockResolvedValueOnce(armView());
+    mockedInvoke.mockResolvedValueOnce(Date.now() + 15 * 60 * 1000); // arm_quorum_enrollment
+    mockedInvoke.mockResolvedValueOnce(
+      armView({ quorumArmedUntilMs: Date.now() + 15 * 60 * 1000 }),
+    ); // post-arm refresh
+    render(DevicesPanel);
+    await fireEvent.click(await screen.findByTestId('quorum-arm-button'));
+    await tick();
+    expect(mockedInvoke).toHaveBeenCalledWith('arm_quorum_enrollment');
+  });
+});

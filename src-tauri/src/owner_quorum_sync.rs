@@ -95,9 +95,11 @@ pub const MAX_QUORUM_SIG_ENTRIES: usize = 16;
 /// forever (they'd never prune).
 pub const QUORUM_CLOCK_SKEW_MS: u64 = 60 * 60 * 1000;
 
-/// The S4 arm window is 15 minutes; the same horizon rule bounds hostile
-/// arm cells (window + skew).
-pub const QUORUM_ARM_HORIZON_MS: u64 = 15 * 60 * 1000 + QUORUM_CLOCK_SKEW_MS;
+/// The S4 pre-armed enrollment co-sign window: 15 minutes, single-use.
+pub const ARM_WINDOW_MS: u64 = 15 * 60 * 1000;
+
+/// The same horizon rule bounds hostile arm cells (window + skew).
+pub const QUORUM_ARM_HORIZON_MS: u64 = ARM_WINDOW_MS + QUORUM_CLOCK_SKEW_MS;
 
 /// What a pending request asks the fleet to co-sign. Revocation only in
 /// S3; the S4 enrollment ceremony adds its variant, and S5 threads the
@@ -113,6 +115,19 @@ pub enum QuorumRequestKind {
         /// Hex of the target's 16-byte device id.
         #[serde(rename = "t")]
         target_hex: String,
+    },
+    /// S4 enrollment ceremony: the initiator asks its armed sibling to
+    /// co-sign a quorum enrollment cert for a newly-paired device. The
+    /// joiner's device id + pubkey bundle are fixed in the payload the
+    /// signers cover (`enrollment_quorum_payload`).
+    #[serde(rename = "n")]
+    Enrollment {
+        /// Hex of the joiner's 16-byte device id.
+        #[serde(rename = "j")]
+        joiner_device_id_hex: String,
+        /// CBOR-hex of the joiner's `PubKeyBundle` (the enrolled key set).
+        #[serde(rename = "b")]
+        joiner_pubkeys_cbor_hex: String,
     },
 }
 
@@ -348,8 +363,10 @@ pub fn quorum_merger() -> Merger<QuorumReqDoc> {
 /// device reaches without an explicit tombstone. Malformed target hex
 /// (cannot ever complete) is settled too. Declined-but-unexpired requests
 /// are RETAINED (UI-dead) so the decline tombstone survives union
-/// re-merges until natural expiry. Expired enrollment arms are dropped.
-/// Returns whether anything was removed.
+/// re-merges until natural expiry. Expired enrollment arms are retained a
+/// full merge horizon past expiry (the single-use tombstone must outlive
+/// any older live arm — see the `retain` below). Returns whether anything
+/// was removed.
 pub fn prune_settled_requests(
     doc: &mut QuorumReqDoc,
     trust: &harmony_owner::state::OwnerState,
@@ -361,7 +378,12 @@ pub fn prune_settled_requests(
         if now_ms > req.expires_at_ms {
             return false;
         }
-        let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind;
+        // Enrollment requests have no convergent completion signal in the
+        // trust doc (the cert lands via the A-side pairing flow, not the
+        // sweep), so keep them until TTL expiry (handled above).
+        let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind else {
+            return true;
+        };
         match parse_device_id_hex(target_hex) {
             Ok(target) => {
                 if trust.is_revoked(target) {
@@ -376,9 +398,58 @@ pub fn prune_settled_requests(
             }
         }
     });
+    // Expired arm cells are RETAINED for a full merge horizon past their
+    // expiry — NOT dropped at `armed_until_ms`. A disarm/consume writes a
+    // newer-Hlc but already-expired tombstone (see `stamp_arm_cell`); if we
+    // pruned it the instant it expired, an older live arm re-merging from a
+    // lagging replica would resurrect the single-use window (no tombstone
+    // left to win LWW). By `armed_until_ms + QUORUM_ARM_HORIZON_MS` any such
+    // older arm has itself expired, so resurrecting it is harmless.
     doc.enroll_arms
-        .retain(|_, arm| now_ms <= arm.armed_until_ms);
+        .retain(|_, arm| now_ms <= arm.armed_until_ms.saturating_add(QUORUM_ARM_HORIZON_MS));
     doc.requests.len() != before_reqs || doc.enroll_arms.len() != before_arms
+}
+
+/// Stamp THIS device's arm cell with a strictly-newer Hlc so the merge's
+/// LWW always prefers it over the prior arm/disarm/consume (the cell is
+/// keyed by armer device-id, so every write to it supersedes the same key).
+/// `armed_until_ms <= now_ms` ⇒ disarmed. We NEVER delete the cell: a delete
+/// can be resurrected when an older `set_at` re-merges from another replica,
+/// so disarm/consume write an already-expired cell that wins LWW and is
+/// reaped later by `prune_settled_requests`. The `(wall_ms, logical)` bump
+/// guarantees strict newness even for two writes in the same millisecond.
+pub(crate) fn stamp_arm_cell(
+    doc: &mut QuorumReqDoc,
+    self_id: [u8; 16],
+    armed_until_ms: u64,
+    now_ms: u64,
+) {
+    let self_hex = hex::encode(self_id);
+    let (wall_ms, logical) = match doc.enroll_arms.get(&self_hex).map(|a| &a.set_at) {
+        Some(prev) if prev.wall_ms >= now_ms => {
+            // Advance strictly past the prior stamp without overflowing the
+            // u32 logical counter: roll the wall clock forward one tick when
+            // it is saturated (astronomically rare, but strict monotonicity
+            // is load-bearing for the arm cell's LWW).
+            if prev.logical == u32::MAX {
+                (prev.wall_ms.saturating_add(1), 0)
+            } else {
+                (prev.wall_ms, prev.logical + 1)
+            }
+        }
+        _ => (now_ms, 0),
+    };
+    doc.enroll_arms.insert(
+        self_hex.clone(),
+        EnrollArm {
+            set_at: Hlc {
+                wall_ms,
+                logical,
+                device_id: self_hex,
+            },
+            armed_until_ms,
+        },
+    );
 }
 
 /// Decode a 16-byte device-id hex string.
@@ -411,6 +482,47 @@ pub fn revocation_pair_payload(
 /// the crate's canonical-CBOR cert payloads (those start with a CBOR map
 /// header byte), and the owner id + request id bind the veto to exactly
 /// one ceremony.
+/// True when the request's INITIATOR has signed an abandon marker into
+/// `declined_by[initiator]` — the convergent "I gave up on this ceremony"
+/// signal written by `LiveQuorumEnrollPort` on co-sign timeout. The
+/// signature is verified against the initiator's enrolled key over
+/// `decline_signing_payload` (same tag/label as a revocation decline), so a
+/// forged marker cannot silently block a live enrollment. Grow-only union
+/// carries it to every replica, so an abandoned enrollment request is never
+/// co-signed even after a stale re-merge.
+fn initiator_abandoned(
+    trust: &harmony_owner::state::OwnerState,
+    request_id_hex: &str,
+    req: &QuorumRequest,
+) -> bool {
+    let Some(sig_hex) = req.declined_by.get(&req.initiator_hex) else {
+        return false;
+    };
+    let (Ok(initiator), Ok(sig)) = (
+        parse_device_id_hex(&req.initiator_hex),
+        hex::decode(sig_hex),
+    ) else {
+        return false;
+    };
+    let Some(cert) = trust.enrollments.get(&initiator) else {
+        return false;
+    };
+    let Ok(vk) =
+        ed25519_dalek::VerifyingKey::from_bytes(&cert.device_pubkeys.classical.ed25519_verify)
+    else {
+        return false;
+    };
+    let payload = decline_signing_payload(trust.owner_id, request_id_hex);
+    harmony_owner::signing::verify_with_tag(
+        &vk,
+        harmony_owner::signing::tags::REVOCATION,
+        &payload,
+        &sig,
+        "Revocation-Quorum-Decline",
+    )
+    .is_ok()
+}
+
 pub fn decline_signing_payload(owner_id: [u8; 16], request_id_hex: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32 + 16 + request_id_hex.len());
     buf.extend_from_slice(b"harmony-zeb677-quorum-decline-v1");
@@ -430,7 +542,11 @@ pub fn verified_decliners(
     request_id_hex: &str,
     req: &QuorumRequest,
 ) -> std::collections::BTreeSet<String> {
-    let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind;
+    // Enrollment requests carry no decline flow (an armed sibling auto-
+    // co-signs; there is no veto surface), so no declines ever count.
+    let QuorumRequestKind::Revocation { target_hex, .. } = &req.kind else {
+        return std::collections::BTreeSet::new();
+    };
     let payload = decline_signing_payload(trust.owner_id, request_id_hex);
     req.declined_by
         .iter()
@@ -579,6 +695,8 @@ impl FleetPersist<QuorumReqDoc> for QuorumPersist {
 pub struct SweepOutcome {
     pub doc_changed: bool,
     pub revocations_applied: usize,
+    /// B-side enrollment co-signs applied this sweep (0 or 1 — single-use arm).
+    pub enrollment_cosigns: usize,
 }
 
 /// One assemblable completion candidate, collected under the quorum-doc
@@ -597,7 +715,11 @@ fn try_assemble(
     self_id: [u8; 16],
     req: &QuorumRequest,
 ) -> Option<RevocationCert> {
-    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind;
+    // Revocation completion only: enrollment certs are assembled A-side by
+    // the pairing ceremony (owner_quorum_enroll), never by this sweep.
+    let QuorumRequestKind::Revocation { reason, target_hex } = &req.kind else {
+        return None;
+    };
     let target = parse_device_id_hex(target_hex).ok()?;
     let reason = crate::owner_commands::parse_revoke_reason(reason).ok()?;
     for (cosigner_hex, sigs) in &req.signatures {
@@ -663,6 +785,351 @@ fn try_assemble(
     None
 }
 
+/// Canonical bytes both quorum signers cover for an enrollment cert. For
+/// K=2 the `signers` slice is the sorted `[initiator, cosigner]` pair.
+/// Quorum enrollment certs mint `expires_at: None` (the fleet's active
+/// window governs liveness, not cert expiry) — sign and verify go through
+/// the crate's single payload builder so they cannot drift.
+pub fn enrollment_quorum_payload(
+    owner_id: [u8; 16],
+    joiner_device_id: [u8; 16],
+    joiner_pubkeys: &harmony_owner::pubkey_bundle::PubKeyBundle,
+    issued_at: u64,
+    signers: &[[u8; 16]],
+) -> Result<Vec<u8>, String> {
+    harmony_owner::certs::EnrollmentCert::quorum_signing_payload_bytes(
+        owner_id,
+        joiner_device_id,
+        joiner_pubkeys,
+        issued_at,
+        None,
+        signers,
+    )
+    .map_err(|e| format!("enrollment quorum payload: {e}"))
+}
+
+/// Decode the joiner's `PubKeyBundle` from an Enrollment request (ciborium,
+/// matching how the pairing SM CBOR-encodes certs/state).
+pub(crate) fn decode_joiner_pubkeys(
+    hex_str: &str,
+) -> Result<harmony_owner::pubkey_bundle::PubKeyBundle, String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("joiner pubkeys hex: {e}"))?;
+    ciborium::from_reader(bytes.as_slice()).map_err(|e| format!("joiner pubkeys cbor: {e}"))
+}
+
+/// A staged B-side enrollment co-signature: apply the Vouch under the trust
+/// lock, then union the signature + consume the arm under the quorum lock.
+struct EnrollmentCosign {
+    request_id: String,
+    self_sig_hex: String,
+    vouch_cert: harmony_owner::certs::VouchingCert,
+}
+
+/// B-side (spec §5.2): if THIS device holds a live arm and an authenticated
+/// `Enrollment` request from a sibling is pending (and not yet co-signed by
+/// us), produce our quorum part + a `Vouch` for the joiner. The arm IS the
+/// consent — no manual step. Single-use: only the FIRST eligible request is
+/// taken; the caller consumes the arm on apply so a second ceremony in the
+/// same window cannot ride it. Returns `None` when nothing is co-signable.
+fn collect_enrollment_cosign(
+    doc: &QuorumReqDoc,
+    trust: &harmony_owner::state::OwnerState,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    self_id: [u8; 16],
+    now_secs: u64,
+    now_ms: u64,
+) -> Option<EnrollmentCosign> {
+    let self_hex = hex::encode(self_id);
+    // A live arm is the consent gate.
+    if doc
+        .enroll_arms
+        .get(&self_hex)
+        .is_none_or(|a| a.armed_until_ms <= now_ms)
+    {
+        return None;
+    }
+    // Depth-1: our own part is only valid if we hold a Master-issued cert.
+    let self_cert = trust.enrollments.get(&self_id)?;
+    if !crate::owner_quorum_commands::is_master_issued(self_cert) || trust.is_revoked(self_id) {
+        return None;
+    }
+    for (id, req) in doc.requests.iter() {
+        if now_ms > req.expires_at_ms
+            || req.initiator_hex == self_hex
+            || req.signatures.contains_key(&self_hex)
+        {
+            continue;
+        }
+        // The initiator can convergently ABANDON its own request (a grow-only
+        // `declined_by` entry survives a union re-merge, unlike a delete) — do
+        // not co-sign it, so a lagging replica re-merging an abandoned request
+        // can't make us burn our single-use arm on a ceremony the inviter has
+        // already given up on (Greptile).
+        if initiator_abandoned(trust, id, req) {
+            continue;
+        }
+        let QuorumRequestKind::Enrollment {
+            joiner_device_id_hex,
+            joiner_pubkeys_cbor_hex,
+        } = &req.kind
+        else {
+            continue;
+        };
+        let (Ok(joiner_id), Ok(joiner_pk), Ok(initiator)) = (
+            parse_device_id_hex(joiner_device_id_hex),
+            decode_joiner_pubkeys(joiner_pubkeys_cbor_hex),
+            parse_device_id_hex(&req.initiator_hex),
+        ) else {
+            continue;
+        };
+        // Both signers cover the SAME payload over the sorted signer set.
+        let mut signers = [initiator, self_id];
+        signers.sort();
+        let Ok(payload) = enrollment_quorum_payload(
+            trust.owner_id,
+            joiner_id,
+            &joiner_pk,
+            req.issued_at,
+            &signers,
+        ) else {
+            continue;
+        };
+        // Authenticate the request: the initiator's part must verify against
+        // its enrolled Master key. An unauthenticated request is never
+        // co-signed (a peer cannot forge a ceremony from A).
+        let Some(init_sig_hex) = req.initiator_sigs.get(&self_hex) else {
+            continue;
+        };
+        let Ok(init_sig) = hex::decode(init_sig_hex) else {
+            continue;
+        };
+        let Some(init_cert) = trust.enrollments.get(&initiator) else {
+            continue;
+        };
+        if !crate::owner_quorum_commands::is_master_issued(init_cert) || trust.is_revoked(initiator)
+        {
+            continue;
+        }
+        let Ok(init_vk) = ed25519_dalek::VerifyingKey::from_bytes(
+            &init_cert.device_pubkeys.classical.ed25519_verify,
+        ) else {
+            continue;
+        };
+        if harmony_owner::signing::verify_with_tag(
+            &init_vk,
+            harmony_owner::signing::tags::ENROLLMENT,
+            &payload,
+            &init_sig,
+            "Enrollment-Quorum-Member",
+        )
+        .is_err()
+        {
+            tracing::warn!(request = %id, "enrollment co-sign: initiator part failed verification; skipped");
+            continue;
+        }
+        let self_sig =
+            harmony_owner::certs::EnrollmentCert::sign_quorum_part(device_signing_key, &payload);
+        let vouch_cert = harmony_owner::certs::VouchingCert::sign(
+            device_signing_key,
+            trust.owner_id,
+            joiner_id,
+            harmony_owner::certs::Stance::Vouch,
+            now_secs,
+        )
+        .ok()?;
+        return Some(EnrollmentCosign {
+            request_id: id.clone(),
+            self_sig_hex: hex::encode(self_sig),
+            vouch_cert,
+        });
+    }
+    None
+}
+
+/// A-side (spec §5.2/§5.3): pick an armed, active, Master-certed sibling
+/// and build an `Enrollment` request for `joiner`, with THIS device's
+/// authenticating quorum part attached (keyed by the chosen cosigner). Pure
+/// — the caller supplies the arms snapshot + `now_ms` and writes/publishes
+/// the returned request. `request_id` is caller-supplied so the planner is
+/// deterministic under test.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_enrollment_request(
+    trust: &harmony_owner::state::OwnerState,
+    enroll_arms: &BTreeMap<String, EnrollArm>,
+    device_signing_key: &ed25519_dalek::SigningKey,
+    self_id: [u8; 16],
+    joiner_device_id: [u8; 16],
+    joiner_pubkeys: &harmony_owner::pubkey_bundle::PubKeyBundle,
+    issued_at: u64,
+    now_ms: u64,
+    request_id: [u8; 16],
+) -> Result<(String, QuorumRequest), String> {
+    let self_hex = hex::encode(self_id);
+    // Depth-1: the initiator's own part is only valid if it is Master-certed.
+    let self_cert = trust
+        .enrollments
+        .get(&self_id)
+        .ok_or_else(|| "notEnrolled: this device has no enrollment".to_string())?;
+    if !crate::owner_quorum_commands::is_master_issued(self_cert) {
+        return Err("notEligible: this device is not master-certed".to_string());
+    }
+    // Pick an armed sibling that can actually co-sign: live arm, active,
+    // Master-certed, not self, not revoked.
+    let active: std::collections::BTreeSet<[u8; 16]> = trust
+        .active_devices(issued_at, harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS)
+        .into_iter()
+        .collect();
+    let sibling = enroll_arms
+        .iter()
+        .filter(|(armer, arm)| arm.armed_until_ms > now_ms && **armer != self_hex)
+        .filter_map(|(armer, _)| parse_device_id_hex(armer).ok())
+        .find(|id| {
+            *id != self_id
+                && active.contains(id)
+                && !trust.is_revoked(*id)
+                && trust
+                    .enrollments
+                    .get(id)
+                    .is_some_and(crate::owner_quorum_commands::is_master_issued)
+        })
+        .ok_or_else(|| {
+            "noArmedSibling: no other device has an active enrollment window — ask a sibling \
+             to Approve adding a device"
+                .to_string()
+        })?;
+    let mut signers = [self_id, sibling];
+    signers.sort();
+    let payload = enrollment_quorum_payload(
+        trust.owner_id,
+        joiner_device_id,
+        joiner_pubkeys,
+        issued_at,
+        &signers,
+    )?;
+    let a_part =
+        harmony_owner::certs::EnrollmentCert::sign_quorum_part(device_signing_key, &payload);
+    let mut joiner_pk_cbor = Vec::new();
+    ciborium::into_writer(joiner_pubkeys, &mut joiner_pk_cbor)
+        .map_err(|e| format!("encode joiner pubkeys: {e}"))?;
+    let mut initiator_sigs = BTreeMap::new();
+    initiator_sigs.insert(hex::encode(sibling), hex::encode(a_part));
+    let req = QuorumRequest {
+        created_at: Hlc {
+            wall_ms: now_ms,
+            logical: 0,
+            device_id: self_hex.clone(),
+        },
+        declined_by: BTreeMap::new(),
+        initiator_hex: self_hex,
+        kind: QuorumRequestKind::Enrollment {
+            joiner_device_id_hex: hex::encode(joiner_device_id),
+            joiner_pubkeys_cbor_hex: hex::encode(joiner_pk_cbor),
+        },
+        initiator_sigs,
+        signatures: BTreeMap::new(),
+        issued_at,
+        // Bound to the arm window: a co-signer only acts inside it anyway.
+        expires_at_ms: now_ms.saturating_add(ARM_WINDOW_MS),
+    };
+    Ok((hex::encode(request_id), req))
+}
+
+/// A-side completion: assemble the quorum `EnrollmentCert` for a request
+/// THIS device initiated, from the first cosigner signature that verifies
+/// against the current trust doc. Returns `None` until a valid co-signature
+/// has merged in. The initiator's own part is its `initiator_sigs` entry for
+/// that cosigner. Mirror of `try_assemble` for the enrollment ceremony.
+pub(crate) fn try_assemble_enrollment(
+    doc: &QuorumReqDoc,
+    trust: &harmony_owner::state::OwnerState,
+    self_id: [u8; 16],
+    request_id: &str,
+) -> Option<harmony_owner::certs::EnrollmentCert> {
+    let self_hex = hex::encode(self_id);
+    let req = doc.requests.get(request_id)?;
+    if req.initiator_hex != self_hex {
+        return None;
+    }
+    let QuorumRequestKind::Enrollment {
+        joiner_device_id_hex,
+        joiner_pubkeys_cbor_hex,
+    } = &req.kind
+    else {
+        return None;
+    };
+    let joiner_id = parse_device_id_hex(joiner_device_id_hex).ok()?;
+    let joiner_pk = decode_joiner_pubkeys(joiner_pubkeys_cbor_hex).ok()?;
+    for (cosigner_hex, sigs) in &req.signatures {
+        let Ok(cosigner) = parse_device_id_hex(cosigner_hex) else {
+            continue;
+        };
+        if cosigner == self_id || trust.is_revoked(cosigner) {
+            continue;
+        }
+        let Some(cosigner_cert) = trust.enrollments.get(&cosigner) else {
+            continue;
+        };
+        if !crate::owner_quorum_commands::is_master_issued(cosigner_cert) {
+            continue;
+        }
+        let mut signers = [self_id, cosigner];
+        signers.sort();
+        let Ok(payload) = enrollment_quorum_payload(
+            trust.owner_id,
+            joiner_id,
+            &joiner_pk,
+            req.issued_at,
+            &signers,
+        ) else {
+            continue;
+        };
+        let Ok(cosig) = hex::decode(&sigs.primary_sig_hex) else {
+            continue;
+        };
+        let Ok(cosigner_vk) = ed25519_dalek::VerifyingKey::from_bytes(
+            &cosigner_cert.device_pubkeys.classical.ed25519_verify,
+        ) else {
+            continue;
+        };
+        if harmony_owner::signing::verify_with_tag(
+            &cosigner_vk,
+            harmony_owner::signing::tags::ENROLLMENT,
+            &payload,
+            &cosig,
+            "Enrollment-Quorum-Member",
+        )
+        .is_err()
+        {
+            tracing::warn!(request = %request_id, "enrollment assemble: cosigner sig failed; skipped");
+            continue;
+        }
+        // A's own part is its authenticating entry for this cosigner.
+        let Some(a_sig_hex) = req.initiator_sigs.get(cosigner_hex) else {
+            continue;
+        };
+        let Ok(a_sig) = hex::decode(a_sig_hex) else {
+            continue;
+        };
+        let mut parts = vec![(self_id, a_sig), (cosigner, cosig)];
+        parts.sort_by_key(|(id, _)| *id);
+        match harmony_owner::certs::EnrollmentCert::assemble_quorum(
+            trust.owner_id,
+            joiner_id,
+            joiner_pk.clone(),
+            req.issued_at,
+            None,
+            parts,
+        ) {
+            Ok(cert) => return Some(cert),
+            Err(e) => {
+                tracing::warn!(error = %e, "enrollment assemble failed; skipped");
+                continue;
+            }
+        }
+    }
+    None
+}
+
 /// One completion pass over the quorum doc (spec §3: completion is
 /// initiator-driven). Prunes settled requests, then — for requests THIS
 /// device initiated — assembles the K=2 cert from the first cosigner
@@ -670,6 +1137,10 @@ fn try_assemble(
 /// validating `add_revocation` (the authority; its quorum arm re-checks
 /// the full signer policy incl. the active-window). A crate-level
 /// rejection leaves the request resident for retry — expiry bounds it.
+///
+/// It also runs the B-side enrollment co-sign (spec §5.2): when THIS device
+/// holds a live arm, an authenticated `Enrollment` request is co-signed and
+/// the joiner vouched, then the arm is consumed (single-use).
 ///
 /// Lock discipline: candidates are collected under the quorum lock,
 /// applied under the trust lock, then removed under the quorum lock again
@@ -691,7 +1162,7 @@ pub async fn run_quorum_sweep(
     let trust_snapshot = trust_doc.lock().await.clone();
 
     // Phase A: prune + collect candidates under the quorum lock.
-    let (pruned, candidates) = {
+    let (pruned, candidates, enroll_cosign) = {
         let mut doc = quorum_doc.lock().await;
         let pruned = prune_settled_requests(&mut doc, &trust_snapshot, now_ms);
         let mut candidates = Vec::new();
@@ -714,7 +1185,16 @@ pub async fn run_quorum_sweep(
                 });
             }
         }
-        (pruned, candidates)
+        // B-side: at most one enrollment co-sign per sweep (single-use arm).
+        let enroll_cosign = collect_enrollment_cosign(
+            &doc,
+            &trust_snapshot,
+            device_signing_key,
+            self_device_id,
+            now_secs,
+            now_ms,
+        );
+        (pruned, candidates, enroll_cosign)
     };
     if pruned {
         quorum_engine.notify_dirty();
@@ -789,9 +1269,68 @@ pub async fn run_quorum_sweep(
                 "quorum sweep: quorum flush failed; dirty latch will retry");
         }
     }
+
+    // Phase B2: apply the B-side enrollment co-sign. Flush-gated like the
+    // revocation path — we only union our signature (which lets the
+    // initiator assemble the enrollment cert) AFTER our Vouch is durable, so
+    // the joiner is never enrolled without a ratifying vouch on record. On
+    // any failure the request stays un-co-signed and the arm stays live; the
+    // next sweep retries.
+    let mut enroll_cosigns = 0usize;
+    if let Some(ec) = enroll_cosign {
+        let vouch = ec.vouch_cert;
+        let applied = crate::owner_trust_sync::mutate_trust_state(
+            crate::owner_trust_sync::TrustStateAccess::Resident {
+                doc: Arc::clone(trust_doc),
+                engine: Arc::clone(trust_engine),
+            },
+            move |s| s.add_vouching(vouch),
+        )
+        .await;
+        match applied {
+            Ok(Ok(())) => match trust_engine.flush_now().await {
+                Ok(()) => {
+                    {
+                        let mut doc = quorum_doc.lock().await;
+                        if let Some(req) = doc.requests.get_mut(&ec.request_id) {
+                            req.signatures
+                                .entry(self_hex.clone())
+                                .or_insert(QuorumRequestSigs {
+                                    primary_sig_hex: ec.self_sig_hex,
+                                    epoch_doc_sig_hex: None,
+                                });
+                        }
+                        // Consume the single-use arm (fresh-Hlc expired cell).
+                        stamp_arm_cell(&mut doc, self_device_id, now_ms.saturating_sub(1), now_ms);
+                    }
+                    quorum_engine.notify_dirty();
+                    if let Err(e) = quorum_engine.flush_now().await {
+                        tracing::warn!(error = %e,
+                            "enrollment co-sign: quorum flush failed; dirty latch will retry");
+                    }
+                    emit("owner-devices-updated");
+                    enroll_cosigns = 1;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, request = %ec.request_id,
+                        "enrollment co-sign: trust flush failed; not co-signed (retry next sweep)");
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, request = %ec.request_id,
+                    "enrollment co-sign: add_vouching rejected; not co-signed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, request = %ec.request_id,
+                    "enrollment co-sign: trust mutation failed; not co-signed");
+            }
+        }
+    }
+
     SweepOutcome {
-        doc_changed: pruned || applied_count > 0,
+        doc_changed: pruned || applied_count > 0 || enroll_cosigns > 0,
         revocations_applied: applied_count,
+        enrollment_cosigns: enroll_cosigns,
     }
 }
 
@@ -899,6 +1438,121 @@ mod tests {
             epoch_doc_sig_hex: None,
             primary_sig_hex: sig.to_string(),
         }
+    }
+
+    #[test]
+    fn stamp_arm_cell_is_monotonic_and_disarm_expires() {
+        let mut doc = QuorumReqDoc::default();
+        let me = [0x11u8; 16];
+        let me_hex = hex::encode(me);
+        // Arm: a future single-use window.
+        stamp_arm_cell(&mut doc, me, NOW_MS + ARM_WINDOW_MS, NOW_MS);
+        let armed = doc.enroll_arms.get(&me_hex).expect("armed").clone();
+        assert!(armed.armed_until_ms > NOW_MS);
+        // Disarm at the SAME wall-ms: must still win LWW via logical bump.
+        stamp_arm_cell(&mut doc, me, NOW_MS - 1, NOW_MS);
+        let disarmed = doc.enroll_arms.get(&me_hex).expect("cell present").clone();
+        assert!(
+            disarmed.armed_until_ms <= NOW_MS,
+            "disarm writes an already-expired cell"
+        );
+        assert!(
+            disarmed.set_at.is_strictly_newer_than(&armed.set_at),
+            "disarm must win LWW over the armed cell"
+        );
+        // Never deleted — a stale re-merge cannot resurrect the window.
+        assert!(doc.enroll_arms.contains_key(&me_hex));
+    }
+
+    #[test]
+    fn stamp_arm_cell_advances_past_saturated_logical() {
+        let mut doc = QuorumReqDoc::default();
+        let me = [0x11u8; 16];
+        let me_hex = hex::encode(me);
+        // Prime a cell already at the logical ceiling.
+        doc.enroll_arms.insert(
+            me_hex.clone(),
+            EnrollArm {
+                set_at: Hlc {
+                    wall_ms: NOW_MS,
+                    logical: u32::MAX,
+                    device_id: me_hex.clone(),
+                },
+                armed_until_ms: NOW_MS + ARM_WINDOW_MS,
+            },
+        );
+        // A same-millisecond restamp must still be strictly newer (no u32
+        // overflow panic / wrap) by rolling the wall clock forward a tick.
+        let prev = doc.enroll_arms.get(&me_hex).unwrap().set_at.clone();
+        stamp_arm_cell(&mut doc, me, NOW_MS - 1, NOW_MS);
+        let next = doc.enroll_arms.get(&me_hex).unwrap().set_at.clone();
+        assert!(next.is_strictly_newer_than(&prev));
+        assert_eq!((next.wall_ms, next.logical), (NOW_MS + 1, 0));
+    }
+
+    #[test]
+    fn consumed_arm_tombstone_survives_older_arm_remerge() {
+        let me = [0x11u8; 16];
+        let me_hex = hex::encode(me);
+        let arm_ms = NOW_MS;
+        // Replica X: armed.
+        let mut x = QuorumReqDoc::default();
+        stamp_arm_cell(&mut x, me, arm_ms + ARM_WINDOW_MS, arm_ms);
+        let old_arm = x.clone();
+
+        // Replica Y: same arm, then consumed (fresh-Hlc expired tombstone).
+        let mut y = old_arm.clone();
+        stamp_arm_cell(&mut y, me, arm_ms - 1, arm_ms); // consume
+
+        // Y's sweep runs shortly after: the tombstone is RETAINED (within the
+        // merge horizon), NOT pruned — otherwise the next step resurrects it.
+        let trust = OwnerState::default();
+        prune_settled_requests(&mut y, &trust, arm_ms + 1);
+        assert!(
+            y.enroll_arms
+                .get(&me_hex)
+                .is_some_and(|a| a.armed_until_ms <= arm_ms),
+            "consumed tombstone must survive the immediate post-consume sweep"
+        );
+
+        // The older, still-live arm from X re-merges into Y. LWW must keep Y's
+        // newer tombstone — the single-use window does NOT come back.
+        merge_quorum_remote_into_local(&mut y, old_arm);
+        assert!(
+            y.enroll_arms
+                .get(&me_hex)
+                .is_some_and(|a| a.armed_until_ms <= arm_ms),
+            "an older live arm must not resurrect a consumed single-use window"
+        );
+    }
+
+    #[test]
+    fn enrollment_request_kind_round_trips_in_doc() {
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(
+            "ab".repeat(8),
+            QuorumRequest {
+                created_at: hlc(NOW_MS, "aa"),
+                declined_by: BTreeMap::new(),
+                initiator_hex: "aa".repeat(8),
+                kind: QuorumRequestKind::Enrollment {
+                    joiner_device_id_hex: "cc".repeat(8),
+                    joiner_pubkeys_cbor_hex: "dd".repeat(4),
+                },
+                initiator_sigs: BTreeMap::new(),
+                signatures: BTreeMap::new(),
+                issued_at: NOW_SECS,
+                expires_at_ms: FAR_FUTURE_MS,
+            },
+        );
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&doc).expect("encode");
+        let back: QuorumReqDoc =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(doc, back);
+        assert!(matches!(
+            back.requests.values().next().map(|r| &r.kind),
+            Some(QuorumRequestKind::Enrollment { .. })
+        ));
     }
 
     fn test_mint(now: u64) -> (OwnerState, RecoveryArtifact) {
@@ -1144,12 +1798,14 @@ mod tests {
             "dd".repeat(16),
             test_request(&"11".repeat(16), "zz-not-hex"),
         );
-        // Expired arm dropped; live arm kept.
+        // Arm expired PAST the merge horizon is dropped; live arm kept. (A
+        // recently-expired tombstone within the horizon is retained — see
+        // `consumed_arm_tombstone_survives_older_arm_remerge`.)
         doc.enroll_arms.insert(
             "11".repeat(16),
             EnrollArm {
                 set_at: hlc(1, "a"),
-                armed_until_ms: NOW_MS - 1,
+                armed_until_ms: NOW_MS - QUORUM_ARM_HORIZON_MS - 1,
             },
         );
         doc.enroll_arms.insert(
@@ -1495,6 +2151,123 @@ mod tests {
         .await;
         assert_eq!(outcome_b.revocations_applied, 0);
         assert!(pair.b.quorum_doc.lock().await.requests.is_empty());
+
+        shutdown_pair(pair).await;
+    }
+
+    /// Full enrollment ceremony across two real engines: B arms, A opens the
+    /// request through the LIVE `LiveQuorumEnrollPort`, the request replicates,
+    /// B's sweep auto-co-signs + vouches + consumes its arm, the co-signature
+    /// replicates back, and A's port assembles a valid K=2 cert. Exercises the
+    /// production port + sweep wiring (not just the pure helpers).
+    #[tokio::test]
+    async fn two_engines_full_ceremony_enrollment_lands() {
+        use crate::owner_quorum_enroll::QuorumEnrollPort;
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 60;
+        let base_ms = base * 1000;
+        let f = sweep_fleet_at(base);
+        let pair = spawn_quorum_pair(f.trust.clone());
+
+        let joiner_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_id = joiner_pk.identity_hash();
+
+        // B arms; the arm replicates to A.
+        {
+            let mut doc_b = pair.b.quorum_doc.lock().await;
+            stamp_arm_cell(
+                &mut doc_b,
+                f.b_id,
+                base_ms + 10_000 + ARM_WINDOW_MS,
+                base_ms + 10_000,
+            );
+        }
+        pair.b.quorum_engine.notify_dirty();
+        let a_doc = Arc::clone(&pair.a.quorum_doc);
+        let b_hex = hex::encode(f.b_id);
+        wait_for("arm to reach A", move || {
+            let doc = Arc::clone(&a_doc);
+            let b_hex = b_hex.clone();
+            async move { doc.lock().await.enroll_arms.contains_key(&b_hex) }
+        })
+        .await;
+
+        // A opens the enrollment request via the LIVE port.
+        let port = crate::owner_quorum_enroll::LiveQuorumEnrollPort::new(
+            Arc::clone(&pair.a.quorum_doc),
+            Arc::clone(&pair.a.quorum_engine),
+            Arc::clone(&pair.a.trust_doc),
+            f.a_sk.clone(),
+            f.a_id,
+        );
+        let rid = port
+            .open_enrollment_request(joiner_id, joiner_pk.clone(), base + 10)
+            .await
+            .expect("open");
+
+        // The request replicates to B.
+        let b_doc = Arc::clone(&pair.b.quorum_doc);
+        let rid_b = rid.clone();
+        wait_for("request to reach B", move || {
+            let doc = Arc::clone(&b_doc);
+            let rid = rid_b.clone();
+            async move { doc.lock().await.requests.contains_key(&rid) }
+        })
+        .await;
+
+        // B's sweep auto-co-signs (armed), vouches the joiner, consumes the arm.
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let b_outcome = run_quorum_sweep(
+            &pair.b.quorum_doc,
+            &pair.b.quorum_engine,
+            &pair.b.trust_doc,
+            &pair.b.trust_engine,
+            &f.b_sk,
+            f.b_id,
+            &collecting_emit(Arc::clone(&events)),
+            None,
+            base + 11,
+            base_ms + 11_000,
+        )
+        .await;
+        assert_eq!(b_outcome.enrollment_cosigns, 1, "B co-signed");
+
+        // A's port polls until the co-signature replicates, then assembles.
+        let cert = port
+            .await_cosign_and_assemble(rid.clone(), std::time::Duration::from_secs(5))
+            .await
+            .expect("assemble");
+        let a_cert = f.trust.enrollments.get(&f.a_id).unwrap().clone();
+        let b_cert = f.trust.enrollments.get(&f.b_id).unwrap().clone();
+        cert.verify_quorum_with_signers(&[a_cert, b_cert], base + 12)
+            .expect("valid quorum enrollment cert");
+        assert_eq!(cert.device_id, joiner_id);
+
+        // A applies the enrollment; B's vouch (from its sweep) replicates in,
+        // so the joiner reaches Full (N=1 sibling vouch).
+        {
+            let mut trust_a = pair.a.trust_doc.lock().await;
+            trust_a
+                .add_enrollment(cert, base + 12, DEFAULT_ACTIVE_WINDOW_SECS)
+                .expect("enroll joiner");
+        }
+        pair.a.trust_engine.notify_dirty();
+        let a_trust = Arc::clone(&pair.a.trust_doc);
+        wait_for("B's vouch to reach A", move || {
+            let t = Arc::clone(&a_trust);
+            async move {
+                t.lock()
+                    .await
+                    .vouching
+                    .vouches_for(joiner_id)
+                    .any(|v| v.signer == f.b_id)
+            }
+        })
+        .await;
 
         shutdown_pair(pair).await;
     }
@@ -1998,6 +2771,308 @@ mod tests {
         assert!(rig.quorum_doc.lock().await.requests.contains_key(&id));
         let _ = rig.quorum_engine.shutdown().await;
         let _ = rig.trust_engine.shutdown().await;
+    }
+
+    /// Build an A-initiated Enrollment request for a fresh joiner, addressed
+    /// to cosigner B (A's authenticating part attached). Returns the doc, the
+    /// request id, A's part, the joiner id + bundle.
+    fn enrollment_request_for(
+        f: &SweepFleet,
+        now_secs: u64,
+        now_ms: u64,
+        arm_b: bool,
+    ) -> (QuorumReqDoc, String, Vec<u8>, [u8; 16], PubKeyBundle) {
+        let joiner_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_id = joiner_pk.identity_hash();
+        let mut signers = [f.a_id, f.b_id];
+        signers.sort();
+        let payload =
+            enrollment_quorum_payload(f.trust.owner_id, joiner_id, &joiner_pk, now_secs, &signers)
+                .expect("payload");
+        let a_part = harmony_owner::certs::EnrollmentCert::sign_quorum_part(&f.a_sk, &payload);
+        let mut joiner_pk_cbor = Vec::new();
+        ciborium::into_writer(&joiner_pk, &mut joiner_pk_cbor).unwrap();
+        let mut initiator_sigs = BTreeMap::new();
+        initiator_sigs.insert(hex::encode(f.b_id), hex::encode(&a_part));
+        let rid = "ee".repeat(8);
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(
+            rid.clone(),
+            QuorumRequest {
+                created_at: hlc(now_ms, "aa"),
+                declined_by: BTreeMap::new(),
+                initiator_hex: hex::encode(f.a_id),
+                kind: QuorumRequestKind::Enrollment {
+                    joiner_device_id_hex: hex::encode(joiner_id),
+                    joiner_pubkeys_cbor_hex: hex::encode(&joiner_pk_cbor),
+                },
+                initiator_sigs,
+                signatures: BTreeMap::new(),
+                issued_at: now_secs,
+                expires_at_ms: now_ms + 100_000,
+            },
+        );
+        if arm_b {
+            stamp_arm_cell(&mut doc, f.b_id, now_ms + ARM_WINDOW_MS, now_ms);
+        }
+        (doc, rid, a_part, joiner_id, joiner_pk)
+    }
+
+    /// B-side auto-co-sign (spec §5.2): armed B reacts to A's authenticated
+    /// Enrollment request — signs, vouches the joiner, consumes the arm —
+    /// and the co-signature assembles into a valid quorum enrollment cert.
+    #[tokio::test]
+    async fn armed_b_auto_cosigns_enrollment_vouches_and_consumes_arm() {
+        let f = sweep_fleet();
+        let now_secs = NOW_SECS + 10;
+        let now_ms = NOW_MS + 10_000;
+        let (doc, rid, a_part, joiner_id, joiner_pk) =
+            enrollment_request_for(&f, now_secs, now_ms, true);
+
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.b_sk,
+            f.b_id,
+            &collecting_emit(Arc::clone(&events)),
+            None,
+            now_secs + 1,
+            now_ms + 1,
+        )
+        .await;
+
+        assert_eq!(outcome.enrollment_cosigns, 1, "B co-signed the enrollment");
+
+        // B's co-signature is present and assembles into a valid K=2 cert.
+        let b_part = {
+            let doc = rig.quorum_doc.lock().await;
+            let req = doc.requests.get(&rid).expect("request");
+            hex::decode(
+                &req.signatures
+                    .get(&hex::encode(f.b_id))
+                    .expect("B signed")
+                    .primary_sig_hex,
+            )
+            .unwrap()
+        };
+        let mut parts = vec![(f.a_id, a_part), (f.b_id, b_part)];
+        parts.sort_by_key(|(id, _)| *id);
+        let cert = harmony_owner::certs::EnrollmentCert::assemble_quorum(
+            f.trust.owner_id,
+            joiner_id,
+            joiner_pk,
+            now_secs,
+            None,
+            parts,
+        )
+        .expect("assemble");
+        let a_cert = f.trust.enrollments.get(&f.a_id).unwrap().clone();
+        let b_cert = f.trust.enrollments.get(&f.b_id).unwrap().clone();
+        cert.verify_quorum_with_signers(&[a_cert, b_cert], now_secs + 2)
+            .expect("valid quorum enrollment cert");
+
+        // B vouched the joiner (lifts Provisional→Full under N=1).
+        {
+            let trust = rig.trust_doc.lock().await;
+            assert!(
+                trust
+                    .vouching
+                    .vouches_for(joiner_id)
+                    .any(|v| v.signer == f.b_id
+                        && matches!(v.stance, harmony_owner::certs::Stance::Vouch)),
+                "B minted a Vouch for the joiner"
+            );
+        }
+        // B's single-use arm is consumed.
+        {
+            let doc = rig.quorum_doc.lock().await;
+            let arm = doc
+                .enroll_arms
+                .get(&hex::encode(f.b_id))
+                .expect("arm cell present");
+            assert!(arm.armed_until_ms <= now_ms + 1, "arm consumed");
+        }
+
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
+    }
+
+    /// Without a live arm, B never co-signs an enrollment request.
+    #[tokio::test]
+    async fn unarmed_b_ignores_enrollment_request() {
+        let f = sweep_fleet();
+        let now_secs = NOW_SECS + 10;
+        let now_ms = NOW_MS + 10_000;
+        let (doc, rid, _a_part, _jid, _jpk) = enrollment_request_for(&f, now_secs, now_ms, false);
+
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.b_sk,
+            f.b_id,
+            &collecting_emit(events),
+            None,
+            now_secs + 1,
+            now_ms + 1,
+        )
+        .await;
+        assert_eq!(outcome.enrollment_cosigns, 0, "no arm ⇒ no co-sign");
+        {
+            let doc = rig.quorum_doc.lock().await;
+            assert!(!doc
+                .requests
+                .get(&rid)
+                .unwrap()
+                .signatures
+                .contains_key(&hex::encode(f.b_id)));
+        }
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
+    }
+
+    /// Convergent abandon (Greptile): an armed B must NOT co-sign an
+    /// enrollment request whose initiator has signed an abandon marker into
+    /// `declined_by` — even though B holds a live arm and the request is
+    /// otherwise valid — so a stale re-merge can't burn B's single-use arm.
+    #[tokio::test]
+    async fn armed_b_skips_abandoned_enrollment_request() {
+        let f = sweep_fleet();
+        let now_secs = NOW_SECS + 10;
+        let now_ms = NOW_MS + 10_000;
+        let (mut doc, rid, _a_part, _jid, _jpk) =
+            enrollment_request_for(&f, now_secs, now_ms, true);
+        // A abandons its own request (signed `declined_by[A]`).
+        let payload = decline_signing_payload(f.trust.owner_id, &rid);
+        let a_sig = harmony_owner::signing::sign_with_tag(
+            &f.a_sk,
+            harmony_owner::signing::tags::REVOCATION,
+            &payload,
+        );
+        doc.requests
+            .get_mut(&rid)
+            .unwrap()
+            .declined_by
+            .insert(hex::encode(f.a_id), hex::encode(a_sig));
+
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.b_sk,
+            f.b_id,
+            &collecting_emit(events),
+            None,
+            now_secs + 1,
+            now_ms + 1,
+        )
+        .await;
+        assert_eq!(
+            outcome.enrollment_cosigns, 0,
+            "an abandoned request must not be co-signed"
+        );
+        {
+            let doc = rig.quorum_doc.lock().await;
+            assert!(!doc
+                .requests
+                .get(&rid)
+                .unwrap()
+                .signatures
+                .contains_key(&hex::encode(f.b_id)));
+        }
+        let _ = rig.quorum_engine.shutdown().await;
+        let _ = rig.trust_engine.shutdown().await;
+    }
+
+    /// A-side planner picks the armed sibling and its request assembles into
+    /// a valid cert once that sibling co-signs — the full A-plan → B-cosign →
+    /// A-assemble path, pure (no engine).
+    #[test]
+    fn plan_enrollment_then_assemble_after_cosign() {
+        let f = sweep_fleet();
+        let now_secs = NOW_SECS + 10;
+        let now_ms = NOW_MS + 10_000;
+        let joiner_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_id = joiner_pk.identity_hash();
+
+        // B is the only armed sibling.
+        let mut arms = BTreeMap::new();
+        arms.insert(
+            hex::encode(f.b_id),
+            EnrollArm {
+                set_at: hlc(now_ms, "bb"),
+                armed_until_ms: now_ms + ARM_WINDOW_MS,
+            },
+        );
+
+        // A plans the request.
+        let (id, req) = plan_enrollment_request(
+            &f.trust, &arms, &f.a_sk, f.a_id, joiner_id, &joiner_pk, now_secs, now_ms, [0xab; 16],
+        )
+        .expect("plan");
+        // The request targets B (the armed sibling) and carries A's part.
+        assert_eq!(req.initiator_hex, hex::encode(f.a_id));
+        assert!(req.initiator_sigs.contains_key(&hex::encode(f.b_id)));
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(id.clone(), req);
+
+        // Before B co-signs, assembly yields nothing.
+        assert!(try_assemble_enrollment(&doc, &f.trust, f.a_id, &id).is_none());
+
+        // B co-signs (same sorted-[A,B] payload).
+        let mut signers = [f.a_id, f.b_id];
+        signers.sort();
+        let payload =
+            enrollment_quorum_payload(f.trust.owner_id, joiner_id, &joiner_pk, now_secs, &signers)
+                .unwrap();
+        let b_part = harmony_owner::certs::EnrollmentCert::sign_quorum_part(&f.b_sk, &payload);
+        doc.requests
+            .get_mut(&id)
+            .unwrap()
+            .signatures
+            .insert(hex::encode(f.b_id), sigs(&hex::encode(b_part)));
+
+        // A assembles a valid quorum enrollment cert.
+        let cert = try_assemble_enrollment(&doc, &f.trust, f.a_id, &id).expect("assemble");
+        let a_cert = f.trust.enrollments.get(&f.a_id).unwrap().clone();
+        let b_cert = f.trust.enrollments.get(&f.b_id).unwrap().clone();
+        cert.verify_quorum_with_signers(&[a_cert, b_cert], now_secs + 1)
+            .expect("valid cert");
+        assert_eq!(cert.device_id, joiner_id);
+    }
+
+    #[test]
+    fn plan_enrollment_request_errors_without_armed_sibling() {
+        let f = sweep_fleet();
+        let now_secs = NOW_SECS + 10;
+        let now_ms = NOW_MS + 10_000;
+        let joiner_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let joiner_pk = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let err = plan_enrollment_request(
+            &f.trust,
+            &BTreeMap::new(), // no arms
+            &f.a_sk,
+            f.a_id,
+            joiner_pk.identity_hash(),
+            &joiner_pk,
+            now_secs,
+            now_ms,
+            [0xab; 16],
+        )
+        .unwrap_err();
+        assert!(err.starts_with("noArmedSibling:"), "got: {err}");
     }
 
     #[test]
