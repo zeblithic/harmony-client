@@ -247,6 +247,7 @@ pub mod relay_optin_persist;
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
 pub mod network_health;
+pub mod revoked_device_projection;
 // ZEB-391: filters stale/virtual addresses out of the advertised iroh direct
 // address set (feeds the reachability-announce publish path below).
 pub mod direct_addr_filter;
