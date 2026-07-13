@@ -1027,6 +1027,15 @@ pub fn build_registry() -> RpcRegistry {
             crate::owner_quorum_commands::disarm_quorum_enrollment_impl(state, sink).await
         }
     );
+    // ZEB-677 S5: standalone quorum fleet-epoch rotation.
+    rpc!(
+        m,
+        "request_quorum_epoch_bump",
+        EmptyArgs,
+        |state, sink, _a| async move {
+            crate::owner_quorum_commands::request_quorum_epoch_bump_impl(state, sink).await
+        }
+    );
     rpc!(
         m,
         "bump_fleet_epoch",
@@ -1974,6 +1983,8 @@ mod tests {
             // quorum enrollment arm window (ZEB-677 S4)
             "arm_quorum_enrollment",
             "disarm_quorum_enrollment",
+            // quorum fleet-epoch rotation (ZEB-677 S5)
+            "request_quorum_epoch_bump",
             // connectivity
             "connectivity_get_my_reachability_record",
             "connectivity_get_my_identity_pub_hex",

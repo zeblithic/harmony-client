@@ -13,3 +13,13 @@ import { invoke } from '@tauri-apps/api/core';
 export async function bumpFleetEpoch(): Promise<number> {
   return invoke<number>('bump_fleet_epoch');
 }
+
+/**
+ * ZEB-677 S5 — open a K=2 quorum fleet-epoch rotation on a master-less fleet
+ * (the `fleetEpochStale` retry surface when there is no master seed to sign
+ * a direct `bump_fleet_epoch`). Resolves to the pending request id; another
+ * of your devices must co-sign for the rotation to land.
+ */
+export async function requestQuorumEpochBump(): Promise<string> {
+  return invoke<string>('request_quorum_epoch_bump');
+}

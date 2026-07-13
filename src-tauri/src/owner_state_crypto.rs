@@ -180,6 +180,29 @@ impl KeyTree {
         })
     }
 
+    /// Generate a KeyTree with fresh **random** key material at `epoch`, for a
+    /// master-less (quorum) fleet epoch bump (ZEB-677 S5). Fleet keys are
+    /// symmetric AEAD material distributed to survivors as sealed blobs — never
+    /// required to be re-derivable from the master seed (cert-only devices
+    /// already adopt via [`Self::from_fleet_material`]). The initiator of a
+    /// quorum bump holds no seed, so it mints new material here and seals it to
+    /// the survivors.
+    pub fn generate_at_epoch(epoch: u32) -> Self {
+        let fill = || {
+            let mut k = Zeroizing::new([0u8; 32]);
+            OsRng.fill_bytes(k.as_mut());
+            k
+        };
+        Self {
+            epoch,
+            entry_aead: fill(),
+            root_aead: fill(),
+            lookup: fill(),
+            nonce: fill(),
+            friend_aead: fill(),
+        }
+    }
+
     /// Export this KeyTree's key material for sealed distribution to an
     /// enrolled device. Only the seed-holding (inviter) device calls this.
     ///
@@ -704,6 +727,28 @@ mod tests {
 
     /// 32-byte all-zeros master seed for deterministic test fixtures.
     const TEST_SEED: [u8; 32] = [0u8; 32];
+
+    #[test]
+    fn generate_at_epoch_is_random_and_material_round_trips() {
+        let a = KeyTree::generate_at_epoch(3);
+        let b = KeyTree::generate_at_epoch(3);
+        assert_eq!(a.epoch, 3);
+        // Two independent generations differ (not master-derived, no shared seed).
+        assert_ne!(a.entry_aead.as_ref(), b.entry_aead.as_ref());
+        assert_ne!(a.root_aead.as_ref(), b.root_aead.as_ref());
+        // The five sub-keys are distinct within one tree.
+        assert_ne!(a.entry_aead.as_ref(), a.root_aead.as_ref());
+        assert_ne!(a.lookup.as_ref(), a.nonce.as_ref());
+        // Material round-trips byte-identical through the sealed-distribution path.
+        let m = a.to_fleet_material();
+        let back = KeyTree::from_fleet_material(&m).expect("round-trip");
+        assert_eq!(back.entry_aead.as_ref(), a.entry_aead.as_ref());
+        assert_eq!(back.friend_aead.as_ref(), a.friend_aead.as_ref());
+        assert_eq!(back.epoch, 3);
+        // Distinct from a master-derived tree at the same epoch.
+        let derived = KeyTree::derive_at_epoch(&TEST_SEED, 3).expect("derive");
+        assert_ne!(a.root_aead.as_ref(), derived.root_aead.as_ref());
+    }
 
     #[test]
     fn key_tree_derives_four_distinct_keys_deterministically() {

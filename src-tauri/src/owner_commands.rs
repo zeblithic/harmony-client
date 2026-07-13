@@ -221,12 +221,35 @@ pub(crate) fn plan_fleet_epoch_bump(
         buf
     };
 
-    // Survivors = enrolled minus revoked. Deliberately NOT `active_devices`
-    // (liveness-windowed): a temporarily-offline, non-revoked device must
-    // still get a blob or it is orphaned at window close.
+    let sealed = seal_material_to_survivors(trust, &material_cbor, None)?;
+
+    let mut doc = crate::fleet_key_epoch::FleetKeyEpochDoc {
+        epoch: new_epoch,
+        bump_wall_ms: now_ms,
+        sealed,
+        master_pubkey: None,
+        master_sig: Vec::new(),
+        quorum_sig: None,
+        signer_certs: Vec::new(),
+    };
+    doc.sign(&artifact.master_signing_key(), master_pubkey)?;
+    Ok((doc, new_kt))
+}
+
+/// Seal `material_cbor` to every surviving device's enrollment x25519 →
+/// `device_id_hex → blob`. Survivors = enrolled minus revoked (deliberately
+/// NOT `active_devices`: a temporarily-offline, non-revoked device must still
+/// get a blob or it is orphaned at window close). `exclude` additionally drops
+/// one device — the quorum-revocation target, which may not yet be revoked in
+/// this trust snapshot (ZEB-677 S5).
+fn seal_material_to_survivors(
+    trust: &harmony_owner::state::OwnerState,
+    material_cbor: &[u8],
+    exclude: Option<[u8; 16]>,
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
     let mut sealed = std::collections::BTreeMap::new();
     for (device_id, cert) in trust.enrollments.iter() {
-        if trust.is_revoked(*device_id) {
+        if trust.is_revoked(*device_id) || exclude == Some(*device_id) {
             continue;
         }
         let id_hex = hex::encode(device_id);
@@ -242,21 +265,54 @@ pub(crate) fn plan_fleet_epoch_bump(
         }
         let blob = crate::dm_signing::seal_to_owner_with_info(
             &x_pub,
-            &material_cbor,
+            material_cbor,
             crate::fleet_key_epoch::FLEET_EPOCH_SEAL_INFO,
         )
         .map_err(|e| format!("sealFailed:{id_hex}: {e}"))?;
         sealed.insert(id_hex, blob);
     }
+    Ok(sealed)
+}
 
-    let mut doc = crate::fleet_key_epoch::FleetKeyEpochDoc {
+/// ZEB-677 S5 — build the UNSIGNED next-epoch carrier doc for a master-less
+/// (quorum) fleet bump. Generates a FRESH RANDOM `KeyTree` (no master seed to
+/// derive from) and seals it to survivors minus `exclude_target`. The returned
+/// doc carries no signature — the co-sign ceremony collects K=2 quorum parts
+/// over its `signing_bytes` and calls `assemble_quorum`. The returned `KeyTree`
+/// is discarded by the request planner (A recovers it by unsealing its own
+/// blob at assembly time, like any survivor).
+pub(crate) fn plan_fleet_epoch_bump_quorum(
+    trust: &harmony_owner::state::OwnerState,
+    current_data_epoch: u32,
+    now_ms: u64,
+    exclude_target: Option<[u8; 16]>,
+) -> Result<
+    (
+        crate::fleet_key_epoch::FleetKeyEpochDoc,
+        crate::owner_state_crypto::KeyTree,
+    ),
+    String,
+> {
+    let new_epoch = current_data_epoch
+        .checked_add(1)
+        .ok_or_else(|| "fleet epoch counter overflow".to_string())?;
+    let new_kt = crate::owner_state_crypto::KeyTree::generate_at_epoch(new_epoch);
+    let material_cbor = {
+        let mut buf = Zeroizing::new(Vec::new());
+        ciborium::into_writer(&new_kt.to_fleet_material(), &mut *buf)
+            .map_err(|e| format!("encode new material: {e}"))?;
+        buf
+    };
+    let sealed = seal_material_to_survivors(trust, &material_cbor, exclude_target)?;
+    let doc = crate::fleet_key_epoch::FleetKeyEpochDoc {
         epoch: new_epoch,
         bump_wall_ms: now_ms,
         sealed,
         master_pubkey: None,
         master_sig: Vec::new(),
+        quorum_sig: None,
+        signer_certs: Vec::new(),
     };
-    doc.sign(&artifact.master_signing_key(), master_pubkey)?;
     Ok((doc, new_kt))
 }
 
@@ -454,8 +510,9 @@ fn build_owner_state_view(
         .filter_map(|(id, r)| {
             // Only revocation requests surface as manual co-sign banners;
             // enrollment requests are auto-co-signed by an armed sibling.
-            let crate::owner_quorum_sync::QuorumRequestKind::Revocation { reason, target_hex } =
-                &r.kind
+            let crate::owner_quorum_sync::QuorumRequestKind::Revocation {
+                reason, target_hex, ..
+            } = &r.kind
             else {
                 return None;
             };
@@ -2736,6 +2793,8 @@ mod revoke_tests {
                 kind: crate::owner_quorum_sync::QuorumRequestKind::Revocation {
                     reason: "lost".into(),
                     target_hex: hex::encode(c_id),
+                    epoch_doc_cbor_hex: None,
+                    epoch_doc_initiator_sig_hex: None,
                 },
                 initiator_sigs: addressed_to
                     .iter()
