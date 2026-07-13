@@ -5520,6 +5520,16 @@ pub async fn start_node_inner(
                                 "BOOT-PROBE 07a: self-row HLC reserved, locking fleet-net doc"
                             );
                             let mut doc = fleet_net_doc.lock().await;
+                            // ZEB-678 S2: preserve any existing feed_binding —
+                            // the self-row rewrite must NEVER drop it, else a
+                            // reboot would propagate `None` with a newer seen_at
+                            // via LWW and wipe the seed-holder's master-revoke
+                            // material (a revocation-evasion hole). It is
+                            // (re)set on first migrated publish.
+                            let feed_binding = doc
+                                .devices
+                                .get(&device_id)
+                                .and_then(|r| r.feed_binding.clone());
                             doc.devices.insert(
                                 device_id.clone(),
                                 crate::fleet_net::FleetNetRow {
@@ -5529,6 +5539,7 @@ pub async fn start_node_inner(
                                         .map(|r| r.to_string())
                                         .unwrap_or_default(),
                                     seen_at,
+                                    feed_binding,
                                 },
                             );
                             // ZEB-418 P2 Task 7: keep the sync snapshot in
@@ -8716,6 +8727,14 @@ pub async fn start_node_inner(
                                     .await;
                                     {
                                         let mut doc = fleet_doc.lock().await;
+                                        // ZEB-678 S2: preserve any existing
+                                        // feed_binding across an endpoint rebind
+                                        // (see the boot self-row rationale — the
+                                        // rewrite must never drop it).
+                                        let feed_binding = doc
+                                            .devices
+                                            .get(&device_id)
+                                            .and_then(|r| r.feed_binding.clone());
                                         doc.devices.insert(
                                             device_id.clone(),
                                             crate::fleet_net::FleetNetRow {
@@ -8725,6 +8744,7 @@ pub async fn start_node_inner(
                                                     .map(|r| r.to_string())
                                                     .unwrap_or_default(),
                                                 seen_at,
+                                                feed_binding,
                                             },
                                         );
                                         *fleet_snapshot

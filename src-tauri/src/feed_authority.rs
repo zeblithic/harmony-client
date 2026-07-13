@@ -107,6 +107,40 @@ pub fn sign_authority_binding(
     r.n_sig = hex::encode(private.sign(&bytes));
 }
 
+/// ZEB-678 S2: build a device's own *active* `FeedAuthorityRecord` for its
+/// feed `N` (no revocation). `node_identity` is the feed's `#3` key (hashes to
+/// `N` and produces `n_sig`); `sk` is the enrolled `#2` device key; `cert` is
+/// this device's own enrollment. Master-issued self-publish uses an empty
+/// signer bundle (a quorum-enrolled device whose own cert is quorum-issued
+/// would need its signer bundle threaded — see the §11 follow-up). Errors if
+/// the `#2` signing key does not match the enrolled `publisher_key`, so a
+/// record that could not verify is never published.
+pub fn build_active_authority(
+    node_identity: &harmony_identity::PrivateIdentity,
+    sk: &ed25519_dalek::SigningKey,
+    cert: &EnrollmentCert,
+    updated_at_ms: u64,
+) -> Result<FeedAuthorityRecord, String> {
+    let publisher_key = sk.verifying_key().to_bytes();
+    if cert.device_pubkeys.classical.ed25519_verify != publisher_key {
+        return Err("enrolled publisher key does not match the #2 signing key".to_string());
+    }
+    let mut rec = FeedAuthorityRecord {
+        feed_id: String::new(), // set by sign_authority_binding
+        owner_id: hex::encode(cert.owner_id),
+        device_id: hex::encode(cert.device_id),
+        publisher_key: hex::encode(publisher_key),
+        n_identity_pub: String::new(), // set by sign_authority_binding
+        enrollment_cbor_hex: encode_cert(cert)?,
+        signer_certs_cbor_hex: String::new(),
+        revocation_cbor_hex: None,
+        updated_at: updated_at_ms,
+        n_sig: String::new(), // set by sign_authority_binding
+    };
+    sign_authority_binding(node_identity, &mut rec);
+    Ok(rec)
+}
+
 /// Verify the `#3` binding: `n_identity_pub` hashes to `feed_id`, and `n_sig`
 /// is a strict Ed25519 signature over the binding bytes. Mirrors
 /// `vine_signing::verify_signed`. Crate-private — it checks ONLY the binding,
@@ -756,5 +790,33 @@ mod tests {
             IngestOutcome::Dropped(_)
         ));
         assert!(cache.get(&bad.feed_id).is_none());
+    }
+
+    #[test]
+    fn build_active_authority_produces_verifiable_record() {
+        let world = mint_quorum_world(0xD2);
+        let n = gen_identity();
+        // world.a_sk is the enrolled #2 key matching world.a_cert (master-issued).
+        let rec = build_active_authority(&n, &world.a_sk, &world.a_cert, WORLD_NOW * 1000)
+            .expect("builds");
+        assert_eq!(rec.feed_id, hex::encode(n.public_identity().address_hash));
+        assert!(
+            rec.revocation_cbor_hex.is_none(),
+            "active binding, no revocation"
+        );
+        assert!(
+            rec.signer_certs_cbor_hex.is_empty(),
+            "master-issued: empty bundle"
+        );
+        let v = verify_authority(&rec, WORLD_NOW).expect("self-built record verifies");
+        assert!(!v.revoked);
+        assert_eq!(v.publisher_key, world.a_sk.verifying_key().to_bytes());
+
+        // A #2 signing key that is not the enrolled key is rejected at build.
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
+        assert!(
+            build_active_authority(&n, &wrong, &world.a_cert, WORLD_NOW * 1000).is_err(),
+            "mismatched publisher key rejected"
+        );
     }
 }

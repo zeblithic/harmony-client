@@ -44,6 +44,19 @@ pub struct FleetNetRow {
     /// LWW stamp for this row; also the staleness clock.
     #[serde(rename = "sa")]
     pub seen_at: Hlc,
+    /// ZEB-678 S2 (§3.5): this device's active `FeedAuthorityRecord` (its full
+    /// binding, no revocation), self-stamped on first migrated vine publish, as
+    /// the record's canonical `serde_json` string. Stored as an opaque String —
+    /// NOT a nested struct — because `FeedAuthorityRecord` is camelCase JSON
+    /// with mixed-length field names, which would violate the canonical-CBOR
+    /// same-length-key contract if nested in this row (see
+    /// `owner_state_crypto::canonical_cbor_encode`). On master-revoke the
+    /// seed-holder parses this, appends a `RevocationCert`, bumps `updated_at`
+    /// (both excluded from `n_sig`, so the binding stays valid), and republishes
+    /// to `harmony/vines/{N}/authority` (§6). Additive: absent on the wire when
+    /// the device has not migrated a feed, so pre-migration peers are unaffected.
+    #[serde(rename = "fb", default, skip_serializing_if = "Option::is_none")]
+    pub feed_binding: Option<String>,
 }
 
 /// A fleet-synced device petname (ZEB-668 S4). Assigned by ANY of the
@@ -375,6 +388,7 @@ mod tests {
             iroh_endpoint_id: [ep_byte; 32],
             home_relay: relay.into(),
             seen_at,
+            feed_binding: None,
         }
     }
 
@@ -414,6 +428,36 @@ mod tests {
         );
         assert_eq!(local.devices["dev-a"].seen_at.wall_ms, 20);
         assert_eq!(local.devices["dev-a"].home_relay, "relay.newer.com");
+    }
+
+    #[test]
+    fn feed_binding_cbor_roundtrips_and_omits_when_none() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+        let mut r = row(0x01, "relay.example.com", hlc(5, "dev-a"));
+        assert!(r.feed_binding.is_none());
+        let none_bytes = canonical_cbor_encode(&r).expect("encode none");
+        // Additive: the `fb` key is omitted when None, so pre-migration rows
+        // stay byte-identical to what old builds produce.
+        assert!(
+            !none_bytes.windows(2).any(|w| w == b"fb"),
+            "fb key omitted when feed_binding is None"
+        );
+        assert_eq!(
+            canonical_cbor_decode::<FleetNetRow>(&none_bytes).unwrap(),
+            r
+        );
+
+        // With a binding (an opaque JSON string — NOT a nested map, so the
+        // canonical-CBOR same-length-key contract is unaffected) it round-trips
+        // deterministically.
+        r.feed_binding = Some(r#"{"feedId":"aa","ownerId":"bb"}"#.to_string());
+        let bytes = canonical_cbor_encode(&r).expect("encode some");
+        assert_eq!(canonical_cbor_decode::<FleetNetRow>(&bytes).unwrap(), r);
+        assert_eq!(
+            canonical_cbor_encode(&r).unwrap(),
+            bytes,
+            "same value encodes byte-identically"
+        );
     }
 
     #[test]
@@ -970,6 +1014,7 @@ mod tests {
                 logical: 0,
                 device_id: "dev-a".into(),
             },
+            feed_binding: None,
         };
         let row_b = FleetNetRow {
             iroh_endpoint_id: [0xBB; 32],
@@ -979,6 +1024,7 @@ mod tests {
                 logical: 0,
                 device_id: "dev-b".into(),
             },
+            feed_binding: None,
         };
 
         let mut doc = FleetNetDoc::default();
