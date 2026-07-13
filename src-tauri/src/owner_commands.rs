@@ -100,8 +100,11 @@ pub(crate) enum RevocationPlan {
     /// Target is already revoked. `is_self` lets the caller complete a
     /// PENDING terminal transition — a prior self-revoke that mutated the
     /// doc but failed at flush must converge on retry (CodeRabbit PR #452).
+    /// `target` (the resolved device_id) lets that retry re-publish the feed
+    /// cut-off from the stored `RevocationCert` (ZEB-678 S3).
     AlreadyRevoked {
         is_self: bool,
+        target: [u8; 16],
     },
     Planned(Box<PlannedRevocation>),
 }
@@ -134,7 +137,7 @@ pub(crate) fn plan_revocation(
     let self_id = crate::owner_state::device_id_from_signing_key(device_signing_key);
     let is_self = target == self_id;
     if state.is_revoked(target) {
-        return Ok(RevocationPlan::AlreadyRevoked { is_self });
+        return Ok(RevocationPlan::AlreadyRevoked { is_self, target });
     }
     // Last-device guard: the CALLER is demonstrably alive (it is making this
     // call), so revoking a sibling can never leave the account with zero
@@ -777,6 +780,59 @@ pub(crate) async fn get_owner_state_inner(
     .await
 }
 
+/// ZEB-678 S3: find the stamped `feed_binding` for the device whose harmony-owner
+/// `device_id` (16-byte, hex) equals `target_device_id_hex`, by scanning fleet-net
+/// rows and parsing each row's authority record. `None` ⇒ that device never
+/// migrated a feed (honest residual §8 — nothing to cut). Keyed on the *parsed*
+/// `device_id`, not the row's SP1 key, so no owner↔SP1 id mapping is needed.
+fn feed_binding_for_device(
+    doc: &crate::fleet_net::FleetNetDoc,
+    target_device_id_hex: &str,
+) -> Option<String> {
+    doc.devices.values().find_map(|row| {
+        let fb = row.feed_binding.as_ref()?;
+        let rec: crate::feed_authority::FeedAuthorityRecord = serde_json::from_str(fb).ok()?;
+        (rec.device_id == target_device_id_hex).then(|| fb.clone())
+    })
+}
+
+/// ZEB-678 S3: publish a revoked device's feed cut-off. Reads its stamped active
+/// binding from the replicated fleet-net doc, appends `revocation`, and republishes
+/// to `harmony/vines/{N}/authority`. Idempotent (sticky-revoked on the follower).
+/// `Ok(true)` ⇒ published; `Ok(false)` ⇒ no migrated feed. Never fatal to revoke.
+async fn publish_feed_revocation(
+    publish_tx: &tokio::sync::mpsc::Sender<crate::event_loop::PublishRequest>,
+    fleet_net_doc: &std::sync::Arc<tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>>,
+    revocation: &RevocationCert,
+    now_ms: u64,
+) -> Result<bool, String> {
+    let target_hex = hex::encode(revocation.target);
+    let feed_binding = {
+        let doc = fleet_net_doc.lock().await;
+        feed_binding_for_device(&doc, &target_hex)
+    };
+    let Some(fb) = feed_binding else {
+        return Ok(false);
+    };
+    let (feed_id, rec_json) =
+        crate::feed_authority::build_revoked_authority(&fb, revocation, now_ms)?;
+    let key_expr = format!("harmony/vines/{feed_id}/authority");
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    publish_tx
+        .send(crate::event_loop::PublishRequest {
+            key_expr,
+            payload: rec_json.into_bytes(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "vine authority: event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "vine authority: event loop dropped publish".to_string())?
+        .map_err(|e| format!("vine authority: publish rejected: {e}"))?;
+    Ok(true)
+}
+
 /// ZEB-668 S2. Self-revoke ordering is load-bearing (spec §3): sign → add →
 /// persist → publish+flush → terminal state + engine halt. The initiating
 /// device must not wait for its own merge callback.
@@ -788,7 +844,18 @@ pub(crate) async fn revoke_device_inner(
     reason: String,
 ) -> Result<(), String> {
     // Snapshot handles under the std lock; drop before any await.
-    let (trust_doc, trust_engine, identity_dir, revoked_flag, owner_sync, fleet_net, retire_nudge) = {
+    #[allow(clippy::type_complexity)]
+    let (
+        trust_doc,
+        trust_engine,
+        identity_dir,
+        revoked_flag,
+        owner_sync,
+        fleet_net,
+        retire_nudge,
+        publish_tx,
+        fleet_net_doc,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -800,6 +867,8 @@ pub(crate) async fn revoke_device_inner(
             g.sync_engine.clone(),
             g.fleet_net_sync.clone(),
             g.community_device_retire_nudge.clone(),
+            g.publish_tx.clone(),
+            g.fleet_net_doc.clone(),
         )
     };
     // ZEB-668 S5: carrier handles for the post-revoke epoch bump (master
@@ -838,6 +907,12 @@ pub(crate) async fn revoke_device_inner(
         Some(doc) => doc.lock().await.clone(),
         None => loaded.state.clone(),
     };
+    // ZEB-678 S3: LWW clock (HLC wall_ms) for the revoked authority republish,
+    // shared by the retry arm and the main path below.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
     let planned = match plan_revocation(
         &trust_snapshot,
         &loaded.device_signing_key,
@@ -847,8 +922,11 @@ pub(crate) async fn revoke_device_inner(
         now_unix(),
     )? {
         RevocationPlan::Planned(p) => p,
-        RevocationPlan::AlreadyRevoked { is_self: false } => return Ok(()), // idempotent
-        RevocationPlan::AlreadyRevoked { is_self: true } => {
+        RevocationPlan::AlreadyRevoked { is_self: false, .. } => return Ok(()), // idempotent
+        RevocationPlan::AlreadyRevoked {
+            is_self: true,
+            target,
+        } => {
             // The doc already carries our own revocation but the terminal
             // transition may be PENDING — a prior self-revoke that failed
             // between mutation and flush would otherwise strand this device
@@ -861,6 +939,19 @@ pub(crate) async fn revoke_device_inner(
                 engine.flush_now().await.map_err(|e| {
                     format!("self-revocation staged but not yet published (will retry): {e}")
                 })?;
+            }
+            // ZEB-678 S3: a self-revoke that added the revocation but died before
+            // publishing its feed cut-off must re-publish it on retry — followers
+            // key on the authority cache, not the trust doc. Idempotent (sticky-
+            // revoked on the follower); reuses the stored cert, no re-signing.
+            if let (Some(publish_tx), Some(fleet_net_doc)) = (&publish_tx, &fleet_net_doc) {
+                if let Some(rev) = trust_snapshot.revocations.cert_for(target).cloned() {
+                    if let Err(e) =
+                        publish_feed_revocation(publish_tx, fleet_net_doc, &rev, now_ms).await
+                    {
+                        tracing::warn!(error = %e, "revoke_device retry: feed cut-off republish failed (non-fatal)");
+                    }
+                }
             }
             complete_self_revoke_terminal(
                 &revoked_flag,
@@ -875,6 +966,9 @@ pub(crate) async fn revoke_device_inner(
     };
     let is_self = planned.is_self;
     let cert = planned.cert;
+    // ZEB-678 S3: keep a copy for the feed cut-off — `cert` is moved into the
+    // add_revocation closure below.
+    let cert_for_feed = cert.clone();
 
     // Apply through the S1 substrate: resident doc + notify_dirty, or the
     // locked load→mutate→save path when the node is down.
@@ -915,6 +1009,26 @@ pub(crate) async fn revoke_device_inner(
                 ));
             }
             tracing::warn!(error = %e, "revoke_device: trust flush failed; dirty latch will retry");
+        }
+    }
+
+    // ZEB-678 S3: cut off the revoked device's migrated vine feed by republishing
+    // its stamped authority binding with the RevocationCert appended. Self-revoke
+    // (own feed, before the terminal engine-halt below) and master-revoke (the
+    // sibling's replicated feed_binding) share this one path. Best-effort +
+    // non-fatal: a device that never migrated a feed has nothing to cut, and a
+    // publish failure never fails the revoke (the trust revocation still landed).
+    if let (Some(publish_tx), Some(fleet_net_doc)) = (&publish_tx, &fleet_net_doc) {
+        match publish_feed_revocation(publish_tx, fleet_net_doc, &cert_for_feed, now_ms).await {
+            Ok(true) => {
+                tracing::info!(target = %device_vk_hex, "revoke_device: published vine feed cut-off")
+            }
+            Ok(false) => {
+                tracing::debug!("revoke_device: revoked device has no migrated vine feed to cut")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "revoke_device: vine feed cut-off publish failed (non-fatal)")
+            }
         }
     }
 
@@ -2028,6 +2142,317 @@ mod revoke_tests {
         (state, a_sk, seed, b_sk, hex::encode(b_vk))
     }
 
+    /// Return the enrollment cert whose classical ed25519 matches `sk`.
+    fn cert_for_sk<'a>(
+        state: &'a OwnerState,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> &'a harmony_owner::certs::EnrollmentCert {
+        let vk = sk.verifying_key().to_bytes();
+        state
+            .enrollments
+            .values()
+            .find(|c| c.device_pubkeys.classical.ed25519_verify == vk)
+            .expect("enrollment for signing key")
+    }
+
+    /// Stamp a device's active feed_binding into a fleet-net row so the revoke
+    /// path can find + cut its feed. Returns the feed_id (N).
+    fn stamp_test_feed_binding(
+        doc: &mut crate::fleet_net::FleetNetDoc,
+        sp1_key: &str,
+        device_cert: &harmony_owner::certs::EnrollmentCert,
+        device_sk: &ed25519_dalek::SigningKey,
+    ) -> String {
+        let n = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let rec = crate::feed_authority::build_active_authority(&n, device_sk, device_cert, 1_000)
+            .expect("build active authority");
+        let feed_id = rec.feed_id.clone();
+        let json = serde_json::to_string(&rec).unwrap();
+        doc.devices.insert(
+            sp1_key.to_string(),
+            crate::fleet_net::FleetNetRow {
+                iroh_endpoint_id: [0u8; 32],
+                home_relay: String::new(),
+                seen_at: crate::owner_state_types::Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: String::new(),
+                },
+                feed_binding: Some(json),
+            },
+        );
+        feed_id
+    }
+
+    /// Shared log of `(key_expr, payload)` pairs a publish-drain task records.
+    type PublishLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Drain `publish_rx`, recording `(key_expr, payload)` and acking each
+    /// request. Returns `(join_handle, shared_log)`.
+    fn spawn_publish_drain(
+        mut publish_rx: tokio::sync::mpsc::Receiver<crate::event_loop::PublishRequest>,
+    ) -> (tokio::task::JoinHandle<()>, PublishLog) {
+        let log: PublishLog = Default::default();
+        let log_c = log.clone();
+        let h = tokio::spawn(async move {
+            while let Some(req) = publish_rx.recv().await {
+                log_c
+                    .lock()
+                    .unwrap()
+                    .push((req.key_expr.clone(), req.payload.clone()));
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        (h, log)
+    }
+
+    #[test]
+    fn feed_binding_for_device_finds_matching_row_and_skips_others() {
+        use crate::fleet_net::{FleetNetDoc, FleetNetRow};
+        use crate::owner_state_types::Hlc;
+        let make_binding = |device_id_hex: &str| {
+            serde_json::json!({
+                "feedId": "feed-abcd",
+                "ownerId": "00".repeat(16),
+                "deviceId": device_id_hex,
+                "publisherKey": "11".repeat(32),
+                "nIdentityPub": "22".repeat(64),
+                "enrollmentCborHex": "aa",
+                "updatedAt": 1u64,
+                "nSig": "33".repeat(64),
+            })
+            .to_string()
+        };
+        let row = |fb: Option<String>| FleetNetRow {
+            iroh_endpoint_id: [0u8; 32],
+            home_relay: String::new(),
+            seen_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: String::new(),
+            },
+            feed_binding: fb,
+        };
+        let mut doc = FleetNetDoc::default();
+        doc.devices.insert("sp1-a".into(), row(None));
+        let match_id = "ab".repeat(16);
+        doc.devices
+            .insert("sp1-b".into(), row(Some(make_binding(&match_id))));
+        doc.devices
+            .insert("sp1-c".into(), row(Some("garbage".into())));
+
+        assert!(feed_binding_for_device(&doc, &match_id).is_some());
+        assert!(feed_binding_for_device(&doc, &"cd".repeat(16)).is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_device_inner_master_revoke_publishes_feed_cutoff() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let now = 1_700_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, a_sk, seed, b_sk, b_vk_hex) = two_device_fixture(now);
+        let b_cert = cert_for_sk(&state, &b_sk).clone();
+        save_owner_state_atomic(dir.path(), &state, &a_sk, Some(&seed), None).unwrap();
+
+        let mut fleet_doc = crate::fleet_net::FleetNetDoc::default();
+        let feed_id = stamp_test_feed_binding(&mut fleet_doc, "sp1-b", &b_cert, &b_sk);
+        let fleet_net_doc = std::sync::Arc::new(tokio::sync::Mutex::new(fleet_doc));
+
+        let (publish_tx, publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+        let (drain, published) = spawn_publish_drain(publish_rx);
+
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            publish_tx: Some(publish_tx),
+            fleet_net_doc: Some(fleet_net_doc),
+            ..crate::NodeState::default()
+        });
+
+        revoke_device_inner(
+            &node,
+            || None,
+            std::sync::Arc::new(|_: &str| {}),
+            b_vk_hex,
+            "lost".into(),
+        )
+        .await
+        .unwrap();
+
+        drop(node);
+        drain.await.unwrap();
+
+        let pubs = published.lock().unwrap();
+        let want_key = format!("harmony/vines/{feed_id}/authority");
+        let hit = pubs
+            .iter()
+            .find(|(k, _)| *k == want_key)
+            .expect("feed cut-off published");
+        let rec: crate::feed_authority::FeedAuthorityRecord =
+            serde_json::from_slice(&hit.1).unwrap();
+        let v = crate::feed_authority::verify_authority(&rec, now).expect("cut-off verifies");
+        assert!(v.revoked, "published authority marks B revoked");
+    }
+
+    #[tokio::test]
+    async fn revoke_device_inner_no_feed_binding_publishes_nothing() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let now = 1_700_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, a_sk, seed, _b_sk, b_vk_hex) = two_device_fixture(now);
+        save_owner_state_atomic(dir.path(), &state, &a_sk, Some(&seed), None).unwrap();
+
+        let fleet_net_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::fleet_net::FleetNetDoc::default(),
+        ));
+        let (publish_tx, publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+        let (drain, published) = spawn_publish_drain(publish_rx);
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            publish_tx: Some(publish_tx),
+            fleet_net_doc: Some(fleet_net_doc),
+            ..crate::NodeState::default()
+        });
+        revoke_device_inner(
+            &node,
+            || None,
+            std::sync::Arc::new(|_: &str| {}),
+            b_vk_hex,
+            "lost".into(),
+        )
+        .await
+        .unwrap();
+        drop(node);
+        drain.await.unwrap();
+        assert!(
+            published.lock().unwrap().is_empty(),
+            "no publish when no feed"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_device_inner_self_revoke_publishes_cutoff_before_terminal() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        // Enroll recently so both devices are active at wall-clock now — the
+        // self-revoke `lastDevice` guard is evaluated against the real clock.
+        let now = now_unix() - 60;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _a_sk, _seed, b_sk, b_vk_hex) = two_device_fixture(now);
+        let b_cert = cert_for_sk(&state, &b_sk).clone();
+        // Persist as B, cert-only (no seed) → self-revoke path.
+        save_owner_state_atomic(dir.path(), &state, &b_sk, None, None).unwrap();
+
+        let mut fleet_doc = crate::fleet_net::FleetNetDoc::default();
+        let feed_id = stamp_test_feed_binding(&mut fleet_doc, "sp1-b", &b_cert, &b_sk);
+        let fleet_net_doc = std::sync::Arc::new(tokio::sync::Mutex::new(fleet_doc));
+
+        let (publish_tx, mut publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+        let log: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let log_pub = log.clone();
+        let drain = tokio::spawn(async move {
+            while let Some(req) = publish_rx.recv().await {
+                log_pub
+                    .lock()
+                    .unwrap()
+                    .push(format!("publish:{}", req.key_expr));
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        let log_emit = log.clone();
+        let emit = std::sync::Arc::new(move |name: &str| {
+            log_emit.lock().unwrap().push(format!("emit:{name}"));
+        });
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            publish_tx: Some(publish_tx),
+            fleet_net_doc: Some(fleet_net_doc),
+            ..crate::NodeState::default()
+        });
+        revoke_device_inner(&node, || None, emit, b_vk_hex, "decommissioned".into())
+            .await
+            .unwrap();
+        drop(node);
+        drain.await.unwrap();
+
+        let events = log.lock().unwrap();
+        let pub_idx = events
+            .iter()
+            .position(|e| e == &format!("publish:harmony/vines/{feed_id}/authority"))
+            .expect("feed cut-off published");
+        let term_idx = events
+            .iter()
+            .position(|e| e == "emit:device-revoked-self")
+            .expect("terminal emitted");
+        assert!(
+            pub_idx < term_idx,
+            "feed cut-off must publish before terminal halt"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_device_inner_retry_republishes_self_feed_cutoff() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let now = 1_700_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _a_sk, _seed, b_sk, b_vk_hex) = two_device_fixture(now);
+        let b_cert = cert_for_sk(&state, &b_sk).clone();
+        let b_target = crate::owner_state::device_id_from_signing_key(&b_sk);
+
+        // Strand B's self-revocation into the doc (added, terminal not latched).
+        let cert = RevocationCert::sign_self(
+            &b_sk,
+            state.owner_id,
+            b_target,
+            now,
+            RevocationReason::Decommissioned,
+        )
+        .unwrap();
+        state
+            .add_revocation(cert, now, trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        save_owner_state_atomic(dir.path(), &state, &b_sk, None, None).unwrap();
+
+        let trust_doc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+
+        let mut fleet_doc = crate::fleet_net::FleetNetDoc::default();
+        let feed_id = stamp_test_feed_binding(&mut fleet_doc, "sp1-b", &b_cert, &b_sk);
+        let fleet_net_doc = std::sync::Arc::new(tokio::sync::Mutex::new(fleet_doc));
+
+        let (publish_tx, publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+        let (drain, published) = spawn_publish_drain(publish_rx);
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            owner_trust_doc: Some(trust_doc),
+            publish_tx: Some(publish_tx),
+            fleet_net_doc: Some(fleet_net_doc),
+            ..crate::NodeState::default()
+        });
+        revoke_device_inner(
+            &node,
+            || None,
+            std::sync::Arc::new(|_: &str| {}),
+            b_vk_hex,
+            "decommissioned".into(),
+        )
+        .await
+        .unwrap();
+        drop(node);
+        drain.await.unwrap();
+
+        let want_key = format!("harmony/vines/{feed_id}/authority");
+        assert!(
+            published
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(k, _)| *k == want_key),
+            "retry arm republishes the self feed cut-off"
+        );
+    }
+
     #[test]
     fn parse_revoke_reason_maps_wire_values() {
         assert_eq!(
@@ -3049,7 +3474,10 @@ mod revoke_tests {
         let second =
             plan_revocation(&state, &a_sk, Some(&seed), &b_vk_hex, "lost", now + 1).unwrap();
         assert!(
-            matches!(second, RevocationPlan::AlreadyRevoked { is_self: false }),
+            matches!(
+                second,
+                RevocationPlan::AlreadyRevoked { is_self: false, .. }
+            ),
             "idempotent no-op: {second:?}"
         );
     }
