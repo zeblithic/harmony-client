@@ -1536,6 +1536,44 @@ impl DmOutbox {
         }
     }
 
+    /// ZEB-580 S1: the full material an outbound *bootstrap invite* signs with —
+    /// the [`dm_signing_material`](Self::dm_signing_material) `(key, device-hash)`
+    /// pair PLUS the self-consistent `inviter_identity_pub` (the cert's #2 combined
+    /// pub on the enrolled path, so
+    /// `derive_device_hash_from_identity_pub(inviter_identity_pub) == device-hash`,
+    /// which Task 3's receiver Check B asserts) and the attached #2
+    /// `EnrollmentCert` (boxed to keep the `DmPacket::Invite` variant small).
+    ///
+    /// The single source of truth for the invite #2/#3 selection:
+    /// `build_invite_packet_bytes` (the deposit rung) AND `add_space`'s live
+    /// invite send (lib.rs Task 6) both route through this, so a #2-only receiver
+    /// can never see one copy of an invite signed #2 and its sibling signed #3.
+    /// Degrades to the legacy #3 transport identity (inline #3 pub, no cert) when
+    /// no enrolled identity is usable — preserving pre-migration wire bytes
+    /// exactly (the #3 pub is `private_identity`'s combined pub, bit-identical to
+    /// `start_node`'s captured `identity_pub_64`).
+    pub(crate) fn dm_invite_material(
+        &self,
+    ) -> (
+        &Arc<ed25519_dalek::SigningKey>,
+        DeviceIdentityHash,
+        [u8; 64],
+        Option<Box<harmony_owner::certs::EnrollmentCert>>,
+    ) {
+        let (key, dh) = self.dm_signing_material();
+        let (inviter_identity_pub, inviter_enrollment) = match self.our_device2_signing_hash {
+            Some(_) => (
+                crate::dm_signing::device2_combined_pub(&self.enrollment_cert),
+                Some(Box::new(self.enrollment_cert.clone())),
+            ),
+            None => (
+                self.private_identity.public_identity().to_public_bytes(),
+                None,
+            ),
+        };
+        (key, dh, inviter_identity_pub, inviter_enrollment)
+    }
+
     /// ZEB-418 P1 Task 8 / ZEB-506: build the signed CidNotify wire bytes for a
     /// deposit. Carries the sender's FULL cached device set via
     /// [`resolve_sender_devices`] (NOT a bare singleton): the recipient's
@@ -1599,18 +1637,9 @@ impl DmOutbox {
         // (so `derive_device_hash_from_identity_pub(inviter_identity_pub) ==
         // signing_device_hash`, which Task 3's receiver Check B asserts). Degrade
         // to the legacy #3 transport identity with NO attached cert otherwise —
-        // preserving pre-migration wire bytes exactly.
-        let (key, dh) = self.dm_signing_material();
-        let (inviter_identity_pub, inviter_enrollment) = match self.our_device2_signing_hash {
-            Some(_) => (
-                crate::dm_signing::device2_combined_pub(&self.enrollment_cert),
-                Some(Box::new(self.enrollment_cert.clone())),
-            ),
-            None => (
-                self.private_identity.public_identity().to_public_bytes(),
-                None,
-            ),
-        };
+        // preserving pre-migration wire bytes exactly. `dm_invite_material` is the
+        // single source of truth shared with `add_space`'s live send (Task 6).
+        let (key, dh, inviter_identity_pub, inviter_enrollment) = self.dm_invite_material();
         // ZEB-504: delegate to the shared free fn so the deposit rung and the
         // live-tunnel transport rebuild the bootstrap invite identically.
         build_invite_packet_from_space(

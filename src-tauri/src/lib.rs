@@ -4709,6 +4709,33 @@ pub async fn start_node_inner(
                         std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed25519_seed));
                     let our_signing_device_hash =
                         crate::owner_state_types::DeviceIdentityHash(our_addr_bytes);
+                    // ZEB-580 S1 Task 6: the #2 (enrolled) DM identity material for
+                    // the live iroh-tunnel transport, built far below once the
+                    // `TunnelManager` exists. The tunnel's `send` signs CidNotify
+                    // bodies with its `signing_key` + `our_signing_device_hash` and
+                    // rebuilds bootstrap invites with its `inviter_identity_pub`, so
+                    // ALL THREE must be #2 when a usable enrolled identity exists —
+                    // mirroring `DmOutbox`'s own #2 selection (`dm_signing_material` /
+                    // `dm_invite_material`) so the tunnel copy and the deposit copy are
+                    // byte-consistent for a #2-only receiver. Computed HERE, before
+                    // `own_enrollment_cert` is moved into `DmOutbox::new` below; falls
+                    // back to the #3 transport identity (`signing_key_arc` /
+                    // `our_signing_device_hash` / `identity_pub_64`) when the cert
+                    // lacks a usable #2 X25519 (pre-ZEB-372 stub / degenerate
+                    // synthetic cert).
+                    let (dm_tunnel_sign_key_arc, dm_tunnel_sign_hash, dm_tunnel_inviter_pub) =
+                        match crate::dm_signing::device2_signing_hash(&own_enrollment_cert) {
+                            Some(h) => (
+                                community_signing_key_arc.clone(),
+                                h,
+                                crate::dm_signing::device2_combined_pub(&own_enrollment_cert),
+                            ),
+                            None => (
+                                signing_key_arc.clone(),
+                                our_signing_device_hash,
+                                identity_pub_64,
+                            ),
+                        };
                     let outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
                         crate::dm_outbox::DmOutbox::new(
                             device_id.clone(),
@@ -10123,12 +10150,16 @@ pub async fn start_node_inner(
                             crate::iroh_tunnel_dm_transport::IrohTunnelDmTransport::new(
                                 std::sync::Arc::clone(tunnel_mgr),
                                 std::sync::Arc::clone(&crdt_state),
-                                signing_key_arc.clone(),
+                                // ZEB-580 S1 Task 6: #2 (enrolled) DM material
+                                // (community key + cert's #2 combined pub + #2 hash)
+                                // when available, else the #3 transport identity —
+                                // computed above before the cert moved into DmOutbox.
+                                // Signs the tunnel's CidNotify bodies AND its rebuilt
+                                // bootstrap DmInvite consistently with the deposit rung.
+                                dm_tunnel_sign_key_arc.clone(),
                                 self_owner,
-                                our_signing_device_hash,
-                                // ZEB-504: this node's device-Identity pubs so the
-                                // live tunnel can rebuild a bootstrap DmInvite.
-                                identity_pub_64,
+                                dm_tunnel_sign_hash,
+                                dm_tunnel_inviter_pub,
                                 std::sync::Arc::clone(&content_store),
                             ),
                         );
@@ -13198,6 +13229,11 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
 #[allow(clippy::type_complexity)]
 pub fn add_space_dm_inner(
     state: &mut crate::owner_state_crdt::OwnerState,
+    // ZEB-580 S1 Task 6: these three carry the DM-invite SIGNING identity —
+    // the enrolled #2 identity (community key / cert's #2 combined pub / #2 DM
+    // hash) when the caller has one, else the legacy #3 transport identity. The
+    // caller pairs them with `inviter_enrollment` below (`Some(cert)` on the #2
+    // path, `None` on #3) so the emitted invite is self-consistent.
     signing_key: &ed25519_dalek::SigningKey,
     inviter_identity_pub: &[u8; 64],
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -13208,6 +13244,11 @@ pub fn add_space_dm_inner(
     recipients: Vec<crate::owner_state_types::OwnerAddr>,
     wall_now_ms: u64,
     prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    // ZEB-580 S1 Task 6: our own #2 `EnrollmentCert` to attach to the invite so
+    // an updated receiver verifies it via the master-attested cert (Task 3 Check
+    // B). `Some` on the #2 path (paired with the #2 signing identity above),
+    // `None` on the #3 fallback (preserves pre-migration wire bytes exactly).
+    inviter_enrollment: Option<Box<harmony_owner::certs::EnrollmentCert>>,
 ) -> Result<
     (
         crate::owner_state_types::SpaceId,
@@ -13390,31 +13431,36 @@ pub fn add_space_dm_inner(
         return Ok((canonical_space_id, None));
     }
 
-    // ── 7. Build + sign the DmInvite. Our own devices come from
-    //       OwnerDeviceCache (populated by Flow A); fall back to just
-    //       our_signing_device_hash if no entry yet (pre-bootstrap).
-    //       ZEB-504: shared with the live-tunnel invite-rebuild path so the
-    //       two can never diverge (a divergence shrank the receiver's cached
-    //       device set — see `resolve_sender_devices`). ──
-    let sender_devices =
-        crate::dm_outbox::resolve_sender_devices(state, self_owner, our_signing_device_hash);
-
-    let signed_invite = crate::dm_envelope::DmInviteSigned {
-        space_id: canonical_space_id,
-        kind,
-        members: all_members,
-        inviter: self_owner,
-        inviter_identity_pub: *inviter_identity_pub,
-        inviter_enrollment: None,
-        content_key,
-        sender_devices,
-        signing_device_hash: our_signing_device_hash,
-        created_at: creation_hlc.clone(),
-    };
-    let invite_packet = crate::dm_envelope::build_signed_invite(signed_invite, signing_key)
-        .map_err(|e| format!("build_signed_invite: {e}"))?;
-    let invite_wire = crate::dm_envelope::encode_packet(&invite_packet)
-        .map_err(|e| format!("encode_packet: {e}"))?;
+    // ── 7. Build + sign the DmInvite. ZEB-580 S1 Task 6: route through the
+    //       SHARED `build_invite_packet_from_space` builder (reading the Space we
+    //       just applied above) instead of hand-constructing the packet, so this
+    //       live send, the deposit rung (`build_invite_packet_bytes`), and the
+    //       live-tunnel rebuild (`build_bootstrap_invite`) emit byte-identical
+    //       invites — same `sender_devices` (ZEB-504: `resolve_sender_devices`,
+    //       never a shrinking singleton) AND the same #2/#3 signing identity +
+    //       attached cert. The caller passes the #2 material (signing_key /
+    //       inviter_identity_pub / our_signing_device_hash / inviter_enrollment)
+    //       so a #2-only receiver accepts this copy. `Ok(None)` is unreachable
+    //       here — we only reach this on the fresh-Insert path, so the DM Space
+    //       exists with a content_key — but surface it as an error rather than
+    //       silently drop a load-bearing bootstrap invite.
+    let invite_wire = crate::dm_outbox::build_invite_packet_from_space(
+        state,
+        &canonical_space_id,
+        signing_key,
+        self_owner,
+        our_signing_device_hash,
+        *inviter_identity_pub,
+        inviter_enrollment,
+    )
+    .map_err(|e| format!("build_invite_packet_from_space: {e}"))?
+    .ok_or_else(|| {
+        format!(
+            "add_space_dm_inner: invite rebuild returned None for freshly-created \
+             DM space {canonical_space_id:?} (invariant broken: just applied as \
+             Dm/GroupDm with a content_key)"
+        )
+    })?;
 
     // ── 7b. ZEB-505: mint a DURABLE invite-only OutboxEntry so the bootstrap
     //       invite is RETRIED + DEPOSITED independently of any message. The
@@ -13547,7 +13593,6 @@ pub(crate) async fn add_space_impl(
         hlc_tracker,
         device_id,
         self_owner,
-        identity_pub_64,
         tunnel_manager,
         snapshot_generation,
     ) = {
@@ -13560,8 +13605,11 @@ pub(crate) async fn add_space_impl(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing (start_node didn't capture it?)")?,
+            // ZEB-580 S1 Task 6: the invite's bootstrap `inviter_identity_pub` is
+            // no longer sourced from NodeState here — it now comes (with the #2
+            // signing identity + cert) from `outbox_g.dm_invite_material()` below,
+            // so a #2-only receiver accepts the invite. `dm_identity_pub_64` stays
+            // on NodeState for the other consumers (send_dm etc.).
             // ZEB-482: the PQ tunnel manager (ZEB-473). `None` on a deposit-only
             // node (no bound iroh endpoint) — the invite tunnel-send is then a
             // no-op; the Space is still applied locally (ZEB-483 adds the
@@ -13577,8 +13625,10 @@ pub(crate) async fn add_space_impl(
         .as_millis() as u64;
 
     // Lock order mirrors send_dm: dm_outbox → crdt_state → hlc_tracker.
-    // We borrow signing_key + our_signing_device_hash from DmOutbox so
-    // we don't double-store identity-derived material on NodeState.
+    // We borrow the DM-invite signing material from DmOutbox (via
+    // `dm_invite_material`, ZEB-580 S1 Task 6) so we don't double-store
+    // identity-derived material on NodeState AND the #2/#3 selection stays
+    // identical to the deposit rung.
     //
     // A `None` `fanout` from the inner function tells us
     // apply_space_with_canonicalization collapsed our minted Space into
@@ -13592,8 +13642,14 @@ pub(crate) async fn add_space_impl(
         let mut tracker_g = hlc_tracker.lock().await;
         let prev_hlc = tracker_g.get(&device_id).cloned();
 
-        let signing_key = outbox_g.signing_key.as_ref();
-        let our_signing_device_hash = outbox_g.our_signing_device_hash;
+        // ZEB-580 S1 Task 6: source the DM-invite signing identity from the outbox
+        // via the SHARED `dm_invite_material` selector — the enrolled #2 identity
+        // (community key / cert's #2 combined pub / #2 DM hash / attached #2 cert)
+        // when a usable enrolled identity exists, else the legacy #3 transport
+        // identity with no cert. Identical selection to the deposit rung
+        // (`build_invite_packet_bytes`) so this live copy and the deposited copy
+        // are #2-consistent for a #2-only receiver.
+        let (inv_key, inv_hash, inv_pub, inv_enrollment) = outbox_g.dm_invite_material();
 
         // ZEB-482 (Move 1b): `add_space_dm_inner` returns the invite fan-out
         // (`Some((invite_wire, recipients))` on a fresh create, `None` on a
@@ -13602,16 +13658,17 @@ pub(crate) async fn add_space_impl(
         // owner-state locks).
         let (canonical_id, fanout) = add_space_dm_inner(
             &mut state_g,
-            signing_key,
-            &identity_pub_64,
+            inv_key.as_ref(),
+            &inv_pub,
             self_owner,
-            our_signing_device_hash,
+            inv_hash,
             &device_id,
             parsed_kind,
             name,
             recipients,
             wall_now_ms,
             prev_hlc.as_ref(),
+            inv_enrollment,
         )?;
 
         // Fetch the HLC stamped on the canonical Space — single source
