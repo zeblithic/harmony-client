@@ -216,8 +216,11 @@ or a DmInvite (bootstrap-ordering trace confirms first-contact CidNotify/Ack nev
 `verify_dm_packet_signature` is unchanged. Dual-path lives in the **resolution** step:
 `lookup_pubkey_for_device` returns whatever combined pub is cached for the wire
 `signing_device_hash` — a #3 pub for a legacy peer, a #2 pub for a bootstrapped-under-#2 peer. Both
-verify identically. The cache can hold **both** a peer's #3 and #2 entries during transition
-(different hashes, different vec slots); neither evicts the other.
+verify identically. In practice the friend-handshake cache write is **LWW-replace** and stores only
+the cert-derived #2 singleton (the safer direction — no stale #3 entry lingers): a legacy #3 entry
+cached *before* the flag-day persists only until that peer re-handshakes, at which point #2 replaces
+it. So "dual-path" means the receiver can verify *either* a #3-cached legacy peer *or* a #2
+bootstrapped peer — not that one owner's entry holds both keys at once.
 
 ### 4.6 Cache: additive #2 entries, first-write-wins per hash
 
@@ -238,7 +241,7 @@ seeds the peer's #2 identity). **No opportunistic identity-refresh machinery is 
 of that complexity is exactly what the flag-day is for.
 
 - **Dual-path receive is retained** — it is *free* (the receiver verifies a packet against whatever
-  pub it holds for that hash, #3 or #2; the cache can hold both). This is not extra machinery, it is
+  pub it holds for that hash, #3 or #2). This is not extra machinery, it is
   simply not ripping out the #3 verify path in this slice: it keeps the flag-day window graceful and
   lets a node still read a legacy #3 DM it had already bootstrapped. #3 body-verify is removed only
   if/when a later cleanup ticket retires the transport-identity concept (N4).
