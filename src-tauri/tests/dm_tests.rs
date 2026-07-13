@@ -18,6 +18,8 @@
 
 #[path = "dm/channel_backfill_integration.rs"]
 mod channel_backfill_integration;
+#[path = "dm/dm_cert_identity_integration.rs"]
+mod dm_cert_identity_integration;
 #[path = "dm/dm_create_integration.rs"]
 mod dm_create_integration;
 #[path = "dm/dm_ipc_roundtrip.rs"]

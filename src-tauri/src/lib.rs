@@ -4709,6 +4709,33 @@ pub async fn start_node_inner(
                         std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed25519_seed));
                     let our_signing_device_hash =
                         crate::owner_state_types::DeviceIdentityHash(our_addr_bytes);
+                    // ZEB-580 S1 Task 6: the #2 (enrolled) DM identity material for
+                    // the live iroh-tunnel transport, built far below once the
+                    // `TunnelManager` exists. The tunnel's `send` signs CidNotify
+                    // bodies with its `signing_key` + `our_signing_device_hash` and
+                    // rebuilds bootstrap invites with its `inviter_identity_pub`, so
+                    // ALL THREE must be #2 when a usable enrolled identity exists —
+                    // mirroring `DmOutbox`'s own #2 selection (`dm_signing_material` /
+                    // `dm_invite_material`) so the tunnel copy and the deposit copy are
+                    // byte-consistent for a #2-only receiver. Computed HERE, before
+                    // `own_enrollment_cert` is moved into `DmOutbox::new` below; falls
+                    // back to the #3 transport identity (`signing_key_arc` /
+                    // `our_signing_device_hash` / `identity_pub_64`) when the cert
+                    // lacks a usable #2 X25519 (pre-ZEB-372 stub / degenerate
+                    // synthetic cert).
+                    let (dm_tunnel_sign_key_arc, dm_tunnel_sign_hash, dm_tunnel_inviter_pub) =
+                        match crate::dm_signing::device2_signing_hash(&own_enrollment_cert) {
+                            Some(h) => (
+                                community_signing_key_arc.clone(),
+                                h,
+                                crate::dm_signing::device2_combined_pub(&own_enrollment_cert),
+                            ),
+                            None => (
+                                signing_key_arc.clone(),
+                                our_signing_device_hash,
+                                identity_pub_64,
+                            ),
+                        };
                     let outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
                         crate::dm_outbox::DmOutbox::new(
                             device_id.clone(),
@@ -10123,12 +10150,16 @@ pub async fn start_node_inner(
                             crate::iroh_tunnel_dm_transport::IrohTunnelDmTransport::new(
                                 std::sync::Arc::clone(tunnel_mgr),
                                 std::sync::Arc::clone(&crdt_state),
-                                signing_key_arc.clone(),
+                                // ZEB-580 S1 Task 6: #2 (enrolled) DM material
+                                // (community key + cert's #2 combined pub + #2 hash)
+                                // when available, else the #3 transport identity —
+                                // computed above before the cert moved into DmOutbox.
+                                // Signs the tunnel's CidNotify bodies AND its rebuilt
+                                // bootstrap DmInvite consistently with the deposit rung.
+                                dm_tunnel_sign_key_arc.clone(),
                                 self_owner,
-                                our_signing_device_hash,
-                                // ZEB-504: this node's device-Identity pubs so the
-                                // live tunnel can rebuild a bootstrap DmInvite.
-                                identity_pub_64,
+                                dm_tunnel_sign_hash,
+                                dm_tunnel_inviter_pub,
                                 std::sync::Arc::clone(&content_store),
                             ),
                         );
@@ -13198,6 +13229,11 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
 #[allow(clippy::type_complexity)]
 pub fn add_space_dm_inner(
     state: &mut crate::owner_state_crdt::OwnerState,
+    // ZEB-580 S1 Task 6: these three carry the DM-invite SIGNING identity —
+    // the enrolled #2 identity (community key / cert's #2 combined pub / #2 DM
+    // hash) when the caller has one, else the legacy #3 transport identity. The
+    // caller pairs them with `inviter_enrollment` below (`Some(cert)` on the #2
+    // path, `None` on #3) so the emitted invite is self-consistent.
     signing_key: &ed25519_dalek::SigningKey,
     inviter_identity_pub: &[u8; 64],
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -13208,6 +13244,11 @@ pub fn add_space_dm_inner(
     recipients: Vec<crate::owner_state_types::OwnerAddr>,
     wall_now_ms: u64,
     prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    // ZEB-580 S1 Task 6: our own #2 `EnrollmentCert` to attach to the invite so
+    // an updated receiver verifies it via the master-attested cert (Task 3 Check
+    // B). `Some` on the #2 path (paired with the #2 signing identity above),
+    // `None` on the #3 fallback (preserves pre-migration wire bytes exactly).
+    inviter_enrollment: Option<Box<harmony_owner::certs::EnrollmentCert>>,
 ) -> Result<
     (
         crate::owner_state_types::SpaceId,
@@ -13390,30 +13431,36 @@ pub fn add_space_dm_inner(
         return Ok((canonical_space_id, None));
     }
 
-    // ── 7. Build + sign the DmInvite. Our own devices come from
-    //       OwnerDeviceCache (populated by Flow A); fall back to just
-    //       our_signing_device_hash if no entry yet (pre-bootstrap).
-    //       ZEB-504: shared with the live-tunnel invite-rebuild path so the
-    //       two can never diverge (a divergence shrank the receiver's cached
-    //       device set — see `resolve_sender_devices`). ──
-    let sender_devices =
-        crate::dm_outbox::resolve_sender_devices(state, self_owner, our_signing_device_hash);
-
-    let signed_invite = crate::dm_envelope::DmInviteSigned {
-        space_id: canonical_space_id,
-        kind,
-        members: all_members,
-        inviter: self_owner,
-        inviter_identity_pub: *inviter_identity_pub,
-        content_key,
-        sender_devices,
-        signing_device_hash: our_signing_device_hash,
-        created_at: creation_hlc.clone(),
-    };
-    let invite_packet = crate::dm_envelope::build_signed_invite(signed_invite, signing_key)
-        .map_err(|e| format!("build_signed_invite: {e}"))?;
-    let invite_wire = crate::dm_envelope::encode_packet(&invite_packet)
-        .map_err(|e| format!("encode_packet: {e}"))?;
+    // ── 7. Build + sign the DmInvite. ZEB-580 S1 Task 6: route through the
+    //       SHARED `build_invite_packet_from_space` builder (reading the Space we
+    //       just applied above) instead of hand-constructing the packet, so this
+    //       live send, the deposit rung (`build_invite_packet_bytes`), and the
+    //       live-tunnel rebuild (`build_bootstrap_invite`) emit byte-identical
+    //       invites — same `sender_devices` (ZEB-504: `resolve_sender_devices`,
+    //       never a shrinking singleton) AND the same #2/#3 signing identity +
+    //       attached cert. The caller passes the #2 material (signing_key /
+    //       inviter_identity_pub / our_signing_device_hash / inviter_enrollment)
+    //       so a #2-only receiver accepts this copy. `Ok(None)` is unreachable
+    //       here — we only reach this on the fresh-Insert path, so the DM Space
+    //       exists with a content_key — but surface it as an error rather than
+    //       silently drop a load-bearing bootstrap invite.
+    let invite_wire = crate::dm_outbox::build_invite_packet_from_space(
+        state,
+        &canonical_space_id,
+        signing_key,
+        self_owner,
+        our_signing_device_hash,
+        *inviter_identity_pub,
+        inviter_enrollment,
+    )
+    .map_err(|e| format!("build_invite_packet_from_space: {e}"))?
+    .ok_or_else(|| {
+        format!(
+            "add_space_dm_inner: invite rebuild returned None for freshly-created \
+             DM space {canonical_space_id:?} (invariant broken: just applied as \
+             Dm/GroupDm with a content_key)"
+        )
+    })?;
 
     // ── 7b. ZEB-505: mint a DURABLE invite-only OutboxEntry so the bootstrap
     //       invite is RETRIED + DEPOSITED independently of any message. The
@@ -13546,7 +13593,6 @@ pub(crate) async fn add_space_impl(
         hlc_tracker,
         device_id,
         self_owner,
-        identity_pub_64,
         tunnel_manager,
         snapshot_generation,
     ) = {
@@ -13559,8 +13605,11 @@ pub(crate) async fn add_space_impl(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing (start_node didn't capture it?)")?,
+            // ZEB-580 S1 Task 6: the invite's bootstrap `inviter_identity_pub` is
+            // no longer sourced from NodeState here — it now comes (with the #2
+            // signing identity + cert) from `outbox_g.dm_invite_material()` below,
+            // so a #2-only receiver accepts the invite. `dm_identity_pub_64` stays
+            // on NodeState for the other consumers (send_dm etc.).
             // ZEB-482: the PQ tunnel manager (ZEB-473). `None` on a deposit-only
             // node (no bound iroh endpoint) — the invite tunnel-send is then a
             // no-op; the Space is still applied locally (ZEB-483 adds the
@@ -13576,8 +13625,10 @@ pub(crate) async fn add_space_impl(
         .as_millis() as u64;
 
     // Lock order mirrors send_dm: dm_outbox → crdt_state → hlc_tracker.
-    // We borrow signing_key + our_signing_device_hash from DmOutbox so
-    // we don't double-store identity-derived material on NodeState.
+    // We borrow the DM-invite signing material from DmOutbox (via
+    // `dm_invite_material`, ZEB-580 S1 Task 6) so we don't double-store
+    // identity-derived material on NodeState AND the #2/#3 selection stays
+    // identical to the deposit rung.
     //
     // A `None` `fanout` from the inner function tells us
     // apply_space_with_canonicalization collapsed our minted Space into
@@ -13591,8 +13642,14 @@ pub(crate) async fn add_space_impl(
         let mut tracker_g = hlc_tracker.lock().await;
         let prev_hlc = tracker_g.get(&device_id).cloned();
 
-        let signing_key = outbox_g.signing_key.as_ref();
-        let our_signing_device_hash = outbox_g.our_signing_device_hash;
+        // ZEB-580 S1 Task 6: source the DM-invite signing identity from the outbox
+        // via the SHARED `dm_invite_material` selector — the enrolled #2 identity
+        // (community key / cert's #2 combined pub / #2 DM hash / attached #2 cert)
+        // when a usable enrolled identity exists, else the legacy #3 transport
+        // identity with no cert. Identical selection to the deposit rung
+        // (`build_invite_packet_bytes`) so this live copy and the deposited copy
+        // are #2-consistent for a #2-only receiver.
+        let (inv_key, inv_hash, inv_pub, inv_enrollment) = outbox_g.dm_invite_material();
 
         // ZEB-482 (Move 1b): `add_space_dm_inner` returns the invite fan-out
         // (`Some((invite_wire, recipients))` on a fresh create, `None` on a
@@ -13601,16 +13658,17 @@ pub(crate) async fn add_space_impl(
         // owner-state locks).
         let (canonical_id, fanout) = add_space_dm_inner(
             &mut state_g,
-            signing_key,
-            &identity_pub_64,
+            inv_key.as_ref(),
+            &inv_pub,
             self_owner,
-            our_signing_device_hash,
+            inv_hash,
             &device_id,
             parsed_kind,
             name,
             recipients,
             wall_now_ms,
             prev_hlc.as_ref(),
+            inv_enrollment,
         )?;
 
         // Fetch the HLC stamped on the canonical Space — single source
@@ -50954,18 +51012,32 @@ fn build_self_handshake_reachability(
 /// the devices, reproducing the exact DM-routing gap ZEB-461 closes.
 ///
 /// `learned_at` is this node's local HLC (anti-forgery: never the peer's claimed
-/// time). An empty `sender_devices` is skipped so a peer that advertised nothing
+/// time). An empty derived bundle is skipped so a peer that advertised nothing
 /// never LWW-clobbers a previously-known-good cache entry.
+///
+/// ZEB-580 S1: the cached DM identity is the peer's **#2** identity derived from
+/// the already-verified `enrollment` cert (combined pub keyed by the #2 DM hash),
+/// NOT the self-asserted wire #3 bundle. Deriving it HERE (the single write point
+/// both dialer paths share) keeps them from drifting — the same reason the helper
+/// exists. The wire `sender_devices` / `device_identity_pubs` are retained only as
+/// the degrade fallback for a cert with no usable X25519 (synthetic / pre-ZEB-372
+/// zeroed cert).
 #[allow(clippy::too_many_arguments)]
 async fn apply_handshaked_friend(
     crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
     addr: crate::owner_state_types::OwnerAddr,
     entry: crate::friend_graph::FriendEntry,
+    // ZEB-580 S1: the peer's EnrollmentCert, ALREADY verified by the caller
+    // (`verify_enrolled_device`). Authoritative source of the peer's #2 DM
+    // identity; the wire bundle below is only the degrade fallback.
+    enrollment: &harmony_owner::certs::EnrollmentCert,
+    // Degrade-only: the self-asserted wire #3 bundle, used solely when the cert
+    // has no usable X25519.
     sender_devices: Vec<crate::owner_state_types::DeviceIdentityHash>,
     device_identity_pubs: Vec<Option<[u8; 64]>>,
     // ZEB-473 Task 5: the peer's per-device tunnel reachability/PQ contacts,
-    // parallel-indexed to `sender_devices` (built from the SIGNED accept fields by
-    // the caller). `apply_owner_device_update` re-aligns these to the sorted
+    // parallel-indexed to the cached device (built from the SIGNED accept fields
+    // by the caller). `apply_owner_device_update` re-aligns these to the sorted
     // device list. `None` elements are skip-on-empty (never clobber a known
     // contact).
     device_tunnel_contacts: Vec<Option<crate::owner_state_types::DeviceTunnelContact>>,
@@ -50979,15 +51051,44 @@ async fn apply_handshaked_friend(
             return Err(format!("friend-graph apply rejected: {reason:?}"));
         }
     }
-    if !sender_devices.is_empty() {
-        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
-            .apply_owner_device_update(
-                addr,
-                sender_devices,
-                device_identity_pubs,
-                device_tunnel_contacts,
-                learned_at,
+    // ZEB-580 S1: prefer the cert-attested #2 identity; degrade to the wire #3
+    // bundle only when the cert carries no usable X25519, then to empty.
+    //
+    // The tunnel contacts are parallel-indexed to the WIRE device bundle. When
+    // we collapse to the single cert-derived #2 hash we can only carry a wire
+    // contact if it unambiguously belongs to #2 — i.e. the peer advertised a
+    // single device, so wire[0] IS the #2 device. With a MULTI-device wire
+    // bundle there is no reliable map from #2's cert-derived hash back to a wire
+    // index (the wire bundle is #3-native), so `apply_owner_device_update`'s
+    // truncate-to-parity would pair #2 with wire[0]'s contact — potentially
+    // another device's reachability. Drop the contact to `None` in that case:
+    // skip-on-empty never clobbers a known contact, and #2's real contact is
+    // re-learned from a later signed device update / the deposit rung.
+    let (devices, pubs, contacts) = match crate::dm_signing::device2_signing_hash(enrollment) {
+        Some(h2) => {
+            let contact = if sender_devices.len() <= 1 {
+                device_tunnel_contacts
+            } else {
+                Vec::new()
+            };
+            (
+                vec![h2],
+                vec![Some(crate::dm_signing::device2_combined_pub(enrollment))],
+                contact,
             )
+        }
+        None if !sender_devices.is_empty() => {
+            (sender_devices, device_identity_pubs, device_tunnel_contacts)
+        }
+        None => (
+            Vec::new(),
+            Vec::new(),
+            Vec::<Option<crate::owner_state_types::DeviceTunnelContact>>::new(),
+        ),
+    };
+    if !devices.is_empty() {
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) =
+            state.apply_owner_device_update(addr, devices, pubs, contacts, learned_at)
         {
             return Err(format!("device-cache apply rejected: {reason:?}"));
         }
@@ -51402,6 +51503,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         &crdt_state,
         payload.inviter_addr,
         entry,
+        &accepted.enrollment,
         accepted.sender_devices.clone(),
         accepted.device_identity_pubs.clone(),
         inviter_contacts,
@@ -53704,6 +53806,14 @@ pub(crate) async fn accept_dm_invite_impl(
     // into the tail.
     let kind = staged.signed.kind;
     let inviter_hex = hex::encode(staged.signed.inviter.0);
+    // ZEB-580 S1: the pub to cache for the signing device. A staged invite
+    // already passed `apply_invite`'s full cert verification at staging time —
+    // on the cert (#2) path that check enforced `inviter_identity_pub ==
+    // device2_combined_pub(cert)`, so this inline pub IS the verified #2 pub;
+    // on the legacy path it is the #3 pub. Either way it equals what
+    // `apply_invite`'s inline auto-accept resolves, so accept caches the same
+    // identity. Captured here BEFORE `signed` moves into the tail.
+    let signer_identity_pub = staged.signed.inviter_identity_pub;
     let members_hex: Vec<String> = staged
         .signed
         .members
@@ -53722,6 +53832,7 @@ pub(crate) async fn accept_dm_invite_impl(
             staged.signed,
             now_ms,
             staged.refresh_owner_device_cache,
+            signer_identity_pub,
         )
     };
     if let Err(e) = apply_result {
@@ -54517,6 +54628,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         &crdt_state,
         target_addr_master,
         entry,
+        &accepted.enrollment,
         accepted.sender_devices.clone(),
         accepted.device_identity_pubs.clone(),
         target_contacts,
@@ -54760,6 +54872,11 @@ mod friend_ipc_tests {
 
     #[tokio::test]
     async fn apply_handshaked_friend_populates_cache_and_skips_empty() {
+        // ZEB-580 S1: this test pins the DEGRADE path — a synthetic cert with a
+        // zeroed X25519 (`mint_test_owner`) yields no #2 identity, so the helper
+        // falls back to caching the self-asserted wire #3 bundle. The #2 path
+        // proper is covered by `apply_handshaked_friend_caches_peer_device2_identity`.
+        let synthetic_cert = crate::community_membership::mint_test_owner(0x5e).cert;
         // A valid, self-consistent device bundle (each Some(pub) hashes to its
         // parallel device hash, so apply_owner_device_update accepts it) — the
         // same construction the acceptor-side cache test uses.
@@ -54786,6 +54903,7 @@ mod friend_ipc_tests {
             &state,
             addr,
             entry,
+            &synthetic_cert,
             devices.clone(),
             pubs.clone(),
             vec![Some(contact.clone())],
@@ -54822,9 +54940,18 @@ mod friend_ipc_tests {
         // an advertised-nothing peer can't LWW-clobber a known-good entry).
         let state2 = tokio::sync::Mutex::new(OwnerState::default());
         let (addr2, entry2) = friend_entry(0x44, FriendStatus::Active, 10);
-        apply_handshaked_friend(&state2, addr2, entry2, vec![], vec![], vec![], hlc(10))
-            .await
-            .expect("apply must succeed with an empty bundle");
+        apply_handshaked_friend(
+            &state2,
+            addr2,
+            entry2,
+            &synthetic_cert,
+            vec![],
+            vec![],
+            vec![],
+            hlc(10),
+        )
+        .await
+        .expect("apply must succeed with an empty bundle");
         {
             let s = state2.lock().await;
             assert!(
@@ -54832,6 +54959,156 @@ mod friend_ipc_tests {
                 "an empty bundle must not create a device-cache entry"
             );
         }
+    }
+
+    /// ZEB-580 S1: the dialer caches the peer's cert-attested #2 DM identity
+    /// (combined pub keyed by the #2 DM hash), NOT the self-asserted wire #3
+    /// bundle. `apply_handshaked_friend` is the SINGLE write point both dialer
+    /// paths share, so exercising it directly covers the token-redeem AND
+    /// add-by-key accept sides symmetrically.
+    #[tokio::test]
+    async fn apply_handshaked_friend_caches_peer_device2_identity() {
+        // A REAL owner: its enrollment cert carries a real birational X25519, so
+        // the #2 identity is derivable.
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted
+            .state
+            .enrollments
+            .values()
+            .next()
+            .expect("one enrollment")
+            .clone();
+        let expect_pub = crate::dm_signing::device2_combined_pub(&cert);
+        let expect_hash =
+            crate::dm_signing::device2_signing_hash(&cert).expect("real cert yields a #2 hash");
+
+        // Key the friend by a self-consistent synthetic master (the helper does
+        // not cross-check the cert's owner_id against `addr` — the caller verifies
+        // that). The cert is authoritative ONLY for the #2 DM identity.
+        let state = tokio::sync::Mutex::new(OwnerState::default());
+        let (addr, entry) = friend_entry(0x55, FriendStatus::Active, 10);
+        // A #3 wire bundle that DIFFERS from the cert-derived #2 hash — present
+        // only to prove it is NOT what gets cached.
+        let wire_devices = vec![crate::owner_state_types::DeviceIdentityHash([0x77; 16])];
+        let wire_pubs: Vec<Option<[u8; 64]>> = vec![None];
+        let contact = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x7c; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1u8; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![4u8; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+        };
+        apply_handshaked_friend(
+            &state,
+            addr,
+            entry,
+            &cert,
+            wire_devices,
+            wire_pubs,
+            vec![Some(contact.clone())],
+            hlc(10),
+        )
+        .await
+        .expect("apply must succeed");
+
+        let s = state.lock().await;
+        let cache = s
+            .owner_device_cache
+            .devices
+            .get(&addr)
+            .expect("device cache entry for the new friend");
+        let idx = cache
+            .devices
+            .iter()
+            .position(|d| *d == expect_hash)
+            .expect("#2 device cached");
+        assert_eq!(cache.device_identity_pubs[idx], Some(expect_pub));
+        // The signed tunnel contact rode along on the cached #2 device.
+        assert_eq!(
+            cache.device_tunnel_contacts.get(idx).cloned().flatten(),
+            Some(contact),
+            "the signed tunnel contact must persist parallel to the #2 device"
+        );
+        // The cert-derived #2 identity REPLACED the wire #3 bundle.
+        assert!(
+            !cache
+                .devices
+                .contains(&crate::owner_state_types::DeviceIdentityHash([0x77; 16])),
+            "the wire #3 bundle must not be cached once the cert carries a #2 identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_handshaked_friend_drops_contact_on_multidevice_wire_collapse() {
+        // ZEB-580 S1: a MULTI-device wire bundle collapses to the single
+        // cert-derived #2 identity. Because the wire bundle is #3-native, we
+        // cannot map #2's cert-hash back to a wire index, so the #2 device must
+        // be cached with NO tunnel contact rather than risk inheriting another
+        // wire device's reachability (which truncate-to-parity would otherwise
+        // pin to wire[0]).
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted
+            .state
+            .enrollments
+            .values()
+            .next()
+            .expect("one enrollment")
+            .clone();
+        let expect_hash =
+            crate::dm_signing::device2_signing_hash(&cert).expect("real cert yields a #2 hash");
+
+        let state = tokio::sync::Mutex::new(OwnerState::default());
+        let (addr, entry) = friend_entry(0x56, FriendStatus::Active, 10);
+        // TWO wire devices with two distinct tunnel contacts — the #2 device is
+        // NOT identifiable among them.
+        let wire_devices = vec![
+            crate::owner_state_types::DeviceIdentityHash([0x77; 16]),
+            crate::owner_state_types::DeviceIdentityHash([0x88; 16]),
+        ];
+        let wire_pubs: Vec<Option<[u8; 64]>> = vec![None, None];
+        let contact0 = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x7c; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1u8; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![4u8; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+        };
+        let contact1 = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x8c; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![2u8; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![5u8; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+        };
+        apply_handshaked_friend(
+            &state,
+            addr,
+            entry,
+            &cert,
+            wire_devices,
+            wire_pubs,
+            vec![Some(contact0), Some(contact1)],
+            hlc(10),
+        )
+        .await
+        .expect("apply must succeed");
+
+        let s = state.lock().await;
+        let cache = s
+            .owner_device_cache
+            .devices
+            .get(&addr)
+            .expect("device cache entry for the new friend");
+        // Exactly the #2 device is cached (both wire #3 hashes dropped).
+        assert_eq!(cache.devices, vec![expect_hash]);
+        let idx = cache
+            .devices
+            .iter()
+            .position(|d| *d == expect_hash)
+            .expect("#2 device cached");
+        // No misaligned contact rode along: neither wire contact leaked onto #2.
+        assert_eq!(
+            cache.device_tunnel_contacts.get(idx).cloned().flatten(),
+            None,
+            "a multi-device wire collapse must NOT pin an arbitrary wire contact to #2"
+        );
     }
 
     #[test]

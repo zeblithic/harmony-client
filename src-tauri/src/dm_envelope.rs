@@ -112,6 +112,15 @@ pub struct DmInviteSigned {
         deserialize_with = "deserialize_identity_pub_from_bstr"
     )]
     pub inviter_identity_pub: [u8; 64],
+    /// ZEB-580 S1: the inviter's enrolled-device (#2) EnrollmentCert. When
+    /// present, the receiver verifies master→#2 (+ owner_id match + that the
+    /// derived #2 DM hash equals `signing_device_hash`) and caches the #2 DM
+    /// identity — no prior friend handshake needed. Absent for legacy #3
+    /// senders (then the receiver falls back to `inviter_identity_pub`).
+    /// Additive: the map key is omitted entirely when None, so pre-ZEB-580
+    /// invites are byte-stable and decode with None.
+    #[serde(rename = "ie", default, skip_serializing_if = "Option::is_none")]
+    pub inviter_enrollment: Option<Box<harmony_owner::certs::EnrollmentCert>>,
 }
 
 /// Reticulum-unicast packet notifying recipients that a new encrypted
@@ -186,6 +195,15 @@ pub struct DmAckSigned {
 ///   byte-equality with `signed_bytes`, and emits `signed_bytes`
 ///   verbatim — see `encode_packet`'s mutation-guard doc comment for
 ///   rationale.
+// ZEB-580 S1: `DmInviteSigned` grew an optional inline `EnrollmentCert`
+// (`inviter_enrollment`), which widened `Invite` well past `CidNotify`/`Ack`
+// and tripped clippy's `large_enum_variant` lint. Fixed by boxing the cert
+// (`Option<Box<EnrollmentCert>>`) rather than suppressing the lint —
+// `Box<T>`'s `Serialize`/`Deserialize` forward transparently to `T`, so this
+// is wire-format-neutral, and `Option<Box<T>>` is pointer-sized so it shrinks
+// `DmInviteSigned`/`DmPacket` back down without rippling `Box::new`/deref
+// through every `DmPacket::Invite { signed, .. }` match site (only the field
+// itself is boxed, not the whole `signed`/`DmInviteSigned` payload).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DmPacket {
     Invite {
@@ -789,6 +807,7 @@ pub mod test_fixtures {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         }
     }
 }
@@ -950,7 +969,19 @@ mod tests {
             created_at: hlc(1),
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         }
+    }
+
+    /// ZEB-580 S1 Task 2: zero-arg sample invite fixture for tests that
+    /// don't care about the specific identity/device values, just a
+    /// well-formed `DmInviteSigned` with `inviter_enrollment: None` to
+    /// override or leave as-is. Wraps `sample_invite_with_identity` with a
+    /// fixed seed (0x42, matching `make_test_identity`'s convention
+    /// elsewhere in this module).
+    fn sample_invite_signed() -> DmInviteSigned {
+        let (_, identity_pub, device_hash) = make_test_identity(0x42);
+        sample_invite_with_identity(identity_pub, device_hash)
     }
 
     /// For tests that don't care about real signature verification (they
@@ -972,6 +1003,7 @@ mod tests {
             created_at: hlc(1),
             signing_device_hash: device_hash,
             inviter_identity_pub: [0x42; 64],
+            inviter_enrollment: None,
         }
     }
 
@@ -993,6 +1025,43 @@ mod tests {
             ack_from_devices: vec![device_hash],
             signing_device_hash: device_hash,
         }
+    }
+
+    /// ZEB-580 S1: a DmInvite carrying an inviter_enrollment round-trips
+    /// byte-exactly and the signature still covers the cert.
+    #[test]
+    fn dm_invite_with_inviter_enrollment_round_trips() {
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted.state.enrollments.values().next().unwrap().clone();
+        let sk = minted.device_signing_key;
+
+        let mut signed = sample_invite_signed(); // existing helper in this test mod
+        signed.inviter_enrollment = Some(Box::new(cert.clone()));
+
+        let packet = build_signed_invite(signed.clone(), &sk).expect("build");
+        let wire = encode_packet(&packet).expect("encode");
+        let decoded = decode_packet(&wire).expect("decode");
+        match decoded {
+            DmPacket::Invite { signed: got, .. } => {
+                assert_eq!(got.inviter_enrollment, Some(Box::new(cert)));
+                assert_eq!(got, signed);
+            }
+            _ => panic!("expected Invite"),
+        }
+    }
+
+    /// Back-compat: a DmInvite WITHOUT the field decodes with None, and the
+    /// canonical bytes are identical to a pre-ZEB-580 invite (skip_serializing_if
+    /// omits the key entirely when None).
+    #[test]
+    fn dm_invite_without_inviter_enrollment_is_none_and_byte_stable() {
+        let signed = sample_invite_signed(); // inviter_enrollment defaults to None
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let back: DmInviteSigned =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(back.inviter_enrollment, None);
+        // The "ie" key must be absent from the map when None.
+        assert!(!bytes.windows(2).any(|w| w == b"ie"));
     }
 
     #[test]
@@ -1340,6 +1409,7 @@ mod tests {
             // claims a device NOT in sender_devices:
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
 
         let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();

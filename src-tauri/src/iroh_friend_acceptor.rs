@@ -1097,41 +1097,49 @@ pub fn process_friend_request(
         }
     }
 
-    // ZEB-461 Task 7: learn the requester's devices so the DM outbox can route
-    // to them (a friend without a shared community would otherwise have an empty
-    // device cache → no DM destination). `learned_at` is this node's local HLC
-    // (the same value stamped on the friend entry just above) — never the peer's
-    // claimed time (handle_invite anti-forgery rule). Skip an empty bundle so we
-    // never LWW-clobber a previously-known-good cache entry (an empty bundle
-    // means "peer advertised nothing": older client, or a failed self-bind →
-    // None path — NOT "peer has zero devices").
-    if !req.sender_devices.is_empty() {
-        // ZEB-473 Task 5: persist the requester's iroh reachability + PQ keys so
-        // the DM tunnel can later dial them. The sender advertises a SINGLE device
-        // (alpha nodes are single-device — `self_device_bundle` emits exactly one),
-        // so this builds a single-element `device_tunnel_contacts` parallel-indexed
-        // to device 0; `apply_owner_device_update` re-aligns it to the sorted device
-        // list. `None` (don't fabricate a contact) when the peer advertised no
-        // reachability — same skip-on-empty rationale as the device bundle, so an
-        // older/contactless peer never LWW-clobbers a previously-known contact.
-        //
-        // SINGLE-DEVICE ASSUMPTION: if a future multi-device sender advertises
-        // `sender_devices.len() > 1`, the apply path pads the contact vec with
-        // `None` (no crash), but the lone contact lands on device index 0, which
-        // may not be the device that sent this handshake. Per-device tunnel-contact
-        // placement for multi-device senders is a deliberate follow-up; alpha does
-        // not exercise it.
-        let device_tunnel_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
-            req.iroh_node_id,
-            req.home_relay_url.clone(),
-            req.pq_dsa_pubkey.clone(),
-            req.pq_kem_pubkey.clone(),
-        )];
+    // ZEB-580 S1: cache the requester's cert-attested #2 DM identity (the
+    // combined pub keyed by the #2 DM hash), derived from the EnrollmentCert
+    // already verified in step 1 above (`verify_enrolled_device`). This is what
+    // the DM signature-verification path consumes, so the CERT is authoritative —
+    // NOT the self-asserted wire #3 bundle (`req.sender_devices` /
+    // `req.device_identity_pubs`), which is now discarded for DM signing. Degrade
+    // to the legacy #3 bundle ONLY when the cert carries no usable X25519
+    // (synthetic / pre-ZEB-372 zeroed cert), then to empty if that bundle is
+    // empty too. `learned_at` is this node's local HLC (the value stamped on the
+    // friend entry just above) — never the peer's claimed time (anti-forgery
+    // rule). An empty result skips the write so a peer that advertised nothing
+    // never LWW-clobbers a previously-known-good cache entry.
+    //
+    // ZEB-473 Task 5: the requester's iroh reachability + PQ keys ride along as a
+    // SINGLE tunnel contact parallel to the (sole) cached device, so the DM
+    // tunnel can later dial them; `apply_owner_device_update` re-aligns it to the
+    // sorted device list. `None` (don't fabricate a contact) when the peer
+    // advertised no reachability — same skip-on-empty rationale as the bundle.
+    let device_tunnel_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
+        req.iroh_node_id,
+        req.home_relay_url.clone(),
+        req.pq_dsa_pubkey.clone(),
+        req.pq_kem_pubkey.clone(),
+    )];
+    let (devices, pubs): (Vec<DeviceIdentityHash>, Vec<Option<[u8; 64]>>) =
+        match crate::dm_signing::device2_signing_hash(&req.enrollment) {
+            Some(h2) => (
+                vec![h2],
+                vec![Some(crate::dm_signing::device2_combined_pub(
+                    &req.enrollment,
+                ))],
+            ),
+            None if !req.sender_devices.is_empty() => {
+                (req.sender_devices.clone(), req.device_identity_pubs.clone())
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+    if !devices.is_empty() {
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
             .apply_owner_device_update(
                 req.from_addr,
-                req.sender_devices.clone(),
-                req.device_identity_pubs.clone(),
+                devices,
+                pubs,
                 device_tunnel_contacts,
                 learned_at,
             )
@@ -3406,6 +3414,116 @@ mod tests {
                 .devices
                 .contains_key(&req.from_addr),
             "an empty bundle must not create a device-cache entry"
+        );
+    }
+
+    /// ZEB-580 S1: a signed friend request from a REAL (`mint_owner`) owner,
+    /// whose EnrollmentCert carries a real birational X25519 — so the acceptor
+    /// can derive the peer's #2 DM identity from the cert. It also carries a
+    /// non-empty #3 wire bundle (a bogus hash + `None` pub) that DIFFERS from the
+    /// cert-derived #2 hash, plus correctly-sized reachability so the handshake
+    /// yields a dialable tunnel contact. Used to prove the acceptor caches the
+    /// CERT-attested #2 identity, NOT the wire #3 bundle.
+    fn signed_request_real_owner() -> FriendLinkRequest {
+        use crate::owner_state_types::{ML_DSA_65_PUBKEY_LEN, ML_KEM_768_PUBKEY_LEN};
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint real owner");
+        let cert = minted
+            .state
+            .enrollments
+            .values()
+            .next()
+            .expect("mint_owner enrolls one device")
+            .clone();
+        let device_key = minted.device_signing_key;
+        let from_addr = OwnerAddr(cert.owner_id);
+        let (_eph_sk, eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+        // A #3 wire bundle that DIFFERS from the cert-derived #2 hash. A `None`
+        // pub is always accepted by `apply_owner_device_update` (no hash check),
+        // so pre-fix code caches THIS hash — the fix must cache #2 instead.
+        let sender_devices = vec![DeviceIdentityHash([0x77; 16])];
+        let device_identity_pubs: Vec<Option<[u8; 64]>> = vec![None];
+        let iroh_node_id = [0x11; 32];
+        let pq_dsa_pubkey = vec![0u8; ML_DSA_65_PUBKEY_LEN];
+        let pq_kem_pubkey = vec![0u8; ML_KEM_768_PUBKEY_LEN];
+        let devices_digest = contact_digest(
+            &sender_devices,
+            &device_identity_pubs,
+            &iroh_node_id,
+            None,
+            &pq_dsa_pubkey,
+            &pq_kem_pubkey,
+        );
+        let preimage = friend_request_sig_preimage(from_addr, None, &eph_pub, &devices_digest);
+        let sig = device_key.sign(&preimage).to_bytes();
+        FriendLinkRequest {
+            from_addr,
+            display: Some("dave".into()),
+            token_sig: None,
+            eph_x25519_pub: eph_pub,
+            enrollment: cert,
+            signer_certs: Vec::new(),
+            sig,
+            sender_devices,
+            device_identity_pubs,
+            iroh_node_id,
+            home_relay_url: None,
+            pq_dsa_pubkey,
+            pq_kem_pubkey,
+        }
+    }
+
+    /// ZEB-580 S1: after processing a friend request, the acceptor caches the
+    /// requester's #2 DM identity (derived from the verified enrollment cert),
+    /// keyed by the #2 DM hash — not the wire #3 bundle it also carries.
+    #[test]
+    fn process_friend_request_caches_requester_device2_identity() {
+        use crate::owner_state_crypto::KeyTree;
+        let req = signed_request_real_owner();
+        let expect_pub = crate::dm_signing::device2_combined_pub(&req.enrollment);
+        let expect_hash = crate::dm_signing::device2_signing_hash(&req.enrollment)
+            .expect("real cert yields a #2 hash");
+        let me = mint_test_owner(0x94);
+        let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        process_friend_request(
+            &mut state,
+            test_hlc(5),
+            &req,
+            me.owner,
+            None,
+            &me.cert,
+            &me.device_key,
+            &kt,
+            0,
+            None,
+            None,
+        )
+        .expect("processed");
+        let entry = state
+            .owner_device_cache
+            .devices
+            .get(&req.from_addr)
+            .expect("cache entry for requester");
+        let idx = entry
+            .devices
+            .iter()
+            .position(|d| *d == expect_hash)
+            .expect("#2 device cached");
+        assert_eq!(entry.device_identity_pubs[idx], Some(expect_pub));
+        // The tunnel contact rode along on the cached #2 device.
+        assert!(
+            entry
+                .device_tunnel_contacts
+                .get(idx)
+                .map(|c| c.is_some())
+                .unwrap_or(false),
+            "the dialable tunnel contact must persist parallel to the #2 device"
+        );
+        // The cert-derived #2 identity REPLACED the wire #3 bundle: the bogus
+        // wire hash must NOT be cached.
+        assert!(
+            !entry.devices.contains(&DeviceIdentityHash([0x77; 16])),
+            "the wire #3 bundle must not be cached once the cert carries a #2 identity"
         );
     }
 

@@ -116,6 +116,7 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
         vec![bob_owner],
         500, // wall_now_ms
         None,
+        None,
     )
     .expect("add_space_dm_inner must succeed");
     // A fresh create returns `Some(fanout)`; `None` would mean a dedupe-merge.
@@ -205,6 +206,7 @@ async fn add_space_dm_mints_durable_invite_only_outbox_entry() {
         vec![bob_owner],
         500,
         None,
+        None,
     )
     .expect("add_space_dm_inner must succeed");
     assert!(fanout.is_some(), "fresh create returns Some(fanout)");
@@ -260,6 +262,7 @@ async fn add_space_group_dm_with_15_recipients_succeeds() {
         recipients,
         500,
         None,
+        None,
     )
     .expect("16 total members at cap must succeed");
 
@@ -284,6 +287,7 @@ async fn add_space_dm_kind_rejects_zero_recipients() {
         "empty".into(),
         vec![], // 0 recipients
         500,
+        None,
         None,
     )
     .expect_err("0 recipients must err");
@@ -312,6 +316,7 @@ async fn add_space_group_dm_rejects_16_or_more_recipients() {
         recipients,
         500,
         None,
+        None,
     )
     .expect_err("17 total members must err");
     assert!(
@@ -337,6 +342,7 @@ async fn add_space_dm_kind_rejects_more_than_one_recipient() {
         vec![OwnerAddr([0x10; 16]), OwnerAddr([0x11; 16])],
         500,
         None,
+        None,
     )
     .expect_err("Dm with 2 recipients must err");
     assert!(
@@ -360,6 +366,7 @@ async fn add_space_dm_kind_rejects_self_in_recipients() {
         "self-loop".into(),
         vec![alice_owner], // self in recipients
         500,
+        None,
         None,
     )
     .expect_err("self in recipients must err");
@@ -416,6 +423,7 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
         vec![bob_owner],
         500,
         None,
+        None,
     )
     .expect("first create must succeed");
     // `Some(fanout)` IS the not-a-merge signal (a merge returns `None`).
@@ -444,6 +452,7 @@ async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
         "DM with Bob (again)".into(),
         vec![bob_owner],
         600, // later wall_ms — irrelevant; dedupe is by sorted members
+        None,
         None,
     )
     .expect("second create must succeed (dedupe path)");
@@ -500,6 +509,7 @@ async fn add_space_group_dm_rejects_duplicate_recipients() {
         "dup".into(),
         vec![bob, carol, bob], // duplicate
         500,
+        None,
         None,
     )
     .expect_err("duplicate recipient must err");

@@ -229,6 +229,14 @@ impl IrohTunnelDmTransport {
             self.self_owner,
             self.our_signing_device_hash,
             self.inviter_identity_pub,
+            // ZEB-580 S1: the live tunnel does NOT attach the #2 cert inline — it
+            // holds no `enrollment_cert`. Its #2 DM material (`signing_key` /
+            // `our_signing_device_hash` / `inviter_identity_pub` = the cert's #2
+            // combined pub) is wired at construction in lib.rs (Task 6), so this
+            // re-driven invite ships the inline #2 pub and a transitional receiver
+            // TOFU-verifies it; the deposit rung and the original `add_space`
+            // invite carry the master-attested cert for full verification.
+            None,
         ) {
             Ok(invite) => invite,
             Err(e) => {
@@ -506,6 +514,95 @@ mod tests {
             [0x55u8; 64],
             cas,
         )
+    }
+
+    /// ZEB-580 S1 Task 6: an `IrohTunnelDmTransport` wired with #2 (enrolled)
+    /// material — exactly what `lib.rs` passes at node construction — signs its
+    /// emitted CidNotify with the community key and stamps the #2 DM hash,
+    /// verifiable against the cert's #2 combined pub (NOT a #3 transport key).
+    /// Mirrors Task 5's `dm_outbox::tests::dm_outbox_signs_cidnotify_with_device2`
+    /// at the tunnel seam, closing the "tunnel untested for #2" gap.
+    #[tokio::test]
+    async fn tunnel_signs_cidnotify_with_device2() {
+        // Mint a real owner → its enrolled device cert + #2 (community) signing
+        // key. Mirrors `dm_outbox::tests::outbox_from_mint`.
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted.state.enrollments.values().next().unwrap().clone();
+        let community_signing_key = Arc::new(minted.device_signing_key);
+        let self_owner = OwnerAddr(cert.owner_id);
+        let device2_hash =
+            crate::dm_signing::device2_signing_hash(&cert).expect("real cert yields a #2 hash");
+        let device2_pub = crate::dm_signing::device2_combined_pub(&cert);
+
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+        let contact = DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey.clone(),
+            pq_kem_pubkey: vec![0x08u8; 32],
+        };
+        let mut owner_state = OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+        // Wire the transport with #2 material — exactly what lib.rs Task 6 passes:
+        // community key + the cert's #2 DM hash + the cert's #2 combined pub.
+        let transport = IrohTunnelDmTransport::new(
+            Arc::clone(&mgr),
+            state,
+            Arc::clone(&community_signing_key),
+            self_owner,
+            device2_hash,
+            device2_pub,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
+
+        let space = SpaceId([0xcc; 16]);
+        let cid = ContentId::from_bytes([0xee; 32]);
+        let mut entry = synthetic_outbox_entry(space, cid, recipient);
+        // ACKed → only the CidNotify routes (no bootstrap invite ahead of it), so
+        // the first routed packet is the CidNotify under test.
+        entry.delivered_to.insert(recipient);
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+        let _ = transport.send(&entry, recipient, Vec::new()).await;
+
+        let routed = wait_for_routed(&mut cmd_rx).await;
+        match crate::dm_envelope::decode_packet(&routed).expect("decode routed packet") {
+            crate::dm_envelope::DmPacket::CidNotify {
+                signed,
+                signature,
+                signed_bytes,
+            } => {
+                assert_eq!(
+                    signed.signing_device_hash, device2_hash,
+                    "tunnel CidNotify must stamp the #2 DM hash"
+                );
+                crate::dm_signing::verify_dm_packet_signature(
+                    &signed_bytes,
+                    &signature,
+                    &device2_pub,
+                    signed.signing_device_hash,
+                )
+                .expect("tunnel CidNotify must verify against the cert's #2 combined pub");
+            }
+            other => panic!("expected CidNotify, got {other:?}"),
+        }
     }
 
     /// ZEB-504: insert a minimal DM `Space` (carrying a `content_key`) so the
@@ -823,6 +920,15 @@ mod tests {
             signed.sender_devices, full_devices,
             "rebuilt invite must carry the inviter's full cached device set, \
              not a singleton (ZEB-504 device-list-regression)"
+        );
+        // ZEB-580 S1: the live-tunnel rebuild is a deliberate no-inline-cert
+        // trust boundary — it ships the #2 pub for transitional TOFU and relies
+        // on the deposit rung / original add_space invite for the master-attested
+        // cert. Pin that so a regression that accidentally attaches (or drops when
+        // it shouldn't) the inline cert here is caught.
+        assert!(
+            signed.inviter_enrollment.is_none(),
+            "ZEB-580 S1: the live-tunnel rebuilt invite must NOT carry the inline cert"
         );
     }
 

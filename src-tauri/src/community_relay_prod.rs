@@ -3142,6 +3142,7 @@ mod tests {
                 created_at: self.created_at.clone(),
                 signing_device_hash: charlie_device_hash,
                 inviter_identity_pub: charlie_identity_pub,
+                inviter_enrollment: None,
             };
             let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
             let signature = private_charlie.sign(&signed_bytes);
@@ -3272,6 +3273,7 @@ mod tests {
             created_at: created_at.clone(),
             signing_device_hash: alice_device_hash,
             inviter_identity_pub: alice_identity_pub,
+            inviter_enrollment: None,
         };
         let inv_signed_bytes =
             crate::owner_state_crypto::canonical_cbor_encode(&inv_signed).unwrap();
