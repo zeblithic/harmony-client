@@ -921,6 +921,15 @@ mod tests {
             "rebuilt invite must carry the inviter's full cached device set, \
              not a singleton (ZEB-504 device-list-regression)"
         );
+        // ZEB-580 S1: the live-tunnel rebuild is a deliberate no-inline-cert
+        // trust boundary — it ships the #2 pub for transitional TOFU and relies
+        // on the deposit rung / original add_space invite for the master-attested
+        // cert. Pin that so a regression that accidentally attaches (or drops when
+        // it shouldn't) the inline cert here is caught.
+        assert!(
+            signed.inviter_enrollment.is_none(),
+            "ZEB-580 S1: the live-tunnel rebuilt invite must NOT carry the inline cert"
+        );
     }
 
     /// A recipient whose cached entry advertises a `DeviceTunnelContact` →

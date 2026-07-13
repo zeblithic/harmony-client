@@ -51053,20 +51053,42 @@ async fn apply_handshaked_friend(
     }
     // ZEB-580 S1: prefer the cert-attested #2 identity; degrade to the wire #3
     // bundle only when the cert carries no usable X25519, then to empty.
-    let (devices, pubs): (
-        Vec<crate::owner_state_types::DeviceIdentityHash>,
-        Vec<Option<[u8; 64]>>,
-    ) = match crate::dm_signing::device2_signing_hash(enrollment) {
-        Some(h2) => (
-            vec![h2],
-            vec![Some(crate::dm_signing::device2_combined_pub(enrollment))],
+    //
+    // The tunnel contacts are parallel-indexed to the WIRE device bundle. When
+    // we collapse to the single cert-derived #2 hash we can only carry a wire
+    // contact if it unambiguously belongs to #2 — i.e. the peer advertised a
+    // single device, so wire[0] IS the #2 device. With a MULTI-device wire
+    // bundle there is no reliable map from #2's cert-derived hash back to a wire
+    // index (the wire bundle is #3-native), so `apply_owner_device_update`'s
+    // truncate-to-parity would pair #2 with wire[0]'s contact — potentially
+    // another device's reachability. Drop the contact to `None` in that case:
+    // skip-on-empty never clobbers a known contact, and #2's real contact is
+    // re-learned from a later signed device update / the deposit rung.
+    let (devices, pubs, contacts) = match crate::dm_signing::device2_signing_hash(enrollment) {
+        Some(h2) => {
+            let contact = if sender_devices.len() <= 1 {
+                device_tunnel_contacts
+            } else {
+                Vec::new()
+            };
+            (
+                vec![h2],
+                vec![Some(crate::dm_signing::device2_combined_pub(enrollment))],
+                contact,
+            )
+        }
+        None if !sender_devices.is_empty() => {
+            (sender_devices, device_identity_pubs, device_tunnel_contacts)
+        }
+        None => (
+            Vec::new(),
+            Vec::new(),
+            Vec::<Option<crate::owner_state_types::DeviceTunnelContact>>::new(),
         ),
-        None if !sender_devices.is_empty() => (sender_devices, device_identity_pubs),
-        None => (Vec::new(), Vec::new()),
     };
     if !devices.is_empty() {
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) =
-            state.apply_owner_device_update(addr, devices, pubs, device_tunnel_contacts, learned_at)
+            state.apply_owner_device_update(addr, devices, pubs, contacts, learned_at)
         {
             return Err(format!("device-cache apply rejected: {reason:?}"));
         }
@@ -55012,6 +55034,80 @@ mod friend_ipc_tests {
                 .devices
                 .contains(&crate::owner_state_types::DeviceIdentityHash([0x77; 16])),
             "the wire #3 bundle must not be cached once the cert carries a #2 identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_handshaked_friend_drops_contact_on_multidevice_wire_collapse() {
+        // ZEB-580 S1: a MULTI-device wire bundle collapses to the single
+        // cert-derived #2 identity. Because the wire bundle is #3-native, we
+        // cannot map #2's cert-hash back to a wire index, so the #2 device must
+        // be cached with NO tunnel contact rather than risk inheriting another
+        // wire device's reachability (which truncate-to-parity would otherwise
+        // pin to wire[0]).
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted
+            .state
+            .enrollments
+            .values()
+            .next()
+            .expect("one enrollment")
+            .clone();
+        let expect_hash =
+            crate::dm_signing::device2_signing_hash(&cert).expect("real cert yields a #2 hash");
+
+        let state = tokio::sync::Mutex::new(OwnerState::default());
+        let (addr, entry) = friend_entry(0x56, FriendStatus::Active, 10);
+        // TWO wire devices with two distinct tunnel contacts — the #2 device is
+        // NOT identifiable among them.
+        let wire_devices = vec![
+            crate::owner_state_types::DeviceIdentityHash([0x77; 16]),
+            crate::owner_state_types::DeviceIdentityHash([0x88; 16]),
+        ];
+        let wire_pubs: Vec<Option<[u8; 64]>> = vec![None, None];
+        let contact0 = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x7c; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1u8; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![4u8; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+        };
+        let contact1 = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x8c; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![2u8; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![5u8; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+        };
+        apply_handshaked_friend(
+            &state,
+            addr,
+            entry,
+            &cert,
+            wire_devices,
+            wire_pubs,
+            vec![Some(contact0), Some(contact1)],
+            hlc(10),
+        )
+        .await
+        .expect("apply must succeed");
+
+        let s = state.lock().await;
+        let cache = s
+            .owner_device_cache
+            .devices
+            .get(&addr)
+            .expect("device cache entry for the new friend");
+        // Exactly the #2 device is cached (both wire #3 hashes dropped).
+        assert_eq!(cache.devices, vec![expect_hash]);
+        let idx = cache
+            .devices
+            .iter()
+            .position(|d| *d == expect_hash)
+            .expect("#2 device cached");
+        // No misaligned contact rode along: neither wire contact leaked onto #2.
+        assert_eq!(
+            cache.device_tunnel_contacts.get(idx).cloned().flatten(),
+            None,
+            "a multi-device wire collapse must NOT pin an arbitrary wire contact to #2"
         );
     }
 
