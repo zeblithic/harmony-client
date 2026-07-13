@@ -49,29 +49,33 @@ pub struct FeedAuthorityRecord {
     pub n_sig: String,
 }
 
-/// CBOR-hex encode a single `EnrollmentCert` for the `enrollment_cbor_hex` field.
-pub fn encode_cert(cert: &EnrollmentCert) -> String {
+/// CBOR-hex encode any serializable value (the shared encoder for the cert
+/// blobs). Returns a recoverable error rather than panicking so the S2 publish
+/// path can surface an encode failure instead of aborting.
+fn encode_cbor_hex<T: serde::Serialize>(value: &T, what: &str) -> Result<String, String> {
     let mut buf = Vec::new();
-    ciborium::into_writer(cert, &mut buf).expect("cbor-encode enrollment cert");
-    hex::encode(buf)
+    ciborium::into_writer(value, &mut buf)
+        .map_err(|e| format!("authority {what} cbor-encode failed: {e}"))?;
+    Ok(hex::encode(buf))
+}
+
+/// CBOR-hex encode a single `EnrollmentCert` for the `enrollment_cbor_hex` field.
+pub fn encode_cert(cert: &EnrollmentCert) -> Result<String, String> {
+    encode_cbor_hex(cert, "enrollment")
 }
 
 /// CBOR-hex encode a quorum signer bundle for `signer_certs_cbor_hex`
 /// (empty ⇒ `""`, which serde omits).
-pub fn encode_certs(certs: &[EnrollmentCert]) -> String {
+pub fn encode_certs(certs: &[EnrollmentCert]) -> Result<String, String> {
     if certs.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
-    let mut buf = Vec::new();
-    ciborium::into_writer(&certs, &mut buf).expect("cbor-encode signer certs");
-    hex::encode(buf)
+    encode_cbor_hex(&certs, "signer_certs")
 }
 
 /// CBOR-hex encode a `RevocationCert` for `revocation_cbor_hex`.
-pub fn encode_revocation(rev: &RevocationCert) -> String {
-    let mut buf = Vec::new();
-    ciborium::into_writer(rev, &mut buf).expect("cbor-encode revocation cert");
-    hex::encode(buf)
+pub fn encode_revocation(rev: &RevocationCert) -> Result<String, String> {
+    encode_cbor_hex(rev, "revocation")
 }
 
 /// Domain-separation prefix + version for the authority binding bytes.
@@ -105,8 +109,9 @@ pub fn sign_authority_binding(
 
 /// Verify the `#3` binding: `n_identity_pub` hashes to `feed_id`, and `n_sig`
 /// is a strict Ed25519 signature over the binding bytes. Mirrors
-/// `vine_signing::verify_signed`.
-pub fn verify_binding(r: &FeedAuthorityRecord) -> Result<(), String> {
+/// `vine_signing::verify_signed`. Crate-private — it checks ONLY the binding,
+/// not enrollment/revocation; `verify_authority` is the full public check.
+pub(crate) fn verify_binding(r: &FeedAuthorityRecord) -> Result<(), String> {
     let pub_vec = hex::decode(&r.n_identity_pub)
         .map_err(|e| format!("authority n_identity_pub not hex: {e}"))?;
     let identity = harmony_identity::Identity::from_public_bytes(&pub_vec)
@@ -139,8 +144,27 @@ fn decode_hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("authority {what} must be 32 bytes"))
 }
 
+/// Upper bound on a single CBOR-hex cert blob. `verify_authority` decodes
+/// attacker-controlled strings once this is wired to peer-writable ingest
+/// (S2), so cap the input before allocating/parsing to bound hostile work. A
+/// cert is a few hundred bytes and a signer bundle a few KiB — 64 KiB is
+/// generous and still bounds abuse.
+const MAX_AUTHORITY_CBOR_BYTES: usize = 64 * 1024;
+
+/// Hex-decode with a size cap checked BEFORE `hex::decode` allocates.
+fn bounded_hex_decode(hexs: &str, what: &str) -> Result<Vec<u8>, String> {
+    if hexs.len() > MAX_AUTHORITY_CBOR_BYTES * 2 {
+        return Err(format!(
+            "authority {what} cbor too large ({} hex chars > {} cap)",
+            hexs.len(),
+            MAX_AUTHORITY_CBOR_BYTES * 2
+        ));
+    }
+    hex::decode(hexs).map_err(|e| format!("authority {what} not hex: {e}"))
+}
+
 fn decode_cert(hexs: &str) -> Result<EnrollmentCert, String> {
-    let bytes = hex::decode(hexs).map_err(|e| format!("authority enrollment not hex: {e}"))?;
+    let bytes = bounded_hex_decode(hexs, "enrollment")?;
     let mut cur = std::io::Cursor::new(&bytes);
     let cert = ciborium::from_reader(&mut cur)
         .map_err(|_| "authority enrollment cbor invalid".to_string())?;
@@ -154,7 +178,7 @@ fn decode_certs(hexs: &str) -> Result<Vec<EnrollmentCert>, String> {
     if hexs.is_empty() {
         return Ok(Vec::new());
     }
-    let bytes = hex::decode(hexs).map_err(|e| format!("authority signer_certs not hex: {e}"))?;
+    let bytes = bounded_hex_decode(hexs, "signer_certs")?;
     let mut cur = std::io::Cursor::new(&bytes);
     let certs = ciborium::from_reader(&mut cur)
         .map_err(|_| "authority signer_certs cbor invalid".to_string())?;
@@ -165,7 +189,7 @@ fn decode_certs(hexs: &str) -> Result<Vec<EnrollmentCert>, String> {
 }
 
 fn decode_revocation(hexs: &str) -> Result<RevocationCert, String> {
-    let bytes = hex::decode(hexs).map_err(|e| format!("authority revocation not hex: {e}"))?;
+    let bytes = bounded_hex_decode(hexs, "revocation")?;
     let mut cur = std::io::Cursor::new(&bytes);
     let rev = ciborium::from_reader(&mut cur)
         .map_err(|_| "authority revocation cbor invalid".to_string())?;
@@ -188,7 +212,17 @@ pub struct VerifiedAuthority {
 /// chokepoint against the claimed owner with `publisher_key`/`device_id`
 /// cross-checks, (3) optional revocation (verified at its own `issued_at`,
 /// target must equal `device_id`).
-pub fn verify_authority(r: &FeedAuthorityRecord) -> Result<VerifiedAuthority, String> {
+///
+/// `now_secs` is the **verifier-controlled** wall clock (Unix seconds) supplied
+/// by the ingest boundary — NOT `r.updated_at`, which is unauthenticated (it is
+/// excluded from `n_sig`), so deriving the enrollment-validity clock from it
+/// would let a peer backdate `updated_at` to revive an expired/backdated cert.
+/// The revocation check keeps `rev.issued_at`, which IS authenticated inside
+/// the `RevocationCert`.
+pub fn verify_authority(
+    r: &FeedAuthorityRecord,
+    now_secs: u64,
+) -> Result<VerifiedAuthority, String> {
     verify_binding(r)?;
     let owner_id = decode_hex16(&r.owner_id, "owner_id")?;
     let device_id = decode_hex16(&r.device_id, "device_id")?;
@@ -196,7 +230,6 @@ pub fn verify_authority(r: &FeedAuthorityRecord) -> Result<VerifiedAuthority, St
     let enrollment = decode_cert(&r.enrollment_cbor_hex)?;
     let signer_certs = decode_certs(&r.signer_certs_cbor_hex)?;
 
-    let now_secs = r.updated_at / 1000;
     let verified = crate::enrollment_verify::verify_enrollment_any_issuer(
         &enrollment,
         &signer_certs,
@@ -273,8 +306,12 @@ impl FeedAuthorityCache {
 
     /// Verify and merge a record. The active binding is first-write-wins; a
     /// verified revocation sets `revoked` true forever (never cleared).
-    pub fn ingest(&mut self, r: &FeedAuthorityRecord) -> IngestOutcome {
-        let verified = match verify_authority(r) {
+    ///
+    /// `now_secs` is the verifier-controlled wall clock forwarded to
+    /// [`verify_authority`] for the enrollment-validity check — never derived
+    /// from the record's unauthenticated `updated_at`.
+    pub fn ingest(&mut self, r: &FeedAuthorityRecord, now_secs: u64) -> IngestOutcome {
+        let verified = match verify_authority(r, now_secs) {
             Ok(v) => v,
             Err(e) => return IngestOutcome::Dropped(format!("invalid: {e}")),
         };
@@ -344,9 +381,11 @@ mod tests {
             device_id: hex::encode(cert.device_id),
             publisher_key: hex::encode(cert.device_pubkeys.classical.ed25519_verify),
             n_identity_pub: String::new(),
-            enrollment_cbor_hex: encode_cert(cert),
-            signer_certs_cbor_hex: encode_certs(&signer_certs),
-            revocation_cbor_hex: revocation.as_ref().map(encode_revocation),
+            enrollment_cbor_hex: encode_cert(cert).expect("encode enrollment"),
+            signer_certs_cbor_hex: encode_certs(&signer_certs).expect("encode signer certs"),
+            revocation_cbor_hex: revocation
+                .as_ref()
+                .map(|r| encode_revocation(r).expect("encode revocation")),
             updated_at: updated_at_secs * 1000,
             n_sig: String::new(),
         };
@@ -368,9 +407,11 @@ mod tests {
             device_id: hex::encode(world.a_cert.device_id),
             publisher_key: hex::encode(world.a_cert.device_pubkeys.classical.ed25519_verify),
             n_identity_pub: "bb".into(),
-            enrollment_cbor_hex: encode_cert(&world.a_cert),
-            signer_certs_cbor_hex: encode_certs(&signer_certs),
-            revocation_cbor_hex: revocation.as_ref().map(encode_revocation),
+            enrollment_cbor_hex: encode_cert(&world.a_cert).expect("encode enrollment"),
+            signer_certs_cbor_hex: encode_certs(&signer_certs).expect("encode signer certs"),
+            revocation_cbor_hex: revocation
+                .as_ref()
+                .map(|r| encode_revocation(r).expect("encode revocation")),
             updated_at: 1_700_000_000_000,
             n_sig: "cc".into(),
         }
@@ -450,7 +491,7 @@ mod tests {
         let world = mint_quorum_world(0x94);
         let n = gen_identity();
         let m = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
-        let vm = verify_authority(&m).expect("master authority verifies");
+        let vm = verify_authority(&m, WORLD_NOW).expect("master authority verifies");
         assert_eq!(vm.device_id, world.a_cert.device_id);
         assert!(!vm.revoked);
 
@@ -463,7 +504,7 @@ mod tests {
             WORLD_NOW,
             &n2,
         );
-        verify_authority(&q).expect("quorum authority verifies with bundle");
+        verify_authority(&q, WORLD_NOW).expect("quorum authority verifies with bundle");
     }
 
     #[test]
@@ -473,7 +514,7 @@ mod tests {
         let mut rec = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
         rec.owner_id = hex::encode([0xEEu8; 16]);
         sign_authority_binding(&n, &mut rec); // rebind valid; owner claim now foreign
-        assert!(verify_authority(&rec).is_err());
+        assert!(verify_authority(&rec, WORLD_NOW).is_err());
     }
 
     #[test]
@@ -484,7 +525,7 @@ mod tests {
         pk.publisher_key = hex::encode([0x01u8; 32]);
         sign_authority_binding(&n, &mut pk);
         assert!(
-            verify_authority(&pk).is_err(),
+            verify_authority(&pk, WORLD_NOW).is_err(),
             "publisher_key mismatch rejected"
         );
 
@@ -493,7 +534,7 @@ mod tests {
         did.device_id = hex::encode([0x02u8; 16]);
         sign_authority_binding(&n2, &mut did);
         assert!(
-            verify_authority(&did).is_err(),
+            verify_authority(&did, WORLD_NOW).is_err(),
             "device_id mismatch rejected"
         );
     }
@@ -523,8 +564,49 @@ mod tests {
         let n = gen_identity();
         let rec = record_for(&world, &expiring, Vec::new(), None, WORLD_NOW, &n);
         assert!(
-            verify_authority(&rec).is_err(),
+            verify_authority(&rec, WORLD_NOW).is_err(),
             "expired enrollment rejected"
+        );
+    }
+
+    #[test]
+    fn verify_authority_uses_verifier_clock_not_updated_at() {
+        // Regression (Qodo #1): `updated_at` is excluded from `n_sig`, so a peer
+        // can set it freely. It must NOT drive the enrollment-validity clock —
+        // otherwise a backdated `updated_at` inside an expired cert's old window
+        // would revive it. The same record is accepted at a clock inside the
+        // window and rejected at the real now, proving the clock is the
+        // verifier's parameter, not the record's field.
+        let world = mint_quorum_world(0xB8);
+        let d_sk = ed25519_dalek::SigningKey::from_bytes(&[0xF1; 32]);
+        let d_bundle = harmony_owner::pubkey_bundle::PubKeyBundle {
+            classical: harmony_owner::pubkey_bundle::ClassicalKeys {
+                ed25519_verify: d_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let d_id = d_bundle.identity_hash();
+        let issued = crate::enrollment_verify::quorum_fixtures::SIGNER_ISSUED_AT;
+        let expiring = EnrollmentCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            d_id,
+            d_bundle,
+            issued,
+            Some(issued + 50), // expires long before WORLD_NOW
+        )
+        .unwrap();
+        let n = gen_identity();
+        // Backdate `updated_at` to sit inside the (now-expired) validity window.
+        let rec = record_for(&world, &expiring, Vec::new(), None, issued + 10, &n);
+
+        // Positive control: valid when the verifier's own clock is in-window.
+        verify_authority(&rec, issued + 10).expect("valid when verifier clock is in-window");
+        // Security: rejected at the real now, regardless of backdated updated_at.
+        assert!(
+            verify_authority(&rec, WORLD_NOW).is_err(),
+            "backdated updated_at must not revive an expired enrollment"
         );
     }
 
@@ -541,7 +623,7 @@ mod tests {
             WORLD_NOW,
             &n,
         );
-        let v = verify_authority(&ok).expect("valid revocation verifies");
+        let v = verify_authority(&ok, WORLD_NOW).expect("valid revocation verifies");
         assert!(v.revoked, "revocation sets revoked");
 
         let n2 = gen_identity();
@@ -555,7 +637,7 @@ mod tests {
             &n2,
         );
         assert!(
-            verify_authority(&bad).is_err(),
+            verify_authority(&bad, WORLD_NOW).is_err(),
             "revocation targeting a different device rejected"
         );
     }
@@ -568,11 +650,14 @@ mod tests {
         let n = gen_identity();
         let mut cache = FeedAuthorityCache::default();
         let a = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
-        assert_eq!(cache.ingest(&a), IngestOutcome::Pinned);
+        assert_eq!(cache.ingest(&a, WORLD_NOW), IngestOutcome::Pinned);
         // Same feed (same #3 `n`) but a DIFFERENT device ⇒ dropped by first-write-wins.
         let b = record_for(&world, &world.b_cert, Vec::new(), None, WORLD_NOW + 1, &n);
         assert_eq!(b.feed_id, a.feed_id, "same #3 identity ⇒ same feed_id");
-        assert!(matches!(cache.ingest(&b), IngestOutcome::Dropped(_)));
+        assert!(matches!(
+            cache.ingest(&b, WORLD_NOW),
+            IngestOutcome::Dropped(_)
+        ));
         assert_eq!(
             cache.get(&a.feed_id).unwrap().device_id,
             world.a_cert.device_id
@@ -592,7 +677,7 @@ mod tests {
             WORLD_NOW,
             &n,
         );
-        assert_eq!(cache.ingest(&active), IngestOutcome::Pinned);
+        assert_eq!(cache.ingest(&active, WORLD_NOW), IngestOutcome::Pinned);
         assert!(!cache.get(&active.feed_id).unwrap().revoked);
 
         let rev = mint_quorum_revocation(&world, world.a_cert.device_id, WORLD_NOW);
@@ -604,7 +689,10 @@ mod tests {
             WORLD_NOW + 10,
             &n,
         );
-        assert_eq!(cache.ingest(&revoked_rec), IngestOutcome::RevokedSet);
+        assert_eq!(
+            cache.ingest(&revoked_rec, WORLD_NOW),
+            IngestOutcome::RevokedSet
+        );
         assert!(cache.get(&active.feed_id).unwrap().revoked);
 
         // A newer clean record must NOT clear it.
@@ -616,7 +704,7 @@ mod tests {
             WORLD_NOW + 20,
             &n,
         );
-        cache.ingest(&newer);
+        cache.ingest(&newer, WORLD_NOW);
         assert!(
             cache.get(&active.feed_id).unwrap().revoked,
             "revoked stays sticky after a newer clean record"
@@ -631,7 +719,7 @@ mod tests {
             WORLD_NOW - 5,
             &n,
         );
-        cache.ingest(&older);
+        cache.ingest(&older, WORLD_NOW);
         assert!(
             cache.get(&active.feed_id).unwrap().revoked,
             "rollback cannot un-revoke"
@@ -644,9 +732,12 @@ mod tests {
         let n = gen_identity();
         let mut cache = FeedAuthorityCache::default();
         let a = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
-        assert_eq!(cache.ingest(&a), IngestOutcome::Pinned);
+        assert_eq!(cache.ingest(&a, WORLD_NOW), IngestOutcome::Pinned);
         let refresh = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW + 100, &n);
-        assert_eq!(cache.ingest(&refresh), IngestOutcome::BenignRefresh);
+        assert_eq!(
+            cache.ingest(&refresh, WORLD_NOW),
+            IngestOutcome::BenignRefresh
+        );
         assert_eq!(
             cache.get(&a.feed_id).unwrap().updated_at,
             (WORLD_NOW + 100) * 1000
@@ -660,7 +751,10 @@ mod tests {
         let mut cache = FeedAuthorityCache::default();
         let mut bad = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
         bad.n_sig = "00".repeat(64); // invalid signature
-        assert!(matches!(cache.ingest(&bad), IngestOutcome::Dropped(_)));
+        assert!(matches!(
+            cache.ingest(&bad, WORLD_NOW),
+            IngestOutcome::Dropped(_)
+        ));
         assert!(cache.get(&bad.feed_id).is_none());
     }
 }

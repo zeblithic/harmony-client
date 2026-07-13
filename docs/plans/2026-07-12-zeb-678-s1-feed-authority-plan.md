@@ -14,11 +14,12 @@
 - New wire fields are additive JSON: `#[serde(rename_all = "camelCase")]`, `#[serde(default, skip_serializing_if = ...)]` on optional/vec fields, declared to keep default-omitted encoding. Signatures are wire-only (never persisted). No `FILE_VERSION` bump anywhere.
 - **CBOR-hex certs (correction found during execution):** the crate cert types (`EnrollmentCert`/`RevocationCert`) are CBOR-native and do NOT round-trip through `serde_json` (their `[u8;16]` fields deserialize expecting a byte string). So the record carries them as canonical-CBOR-hex blobs — `enrollment_cbor_hex: String`, `signer_certs_cbor_hex: String` (default/skip-if-`""`), `revocation_cbor_hex: Option<String>` — encoded via `ciborium::into_writer` + `hex::encode` and decoded via `hex::decode` + `ciborium::from_reader` (the established `signer_certs_cbor` butler/relay idiom). The task snippets below that show `enrollment: EnrollmentCert` etc. map to these `*_cbor_hex` fields; helpers `encode_cert`/`encode_certs`/`encode_revocation` (Task 1) and `decode_cert`/`decode_certs`/`decode_revocation` (Task 3) do the conversion.
 - Binding bytes are length-prefixed exactly like `vine_signing` (`push_str` = `u32-LE len ‖ bytes`); domain constant `"harmony-vine-authority-v1"`. The `n_sig` covers ONLY the immutable binding fields (`feed_id, owner_id, device_id, publisher_key`) — never `updated_at` or `revocation`.
-- Chokepoint reuse only — never re-implement issuer policy: `enrollment_verify::verify_enrollment_any_issuer(cert, signer_certs, Some(&owner_id), now_secs)`; `verify_revocation_any_issuer(cert, target_enrollment, signer_certs, now_secs)`. `now_secs = updated_at / 1000` for enrollment; `revocation.issued_at` for revocation (issued-at semantics).
+- Chokepoint reuse only — never re-implement issuer policy: `enrollment_verify::verify_enrollment_any_issuer(cert, signer_certs, Some(&owner_id), now_secs)`; `verify_revocation_any_issuer(cert, target_enrollment, signer_certs, now_secs)`. `now_secs` for the enrollment check is **verifier-controlled** — supplied as a parameter by the ingest boundary, NOT derived from `updated_at` (which is excluded from `n_sig`, so a peer could backdate it to revive an expired cert). Revocation uses `revocation.issued_at` (authenticated inside the cert; issued-at semantics). `verify_authority(record, now_secs)` and `FeedAuthorityCache::ingest(record, now_secs)` both take the clock.
 - Cache discipline: active binding (`device_id, publisher_key, n_identity_pub`) is **first-write-wins**; `revoked` is **sticky/monotonic-true**, set only by a record carrying a valid `RevocationCert` whose `target == pinned device_id`, and never cleared regardless of `updated_at`.
 - Gates (harmony-client `CLAUDE.md`): per-task `scripts/test-select --context task` (paste the `round=…/bucket=…` summary line into the task note); `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; full `cargo nextest run --locked --workspace --all-targets --features test-fixtures` before the PR opens. All cargo commands run from `src-tauri/`.
 - Commit trailer on every commit:
-  ```
+
+  ```text
   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
   Claude-Session: https://claude.ai/code/session_01MsT6ZD7kqbpbKoeenyQPtc
   ```
@@ -680,11 +681,13 @@ Expected: the full `feed_authority` suite passes.
 - [ ] **Step 5: Full gate + commit.**
 
 Run:
+
 ```bash
 cd src-tauri && cargo fmt --all -- --check \
  && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings \
  && cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
+
 Expected: clean fmt, zero clippy warnings, full suite green.
 
 ```bash

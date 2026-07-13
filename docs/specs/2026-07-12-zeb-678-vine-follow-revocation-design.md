@@ -230,7 +230,12 @@ complete, fully-verifiable record. A device that never migrated a feed has no
 2. `verify_enrollment_any_issuer(enrollment, signer_certs, Some(owner_id_bytes), now_secs)`
    → `VerifiedEnrollment { device_ed25519, .. }`; require
    `device_ed25519 == publisher_key` and `enrollment.device_id == device_id`.
-   `now_secs = updated_at / 1000`.
+   `now_secs` is **verifier-controlled** — the ingest boundary supplies the
+   real wall clock. It is deliberately *not* derived from `updated_at`, which
+   is excluded from `n_sig` (unauthenticated); deriving the expiry clock from
+   it would let a peer backdate `updated_at` to revive an expired/backdated
+   enrollment. The revocation check below keeps `revocation.issued_at`, which
+   *is* authenticated inside the `RevocationCert`.
 3. If `revocation` present:
    `verify_revocation_any_issuer(revocation, target_enrollment = enrollment, signer_certs, revocation.issued_at)`
    and require `revocation.target == device_id`. (Issued-at-time semantics so a
@@ -244,7 +249,7 @@ complete, fully-verifiable record. A device that never migrated a feed has no
      dodge a revocation aimed at its own device. Later records that disagree
      with the pinned binding are dropped.
    * **`revoked`** is **sticky / monotonic-true**: set by *any* record
-     carrying a valid `RevocationCert` whose `target == ` the pinned
+     carrying a valid `RevocationCert` whose `target` equals the pinned
      `device_id`, and never cleared — independent of `updated_at`, so a newer
      `revoked:false` record can never un-revoke. `updated_at` LWW governs only
      benign refreshes that agree on the pinned binding.
