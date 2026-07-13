@@ -50955,18 +50955,32 @@ fn build_self_handshake_reachability(
 /// the devices, reproducing the exact DM-routing gap ZEB-461 closes.
 ///
 /// `learned_at` is this node's local HLC (anti-forgery: never the peer's claimed
-/// time). An empty `sender_devices` is skipped so a peer that advertised nothing
+/// time). An empty derived bundle is skipped so a peer that advertised nothing
 /// never LWW-clobbers a previously-known-good cache entry.
+///
+/// ZEB-580 S1: the cached DM identity is the peer's **#2** identity derived from
+/// the already-verified `enrollment` cert (combined pub keyed by the #2 DM hash),
+/// NOT the self-asserted wire #3 bundle. Deriving it HERE (the single write point
+/// both dialer paths share) keeps them from drifting — the same reason the helper
+/// exists. The wire `sender_devices` / `device_identity_pubs` are retained only as
+/// the degrade fallback for a cert with no usable X25519 (synthetic / pre-ZEB-372
+/// zeroed cert).
 #[allow(clippy::too_many_arguments)]
 async fn apply_handshaked_friend(
     crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
     addr: crate::owner_state_types::OwnerAddr,
     entry: crate::friend_graph::FriendEntry,
+    // ZEB-580 S1: the peer's EnrollmentCert, ALREADY verified by the caller
+    // (`verify_enrolled_device`). Authoritative source of the peer's #2 DM
+    // identity; the wire bundle below is only the degrade fallback.
+    enrollment: &harmony_owner::certs::EnrollmentCert,
+    // Degrade-only: the self-asserted wire #3 bundle, used solely when the cert
+    // has no usable X25519.
     sender_devices: Vec<crate::owner_state_types::DeviceIdentityHash>,
     device_identity_pubs: Vec<Option<[u8; 64]>>,
     // ZEB-473 Task 5: the peer's per-device tunnel reachability/PQ contacts,
-    // parallel-indexed to `sender_devices` (built from the SIGNED accept fields by
-    // the caller). `apply_owner_device_update` re-aligns these to the sorted
+    // parallel-indexed to the cached device (built from the SIGNED accept fields
+    // by the caller). `apply_owner_device_update` re-aligns these to the sorted
     // device list. `None` elements are skip-on-empty (never clobber a known
     // contact).
     device_tunnel_contacts: Vec<Option<crate::owner_state_types::DeviceTunnelContact>>,
@@ -50980,15 +50994,22 @@ async fn apply_handshaked_friend(
             return Err(format!("friend-graph apply rejected: {reason:?}"));
         }
     }
-    if !sender_devices.is_empty() {
-        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = state
-            .apply_owner_device_update(
-                addr,
-                sender_devices,
-                device_identity_pubs,
-                device_tunnel_contacts,
-                learned_at,
-            )
+    // ZEB-580 S1: prefer the cert-attested #2 identity; degrade to the wire #3
+    // bundle only when the cert carries no usable X25519, then to empty.
+    let (devices, pubs): (
+        Vec<crate::owner_state_types::DeviceIdentityHash>,
+        Vec<Option<[u8; 64]>>,
+    ) = match crate::dm_signing::device2_signing_hash(enrollment) {
+        Some(h2) => (
+            vec![h2],
+            vec![Some(crate::dm_signing::device2_combined_pub(enrollment))],
+        ),
+        None if !sender_devices.is_empty() => (sender_devices, device_identity_pubs),
+        None => (Vec::new(), Vec::new()),
+    };
+    if !devices.is_empty() {
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) =
+            state.apply_owner_device_update(addr, devices, pubs, device_tunnel_contacts, learned_at)
         {
             return Err(format!("device-cache apply rejected: {reason:?}"));
         }
@@ -51403,6 +51424,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         &crdt_state,
         payload.inviter_addr,
         entry,
+        &accepted.enrollment,
         accepted.sender_devices.clone(),
         accepted.device_identity_pubs.clone(),
         inviter_contacts,
@@ -54527,6 +54549,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         &crdt_state,
         target_addr_master,
         entry,
+        &accepted.enrollment,
         accepted.sender_devices.clone(),
         accepted.device_identity_pubs.clone(),
         target_contacts,
@@ -54770,6 +54793,11 @@ mod friend_ipc_tests {
 
     #[tokio::test]
     async fn apply_handshaked_friend_populates_cache_and_skips_empty() {
+        // ZEB-580 S1: this test pins the DEGRADE path — a synthetic cert with a
+        // zeroed X25519 (`mint_test_owner`) yields no #2 identity, so the helper
+        // falls back to caching the self-asserted wire #3 bundle. The #2 path
+        // proper is covered by `apply_handshaked_friend_caches_peer_device2_identity`.
+        let synthetic_cert = crate::community_membership::mint_test_owner(0x5e).cert;
         // A valid, self-consistent device bundle (each Some(pub) hashes to its
         // parallel device hash, so apply_owner_device_update accepts it) — the
         // same construction the acceptor-side cache test uses.
@@ -54796,6 +54824,7 @@ mod friend_ipc_tests {
             &state,
             addr,
             entry,
+            &synthetic_cert,
             devices.clone(),
             pubs.clone(),
             vec![Some(contact.clone())],
@@ -54832,9 +54861,18 @@ mod friend_ipc_tests {
         // an advertised-nothing peer can't LWW-clobber a known-good entry).
         let state2 = tokio::sync::Mutex::new(OwnerState::default());
         let (addr2, entry2) = friend_entry(0x44, FriendStatus::Active, 10);
-        apply_handshaked_friend(&state2, addr2, entry2, vec![], vec![], vec![], hlc(10))
-            .await
-            .expect("apply must succeed with an empty bundle");
+        apply_handshaked_friend(
+            &state2,
+            addr2,
+            entry2,
+            &synthetic_cert,
+            vec![],
+            vec![],
+            vec![],
+            hlc(10),
+        )
+        .await
+        .expect("apply must succeed with an empty bundle");
         {
             let s = state2.lock().await;
             assert!(
@@ -54842,6 +54880,82 @@ mod friend_ipc_tests {
                 "an empty bundle must not create a device-cache entry"
             );
         }
+    }
+
+    /// ZEB-580 S1: the dialer caches the peer's cert-attested #2 DM identity
+    /// (combined pub keyed by the #2 DM hash), NOT the self-asserted wire #3
+    /// bundle. `apply_handshaked_friend` is the SINGLE write point both dialer
+    /// paths share, so exercising it directly covers the token-redeem AND
+    /// add-by-key accept sides symmetrically.
+    #[tokio::test]
+    async fn apply_handshaked_friend_caches_peer_device2_identity() {
+        // A REAL owner: its enrollment cert carries a real birational X25519, so
+        // the #2 identity is derivable.
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted
+            .state
+            .enrollments
+            .values()
+            .next()
+            .expect("one enrollment")
+            .clone();
+        let expect_pub = crate::dm_signing::device2_combined_pub(&cert);
+        let expect_hash =
+            crate::dm_signing::device2_signing_hash(&cert).expect("real cert yields a #2 hash");
+
+        // Key the friend by a self-consistent synthetic master (the helper does
+        // not cross-check the cert's owner_id against `addr` — the caller verifies
+        // that). The cert is authoritative ONLY for the #2 DM identity.
+        let state = tokio::sync::Mutex::new(OwnerState::default());
+        let (addr, entry) = friend_entry(0x55, FriendStatus::Active, 10);
+        // A #3 wire bundle that DIFFERS from the cert-derived #2 hash — present
+        // only to prove it is NOT what gets cached.
+        let wire_devices = vec![crate::owner_state_types::DeviceIdentityHash([0x77; 16])];
+        let wire_pubs: Vec<Option<[u8; 64]>> = vec![None];
+        let contact = crate::owner_state_types::DeviceTunnelContact {
+            iroh_node_id: [0x7c; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![1u8; crate::owner_state_types::ML_DSA_65_PUBKEY_LEN],
+            pq_kem_pubkey: vec![4u8; crate::owner_state_types::ML_KEM_768_PUBKEY_LEN],
+        };
+        apply_handshaked_friend(
+            &state,
+            addr,
+            entry,
+            &cert,
+            wire_devices,
+            wire_pubs,
+            vec![Some(contact.clone())],
+            hlc(10),
+        )
+        .await
+        .expect("apply must succeed");
+
+        let s = state.lock().await;
+        let cache = s
+            .owner_device_cache
+            .devices
+            .get(&addr)
+            .expect("device cache entry for the new friend");
+        let idx = cache
+            .devices
+            .iter()
+            .position(|d| *d == expect_hash)
+            .expect("#2 device cached");
+        assert_eq!(cache.device_identity_pubs[idx], Some(expect_pub));
+        // The signed tunnel contact rode along on the cached #2 device.
+        assert_eq!(
+            cache.device_tunnel_contacts.get(idx).cloned().flatten(),
+            Some(contact),
+            "the signed tunnel contact must persist parallel to the #2 device"
+        );
+        // The cert-derived #2 identity REPLACED the wire #3 bundle.
+        assert!(
+            !cache
+                .devices
+                .contains(&crate::owner_state_types::DeviceIdentityHash([0x77; 16])),
+            "the wire #3 bundle must not be cached once the cert carries a #2 identity"
+        );
     }
 
     #[test]
