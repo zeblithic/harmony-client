@@ -120,7 +120,7 @@ pub struct DmInviteSigned {
     /// Additive: the map key is omitted entirely when None, so pre-ZEB-580
     /// invites are byte-stable and decode with None.
     #[serde(rename = "ie", default, skip_serializing_if = "Option::is_none")]
-    pub inviter_enrollment: Option<harmony_owner::certs::EnrollmentCert>,
+    pub inviter_enrollment: Option<Box<harmony_owner::certs::EnrollmentCert>>,
 }
 
 /// Reticulum-unicast packet notifying recipients that a new encrypted
@@ -196,15 +196,14 @@ pub struct DmAckSigned {
 ///   verbatim — see `encode_packet`'s mutation-guard doc comment for
 ///   rationale.
 // ZEB-580 S1: `DmInviteSigned` grew an optional inline `EnrollmentCert`
-// (`inviter_enrollment`), widening `Invite` well past `CidNotify`/`Ack`. Like
-// `ApplyInviteOutcome` (dm_outbox.rs), a `DmPacket` is a transient
-// construct-then-immediately-encode-or-match value — `build_signed_invite`/
-// `decode_packet` produce one, callers pass it straight to `encode_packet` or
-// destructure it, never store it in a Vec/struct field/channel (grep
-// confirms no such site) — so the size asymmetry the lint flags has no
-// memory cost worth boxing `signed` for, and boxing would ripple `Box<..>`
-// unwraps across every `DmPacket::Invite { signed, .. }` match site.
-#[allow(clippy::large_enum_variant)]
+// (`inviter_enrollment`), which widened `Invite` well past `CidNotify`/`Ack`
+// and tripped clippy's `large_enum_variant` lint. Fixed by boxing the cert
+// (`Option<Box<EnrollmentCert>>`) rather than suppressing the lint —
+// `Box<T>`'s `Serialize`/`Deserialize` forward transparently to `T`, so this
+// is wire-format-neutral, and `Option<Box<T>>` is pointer-sized so it shrinks
+// `DmInviteSigned`/`DmPacket` back down without rippling `Box::new`/deref
+// through every `DmPacket::Invite { signed, .. }` match site (only the field
+// itself is boxed, not the whole `signed`/`DmInviteSigned` payload).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DmPacket {
     Invite {
@@ -1037,14 +1036,14 @@ mod tests {
         let sk = minted.device_signing_key;
 
         let mut signed = sample_invite_signed(); // existing helper in this test mod
-        signed.inviter_enrollment = Some(cert.clone());
+        signed.inviter_enrollment = Some(Box::new(cert.clone()));
 
         let packet = build_signed_invite(signed.clone(), &sk).expect("build");
         let wire = encode_packet(&packet).expect("encode");
         let decoded = decode_packet(&wire).expect("decode");
         match decoded {
             DmPacket::Invite { signed: got, .. } => {
-                assert_eq!(got.inviter_enrollment, Some(cert));
+                assert_eq!(got.inviter_enrollment, Some(Box::new(cert)));
                 assert_eq!(got, signed);
             }
             _ => panic!("expected Invite"),
