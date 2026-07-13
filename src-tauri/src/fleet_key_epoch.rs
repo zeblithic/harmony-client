@@ -169,9 +169,11 @@ impl FleetKeyEpochDoc {
     /// ZEB-677 S5 — verify a carrier doc by whichever issuer signed it: a
     /// quorum doc (`quorum_sig` present) via [`Self::verify_quorum`], else the
     /// master path via [`Self::verify`]. The single reader entry point.
-    pub fn verify_any(&self, owner_id: &[u8; 16], now_secs: u64) -> bool {
+    /// Fully self-contained (no external clock — quorum signer certs verify at
+    /// the doc's own signed `bump_wall_ms`).
+    pub fn verify_any(&self, owner_id: &[u8; 16]) -> bool {
         if self.quorum_sig.is_some() {
-            self.verify_quorum(owner_id, now_secs)
+            self.verify_quorum(owner_id)
         } else {
             self.verify(owner_id)
         }
@@ -229,13 +231,18 @@ impl FleetKeyEpochDoc {
     /// ZEB-677 S5 — verify a quorum-signed doc against its EMBEDDED signer
     /// bundle (self-contained: the synchronous carrier merger cannot lock the
     /// async trust doc). Mirrors the crate's `verify_quorum_with_signers`:
-    /// ≥2 distinct signers; parity signers/signatures; every signer id has a
-    /// matching embedded cert; each cert is Master-issued, `owner_id`-bound,
-    /// and valid at `now_secs`; each signature verifies against that cert's
-    /// enrolled ed25519 key over [`Self::signing_bytes`]. Live-revocation is
-    /// intentionally NOT checked here — it mirrors the master path (no
-    /// revocation check) and is gated in the co-sign ceremony instead.
-    pub fn verify_quorum(&self, owner_id: &[u8; 16], now_secs: u64) -> bool {
+    /// ≥2 DISTINCT signers (deduplicated on the decoded 16-byte device id, so
+    /// hex-casing variants of one id cannot masquerade as a quorum — Qodo PR
+    /// #461); parity signers/signatures; every signer id has a matching
+    /// embedded cert; each cert is Master-issued, `owner_id`-bound, and valid
+    /// **at the doc's own signed `bump_wall_ms`** (not the reader's clock — a
+    /// signer cert that expires after the bump must not make an
+    /// already-signed carrier unverifiable on a later boot/merge, Qodo PR
+    /// #461); each signature verifies against that cert's enrolled ed25519 key
+    /// over [`Self::signing_bytes`]. Live-revocation is intentionally NOT
+    /// checked here — it mirrors the master path (no revocation check) and is
+    /// gated in the co-sign ceremony instead.
+    pub fn verify_quorum(&self, owner_id: &[u8; 16]) -> bool {
         let Some(q) = self.quorum_sig.as_ref() else {
             return false;
         };
@@ -245,20 +252,22 @@ impl FleetKeyEpochDoc {
         let Ok(bytes) = self.signing_bytes() else {
             return false;
         };
+        // Verify signer certs as of the doc's signed bump time, not "now".
+        let bump_secs = self.bump_wall_ms / 1000;
         let mut seen = std::collections::BTreeSet::new();
         for (signer_hex, sig_bytes) in q.signers.iter().zip(q.signatures.iter()) {
-            // Distinct signers.
-            if !seen.insert(signer_hex.clone()) {
-                return false;
-            }
             let Ok(signer_id_vec) = hex::decode(signer_hex) else {
                 return false;
             };
             let Ok(signer_id) = <[u8; 16]>::try_from(signer_id_vec.as_slice()) else {
                 return false;
             };
+            // Distinct signers — on the DECODED id, so "ab"/"AB" can't double.
+            if !seen.insert(signer_id) {
+                return false;
+            }
             // Depth-1: the signer's own cert must be present, Master-issued,
-            // this owner, and valid now.
+            // this owner, and valid at bump time.
             let Some(cert) = self.signer_certs.iter().find(|c| c.device_id == signer_id) else {
                 return false;
             };
@@ -268,7 +277,7 @@ impl FleetKeyEpochDoc {
             if !matches!(cert.issuer, EnrollmentIssuer::Master { .. }) {
                 return false;
             }
-            if cert.verify(now_secs).is_err() {
+            if cert.verify(bump_secs).is_err() {
                 return false;
             }
             let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(
@@ -305,27 +314,18 @@ impl<T: serde::Serialize> crate::owner_state_crypto::CanonicalPayload for Canoni
 /// wholesale iff its epoch is STRICTLY higher than the local doc's AND its
 /// signature verifies against `owner_id` (master OR quorum — ZEB-677 S5).
 /// Everything else (equal or lower epoch, unsigned, wrong owner, bad
-/// signature) leaves `local` untouched. `now_secs` bounds the quorum signers'
-/// cert active-window check. Returns whether local changed.
-/// Current Unix time in **seconds** — the unit of an `EnrollmentCert`'s active
-/// window (`verify(now_secs)`), for quorum-doc verification. 0 on clock error.
-pub fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
+/// signature) leaves `local` untouched. Fully self-contained — a quorum doc's
+/// signer certs verify at its own signed `bump_wall_ms`, so no clock is
+/// threaded in. Returns whether local changed.
 pub fn merge_fleet_keys_remote(
     local: &mut FleetKeyEpochDoc,
     remote: FleetKeyEpochDoc,
     owner_id: &[u8; 16],
-    now_secs: u64,
 ) -> bool {
     if remote.epoch <= local.epoch {
         return false;
     }
-    if !remote.verify_any(owner_id, now_secs) {
+    if !remote.verify_any(owner_id) {
         tracing::warn!(
             remote_epoch = remote.epoch,
             quorum = remote.quorum_sig.is_some(),
@@ -369,11 +369,7 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), crate::fleet
 /// adoption of every legitimate carrier doc until a strictly-higher epoch
 /// appeared. An unverifiable persisted doc degrades to the default and
 /// re-replicates.
-pub fn load_doc_or_recover(
-    path: &std::path::Path,
-    owner_id: &[u8; 16],
-    now_secs: u64,
-) -> FleetKeyEpochDoc {
+pub fn load_doc_or_recover(path: &std::path::Path, owner_id: &[u8; 16]) -> FleetKeyEpochDoc {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FleetKeyEpochDoc::default(),
@@ -400,7 +396,7 @@ pub fn load_doc_or_recover(
     };
     // Epoch 0 is the never-bumped default (unsigned by construction); any
     // bumped doc must carry a valid master signature.
-    if doc.epoch > 0 && !doc.verify_any(owner_id, now_secs) {
+    if doc.epoch > 0 && !doc.verify_any(owner_id) {
         tracing::warn!(path = %path.display(), epoch = doc.epoch,
             "fleet-keys doc failed signature verification; starting from default");
         return FleetKeyEpochDoc::default();
@@ -634,16 +630,13 @@ mod tests {
 
         // Happy path: two Master-issued signers.
         let doc = quorum_doc(1, &[a.clone(), b.clone()]);
-        assert!(
-            doc.verify_quorum(&owner_id, now),
-            "valid quorum doc verifies"
-        );
+        assert!(doc.verify_quorum(&owner_id), "valid quorum doc verifies");
         // A quorum doc is NOT a master doc.
         assert!(!doc.verify(&owner_id), "quorum doc has no master signature");
 
         // <2 signers rejected.
         let one = quorum_doc(1, std::slice::from_ref(&a));
-        assert!(!one.verify_quorum(&owner_id, now), "single signer rejected");
+        assert!(!one.verify_quorum(&owner_id), "single signer rejected");
 
         // Tampered `sealed` breaks every signature.
         let mut tampered = doc.clone();
@@ -651,7 +644,7 @@ mod tests {
             .sealed
             .insert("intruder".to_string(), vec![0xCD; 8]);
         assert!(
-            !tampered.verify_quorum(&owner_id, now),
+            !tampered.verify_quorum(&owner_id),
             "tampered sealed rejected"
         );
 
@@ -661,7 +654,7 @@ mod tests {
         let c = mint_master_device(&other.master_signing_key(), &other_master, 0x33, now);
         let cross = quorum_doc(1, &[a.clone(), c]);
         assert!(
-            !cross.verify_quorum(&owner_id, now),
+            !cross.verify_quorum(&owner_id),
             "wrong-owner signer rejected"
         );
 
@@ -674,7 +667,7 @@ mod tests {
             };
         }
         assert!(
-            !depth.verify_quorum(&owner_id, now),
+            !depth.verify_quorum(&owner_id),
             "non-Master signer rejected (depth-1)"
         );
 
@@ -693,7 +686,7 @@ mod tests {
             q.signatures[0] = FleetKeyEpochDoc::sign_quorum_part(&b.0, &bytes);
         }
         assert!(
-            !forged.verify_quorum(&owner_id, now),
+            !forged.verify_quorum(&owner_id),
             "mismatched signer/key rejected"
         );
     }
@@ -710,10 +703,90 @@ mod tests {
         let bytes = canonical_cbor_encode(&doc).expect("encode");
         let back: FleetKeyEpochDoc = ciborium::from_reader(bytes.as_slice()).expect("decode");
         assert_eq!(back, doc);
-        assert!(back.verify_quorum(&master.identity_hash(), now));
+        assert!(back.verify_quorum(&master.identity_hash()));
     }
 
-    const MERGE_NOW: u64 = 1_700_000_000;
+    #[test]
+    fn verify_quorum_rejects_hex_casing_duplicate_signer() {
+        // Qodo PR #461: dedup must be on the DECODED device id, not the raw hex
+        // string — else one device's id in two hex casings passes "≥2 distinct".
+        let now = 1_700_000_000;
+        let artifact = RecoveryArtifact::from_seed([5u8; 32]);
+        let master = artifact.master_pubkey_bundle();
+        let owner_id = master.identity_hash();
+        let a = mint_master_device(&artifact.master_signing_key(), &master, 0x11, now);
+        let doc = quorum_doc(1, &[a.clone(), a.clone()]); // same device twice
+                                                          // Force an upper-case hex variant on the second signer entry so the raw
+                                                          // strings differ but decode to the same id.
+        let mut forged = doc.clone();
+        if let Some(q) = forged.quorum_sig.as_mut() {
+            q.signers[1] = q.signers[1].to_uppercase();
+        }
+        assert!(
+            !forged.verify_quorum(&owner_id),
+            "one device in two hex casings must not satisfy K=2"
+        );
+    }
+
+    #[test]
+    fn verify_quorum_uses_bump_time_not_readers_clock() {
+        // Qodo PR #461: signer certs verify at the doc's own signed bump time,
+        // so a cert that expires AFTER the bump keeps the carrier verifiable on
+        // a later boot/merge (verification is time-independent of the reader).
+        let issued = 1_700_000_000u64;
+        let artifact = RecoveryArtifact::from_seed([5u8; 32]);
+        let master = artifact.master_pubkey_bundle();
+        let owner_id = master.identity_hash();
+        let owner_sk = artifact.master_signing_key();
+        // Certs expire 1 hour after issue; the doc's bump time is within that.
+        let mk = |seed: u8| {
+            let dev_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let pkb = PubKeyBundle::classical_only(dev_sk.verifying_key().to_bytes());
+            let cert = EnrollmentCert::sign_master(
+                &owner_sk,
+                master.clone(),
+                pkb.identity_hash(),
+                pkb,
+                issued,
+                Some(issued + 3600),
+            )
+            .expect("sign_master");
+            (dev_sk, cert)
+        };
+        let mut doc = FleetKeyEpochDoc {
+            epoch: 1,
+            bump_wall_ms: (issued + 60) * 1000, // within the cert window
+            sealed: BTreeMap::from([("dev".to_string(), vec![0xAB; 40])]),
+            ..Default::default()
+        };
+        let bytes = doc.signing_bytes().expect("bytes");
+        let devs = [mk(0x11), mk(0x22)];
+        let signers: Vec<[u8; 16]> = devs.iter().map(|(_, c)| c.device_id).collect();
+        let signatures: Vec<Vec<u8>> = devs
+            .iter()
+            .map(|(sk, _)| FleetKeyEpochDoc::sign_quorum_part(sk, &bytes))
+            .collect();
+        let certs: Vec<EnrollmentCert> = devs.iter().map(|(_, c)| c.clone()).collect();
+        doc.assemble_quorum(signers, signatures, certs);
+        // Verifies (bump time is inside the cert window) regardless of "now".
+        assert!(doc.verify_quorum(&owner_id));
+
+        // A doc bumped AFTER the certs expired does not verify.
+        let mut late = doc.clone();
+        late.bump_wall_ms = (issued + 7200) * 1000; // past expiry
+                                                    // Re-sign so signatures still match the new bump time.
+        let late_bytes = late.signing_bytes().expect("bytes");
+        if let Some(q) = late.quorum_sig.as_mut() {
+            q.signatures = devs
+                .iter()
+                .map(|(sk, _)| FleetKeyEpochDoc::sign_quorum_part(sk, &late_bytes))
+                .collect();
+        }
+        assert!(
+            !late.verify_quorum(&owner_id),
+            "a bump past the signer certs' expiry must not verify"
+        );
+    }
 
     #[test]
     fn merge_adopts_strictly_higher_signed_remote_only() {
@@ -723,8 +796,7 @@ mod tests {
         assert!(merge_fleet_keys_remote(
             &mut local,
             remote1.clone(),
-            &owner_id,
-            MERGE_NOW
+            &owner_id
         ));
         assert_eq!(local.epoch, 1);
 
@@ -732,18 +804,13 @@ mod tests {
         assert!(!merge_fleet_keys_remote(
             &mut local,
             remote1.clone(),
-            &owner_id,
-            MERGE_NOW
+            &owner_id
         ));
 
         // Lower epoch after a higher one: kept local.
         let (remote2, _) = signed_doc([3u8; 32], 2);
-        assert!(merge_fleet_keys_remote(
-            &mut local, remote2, &owner_id, MERGE_NOW
-        ));
-        assert!(!merge_fleet_keys_remote(
-            &mut local, remote1, &owner_id, MERGE_NOW
-        ));
+        assert!(merge_fleet_keys_remote(&mut local, remote2, &owner_id));
+        assert!(!merge_fleet_keys_remote(&mut local, remote1, &owner_id));
         assert_eq!(local.epoch, 2);
     }
 
@@ -755,17 +822,13 @@ mod tests {
         let mut unsigned = good.clone();
         unsigned.master_sig = Vec::new();
         let mut local = FleetKeyEpochDoc::default();
-        assert!(!merge_fleet_keys_remote(
-            &mut local, unsigned, &owner_id, MERGE_NOW
-        ));
+        assert!(!merge_fleet_keys_remote(&mut local, unsigned, &owner_id));
         assert_eq!(local, FleetKeyEpochDoc::default());
 
         // Signed by a DIFFERENT master (a revoked device forging with its
         // own key): identity hash doesn't match this owner.
         let (forged, _other_owner) = signed_doc([9u8; 32], 5);
-        assert!(!merge_fleet_keys_remote(
-            &mut local, forged, &owner_id, MERGE_NOW
-        ));
+        assert!(!merge_fleet_keys_remote(&mut local, forged, &owner_id));
         assert_eq!(local.epoch, 0);
     }
 
@@ -782,12 +845,7 @@ mod tests {
         // A valid quorum doc at a higher epoch is adopted.
         let good = quorum_doc(1, &[a.clone(), b.clone()]);
         let mut local = FleetKeyEpochDoc::default();
-        assert!(merge_fleet_keys_remote(
-            &mut local,
-            good.clone(),
-            &owner_id,
-            now
-        ));
+        assert!(merge_fleet_keys_remote(&mut local, good.clone(), &owner_id));
         assert_eq!(local.epoch, 1);
         assert!(local.quorum_sig.is_some());
 
@@ -796,9 +854,7 @@ mod tests {
         tampered
             .sealed
             .insert("intruder".to_string(), vec![0xEE; 8]);
-        assert!(!merge_fleet_keys_remote(
-            &mut local, tampered, &owner_id, now
-        ));
+        assert!(!merge_fleet_keys_remote(&mut local, tampered, &owner_id));
         assert_eq!(local.epoch, 1, "tampered quorum doc did not clobber local");
     }
 
@@ -847,7 +903,7 @@ mod tests {
 
         // Missing files recover to defaults.
         assert_eq!(
-            load_doc_or_recover(&doc_path, &owner_id, MERGE_NOW),
+            load_doc_or_recover(&doc_path, &owner_id),
             FleetKeyEpochDoc::default()
         );
         assert!(load_replay_or_recover(&replay_path).is_empty());
@@ -864,13 +920,13 @@ mod tests {
             replay_path: replay_path.clone(),
         };
         crate::fleet_sync::FleetPersist::persist(&persist, &doc, &tracker).expect("persist");
-        assert_eq!(load_doc_or_recover(&doc_path, &owner_id, MERGE_NOW), doc);
+        assert_eq!(load_doc_or_recover(&doc_path, &owner_id), doc);
         assert_eq!(load_replay_or_recover(&replay_path), tracker);
 
         // Corrupt doc recovers to default rather than failing the boot.
         std::fs::write(&doc_path, [0xFF, 0x00]).expect("corrupt");
         assert_eq!(
-            load_doc_or_recover(&doc_path, &owner_id, MERGE_NOW),
+            load_doc_or_recover(&doc_path, &owner_id),
             FleetKeyEpochDoc::default()
         );
 
@@ -881,7 +937,7 @@ mod tests {
         forged.epoch = 99;
         crate::fleet_sync::FleetPersist::persist(&persist, &forged, &tracker).expect("persist");
         assert_eq!(
-            load_doc_or_recover(&doc_path, &owner_id, MERGE_NOW),
+            load_doc_or_recover(&doc_path, &owner_id),
             FleetKeyEpochDoc::default(),
             "tampered persisted doc must degrade to default"
         );

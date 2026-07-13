@@ -2304,10 +2304,7 @@ mod revoke_tests {
                     move |l: &mut crate::fleet_key_epoch::FleetKeyEpochDoc, r| {
                         crate::fleet_sync::MergeOutcome {
                             changed: crate::fleet_key_epoch::merge_fleet_keys_remote(
-                                l,
-                                r,
-                                &owner_id,
-                                crate::fleet_key_epoch::now_unix_secs(),
+                                l, r, &owner_id,
                             ),
                         }
                     },
@@ -2797,6 +2794,7 @@ mod revoke_tests {
                     reason: "lost".into(),
                     target_hex: hex::encode(c_id),
                     epoch_doc_cbor_hex: None,
+                    epoch_doc_initiator_sig_hex: None,
                 },
                 initiator_sigs: addressed_to
                     .iter()

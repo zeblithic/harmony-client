@@ -124,6 +124,14 @@ pub enum QuorumRequestKind {
         /// `fleetEpochStale` banner offers a manual rotate.
         #[serde(rename = "d", default, skip_serializing_if = "Option::is_none")]
         epoch_doc_cbor_hex: Option<String>,
+        /// ZEB-677 S5 — the INITIATOR's detached signature over the bundled
+        /// epoch doc's `signing_bytes` (present iff `epoch_doc_cbor_hex` is).
+        /// Binds the epoch doc to the initiator's authorization: a co-signer
+        /// verifies this before signing, so a replicated-doc write cannot
+        /// substitute a different epoch doc for the co-signer to bless (Qodo
+        /// PR #461).
+        #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+        epoch_doc_initiator_sig_hex: Option<String>,
     },
     /// ZEB-677 S5 — a standalone quorum fleet-epoch rotation (no revocation),
     /// for the `fleetEpochStale` retry surface on a master-less fleet. The
@@ -826,6 +834,7 @@ fn try_assemble(
             reason,
             target_hex,
             epoch_doc_cbor_hex,
+            ..
         } => {
             let target = parse_device_id_hex(target_hex).ok()?;
             let reason = crate::owner_commands::parse_revoke_reason(reason).ok()?;
@@ -1465,23 +1474,37 @@ pub async fn run_quorum_sweep_with_carrier(
                         // once the trust doc carries the revocation durably.
                         match trust_engine.flush_now().await {
                             Ok(()) => {
-                                completed.push(request_id);
                                 revocations_applied += 1;
                                 // NO-ROLLBACK: install the bundled crypto cutoff
-                                // AFTER the revoke is durable. A failed bump
-                                // leaves the revoke standing; the fleetEpochStale
-                                // banner is the retry surface.
-                                if let (Some(doc), Some(c)) = (epoch_doc, carrier) {
-                                    if install_quorum_epoch_doc(
-                                        c,
-                                        device_signing_key,
-                                        self_device_id,
-                                        doc,
-                                    )
-                                    .await
-                                    {
-                                        epoch_bumps_installed += 1;
+                                // AFTER the revoke is durable.
+                                match (epoch_doc, carrier) {
+                                    // Bundle + carrier ready: install (monotonic,
+                                    // best-effort) and prune — a not-newer result
+                                    // means the fleet already rotated, so we're done.
+                                    (Some(doc), Some(c)) => {
+                                        if install_quorum_epoch_doc(
+                                            c,
+                                            device_signing_key,
+                                            self_device_id,
+                                            doc,
+                                        )
+                                        .await
+                                        {
+                                            epoch_bumps_installed += 1;
+                                        }
+                                        completed.push(request_id);
                                     }
+                                    // Bundle but NO carrier yet (boot race, Code-
+                                    // Rabbit PR #461): the revoke is durable; RETAIN
+                                    // the request so a later sweep installs the bump
+                                    // once the carrier slot is filled. fleetEpochStale
+                                    // is the interim surface — the bump is NOT dropped.
+                                    (Some(_doc), None) => {
+                                        tracing::info!(request = %request_id,
+                                            "quorum sweep: revoke durable, bundled bump deferred until the carrier is ready; request retained");
+                                    }
+                                    // Revoke-only: prune.
+                                    (None, _) => completed.push(request_id),
                                 }
                             }
                             Err(e) => {
@@ -1700,6 +1723,7 @@ mod tests {
                 reason: "lost".to_string(),
                 target_hex: target.to_string(),
                 epoch_doc_cbor_hex: None,
+                epoch_doc_initiator_sig_hex: None,
             },
             initiator_sigs: BTreeMap::new(),
             signatures: BTreeMap::new(),
@@ -1957,6 +1981,7 @@ mod tests {
             reason: "compromised".to_string(),
             target_hex: "33".repeat(16),
             epoch_doc_cbor_hex: None,
+            epoch_doc_initiator_sig_hex: None,
         };
         req.signatures.insert("bb".repeat(16), sigs("sig"));
         remote.requests.insert(id.clone(), req);
@@ -2989,7 +3014,7 @@ mod tests {
         let epoch_doc = assembly.epoch_doc.expect("bundled epoch doc assembled");
         let owner_id = f.trust.owner_id;
         assert!(
-            epoch_doc.verify_quorum(&owner_id, NOW_SECS + 30),
+            epoch_doc.verify_quorum(&owner_id),
             "quorum-signed carrier verifies against its embedded signer bundle"
         );
         assert_eq!(epoch_doc.epoch, 5, "epoch bumped to N+1");
@@ -3042,6 +3067,87 @@ mod tests {
         assert_eq!(cr.carrier.fleet_keys.newest().epoch, 5);
     }
 
+    #[test]
+    fn cosign_rejects_substituted_bundled_epoch_doc() {
+        // Qodo PR #461 (security): the initiator binds the bundled epoch doc,
+        // so a co-signer refuses to sign a doc swapped in after the request was
+        // written (which could, e.g., still seal new material to the target).
+        let f = sweep_fleet();
+        let (id, mut req) = crate::owner_quorum_commands::plan_quorum_revocation_request(
+            &f.trust,
+            &f.a_sk,
+            false,
+            &f.c_vk_hex,
+            "lost",
+            NOW_SECS + 10,
+            NOW_MS + 10_000,
+            [0xce; 16],
+            Some(4),
+        )
+        .expect("plan");
+        // Substitute a DIFFERENT epoch doc (target NOT excluded) — the
+        // initiator's binding signature no longer matches these bytes.
+        let (evil, _kt) =
+            crate::owner_commands::plan_fleet_epoch_bump_quorum(&f.trust, 4, NOW_MS + 10_000, None)
+                .expect("evil doc");
+        let evil_hex =
+            hex::encode(crate::owner_state_crypto::canonical_cbor_encode(&evil).expect("encode"));
+        if let QuorumRequestKind::Revocation {
+            epoch_doc_cbor_hex, ..
+        } = &mut req.kind
+        {
+            *epoch_doc_cbor_hex = Some(evil_hex);
+        }
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(id.clone(), req);
+        let err = crate::owner_quorum_commands::cosign_request_core(
+            &mut doc,
+            &f.trust,
+            &f.b_sk,
+            f.b_id,
+            &id,
+            NOW_MS + 20_000,
+        )
+        .expect_err("substituted epoch doc must be rejected");
+        assert!(err.contains("badEpochDoc"), "unexpected error: {err}");
+        // No signature was added.
+        assert!(!doc.requests[&id]
+            .signatures
+            .contains_key(&hex::encode(f.b_id)));
+    }
+
+    #[tokio::test]
+    async fn bundled_bump_without_carrier_retains_request_for_retry() {
+        // CodeRabbit PR #461: a bundled revocation swept before the carrier slot
+        // is filled (boot race) must NOT drop the bump — the revoke lands but the
+        // request is RETAINED so a later sweep (with the carrier) installs it.
+        let f = sweep_fleet();
+        let (doc, _id) = planned_and_cosigned_bundle(&f, 4);
+        let rig = sweep_rig(f.trust.clone(), doc);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // No carrier passed → the plain wrapper (revoke-only install path).
+        let outcome = run_quorum_sweep(
+            &rig.quorum_doc,
+            &rig.quorum_engine,
+            &rig.trust_doc,
+            &rig.trust_engine,
+            &f.a_sk,
+            f.a_id,
+            &collecting_emit(Arc::clone(&events)),
+            None,
+            NOW_SECS + 30,
+            NOW_MS + 30_000,
+        )
+        .await;
+        assert_eq!(outcome.revocations_applied, 1, "revoke still lands");
+        assert_eq!(outcome.epoch_bumps_installed, 0, "no carrier → no install");
+        assert!(rig.trust_doc.lock().await.is_revoked(f.c_id));
+        assert!(
+            !rig.quorum_doc.lock().await.requests.is_empty(),
+            "request retained so the bundled bump can be installed on a later sweep"
+        );
+    }
+
     #[tokio::test]
     async fn manual_epoch_bump_ceremony_installs_without_revocation() {
         let f = sweep_fleet();
@@ -3082,7 +3188,7 @@ mod tests {
         assert!(assembly.cert.is_none(), "epoch bump has no revocation cert");
         let epoch_doc = assembly.epoch_doc.expect("epoch doc");
         assert_eq!(epoch_doc.epoch, 5);
-        assert!(epoch_doc.verify_quorum(&f.trust.owner_id, NOW_SECS + 30));
+        assert!(epoch_doc.verify_quorum(&f.trust.owner_id));
 
         // The sweep installs it (no revocation applied).
         let rig = sweep_rig(f.trust.clone(), doc);

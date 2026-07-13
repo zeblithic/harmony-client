@@ -151,8 +151,9 @@ pub(crate) fn plan_quorum_revocation_request(
     // ZEB-677 S5 — bundle the pre-built UNSIGNED next-epoch carrier doc (target
     // excluded from the sealed set) when the node is carrying fleet keys. The
     // co-signer signs its hash too, so a single approval yields both the
-    // RevocationCert quorum and the crypto cutoff.
-    let epoch_doc_cbor_hex = match current_fleet_epoch {
+    // RevocationCert quorum and the crypto cutoff. The initiator ALSO signs the
+    // doc so a co-signer can bind it to this request (Qodo PR #461).
+    let (epoch_doc_cbor_hex, epoch_doc_initiator_sig_hex) = match current_fleet_epoch {
         Some(epoch) => {
             let (unsigned, _kt) = crate::owner_commands::plan_fleet_epoch_bump_quorum(
                 trust,
@@ -162,9 +163,12 @@ pub(crate) fn plan_quorum_revocation_request(
             )?;
             let bytes = crate::owner_state_crypto::canonical_cbor_encode(&unsigned)
                 .map_err(|e| format!("encode bundled epoch doc: {e}"))?;
-            Some(hex::encode(bytes))
+            let initiator_sig = unsigned
+                .quorum_part_over(device_signing_key)
+                .map_err(|e| format!("sign bundled epoch doc: {e}"))?;
+            (Some(hex::encode(bytes)), Some(hex::encode(initiator_sig)))
         }
-        None => None,
+        None => (None, None),
     };
     let self_hex = hex::encode(self_id);
     let request = QuorumRequest {
@@ -179,6 +183,7 @@ pub(crate) fn plan_quorum_revocation_request(
             reason: reason_str.to_string(),
             target_hex: hex::encode(target),
             epoch_doc_cbor_hex,
+            epoch_doc_initiator_sig_hex,
         },
         initiator_sigs,
         signatures: Default::default(),
@@ -376,6 +381,7 @@ pub(crate) fn cosign_request_core(
         reason,
         target_hex,
         epoch_doc_cbor_hex,
+        epoch_doc_initiator_sig_hex,
     } = &req.kind
     else {
         return Err(
@@ -383,9 +389,11 @@ pub(crate) fn cosign_request_core(
                 .to_string(),
         );
     };
-    // ZEB-677 S5 — clone the optional bundled epoch doc up front so its later
-    // use doesn't hold an immutable borrow of `req` across the signature insert.
+    // ZEB-677 S5 — clone the optional bundled epoch doc + its initiator binding
+    // up front so their later use doesn't hold an immutable borrow of `req`
+    // across the signature insert.
     let epoch_doc_hex = epoch_doc_cbor_hex.clone();
+    let epoch_doc_initiator_sig = epoch_doc_initiator_sig_hex.clone();
     if now_ms > req.expires_at_ms {
         return Err(
             "expired: this request has expired — ask the other device to retry".to_string(),
@@ -471,12 +479,26 @@ pub(crate) fn cosign_request_core(
     let own_sig = RevocationCert::sign_quorum_part(device_signing_key, &payload);
     // ZEB-677 S5 — if the request bundles a next-epoch carrier doc, produce the
     // SECOND detached signature over its hash. One approval → revoke + cutoff.
+    // BUT first bind the doc to the initiator: verify the initiator's own part
+    // over the exact epoch-doc bytes, so a replicated-doc write cannot swap in
+    // a different epoch doc for this device to bless (Qodo PR #461).
     let epoch_doc_sig_hex = match &epoch_doc_hex {
         Some(hex_doc) => {
             let bytes = hex::decode(hex_doc).map_err(|e| format!("badEpochDoc: not hex ({e})"))?;
             let unsigned: crate::fleet_key_epoch::FleetKeyEpochDoc =
                 crate::owner_state_crypto::canonical_cbor_decode(&bytes)
                     .map_err(|e| format!("badEpochDoc: decode ({e})"))?;
+            let a_sig_hex = epoch_doc_initiator_sig.as_deref().ok_or_else(|| {
+                "badEpochDoc: bundled epoch doc has no initiator signature".to_string()
+            })?;
+            let a_sig = hex::decode(a_sig_hex)
+                .map_err(|e| format!("badEpochDoc: initiator sig not hex ({e})"))?;
+            if !unsigned.verify_quorum_part(&initiator_vk, &a_sig) {
+                return Err(
+                    "badEpochDoc: initiator signature does not match the bundled epoch doc"
+                        .to_string(),
+                );
+            }
             let epoch_sig = unsigned
                 .quorum_part_over(device_signing_key)
                 .map_err(|e| format!("badEpochDoc: sign ({e})"))?;
