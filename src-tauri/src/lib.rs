@@ -53705,6 +53705,14 @@ pub(crate) async fn accept_dm_invite_impl(
     // into the tail.
     let kind = staged.signed.kind;
     let inviter_hex = hex::encode(staged.signed.inviter.0);
+    // ZEB-580 S1: the pub to cache for the signing device. A staged invite
+    // already passed `apply_invite`'s full cert verification at staging time —
+    // on the cert (#2) path that check enforced `inviter_identity_pub ==
+    // device2_combined_pub(cert)`, so this inline pub IS the verified #2 pub;
+    // on the legacy path it is the #3 pub. Either way it equals what
+    // `apply_invite`'s inline auto-accept resolves, so accept caches the same
+    // identity. Captured here BEFORE `signed` moves into the tail.
+    let signer_identity_pub = staged.signed.inviter_identity_pub;
     let members_hex: Vec<String> = staged
         .signed
         .members
@@ -53723,6 +53731,7 @@ pub(crate) async fn accept_dm_invite_impl(
             staged.signed,
             now_ms,
             staged.refresh_owner_device_cache,
+            signer_identity_pub,
         )
     };
     if let Err(e) = apply_result {

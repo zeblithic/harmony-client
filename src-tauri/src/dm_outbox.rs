@@ -2317,14 +2317,51 @@ pub(crate) fn apply_invite(
     if !signed.members.contains(&self_owner) {
         return Err(DmReceiveError::ReceiverNotInMembers);
     }
-    // Verify signature using inline inviter_identity_pub (64-byte combined
-    // identity pubs — verify_dm_packet_signature splits + uses Ed25519
-    // half for the actual signature verification, X25519 half participates
-    // only in the device-hash recomputation that defeats key-substitution).
+    // ZEB-580 S1: resolve the signer's combined pub. If the invite carries an
+    // inviter_enrollment (#2 cert), verify master→#2 + owner binding + hash
+    // agreement and use the #2 combined pub; otherwise fall back to the legacy
+    // inline #3 pub. Either way the resolved pub is fed to
+    // verify_dm_packet_signature (which splits it: Ed25519 half checks the
+    // actual signature, X25519 half participates only in the device-hash
+    // recomputation that defeats key-substitution).
+    let signer_identity_pub: [u8; 64] = if let Some(cert) = &signed.inviter_enrollment {
+        // Master-issued only on this path (N3): no signer bundle carried, so a
+        // Quorum cert reaching here (empty signer_certs) errors → mapped to
+        // SignatureVerificationFailed → the invite is dropped (the sender must
+        // re-bootstrap via the friend handshake). Expiry-agnostic (now_secs =
+        // 0), matching DmOutbox::new's ZEB-378 invariant.
+        crate::enrollment_verify::verify_enrollment_any_issuer(
+            cert,
+            &[],
+            Some(&signed.inviter.0),
+            0,
+        )
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+        // The cert's #2 DM hash must equal the body's claimed signing device
+        // hash — rejects an invite that carries a valid cert but is signed by a
+        // DIFFERENT device (forged-sender / cert-hash desync).
+        let expected = crate::dm_signing::device2_signing_hash(cert)
+            .ok_or(DmReceiveError::SignatureVerificationFailed)?;
+        if expected != signed.signing_device_hash {
+            return Err(DmReceiveError::SigningKeyDoesNotMatchDeviceHash);
+        }
+        let d2_pub = crate::dm_signing::device2_combined_pub(cert);
+        // Defense in depth: the cert and the self-consistent inline pub (Task 5
+        // sets inviter_identity_pub = device2_combined_pub on the #2 path) must
+        // agree, so a mismatched invite (cert for one #2, inline pub for
+        // another) is rejected rather than silently trusting the cert over the
+        // signed pub.
+        if d2_pub != signed.inviter_identity_pub {
+            return Err(DmReceiveError::SigningKeyDoesNotMatchDeviceHash);
+        }
+        d2_pub
+    } else {
+        signed.inviter_identity_pub
+    };
     crate::dm_signing::verify_dm_packet_signature(
         signed_bytes,
         &signature,
-        &signed.inviter_identity_pub,
+        &signer_identity_pub,
         signed.signing_device_hash,
     )?;
 
@@ -2368,6 +2405,7 @@ pub(crate) fn apply_invite(
         signed,
         wall_now_ms,
         refresh_owner_device_cache,
+        signer_identity_pub,
     )?;
     Ok(ApplyInviteOutcome::Accepted)
 }
@@ -2382,6 +2420,12 @@ pub(crate) fn run_invite_accept_tail(
     signed: crate::dm_envelope::DmInviteSigned,
     wall_now_ms: u64,
     refresh_owner_device_cache: bool,
+    // ZEB-580 S1: the inviter's resolved combined identity pub to cache for the
+    // signing device — the cert's #2 combined pub when `apply_invite` took the
+    // cert path, else the legacy inline #3 pub. Callers resolve this; the tail
+    // must NOT re-read `signed.inviter_identity_pub` for the cache write (that
+    // would cache the #3 pub even on a #2-verified invite).
+    signer_identity_pub: [u8; 64],
 ) -> Result<(), DmReceiveError> {
     // Phase 3b auto-accept: write the Space, and — on the authenticated
     // tunnel/dormant path only — refresh the OwnerDeviceCache.
@@ -2465,7 +2509,7 @@ pub(crate) fn run_invite_accept_tail(
             .iter()
             .position(|d| *d == signed.signing_device_hash)
             .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
-        device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
+        device_identity_pubs[signer_idx] = Some(signer_identity_pub);
 
         // SECURITY: the OwnerDeviceCache LWW HLC must record when WE
         // learned about these devices, NOT the timestamp the inviter
@@ -3455,6 +3499,55 @@ mod tests {
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
         (signed, signature, body_bytes)
+    }
+
+    /// ZEB-580 S1 (Task 3) test helper: the canonical CBOR encoding of a signed
+    /// invite body — the exact bytes `apply_invite` verifies the signature over.
+    fn canonical(signed: &crate::dm_envelope::DmInviteSigned) -> Vec<u8> {
+        crate::owner_state_crypto::canonical_cbor_encode(signed).unwrap()
+    }
+
+    /// ZEB-580 S1 (Task 3) test helper: a #2-cert-carrying `DmInviteSigned`
+    /// (UNSIGNED) whose signing device is the one enrolled by `cert` — i.e.
+    /// `signing_device_hash` is the cert's #2 DM hash, `sender_devices` is that
+    /// singleton, and `inviter_identity_pub` is the cert's #2 combined pub (the
+    /// shape Task 5 emits on the send side). Marks `inviter` an ACTIVE friend so
+    /// a *valid* invite reaches the accept tail. Callers sign the returned body
+    /// with the enrolled device's #2 key (and may mutate exactly one field first
+    /// to drive a reject path). `inviter` is passed separately from the cert so
+    /// the owner-mismatch case can wire a cert whose `owner_id != inviter`.
+    fn build_dm_invite_signed_with_cert(
+        state: &mut OwnerState,
+        self_owner: OwnerAddr,
+        inviter: OwnerAddr,
+        cert: harmony_owner::certs::EnrollmentCert,
+    ) -> crate::dm_envelope::DmInviteSigned {
+        insert_active_friend(state, inviter);
+        let device2_pub = crate::dm_signing::device2_combined_pub(&cert);
+        let device2_hash =
+            crate::dm_signing::device2_signing_hash(&cert).expect("minted cert yields a #2 hash");
+        // mint_owner draws a random owner_id, so `inviter` may sort either side
+        // of `self_owner` — the DM Space canonical-CBOR invariant requires
+        // members sorted ascending, so sort here for determinism (order-agnostic
+        // for the `.contains()` sanity gates; the body is signed AFTER this).
+        let mut members = vec![inviter, self_owner];
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members,
+            inviter,
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device2_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "inviter".into(),
+            },
+            signing_device_hash: device2_hash,
+            inviter_identity_pub: device2_pub,
+            inviter_enrollment: Some(Box::new(cert)),
+        }
     }
 
     /// ZEB-262 Phase 4 Task 2: assert that `DmOutbox.signing_key` and
@@ -5945,6 +6038,192 @@ mod tests {
         assert_eq!(entry.device_identity_pubs[0], Some(identity_pub));
     }
 
+    // ── ZEB-580 S1 (Task 3): cert-anchored #2 DM identity on the invite path ────
+
+    /// ZEB-580 S1: an invite carrying a valid `inviter_enrollment` (#2 cert)
+    /// verifies via the cert's #2 combined pub and caches the #2 DM identity
+    /// (not a #3), keyed by the #2 DM hash.
+    #[test]
+    fn apply_invite_with_cert_caches_device2_identity() {
+        use ed25519_dalek::Signer;
+
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted.state.enrollments.values().next().unwrap().clone();
+        let sk2 = minted.device_signing_key; // the enrolled device's #2 key
+        let inviter = OwnerAddr(cert.owner_id);
+        let device2_pub = crate::dm_signing::device2_combined_pub(&cert);
+        let device2_hash = crate::dm_signing::device2_signing_hash(&cert).unwrap();
+
+        let mut state = OwnerState::default();
+        let signed =
+            build_dm_invite_signed_with_cert(&mut state, self_owner, inviter, cert.clone());
+        let signed_bytes = canonical(&signed);
+        let signature = sk2.sign(&signed_bytes).to_bytes();
+
+        let out = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &signed_bytes,
+            1_700_000_100,
+            Some(inviter),
+            true,
+        )
+        .expect("apply");
+        assert!(matches!(out, ApplyInviteOutcome::Accepted));
+
+        // The cache now holds the #2 combined pub keyed by the #2 DM hash.
+        let entry = state.owner_device_cache.devices.get(&inviter).unwrap();
+        let idx = entry
+            .devices
+            .iter()
+            .position(|d| *d == device2_hash)
+            .unwrap();
+        assert_eq!(entry.device_identity_pubs[idx], Some(device2_pub));
+    }
+
+    /// ZEB-580 S1: a cert whose `owner_id` does NOT match `signed.inviter` is
+    /// rejected — `verify_enrollment_any_issuer`'s owner bind fails and maps to
+    /// `SignatureVerificationFailed`. Everything else about the invite is valid
+    /// (self-consistent #2 pub/hash/signature, inviter befriended, all sanity
+    /// gates pass), so this isolates the cert↔owner binding as the sole reason.
+    #[test]
+    fn apply_invite_cert_owner_mismatch_rejects() {
+        use ed25519_dalek::Signer;
+
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted.state.enrollments.values().next().unwrap().clone();
+        let sk2 = minted.device_signing_key;
+        // The claimed inviter is a DIFFERENT owner than the cert enrolls.
+        let bogus_inviter = OwnerAddr([0x99; 16]);
+        assert_ne!(cert.owner_id, bogus_inviter.0);
+
+        let mut state = OwnerState::default();
+        let signed =
+            build_dm_invite_signed_with_cert(&mut state, self_owner, bogus_inviter, cert.clone());
+        let signed_bytes = canonical(&signed);
+        let signature = sk2.sign(&signed_bytes).to_bytes();
+
+        let err = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &signed_bytes,
+            1_700_000_100,
+            Some(bogus_inviter),
+            true,
+        )
+        .expect_err("cert owner mismatch must reject");
+        assert!(
+            matches!(err, DmReceiveError::SignatureVerificationFailed),
+            "expected SignatureVerificationFailed, got {err:?}"
+        );
+    }
+
+    /// ZEB-580 S1: cert/hash desync — the invite is signed by a FOREIGN device
+    /// (self-consistent inline pub/hash/signature, so the legacy
+    /// `verify_dm_packet_signature` alone would ACCEPT it) but carries the
+    /// victim's cert with `inviter = victim`. The new cert-anchored check
+    /// (`device2_signing_hash(cert) != signing_device_hash`) catches the
+    /// mismatch and rejects, defeating a forged-sender attack that binds an
+    /// attacker's device under the victim's owner.
+    #[test]
+    fn apply_invite_cert_hash_mismatch_rejects() {
+        use ed25519_dalek::Signer;
+
+        let self_owner = OwnerAddr([0xaa; 16]);
+        // Victim: the cert we (honestly) attach; its owner is the claimed inviter.
+        let victim = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint victim");
+        let victim_cert = victim.state.enrollments.values().next().unwrap().clone();
+        let victim_owner = OwnerAddr(victim_cert.owner_id);
+        // Attacker: a foreign device that actually signs the frame.
+        let attacker = harmony_owner::lifecycle::mint_owner(1_700_000_001).expect("mint attacker");
+        let attacker_cert = attacker.state.enrollments.values().next().unwrap().clone();
+        let attacker_sk2 = attacker.device_signing_key;
+        let attacker_pub = crate::dm_signing::device2_combined_pub(&attacker_cert);
+        let attacker_hash = crate::dm_signing::device2_signing_hash(&attacker_cert).unwrap();
+        let victim_hash = crate::dm_signing::device2_signing_hash(&victim_cert).unwrap();
+        assert_ne!(attacker_hash, victim_hash);
+
+        let mut state = OwnerState::default();
+        // Base the invite on the victim (cert owner == inviter == befriended),
+        // then desync the SIGNING device to the attacker's.
+        let mut signed =
+            build_dm_invite_signed_with_cert(&mut state, self_owner, victim_owner, victim_cert);
+        signed.sender_devices = vec![attacker_hash];
+        signed.signing_device_hash = attacker_hash;
+        signed.inviter_identity_pub = attacker_pub;
+        let signed_bytes = canonical(&signed);
+        let signature = attacker_sk2.sign(&signed_bytes).to_bytes();
+
+        let err = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &signed_bytes,
+            1_700_000_100,
+            Some(victim_owner),
+            true,
+        )
+        .expect_err("cert/hash desync must reject");
+        assert!(
+            matches!(err, DmReceiveError::SigningKeyDoesNotMatchDeviceHash),
+            "expected SigningKeyDoesNotMatchDeviceHash, got {err:?}"
+        );
+    }
+
+    /// ZEB-580 S1: a legacy invite (`inviter_enrollment = None`) still verifies
+    /// via the inline #3 pub and caches that #3 identity — the pre-cert path is
+    /// unchanged by the Task 3 dual-path fork.
+    #[test]
+    fn apply_invite_legacy_no_cert_caches_device3() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default();
+        insert_active_friend(&mut state, OwnerAddr([1; 16]));
+
+        let (signed, signature, body_bytes) = build_valid_dm_invite(self_owner);
+        assert!(
+            signed.inviter_enrollment.is_none(),
+            "legacy fixture must carry no cert"
+        );
+        let device_hash = signed.signing_device_hash;
+        let identity_pub = signed.inviter_identity_pub;
+
+        let out = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            200,
+            None,
+            true,
+        )
+        .expect("apply");
+        assert!(matches!(out, ApplyInviteOutcome::Accepted));
+
+        let entry = state
+            .owner_device_cache
+            .devices
+            .get(&OwnerAddr([1; 16]))
+            .expect("cache row present on legacy auto-accept");
+        let idx = entry
+            .devices
+            .iter()
+            .position(|d| *d == device_hash)
+            .unwrap();
+        assert_eq!(entry.device_identity_pubs[idx], Some(identity_pub));
+    }
+
     /// An invite from a NON-friend is staged and writes NOTHING to owner state
     /// (spec: staging is process-local only; decline == offline).
     #[test]
@@ -6134,12 +6413,17 @@ mod tests {
                 ApplyInviteOutcome::Staged(s) => s,
                 other => panic!("expected Staged, got {other:?}"),
             };
+            // Legacy fixture (no cert): the resolved signer pub is the inline
+            // #3 pub — exactly what apply_invite's inline auto-accept resolves,
+            // so the two legs stay byte-identical. Capture before the move.
+            let deferred_signer_pub = staged.signed.inviter_identity_pub;
             run_invite_accept_tail(
                 &mut b,
                 "dev",
                 staged.signed,
                 777,
                 staged.refresh_owner_device_cache,
+                deferred_signer_pub,
             )
             .unwrap();
 
@@ -6191,12 +6475,14 @@ mod tests {
             ApplyInviteOutcome::Staged(s) => s,
             other => panic!("expected Staged, got {other:?}"),
         };
+        let deferred_signer_pub = staged.signed.inviter_identity_pub;
         run_invite_accept_tail(
             &mut state,
             "dev",
             staged.signed,
             wall_now_ms,
             staged.refresh_owner_device_cache,
+            deferred_signer_pub,
         )
         .unwrap();
 
@@ -6246,12 +6532,14 @@ mod tests {
             ApplyInviteOutcome::Staged(s) => s,
             other => panic!("expected Staged, got {other:?}"),
         };
+        let deferred_signer_pub = staged.signed.inviter_identity_pub;
         run_invite_accept_tail(
             &mut state,
             "dev",
             staged.signed,
             wall_now_ms,
             staged.refresh_owner_device_cache,
+            deferred_signer_pub,
         )
         .unwrap();
 
