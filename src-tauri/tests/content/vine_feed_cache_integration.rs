@@ -204,10 +204,12 @@ fn two_reactors_like_same_vine_count_is_two() {
     let r1 = cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&alice),
+        0,
     );
     let r2 = cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "bob-addr"),
         &reaction_bytes(&bob),
+        0,
     );
     assert_eq!(r1, Some(ReactionOutcome::Inserted));
     assert_eq!(r2, Some(ReactionOutcome::Inserted));
@@ -226,10 +228,12 @@ fn same_reactor_unlikes_then_likes_lww_wins() {
     cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&unlike),
+        0,
     );
     let outcome = cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&like),
+        0,
     );
     assert_eq!(outcome, Some(ReactionOutcome::UpdatedNewer));
 
@@ -245,6 +249,7 @@ fn stale_reaction_does_not_overwrite_newer() {
     cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&recent_like),
+        0,
     );
 
     // Late-arriving unlike (older timestamp) — must NOT overwrite.
@@ -252,6 +257,7 @@ fn stale_reaction_does_not_overwrite_newer() {
     let outcome = cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&stale_unlike),
+        0,
     );
     assert_eq!(outcome, Some(ReactionOutcome::Stale));
 
@@ -269,10 +275,12 @@ fn liked_by_me_reflects_viewer_addr() {
     cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&alice),
+        0,
     );
     cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "bob-addr"),
         &reaction_bytes(&bob),
+        0,
     );
 
     let alice_view = cache.get_reaction("vine-1", &addr("alice-addr"));
@@ -298,10 +306,12 @@ fn same_second_toggle_overwrites_not_dropped() {
     let r1 = cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&like),
+        0,
     );
     let r2 = cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&unlike),
+        0,
     );
 
     assert_eq!(r1, Some(ReactionOutcome::Inserted));
@@ -328,10 +338,12 @@ fn same_timestamp_same_liked_is_stale_no_reemit() {
     let r1 = cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&like1),
+        0,
     );
     let r2 = cache.on_reaction_sample(
         &reaction_topic("creator-addr", "vine-1", "alice-addr"),
         &reaction_bytes(&like2),
+        0,
     );
 
     assert_eq!(r1, Some(ReactionOutcome::Inserted));

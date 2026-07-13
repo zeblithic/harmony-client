@@ -120,11 +120,15 @@ fn cache_survives_reload() {
         let r1 = canonical_reaction_bytes("vine-A", "bob-addr", "Bob", true, recent_a + 5);
         let r2 = canonical_reaction_bytes("vine-A", "carol-addr", "Carol", true, recent_a + 10);
         assert_eq!(
-            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-A", "bob-addr"), &r1),
+            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-A", "bob-addr"), &r1, 0),
             Some(ReactionOutcome::Inserted)
         );
         assert_eq!(
-            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-A", "carol-addr"), &r2),
+            cache.on_reaction_sample(
+                &reaction_topic("alice-addr", "vine-A", "carol-addr"),
+                &r2,
+                0
+            ),
             Some(ReactionOutcome::Inserted)
         );
 

@@ -3024,6 +3024,21 @@ pub async fn run(
     )
     .await;
 
+    // ZEB-678 S2: subscribe to per-feed authority records (owner-anchoring +
+    // revocation). Own key space — `harmony/vines/*` is single-segment and
+    // cannot match the deeper `{N}/authority` keys.
+    dispatch_action(
+        RuntimeAction::Subscribe {
+            key_expr: "harmony/vines/*/authority".to_string(),
+        },
+        &session,
+        &zenoh_tx,
+        &app,
+        &closing,
+        &own_zid,
+    )
+    .await;
+
     // Note: per-creator Zenoh subscriptions are not used yet because the
     // publish path (harmony/vines/{addr}) does not include /announce/.
     // Once harmony-node adopts the full keyspace protocol
@@ -8313,6 +8328,17 @@ fn emit_frontend_event(
             crate::node_event_sink::emit_ser(app.as_ref(), "message-received", &msg);
         }
     } else if key_expr.starts_with("harmony/vines/") {
+        // ZEB-678 S2: verifier-controlled wall clock for the authority-aware
+        // ingest paths (authority enrollment expiry; reaction enrollment). One
+        // computation shared by the authority / reaction / descriptor arms.
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        )
+        .unwrap_or(u64::MAX);
+        let now_secs = now_ms / 1000;
         if key_expr.contains("/tombstones/") {
             // ZEB-670: creator-signed delete. Returns the CID to evict
             // when the tombstone freed the last live reference — the
@@ -8353,13 +8379,25 @@ fn emit_frontend_event(
             }
             return None;
         }
+        if key_expr.ends_with("/authority") {
+            // ZEB-678 S2: feed authority record → cache (owner-anchoring +
+            // revocation). Verifier-controlled clock; ingest never degrades
+            // existing state and drives no frontend view, so no emit.
+            match vine_feed_cache.lock() {
+                Ok(mut cache) => cache.on_authority_sample(key_expr, payload, now_secs),
+                Err(e) => {
+                    tracing::error!(error = %e, "vine_feed_cache mutex poisoned; skipping authority ingest");
+                }
+            }
+            return None;
+        }
         if key_expr.contains("/reactions/") {
             // ZEB-286: route reaction through the cache. Re-emit to the
             // frontend ONLY on Inserted or UpdatedNewer (stale/duplicate
             // re-arrivals are absorbed silently). The cache's per-LWW
             // dedupe replaces the previous naive every-sample emit.
             let outcome = match vine_feed_cache.lock() {
-                Ok(mut cache) => cache.on_reaction_sample(key_expr, payload),
+                Ok(mut cache) => cache.on_reaction_sample(key_expr, payload, now_secs),
                 Err(e) => {
                     tracing::error!(error = %e, "vine_feed_cache mutex poisoned; skipping reaction emit");
                     None
@@ -8386,14 +8424,8 @@ fn emit_frontend_event(
             // (Followed vs Discover) is decided by the cache once at
             // first insert; re-arrivals are absorbed. The cache returns
             // the ready-to-emit VineVideoDtoWithSource so we do not have
-            // to re-parse + re-mutate JSON here.
-            let now_ms = u64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0),
-            )
-            .unwrap_or(u64::MAX);
+            // to re-parse + re-mutate JSON here. `now_ms` is the block-hoisted
+            // clock (ZEB-678 S2).
             let outcome = match vine_feed_cache.lock() {
                 Ok(mut cache) => match followed_set.lock() {
                     Ok(set) => cache.on_descriptor_sample(key_expr, payload, &set, now_ms),
