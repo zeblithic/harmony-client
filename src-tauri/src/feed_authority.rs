@@ -74,9 +74,91 @@ pub fn encode_revocation(rev: &RevocationCert) -> String {
     hex::encode(buf)
 }
 
+/// Domain-separation prefix + version for the authority binding bytes.
+const AUTHORITY_DOMAIN: &str = "harmony-vine-authority-v1";
+
+/// Length-prefixed bytes the `n_sig` covers — ONLY the immutable binding
+/// fields (§3.1). `updated_at`/revocation are authenticated separately, so a
+/// benign clock refresh or an appended revocation never invalidates `n_sig`.
+pub fn authority_binding_bytes(r: &FeedAuthorityRecord) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    crate::vine_signing::push_str(&mut out, AUTHORITY_DOMAIN);
+    crate::vine_signing::push_str(&mut out, &r.feed_id);
+    crate::vine_signing::push_str(&mut out, &r.owner_id);
+    crate::vine_signing::push_str(&mut out, &r.device_id);
+    crate::vine_signing::push_str(&mut out, &r.publisher_key);
+    out
+}
+
+/// Set `feed_id` (= the `#3` address), `n_identity_pub`, and `n_sig` in place.
+/// Mirrors `vine_signing::sign_descriptor`; the `#3` key is used exactly once
+/// per feed, to establish this binding.
+pub fn sign_authority_binding(
+    private: &harmony_identity::PrivateIdentity,
+    r: &mut FeedAuthorityRecord,
+) {
+    r.feed_id = crate::vine_signing::signer_address(private);
+    r.n_identity_pub = hex::encode(private.public_identity().to_public_bytes());
+    let bytes = authority_binding_bytes(r);
+    r.n_sig = hex::encode(private.sign(&bytes));
+}
+
+/// Verify the `#3` binding: `n_identity_pub` hashes to `feed_id`, and `n_sig`
+/// is a strict Ed25519 signature over the binding bytes. Mirrors
+/// `vine_signing::verify_signed`.
+pub fn verify_binding(r: &FeedAuthorityRecord) -> Result<(), String> {
+    let pub_vec = hex::decode(&r.n_identity_pub)
+        .map_err(|e| format!("authority n_identity_pub not hex: {e}"))?;
+    let identity = harmony_identity::Identity::from_public_bytes(&pub_vec)
+        .map_err(|_| "authority n_identity_pub invalid".to_string())?;
+    if hex::encode(identity.address_hash) != r.feed_id {
+        return Err("authority n_identity_pub does not match feed_id".to_string());
+    }
+    let sig_bytes: [u8; 64] = hex::decode(&r.n_sig)
+        .map_err(|e| format!("authority n_sig not hex: {e}"))?
+        .try_into()
+        .map_err(|_| "authority n_sig must be 64 bytes".to_string())?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    identity
+        .verifying_key
+        .verify_strict(&authority_binding_bytes(r), &sig)
+        .map_err(|_| "authority binding signature invalid".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gen_identity() -> harmony_identity::PrivateIdentity {
+        harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
+    }
+
+    /// Build a record for `cert` under `world`, signed by `#3` identity `n`.
+    /// Reused across the binding, verify, and cache tests — same-feed tests
+    /// thread the SAME `n` so `feed_id` stays constant.
+    fn record_for(
+        world: &crate::enrollment_verify::quorum_fixtures::QuorumWorld,
+        cert: &EnrollmentCert,
+        signer_certs: Vec<EnrollmentCert>,
+        revocation: Option<RevocationCert>,
+        updated_at_secs: u64,
+        n: &harmony_identity::PrivateIdentity,
+    ) -> FeedAuthorityRecord {
+        let mut rec = FeedAuthorityRecord {
+            feed_id: String::new(),
+            owner_id: hex::encode(world.owner_id),
+            device_id: hex::encode(cert.device_id),
+            publisher_key: hex::encode(cert.device_pubkeys.classical.ed25519_verify),
+            n_identity_pub: String::new(),
+            enrollment_cbor_hex: encode_cert(cert),
+            signer_certs_cbor_hex: encode_certs(&signer_certs),
+            revocation_cbor_hex: revocation.as_ref().map(encode_revocation),
+            updated_at: updated_at_secs * 1000,
+            n_sig: String::new(),
+        };
+        sign_authority_binding(n, &mut rec);
+        rec
+    }
     use crate::enrollment_verify::quorum_fixtures::{
         mint_quorum_revocation, mint_quorum_world, WORLD_NOW,
     };
@@ -138,5 +220,32 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         let back: FeedAuthorityRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn binding_signs_and_verifies() {
+        let world = mint_quorum_world(0x88);
+        let n = gen_identity();
+        let rec = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        assert_eq!(rec.feed_id, hex::encode(n.public_identity().address_hash));
+        verify_binding(&rec).expect("valid binding verifies");
+    }
+
+    #[test]
+    fn binding_rejects_wrong_feed_id() {
+        let world = mint_quorum_world(0x8C);
+        let n = gen_identity();
+        let mut rec = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        rec.feed_id = "00".repeat(20); // no longer matches hash(n_identity_pub)
+        assert!(verify_binding(&rec).is_err());
+    }
+
+    #[test]
+    fn binding_rejects_tampered_bound_field() {
+        let world = mint_quorum_world(0x90);
+        let n = gen_identity();
+        let mut rec = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        rec.owner_id = "11".repeat(16); // covered by n_sig ⇒ signature no longer matches
+        assert!(verify_binding(&rec).is_err());
     }
 }
