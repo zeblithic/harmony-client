@@ -163,7 +163,7 @@ fn bounded_hex_decode(hexs: &str, what: &str) -> Result<Vec<u8>, String> {
     hex::decode(hexs).map_err(|e| format!("authority {what} not hex: {e}"))
 }
 
-fn decode_cert(hexs: &str) -> Result<EnrollmentCert, String> {
+pub(crate) fn decode_cert(hexs: &str) -> Result<EnrollmentCert, String> {
     let bytes = bounded_hex_decode(hexs, "enrollment")?;
     let mut cur = std::io::Cursor::new(&bytes);
     let cert = ciborium::from_reader(&mut cur)
@@ -174,7 +174,7 @@ fn decode_cert(hexs: &str) -> Result<EnrollmentCert, String> {
     Ok(cert)
 }
 
-fn decode_certs(hexs: &str) -> Result<Vec<EnrollmentCert>, String> {
+pub(crate) fn decode_certs(hexs: &str) -> Result<Vec<EnrollmentCert>, String> {
     if hexs.is_empty() {
         return Ok(Vec::new());
     }

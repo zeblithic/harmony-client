@@ -15,9 +15,14 @@
 //! `hex::encode(address_hash)` — see `start_node`'s identity-load block).
 
 use serde::{Deserialize, Serialize};
+// ZEB-678 S2: `sk.sign(..)` on the enrolled `#2` key comes from the
+// `ed25519_dalek::Signer` trait (the `#3` path signs via `PrivateIdentity`).
+use ed25519_dalek::Signer as _;
 
 /// Domain-separation prefix + version for the signed byte string.
 const CANONICAL_PREFIX: &str = "harmony-vine-tombstone-v1";
+/// ZEB-678 S2: `-v2` domain for the enrolled `#2` device signature.
+const CANONICAL_PREFIX_V2: &str = "harmony-vine-tombstone-v2";
 
 /// Wire record published on `harmony/vines/{creator}/tombstones/{vine_id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +119,43 @@ pub fn verify_tombstone(t: &VineTombstonePayload) -> Result<(), String> {
         .verifying_key
         .verify_strict(&bytes, &sig)
         .map_err(|_| "tombstone signature invalid".to_string())
+}
+
+/// ZEB-678 S2: same field set as [`canonical_bytes`] under the `-v2` domain.
+pub fn canonical_bytes_v2(
+    vine_id: &str,
+    video_cid: &str,
+    creator_address: &str,
+    deleted_at: u64,
+) -> Vec<u8> {
+    format!("{CANONICAL_PREFIX_V2}|{vine_id}|{video_cid}|{creator_address}|{deleted_at}")
+        .into_bytes()
+}
+
+/// ZEB-678 S2: add the enrolled `#2` `device_sig` to an already-`#3`-signed
+/// tombstone (dual-sign — the required `#3` `sig`/`creator_identity_pub` stay
+/// for backward verify; `device_sig` marks it migrated).
+pub fn sign_tombstone_v2(sk: &ed25519_dalek::SigningKey, t: &mut VineTombstonePayload) {
+    let bytes = canonical_bytes_v2(&t.vine_id, &t.video_cid, &t.creator_address, t.deleted_at);
+    t.device_sig = Some(hex::encode(sk.sign(&bytes).to_bytes()));
+}
+
+/// ZEB-678 S2: verify a tombstone's `#2` `device_sig` against the feed
+/// authority `publisher_key`.
+pub fn verify_tombstone_v2(
+    t: &VineTombstonePayload,
+    publisher_key: &[u8; 32],
+) -> Result<(), String> {
+    if t.vine_id.contains('|') || t.video_cid.contains('|') || t.creator_address.contains('|') {
+        return Err("tombstone field contains the canonical separator '|'".into());
+    }
+    let bytes = canonical_bytes_v2(&t.vine_id, &t.video_cid, &t.creator_address, t.deleted_at);
+    crate::vine_signing::verify_device_sig(
+        t.device_sig.as_deref(),
+        publisher_key,
+        &bytes,
+        "tombstone",
+    )
 }
 
 #[cfg(test)]
@@ -246,5 +288,47 @@ mod tests {
             tombstone_key_expr("aabb", "vine-1"),
             "harmony/vines/aabb/tombstones/vine-1"
         );
+    }
+
+    #[test]
+    fn tombstone_v2_dual_signs_and_verifies() {
+        let id = test_identity();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x66; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let mut t = sign_tombstone(
+            &id,
+            "vine-abc-1".into(),
+            "cafe01".into(),
+            addr_of(&id),
+            1_700_000_000,
+        );
+        assert!(t.device_sig.is_none());
+        assert!(verify_tombstone(&t).is_ok(), "legacy #3 valid before v2");
+        sign_tombstone_v2(&sk, &mut t);
+        assert!(t.device_sig.is_some());
+        verify_tombstone_v2(&t, &pk).expect("valid #2 tombstone signature");
+        // Dual-sign: the legacy `#3` signature STILL verifies after adding v2.
+        assert!(
+            verify_tombstone(&t).is_ok(),
+            "legacy #3 still valid on a dual-signed tombstone"
+        );
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(
+            verify_tombstone_v2(&t, &wrong).is_err(),
+            "wrong key rejected"
+        );
+        // A tombstone with no device_sig fails the v2 path.
+        let plain = sign_tombstone(
+            &id,
+            "vine-abc-2".into(),
+            "cafe02".into(),
+            addr_of(&id),
+            1_700_000_001,
+        );
+        assert!(verify_tombstone_v2(&plain, &pk)
+            .unwrap_err()
+            .contains("no device signature"));
     }
 }

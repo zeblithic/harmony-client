@@ -34,6 +34,9 @@
 //! the record type is born strict.
 
 use crate::{VineDescriptorPayload, VineFollowListPayload, VineReactionPayload};
+// ZEB-678 S2: `sk.sign(..)` on the raw enrolled `#2` key comes from the
+// `ed25519_dalek::Signer` trait (the `#3` path signs via `PrivateIdentity`).
+use ed25519_dalek::Signer as _;
 
 /// Domain-separation prefix + version for descriptor canonical bytes.
 const DESCRIPTOR_DOMAIN: &str = "harmony-vine-descriptor-v1";
@@ -215,6 +218,164 @@ pub fn verify_follow_list(p: &VineFollowListPayload) -> Result<(), String> {
         &p.owner_address,
         &follow_list_canonical_bytes(p),
         "follow list",
+    )
+}
+
+// ── ZEB-678 S2: enrolled `#2` device-key signing (`-v2` domain) ──────────
+//
+// The migration re-signs the SAME canonical field set as the `#3` builders
+// under bumped `-v2` domain constants, producing a `device_sig` that
+// receivers verify against the feed's authority `publisher_key`. The domain
+// bump gives clean protocol separation from `#3`-signed bytes;
+// `creator_address`/`owner_address` is already inside the signed bytes, so a
+// `device_sig` cannot be replayed onto another feed.
+
+/// `-v2` domain: descriptor signed by the enrolled `#2` device key.
+const DESCRIPTOR_DOMAIN_V2: &str = "harmony-vine-descriptor-v2";
+/// `-v2` domain: reaction signed by the enrolled `#2` device key.
+const REACTION_DOMAIN_V2: &str = "harmony-vine-reaction-v2";
+/// `-v2` domain: follow list signed by the enrolled `#2` device key.
+const FOLLOW_LIST_DOMAIN_V2: &str = "harmony-vine-follows-v2";
+
+/// Same field set as [`descriptor_canonical_bytes`], under the `-v2` domain.
+pub fn descriptor_canonical_bytes_v2(d: &VineDescriptorPayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    push_str(&mut out, DESCRIPTOR_DOMAIN_V2);
+    push_str(&mut out, &d.id);
+    push_str(&mut out, &d.creator_address);
+    push_str(&mut out, &d.creator_name);
+    push_u64(&mut out, d.created_at);
+    push_str(&mut out, &d.video_cid);
+    push_opt_str(&mut out, &d.title);
+    push_opt_str(&mut out, &d.reshare_of);
+    push_opt_str(&mut out, &d.original_creator_address);
+    push_opt_str(&mut out, &d.original_creator_name);
+    out
+}
+
+/// Same field set as [`reaction_canonical_bytes`], under the `-v2` domain.
+pub fn reaction_canonical_bytes_v2(r: &VineReactionPayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    push_str(&mut out, REACTION_DOMAIN_V2);
+    push_str(&mut out, &r.vine_id);
+    push_str(&mut out, &r.reactor_address);
+    push_str(&mut out, &r.reactor_name);
+    push_bool(&mut out, r.liked);
+    push_u64(&mut out, r.timestamp);
+    out
+}
+
+/// Same field set as [`follow_list_canonical_bytes`], under the `-v2` domain.
+pub fn follow_list_canonical_bytes_v2(p: &VineFollowListPayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + p.follows.len() * 40);
+    push_str(&mut out, FOLLOW_LIST_DOMAIN_V2);
+    push_str(&mut out, &p.owner_address);
+    push_u64(&mut out, p.updated_at);
+    out.extend_from_slice(&(p.follows.len() as u32).to_le_bytes());
+    for addr in &p.follows {
+        push_str(&mut out, addr);
+    }
+    out
+}
+
+/// Sign a descriptor with the enrolled `#2` device key, setting `device_sig`.
+/// The legacy `#3` `identity_pub`/`sig` are left untouched — a migrated record
+/// leaves them `None`.
+pub fn sign_descriptor_v2(sk: &ed25519_dalek::SigningKey, d: &mut VineDescriptorPayload) {
+    let bytes = descriptor_canonical_bytes_v2(d);
+    d.device_sig = Some(hex::encode(sk.sign(&bytes).to_bytes()));
+}
+
+/// Sign a reaction with the enrolled `#2` device key, setting `device_sig`.
+/// The caller sets the owner-anchoring fields (`owner_id`/`enrollment_cbor_hex`
+/// /`signer_certs_cbor_hex`) so the reaction self-verifies cross-actor.
+pub fn sign_reaction_v2(sk: &ed25519_dalek::SigningKey, r: &mut VineReactionPayload) {
+    let bytes = reaction_canonical_bytes_v2(r);
+    r.device_sig = Some(hex::encode(sk.sign(&bytes).to_bytes()));
+}
+
+/// Sign a follow list with the enrolled `#2` device key, setting `device_sig`.
+pub fn sign_follow_list_v2(sk: &ed25519_dalek::SigningKey, p: &mut VineFollowListPayload) {
+    let bytes = follow_list_canonical_bytes_v2(p);
+    p.device_sig = Some(hex::encode(sk.sign(&bytes).to_bytes()));
+}
+
+/// Shared `#2` verification core: a hex `device_sig` checked with
+/// `verify_strict` against a feed's authority `publisher_key` (RFC 8032 strict
+/// subset, same posture as [`verify_signed`]).
+pub(crate) fn verify_device_sig(
+    device_sig: Option<&str>,
+    publisher_key: &[u8; 32],
+    canonical: &[u8],
+    what: &str,
+) -> Result<(), String> {
+    let sig = device_sig.ok_or_else(|| format!("{what} has no device signature"))?;
+    let sig_bytes: [u8; 64] = hex::decode(sig)
+        .map_err(|e| format!("{what} device_sig is not hex: {e}"))?
+        .try_into()
+        .map_err(|_| format!("{what} device_sig must be 64 bytes"))?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(publisher_key)
+        .map_err(|_| format!("{what} publisher key invalid"))?;
+    vk.verify_strict(canonical, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+        .map_err(|_| format!("{what} device signature invalid"))
+}
+
+/// Verify a descriptor's `#2` `device_sig` against the feed authority
+/// `publisher_key`.
+pub fn verify_descriptor_v2(
+    d: &VineDescriptorPayload,
+    publisher_key: &[u8; 32],
+) -> Result<(), String> {
+    verify_device_sig(
+        d.device_sig.as_deref(),
+        publisher_key,
+        &descriptor_canonical_bytes_v2(d),
+        "descriptor",
+    )
+}
+
+/// Verify a follow list's `#2` `device_sig` against the feed authority
+/// `publisher_key`.
+pub fn verify_follow_list_v2(
+    p: &VineFollowListPayload,
+    publisher_key: &[u8; 32],
+) -> Result<(), String> {
+    verify_device_sig(
+        p.device_sig.as_deref(),
+        publisher_key,
+        &follow_list_canonical_bytes_v2(p),
+        "follow list",
+    )
+}
+
+/// Verify a reaction STANDALONE (cross-actor): recover the reactor's enrolled
+/// `#2` key from its carried enrollment via the chokepoint, then check
+/// `device_sig` against it. `now_secs` is verifier-controlled (supplied by the
+/// ingest boundary), never derived from a record field.
+pub fn verify_reaction_v2(r: &VineReactionPayload, now_secs: u64) -> Result<(), String> {
+    let owner_hex = r.owner_id.as_deref().ok_or("reaction missing owner_id")?;
+    let owner_id: [u8; 16] = hex::decode(owner_hex)
+        .map_err(|e| format!("reaction owner_id is not hex: {e}"))?
+        .try_into()
+        .map_err(|_| "reaction owner_id must be 16 bytes".to_string())?;
+    let enrollment = crate::feed_authority::decode_cert(
+        r.enrollment_cbor_hex
+            .as_deref()
+            .ok_or("reaction missing enrollment")?,
+    )?;
+    let signer_certs = crate::feed_authority::decode_certs(&r.signer_certs_cbor_hex)?;
+    let verified = crate::enrollment_verify::verify_enrollment_any_issuer(
+        &enrollment,
+        &signer_certs,
+        Some(&owner_id),
+        now_secs,
+    )
+    .map_err(|e| format!("reaction enrollment invalid: {e}"))?;
+    verify_device_sig(
+        r.device_sig.as_deref(),
+        &verified.device_ed25519,
+        &reaction_canonical_bytes_v2(r),
+        "reaction",
     )
 }
 
@@ -585,5 +746,94 @@ mod tests {
         let r: VineReactionPayload = serde_json::from_value(legacy_r).unwrap();
         assert!(r.identity_pub.is_none());
         assert!(r.sig.is_none());
+    }
+
+    // ── ZEB-678 S2: enrolled `#2` device-key (`-v2`) signing ─────────────
+
+    #[test]
+    fn descriptor_v2_sign_verify_roundtrip_and_wrong_key_rejected() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let id = test_identity();
+        let mut d = descriptor_for(&id);
+        assert!(d.device_sig.is_none());
+        sign_descriptor_v2(&sk, &mut d);
+        assert!(d.device_sig.is_some(), "device_sig set");
+        // v2 signing leaves the legacy `#3` fields untouched (migrated record).
+        assert!(d.sig.is_none() && d.identity_pub.is_none());
+        verify_descriptor_v2(&d, &pk).expect("valid #2 signature");
+
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(
+            verify_descriptor_v2(&d, &wrong).is_err(),
+            "wrong publisher key rejected"
+        );
+        // A `#3`-only descriptor (no device_sig) fails the v2 path.
+        let d3 = descriptor_for(&id);
+        assert!(verify_descriptor_v2(&d3, &pk)
+            .unwrap_err()
+            .contains("no device signature"));
+    }
+
+    #[test]
+    fn follow_list_v2_sign_verify_and_device_sig_omitted_when_none() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let id = test_identity();
+        let mut p = follow_list_for(&id);
+        let before = serde_json::to_value(&p).unwrap();
+        assert!(
+            before.get("deviceSig").is_none(),
+            "deviceSig omitted when None"
+        );
+        sign_follow_list_v2(&sk, &mut p);
+        verify_follow_list_v2(&p, &pk).expect("valid #2 follow-list signature");
+        assert!(serde_json::to_value(&p).unwrap().get("deviceSig").is_some());
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(verify_follow_list_v2(&p, &wrong).is_err());
+    }
+
+    #[test]
+    fn reaction_v2_self_verifies_master_and_quorum() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xC0);
+
+        // Master-issued reactor: `#2` key = a_sk, cert = a_cert, empty bundle.
+        let mut r = reaction_for(&test_identity());
+        r.owner_id = Some(hex::encode(world.owner_id));
+        r.enrollment_cbor_hex = Some(crate::feed_authority::encode_cert(&world.a_cert).unwrap());
+        r.signer_certs_cbor_hex = String::new();
+        sign_reaction_v2(&world.a_sk, &mut r);
+        verify_reaction_v2(&r, WORLD_NOW).expect("master-issued reaction self-verifies");
+
+        // A device_sig NOT from the enrolled key is rejected.
+        let mut bad = r.clone();
+        sign_reaction_v2(
+            &ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]),
+            &mut bad,
+        );
+        assert!(
+            verify_reaction_v2(&bad, WORLD_NOW).is_err(),
+            "device_sig not from the enrolled key is rejected"
+        );
+
+        // Quorum-issued reactor: `#2` key = c_sk, cert = c_quorum_cert,
+        // signer bundle = [a_cert, b_cert].
+        let mut rq = reaction_for(&test_identity());
+        rq.owner_id = Some(hex::encode(world.owner_id));
+        rq.enrollment_cbor_hex =
+            Some(crate::feed_authority::encode_cert(&world.c_quorum_cert).unwrap());
+        rq.signer_certs_cbor_hex = crate::feed_authority::encode_certs(&world.bundle).unwrap();
+        sign_reaction_v2(&world.c_sk, &mut rq);
+        verify_reaction_v2(&rq, WORLD_NOW).expect("quorum-issued reaction self-verifies");
+
+        // Owner-id mismatch is rejected (enrollment is not under that owner).
+        let mut wrong_owner = r.clone();
+        wrong_owner.owner_id = Some(hex::encode([0x55u8; 16]));
+        assert!(verify_reaction_v2(&wrong_owner, WORLD_NOW).is_err());
     }
 }
