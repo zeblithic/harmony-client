@@ -446,6 +446,14 @@ pub(crate) fn resolve_sender_devices(
 /// fleet-replicated alongside it). `Err` for a DM/GroupDm Space that EXISTS but
 /// has no `content_key`, or a sign/encode failure — the invite is load-bearing
 /// there, so the caller must NOT silently drop it.
+///
+/// ZEB-580 S1: `inviter_enrollment` attaches the inviter's own #2
+/// `EnrollmentCert` (boxed to keep the `DmPacket::Invite` variant small) so an
+/// updated receiver verifies the invite via the master-attested cert (Task 3
+/// Check B). The caller pairs this with a #2 `signing_key` / `our_signing_device_hash`
+/// / `inviter_identity_pub` (the cert's #2 combined pub) so the invite is
+/// self-consistent. On the #3 fallback path the caller passes `None` here and
+/// the legacy #3 pub, preserving pre-migration wire bytes exactly.
 pub(crate) fn build_invite_packet_from_space(
     state: &OwnerState,
     space_id: &SpaceId,
@@ -453,6 +461,7 @@ pub(crate) fn build_invite_packet_from_space(
     self_owner: OwnerAddr,
     our_signing_device_hash: DeviceIdentityHash,
     inviter_identity_pub: [u8; 64],
+    inviter_enrollment: Option<Box<harmony_owner::certs::EnrollmentCert>>,
 ) -> Result<Option<Vec<u8>>, String> {
     let Some(space) = state.spaces.get(space_id) else {
         return Ok(None);
@@ -478,7 +487,7 @@ pub(crate) fn build_invite_packet_from_space(
         created_at: space.created_at.clone(),
         signing_device_hash: our_signing_device_hash,
         inviter_identity_pub,
-        inviter_enrollment: None,
+        inviter_enrollment,
     };
     crate::dm_envelope::build_signed_invite(signed, signing_key)
         .and_then(|p| crate::dm_envelope::encode_packet(&p))
@@ -626,6 +635,12 @@ pub struct DmOutbox {
     /// attached to outbound identity-introducing events (bootstrap/redeem Join,
     /// PendingJoin).
     pub(crate) enrollment_cert: harmony_owner::certs::EnrollmentCert,
+    /// ZEB-580 S1: this device's #2 DM hash, computed from `enrollment_cert`.
+    /// `None` when the cert has no usable X25519 (synthetic/test certs) — then
+    /// DM body signing degrades to the legacy #3 (`signing_key` /
+    /// `our_signing_device_hash`) via [`DmOutbox::dm_signing_material`].
+    /// Populated identically in both `new` and `new_synthetic`.
+    pub(crate) our_device2_signing_hash: Option<DeviceIdentityHash>,
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
     /// ZEB-418 SP2 P1 Task 8: sender-side butler deposit client. `None`
@@ -685,6 +700,9 @@ impl DmOutbox {
             community_signing_key.verifying_key().to_bytes(),
             "DmOutbox: cert device key must match community_signing_key"
         );
+        // ZEB-580 S1: compute the #2 DM hash BEFORE `enrollment_cert` is moved
+        // into the struct literal below. `None` degrades DM signing to #3.
+        let our_device2_signing_hash = crate::dm_signing::device2_signing_hash(&enrollment_cert);
         Self {
             device_id,
             self_owner,
@@ -693,6 +711,7 @@ impl DmOutbox {
             private_identity,
             community_signing_key,
             enrollment_cert,
+            our_device2_signing_hash,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
             butler_deposit_client: None,
@@ -720,6 +739,8 @@ impl DmOutbox {
         community_signing_key: Arc<ed25519_dalek::SigningKey>,
         enrollment_cert: harmony_owner::certs::EnrollmentCert,
     ) -> Self {
+        // ZEB-580 S1: same #2 DM hash computation as `new` (kept in sync).
+        let our_device2_signing_hash = crate::dm_signing::device2_signing_hash(&enrollment_cert);
         Self {
             device_id,
             self_owner,
@@ -728,6 +749,7 @@ impl DmOutbox {
             private_identity,
             community_signing_key,
             enrollment_cert,
+            our_device2_signing_hash,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
             butler_deposit_client: None,
@@ -1500,6 +1522,20 @@ impl DmOutbox {
         (outcome, deposit_candidates)
     }
 
+    /// ZEB-580 S1: the (key, device-hash) pair for DM body signing — the
+    /// enrolled #2 identity (`community_signing_key` + the cert's #2 DM hash)
+    /// when a usable enrolled identity exists (`our_device2_signing_hash` is
+    /// `Some`), else the legacy #3 Reticulum transport key (`signing_key` +
+    /// `our_signing_device_hash`). Every outbound DM *body* sign site
+    /// (CidNotify + Invite) routes through this so the send side never diverges;
+    /// the transport-digest / countersign paths keep the #3 key by design (N4).
+    fn dm_signing_material(&self) -> (&Arc<ed25519_dalek::SigningKey>, DeviceIdentityHash) {
+        match self.our_device2_signing_hash {
+            Some(h) => (&self.community_signing_key, h),
+            None => (&self.signing_key, self.our_signing_device_hash),
+        }
+    }
+
     /// ZEB-418 P1 Task 8 / ZEB-506: build the signed CidNotify wire bytes for a
     /// deposit. Carries the sender's FULL cached device set via
     /// [`resolve_sender_devices`] (NOT a bare singleton): the recipient's
@@ -1520,18 +1556,16 @@ impl DmOutbox {
         let Some(message_cid) = entry.message_cid else {
             return Err("build_cidnotify_packet_bytes called on an invite-only entry".into());
         };
+        // ZEB-580 S1: sign the DM body with #2 (enrolled) when available, else #3.
+        let (key, dh) = self.dm_signing_material();
         let signed = crate::dm_envelope::DmCidNotifySigned {
             space_id: entry.space_id,
             message_cid,
             sender_owner_addr: self.self_owner,
-            sender_devices: resolve_sender_devices(
-                state,
-                self.self_owner,
-                self.our_signing_device_hash,
-            ),
-            signing_device_hash: self.our_signing_device_hash,
+            sender_devices: resolve_sender_devices(state, self.self_owner, dh),
+            signing_device_hash: dh,
         };
-        build_dm_packet(signed, &self.signing_key)
+        build_dm_packet(signed, key)
     }
 
     /// ZEB-483 / ZEB-504: rebuild + sign the DmInvite wire bytes for a DM-Space
@@ -1560,15 +1594,33 @@ impl DmOutbox {
         state: &OwnerState,
         space_id: &SpaceId,
     ) -> Result<Option<Vec<u8>>, String> {
+        // ZEB-580 S1: sign the invite body with #2 (enrolled) when available and
+        // attach our own #2 EnrollmentCert + the self-consistent #2 combined pub
+        // (so `derive_device_hash_from_identity_pub(inviter_identity_pub) ==
+        // signing_device_hash`, which Task 3's receiver Check B asserts). Degrade
+        // to the legacy #3 transport identity with NO attached cert otherwise —
+        // preserving pre-migration wire bytes exactly.
+        let (key, dh) = self.dm_signing_material();
+        let (inviter_identity_pub, inviter_enrollment) = match self.our_device2_signing_hash {
+            Some(_) => (
+                crate::dm_signing::device2_combined_pub(&self.enrollment_cert),
+                Some(Box::new(self.enrollment_cert.clone())),
+            ),
+            None => (
+                self.private_identity.public_identity().to_public_bytes(),
+                None,
+            ),
+        };
         // ZEB-504: delegate to the shared free fn so the deposit rung and the
         // live-tunnel transport rebuild the bootstrap invite identically.
         build_invite_packet_from_space(
             state,
             space_id,
-            &self.signing_key,
+            key,
             self.self_owner,
-            self.our_signing_device_hash,
-            self.private_identity.public_identity().to_public_bytes(),
+            dh,
+            inviter_identity_pub,
+            inviter_enrollment,
         )
     }
 
@@ -6039,6 +6091,184 @@ mod tests {
     }
 
     // ── ZEB-580 S1 (Task 3): cert-anchored #2 DM identity on the invite path ────
+
+    /// ZEB-580 S1 (Task 5) sender-side helper: a `DmOutbox` built from a REAL
+    /// minted owner (`mint_owner`, whose enrolled device carries a usable
+    /// X25519 pub) so its `enrollment_cert` yields a `Some` #2 DM hash — the
+    /// path where DM body signing flips to #2. Returns `(outbox, cert)`; the
+    /// cert is the exact one attached to outbound invites. The #3 (Reticulum)
+    /// material is a distinct synthetic identity (seed `[0x55; 32]`, mirroring
+    /// `make_outbox_synthetic`) so #2 and #3 are provably different keys.
+    fn outbox_from_mint() -> (DmOutbox, harmony_owner::certs::EnrollmentCert) {
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted.state.enrollments.values().next().unwrap().clone();
+        // The enrolled device's #2 signing key (binds to `cert`'s device
+        // ed25519) — this becomes the outbox's `community_signing_key`.
+        let community_signing_key = std::sync::Arc::new(minted.device_signing_key);
+        let self_owner = OwnerAddr(cert.owner_id);
+
+        // Distinct #3 transport identity (never used for DM signing on the #2
+        // path — pinned distinct so a regression that signs #3 is caught).
+        let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let priv_bytes = private_identity.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
+        let private_identity = std::sync::Arc::new(private_identity);
+
+        let outbox = DmOutbox::new(
+            "dev".into(),
+            self_owner,
+            device_hash,
+            signing_key,
+            private_identity,
+            community_signing_key,
+            cert.clone(),
+        );
+        (outbox, cert)
+    }
+
+    /// ZEB-580 S1 (Task 5) sender-side helper: an `OutboxEntry` for a message
+    /// (so `build_cidnotify_packet_bytes` produces a CidNotify).
+    fn message_entry() -> OutboxEntry {
+        OutboxEntry {
+            id: OutboxEntryId([0xab; 16]),
+            space_id: SpaceId([0xcc; 16]),
+            recipient_owners: vec![OwnerAddr([0x0b; 16])],
+            message_cid: Some(ContentId::from_bytes([0xee; 32])),
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        }
+    }
+
+    /// ZEB-580 S1 (Task 5): a `DmOutbox` built from a real (minted) enrollment
+    /// cert signs its CidNotify with #2 and stamps the #2 DM hash, verifiable
+    /// against the #2 combined pub — NOT the #3 transport key.
+    #[test]
+    fn dm_outbox_signs_cidnotify_with_device2() {
+        let (outbox, cert) = outbox_from_mint();
+        let device2_hash = crate::dm_signing::device2_signing_hash(&cert).unwrap();
+        assert_eq!(outbox.our_device2_signing_hash, Some(device2_hash));
+        // Guard: the #2 hash must differ from the #3 transport hash, so a
+        // regression that signs #3 can't accidentally pass the assertions below.
+        assert_ne!(device2_hash, outbox.our_signing_device_hash);
+
+        let state = OwnerState::default();
+        let entry = message_entry();
+        let bytes = outbox
+            .build_cidnotify_packet_bytes(&state, &entry)
+            .expect("build cidnotify");
+        match crate::dm_envelope::decode_packet(&bytes).unwrap() {
+            crate::dm_envelope::DmPacket::CidNotify {
+                signed,
+                signature,
+                signed_bytes,
+            } => {
+                assert_eq!(signed.signing_device_hash, device2_hash);
+                crate::dm_signing::verify_dm_packet_signature(
+                    &signed_bytes,
+                    &signature,
+                    &crate::dm_signing::device2_combined_pub(&cert),
+                    signed.signing_device_hash,
+                )
+                .expect("CidNotify must verify against the #2 combined pub");
+            }
+            other => panic!("expected CidNotify, got {other:?}"),
+        }
+    }
+
+    /// ZEB-580 S1 (Task 5): a rebuilt bootstrap invite carries
+    /// `inviter_enrollment = Some(self cert)` (boxed) and a self-consistent #2
+    /// `inviter_identity_pub` / `signing_device_hash`, so an updated receiver
+    /// verifies it via the master-attested cert (Task 3 Check B).
+    #[test]
+    fn dm_outbox_invite_attaches_enrollment_cert() {
+        let (outbox, cert) = outbox_from_mint();
+        let self_owner = outbox.self_owner;
+        let device2_pub = crate::dm_signing::device2_combined_pub(&cert);
+        let device2_hash = crate::dm_signing::device2_signing_hash(&cert).unwrap();
+
+        let space_id = SpaceId([7; 16]);
+        let mut members = vec![self_owner, OwnerAddr([0x0b; 16])];
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        // Seed the DM Space the invite rebuild reads from (id/members/content_key).
+        let space_seed = crate::dm_envelope::DmInviteSigned {
+            space_id,
+            kind: SpaceKind::Dm,
+            members,
+            inviter: self_owner,
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device2_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "inviter".into(),
+            },
+            signing_device_hash: device2_hash,
+            inviter_identity_pub: device2_pub,
+            inviter_enrollment: None,
+        };
+        let mut state = OwnerState::default();
+        insert_space_from_invite(&mut state, &space_seed);
+
+        let bytes = outbox
+            .build_invite_packet_bytes(&state, &space_id)
+            .expect("invite rebuild must not error")
+            .expect("DM space yields an invite");
+        match crate::dm_envelope::decode_packet(&bytes).unwrap() {
+            crate::dm_envelope::DmPacket::Invite { signed, .. } => {
+                assert_eq!(
+                    signed.inviter_enrollment,
+                    Some(Box::new(cert)),
+                    "invite must attach the sender's own #2 EnrollmentCert (boxed)"
+                );
+                assert_eq!(
+                    signed.inviter_identity_pub, device2_pub,
+                    "the #2 path must ship the cert's #2 combined pub inline (self-consistent)"
+                );
+                assert_eq!(signed.signing_device_hash, device2_hash);
+            }
+            other => panic!("expected Invite, got {other:?}"),
+        }
+    }
+
+    /// ZEB-580 S1 (Task 5): the #3 DEGRADE path. A `DmOutbox` built via
+    /// `new_synthetic` with a cert whose device X25519 is all-zero (the
+    /// `mint_test_owner` shape `make_outbox_synthetic` uses) has
+    /// `our_device2_signing_hash == None` and signs its CidNotify with the
+    /// legacy #3 transport key / hash. This pins the synthetic-cert fallback
+    /// that keeps every existing `make_outbox_synthetic` test byte-stable.
+    #[test]
+    fn dm_outbox_degrades_to_device3_when_cert_lacks_x25519() {
+        let alice = OwnerAddr([0xaa; 16]);
+        let outbox = make_outbox_synthetic("dev", alice);
+        // The synthetic cert (mint_test_owner) has a zeroed device X25519.
+        assert!(
+            outbox.our_device2_signing_hash.is_none(),
+            "a zeroed-X25519 cert must yield no #2 DM hash (degrade to #3)"
+        );
+
+        let state = OwnerState::default();
+        let entry = message_entry();
+        let bytes = outbox
+            .build_cidnotify_packet_bytes(&state, &entry)
+            .expect("build cidnotify");
+        match crate::dm_envelope::decode_packet(&bytes).unwrap() {
+            crate::dm_envelope::DmPacket::CidNotify { signed, .. } => {
+                assert_eq!(
+                    signed.signing_device_hash, outbox.our_signing_device_hash,
+                    "degrade path must stamp the #3 transport hash"
+                );
+            }
+            other => panic!("expected CidNotify, got {other:?}"),
+        }
+    }
 
     /// ZEB-580 S1: an invite carrying a valid `inviter_enrollment` (#2 cert)
     /// verifies via the cert's #2 combined pub and caches the #2 DM identity

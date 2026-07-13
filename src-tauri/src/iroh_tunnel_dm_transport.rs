@@ -229,6 +229,14 @@ impl IrohTunnelDmTransport {
             self.self_owner,
             self.our_signing_device_hash,
             self.inviter_identity_pub,
+            // ZEB-580 S1: the live tunnel does NOT attach the #2 cert inline — it
+            // holds no `enrollment_cert`. Its #2 DM material (`signing_key` /
+            // `our_signing_device_hash` / `inviter_identity_pub` = the cert's #2
+            // combined pub) is wired at construction in lib.rs (Task 6), so this
+            // re-driven invite ships the inline #2 pub and a transitional receiver
+            // TOFU-verifies it; the deposit rung and the original `add_space`
+            // invite carry the master-attested cert for full verification.
+            None,
         ) {
             Ok(invite) => invite,
             Err(e) => {
