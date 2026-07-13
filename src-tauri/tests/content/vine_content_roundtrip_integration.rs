@@ -94,6 +94,7 @@ fn make_vine_descriptor(vine_id: &str, creator: &str, video_cid_hex: &str) -> Ve
         original_creator_name: None,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
     harmony_app::vine_signing::sign_descriptor(
         &crate::vine_signing_testutil::signer_for(creator),
@@ -560,6 +561,7 @@ async fn vine_full_round_trip_publish_feed_view_fetch_reshare() {
         original_creator_name: Some("Test Creator".to_string()),
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
     harmony_app::vine_signing::sign_descriptor(
         &crate::vine_signing_testutil::signer_for("rt-resharer"),

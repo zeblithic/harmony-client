@@ -38,6 +38,7 @@ fn make_descriptor(
         original_creator_name: None,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
     harmony_app::vine_signing::sign_descriptor(&signer_for(creator), &mut v);
     v
@@ -63,6 +64,10 @@ fn make_reaction(
         timestamp,
         identity_pub: None,
         sig: None,
+        owner_id: None,
+        enrollment_cbor_hex: None,
+        signer_certs_cbor_hex: String::new(),
+        device_sig: None,
     };
     harmony_app::vine_signing::sign_reaction(&signer_for(reactor), &mut v);
     v

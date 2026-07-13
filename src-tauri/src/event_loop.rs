@@ -8551,6 +8551,7 @@ mod vine_tombstone_routing_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         crate::vine_signing::sign_descriptor(signer, &mut d);
         let outcome = cache.lock().unwrap().on_descriptor_sample(

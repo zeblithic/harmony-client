@@ -464,6 +464,7 @@ impl VineFeedCache {
                 // trusted local state (same posture as TombstoneOnDisk).
                 identity_pub: None,
                 sig: None,
+                device_sig: None,
             };
             cache.descriptors.insert(
                 d.id,
@@ -1384,6 +1385,7 @@ mod tests {
             original_creator_name: original_creator_name.map(String::from),
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         crate::vine_signing::sign_descriptor(&signer, &mut v);
         serde_json::to_vec(&v).unwrap()
@@ -1411,6 +1413,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let out = cache.on_descriptor_sample(
             &topic("alice-addr"),
@@ -1486,6 +1489,10 @@ mod tests {
             timestamp: 100,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         };
         let out = cache.on_reaction_sample(
             &reaction_topic("alice-addr", "vine-1", "bob-addr"),
@@ -1716,6 +1723,10 @@ mod tests {
             timestamp,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         };
         crate::vine_signing::sign_reaction(&signer, &mut v);
         serde_json::to_vec(&v).unwrap()
@@ -3414,6 +3425,7 @@ mod tests {
             updated_at,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         crate::vine_signing::sign_follow_list(&signer_for(owner), &mut payload);
         serde_json::to_vec(&payload).unwrap()
@@ -3548,6 +3560,7 @@ mod tests {
             updated_at: 100,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         crate::vine_signing::sign_follow_list(&owner, &mut payload);
         let outcome = cache.on_follow_list_sample(
@@ -3665,6 +3678,7 @@ mod tests {
                 updated_at: i as u64, // strictly increasing — entry 0 is stalest
                 identity_pub: None,
                 sig: None,
+                device_sig: None,
             };
             crate::vine_signing::sign_follow_list(&private, &mut payload);
             let outcome = cache.on_follow_list_sample(

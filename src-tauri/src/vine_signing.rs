@@ -247,6 +247,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         }
     }
 
@@ -259,6 +260,10 @@ mod tests {
             timestamp: 1_700_000_100,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         }
     }
 
@@ -438,6 +443,7 @@ mod tests {
             updated_at: 1_700_000_200,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         }
     }
 

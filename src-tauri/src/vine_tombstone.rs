@@ -33,6 +33,12 @@ pub struct VineTombstonePayload {
     pub creator_identity_pub: String,
     /// Hex-encoded 64-byte Ed25519 signature over `canonical_bytes`.
     pub sig: String,
+    /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
+    /// `canonical_bytes_v2`. A tombstone dual-signs (the `#3` `sig`/
+    /// `creator_identity_pub` stay required for backward verify); presence
+    /// of `device_sig` marks the tombstone as migrated. Wire-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_sig: Option<String>,
 }
 
 /// Deterministic byte string the signature covers. `|` cannot appear in
@@ -75,6 +81,7 @@ pub fn sign_tombstone(
         deleted_at,
         creator_identity_pub: hex::encode(private.public_identity().to_public_bytes()),
         sig: hex::encode(sig),
+        device_sig: None,
     }
 }
 
@@ -183,6 +190,7 @@ mod tests {
             deleted_at: 1_700_000_000,
             creator_identity_pub: hex::encode(id.public_identity().to_public_bytes()),
             sig: hex::encode(attacker.sign(&bytes)),
+            device_sig: None,
         };
         let err = verify_tombstone(&forged).unwrap_err();
         assert!(err.contains("signature invalid"), "got {err:?}");
@@ -203,6 +211,7 @@ mod tests {
             deleted_at: 1_700_000_000,
             creator_identity_pub: hex::encode(id.public_identity().to_public_bytes()),
             sig: hex::encode(id.sign(&bytes)),
+            device_sig: None,
         };
         let err = verify_tombstone(&t).unwrap_err();
         assert!(err.contains("separator"), "got {err:?}");

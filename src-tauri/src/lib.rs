@@ -13912,6 +13912,13 @@ pub struct VineDescriptorPayload {
     /// `vine_signing::descriptor_canonical_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
+    /// `vine_signing::descriptor_canonical_bytes_v2`. Present on records
+    /// signed by the enrolled device key; its presence marks the feed as
+    /// migrated (dual-path ingest requires it once the feed's authority
+    /// record is cached). Wire-only, like `sig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_sig: Option<String>,
 }
 
 /// Vine descriptor sent from the frontend to publish.
@@ -13993,6 +14000,26 @@ pub struct VineReactionPayload {
     /// `vine_signing::reaction_canonical_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// ZEB-678 S2: reactor's owner_id (hex 16 bytes). Reactions are
+    /// cross-actor (delivered under the creator's topic to followers who
+    /// usually lack the reactor's authority record), so a migrated reaction
+    /// carries its own owner-anchoring proof and is verified standalone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    /// ZEB-678 S2: reactor's enrollment cert as canonical-CBOR-hex (the
+    /// crate cert types are CBOR-native and do not round-trip through
+    /// serde_json — same idiom as `FeedAuthorityRecord`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_cbor_hex: Option<String>,
+    /// ZEB-678 S2: reactor's quorum signer bundle as canonical-CBOR-hex
+    /// (empty ⇒ master-issued).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signer_certs_cbor_hex: String,
+    /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
+    /// `vine_signing::reaction_canonical_bytes_v2`. Presence marks a
+    /// migrated (owner-anchored) reaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_sig: Option<String>,
 }
 
 /// Vine reaction sent from the frontend to publish.
@@ -14028,6 +14055,12 @@ pub struct VineFollowListPayload {
     /// `vine_signing::follow_list_canonical_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
+    /// `vine_signing::follow_list_canonical_bytes_v2`. Presence marks the
+    /// owner's feed as migrated (dual-path ingest requires it once the
+    /// feed's authority record is cached). Wire-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_sig: Option<String>,
 }
 
 /// Build + publish a vine descriptor on `harmony/vines/{creator_address}`.
@@ -14132,6 +14165,7 @@ async fn publish_vine(
         original_creator_name: vine.original_creator_name,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
 
     publish_vine_descriptor(state.inner(), wire).await
@@ -14235,6 +14269,7 @@ pub(crate) async fn publish_vine_impl(
         original_creator_name: None,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
 
     publish_vine_descriptor(state, descriptor).await?;
@@ -14312,6 +14347,7 @@ pub(crate) async fn reshare_vine_impl(
         original_creator_name,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
 
     publish_vine_descriptor(state, descriptor).await?;
@@ -14376,6 +14412,10 @@ pub(crate) async fn publish_vine_reaction_impl(
         timestamp: now_secs,
         identity_pub: None,
         sig: None,
+        owner_id: None,
+        enrollment_cbor_hex: None,
+        signer_certs_cbor_hex: String::new(),
+        device_sig: None,
     };
     vine_signing::sign_reaction(&identity, &mut wire);
 
@@ -14548,6 +14588,7 @@ mod delete_vine_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         vine_signing::sign_descriptor(&creator_identity, &mut descriptor);
         let outcome = cache.on_descriptor_sample(
@@ -14609,6 +14650,7 @@ mod delete_vine_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         vine_signing::sign_descriptor(&creator_identity, &mut descriptor);
         cache.on_descriptor_sample(
@@ -14649,6 +14691,7 @@ mod delete_vine_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         vine_signing::sign_descriptor(&identity, &mut descriptor);
         cache.on_descriptor_sample(
@@ -14741,6 +14784,7 @@ mod vine_publish_signing_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         }
     }
 
@@ -15177,6 +15221,7 @@ fn build_signed_follow_list_with(
         updated_at,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
     vine_signing::sign_follow_list(identity, &mut payload);
     Ok(payload)
@@ -57784,6 +57829,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let json = serde_json::to_vec(&vine).unwrap();
         let parsed: VineDescriptorPayload = serde_json::from_slice(&json).unwrap();
@@ -57809,6 +57855,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&vine).unwrap()).unwrap();
         assert!(
@@ -57844,6 +57891,7 @@ mod tests {
             original_creator_name: Some("Original Creator".to_string()),
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let json = serde_json::to_string(&payload).expect("serialize");
         assert!(
@@ -57881,6 +57929,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let json = serde_json::to_string(&payload).expect("serialize");
         assert!(
@@ -57945,6 +57994,10 @@ mod tests {
             timestamp: 1711600000,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         };
         let json = serde_json::to_vec(&reaction).unwrap();
         let parsed: VineReactionPayload = serde_json::from_slice(&json).unwrap();
@@ -57965,6 +58018,10 @@ mod tests {
             timestamp: 0,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&reaction).unwrap()).unwrap();
         assert!(json.contains("\"vineId\""), "expected camelCase: {json}");
