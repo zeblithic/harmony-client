@@ -325,6 +325,11 @@ pub struct VineFeedCache {
     /// ZEB-671: derived reachability (creator → degree + via-path).
     /// Recomputed on graph-input or follow-list change; NOT persisted.
     reach: HashMap<String, crate::vine_follow_graph::Reach>,
+    /// ZEB-678 S2: per-feed authority records (owner-anchoring + revocation),
+    /// fed by `on_authority_sample`. In-memory only (like `reach`); the content
+    /// verifiers consult it to pick the dual-path (authority cached ⇒ require
+    /// `#2` + `!revoked`; else legacy `#3`).
+    authority: crate::feed_authority::FeedAuthorityCache,
     /// `Some(path_to_vine_feed.json)` when constructed via `load()`;
     /// `None` for `new()`. `save()` checks this and is a no-op when None.
     path: Option<PathBuf>,
@@ -354,6 +359,7 @@ impl VineFeedCache {
             graph_me: String::new(),
             graph_my_follows: Vec::new(),
             reach: HashMap::new(),
+            authority: crate::feed_authority::FeedAuthorityCache::default(),
             path: Some(path.clone()),
         };
         Self::populate_from_disk(&mut cache, &path);
@@ -464,6 +470,7 @@ impl VineFeedCache {
                 // trusted local state (same posture as TombstoneOnDisk).
                 identity_pub: None,
                 sig: None,
+                device_sig: None,
             };
             cache.descriptors.insert(
                 d.id,
@@ -528,6 +535,40 @@ impl VineFeedCache {
     /// Returns `Some(Rejected(reason))` on JSON parse failure.
     /// Idempotent: re-arrival of an already-cached `vine_id` returns
     /// `AlreadyPresent` and does NOT mutate the cache. Source decision
+    /// ZEB-678 S2: ingest a feed authority record from
+    /// `harmony/vines/{N}/authority`. Parses the record, binds it to the topic
+    /// segment `N`, and feeds it to the LWW/sticky-`revoked` `FeedAuthorityCache`
+    /// (first-write-wins binding, monotonic revocation). `now_secs` is the
+    /// verifier's wall clock (never a record field). A malformed record or a
+    /// topic/`feed_id` mismatch is dropped with a warn — authority ingest never
+    /// degrades existing cached state.
+    pub fn on_authority_sample(&mut self, key_expr: &str, payload: &[u8], now_secs: u64) {
+        let feed = match key_expr
+            .strip_prefix("harmony/vines/")
+            .and_then(|s| s.strip_suffix("/authority"))
+        {
+            Some(f) if !f.contains('/') => f,
+            _ => return, // not a `harmony/vines/{N}/authority` topic
+        };
+        let rec: crate::feed_authority::FeedAuthorityRecord = match serde_json::from_slice(payload)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "dropping malformed feed authority record");
+                return;
+            }
+        };
+        if rec.feed_id != feed {
+            tracing::warn!(
+                topic_feed = feed,
+                record_feed = %rec.feed_id,
+                "feed authority record feed_id does not match its topic; dropping"
+            );
+            return;
+        }
+        let _ = self.authority.ingest(&rec, now_secs);
+    }
+
     /// (Followed vs Discover) is frozen at first insert.
     pub fn on_descriptor_sample(
         &mut self,
@@ -559,10 +600,21 @@ impl VineFeedCache {
         // record replayed onto another topic AND a forged record on the
         // right topic are rejected. Disk loads bypass this path
         // (populate_from_disk) and stay tolerant of pre-ZEB-673 rows.
-        if let Err(e) = crate::vine_signing::verify_descriptor(&descriptor) {
+        let topic_creator = key_expr.strip_prefix("harmony/vines/").unwrap_or("");
+        // ZEB-678 S2: dual-path admission. Authority cached for this feed ⇒
+        // require a valid `#2` device_sig against the pinned publisher_key AND a
+        // non-revoked device (legacy `#3`-only records are rejected once the
+        // feed has migrated). No authority cached ⇒ verify the legacy `#3` way.
+        let verify_result = match self.authority.get(topic_creator) {
+            Some(p) if p.revoked => {
+                Err("descriptor rejected: publisher device revoked".to_string())
+            }
+            Some(p) => crate::vine_signing::verify_descriptor_v2(&descriptor, &p.publisher_key),
+            None => crate::vine_signing::verify_descriptor(&descriptor),
+        };
+        if let Err(e) = verify_result {
             return Some(DescriptorOutcome::Rejected(e));
         }
-        let topic_creator = key_expr.strip_prefix("harmony/vines/").unwrap_or("");
         if topic_creator != descriptor.creator_address {
             return Some(DescriptorOutcome::Rejected(format!(
                 "descriptor topic creator '{topic_creator}' does not match payload creator '{}'",
@@ -732,6 +784,7 @@ impl VineFeedCache {
         &mut self,
         key_expr: &str,
         payload: &[u8],
+        now_secs: u64,
     ) -> Option<ReactionOutcome> {
         if !(key_expr.starts_with("harmony/vines/") && key_expr.contains("/reactions/")) {
             return None;
@@ -753,7 +806,30 @@ impl VineFeedCache {
         // leading `{creator}` segment names the topic OWNER, which the
         // payload doesn't carry — cross-creator replay of the same
         // (vine_id, reactor) tuple is idempotent by construction.
-        if let Err(e) = crate::vine_signing::verify_reaction(&reaction) {
+        // ZEB-678 S2 (review-fix, CodeRabbit security): the `#3` signature binds
+        // `reactor_address` and is ALWAYS required. `verify_reaction_v2` alone
+        // recovers an enrolled device from the carried enrollment but never ties
+        // it to `reactor_address`, so any enrolled device could mint a reaction
+        // for an arbitrary address (dedup + revocation key off `reactor_address`).
+        // When a migrated reaction also carries `device_sig`, the `#2` layer is
+        // verified as defense-in-depth. Revocation is best-effort (§3.3): rejected
+        // only when we DO hold the reactor's authority record marking its device
+        // revoked — keyed by the now `#3`-bound reactor_address.
+        let verify_result = crate::vine_signing::verify_reaction(&reaction)
+            .and_then(|()| {
+                if reaction.device_sig.is_some() {
+                    crate::vine_signing::verify_reaction_v2(&reaction, now_secs)
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|()| match self.authority.get(&reaction.reactor_address) {
+                Some(p) if p.revoked => {
+                    Err("reaction rejected: reactor device revoked".to_string())
+                }
+                _ => Ok(()),
+            });
+        if let Err(e) = verify_result {
             return Some(ReactionOutcome::Rejected(e));
         }
         let mut tail = key_expr
@@ -848,7 +924,22 @@ impl VineFeedCache {
             }
         };
 
-        if let Err(e) = crate::vine_tombstone::verify_tombstone(&t) {
+        // ZEB-678 S2: dual-path. Authority cached for this feed ⇒ require the
+        // `#2` device_sig against the pinned publisher_key AND a non-revoked
+        // device; else verify the legacy `#3` tombstone. A migrated tombstone
+        // dual-signs, so both branches have material to verify.
+        let tomb_feed = key_expr
+            .strip_prefix("harmony/vines/")
+            .unwrap_or_default()
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let verify_result = match self.authority.get(tomb_feed) {
+            Some(p) if p.revoked => Err("tombstone rejected: publisher device revoked".to_string()),
+            Some(p) => crate::vine_tombstone::verify_tombstone_v2(&t, &p.publisher_key),
+            None => crate::vine_tombstone::verify_tombstone(&t),
+        };
+        if let Err(e) = verify_result {
             return Some(TombstoneOutcome::Rejected(e));
         }
 
@@ -973,7 +1064,18 @@ impl VineFeedCache {
             Err(e) => return FollowListOutcome::Rejected(format!("follow list parse failed: {e}")),
         };
 
-        if let Err(e) = crate::vine_signing::verify_follow_list(&list) {
+        // ZEB-678 S2: dual-path. Authority cached for this owner's feed ⇒
+        // require the `#2` device_sig against the pinned publisher_key AND a
+        // non-revoked device; else verify the legacy `#3`. A migrated follow
+        // list dual-signs (best-effort via try_lock at publish), so the `#2`
+        // branch normally has material; a rare `#3`-only list on a migrated feed
+        // is rejected here and re-migrates on the next publish.
+        let verify_result = match self.authority.get(&list.owner_address) {
+            Some(p) if p.revoked => Err("follow list rejected: owner device revoked".to_string()),
+            Some(p) => crate::vine_signing::verify_follow_list_v2(&list, &p.publisher_key),
+            None => crate::vine_signing::verify_follow_list(&list),
+        };
+        if let Err(e) = verify_result {
             return FollowListOutcome::Rejected(e);
         }
 
@@ -1384,6 +1486,7 @@ mod tests {
             original_creator_name: original_creator_name.map(String::from),
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         crate::vine_signing::sign_descriptor(&signer, &mut v);
         serde_json::to_vec(&v).unwrap()
@@ -1411,6 +1514,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let out = cache.on_descriptor_sample(
             &topic("alice-addr"),
@@ -1486,10 +1590,15 @@ mod tests {
             timestamp: 100,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         };
         let out = cache.on_reaction_sample(
             &reaction_topic("alice-addr", "vine-1", "bob-addr"),
             &serde_json::to_vec(&r).unwrap(),
+            0,
         );
         assert!(
             matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("unsigned")),
@@ -1506,6 +1615,7 @@ mod tests {
         let out = cache.on_reaction_sample(
             &reaction_topic("alice-addr", "vine-OTHER", "bob-addr"),
             &bytes,
+            0,
         );
         assert!(
             matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("does not match payload")),
@@ -1515,6 +1625,7 @@ mod tests {
         let out = cache.on_reaction_sample(
             &reaction_topic("alice-addr", "vine-1", "carol-addr"),
             &bytes,
+            0,
         );
         assert!(
             matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("does not match payload")),
@@ -1527,7 +1638,7 @@ mod tests {
             "{}/extra",
             reaction_topic("alice-addr", "vine-1", "bob-addr")
         );
-        let out = cache.on_reaction_sample(&deep, &bytes);
+        let out = cache.on_reaction_sample(&deep, &bytes, 0);
         assert!(
             matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("does not match payload")),
             "got {out:?}"
@@ -1716,6 +1827,10 @@ mod tests {
             timestamp,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         };
         crate::vine_signing::sign_reaction(&signer, &mut v);
         serde_json::to_vec(&v).unwrap()
@@ -1739,10 +1854,12 @@ mod tests {
         let r1 = cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_likes,
+            0,
         );
         let r2 = cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "bob-addr"),
             &bob_likes,
+            0,
         );
 
         assert_eq!(r1, Some(ReactionOutcome::Inserted));
@@ -1764,10 +1881,12 @@ mod tests {
         cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_unlikes,
+            0,
         );
         let r2 = cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_likes,
+            0,
         );
         assert_eq!(r2, Some(ReactionOutcome::UpdatedNewer));
 
@@ -1784,6 +1903,7 @@ mod tests {
         cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_likes,
+            0,
         );
 
         // Stale unlike at t=100 (lower timestamp, must be rejected)
@@ -1791,6 +1911,7 @@ mod tests {
         let outcome = cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &stale_unlike,
+            0,
         );
         assert_eq!(outcome, Some(ReactionOutcome::Stale));
 
@@ -1809,10 +1930,12 @@ mod tests {
         cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_likes,
+            0,
         );
         cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "bob-addr"),
             &bob_likes,
+            0,
         );
 
         // From Alice's perspective: liked_by_me=true (she liked it)
@@ -1832,11 +1955,11 @@ mod tests {
         let payload = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 100);
 
         // Descriptor topic — must NOT match the reaction branch
-        let outcome = cache.on_reaction_sample(&topic("creator-addr"), &payload);
+        let outcome = cache.on_reaction_sample(&topic("creator-addr"), &payload, 0);
         assert_eq!(outcome, None);
 
         // Unrelated topic
-        let outcome2 = cache.on_reaction_sample("harmony/profile/alice-addr", &payload);
+        let outcome2 = cache.on_reaction_sample("harmony/profile/alice-addr", &payload, 0);
         assert_eq!(outcome2, None);
     }
 
@@ -1845,8 +1968,11 @@ mod tests {
         let mut cache = VineFeedCache::new();
         let bad = b"{{{not json";
 
-        let outcome =
-            cache.on_reaction_sample(&reaction_topic("creator-addr", "vine-1", "alice-addr"), bad);
+        let outcome = cache.on_reaction_sample(
+            &reaction_topic("creator-addr", "vine-1", "alice-addr"),
+            bad,
+            0,
+        );
         assert!(
             matches!(outcome, Some(ReactionOutcome::Rejected(ref e)) if e.contains("parse failed")),
             "got {outcome:?}"
@@ -1878,6 +2004,7 @@ mod tests {
         cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "alice-addr"),
             &alice_unlike,
+            0,
         );
 
         // Bob likes (so count > 0, isolating the liked_by_me=false invariant)
@@ -1885,6 +2012,7 @@ mod tests {
         cache.on_reaction_sample(
             &reaction_topic("creator-addr", "vine-1", "bob-addr"),
             &bob_like,
+            0,
         );
 
         let summary = cache.get_reaction("vine-1", &addr("alice-addr"));
@@ -2094,8 +2222,11 @@ mod tests {
 
             let react =
                 canonical_reaction_bytes("vine-rt", "bob-addr", "Bob", true, recent_created_at + 1);
-            let out2 = cache
-                .on_reaction_sample(&reaction_topic("alice-addr", "vine-rt", "bob-addr"), &react);
+            let out2 = cache.on_reaction_sample(
+                &reaction_topic("alice-addr", "vine-rt", "bob-addr"),
+                &react,
+                0,
+            );
             assert_eq!(out2, Some(ReactionOutcome::Inserted));
 
             assert!(cache.mark_viewed("vine-rt".to_string()));
@@ -2286,8 +2417,11 @@ mod tests {
 
             // Insert reaction
             let react = canonical_reaction_bytes("vine-r1", "bob-addr", "Bob", true, recent + 10);
-            let out = cache
-                .on_reaction_sample(&reaction_topic("alice-addr", "vine-r1", "bob-addr"), &react);
+            let out = cache.on_reaction_sample(
+                &reaction_topic("alice-addr", "vine-r1", "bob-addr"),
+                &react,
+                0,
+            );
             assert_eq!(out, Some(ReactionOutcome::Inserted));
 
             // Update reaction (LWW newer timestamp)
@@ -2295,6 +2429,7 @@ mod tests {
             let out2 = cache.on_reaction_sample(
                 &reaction_topic("alice-addr", "vine-r1", "bob-addr"),
                 &react2,
+                0,
             );
             assert_eq!(out2, Some(ReactionOutcome::UpdatedNewer));
         }
@@ -2334,8 +2469,11 @@ mod tests {
             );
             cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
             let react = canonical_reaction_bytes("vine-ri", "bob-addr", "Bob", true, recent + 10);
-            let out = cache
-                .on_reaction_sample(&reaction_topic("alice-addr", "vine-ri", "bob-addr"), &react);
+            let out = cache.on_reaction_sample(
+                &reaction_topic("alice-addr", "vine-ri", "bob-addr"),
+                &react,
+                0,
+            );
             assert_eq!(out, Some(ReactionOutcome::Inserted));
             // No further mutations — the Inserted save must be sufficient.
         }
@@ -2374,9 +2512,9 @@ mod tests {
             );
             cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
             let r1 = canonical_reaction_bytes("vine-lr", "bob-addr", "Bob", true, recent + 10);
-            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-lr", "bob-addr"), &r1);
+            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-lr", "bob-addr"), &r1, 0);
             let r2 = canonical_reaction_bytes("vine-lr", "ann-addr", "Ann", false, recent + 11);
-            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-lr", "ann-addr"), &r2);
+            cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-lr", "ann-addr"), &r2, 0);
         }
         let cache2 = VineFeedCache::load(dir.path());
         let rows = cache2.list_reactions();
@@ -2914,10 +3052,12 @@ mod tests {
         cache.on_reaction_sample(
             &format!("harmony/vines/{addr}/reactions/vine-1/alice-addr"),
             &canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 100),
+            0,
         );
         cache.on_reaction_sample(
             &format!("harmony/vines/{addr}/reactions/vine-1/bob-addr"),
             &canonical_reaction_bytes("vine-1", "bob-addr", "Bob", true, 110),
+            0,
         );
         assert!(cache.mark_viewed("vine-1".into()));
 
@@ -3414,6 +3554,7 @@ mod tests {
             updated_at,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         crate::vine_signing::sign_follow_list(&signer_for(owner), &mut payload);
         serde_json::to_vec(&payload).unwrap()
@@ -3548,6 +3689,7 @@ mod tests {
             updated_at: 100,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         crate::vine_signing::sign_follow_list(&owner, &mut payload);
         let outcome = cache.on_follow_list_sample(
@@ -3665,6 +3807,7 @@ mod tests {
                 updated_at: i as u64, // strictly increasing — entry 0 is stalest
                 identity_pub: None,
                 sig: None,
+                device_sig: None,
             };
             crate::vine_signing::sign_follow_list(&private, &mut payload);
             let outcome = cache.on_follow_list_sample(
@@ -3681,6 +3824,368 @@ mod tests {
         assert!(
             !cache.follow_lists().values().any(|e| e.updated_at == 0),
             "stalest entry evicted"
+        );
+    }
+
+    // ── ZEB-678 S2: dual-path (authority-aware) admission ────────────────
+
+    /// Authority sub-topic for a named test feed.
+    fn authority_topic(creator: &str) -> String {
+        format!("harmony/vines/{}/authority", addr(creator))
+    }
+
+    /// Serialized `FeedAuthorityRecord` binding `creator`'s feed to the enrolled
+    /// `#2` device `world.a`. `revoke` layers an A+B quorum revocation of that
+    /// device (with the signer bundle needed to verify it). Reuses the public
+    /// builder for the (unchanged) `#3` binding, then attaches the optional
+    /// signer-bundle / revocation fields — neither is covered by `n_sig`, so the
+    /// binding stays valid.
+    fn authority_record(
+        creator: &str,
+        world: &crate::enrollment_verify::quorum_fixtures::QuorumWorld,
+        updated_at_ms: u64,
+        revoke: bool,
+    ) -> Vec<u8> {
+        use crate::enrollment_verify::quorum_fixtures::WORLD_NOW;
+        let n = signer_for(creator);
+        let mut rec = crate::feed_authority::build_active_authority(
+            &n,
+            &world.a_sk,
+            &world.a_cert,
+            updated_at_ms,
+        )
+        .expect("build authority record");
+        assert_eq!(
+            rec.feed_id,
+            addr(creator),
+            "authority feed_id == creator feed"
+        );
+        if revoke {
+            let rev = crate::enrollment_verify::quorum_fixtures::mint_quorum_revocation(
+                world,
+                world.a_cert.device_id,
+                WORLD_NOW,
+            );
+            rec.signer_certs_cbor_hex =
+                crate::feed_authority::encode_certs(&world.bundle).expect("encode signer bundle");
+            rec.revocation_cbor_hex =
+                Some(crate::feed_authority::encode_revocation(&rev).expect("encode revocation"));
+        }
+        serde_json::to_vec(&rec).unwrap()
+    }
+
+    /// A `#2`-signed descriptor for `creator`'s feed, signed by device key `sk`.
+    /// Leaves the legacy `#3` fields (`identity_pub`/`sig`) `None` — post-migration
+    /// records are pure `#2`.
+    fn v2_descriptor_bytes(
+        vine_id: &str,
+        creator: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> Vec<u8> {
+        let mut d = crate::VineDescriptorPayload {
+            id: vine_id.to_string(),
+            creator_address: addr(creator),
+            creator_name: "Creator".into(),
+            created_at: 1_700_000_000,
+            video_cid: format!("cid-{vine_id}"),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+            identity_pub: None,
+            sig: None,
+            device_sig: None,
+        };
+        crate::vine_signing::sign_descriptor_v2(sk, &mut d);
+        serde_json::to_vec(&d).unwrap()
+    }
+
+    /// The S2 cutover: a legacy `#3`-signed descriptor is admitted while the feed
+    /// has no authority record, then rejected the instant the feed's authority
+    /// record migrates it to the `#2` device key; a `#2`-signed descriptor is
+    /// accepted post-migration.
+    #[test]
+    fn descriptor_legacy_accepted_pre_authority_rejected_post_authority() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xE0);
+        let creator = "s2-migrating-feed";
+        let feed_topic = topic(creator);
+        let followed = followed_set_with(&[creator]);
+        let now_ms = WORLD_NOW * 1000;
+
+        let mut cache = VineFeedCache::new();
+
+        // 1) Legacy #3 descriptor, no authority cached → accepted.
+        let d1 = canonical_descriptor_bytes(
+            "vine-s2-legacy",
+            creator,
+            "Creator",
+            "cid-legacy",
+            None,
+            None,
+            WORLD_NOW,
+            None,
+            None,
+        );
+        assert!(
+            matches!(
+                cache.on_descriptor_sample(&feed_topic, &d1, &followed, now_ms),
+                Some(DescriptorOutcome::Inserted { .. })
+            ),
+            "legacy #3 descriptor accepted before the feed migrates"
+        );
+
+        // 2) Ingest the feed's authority record → the feed migrates to #2.
+        cache.on_authority_sample(
+            &authority_topic(creator),
+            &authority_record(creator, &world, now_ms, false),
+            WORLD_NOW,
+        );
+
+        // 3) A #3-only descriptor is now rejected (authority cached ⇒ #2 required).
+        let d3 = canonical_descriptor_bytes(
+            "vine-s2-post-legacy",
+            creator,
+            "Creator",
+            "cid-post-legacy",
+            None,
+            None,
+            WORLD_NOW + 1,
+            None,
+            None,
+        );
+        assert!(
+            matches!(
+                cache.on_descriptor_sample(&feed_topic, &d3, &followed, now_ms),
+                Some(DescriptorOutcome::Rejected(_))
+            ),
+            "post-migration a #3-only descriptor is rejected"
+        );
+
+        // 4) A #2-signed descriptor from the enrolled device is accepted.
+        let d2 = v2_descriptor_bytes("vine-s2-v2", creator, &world.a_sk);
+        assert!(
+            matches!(
+                cache.on_descriptor_sample(&feed_topic, &d2, &followed, now_ms),
+                Some(DescriptorOutcome::Inserted { .. })
+            ),
+            "post-migration a #2-signed descriptor is accepted"
+        );
+    }
+
+    /// Once a feed's authority carries a valid revocation of its publisher
+    /// device, even a correctly `#2`-signed descriptor is rejected — this is the
+    /// revocation-aware admission that is the point of ZEB-678.
+    #[test]
+    fn descriptor_rejected_when_feed_authority_revoked() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xE4);
+        let creator = "s2-revoked-feed";
+        let feed_topic = topic(creator);
+        let followed = followed_set_with(&[creator]);
+        let now_ms = WORLD_NOW * 1000;
+        let mut cache = VineFeedCache::new();
+
+        // Migrate the feed, then revoke the publisher device (sticky).
+        cache.on_authority_sample(
+            &authority_topic(creator),
+            &authority_record(creator, &world, now_ms, false),
+            WORLD_NOW,
+        );
+        cache.on_authority_sample(
+            &authority_topic(creator),
+            &authority_record(creator, &world, now_ms + 10_000, true),
+            WORLD_NOW,
+        );
+
+        // A correctly #2-signed descriptor is rejected — the device is revoked.
+        let d = v2_descriptor_bytes("vine-after-revoke", creator, &world.a_sk);
+        let out = cache.on_descriptor_sample(&feed_topic, &d, &followed, now_ms);
+        assert!(
+            matches!(&out, Some(DescriptorOutcome::Rejected(e)) if e.contains("revoked")),
+            "a revoked publisher's descriptor is rejected: {out:?}"
+        );
+    }
+
+    /// Defense-in-depth for the event-loop router (Task 8): the `emit_frontend_event`
+    /// dispatch only forwards `.../authority` keys here, but `on_authority_sample`
+    /// re-validates the topic shape so a misroute can never pin a feed from a
+    /// reaction / descriptor / malformed key.
+    #[test]
+    fn on_authority_sample_ignores_non_authority_topics() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xE8);
+        let creator = "s2-filter-feed";
+        let payload = authority_record(creator, &world, WORLD_NOW * 1000, false);
+        let mut cache = VineFeedCache::new();
+
+        // Wrong sub-topic: a reactions key (never routed here in production).
+        cache.on_authority_sample(
+            &format!("harmony/vines/{}/reactions/r1", addr(creator)),
+            &payload,
+            WORLD_NOW,
+        );
+        // Bare descriptor topic — no `/authority` suffix.
+        cache.on_authority_sample(&topic(creator), &payload, WORLD_NOW);
+        // Nested feed segment: feed id `{addr}/nested` contains '/'.
+        cache.on_authority_sample(
+            &format!("harmony/vines/{}/nested/authority", addr(creator)),
+            &payload,
+            WORLD_NOW,
+        );
+        assert!(
+            cache.authority.get(&addr(creator)).is_none(),
+            "no feed pinned from a non-authority or malformed topic"
+        );
+
+        // The correctly-addressed authority record DOES pin — proving the
+        // negatives above are the topic filter, not a broken payload.
+        cache.on_authority_sample(&authority_topic(creator), &payload, WORLD_NOW);
+        assert!(
+            cache.authority.get(&addr(creator)).is_some(),
+            "the correctly-addressed authority record pins the feed"
+        );
+    }
+
+    // ── ZEB-678 S2 review-fix: dual-signing (out-of-order + reactor bind) ──
+
+    /// A DUAL-signed descriptor: `#3` (binds `creator_address`) + `#2` device_sig.
+    fn dual_signed_descriptor_bytes(
+        vine_id: &str,
+        creator: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> Vec<u8> {
+        let signer = signer_for(creator);
+        let mut d = crate::VineDescriptorPayload {
+            id: vine_id.to_string(),
+            creator_address: addr(creator),
+            creator_name: "Creator".into(),
+            created_at: 1_700_000_000,
+            video_cid: format!("cid-{vine_id}"),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+            identity_pub: None,
+            sig: None,
+            device_sig: None,
+        };
+        crate::vine_signing::sign_descriptor(&signer, &mut d);
+        crate::vine_signing::sign_descriptor_v2(sk, &mut d);
+        serde_json::to_vec(&d).unwrap()
+    }
+
+    /// The out-of-order fix (Qodo #1): a dual-signed descriptor is admitted BOTH
+    /// before its feed's authority is cached (legacy `#3` path — the record can
+    /// arrive before `/authority` over unordered Zenoh) AND after migration (via
+    /// the `#2` path).
+    #[test]
+    fn dual_signed_descriptor_accepted_pre_and_post_authority() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xEE);
+        let creator = "s2-dual-desc-feed";
+        let feed_topic = topic(creator);
+        let followed = followed_set_with(&[creator]);
+        let now_ms = WORLD_NOW * 1000;
+        let mut cache = VineFeedCache::new();
+
+        // Pre-authority: accepted via the legacy `#3` binding.
+        let d1 = dual_signed_descriptor_bytes("vine-dual-1", creator, &world.a_sk);
+        assert!(
+            matches!(
+                cache.on_descriptor_sample(&feed_topic, &d1, &followed, now_ms),
+                Some(DescriptorOutcome::Inserted { .. })
+            ),
+            "dual-signed descriptor accepted before its authority arrives"
+        );
+
+        // Migrate the feed, then a new dual-signed descriptor is accepted via `#2`.
+        cache.on_authority_sample(
+            &authority_topic(creator),
+            &authority_record(creator, &world, now_ms, false),
+            WORLD_NOW,
+        );
+        let d2 = dual_signed_descriptor_bytes("vine-dual-2", creator, &world.a_sk);
+        assert!(
+            matches!(
+                cache.on_descriptor_sample(&feed_topic, &d2, &followed, now_ms),
+                Some(DescriptorOutcome::Inserted { .. })
+            ),
+            "dual-signed descriptor accepted after migration via #2"
+        );
+    }
+
+    /// The impersonation fix (CodeRabbit security): a reaction carrying a valid
+    /// `#2` `device_sig` + enrollment but NO `#3` binding for its claimed
+    /// `reactor_address` is rejected — an enrolled device must not be able to
+    /// mint a reaction for an arbitrary address.
+    #[test]
+    fn reaction_with_v2_sig_but_unbound_reactor_address_is_rejected() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xEC);
+        let mut cache = VineFeedCache::new();
+        let victim = "s2-victim-addr";
+        let mut wire = crate::VineReactionPayload {
+            vine_id: "vine-imp".into(),
+            reactor_address: addr(victim),
+            reactor_name: "Victim".into(),
+            liked: true,
+            timestamp: 100,
+            identity_pub: None,
+            sig: None,
+            owner_id: Some(hex::encode(world.a_cert.owner_id)),
+            enrollment_cbor_hex: Some(crate::feed_authority::encode_cert(&world.a_cert).unwrap()),
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
+        };
+        // Attacker signs with its own enrolled `#2` key only (no victim `#3` key).
+        crate::vine_signing::sign_reaction_v2(&world.a_sk, &mut wire);
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let out = cache.on_reaction_sample(
+            &reaction_topic("s2-creator", "vine-imp", victim),
+            &bytes,
+            WORLD_NOW,
+        );
+        assert!(
+            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("unsigned")),
+            "a #2-only reaction with an unbound reactor_address is rejected: {out:?}"
+        );
+        assert_eq!(cache.len_reactions(), 0);
+    }
+
+    /// A properly dual-signed reaction (`#3` binds `reactor_address`, `#2` rides
+    /// on top) is admitted.
+    #[test]
+    fn dual_signed_reaction_is_accepted() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xED);
+        let mut cache = VineFeedCache::new();
+        let reactor = "s2-dual-reactor";
+        let signer = signer_for(reactor);
+        let mut wire = crate::VineReactionPayload {
+            vine_id: "vine-dual".into(),
+            reactor_address: addr(reactor),
+            reactor_name: "Reactor".into(),
+            liked: true,
+            timestamp: 100,
+            identity_pub: None,
+            sig: None,
+            owner_id: Some(hex::encode(world.a_cert.owner_id)),
+            enrollment_cbor_hex: Some(crate::feed_authority::encode_cert(&world.a_cert).unwrap()),
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
+        };
+        crate::vine_signing::sign_reaction(&signer, &mut wire); // #3 binds reactor_address
+        crate::vine_signing::sign_reaction_v2(&world.a_sk, &mut wire); // #2 defense-in-depth
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let out = cache.on_reaction_sample(
+            &reaction_topic("s2-vine-creator", "vine-dual", reactor),
+            &bytes,
+            WORLD_NOW,
+        );
+        assert!(
+            matches!(out, Some(ReactionOutcome::Inserted)),
+            "dual-signed reaction accepted: {out:?}"
         );
     }
 }

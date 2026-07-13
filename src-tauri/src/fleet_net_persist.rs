@@ -244,6 +244,7 @@ mod tests {
                 logical: 0,
                 device_id: "dev-a".into(),
             },
+            feed_binding: None,
         }
     }
 

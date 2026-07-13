@@ -870,6 +870,18 @@ pub struct NodeState {
     community_delta_tx:
         Option<tokio::sync::mpsc::Sender<crate::community_state_sync::CommunityMembershipDelta>>,
     /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
+    /// ZEB-678 S2: set true after this device publishes its feed
+    /// `FeedAuthorityRecord` (the Zenoh authority sample) for the first time this
+    /// boot. Once-per-boot gate for `publish_feed_authority_if_needed` (the record
+    /// is LWW; re-publishing every vine would be wasteful — steady state converges
+    /// on the first publish).
+    vine_authority_published: bool,
+    /// ZEB-678 S2 (review-fix): set true once the active binding is stamped into
+    /// this device's fleet-net `feed_binding`. GATED SEPARATELY from the Zenoh
+    /// publish so a stamp that no-ops (fleet-net not yet wired / self-row absent)
+    /// is retried on later vine publishes WITHOUT re-publishing the authority
+    /// record — the stamp is the material a seed-holder needs to master-revoke.
+    vine_feed_binding_stamped: bool,
     /// start_node alongside the SyncEngine; shared with the IPC handler
     /// (send_dm) and the event-loop drain tick.
     dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
@@ -1744,6 +1756,8 @@ impl Default for NodeState {
             sync_engine: None,
             community_registry: None,
             community_delta_tx: None,
+            vine_authority_published: false,
+            vine_feed_binding_stamped: false,
             dm_outbox: None,
             dm_transport: None,
             crdt_state: None,
@@ -5520,6 +5534,16 @@ pub async fn start_node_inner(
                                 "BOOT-PROBE 07a: self-row HLC reserved, locking fleet-net doc"
                             );
                             let mut doc = fleet_net_doc.lock().await;
+                            // ZEB-678 S2: preserve any existing feed_binding —
+                            // the self-row rewrite must NEVER drop it, else a
+                            // reboot would propagate `None` with a newer seen_at
+                            // via LWW and wipe the seed-holder's master-revoke
+                            // material (a revocation-evasion hole). It is
+                            // (re)set on first migrated publish.
+                            let feed_binding = doc
+                                .devices
+                                .get(&device_id)
+                                .and_then(|r| r.feed_binding.clone());
                             doc.devices.insert(
                                 device_id.clone(),
                                 crate::fleet_net::FleetNetRow {
@@ -5529,6 +5553,7 @@ pub async fn start_node_inner(
                                         .map(|r| r.to_string())
                                         .unwrap_or_default(),
                                     seen_at,
+                                    feed_binding,
                                 },
                             );
                             // ZEB-418 P2 Task 7: keep the sync snapshot in
@@ -8716,6 +8741,14 @@ pub async fn start_node_inner(
                                     .await;
                                     {
                                         let mut doc = fleet_doc.lock().await;
+                                        // ZEB-678 S2: preserve any existing
+                                        // feed_binding across an endpoint rebind
+                                        // (see the boot self-row rationale — the
+                                        // rewrite must never drop it).
+                                        let feed_binding = doc
+                                            .devices
+                                            .get(&device_id)
+                                            .and_then(|r| r.feed_binding.clone());
                                         doc.devices.insert(
                                             device_id.clone(),
                                             crate::fleet_net::FleetNetRow {
@@ -8725,6 +8758,7 @@ pub async fn start_node_inner(
                                                     .map(|r| r.to_string())
                                                     .unwrap_or_default(),
                                                 seen_at,
+                                                feed_binding,
                                             },
                                         );
                                         *fleet_snapshot
@@ -13912,6 +13946,13 @@ pub struct VineDescriptorPayload {
     /// `vine_signing::descriptor_canonical_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
+    /// `vine_signing::descriptor_canonical_bytes_v2`. Present on records
+    /// signed by the enrolled device key; its presence marks the feed as
+    /// migrated (dual-path ingest requires it once the feed's authority
+    /// record is cached). Wire-only, like `sig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_sig: Option<String>,
 }
 
 /// Vine descriptor sent from the frontend to publish.
@@ -13993,6 +14034,26 @@ pub struct VineReactionPayload {
     /// `vine_signing::reaction_canonical_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// ZEB-678 S2: reactor's owner_id (hex 16 bytes). Reactions are
+    /// cross-actor (delivered under the creator's topic to followers who
+    /// usually lack the reactor's authority record), so a migrated reaction
+    /// carries its own owner-anchoring proof and is verified standalone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    /// ZEB-678 S2: reactor's enrollment cert as canonical-CBOR-hex (the
+    /// crate cert types are CBOR-native and do not round-trip through
+    /// serde_json — same idiom as `FeedAuthorityRecord`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_cbor_hex: Option<String>,
+    /// ZEB-678 S2: reactor's quorum signer bundle as canonical-CBOR-hex
+    /// (empty ⇒ master-issued).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signer_certs_cbor_hex: String,
+    /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
+    /// `vine_signing::reaction_canonical_bytes_v2`. Presence marks a
+    /// migrated (owner-anchored) reaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_sig: Option<String>,
 }
 
 /// Vine reaction sent from the frontend to publish.
@@ -14028,6 +14089,12 @@ pub struct VineFollowListPayload {
     /// `vine_signing::follow_list_canonical_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
+    /// `vine_signing::follow_list_canonical_bytes_v2`. Presence marks the
+    /// owner's feed as migrated (dual-path ingest requires it once the
+    /// feed's authority record is cached). Wire-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_sig: Option<String>,
 }
 
 /// Build + publish a vine descriptor on `harmony/vines/{creator_address}`.
@@ -14039,11 +14106,190 @@ pub struct VineFollowListPayload {
 /// `publish_tx`. The descriptor's `creator_address` selects the topic AND
 /// is bound to the signature, so callers must set it to this node's own
 /// address before calling.
+/// ZEB-678 S2: obtain the enrolled `#2` device signing key + this device's
+/// enrollment cert for migrated vine signing. Clones the `dm_outbox` Arc out
+/// from under the std `NodeState` lock, then async-locks it — never holds the
+/// std lock across the `.await`. `None` ⇒ the device is not enrolled (no
+/// outbox wired), so the caller falls back to legacy `#3` signing.
+async fn vine_publisher_material(
+    dm_outbox: &Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
+) -> Option<(
+    std::sync::Arc<ed25519_dalek::SigningKey>,
+    harmony_owner::certs::EnrollmentCert,
+)> {
+    let outbox = dm_outbox.as_ref()?;
+    let g = outbox.lock().await;
+    Some((g.community_signing_key.clone(), g.enrollment_cert.clone()))
+}
+
+/// ZEB-678 S2: on this device's first migrated vine publish, build + publish its
+/// feed `FeedAuthorityRecord` (active binding, no revocation) to
+/// `harmony/vines/{N}/authority`, and self-stamp the record into its fleet-net
+/// row so a seed-holder can master-revoke it later (§3.5). The Zenoh publish and
+/// the fleet-net stamp are gated INDEPENDENTLY (`vine_authority_published` /
+/// `vine_feed_binding_stamped`) so a stamp that no-ops (fleet-net not yet wired)
+/// retries on a later vine publish without re-publishing the LWW record. The
+/// publish is reserved atomically to avoid concurrent duplicates. Best-effort —
+/// a failure is logged, does NOT fail the content publish, and leaves the
+/// relevant gate unset so the next vine publish retries.
+async fn publish_feed_authority_if_needed(
+    state: &Mutex<NodeState>,
+    publish_tx: &tokio::sync::mpsc::Sender<event_loop::PublishRequest>,
+    identity: &harmony_identity::PrivateIdentity,
+    sk: &ed25519_dalek::SigningKey,
+    cert: &harmony_owner::certs::EnrollmentCert,
+) {
+    // Decide what still needs doing and ATOMICALLY reserve the Zenoh publish, so
+    // two concurrent vine publishes can't emit duplicate authority records
+    // (CodeRabbit). The fleet-net stamp is gated separately (Qodo/CodeRabbit): a
+    // stamp that no-ops (fleet-net not yet wired) must retry on a later vine
+    // publish WITHOUT re-publishing the authority record.
+    let (do_publish, do_stamp) = match state.lock() {
+        Ok(mut g) => {
+            let do_publish = !g.vine_authority_published;
+            let do_stamp = !g.vine_feed_binding_stamped;
+            if !do_publish && !do_stamp {
+                return;
+            }
+            if do_publish {
+                g.vine_authority_published = true; // reserve
+            }
+            (do_publish, do_stamp)
+        }
+        Err(_) => return,
+    };
+    // Release the reservation so a later vine publish retries, on any failure
+    // before the Zenoh publish actually lands.
+    let release_publish = || {
+        if do_publish {
+            if let Ok(mut g) = state.lock() {
+                g.vine_authority_published = false;
+            }
+        }
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let rec = match feed_authority::build_active_authority(identity, sk, cert, now_ms) {
+        Ok(r) => r,
+        Err(e) => {
+            release_publish();
+            tracing::warn!(error = %e, "vine authority: build failed; feed stays on legacy path");
+            return;
+        }
+    };
+    let rec_json = match serde_json::to_string(&rec) {
+        Ok(j) => j,
+        Err(e) => {
+            release_publish();
+            tracing::warn!(error = %e, "vine authority: serialize failed");
+            return;
+        }
+    };
+    if do_publish {
+        let key_expr = format!("harmony/vines/{}/authority", rec.feed_id);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if publish_tx
+            .send(event_loop::PublishRequest {
+                key_expr,
+                payload: rec_json.clone().into_bytes(),
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            release_publish();
+            tracing::warn!("vine authority: event loop not running; publish skipped");
+            return;
+        }
+        match reply_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                release_publish();
+                tracing::warn!(error = %e, "vine authority: publish rejected");
+                return;
+            }
+            Err(_) => {
+                release_publish();
+                tracing::warn!("vine authority: event loop dropped publish");
+                return;
+            }
+        }
+    }
+    // Self-stamp the active binding into the fleet-net row (best-effort — enables
+    // master-revoke). Latch the stamp gate ONLY when it actually applied, so a
+    // no-op retries on the next vine publish without re-publishing the record.
+    if do_stamp && stamp_feed_binding(state, &rec_json).await {
+        if let Ok(mut g) = state.lock() {
+            g.vine_feed_binding_stamped = true;
+        }
+    }
+}
+
+/// ZEB-678 S2: write this device's active `FeedAuthorityRecord` JSON into its
+/// own fleet-net row's `feed_binding`, bump the row's `seen_at` (so the update
+/// wins per-row LWW), refresh the sync snapshot, and notify the engine. Mirrors
+/// `set_butler_pin_impl`'s local-write path. Uses the fleet-net HLC tracker (as
+/// the boot self-row does) so the device-row clock stays monotonic. Best-effort:
+/// a missing fleet-net handle (headless/degraded) or an absent self-row is
+/// logged and skipped.
+/// Returns `true` iff the binding was written into the self-row (the caller
+/// latches its gate only then, so a no-op retries on the next vine publish).
+async fn stamp_feed_binding(state: &Mutex<NodeState>, rec_json: &str) -> bool {
+    let (doc_arc, snapshot_arc, sync_arc, tracker_arc, self_device_id) = {
+        let g = match state.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        match (
+            g.fleet_net_doc.clone(),
+            g.fleet_net_snapshot.clone(),
+            g.fleet_net_sync.clone(),
+            g.fleet_net_tracker.clone(),
+            g.fleet_net_device_id.clone(),
+        ) {
+            (Some(d), Some(s), Some(sy), Some(t), Some(id)) => (d, s, sy, t, id),
+            _ => {
+                tracing::debug!("vine authority: fleet-net not wired; skipping feed_binding stamp");
+                return false;
+            }
+        }
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let seen_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&tracker_arc, &self_device_id, now_ms).await;
+    {
+        let mut doc = doc_arc.lock().await;
+        match doc.devices.get_mut(&self_device_id) {
+            Some(row) => {
+                row.feed_binding = Some(rec_json.to_string());
+                row.seen_at = seen_at;
+            }
+            None => {
+                tracing::warn!("vine authority: self-row absent; feed_binding stamp skipped");
+                return false;
+            }
+        }
+        *snapshot_arc.write().unwrap_or_else(|p| p.into_inner()) = doc.clone();
+    }
+    sync_arc.notify_dirty();
+    // The row is written + dirty-latched; a flush failure is retried by the latch,
+    // so the stamp counts as applied.
+    if let Err(e) = sync_arc.flush_now().await {
+        tracing::warn!(error = %e, "vine authority: fleet-net flush failed; dirty latch retries");
+    }
+    true
+}
+
 pub(crate) async fn publish_vine_descriptor(
     state: &Mutex<NodeState>,
     mut descriptor: VineDescriptorPayload,
 ) -> Result<(), String> {
-    let (publish_tx, identity) = {
+    let (publish_tx, identity, dm_outbox) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
             guard
@@ -14054,6 +14300,7 @@ pub(crate) async fn publish_vine_descriptor(
                 .owner_private_identity
                 .clone()
                 .ok_or_else(|| "identity unavailable: cannot sign vine publish".to_string())?,
+            guard.dm_outbox.clone(),
         )
     };
 
@@ -14067,7 +14314,24 @@ pub(crate) async fn publish_vine_descriptor(
             descriptor.creator_address
         ));
     }
-    vine_signing::sign_descriptor(&identity, &mut descriptor);
+    // ZEB-678 S2 (review-fix, Qodo/CodeRabbit): DUAL-sign. The `#3` signature
+    // binds `creator_address` and is accepted by receivers that have not yet
+    // cached this feed's authority record — Zenoh delivery is unordered and the
+    // authority cache is in-memory / non-persisted, so a descriptor can arrive
+    // before `/authority` (or after a restart). The `#2` `device_sig` is added
+    // on top; once the feed's authority is cached the verifier REQUIRES it and
+    // rejects `#3`-only records, so dual-signing does not weaken revocation.
+    match vine_publisher_material(&dm_outbox).await {
+        Some((sk, cert)) => {
+            vine_signing::sign_descriptor(&identity, &mut descriptor);
+            vine_signing::sign_descriptor_v2(&sk, &mut descriptor);
+            publish_feed_authority_if_needed(state, &publish_tx, &identity, &sk, &cert).await;
+        }
+        None => {
+            tracing::warn!("vine descriptor: enrolled #2 key unavailable; signing legacy #3");
+            vine_signing::sign_descriptor(&identity, &mut descriptor);
+        }
+    }
 
     let key_expr = format!("harmony/vines/{}", descriptor.creator_address);
     let payload = serde_json::to_vec(&descriptor).map_err(|e| format!("serialize: {e}"))?;
@@ -14132,6 +14396,7 @@ async fn publish_vine(
         original_creator_name: vine.original_creator_name,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
 
     publish_vine_descriptor(state.inner(), wire).await
@@ -14235,6 +14500,7 @@ pub(crate) async fn publish_vine_impl(
         original_creator_name: None,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
 
     publish_vine_descriptor(state, descriptor).await?;
@@ -14312,6 +14578,7 @@ pub(crate) async fn reshare_vine_impl(
         original_creator_name,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
 
     publish_vine_descriptor(state, descriptor).await?;
@@ -14340,7 +14607,7 @@ pub(crate) async fn publish_vine_reaction_impl(
         return Err("vine_creator_address is required".to_string());
     }
 
-    let (publish_tx, node_addr, identity) = {
+    let (publish_tx, node_addr, identity, dm_outbox) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .publish_tx
@@ -14350,7 +14617,12 @@ pub(crate) async fn publish_vine_reaction_impl(
             .owner_private_identity
             .clone()
             .ok_or_else(|| "identity unavailable: cannot sign vine reaction".to_string())?;
-        (tx, guard.node_addr.clone(), identity)
+        (
+            tx,
+            guard.node_addr.clone(),
+            identity,
+            guard.dm_outbox.clone(),
+        )
     };
 
     let now_secs = std::time::SystemTime::now()
@@ -14376,8 +14648,33 @@ pub(crate) async fn publish_vine_reaction_impl(
         timestamp: now_secs,
         identity_pub: None,
         sig: None,
+        owner_id: None,
+        enrollment_cbor_hex: None,
+        signer_certs_cbor_hex: String::new(),
+        device_sig: None,
     };
-    vine_signing::sign_reaction(&identity, &mut wire);
+    // ZEB-678 S2 (review-fix, CodeRabbit security): DUAL-sign. The `#3`
+    // signature is load-bearing — it binds `reactor_address` (an enrolled `#2`
+    // device cannot be tied to a `#3` node address without the feed authority
+    // record, which cross-actor receivers usually lack, so `verify_reaction_v2`
+    // alone would let any enrolled device mint a reaction for an arbitrary
+    // address). The `#2` `device_sig` + owner-anchoring proof ride on top as
+    // defense-in-depth; revocation is enforced via the authority cache keyed by
+    // the `#3`-bound reactor_address.
+    match vine_publisher_material(&dm_outbox).await {
+        Some((sk, cert)) => {
+            wire.owner_id = Some(hex::encode(cert.owner_id));
+            wire.enrollment_cbor_hex = Some(feed_authority::encode_cert(&cert)?);
+            wire.signer_certs_cbor_hex = String::new();
+            vine_signing::sign_reaction(&identity, &mut wire);
+            vine_signing::sign_reaction_v2(&sk, &mut wire);
+            publish_feed_authority_if_needed(state, &publish_tx, &identity, &sk, &cert).await;
+        }
+        None => {
+            tracing::warn!("vine reaction: enrolled #2 key unavailable; signing legacy #3");
+            vine_signing::sign_reaction(&identity, &mut wire);
+        }
+    }
 
     let key_expr = format!(
         "harmony/vines/{}/reactions/{}/{}",
@@ -14432,7 +14729,7 @@ pub(crate) async fn delete_vine_impl(
     state: &Mutex<NodeState>,
     vine_id: String,
 ) -> Result<DeleteVineResult, String> {
-    let (publish_tx, node_addr, identity, cache) = {
+    let (publish_tx, node_addr, identity, cache, dm_outbox) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
             guard
@@ -14448,6 +14745,7 @@ pub(crate) async fn delete_vine_impl(
                 .vine_feed_cache
                 .clone()
                 .ok_or_else(|| "not connected".to_string())?,
+            guard.dm_outbox.clone(),
         )
     };
 
@@ -14481,13 +14779,19 @@ pub(crate) async fn delete_vine_impl(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let tombstone = vine_tombstone::sign_tombstone(
+    let mut tombstone = vine_tombstone::sign_tombstone(
         &identity,
         vine_id.clone(),
         video_cid,
         node_addr.clone(),
         deleted_at,
     );
+    // ZEB-678 S2: dual-sign with the enrolled `#2` key when available (the `#3`
+    // fields stay for backward verify) and maintain the feed authority record.
+    if let Some((sk, cert)) = vine_publisher_material(&dm_outbox).await {
+        vine_tombstone::sign_tombstone_v2(&sk, &mut tombstone);
+        publish_feed_authority_if_needed(state, &publish_tx, &identity, &sk, &cert).await;
+    }
     let key_expr = vine_tombstone::tombstone_key_expr(&node_addr, &vine_id);
     let payload = serde_json::to_vec(&tombstone).map_err(|e| format!("serialize: {e}"))?;
 
@@ -14548,6 +14852,7 @@ mod delete_vine_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         vine_signing::sign_descriptor(&creator_identity, &mut descriptor);
         let outcome = cache.on_descriptor_sample(
@@ -14609,6 +14914,7 @@ mod delete_vine_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         vine_signing::sign_descriptor(&creator_identity, &mut descriptor);
         cache.on_descriptor_sample(
@@ -14649,6 +14955,7 @@ mod delete_vine_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         vine_signing::sign_descriptor(&identity, &mut descriptor);
         cache.on_descriptor_sample(
@@ -14741,6 +15048,7 @@ mod vine_publish_signing_tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         }
     }
 
@@ -15177,8 +15485,22 @@ fn build_signed_follow_list_with(
         updated_at,
         identity_pub: None,
         sig: None,
+        device_sig: None,
     };
     vine_signing::sign_follow_list(identity, &mut payload);
+    // ZEB-678 S2: also add the enrolled `#2` device signature (dual-sign, like
+    // the tombstone) when the outbox is immediately lockable. This publish path
+    // is fully synchronous and cannot `.await`, so `try_lock` is used; a
+    // contended outbox falls back to `#3`-only and self-heals on the next
+    // publish. The feed's authority record is published by the content paths
+    // (descriptor/reaction/tombstone), NOT here, so a follow-only owner's list
+    // stays verifiable via `#3` (no authority cached ⇒ legacy path), while a
+    // migrated owner's followers enforce `#2` + `!revoked`.
+    if let Some(outbox) = guard.dm_outbox.as_ref() {
+        if let Ok(og) = outbox.try_lock() {
+            vine_signing::sign_follow_list_v2(&og.community_signing_key, &mut payload);
+        }
+    }
     Ok(payload)
 }
 
@@ -57784,6 +58106,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let json = serde_json::to_vec(&vine).unwrap();
         let parsed: VineDescriptorPayload = serde_json::from_slice(&json).unwrap();
@@ -57809,6 +58132,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&vine).unwrap()).unwrap();
         assert!(
@@ -57844,6 +58168,7 @@ mod tests {
             original_creator_name: Some("Original Creator".to_string()),
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let json = serde_json::to_string(&payload).expect("serialize");
         assert!(
@@ -57881,6 +58206,7 @@ mod tests {
             original_creator_name: None,
             identity_pub: None,
             sig: None,
+            device_sig: None,
         };
         let json = serde_json::to_string(&payload).expect("serialize");
         assert!(
@@ -57945,6 +58271,10 @@ mod tests {
             timestamp: 1711600000,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         };
         let json = serde_json::to_vec(&reaction).unwrap();
         let parsed: VineReactionPayload = serde_json::from_slice(&json).unwrap();
@@ -57965,6 +58295,10 @@ mod tests {
             timestamp: 0,
             identity_pub: None,
             sig: None,
+            owner_id: None,
+            enrollment_cbor_hex: None,
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&reaction).unwrap()).unwrap();
         assert!(json.contains("\"vineId\""), "expected camelCase: {json}");
@@ -62339,6 +62673,8 @@ mod start_node_race_tests {
             sync_engine: None,
             community_registry: None,
             community_delta_tx: None,
+            vine_authority_published: false,
+            vine_feed_binding_stamped: false,
             dm_outbox: None,
             dm_transport: None,
             crdt_state: None,
