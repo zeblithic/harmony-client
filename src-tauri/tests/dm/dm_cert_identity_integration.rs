@@ -15,34 +15,39 @@
 //!      `Some(device2_combined_pub(cert))`) — the acceptor caches the requester's
 //!      #2 in `process_friend_request`; the dialer caches the inviter's #2 in
 //!      `apply_handshaked_friend`. NOT the self-asserted wire #3 bundle.
-//!   3. Alice sends a DM to Bob. The CidNotify is signed by Alice's #2 and Bob
-//!      verifies it against the #2 combined pub his handshake cached — the
-//!      resolved signer is provably Alice's #2, never her #3 (Bob's cache holds
-//!      only the #2 hash; the #3 hash is a distinct value that is absent).
+//!   3. Alice sends a DM to Bob. Its CidNotify is produced by the REAL send-side
+//!      path — `drain() → push_deposit_candidate → build_cidnotify_packet_bytes →
+//!      dm_signing_material()`, the exact production code that picks #2-vs-#3 (a
+//!      capturing deposit-client mock hands us the signed wire bytes). Those
+//!      bytes are stamped with Alice's #2 (asserted `!=` her #3 hash) and verify
+//!      under her #2 combined pub. Bob then resolves the signer from his
+//!      handshake-seeded cache — provably Alice's #2 (his cache holds exactly the
+//!      #2 device; the #3 hash is absent).
 //!   4. Bob receives + decrypts the message payload via the production
-//!      `handle_cidnotify_lifted` receive path (delivery not regressed) and emits
-//!      `dm-received` with the round-tripped plaintext.
-//!   5. A DmInvite Alice produces carries `inviter_enrollment = Some(A #2 cert)`,
-//!      is self-consistent (#2 pub / hash / signature), and passes every gate a
-//!      fresh receiver's cert-path `apply_invite` runs (master→#2 + owner bind,
-//!      `device2_signing_hash(cert) == signing_device_hash`, Check B
-//!      `device2_combined_pub(cert) == inviter_identity_pub`, and the packet
-//!      signature). See the DEFERRED note below re: the `apply_invite` CALL.
+//!      `handle_cidnotify_lifted` receive path fed the REAL drained CidNotify
+//!      bytes (delivery not regressed) and emits `dm-received` with the
+//!      round-tripped plaintext.
+//!   5. The invite the REAL deposit path rebuilds (`build_invite_packet_bytes →
+//!      dm_invite_material()`) carries `inviter_enrollment = Some(A #2 cert)`, and
+//!      Bob's REAL accept path (`DmOutbox::handle_invite → apply_invite →
+//!      run_invite_accept_tail`) auto-accepts it (Bob is Alice's active friend
+//!      from the handshake) — bootstrapping the DM Space AND caching Alice's #2
+//!      (`device2_signing_hash(cert)` → `Some(device2_combined_pub(cert))`, no #3).
 //!
-//! ## Coverage vs deferred (per the Task 7 brief's "assert the strongest subset")
+//! ## Coverage (per the Task 7 brief's "assert the strongest subset")
 //!
-//! Assertions 1–4 are covered END TO END with the real handshake + the real
-//! production receive path (`handle_cidnotify_lifted`). Assertion 5 is covered at
-//! the invite-construction + cert-path-precondition level. The `apply_invite`
-//! CALL itself (and its resulting cache write on a fresh receiver) is
-//! `pub(crate)` and therefore unreachable from a black-box integration test that
-//! compiles against `harmony_app`'s PUBLIC API; that exact call is pinned by the
-//! in-crate unit tests `dm_outbox::tests::apply_invite_with_cert_caches_device2_identity`
-//! / `_cert_owner_mismatch_rejects` / `_cert_hash_mismatch_rejects`, and the
-//! same cert→#2 caching is ALSO proven live here by assertion 2 (the real
-//! handshake runs the identical `device2_signing_hash`/`device2_combined_pub`
-//! derivation over the wire). Full first-contact invite acceptance over a live
-//! in-process DM tunnel is deferred to live-fleet (ZEB-504 cross-WAN shape).
+//! All five assertions are covered end-to-end against production code paths: the
+//! real iroh friend handshake (1, 2), the real send-side signing selection via
+//! `drain`/`dm_signing_material` (3), the real `handle_cidnotify_lifted` receive
+//! path (4), and the real `handle_invite → apply_invite` cert-anchored accept
+//! path (5). Both wire packets (CidNotify + invite) are pulled from the REAL
+//! deposit rung, so a regression leaving the sender on #3 surfaces here.
+//!
+//! The one substitution is TRANSPORT, not logic: the deposit-capture mock + a
+//! shared in-memory CAS stand in for the live iroh DM tunnel / butler carrier
+//! (an in-process tunnel is out of this harness's scope). The bytes crossing that
+//! boundary are the exact production-signed packets. Live first-contact over a
+//! real cross-WAN tunnel remains the ZEB-504 live-fleet shape.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -189,6 +194,28 @@ impl harmony_app::node_event_sink::NodeEventSink for RecordingSink {
             .lock()
             .expect("sink lock")
             .push((event.to_string(), payload));
+    }
+}
+
+/// Capturing butler-deposit mock: records every `ButlerDepositRequest` the REAL
+/// drain path builds (so the test can pull out the production-signed CidNotify +
+/// invite wire bytes) and reports `Failed` so the outbox entry stays Pending
+/// (no state mutation from the capture itself).
+struct CapturingDepositClient {
+    captured: Arc<StdMutex<Vec<harmony_app::butler_deposit::ButlerDepositRequest>>>,
+}
+
+#[async_trait::async_trait]
+impl harmony_app::butler_deposit::ButlerDepositClient for CapturingDepositClient {
+    async fn deposit(
+        &self,
+        req: &harmony_app::butler_deposit::ButlerDepositRequest,
+    ) -> harmony_app::butler_deposit::DepositRungOutcome {
+        self.captured
+            .lock()
+            .expect("captured lock")
+            .push(req.clone());
+        harmony_app::butler_deposit::DepositRungOutcome::Failed("capture-only mock".into())
     }
 }
 
@@ -441,22 +468,23 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
         }
 
         // ── ASSERTION 2: each side cached the PEER's cert-derived #2. ─────
-        // Helper: assert `cache[owner]` maps `d2_hash` → Some(d2_pub) and does
-        // NOT carry the peer's #3 identity hash (proving cert-attested #2, not
-        // the self-asserted wire #3 bundle, seeded the cache).
+        // Helper: the handshake caches the peer as EXACTLY the singleton #2
+        // device (`device2_signing_hash → Some(device2_combined_pub)`) — proving
+        // the cert-attested #2 seeded the cache, NOT some other device (a #3
+        // transport hash would make this a >1-entry or different-hash set).
         let assert_cached_device2 = |cache_entry: &OwnerDeviceEntry,
                                      d2_hash: DeviceIdentityHash,
                                      d2_pub: [u8; 64],
                                      who: &str| {
-            let idx = cache_entry
-                .devices
-                .iter()
-                .position(|d| *d == d2_hash)
-                .unwrap_or_else(|| panic!("{who}: #2 DM hash must be a cached device"));
             assert_eq!(
-                cache_entry.device_identity_pubs[idx],
-                Some(d2_pub),
-                "{who}: cached pub at the #2 device index must be the #2 combined pub"
+                cache_entry.devices,
+                vec![d2_hash],
+                "{who}: cache holds exactly the peer's #2 device (singleton — not a #3 hash)"
+            );
+            assert_eq!(
+                cache_entry.device_identity_pubs,
+                vec![Some(d2_pub)],
+                "{who}: cached pub is the peer's #2 combined pub"
             );
         };
         {
@@ -486,12 +514,7 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
         // (content-addressed store; the live tunnel/deposit carries it — sharing
         // the CAS is the in-process stand-in for that transport).
         let content_key = DmContentKey::new([0x5c; 32]);
-        let space_seed = make_dm_space(
-            SpaceId([0x77; 16]),
-            alice.owner,
-            bob.owner,
-            content_key.clone(),
-        );
+        let space_seed = make_dm_space(SpaceId([0x77; 16]), alice.owner, bob.owner, content_key);
         let dm_space_id = {
             let mut g = alice_crdt_state.lock().await;
             g.apply_space_with_canonicalization(space_seed.clone());
@@ -560,33 +583,58 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
                 .expect("alice send_dm ok")
         };
 
-        // Build the CidNotify EXACTLY as the production deposit/tunnel builders
-        // do (`build_cidnotify_packet_bytes`): sign the body with Alice's #2 key
-        // and stamp her #2 DM hash. `sender_devices` is Alice's own set — she
-        // does not cache herself, so production's `resolve_sender_devices` falls
-        // back to the singleton [#2 hash], which is exactly this.
-        let cidnotify_signed = harmony_app::dm_envelope::DmCidNotifySigned {
-            space_id: dm_space_id,
-            message_cid,
-            sender_owner_addr: alice.owner,
-            sender_devices: vec![alice_d2_hash],
-            signing_device_hash: alice_d2_hash,
+        // ── ASSERTION 3 (send side): drive the CidNotify through the REAL
+        //    send path so the production #2-vs-#3 selection actually runs.
+        //    `send_dm` only encrypts + enqueues; the signing decision lives in
+        //    `build_cidnotify_packet_bytes` (which calls `dm_signing_material()`),
+        //    reached via `drain → push_deposit_candidate`. We install a capturing
+        //    butler-deposit mock and drain twice — the first drain's transient
+        //    failure records an AttemptState, the second (after the 5s backoff
+        //    window) has `pre_failure_count >= 1` and therefore builds + deposits
+        //    the real signed packet. A regression that left Alice signing #3
+        //    would be caught right here.
+        let captured = Arc::new(StdMutex::new(Vec::<
+            harmony_app::butler_deposit::ButlerDepositRequest,
+        >::new()));
+        alice_outbox.set_butler_deposit_client(Arc::new(CapturingDepositClient {
+            captured: Arc::clone(&captured),
+        }));
+        let deposit_transport = harmony_app::dm_outbox::DepositOnlyDmTransport;
+        let t0 = now_ms();
+        {
+            let mut g = alice_crdt_state.lock().await;
+            alice_outbox.drain(&mut g, &deposit_transport, t0).await;
+        }
+        {
+            let mut g = alice_crdt_state.lock().await;
+            // +60s ≫ the 5s backoff window, so the (entry, recipient) pair is due.
+            alice_outbox
+                .drain(&mut g, &deposit_transport, t0 + 60_000)
+                .await;
+        }
+        let deposit_req = {
+            let g = captured.lock().expect("captured lock");
+            g.iter()
+                .find(|r| r.cidnotify_packet.is_some())
+                .cloned()
+                .expect("the REAL drain path built + deposited a CidNotify candidate")
         };
-        // ── ASSERTION 3 (send side): the CidNotify is stamped with Alice's #2,
-        //    never her #3. ────────────────────────────────────────────────
         assert_eq!(
-            cidnotify_signed.signing_device_hash, alice_d2_hash,
-            "CidNotify must be signed by Alice's #2 DM identity"
+            deposit_req.message_cid,
+            Some(message_cid),
+            "the deposited candidate references the message Alice just sent"
         );
-        assert_ne!(
-            cidnotify_signed.signing_device_hash, alice_hash3,
-            "CidNotify must NOT be signed by Alice's #3 transport identity"
-        );
-        let cidnotify_packet =
-            harmony_app::dm_envelope::build_signed_cidnotify(cidnotify_signed, &alice_d2_key)
-                .expect("build signed cidnotify");
-        let cidnotify_wire =
-            harmony_app::dm_envelope::encode_packet(&cidnotify_packet).expect("encode cidnotify");
+        let cidnotify_wire = deposit_req
+            .cidnotify_packet
+            .clone()
+            .expect("deposit carries the CidNotify wire bytes");
+        // The deposit path also fail-closed-rebuilds the bootstrap invite via
+        // `build_invite_packet_bytes → dm_invite_material()`; capture it for
+        // assertion 5 (also production-signed #2 bytes).
+        let invite_wire = deposit_req
+            .invite_packet
+            .clone()
+            .expect("deposit carries the rebuilt DmInvite wire bytes");
 
         let (rx_signed, rx_signature, rx_signed_bytes) =
             match harmony_app::dm_envelope::decode_packet(&cidnotify_wire)
@@ -599,6 +647,23 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
                 } => (signed, signature, signed_bytes),
                 other => panic!("expected CidNotify, got {other:?}"),
             };
+        // The REAL builder stamped Alice's #2 DM hash, NOT her #3 transport hash,
+        // and the drained bytes verify under her #2 combined pub.
+        assert_eq!(
+            rx_signed.signing_device_hash, alice_d2_hash,
+            "the REAL drain path signed the CidNotify with Alice's #2 DM identity"
+        );
+        assert_ne!(
+            rx_signed.signing_device_hash, alice_hash3,
+            "the REAL drain path did NOT sign with Alice's #3 transport identity"
+        );
+        harmony_app::dm_signing::verify_dm_packet_signature(
+            &rx_signed_bytes,
+            &rx_signature,
+            &alice_d2_pub,
+            rx_signed.signing_device_hash,
+        )
+        .expect("the drained CidNotify bytes verify under Alice's #2 combined pub");
 
         // ── ASSERTION 3 (receive side): Bob resolves the signer from his
         //    handshake-seeded cache and it is provably Alice's #2. ─────────
@@ -696,37 +761,11 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
             );
         }
 
-        // ── ASSERTION 5: Alice's DmInvite carries her #2 cert and passes every
-        //    cert-path gate a fresh receiver's `apply_invite` runs. ─────────
-        // (The `apply_invite` call itself is pub(crate) — unreachable here; see
-        // the module DEFERRED note. This asserts the invite is well-formed and
-        // acceptance-ready, and that the value a fresh receiver would cache is
-        // Alice's #2.)
-        let invite_signed = harmony_app::dm_envelope::DmInviteSigned {
-            space_id: dm_space_id,
-            kind: SpaceKind::Dm,
-            members: {
-                let mut m = vec![alice.owner, bob.owner];
-                m.sort();
-                m
-            },
-            inviter: alice.owner,
-            content_key,
-            sender_devices: vec![alice_d2_hash],
-            created_at: Hlc {
-                wall_ms: 100,
-                logical: 0,
-                device_id: "alice-dev".into(),
-            },
-            signing_device_hash: alice_d2_hash,
-            inviter_identity_pub: alice_d2_pub,
-            inviter_enrollment: Some(Box::new(alice.cert.clone())),
-        };
-        let invite_packet =
-            harmony_app::dm_envelope::build_signed_invite(invite_signed, &alice_d2_key)
-                .expect("build signed invite");
-        let invite_wire =
-            harmony_app::dm_envelope::encode_packet(&invite_packet).expect("encode invite");
+        // ── ASSERTION 5: the REAL deposit-rebuilt DmInvite carries Alice's #2
+        //    cert, and Bob's REAL accept path caches Alice's #2. ────────────
+        // The invite bytes come from the same drain/deposit candidate captured
+        // above (`build_invite_packet_bytes → dm_invite_material()`), so they are
+        // production-signed #2 bytes — not hand-built.
         let (inv_signed, inv_signature, inv_signed_bytes) =
             match harmony_app::dm_envelope::decode_packet(&invite_wire).expect("decode invite") {
                 harmony_app::dm_envelope::DmPacket::Invite {
@@ -736,70 +775,81 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
                 } => (signed, signature, signed_bytes),
                 other => panic!("expected Invite, got {other:?}"),
             };
-
-        // 5a. Carries Alice's #2 EnrollmentCert.
+        // 5a. The rebuilt invite attaches Alice's #2 EnrollmentCert.
         assert_eq!(
             inv_signed.inviter_enrollment,
             Some(Box::new(alice.cert.clone())),
-            "invite attaches Alice's #2 EnrollmentCert"
+            "deposit-rebuilt invite attaches Alice's #2 EnrollmentCert"
         );
-        let inv_cert = inv_signed
-            .inviter_enrollment
-            .as_ref()
-            .expect("cert present");
-        // 5b. master→#2 + owner_id bind (apply_invite step 1, expiry-agnostic).
-        harmony_app::enrollment_verify::verify_enrollment_any_issuer(
-            inv_cert,
-            &[],
-            Some(&alice.owner.0),
-            0,
-        )
-        .expect("cert verifies master→#2 and binds Alice's owner_id");
-        // 5c. cert's #2 DM hash == the body's signing device hash.
+
+        // 5b. Drive it through Bob's REAL accept path
+        // (`handle_invite → apply_invite → run_invite_accept_tail`), which runs
+        // the cert-anchored gates (verify_enrollment_any_issuer, cert-hash ==
+        // signing_device_hash, Check B) and then writes the Space + caches #2.
+        //
+        // Bob is Alice's active friend (assertion 1), so apply_invite AUTO-ACCEPTS
+        // rather than staging. We run against a copy of Bob's real post-handshake
+        // state with Alice's device-cache entry + the DM Space removed, so the
+        // accept path's cert-gated cache WRITE is observable rather than masked by
+        // the handshake-seeded #2 cache (assertion 2) and the seeded Space
+        // (assertions 3–4). Alice stays an active friend, so the cert-path is
+        // exercised end to end.
+        let mut bob_accept_state = { bob_crdt_state.lock().await.clone() };
+        bob_accept_state
+            .owner_device_cache
+            .devices
+            .remove(&alice.owner);
+        bob_accept_state.spaces.remove(&dm_space_id);
+        assert!(
+            !bob_accept_state
+                .owner_device_cache
+                .devices
+                .contains_key(&alice.owner),
+            "precondition: no cached device for Alice before the invite is applied"
+        );
+        assert!(
+            !bob_accept_state.spaces.contains_key(&dm_space_id),
+            "precondition: DM Space absent before the invite is applied"
+        );
+
+        {
+            let mut ob = bob_outbox.lock().await;
+            ob.handle_invite(
+                &mut bob_accept_state,
+                inv_signed,
+                inv_signature,
+                &inv_signed_bytes,
+                now_ms(),
+            )
+            .await
+            .expect("handle_invite (real apply_invite #2 cert path) must accept");
+        }
+
+        // Accepted (not Staged): the DM Space was bootstrapped AND Alice's #2 was
+        // cached from the cert.
+        assert!(
+            bob_accept_state.spaces.contains_key(&dm_space_id),
+            "apply_invite bootstrapped the DM Space (auto-accept, not staged)"
+        );
+        let accepted_entry = bob_accept_state
+            .owner_device_cache
+            .devices
+            .get(&alice.owner)
+            .expect("apply_invite cached Alice's device set from the cert");
         assert_eq!(
-            harmony_app::dm_signing::device2_signing_hash(inv_cert).expect("cert #2 hash"),
-            inv_signed.signing_device_hash,
-            "cert #2 DM hash equals the invite's signing_device_hash"
+            accepted_entry.devices,
+            vec![alice_d2_hash],
+            "apply_invite cached exactly Alice's #2 device (singleton — not a #3 hash)"
         );
-        // 5d. Check B: cert's #2 combined pub == the inline inviter_identity_pub.
-        assert_eq!(
-            harmony_app::dm_signing::device2_combined_pub(inv_cert),
-            inv_signed.inviter_identity_pub,
-            "Check B: device2_combined_pub(cert) == inviter_identity_pub"
-        );
-        // 5e. The packet signature verifies against the #2 combined pub.
-        harmony_app::dm_signing::verify_dm_packet_signature(
-            &inv_signed_bytes,
-            &inv_signature,
-            &inv_signed.inviter_identity_pub,
-            inv_signed.signing_device_hash,
-        )
-        .expect("invite signature verifies against Alice's #2 combined pub");
-        // 5f. A fresh receiver would cache Alice's #2 (hash → combined pub).
-        let mut fresh = OwnerState::default();
-        fresh.owner_device_cache.devices.insert(
-            alice.owner,
-            OwnerDeviceEntry {
-                devices: vec![alice_d2_hash],
-                device_identity_pubs: vec![Some(alice_d2_pub)],
-                device_tunnel_contacts: vec![None],
-                learned_at: Hlc {
-                    wall_ms: now_ms(),
-                    logical: 0,
-                    device_id: "bob-dev".into(),
-                },
-            },
-        );
-        let fresh_entry = fresh.owner_device_cache.devices.get(&alice.owner).unwrap();
-        let fresh_idx = fresh_entry
+        let acc_idx = accepted_entry
             .devices
             .iter()
-            .position(|d| *d == inv_signed.signing_device_hash)
-            .expect("fresh receiver caches the #2 device");
+            .position(|d| *d == alice_d2_hash)
+            .expect("cached #2 device present");
         assert_eq!(
-            fresh_entry.device_identity_pubs[fresh_idx],
+            accepted_entry.device_identity_pubs[acc_idx],
             Some(alice_d2_pub),
-            "a fresh receiver caches Alice's #2 combined pub (not a #3)"
+            "apply_invite cached Alice's #2 combined pub (not a #3)"
         );
 
         // ── Teardown. ────────────────────────────────────────────────────
