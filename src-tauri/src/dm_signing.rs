@@ -288,6 +288,34 @@ pub fn derive_device_hash_from_identity_pub(identity_pub: &[u8; 64]) -> Option<D
     Some(DeviceIdentityHash(identity.address_hash))
 }
 
+/// ZEB-580 S1: build the 64-byte DM combined pub (`X25519_pub(32) ‖
+/// Ed25519_pub(32)`) for an enrolled device (#2) from its EnrollmentCert's
+/// classical pubkeys. This is the same layout as
+/// `harmony_identity::Identity::to_public_bytes()`, so its DM device hash is
+/// `derive_device_hash_from_identity_pub(&combined)` and
+/// `verify_dm_packet_signature` accepts it unchanged.
+pub fn device2_combined_pub(cert: &harmony_owner::certs::EnrollmentCert) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&cert.device_pubkeys.classical.x25519_pub);
+    out[32..].copy_from_slice(&cert.device_pubkeys.classical.ed25519_verify);
+    out
+}
+
+/// ZEB-580 S1: the DM device hash for a device's #2 identity, or `None` when
+/// the cert lacks a usable X25519 pub (all-zero pre-ZEB-372 stub or a
+/// degenerate synthetic cert) or the combined pub is not a valid Identity
+/// point. Callers treat `None` as "no #2 identity available" and degrade to
+/// the legacy #3 path.
+pub fn device2_signing_hash(
+    cert: &harmony_owner::certs::EnrollmentCert,
+) -> Option<DeviceIdentityHash> {
+    let combined = device2_combined_pub(cert);
+    if combined[..32] == [0u8; 32] {
+        return None;
+    }
+    derive_device_hash_from_identity_pub(&combined)
+}
+
 /// Sign a Reticulum DM packet body. The signature is applied to the
 /// canonical CBOR encoding of the body (which includes
 /// `signing_device_hash` to prevent key-substitution attacks).
@@ -814,5 +842,43 @@ mod tests {
                  implementations disagree — cross-repo derivation drift"
             );
         }
+    }
+
+    /// ZEB-580 S1: the #2 combined pub is x25519_pub ‖ ed25519_verify from
+    /// the cert, and its DM hash differs from the same device's #3 hash.
+    #[test]
+    fn device2_combined_pub_and_hash_from_mint() {
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted
+            .state
+            .enrollments
+            .values()
+            .find(|c| {
+                c.device_pubkeys.classical.ed25519_verify
+                    == minted.device_signing_key.verifying_key().to_bytes()
+            })
+            .expect("device cert");
+
+        let combined = device2_combined_pub(cert);
+        assert_eq!(&combined[..32], &cert.device_pubkeys.classical.x25519_pub);
+        assert_eq!(
+            &combined[32..],
+            &cert.device_pubkeys.classical.ed25519_verify
+        );
+
+        let h2 = device2_signing_hash(cert).expect("real cert yields a #2 hash");
+        // Deterministic + equals the direct derivation.
+        assert_eq!(h2, derive_device_hash_from_identity_pub(&combined).unwrap());
+    }
+
+    /// A cert with an all-zero X25519 half (the pre-ZEB-372 stub / a
+    /// degenerate synthetic cert) yields no usable #2 identity — callers
+    /// must degrade rather than cache a degenerate combined pub.
+    #[test]
+    fn device2_signing_hash_rejects_zeroed_x25519() {
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let mut cert = minted.state.enrollments.values().next().unwrap().clone();
+        cert.device_pubkeys.classical.x25519_pub = [0u8; 32];
+        assert!(device2_signing_hash(&cert).is_none());
     }
 }
