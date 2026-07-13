@@ -806,23 +806,29 @@ impl VineFeedCache {
         // leading `{creator}` segment names the topic OWNER, which the
         // payload doesn't carry — cross-creator replay of the same
         // (vine_id, reactor) tuple is idempotent by construction.
-        // ZEB-678 S2: dual-path. A migrated reaction (carries `device_sig`)
-        // self-verifies via the enrollment chokepoint — cross-actor, so the
-        // follower usually lacks the reactor's authority record. Revocation is
-        // best-effort (§3.3): rejected only when we DO hold the reactor's
-        // authority record marking its device revoked. Else legacy `#3`.
-        let verify_result = if reaction.device_sig.is_some() {
-            crate::vine_signing::verify_reaction_v2(&reaction, now_secs).and_then(|()| {
-                match self.authority.get(&reaction.reactor_address) {
-                    Some(p) if p.revoked => {
-                        Err("reaction rejected: reactor device revoked".to_string())
-                    }
-                    _ => Ok(()),
+        // ZEB-678 S2 (review-fix, CodeRabbit security): the `#3` signature binds
+        // `reactor_address` and is ALWAYS required. `verify_reaction_v2` alone
+        // recovers an enrolled device from the carried enrollment but never ties
+        // it to `reactor_address`, so any enrolled device could mint a reaction
+        // for an arbitrary address (dedup + revocation key off `reactor_address`).
+        // When a migrated reaction also carries `device_sig`, the `#2` layer is
+        // verified as defense-in-depth. Revocation is best-effort (§3.3): rejected
+        // only when we DO hold the reactor's authority record marking its device
+        // revoked — keyed by the now `#3`-bound reactor_address.
+        let verify_result = crate::vine_signing::verify_reaction(&reaction)
+            .and_then(|()| {
+                if reaction.device_sig.is_some() {
+                    crate::vine_signing::verify_reaction_v2(&reaction, now_secs)
+                } else {
+                    Ok(())
                 }
             })
-        } else {
-            crate::vine_signing::verify_reaction(&reaction)
-        };
+            .and_then(|()| match self.authority.get(&reaction.reactor_address) {
+                Some(p) if p.revoked => {
+                    Err("reaction rejected: reactor device revoked".to_string())
+                }
+                _ => Ok(()),
+            });
         if let Err(e) = verify_result {
             return Some(ReactionOutcome::Rejected(e));
         }
@@ -4038,6 +4044,148 @@ mod tests {
         assert!(
             cache.authority.get(&addr(creator)).is_some(),
             "the correctly-addressed authority record pins the feed"
+        );
+    }
+
+    // ── ZEB-678 S2 review-fix: dual-signing (out-of-order + reactor bind) ──
+
+    /// A DUAL-signed descriptor: `#3` (binds `creator_address`) + `#2` device_sig.
+    fn dual_signed_descriptor_bytes(
+        vine_id: &str,
+        creator: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> Vec<u8> {
+        let signer = signer_for(creator);
+        let mut d = crate::VineDescriptorPayload {
+            id: vine_id.to_string(),
+            creator_address: addr(creator),
+            creator_name: "Creator".into(),
+            created_at: 1_700_000_000,
+            video_cid: format!("cid-{vine_id}"),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+            identity_pub: None,
+            sig: None,
+            device_sig: None,
+        };
+        crate::vine_signing::sign_descriptor(&signer, &mut d);
+        crate::vine_signing::sign_descriptor_v2(sk, &mut d);
+        serde_json::to_vec(&d).unwrap()
+    }
+
+    /// The out-of-order fix (Qodo #1): a dual-signed descriptor is admitted BOTH
+    /// before its feed's authority is cached (legacy `#3` path — the record can
+    /// arrive before `/authority` over unordered Zenoh) AND after migration (via
+    /// the `#2` path).
+    #[test]
+    fn dual_signed_descriptor_accepted_pre_and_post_authority() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xEE);
+        let creator = "s2-dual-desc-feed";
+        let feed_topic = topic(creator);
+        let followed = followed_set_with(&[creator]);
+        let now_ms = WORLD_NOW * 1000;
+        let mut cache = VineFeedCache::new();
+
+        // Pre-authority: accepted via the legacy `#3` binding.
+        let d1 = dual_signed_descriptor_bytes("vine-dual-1", creator, &world.a_sk);
+        assert!(
+            matches!(
+                cache.on_descriptor_sample(&feed_topic, &d1, &followed, now_ms),
+                Some(DescriptorOutcome::Inserted { .. })
+            ),
+            "dual-signed descriptor accepted before its authority arrives"
+        );
+
+        // Migrate the feed, then a new dual-signed descriptor is accepted via `#2`.
+        cache.on_authority_sample(
+            &authority_topic(creator),
+            &authority_record(creator, &world, now_ms, false),
+            WORLD_NOW,
+        );
+        let d2 = dual_signed_descriptor_bytes("vine-dual-2", creator, &world.a_sk);
+        assert!(
+            matches!(
+                cache.on_descriptor_sample(&feed_topic, &d2, &followed, now_ms),
+                Some(DescriptorOutcome::Inserted { .. })
+            ),
+            "dual-signed descriptor accepted after migration via #2"
+        );
+    }
+
+    /// The impersonation fix (CodeRabbit security): a reaction carrying a valid
+    /// `#2` `device_sig` + enrollment but NO `#3` binding for its claimed
+    /// `reactor_address` is rejected — an enrolled device must not be able to
+    /// mint a reaction for an arbitrary address.
+    #[test]
+    fn reaction_with_v2_sig_but_unbound_reactor_address_is_rejected() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xEC);
+        let mut cache = VineFeedCache::new();
+        let victim = "s2-victim-addr";
+        let mut wire = crate::VineReactionPayload {
+            vine_id: "vine-imp".into(),
+            reactor_address: addr(victim),
+            reactor_name: "Victim".into(),
+            liked: true,
+            timestamp: 100,
+            identity_pub: None,
+            sig: None,
+            owner_id: Some(hex::encode(world.a_cert.owner_id)),
+            enrollment_cbor_hex: Some(crate::feed_authority::encode_cert(&world.a_cert).unwrap()),
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
+        };
+        // Attacker signs with its own enrolled `#2` key only (no victim `#3` key).
+        crate::vine_signing::sign_reaction_v2(&world.a_sk, &mut wire);
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let out = cache.on_reaction_sample(
+            &reaction_topic("s2-creator", "vine-imp", victim),
+            &bytes,
+            WORLD_NOW,
+        );
+        assert!(
+            matches!(out, Some(ReactionOutcome::Rejected(ref e)) if e.contains("unsigned")),
+            "a #2-only reaction with an unbound reactor_address is rejected: {out:?}"
+        );
+        assert_eq!(cache.len_reactions(), 0);
+    }
+
+    /// A properly dual-signed reaction (`#3` binds `reactor_address`, `#2` rides
+    /// on top) is admitted.
+    #[test]
+    fn dual_signed_reaction_is_accepted() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0xED);
+        let mut cache = VineFeedCache::new();
+        let reactor = "s2-dual-reactor";
+        let signer = signer_for(reactor);
+        let mut wire = crate::VineReactionPayload {
+            vine_id: "vine-dual".into(),
+            reactor_address: addr(reactor),
+            reactor_name: "Reactor".into(),
+            liked: true,
+            timestamp: 100,
+            identity_pub: None,
+            sig: None,
+            owner_id: Some(hex::encode(world.a_cert.owner_id)),
+            enrollment_cbor_hex: Some(crate::feed_authority::encode_cert(&world.a_cert).unwrap()),
+            signer_certs_cbor_hex: String::new(),
+            device_sig: None,
+        };
+        crate::vine_signing::sign_reaction(&signer, &mut wire); // #3 binds reactor_address
+        crate::vine_signing::sign_reaction_v2(&world.a_sk, &mut wire); // #2 defense-in-depth
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let out = cache.on_reaction_sample(
+            &reaction_topic("s2-vine-creator", "vine-dual", reactor),
+            &bytes,
+            WORLD_NOW,
+        );
+        assert!(
+            matches!(out, Some(ReactionOutcome::Inserted)),
+            "dual-signed reaction accepted: {out:?}"
         );
     }
 }

@@ -310,10 +310,18 @@ pub(crate) fn verify_device_sig(
     what: &str,
 ) -> Result<(), String> {
     let sig = device_sig.ok_or_else(|| format!("{what} has no device signature"))?;
-    let sig_bytes: [u8; 64] = hex::decode(sig)
-        .map_err(|e| format!("{what} device_sig is not hex: {e}"))?
-        .try_into()
-        .map_err(|_| format!("{what} device_sig must be 64 bytes"))?;
+    // ZEB-678 S2 (review-fix, Qodo security): bound the attacker-controlled hex
+    // before decoding — length-check then decode into a fixed buffer, so an
+    // oversized-but-valid-hex string can't force a large allocation on the
+    // network-ingest path (mirrors feed_authority's capped decoders).
+    if sig.len() != 128 {
+        return Err(format!(
+            "{what} device_sig must be 128 hex chars (64 bytes)"
+        ));
+    }
+    let mut sig_bytes = [0u8; 64];
+    hex::decode_to_slice(sig, &mut sig_bytes)
+        .map_err(|e| format!("{what} device_sig is not hex: {e}"))?;
     let vk = ed25519_dalek::VerifyingKey::from_bytes(publisher_key)
         .map_err(|_| format!("{what} publisher key invalid"))?;
     vk.verify_strict(canonical, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
@@ -354,10 +362,13 @@ pub fn verify_follow_list_v2(
 /// ingest boundary), never derived from a record field.
 pub fn verify_reaction_v2(r: &VineReactionPayload, now_secs: u64) -> Result<(), String> {
     let owner_hex = r.owner_id.as_deref().ok_or("reaction missing owner_id")?;
-    let owner_id: [u8; 16] = hex::decode(owner_hex)
-        .map_err(|e| format!("reaction owner_id is not hex: {e}"))?
-        .try_into()
-        .map_err(|_| "reaction owner_id must be 16 bytes".to_string())?;
+    // Bound the hex before decoding (Qodo security) — fixed-size owner id.
+    if owner_hex.len() != 32 {
+        return Err("reaction owner_id must be 32 hex chars (16 bytes)".to_string());
+    }
+    let mut owner_id = [0u8; 16];
+    hex::decode_to_slice(owner_hex, &mut owner_id)
+        .map_err(|e| format!("reaction owner_id is not hex: {e}"))?;
     let enrollment = crate::feed_authority::decode_cert(
         r.enrollment_cbor_hex
             .as_deref()
@@ -797,6 +808,12 @@ mod tests {
         assert!(verify_follow_list_v2(&p, &wrong).is_err());
     }
 
+    // NOTE: `verify_reaction_v2` intentionally verifies ONLY the `#2` layer
+    // (enrollment + device_sig); it does NOT bind `reactor_address` — the `#2`
+    // device cannot be tied to a `#3` node address standalone. That binding is
+    // enforced by the ingest path (`VineFeedCache::on_reaction_sample` always
+    // runs `verify_reaction` first), so this isolation test uses an unrelated
+    // `reactor_address` by design.
     #[test]
     fn reaction_v2_self_verifies_master_and_quorum() {
         use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
@@ -835,5 +852,28 @@ mod tests {
         let mut wrong_owner = r.clone();
         wrong_owner.owner_id = Some(hex::encode([0x55u8; 16]));
         assert!(verify_reaction_v2(&wrong_owner, WORLD_NOW).is_err());
+    }
+
+    /// Qodo security: the attacker-controlled `device_sig` hex is length-bounded
+    /// BEFORE decoding, so an oversized-but-valid-hex string is rejected on the
+    /// length gate rather than allocating first.
+    #[test]
+    fn verify_device_sig_length_bounded_before_decode() {
+        let pk = [0u8; 32];
+        let oversized = "a".repeat(10_000);
+        let err = verify_device_sig(Some(&oversized), &pk, b"canonical", "test").unwrap_err();
+        assert!(
+            err.contains("128 hex chars"),
+            "oversized rejected by length: {err}"
+        );
+
+        // A correctly-sized (but not matching) sig passes the length gate and
+        // fails later at verify — proving the gate rejects only on length.
+        let right_len = "a".repeat(128);
+        let err2 = verify_device_sig(Some(&right_len), &pk, b"canonical", "test").unwrap_err();
+        assert!(
+            !err2.contains("128 hex chars"),
+            "128-char sig clears the length gate: {err2}"
+        );
     }
 }
