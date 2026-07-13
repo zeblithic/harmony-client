@@ -159,6 +159,14 @@ pub fn build_revoked_authority(
 ) -> Result<(String, String), String> {
     let mut rec: FeedAuthorityRecord = serde_json::from_str(active_binding_json)
         .map_err(|e| format!("feed_binding parse failed: {e}"))?;
+    // Authenticate the binding BEFORE trusting `feed_id` (the publish topic) or
+    // republishing. `feed_binding` is self-authored by the target device into its
+    // fleet-net row, so a tampered/corrupt one must not steer the seed-holder to
+    // publish to a bogus topic (or a record every follower drops) while we log a
+    // successful cut-off. `verify_binding` proves `feed_id == hash(n_identity_pub)`
+    // under a valid `n_sig`, so a device can only ever republish a binding for the
+    // feed it actually owns. (ZEB-678 S3 review — Qodo/CodeRabbit.)
+    verify_binding(&rec)?;
     let target_hex = hex::encode(revocation.target);
     if target_hex != rec.device_id {
         return Err(format!(
@@ -526,6 +534,29 @@ mod tests {
         )
         .unwrap();
         assert!(build_revoked_authority("not json", &rev, 1_000).is_err());
+    }
+
+    #[test]
+    fn build_revoked_authority_rejects_tampered_binding() {
+        use harmony_owner::certs::RevocationReason;
+        let world = mint_quorum_world(0xA3);
+        let n = gen_identity();
+        // A validly-signed binding whose feed_id is then tampered so it no longer
+        // hashes from n_identity_pub — a corrupt/hostile self-stamped feed_binding.
+        let mut active = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        active.feed_id = "deadbeef".repeat(8);
+        let active_json = serde_json::to_string(&active).unwrap();
+        let rev = RevocationCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.a_cert.device_id,
+            WORLD_NOW,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        // Must reject on binding verification, before it would publish to the
+        // tampered feed_id topic.
+        assert!(build_revoked_authority(&active_json, &rev, WORLD_NOW * 1000).is_err());
     }
 
     fn sample(

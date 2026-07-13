@@ -833,6 +833,34 @@ async fn publish_feed_revocation(
     Ok(true)
 }
 
+/// ZEB-678 S3: best-effort, non-fatal feed cut-off publish shared by the main
+/// revoke path and the idempotent/retry arms. Logs the outcome and never fails
+/// the revoke — the trust revocation has already landed regardless. `context`
+/// distinguishes the call site in logs (main / self-retry / sibling-retry).
+async fn try_publish_feed_cutoff(
+    publish_tx: &Option<tokio::sync::mpsc::Sender<crate::event_loop::PublishRequest>>,
+    fleet_net_doc: &Option<std::sync::Arc<tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>>>,
+    revocation: &RevocationCert,
+    now_ms: u64,
+    context: &str,
+) {
+    let (Some(publish_tx), Some(fleet_net_doc)) = (publish_tx, fleet_net_doc) else {
+        return;
+    };
+    match publish_feed_revocation(publish_tx, fleet_net_doc, revocation, now_ms).await {
+        Ok(true) => tracing::info!(context, "revoke_device: published vine feed cut-off"),
+        Ok(false) => {
+            tracing::debug!(
+                context,
+                "revoke_device: revoked device has no migrated vine feed to cut"
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, context, "revoke_device: vine feed cut-off publish failed (non-fatal)")
+        }
+    }
+}
+
 /// ZEB-668 S2. Self-revoke ordering is load-bearing (spec §3): sign → add →
 /// persist → publish+flush → terminal state + engine halt. The initiating
 /// device must not wait for its own merge callback.
@@ -922,7 +950,22 @@ pub(crate) async fn revoke_device_inner(
         now_unix(),
     )? {
         RevocationPlan::Planned(p) => p,
-        RevocationPlan::AlreadyRevoked { is_self: false, .. } => return Ok(()), // idempotent
+        RevocationPlan::AlreadyRevoked {
+            is_self: false,
+            target,
+        } => {
+            // Idempotent for trust state, but still re-drive the feed cut-off:
+            // the main-path publish is best-effort, so a transient failure there
+            // must be retried on a subsequent revoke of the same (already-revoked)
+            // sibling. Any fleet device holding the replicated revocation can
+            // republish — the cert is self-proving, sticky-revoked on the follower.
+            // (ZEB-678 S3 review — CodeRabbit.)
+            if let Some(rev) = trust_snapshot.revocations.cert_for(target).cloned() {
+                try_publish_feed_cutoff(&publish_tx, &fleet_net_doc, &rev, now_ms, "sibling-retry")
+                    .await;
+            }
+            return Ok(());
+        }
         RevocationPlan::AlreadyRevoked {
             is_self: true,
             target,
@@ -944,14 +987,9 @@ pub(crate) async fn revoke_device_inner(
             // publishing its feed cut-off must re-publish it on retry — followers
             // key on the authority cache, not the trust doc. Idempotent (sticky-
             // revoked on the follower); reuses the stored cert, no re-signing.
-            if let (Some(publish_tx), Some(fleet_net_doc)) = (&publish_tx, &fleet_net_doc) {
-                if let Some(rev) = trust_snapshot.revocations.cert_for(target).cloned() {
-                    if let Err(e) =
-                        publish_feed_revocation(publish_tx, fleet_net_doc, &rev, now_ms).await
-                    {
-                        tracing::warn!(error = %e, "revoke_device retry: feed cut-off republish failed (non-fatal)");
-                    }
-                }
+            if let Some(rev) = trust_snapshot.revocations.cert_for(target).cloned() {
+                try_publish_feed_cutoff(&publish_tx, &fleet_net_doc, &rev, now_ms, "self-retry")
+                    .await;
             }
             complete_self_revoke_terminal(
                 &revoked_flag,
@@ -1018,19 +1056,7 @@ pub(crate) async fn revoke_device_inner(
     // sibling's replicated feed_binding) share this one path. Best-effort +
     // non-fatal: a device that never migrated a feed has nothing to cut, and a
     // publish failure never fails the revoke (the trust revocation still landed).
-    if let (Some(publish_tx), Some(fleet_net_doc)) = (&publish_tx, &fleet_net_doc) {
-        match publish_feed_revocation(publish_tx, fleet_net_doc, &cert_for_feed, now_ms).await {
-            Ok(true) => {
-                tracing::info!(target = %device_vk_hex, "revoke_device: published vine feed cut-off")
-            }
-            Ok(false) => {
-                tracing::debug!("revoke_device: revoked device has no migrated vine feed to cut")
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "revoke_device: vine feed cut-off publish failed (non-fatal)")
-            }
-        }
-    }
+    try_publish_feed_cutoff(&publish_tx, &fleet_net_doc, &cert_for_feed, now_ms, "main").await;
 
     // ZEB-668 S5: a master-issued revoke immediately rotates the fleet
     // KeyTree so the revoked device's retained epoch material goes stale
@@ -2450,6 +2476,71 @@ mod revoke_tests {
                 .iter()
                 .any(|(k, _)| *k == want_key),
             "retry arm republishes the self feed cut-off"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_device_inner_sibling_already_revoked_republishes_feed_cutoff() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-passphrase");
+        let now = 1_700_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, a_sk, seed, b_sk, b_vk_hex) = two_device_fixture(now);
+        let b_cert = cert_for_sk(&state, &b_sk).clone();
+        let b_target = crate::owner_state::device_id_from_signing_key(&b_sk);
+
+        // Pre-revoke B (master-signed), as if a prior master-revoke landed the
+        // trust state but its best-effort feed cut-off publish failed.
+        let artifact = RecoveryArtifact::from_seed(seed);
+        let cert = RevocationCert::sign_master(
+            &artifact.master_signing_key(),
+            artifact.master_pubkey_bundle(),
+            b_target,
+            now,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        state
+            .add_revocation(cert, now, trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        save_owner_state_atomic(dir.path(), &state, &a_sk, Some(&seed), None).unwrap();
+        let trust_doc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+
+        let mut fleet_doc = crate::fleet_net::FleetNetDoc::default();
+        let feed_id = stamp_test_feed_binding(&mut fleet_doc, "sp1-b", &b_cert, &b_sk);
+        let fleet_net_doc = std::sync::Arc::new(tokio::sync::Mutex::new(fleet_doc));
+
+        let (publish_tx, publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+        let (drain, published) = spawn_publish_drain(publish_rx);
+        let node = std::sync::Mutex::new(crate::NodeState {
+            identity_dir: Some(dir.path().to_path_buf()),
+            owner_trust_doc: Some(trust_doc),
+            publish_tx: Some(publish_tx),
+            fleet_net_doc: Some(fleet_net_doc),
+            ..crate::NodeState::default()
+        });
+        // A (seed-holder) re-revokes the already-revoked sibling B → the
+        // idempotent arm must still re-drive the feed cut-off.
+        revoke_device_inner(
+            &node,
+            || None,
+            std::sync::Arc::new(|_: &str| {}),
+            b_vk_hex,
+            "lost".into(),
+        )
+        .await
+        .unwrap();
+        drop(node);
+        drain.await.unwrap();
+
+        let want_key = format!("harmony/vines/{feed_id}/authority");
+        assert!(
+            published
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(k, _)| *k == want_key),
+            "sibling idempotent arm republishes the feed cut-off"
         );
     }
 
