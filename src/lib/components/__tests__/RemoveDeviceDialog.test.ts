@@ -46,9 +46,11 @@ describe('RemoveDeviceDialog (ZEB-668 S2)', () => {
     expect(screen.queryByText(/holds your master key/i)).toBeNull();
   });
 
-  it('states what is NOT severed (honesty rule)', () => {
+  it('states the feed cutoff and what is NOT yet severed (honesty rule)', () => {
     render(RemoveDeviceDialog, { props: props() });
-    expect(screen.getByText(/not blocked yet/i)).toBeInTheDocument();
+    // ZEB-678 S3: vine feeds now stop accepting posts; DMs still aren't blocked.
+    expect(screen.getByText(/stop accepting new posts/i)).toBeInTheDocument();
+    expect(screen.getByText(/aren't blocked yet/i)).toBeInTheDocument();
   });
 
   it('maps notMaster errors to friendly copy', () => {
@@ -107,7 +109,8 @@ describe('RemoveDeviceDialog replace mode (ZEB-668 S6)', () => {
 
   it('keeps the honesty copy about un-severed surfaces in replace mode', () => {
     render(RemoveDeviceDialog, { props: props({ mode: 'replace' }) });
-    expect(screen.getByText(/not blocked yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/stop accepting new posts/i)).toBeInTheDocument();
+    expect(screen.getByText(/aren't blocked yet/i)).toBeInTheDocument();
   });
 
   it('still requires the exact device name in replace mode', async () => {

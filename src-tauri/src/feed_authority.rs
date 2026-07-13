@@ -141,6 +141,45 @@ pub fn build_active_authority(
     Ok(rec)
 }
 
+/// ZEB-678 S3: turn a device's stamped *active* `FeedAuthorityRecord` (its
+/// fleet-net `feed_binding`) into a *revoked* one by appending `revocation` and
+/// bumping the LWW clock. No re-signing: `n_sig` covers only the immutable
+/// binding (§3.1, [`authority_binding_bytes`]), so the original signature stays
+/// valid and every follower still accepts the record — now flagged revoked.
+/// Returns `(feed_id, canonical_json)` ready to publish to
+/// `harmony/vines/{feed_id}/authority`.
+///
+/// Rejects a `revocation` whose `target` is not the feed's `device_id`: such a
+/// record is dropped by every follower at [`verify_authority`] step 3, so we
+/// never emit it.
+pub fn build_revoked_authority(
+    active_binding_json: &str,
+    revocation: &RevocationCert,
+    now_ms: u64,
+) -> Result<(String, String), String> {
+    let mut rec: FeedAuthorityRecord = serde_json::from_str(active_binding_json)
+        .map_err(|e| format!("feed_binding parse failed: {e}"))?;
+    // Authenticate the binding BEFORE trusting `feed_id` (the publish topic) or
+    // republishing. `feed_binding` is self-authored by the target device into its
+    // fleet-net row, so a tampered/corrupt one must not steer the seed-holder to
+    // publish to a bogus topic (or a record every follower drops) while we log a
+    // successful cut-off. `verify_binding` proves `feed_id == hash(n_identity_pub)`
+    // under a valid `n_sig`, so a device can only ever republish a binding for the
+    // feed it actually owns. (ZEB-678 S3 review — Qodo/CodeRabbit.)
+    verify_binding(&rec)?;
+    let target_hex = hex::encode(revocation.target);
+    if target_hex != rec.device_id {
+        return Err(format!(
+            "revocation target {target_hex} does not match feed device_id {}",
+            rec.device_id
+        ));
+    }
+    rec.revocation_cbor_hex = Some(encode_revocation(revocation)?);
+    rec.updated_at = now_ms.max(rec.updated_at.saturating_add(1));
+    let json = serde_json::to_string(&rec).map_err(|e| format!("serialize failed: {e}"))?;
+    Ok((rec.feed_id.clone(), json))
+}
+
 /// Verify the `#3` binding: `n_identity_pub` hashes to `feed_id`, and `n_sig`
 /// is a strict Ed25519 signature over the binding bytes. Mirrors
 /// `vine_signing::verify_signed`. Crate-private — it checks ONLY the binding,
@@ -429,6 +468,96 @@ mod tests {
     use crate::enrollment_verify::quorum_fixtures::{
         mint_quorum_revocation, mint_quorum_world, WORLD_NOW,
     };
+
+    #[test]
+    fn build_revoked_authority_appends_cert_and_still_verifies_as_revoked() {
+        use harmony_owner::certs::RevocationReason;
+        let world = mint_quorum_world(0xA0);
+        let n = gen_identity();
+        // The stamped active feed_binding: master-issued (empty bundle), no revocation.
+        let active = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        let active_json = serde_json::to_string(&active).unwrap();
+        let expected_feed = active.feed_id.clone();
+
+        let rev = RevocationCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.a_cert.device_id,
+            WORLD_NOW,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        let now_ms = (WORLD_NOW + 5) * 1000;
+
+        let (feed_id, json) = build_revoked_authority(&active_json, &rev, now_ms).unwrap();
+        assert_eq!(feed_id, expected_feed);
+
+        let parsed: FeedAuthorityRecord = serde_json::from_str(&json).unwrap();
+        assert!(parsed.revocation_cbor_hex.is_some(), "revocation appended");
+        assert!(parsed.updated_at >= now_ms, "updated_at bumped forward");
+        // n_sig untouched → the binding still verifies, now flagged revoked.
+        let v = verify_authority(&parsed, WORLD_NOW).expect("revoked authority verifies");
+        assert!(v.revoked, "device must be marked revoked");
+        assert_eq!(v.device_id, world.a_cert.device_id);
+    }
+
+    #[test]
+    fn build_revoked_authority_rejects_target_that_is_not_the_feed_device() {
+        use harmony_owner::certs::RevocationReason;
+        let world = mint_quorum_world(0xA1);
+        let n = gen_identity();
+        let active = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        let active_json = serde_json::to_string(&active).unwrap();
+        // Revocation targets a DIFFERENT device (C), not the feed's device (A).
+        let rev = RevocationCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.c_quorum_cert.device_id,
+            WORLD_NOW,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        let err = build_revoked_authority(&active_json, &rev, WORLD_NOW * 1000).unwrap_err();
+        assert!(err.contains("target"), "target mismatch is rejected: {err}");
+    }
+
+    #[test]
+    fn build_revoked_authority_rejects_unparseable_binding() {
+        use harmony_owner::certs::RevocationReason;
+        let world = mint_quorum_world(0xA2);
+        let rev = RevocationCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.a_cert.device_id,
+            WORLD_NOW,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        assert!(build_revoked_authority("not json", &rev, 1_000).is_err());
+    }
+
+    #[test]
+    fn build_revoked_authority_rejects_tampered_binding() {
+        use harmony_owner::certs::RevocationReason;
+        let world = mint_quorum_world(0xA3);
+        let n = gen_identity();
+        // A validly-signed binding whose feed_id is then tampered so it no longer
+        // hashes from n_identity_pub — a corrupt/hostile self-stamped feed_binding.
+        let mut active = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        active.feed_id = "deadbeef".repeat(8);
+        let active_json = serde_json::to_string(&active).unwrap();
+        let rev = RevocationCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.a_cert.device_id,
+            WORLD_NOW,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        // Must reject on binding verification, before it would publish to the
+        // tampered feed_id topic.
+        assert!(build_revoked_authority(&active_json, &rev, WORLD_NOW * 1000).is_err());
+    }
 
     fn sample(
         revocation: Option<RevocationCert>,
