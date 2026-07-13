@@ -478,6 +478,7 @@ pub(crate) fn build_invite_packet_from_space(
         created_at: space.created_at.clone(),
         signing_device_hash: our_signing_device_hash,
         inviter_identity_pub,
+        inviter_enrollment: None,
     };
     crate::dm_envelope::build_signed_invite(signed, signing_key)
         .and_then(|p| crate::dm_envelope::encode_packet(&p))
@@ -3389,6 +3390,7 @@ mod tests {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
@@ -5872,6 +5874,7 @@ mod tests {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
 
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
@@ -6361,6 +6364,7 @@ mod tests {
             created_at: attacker_hlc.clone(),
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
@@ -6433,6 +6437,7 @@ mod tests {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
@@ -6479,6 +6484,7 @@ mod tests {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
@@ -6521,6 +6527,7 @@ mod tests {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
 
         // NOTE: decode_packet would reject this packet as
@@ -6572,6 +6579,7 @@ mod tests {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);
@@ -6611,6 +6619,7 @@ mod tests {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let mut signature = private.sign(&body_bytes);
@@ -6669,6 +6678,7 @@ mod tests {
             },
             signing_device_hash: device_hash,
             inviter_identity_pub: identity_pub,
+            inviter_enrollment: None,
         };
         let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private.sign(&body_bytes);

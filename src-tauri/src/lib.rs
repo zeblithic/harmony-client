@@ -13405,6 +13405,7 @@ pub fn add_space_dm_inner(
         members: all_members,
         inviter: self_owner,
         inviter_identity_pub: *inviter_identity_pub,
+        inviter_enrollment: None,
         content_key,
         sender_devices,
         signing_device_hash: our_signing_device_hash,
