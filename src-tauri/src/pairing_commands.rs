@@ -54,6 +54,19 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
         let guard = state.lock().unwrap_or_else(|p| p.into_inner());
         guard.fleet_keys.as_ref().map_or(0, |k| k.newest().epoch)
     };
+    // ZEB-510 step 2: snapshot this device's iroh dialing coordinates so the
+    // outgoing CONFIRM carries them, seeding the joiner's dial route to us.
+    // `unwrap_or_default()` yields an empty relay when no home relay has
+    // resolved yet; `None` when the node has no iroh endpoint at all.
+    let local_iroh_endpoint = {
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.iroh_endpoint.as_ref().map(|ep| {
+            (
+                *ep.node_id().as_bytes(),
+                ep.home_relay().map(|r| r.to_string()).unwrap_or_default(),
+            )
+        })
+    };
 
     let command = if let Some(master_seed) = loaded.master_seed {
         // Seed-holding inviter — the classic path (unchanged behavior).
@@ -64,6 +77,7 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
             fleet_keytree: None,
             quorum_ctx: None,
             fleet_current_epoch,
+            local_iroh_endpoint: local_iroh_endpoint.clone(),
         }
     } else {
         // ZEB-677 S4: a seedless device can still be the pairing inviter IFF
@@ -126,6 +140,7 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
             fleet_keytree: loaded.fleet_keytree,
             quorum_ctx: Some(std::sync::Arc::new(port)),
             fleet_current_epoch,
+            local_iroh_endpoint,
         }
     };
 
@@ -149,11 +164,23 @@ pub(crate) async fn start_joiner_pairing_inner(
     display_name: String,
 ) -> Result<(), String> {
     let signing_key = SigningKey::generate(&mut OsRng);
+    // ZEB-510 step 2: snapshot this device's iroh dialing coordinates so the
+    // outgoing CONFIRM carries them, seeding the inviter's dial route to us.
+    let local_iroh_endpoint = {
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.iroh_endpoint.as_ref().map(|ep| {
+            (
+                *ep.node_id().as_bytes(),
+                ep.home_relay().map(|r| r.to_string()).unwrap_or_default(),
+            )
+        })
+    };
     let (cmd_tx, _state_rx) = require_pairing_handle(state)?;
     cmd_tx
         .send(PairingCommand::StartJoiner {
             display_name,
             signing_key,
+            local_iroh_endpoint,
         })
         .await
         .map_err(|_| "pairing state machine not running".to_string())?;

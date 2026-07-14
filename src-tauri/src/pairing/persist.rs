@@ -224,6 +224,7 @@ mod tests {
             owner_state: state,
             our_device_id: joiner_id,
             fleet_keytree: None,
+            peer_iroh_endpoint: None,
         };
         // Use the inner variant with `keychain: None` so the encrypted-file
         // fallback under `HARMONY_PASSPHRASE` is exercised — the production
@@ -282,6 +283,7 @@ mod tests {
             owner_state: state,
             our_device_id: joiner_id,
             fleet_keytree: Some(vec![material]),
+            peer_iroh_endpoint: None,
         };
         install_joiner_state_inner(dir.path(), result, None, None).unwrap();
 
@@ -333,6 +335,7 @@ mod tests {
                 owner_state: state,
                 our_device_id: joiner_id,
                 fleet_keytree,
+                peer_iroh_endpoint: None,
             }
         };
 
@@ -421,6 +424,7 @@ mod tests {
             cert,
             now,
             master_seed: Some(Zeroizing::new(master_seed_bytes)),
+            peer_iroh_endpoint: None,
         };
         // Use the inner variant — see install_writes_owner_state_cbor for why.
         install_inviter_state_inner(dir.path(), result, None, None).unwrap();
@@ -519,11 +523,13 @@ mod tests {
             cert: cert_a,
             now: 1_700_000_001,
             master_seed: Some(Zeroizing::new(master_seed_bytes)),
+            peer_iroh_endpoint: None,
         };
         let result_b = InviterEnrollResult {
             cert: cert_b,
             now: 1_700_000_002,
             master_seed: Some(Zeroizing::new(master_seed_bytes)),
+            peer_iroh_endpoint: None,
         };
 
         // Synchronize the two threads so they enter install_inviter_state_inner
@@ -597,6 +603,7 @@ mod tests {
             cert,
             now: 1_700_000_001,
             master_seed: Some(Zeroizing::new(master_seed_bytes)),
+            peer_iroh_endpoint: None,
         };
         let err =
             install_inviter_state_inner(dir.path(), result, None, None).expect_err("must error");

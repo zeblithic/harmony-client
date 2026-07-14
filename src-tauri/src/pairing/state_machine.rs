@@ -56,10 +56,15 @@ pub enum PairingCommand {
         /// ZEB-668 S5: the fleet's current KeyTree epoch (0 = never bumped).
         /// When > 0 the ENROLL payload carries the multi-epoch material set.
         fleet_current_epoch: u32,
+        /// ZEB-510 step 2: this device's iroh endpoint (node_id, home_relay),
+        /// attached to our CONFIRM so the joiner can seed a dial route to us.
+        local_iroh_endpoint: Option<([u8; 32], String)>,
     },
     StartJoiner {
         display_name: String,
         signing_key: SigningKey,
+        /// ZEB-510 step 2: this device's iroh endpoint, attached to our CONFIRM.
+        local_iroh_endpoint: Option<([u8; 32], String)>,
     },
     SelectPeer {
         peer_session_id: Uuid,
@@ -79,6 +84,10 @@ pub struct JoinerEnrollResult {
     /// this cert-only device can build the fleet engines on next boot. `None`
     /// when paired with a pre-ZEB-492 inviter that didn't send it.
     pub fleet_keytree: Option<Vec<crate::owner_state_crypto::FleetKeyMaterial>>,
+    /// ZEB-510 step 2: the inviter's iroh endpoint observed in their CONFIRM,
+    /// persisted as a first-contact dial seed. `None` when paired with a
+    /// pre-step-2 inviter.
+    pub peer_iroh_endpoint: Option<([u8; 32], String)>,
 }
 
 /// Output from the state machine for the Inviter side, when enrollment of a
@@ -110,6 +119,10 @@ pub struct InviterEnrollResult {
     /// persist layer must NOT resurrect one (it passes `None` through to
     /// `save_owner_state_atomic`, leaving the cert-only posture intact).
     pub master_seed: Option<Zeroizing<[u8; 32]>>,
+    /// ZEB-510 step 2: the joiner's iroh endpoint observed in their CONFIRM,
+    /// persisted as a first-contact dial seed. `None` when paired with a
+    /// pre-step-2 joiner (or the endpoint was unknown).
+    pub peer_iroh_endpoint: Option<([u8; 32], String)>,
 }
 
 /// Carries the inviter enrollment to the persistence drainer AND a oneshot
@@ -217,13 +230,13 @@ async fn run_state_machine(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return; };
                 match cmd {
-                    PairingCommand::StartInviter { display_name, owner_state, master_seed, fleet_keytree, quorum_ctx, fleet_current_epoch } => {
+                    PairingCommand::StartInviter { display_name, owner_state, master_seed, fleet_keytree, quorum_ctx, fleet_current_epoch, local_iroh_endpoint } => {
                         // start_inviter returns None on publish failure (state already
                         // pushed to Failed); leave ctx as None so the user must Cancel.
-                        ctx = start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, fleet_keytree, quorum_ctx, fleet_current_epoch, &now_fn).await;
+                        ctx = start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, fleet_keytree, quorum_ctx, fleet_current_epoch, local_iroh_endpoint, &now_fn).await;
                     }
-                    PairingCommand::StartJoiner { display_name, signing_key } => {
-                        ctx = start_joiner(&transport, &state_tx, display_name, signing_key, &now_fn).await;
+                    PairingCommand::StartJoiner { display_name, signing_key, local_iroh_endpoint } => {
+                        ctx = start_joiner(&transport, &state_tx, display_name, signing_key, local_iroh_endpoint, &now_fn).await;
                     }
                     PairingCommand::SelectPeer { peer_session_id } => {
                         if let Some(c) = ctx.as_mut() {
@@ -444,6 +457,13 @@ struct SessionCtx {
     session_key: Option<[u8; 32]>,
     sas_digits: Option<String>,
 
+    /// ZEB-510 step 2: this device's own iroh endpoint (node_id, home_relay),
+    /// threaded from the Start* command; attached to our outgoing CONFIRM.
+    local_iroh_endpoint: Option<([u8; 32], String)>,
+    /// ZEB-510 step 2: the peer's iroh endpoint as observed in their CONFIRM;
+    /// carried into the enroll result for the seed store.
+    peer_iroh_endpoint: Option<([u8; 32], String)>,
+
     // After Confirm:
     our_confirmed: bool,
     peer_confirmed: bool,
@@ -481,6 +501,8 @@ impl SessionCtx {
             received_selects_from: Vec::new(),
             session_key: None,
             sas_digits: None,
+            local_iroh_endpoint: None,
+            peer_iroh_endpoint: None,
             our_confirmed: false,
             peer_confirmed: false,
             cert_sent: false,
@@ -498,6 +520,7 @@ async fn start_inviter(
     fleet_keytree: Option<Vec<crate::owner_state_crypto::FleetKeyMaterial>>,
     quorum_ctx: Option<Arc<dyn crate::owner_quorum_enroll::QuorumEnrollPort>>,
     fleet_current_epoch: u32,
+    local_iroh_endpoint: Option<([u8; 32], String)>,
     _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Option<SessionCtx> {
     let mut ctx = SessionCtx::new(PairingRole::Inviter, display_name);
@@ -506,6 +529,7 @@ async fn start_inviter(
     ctx.fleet_keytree = fleet_keytree;
     ctx.quorum_ctx = quorum_ctx;
     ctx.fleet_current_epoch = fleet_current_epoch;
+    ctx.local_iroh_endpoint = local_iroh_endpoint;
 
     let _ = state_tx.send(PairingState::Discovering {
         role: PairingRole::Inviter,
@@ -532,6 +556,7 @@ async fn start_joiner(
     state_tx: &watch::Sender<PairingState>,
     display_name: String,
     signing_key: SigningKey,
+    local_iroh_endpoint: Option<([u8; 32], String)>,
     _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Option<SessionCtx> {
     let mut ctx = SessionCtx::new(PairingRole::Joiner, display_name);
@@ -539,6 +564,7 @@ async fn start_joiner(
     let pubkey = PubKeyBundle::classical_only(verify_bytes);
     ctx.our_signing_key = Some(signing_key);
     ctx.our_pubkey = Some(pubkey);
+    ctx.local_iroh_endpoint = local_iroh_endpoint;
 
     let _ = state_tx.send(PairingState::Discovering {
         role: PairingRole::Joiner,
@@ -742,12 +768,17 @@ async fn on_confirm_sas(
     // the peer had been told (so maybe_advance_to_enroll could fire on
     // peer-CONFIRM arrival) while the peer was still waiting for our SAS
     // confirmation.
+    // ZEB-510 step 2: attach this device's iroh dialing coordinates to the
+    // SAS-authenticated CONFIRM so the peer can seed a first-contact dial
+    // route to us. Omitted (both `None`) when we have no local endpoint.
+    let (iroh_node_id_hex, iroh_home_relay) = match ctx.local_iroh_endpoint.as_ref() {
+        Some((node_id, relay)) => (Some(hex::encode(node_id)), Some(relay.clone())),
+        None => (None, None),
+    };
     let payload = EncryptedPayload::Confirm {
         sas_digits: sas_digits.clone(),
-        // ZEB-510 step 2 wires the field; Task 3 populates it from the local
-        // iroh endpoint. Left `None` here preserves current behavior.
-        iroh_node_id_hex: None,
-        iroh_home_relay: None,
+        iroh_node_id_hex,
+        iroh_home_relay,
     };
     let mut pt = Vec::new();
     if let Err(e) = ciborium::into_writer(&payload, &mut pt) {
@@ -1275,6 +1306,7 @@ async fn finish_inviter_enroll(
                 cert,
                 now,
                 master_seed: result_master_seed,
+                peer_iroh_endpoint: ctx.peer_iroh_endpoint.clone(),
             },
             persisted_ack: ack_tx,
         })
@@ -1526,10 +1558,11 @@ async fn on_encrypted_payload(
     quorum_done_tx: &QuorumDoneTx,
 ) {
     match payload {
-        // ZEB-510 step 2: `iroh_node_id_hex`/`iroh_home_relay` are ignored
-        // here (`..`) — Task 3 adds the seed-dial-route logic that consumes
-        // them.
-        EncryptedPayload::Confirm { sas_digits, .. } => {
+        EncryptedPayload::Confirm {
+            sas_digits,
+            iroh_node_id_hex,
+            iroh_home_relay,
+        } => {
             // Defense-in-depth: the SAS in the message must match what we
             // computed locally. (Session_key already authenticates this, but
             // the explicit equality check makes the intent obvious.)
@@ -1539,6 +1572,20 @@ async fn on_encrypted_payload(
                 });
                 return;
             }
+            // ZEB-510 step 2: record the peer's dialing coordinates observed
+            // over this SAS-authenticated channel (best-effort — a pre-step-2
+            // peer omits them, leaving this None).
+            ctx.peer_iroh_endpoint = match (iroh_node_id_hex, iroh_home_relay) {
+                (Some(nid_hex), relay) => match hex::decode(&nid_hex) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut nid = [0u8; 32];
+                        nid.copy_from_slice(&bytes);
+                        Some((nid, relay.unwrap_or_default()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
             ctx.peer_confirmed = true;
             // Caveat 1: when we receive peer-CONFIRM AFTER we have already
             // locally confirmed, we must drive the post-confirm transition
@@ -1764,6 +1811,7 @@ async fn on_encrypted_payload(
                     owner_state,
                     our_device_id,
                     fleet_keytree,
+                    peer_iroh_endpoint: ctx.peer_iroh_endpoint.clone(),
                 })
                 .await
             {
@@ -1937,6 +1985,7 @@ mod tests {
                 fleet_keytree: None,
                 quorum_ctx: None,
                 fleet_current_epoch: 0,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -1945,6 +1994,7 @@ mod tests {
             .send(PairingCommand::StartJoiner {
                 display_name: "AVALON".to_string(),
                 signing_key: joiner_sk,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -2065,6 +2115,174 @@ mod tests {
             .contains_key(&original_inviter_device_id));
     }
 
+    /// ZEB-510 step 2: the iroh endpoint each device attaches to its
+    /// SAS-authenticated CONFIRM must round-trip into the OTHER side's enroll
+    /// result, so a same-owner fleet peer's first-contact dial route can be
+    /// seeded from the pairing handshake. Drives a full inviter↔joiner pairing
+    /// with a distinct endpoint on each side and asserts each side's enroll
+    /// result carries the peer's endpoint.
+    #[tokio::test]
+    async fn confirm_round_trips_peer_iroh_endpoint() {
+        let MintResult {
+            state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+
+        // Distinct endpoints so each side's assertion is unambiguous.
+        let inviter_ep = ([0x11u8; 32], "https://inviter.relay/".to_string());
+        let joiner_ep = ([0x22u8; 32], "https://joiner.relay/".to_string());
+
+        let (inviter_t, joiner_t) = InMemoryBroker::pair();
+        let test_interval = Duration::from_secs(60);
+        let mut inviter_handle = spawn_state_machine(
+            Arc::new(inviter_t),
+            fixed_clock(1_700_000_001),
+            test_interval,
+        );
+        let joiner_handle = spawn_state_machine(
+            Arc::new(joiner_t),
+            fixed_clock(1_700_000_002),
+            test_interval,
+        );
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::StartInviter {
+                display_name: "KRILE".to_string(),
+                owner_state: state.clone(),
+                master_seed: Some(master_seed),
+                fleet_keytree: None,
+                quorum_ctx: None,
+                fleet_current_epoch: 0,
+                local_iroh_endpoint: Some(inviter_ep.clone()),
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::StartJoiner {
+                display_name: "AVALON".to_string(),
+                signing_key: joiner_sk,
+                local_iroh_endpoint: Some(joiner_ep.clone()),
+            })
+            .await
+            .unwrap();
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        let mut joiner_state = joiner_handle.state_rx.clone();
+
+        // Discover.
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter sees joiner within 2s");
+        timeout(Duration::from_secs(2), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner sees inviter within 2s");
+
+        // Select.
+        let inviter_peer_id = match &*inviter_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!(),
+        };
+        let joiner_peer_id = match &*joiner_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!(),
+        };
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: inviter_peer_id,
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: joiner_peer_id,
+            })
+            .await
+            .unwrap();
+
+        // Handshake.
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter handshakes within 2s");
+        timeout(Duration::from_secs(2), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner handshakes within 2s");
+
+        // Both confirm.
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::ConfirmSas)
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::ConfirmSas)
+            .await
+            .unwrap();
+
+        // Joiner completes on its own and reports the INVITER's endpoint.
+        timeout(Duration::from_secs(3), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Complete { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner completes within 3s");
+        let mut jrx = joiner_handle.joiner_result_rx.expect("joiner result rx");
+        let joiner_result = timeout(Duration::from_secs(1), jrx.recv())
+            .await
+            .expect("joiner result arrives")
+            .expect("result not None");
+        assert_eq!(
+            joiner_result.peer_iroh_endpoint,
+            Some(inviter_ep),
+            "joiner learns the inviter's iroh endpoint from its CONFIRM"
+        );
+
+        // Inviter pushes its enroll handoff (then parks at Enrolling awaiting the
+        // persist ack this test never fires) carrying the JOINER's endpoint.
+        let mut irx = inviter_handle
+            .inviter_result_rx
+            .take()
+            .expect("inviter result rx");
+        let handoff = timeout(Duration::from_secs(2), irx.recv())
+            .await
+            .expect("inviter handoff arrives within 2s")
+            .expect("handoff not None");
+        assert_eq!(
+            handoff.result.peer_iroh_endpoint,
+            Some(joiner_ep),
+            "inviter learns the joiner's iroh endpoint from its CONFIRM"
+        );
+    }
+
     /// Spawn a fresh inviter+joiner pair over an in-memory broker and drive
     /// them through Discover → Select → Handshake → mutual ConfirmSas. After
     /// this returns, the inviter has signed + published ENROLL and pushed an
@@ -2103,6 +2321,7 @@ mod tests {
                 fleet_keytree: None,
                 quorum_ctx: None,
                 fleet_current_epoch: 0,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -2111,6 +2330,7 @@ mod tests {
             .send(PairingCommand::StartJoiner {
                 display_name: "AVALON".to_string(),
                 signing_key: joiner_sk,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -2408,6 +2628,7 @@ mod tests {
                 fleet_keytree,
                 quorum_ctx,
                 fleet_current_epoch: 0,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -2416,6 +2637,7 @@ mod tests {
             .send(PairingCommand::StartJoiner {
                 display_name: "AVALON".to_string(),
                 signing_key: joiner_sk,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -2692,6 +2914,7 @@ mod tests {
                 fleet_keytree: None,
                 quorum_ctx: None,
                 fleet_current_epoch: 0,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -2843,6 +3066,7 @@ mod tests {
                 fleet_keytree: None,
                 quorum_ctx: None,
                 fleet_current_epoch: 0,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -2851,6 +3075,7 @@ mod tests {
             .send(PairingCommand::StartJoiner {
                 display_name: "AVALON".to_string(),
                 signing_key: joiner_sk,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -2955,6 +3180,7 @@ mod tests {
                 fleet_keytree: None,
                 quorum_ctx: None,
                 fleet_current_epoch: 0,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -3078,6 +3304,7 @@ mod tests {
                 fleet_keytree: None,
                 quorum_ctx: None,
                 fleet_current_epoch: 0,
+                local_iroh_endpoint: None,
             })
             .await
             .unwrap();
@@ -3283,6 +3510,7 @@ mod tests {
                     fleet_keytree: None,
                     quorum_ctx: None,
                     fleet_current_epoch: 0,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3336,6 +3564,7 @@ mod tests {
                     fleet_keytree: None,
                     quorum_ctx: None,
                     fleet_current_epoch: 0,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3344,6 +3573,7 @@ mod tests {
                 .send(PairingCommand::StartJoiner {
                     display_name: "avalon".to_string(),
                     signing_key: joiner_sk,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3397,6 +3627,7 @@ mod tests {
                     fleet_keytree: None,
                     quorum_ctx: None,
                     fleet_current_epoch: 0,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3405,6 +3636,7 @@ mod tests {
                 .send(PairingCommand::StartJoiner {
                     display_name: "avalon".to_string(),
                     signing_key: joiner_sk,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3499,6 +3731,7 @@ mod tests {
                     fleet_keytree: None,
                     quorum_ctx: None,
                     fleet_current_epoch: 0,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3507,6 +3740,7 @@ mod tests {
                 .send(PairingCommand::StartJoiner {
                     display_name: "avalon".to_string(),
                     signing_key: joiner_sk,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3653,6 +3887,7 @@ mod tests {
                     fleet_keytree: None,
                     quorum_ctx: None,
                     fleet_current_epoch: 0,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3661,6 +3896,7 @@ mod tests {
                 .send(PairingCommand::StartJoiner {
                     display_name: "avalon".to_string(),
                     signing_key: joiner_sk,
+                    local_iroh_endpoint: None,
                 })
                 .await
                 .unwrap();
@@ -3813,6 +4049,7 @@ mod tests {
                             fleet_keytree: None,
                             quorum_ctx: None,
                             fleet_current_epoch: 0,
+                            local_iroh_endpoint: None,
                         })
                         .await
                         .unwrap();
@@ -3824,6 +4061,7 @@ mod tests {
                         .send(PairingCommand::StartJoiner {
                             display_name: "avalon".to_string(),
                             signing_key: joiner_sk,
+                            local_iroh_endpoint: None,
                         })
                         .await
                         .unwrap();
