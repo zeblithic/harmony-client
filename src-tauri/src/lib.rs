@@ -2277,6 +2277,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
             }
         }
         guard.node_addr.clear();
+        // ZEB-687: clear the observability clone of the revoked-device projection
+        // so a stopped node keeps no live handle — parity with the
+        // community_registry / community_delta_tx takes below. Cheap Arc drop; no
+        // ordered outside-lock teardown needed, so it's cleared in place here
+        // rather than threaded through the `tup` drop-after-unlock dance.
+        guard.revoked_device_projection.take();
         let tup = (
             guard.shutdown_tx.take(),
             guard.thread.take(),
@@ -66181,8 +66187,36 @@ mod relay_opt_in_tests {
 #[cfg(all(test, feature = "test-fixtures"))]
 mod zeb_687_revoked_feed_boot_tests {
     use super::*;
+    use serial_test::serial;
+
+    /// RAII guard: sets an env var, restores its prior value (or removes it if
+    /// it was unset) on drop — including on panic. Boot-path env (HOME etc.) is
+    /// process-global; without restore a leaked value contaminates other tests
+    /// under a shared-process `cargo test` run. nextest isolates per process,
+    /// but the guard keeps this correct under both runners; `#[serial]` on the
+    /// test additionally stops a concurrent env reader from racing the set.
+    struct EnvVarGuard {
+        name: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prev = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial]
     async fn live_on_epoch_hook_feeds_revoked_projection() {
         // NO outer whole-test timeout. A full node boot + the one-time
         // process-global iroh bind legitimately runs 80-130s under a
@@ -66210,20 +66244,24 @@ mod zeb_687_revoked_feed_boot_tests {
         // (a) Env scaffolding — temp HOME + passphrase route identity to the
         //     encrypted-file store inside the tempdir. Keychain auto-refuses in
         //     cfg(test) (ZEB-428); HARMONY_DISABLE_KEYCHAIN=1 is belt-and-braces.
-        //     nextest runs each test in its own process, so raw `set_var` needs
-        //     no restore guard for isolation. (edition 2021 → not `unsafe`.)
+        //     Each var is set through `EnvVarGuard`, which restores the prior
+        //     value on drop (end of test, incl. panic) so this process-global
+        //     mutation never leaks into another test. The guards are bound to
+        //     named `_g_*` locals so they live to the end of the test scope —
+        //     dropped AFTER `stop_inner` (step (j)), so shutdown still sees the
+        //     tempdir HOME.
         let home = tempfile::tempdir().expect("tempdir for HOME override");
         let home_str = home
             .path()
             .to_str()
             .expect("tempdir path is valid utf8")
             .to_string();
-        std::env::set_var("HOME", &home_str);
-        std::env::set_var("USERPROFILE", &home_str);
-        std::env::set_var("HARMONY_PASSPHRASE", "zeb687-revoked-feed-boot-guard");
-        std::env::set_var("XDG_DATA_HOME", format!("{home_str}/xdg-data"));
-        std::env::set_var("APPDATA", format!("{home_str}/appdata"));
-        std::env::set_var("HARMONY_DISABLE_KEYCHAIN", "1");
+        let _g_home = EnvVarGuard::set("HOME", &home_str);
+        let _g_userprofile = EnvVarGuard::set("USERPROFILE", &home_str);
+        let _g_pass = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb687-revoked-feed-boot-guard");
+        let _g_xdg = EnvVarGuard::set("XDG_DATA_HOME", &format!("{home_str}/xdg-data"));
+        let _g_appdata = EnvVarGuard::set("APPDATA", &format!("{home_str}/appdata"));
+        let _g_nokeychain = EnvVarGuard::set("HARMONY_DISABLE_KEYCHAIN", "1");
 
         // (b) Mint a real owner identity FIRST. The community subsystem
         //     (registry + delta consumer + the on-epoch hook under test) only
@@ -66352,7 +66390,7 @@ mod zeb_687_revoked_feed_boot_tests {
             .expect("send delta on the live community_delta_tx");
 
         // (i) Condition poll (NOT a quiet-window — ZEB-686 flake anti-pattern):
-        //     succeed the instant the hook feeds the key; the 10s deadline only
+        //     succeed the instant the hook feeds the key; the deadline only
         //     bounds a regression where the feed call is gone.
         // 30s (not 10s): once boot is done the hook fires in microseconds, but
         // under full-sweep contention the delta-consumer task's scheduling can
@@ -66371,5 +66409,11 @@ mod zeb_687_revoked_feed_boot_tests {
             node_proj.is_revoked(&owner, &revoked),
             "live on-epoch hook fed the revoked key into the node's projection"
         );
+
+        // (j) Tear the booted node down so its spawned tasks don't outlive the
+        //     test and interfere with a subsequent in-process (`cargo test`)
+        //     test — matches serve_cli / api_server teardown. Runs while HOME is
+        //     still the tempdir; the env guards drop after this at end of scope.
+        let _ = stop_inner(&state, None);
     }
 }
