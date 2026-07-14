@@ -156,10 +156,13 @@ where
 
 /// Poll the received-event counter until it stops growing for
 /// `stable_for_polls` consecutive 100ms intervals (= ~500ms quiet),
-/// or `timeout` elapses. Used before the replay-attack phase so
-/// in-flight backfill replies don't race the replay measurement,
-/// and by the offline-window check as a logical-time signal that
-/// B's adapter has fully drained.
+/// or `timeout` elapses. Used by the offline-window checks to confirm
+/// B's adapter has drained after `stop()` and stays quiet while A keeps
+/// publishing — i.e. a *negative* drain signal (nothing more should
+/// arrive). (ZEB-686 retired its former use as the replay-phase
+/// readiness barrier — a quiet-window is the wrong shape for a
+/// *positive* "backfill done" wait and flaked under load; the replay
+/// checkpoint now counts the pinned replayed message-id instead.)
 ///
 /// `Ok(count)` — counter was stable for the requested window.
 /// `Err(count)` — timeout fired before stability was observed (the
@@ -609,33 +612,56 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     );
 
     // ── Phase 4: replay attack ───────────────────────────────────────
-    // Wait for received_b to stabilize — backfill replies stream in
-    // asynchronously and we don't want late-arriving in-flight
-    // deliveries to be mis-attributed to the replay.
-    let stable_count = wait_for_stable_count(&received_b, 5, Duration::from_secs(5))
-        .await
-        .unwrap_or_else(|count| {
-            panic!(
-                "received_b never stabilized within 5s after backfill; \
-                 last observed count = {count}. Backfill replay-stream is \
-                 not draining."
-            )
-        });
-
-    // Re-encrypt one of A's events and re-publish it via A's session.
-    // The packet is wire-identical to the original broadcast (and
-    // backfill replies, per spec §17.1). B's replay tracker has
-    // already advanced past this event's HLC, so B must drop the
-    // duplicate.
-    let pre_replay_count = stable_count;
+    // The replayed event is `posted_ids[0]` — the FIRST event A published,
+    // so it carries the minimum HLC on A's (sole) author/device lane. B's
+    // replay tracker, rebuilt on respawn from the ≥100 events already on
+    // disk, sits at a strictly-higher high-water mark, so this event is
+    // dropped at the tracker gate on every re-serve. Its emission therefore
+    // happens exactly ONCE (the Phase-1 live delivery, which is lossless —
+    // see the ZEB-288 batching note above) and can never recur, independent
+    // of how the rest of the backfill emission stream drains.
+    //
+    // ZEB-686: assert on the count of THIS specific message-id, not the
+    // total received count. The previous baseline was captured via a
+    // wall-clock quiet-window (`wait_for_stable_count`) that, under full-
+    // sweep contention, latched a premature "stable" total while legit
+    // backfill replies were still draining, then mis-attributed the resumed
+    // deliveries to the replay packet (`got 300, expected 184`). The total
+    // received count is load-dependent; the replayed id's emission count is
+    // pinned at 1 by the high-water-mark argument above, so counting it is
+    // deterministic and immune to the lull — retiring the last quiet-window
+    // readiness barrier in this test (generalizes the ZEB-469 audit).
     let first_id = posted_ids[0];
-    let first_event_opt = engine_a
+    let replayed_id_hex = hex::encode(first_id.0);
+    let count_replayed = || {
+        received_b
+            .lock()
+            .expect("received_b lock")
+            .iter()
+            .filter(|id| **id == replayed_id_hex)
+            .count()
+    };
+    // The replayed event must already have been delivered exactly once
+    // (Phase-1 live) — this makes the post-replay equality below non-vacuous
+    // (a broken tracker that re-emits would push it to 2).
+    let pre_replay_emits = count_replayed();
+    assert_eq!(
+        pre_replay_emits, 1,
+        "replayed event should have been delivered exactly once before the replay \
+         (got {pre_replay_emits}); the assertion below would be vacuous otherwise"
+    );
+
+    // Re-encrypt A's first event and re-publish it via A's session. The
+    // packet is wire-identical to the original broadcast (and backfill
+    // replies, per spec §17.1). B's replay tracker has already advanced
+    // past this event's HLC, so B must drop the duplicate.
+    let first_event = engine_a
         .list_messages(None, 200)
         .await
         .expect("list a")
         .into_iter()
-        .find(|ev| *ev.id() == first_id);
-    let first_event = first_event_opt.expect("first event");
+        .find(|ev| *ev.id() == first_id)
+        .expect("first event");
     let replay_packet = encrypt_channel_packet(&channel_key, &first_event).expect("re-encrypt");
     let topic = format!(
         "harmony/channels/{}/{}/events",
@@ -655,17 +681,18 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     // confirm the replayed duplicate does NOT re-emit — so its only failure mode
     // is a spurious pass (the drop simply isn't exercised if the packet is slow),
     // never a spurious CI failure: A↔B subscriber matching is already established
-    // (B just received all 150 events and stabilized above), and a late legit
-    // delivery is ruled out by the preceding wait_for_stable_count. A fully
+    // (B just received all 150 events above), and the replayed id's HLC is the
+    // lane minimum so no in-flight legit delivery can bump its count. A fully
     // deterministic conversion would require an engine-level "events dropped by
     // replay tracker" counter to wait on; that instrumentation is out of scope
     // for this flake-hardening pass (the sleep is not a CI-flake source).
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let final_count = received_b.lock().expect("received_b lock").len();
+    let post_replay_emits = count_replayed();
     assert_eq!(
-        final_count, pre_replay_count,
-        "B should not double-emit replayed event (got {final_count}, expected {pre_replay_count})"
+        post_replay_emits, pre_replay_emits,
+        "B should not re-emit the replayed event (replayed id emitted {post_replay_emits}×, \
+         expected {pre_replay_emits}× — the replay tracker must drop the duplicate)"
     );
 
     // ── Final state check ────────────────────────────────────────────
