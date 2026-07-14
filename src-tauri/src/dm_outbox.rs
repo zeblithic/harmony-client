@@ -10740,11 +10740,15 @@ mod tests {
     }
 
     #[test]
-    fn cidnotify_cutoff_is_noop_for_legacy_device3_signer() {
+    fn cidnotify_cutoff_admits_non_revoked_key_of_revoked_owner() {
         // A #3 signer's cached combined pub — its ed25519 half is a #3
         // identity key, which is never an enrolled #2 key and so can never be
         // in revoked_device_keys. Even with a non-empty projection for the
-        // owner, a #3 packet is admitted.
+        // owner, a #3 packet is admitted. (The verify boundary sees only a
+        // cached 64-byte pub and cannot structurally distinguish #2 from #3;
+        // what this pins is that a key ABSENT from a revoked owner's set is
+        // admitted — guarding against a per-owner blanket drop / over-rejection
+        // — which is exactly the no-downgrade-hole property for legacy #3.)
         let (state, signed, signature, signed_bytes, owner, _combined3) =
             cidnotify_verify_fixture_device3();
         let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();

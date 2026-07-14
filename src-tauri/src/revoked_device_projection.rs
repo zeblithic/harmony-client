@@ -13,7 +13,7 @@ use crate::owner_state_types::OwnerAddr;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RevokedDeviceProjection {
     // owner -> revoked #2 ed25519 verify keys. std RwLock (NOT tokio): the read
     // sits on the DM receive path inside the owner-state critical section and
