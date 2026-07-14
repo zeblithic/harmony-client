@@ -66180,16 +66180,17 @@ mod zeb_687_revoked_feed_boot_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn live_on_epoch_hook_feeds_revoked_projection() {
-        // Defense-in-depth kill switch: full boot + iroh global init is heavy
-        // (~20-40s incl. the one-time process-global iroh bind). The real
-        // assertions below carry their own tight budgets; this outer timeout
-        // only bounds a wedged boot so the test can never hang CI.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(90),
-            live_on_epoch_hook_feeds_revoked_projection_inner(),
-        )
-        .await
-        .expect("test must complete within 90s");
+        // NO outer whole-test timeout. A full node boot + the one-time
+        // process-global iroh bind legitimately runs 80-130s under a
+        // `--workspace --all-targets` sweep's CPU contention — the sibling
+        // full-boot tests `api_server::serve_core_drives_full_flow_over_http_and_ws`
+        // and `profile_isolation::named_profile_scopes_both_roots_and_boots`
+        // pass at ~128s / ~78s with no outer cap. An outer kill-switch set
+        // below that legitimate cost is a load-flake generator, not a safety
+        // net (a 90s cap here false-failed under the full sweep). The real
+        // correctness gate is the inner condition-poll deadline in step (i);
+        // a genuinely wedged boot is bounded by the CI job timeout.
+        live_on_epoch_hook_feeds_revoked_projection_inner().await;
     }
 
     async fn live_on_epoch_hook_feeds_revoked_projection_inner() {
@@ -66349,11 +66350,16 @@ mod zeb_687_revoked_feed_boot_tests {
         // (i) Condition poll (NOT a quiet-window — ZEB-686 flake anti-pattern):
         //     succeed the instant the hook feeds the key; the 10s deadline only
         //     bounds a regression where the feed call is gone.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // 30s (not 10s): once boot is done the hook fires in microseconds, but
+        // under full-sweep contention the delta-consumer task's scheduling can
+        // lag; a generous deadline keeps this robust while still failing fast
+        // enough on a real regression (a removed feed call spins the full 30s
+        // then fails — the RED-check path).
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !node_proj.is_revoked(&owner, &revoked) {
             assert!(
                 Instant::now() < deadline,
-                "live on-epoch hook must feed the revoked projection within 10s"
+                "live on-epoch hook must feed the revoked projection within 30s"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
