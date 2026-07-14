@@ -344,6 +344,44 @@ pub fn selection_view(
         .collect()
 }
 
+/// ZEB-510: project a durable fleet-net device row into a dial-target
+/// reachability payload for the [`crate::reachability_resolver::ReachabilityResolver`].
+///
+/// The row's `iroh_endpoint_id` becomes the payload's `iroh_node_id` (the
+/// resolver keys on it). The payload is **verification-exempt**: `identity_
+/// signature` is zero-filled because the trust boundary for a fleet row is
+/// fleet-net's symmetric-key decrypt (only an enrolled sibling holding the
+/// owner's fleet KeyTree produces a decryptable row), not a per-record
+/// identity signature. `butler_set`/`bs_at` are empty — a sibling is a dial
+/// target here, not advertising its own butlers — and `direct_addresses` is
+/// empty because node-id-based dialing holepunches/relays (fleet rows carry no
+/// direct addrs).
+pub fn sibling_reachability_payload(
+    row: &FleetNetRow,
+) -> crate::reachability_record::ReachabilityAnnouncePayload {
+    crate::reachability_record::ReachabilityAnnouncePayload {
+        iroh_node_id: row.iroh_endpoint_id,
+        home_relay_url: row.home_relay.clone(),
+        direct_addresses: Vec::new(),
+        announced_at_ms: row.seen_at.wall_ms,
+        identity_signature: [0u8; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
+    }
+}
+
+/// ZEB-510: every device row in `doc` EXCEPT `self_device_id`, as owned clones.
+///
+/// Owned clones (not borrows) so callers can drop the `FleetNetDoc` lock before
+/// feeding the resolver. The self row is excluded so P never dials itself.
+pub fn sibling_rows(doc: &FleetNetDoc, self_device_id: &str) -> Vec<(String, FleetNetRow)> {
+    doc.devices
+        .iter()
+        .filter(|(id, _)| id.as_str() != self_device_id)
+        .map(|(id, row)| (id.clone(), row.clone()))
+        .collect()
+}
+
 /// Snapshot the SP1-device-id → ed25519-vk map that `build_butler_set`'s
 /// prod `vk_lookup` reads, from the owner_device_cache (spec §5: "`vk` comes
 /// from `owner_device_cache`"). Fleet-net keys are hex(ed25519 vk); the cache
@@ -403,6 +441,47 @@ mod tests {
     // additive-decode test can prove pre-S4 bytes still parse (ZEB-668 S4).
     // See EXPECTED_OUTHOLD_DOC_HEX in dm_outhold.rs for the pattern.
     const EXPECTED_FLEET_NET_DOC_HEX: &str = "a3626476a2784061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161a3626570982018aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa6268726f72656c61792e616c7068612e636f6d627361a361771903e8616c006164656465762d61784062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262a3626570982018bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb6268726e72656c61792e626574612e636f6d627361a361771907d0616c006164656465762d6262706e784061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161627061a36177190bb8616c006164696465762d6f776e6572";
+
+    // ── Sibling-dial mapper + helper tests (ZEB-510) ─────────────────────────
+
+    #[test]
+    fn sibling_reachability_payload_maps_fields_and_is_unsigned() {
+        let r = row(0xB2, "https://relay.example/", hlc(4242, "dev"));
+        let p = sibling_reachability_payload(&r);
+        assert_eq!(p.iroh_node_id, [0xB2; 32]);
+        assert_eq!(p.home_relay_url, "https://relay.example/");
+        assert_eq!(p.announced_at_ms, 4242);
+        assert!(p.direct_addresses.is_empty());
+        assert_eq!(p.identity_signature, [0u8; 64]); // verification-exempt
+        assert!(p.butler_set.is_empty());
+        assert_eq!(p.bs_at, 0);
+    }
+
+    #[test]
+    fn sibling_rows_excludes_self_and_returns_the_rest() {
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert("self-id".into(), row(0x01, "a", hlc(10, "dev")));
+        doc.devices
+            .insert("sib-b2".into(), row(0x02, "b", hlc(20, "dev")));
+        doc.devices
+            .insert("sib-b3".into(), row(0x03, "c", hlc(30, "dev")));
+
+        let out = sibling_rows(&doc, "self-id");
+        let ids: std::collections::BTreeSet<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(out.len(), 2);
+        assert!(ids.contains("sib-b2"));
+        assert!(ids.contains("sib-b3"));
+        assert!(!ids.contains("self-id"), "self row must be excluded");
+    }
+
+    #[test]
+    fn sibling_rows_empty_when_only_self_present() {
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert("self-id".into(), row(0x01, "a", hlc(10, "dev")));
+        assert!(sibling_rows(&doc, "self-id").is_empty());
+    }
 
     // ── Row LWW tests ─────────────────────────────────────────────────────────
 
