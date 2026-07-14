@@ -385,6 +385,11 @@ pub struct ProdRelayIngestCtx {
     /// A relay-recovered non-friend invite (invite-only or co-deposited) is
     /// staged here + surfaced via `sink`. `None` only in unit tests.
     pub pending_dm_invites: Option<Arc<crate::pending_dm_invites::PendingDmInvites>>,
+    /// ZEB-580 S2: the shared-community revocation projection — forwarded to
+    /// `verify_cidnotify_sender_binding` for the CidNotify signer-device
+    /// cutoff (bare Arc-backed handle, matches `MembershipProjection`'s
+    /// by-value-clone style).
+    pub revoked: crate::revoked_device_projection::RevokedDeviceProjection,
 }
 
 #[async_trait]
@@ -543,6 +548,7 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                 &signed,
                 &signature,
                 &signed_bytes,
+                &self.revoked,
             )
             .map_err(|e| format!("verify_cidnotify_sender_binding: {e:?}"))?;
             // ZEB-236 (T3): a co-deposited invite from a non-friend is STAGED
@@ -3334,6 +3340,7 @@ mod tests {
             content_store,
             sink,
             pending_dm_invites: None,
+            revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
         };
 
         RelayRecoverInviteFixture {

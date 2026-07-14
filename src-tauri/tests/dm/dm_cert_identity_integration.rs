@@ -726,6 +726,7 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
             rx_signature,
             rx_signed_bytes,
             now_ms(),
+            harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await;
 

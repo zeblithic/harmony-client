@@ -5104,6 +5104,8 @@ pub async fn start_node_inner(
                             &pending_dm_invites_for_state,
                         )),
                         enrolled: dm_inbox_enrolled,
+                        // ZEB-580 S2: shared-community revocation cutoff handle.
+                        revoked: revoked_device_projection.clone(),
                     });
                     // The ingest sweeper: one startup sweep (entries
                     // deposited while this device was offline), then one
@@ -9500,6 +9502,8 @@ pub async fn start_node_inner(
                             // carries — needed so the invite-ingest arm can run
                             // sanity gate 3 (self_owner ∈ members).
                             let drain_self_owner = self_owner;
+                            // ZEB-580 S2: shared-community revocation cutoff handle.
+                            let drain_revoked = revoked_device_projection.clone();
                             tokio::spawn(async move {
                                 while let Some(dm) = tunnel_ingest_rx.recv().await {
                                     match crate::dm_inbox_ingest::ingest_dm_packet(
@@ -9514,6 +9518,7 @@ pub async fn start_node_inner(
                                         // sending device.
                                         dm.peer_node_id,
                                         &dm.payload,
+                                        &drain_revoked,
                                     )
                                     .await
                                     {
@@ -9763,6 +9768,9 @@ pub async fn start_node_inner(
                                             pending_dm_invites: Some(std::sync::Arc::clone(
                                                 &pending_dm_invites_for_state,
                                             )),
+                                            // ZEB-580 S2: shared-community
+                                            // revocation cutoff handle.
+                                            revoked: revoked_device_projection.clone(),
                                         },
                                     );
                                     let relay_pull_transport: std::sync::Arc<

@@ -442,6 +442,9 @@ pub(crate) async fn ingest_dm_packet(
     // the device the frame actually arrived from — see `resolve_owner_for_peer`.
     peer_node_id: [u8; 32],
     packet_bytes: &[u8],
+    // ZEB-580 S2: the shared-community revocation projection — forwarded to
+    // `verify_cidnotify_admission` for the CidNotify signer-device cutoff.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
 ) -> Result<bool, String> {
     // 1. Decode + dispatch on the DmPacket variant (ZEB-482). The tunnel
     //    carries a discriminated `DmPacket`; today only `Invite` (DM-Space
@@ -587,6 +590,7 @@ pub(crate) async fn ingest_dm_packet(
             &signed,
             &signature,
             &signed_bytes,
+            revoked,
         )
         .map_err(|e| format!("verify_cidnotify_admission: {e:?}"))?;
         resolved_owner
@@ -774,6 +778,11 @@ pub struct ProdDmInboxIngestCtx {
     pub pending_dm_invites: Option<std::sync::Arc<crate::pending_dm_invites::PendingDmInvites>>,
     /// Enrolled device ids (64-hex), snapshotted at start_node.
     pub enrolled: BTreeSet<String>,
+    /// ZEB-580 S2: the shared-community revocation projection — a bare
+    /// (Arc-backed, cheap-clone) handle matching `MembershipProjection`'s
+    /// by-value style. Forwarded to `verify_cidnotify_sender_binding` for the
+    /// CidNotify signer-device cutoff.
+    pub revoked: crate::revoked_device_projection::RevokedDeviceProjection,
 }
 
 #[async_trait]
@@ -853,6 +862,7 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                 &signed,
                 &signature,
                 &signed_bytes,
+                &self.revoked,
             )
             .map_err(|e| format!("verify_cidnotify_sender_binding: {e:?}"))?;
             // ZEB-236 (T3): a co-deposited invite from a non-friend is STAGED
@@ -1657,6 +1667,7 @@ mod tests {
             // CidNotify path ignores peer_node_id (only the Invite arm binds).
             [0u8; 32],
             &fx.packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect("known-good packet must ingest");
@@ -1700,6 +1711,7 @@ mod tests {
             &fx.bob_device_id,
             [0u8; 32],
             &fx.packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect("duplicate packet is not an error");
@@ -1812,6 +1824,7 @@ mod tests {
             "bob-device-64hex",
             peer_node_id,
             &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect("a known-good invite from a bound peer must apply");
@@ -1932,6 +1945,7 @@ mod tests {
             "bob-device-64hex",
             peer_node_id,
             &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect("a non-friend invite stages (not an error)");
@@ -2066,6 +2080,7 @@ mod tests {
             "bob-device-64hex",
             peer_node_id,
             &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect("a non-friend invite stages (not an error)");
@@ -2092,6 +2107,7 @@ mod tests {
             "bob-device-64hex",
             peer_node_id,
             &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect("a friend-tier invite redelivery must apply");
@@ -2174,6 +2190,7 @@ mod tests {
             &fx.bob_device_id,
             [0u8; 32],
             &wire,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect("a CidNotifyWithBlob from an admitted sender must deliver");
@@ -2239,6 +2256,7 @@ mod tests {
             &fx.bob_device_id,
             [0u8; 32],
             &wire,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect_err("an unadmitted CidNotifyWithBlob must be rejected");
@@ -2288,6 +2306,7 @@ mod tests {
             &fx.bob_device_id,
             [0u8; 32],
             &wire,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect_err("a CID-mismatched inline blob must be rejected");
@@ -2400,6 +2419,7 @@ mod tests {
             "bob-device-64hex",
             peer_node_id,
             &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect_err("an inviter-vs-peer mismatch must be rejected");
@@ -2499,6 +2519,7 @@ mod tests {
             "bob-device-64hex",
             unknown_peer_node_id,
             &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect_err("an invite from an unbindable peer must be rejected");
@@ -2545,6 +2566,7 @@ mod tests {
             &fx.bob_device_id,
             [0u8; 32],
             &tampered,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect_err("a tampered packet must be rejected");
@@ -2599,6 +2621,7 @@ mod tests {
             &fx.bob_device_id,
             [0u8; 32],
             &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect_err("an Ack on the tunnel ingest path must be rejected");
@@ -2692,6 +2715,7 @@ mod tests {
             &fx.bob_device_id,
             [0u8; 32],
             &fx.packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect_err("a sender kicked mid-fetch must be rejected by the Phase-C re-check");
@@ -2754,6 +2778,7 @@ mod tests {
             &fx.bob_device_id,
             [0u8; 32],
             &fx.packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await
         .expect_err("a CAS blob whose CID != signed message_cid must be rejected");
@@ -3074,6 +3099,7 @@ mod tests {
             sink,
             pending_dm_invites: None,
             enrolled: BTreeSet::new(),
+            revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
         };
 
         RecoverInviteFixture {
@@ -3410,6 +3436,7 @@ mod tests {
             sink,
             pending_dm_invites: Some(Arc::clone(&pending)),
             enrolled: BTreeSet::new(),
+            revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
         };
 
         let err = prod_ctx
@@ -3615,6 +3642,7 @@ mod tests {
             sink,
             pending_dm_invites: Some(Arc::clone(&pending)),
             enrolled: BTreeSet::new(),
+            revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
         };
         (prod_ctx, pending, sink_handle)
     }

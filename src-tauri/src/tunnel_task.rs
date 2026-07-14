@@ -1649,6 +1649,8 @@ mod tests {
         let drain_sink = Arc::clone(&fx.sink);
         let drain_device = fx.bob_device_id.clone();
         let drain_self_owner = fx.bob;
+        // ZEB-580 S2: empty projection — this test does not exercise revocation.
+        let drain_revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
         let drain = tokio::spawn(async move {
             while let Some(dm) = resp_ingest_rx.recv().await {
                 let _ = ingest_dm_packet(
@@ -1660,6 +1662,7 @@ mod tests {
                     &drain_device,
                     dm.peer_node_id,
                     &dm.payload,
+                    &drain_revoked,
                 )
                 .await;
             }
