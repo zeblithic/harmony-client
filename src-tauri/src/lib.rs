@@ -870,6 +870,11 @@ pub struct NodeState {
     /// happens after `registry.shutdown_all()`).
     community_delta_tx:
         Option<tokio::sync::mpsc::Sender<crate::community_state_sync::CommunityMembershipDelta>>,
+    /// ZEB-687: a clone of the live `RevokedDeviceProjection` fed by the
+    /// on-epoch hook / boot-replay seed. Stored only so `#[cfg(test)]` can
+    /// observe that the feed wiring actually runs; production reads go
+    /// through the receive-path handles, not this field.
+    revoked_device_projection: Option<crate::revoked_device_projection::RevokedDeviceProjection>,
     /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
     /// ZEB-678 S2: set true after this device publishes its feed
     /// `FeedAuthorityRecord` (the Zenoh authority sample) for the first time this
@@ -1708,6 +1713,18 @@ impl NodeState {
     ) {
         self.crdt_state = Some(state);
     }
+
+    /// ZEB-687: expose the live `RevokedDeviceProjection` clone stashed by
+    /// `start_node_inner`'s boot populate site, so a test can observe that the
+    /// on-epoch hook / boot-replay seed actually fed it (the regression guard
+    /// this seam exists for).
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by the ZEB-687 boot regression test (separate task).
+    pub(crate) fn revoked_device_projection_for_test(
+        &self,
+    ) -> Option<crate::revoked_device_projection::RevokedDeviceProjection> {
+        self.revoked_device_projection.clone()
+    }
 }
 
 impl Default for NodeState {
@@ -1757,6 +1774,7 @@ impl Default for NodeState {
             sync_engine: None,
             community_registry: None,
             community_delta_tx: None,
+            revoked_device_projection: None,
             vine_authority_published: false,
             vine_feed_binding_stamped: false,
             dm_outbox: None,
@@ -3169,6 +3187,21 @@ impl std::fmt::Display for SupersededError {
             ),
         }
     }
+}
+
+/// ZEB-687: the single feed point for the revoked-device projection from a
+/// community's materialized view. Both `start_node_inner` choke points (the
+/// live on-epoch hook and the boot-replay seed) call this, so the feed logic
+/// lives in one tested place and a helper-body regression breaks both sites.
+fn feed_revoked_from_materialized(
+    proj: &crate::revoked_device_projection::RevokedDeviceProjection,
+    mat: &crate::community_membership::MaterializedMembership,
+) {
+    proj.union_from_members(
+        mat.members
+            .iter()
+            .map(|(o, m)| (*o, &m.revoked_device_keys)),
+    );
 }
 
 /// Start the harmony node with an embedded NodeRuntime.
@@ -7112,8 +7145,9 @@ pub async fn start_node_inner(
                                             // Fed unconditionally — even the remove_community branch below must
                                             // still see this, since a revocation learned right before a leave
                                             // must survive.
-                                            revoked_device_projection.union_from_members(
-                                                mat.members.iter().map(|(o, m)| (*o, &m.revoked_device_keys)),
+                                            feed_revoked_from_materialized(
+                                                &revoked_device_projection,
+                                                &mat,
                                             );
                                             let local_joined = mat
                                                 .members
@@ -7814,11 +7848,9 @@ pub async fn start_node_inner(
                                 // materialized state (the on-epoch hook only fires on NEW deltas).
                                 // Unconditional — before the is_joined gate that only affects the
                                 // membership seed.
-                                revoked_device_projection.union_from_members(
-                                    current
-                                        .members
-                                        .iter()
-                                        .map(|(o, m)| (*o, &m.revoked_device_keys)),
+                                feed_revoked_from_materialized(
+                                    &revoked_device_projection,
+                                    &current,
                                 );
                                 let is_joined = |actor: &crate::owner_state_types::OwnerAddr| {
                                     current
@@ -10768,6 +10800,11 @@ pub async fn start_node_inner(
                         // `registry.shutdown_all()` and the consumer task winds
                         // down cleanly.
                         guard.community_delta_tx = community_delta_tx_for_state.clone();
+                        // ZEB-687: stash a clone of the revoked-device projection so
+                        // #[cfg(test)] can observe the on-epoch hook / boot-replay
+                        // seed actually feeding it (Clone is over an inner Arc<RwLock<..>>,
+                        // so this clone sees the live hook's writes).
+                        guard.revoked_device_projection = Some(revoked_device_projection.clone());
                         // ZEB-225 Sub-B Phase 2: store DM outbox + per-identity
                         // handles on NodeState for send_dm IPC + (T7) drain tick.
                         guard.dm_outbox = dm_outbox_arc.clone();
@@ -58871,6 +58908,42 @@ mod tests {
 
         assert!(proj.is_revoked(&owner, &[0xcd; 32]));
     }
+
+    /// ZEB-687: pins `feed_revoked_from_materialized` — the shared helper both
+    /// `start_node_inner` choke points call — against a `MaterializedMembership`
+    /// fixture (rather than a raw `members` map, unlike the sibling test above).
+    #[test]
+    fn feed_revoked_from_materialized_unions_member_keys() {
+        use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
+        use crate::owner_state_types::OwnerAddr;
+        use crate::revoked_device_projection::RevokedDeviceProjection;
+        use std::collections::BTreeSet;
+
+        let proj = RevokedDeviceProjection::new();
+        let owner = OwnerAddr([0x11; 16]);
+        let revoked = [0xaa; 32];
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: crate::owner_state_types::Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "zeb687".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::from([revoked]),
+            },
+        );
+        assert!(!proj.is_revoked(&owner, &revoked));
+        feed_revoked_from_materialized(&proj, &mat);
+        assert!(
+            proj.is_revoked(&owner, &revoked),
+            "helper must union member revoked keys"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -63026,6 +63099,7 @@ mod start_node_race_tests {
             sync_engine: None,
             community_registry: None,
             community_delta_tx: None,
+            revoked_device_projection: None,
             vine_authority_published: false,
             vine_feed_binding_stamped: false,
             dm_outbox: None,
