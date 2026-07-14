@@ -87,11 +87,16 @@ pub enum ReachabilitySource {
     DurableCrdt,
     /// Fetched live from the recipient's pkarr routing blob.
     PkarrLive,
-    /// ZEB-510: a same-owner fleet sibling's iroh endpoint, seeded from the
-    /// owner's durable `FleetNetDoc` (fleet_net.cbor). Verification-exempt: the
-    /// ingest boundary is fleet-net's symmetric-key decrypt, so the entry
-    /// carries a zero-filled `identity_signature`. Never present in
-    /// `self_owner`'s pkarr blob (that is the deferred ZEB-513 cross-WAN path).
+    /// ZEB-510: a same-owner fleet sibling's iroh endpoint. Fed from two
+    /// verification-exempt sources, each carrying a zero-filled
+    /// `identity_signature` (the ingest boundary is the trust boundary, not a
+    /// per-record signature): (1) step 1 — the owner's durable `FleetNetDoc`
+    /// (fleet_net.cbor), whose boundary is fleet-net's symmetric-key decrypt;
+    /// (2) step 2 — the `fleet_peer_seed` store, whose boundary is the
+    /// SAS-authenticated pairing channel the endpoint was observed on. The step-1
+    /// FleetNetDoc row supersedes a step-2 seed for the same node via LWW once it
+    /// exists (same stable node_id either way). Never present in `self_owner`'s
+    /// pkarr blob (that is the deferred ZEB-513 cross-WAN path).
     FleetSibling,
 }
 

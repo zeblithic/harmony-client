@@ -5689,6 +5689,52 @@ pub async fn start_node_inner(
                             );
                         }
                     }
+                    // ZEB-510 step 2: feed SAS first-contact seeds into the
+                    // resolver so P can dial a freshly-paired sibling BEFORE
+                    // fleet-net has ever converged. A real FleetNetDoc row for
+                    // the same node (fed by the step-1 hook above) supersedes a
+                    // seed via LWW once it exists; correctness does not depend on
+                    // the ordering (same stable node_id either way).
+                    {
+                        let self_node_id = iroh_endpoint_arc
+                            .as_ref()
+                            .map(|ep| *ep.node_id().as_bytes());
+                        let seed_path = identity_dir
+                            .join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
+                        // Best-effort (mirrors the write side in
+                        // pairing/persist.rs::persist_peer_seed): a transient read
+                        // failure of this accelerator store must NOT abort boot —
+                        // the device simply proceeds without the seed and gains
+                        // sibling reachability once fleet-net converges (the
+                        // pre-step-2 behavior). load_doc_or_recover already
+                        // self-heals a corrupt file to default(), so only a
+                        // transient I/O error reaches the Err arm.
+                        match crate::fleet_peer_seed_persist::load_doc_or_recover(&seed_path) {
+                            Ok(seed_doc) => {
+                                for row in seed_doc.seeds.values() {
+                                    if Some(row.iroh_node_id) == self_node_id {
+                                        continue; // never seed ourselves
+                                    }
+                                    reachability_resolver.update_with_source(
+                                        self_owner,
+                                        crate::fleet_peer_seed::seed_reachability_payload(row),
+                                        crate::owner_state_types::Hlc {
+                                            wall_ms: row.observed_at_ms,
+                                            logical: 0,
+                                            device_id: String::new(),
+                                        },
+                                        crate::reachability_resolver::ReachabilitySource::FleetSibling,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "fleet-peer-seed load failed at boot; skipping dial-seed feed (sibling reachability will arrive on fleet-net convergence)"
+                                );
+                            }
+                        }
+                    }
                     fleet_net_doc_opt = Some(std::sync::Arc::clone(&fleet_net_doc));
                     fleet_net_tracker_opt = Some(std::sync::Arc::clone(&fleet_net_tracker));
                     fleet_net_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_net_sync));
