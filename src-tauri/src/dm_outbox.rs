@@ -6636,7 +6636,7 @@ mod tests {
             "no Space must be written for a cut-off invite"
         );
         assert!(
-            state.owner_device_cache.devices.get(&inviter).is_none(),
+            !state.owner_device_cache.devices.contains_key(&inviter),
             "no cache entry must be written for the cut-off inviter"
         );
     }
