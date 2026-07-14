@@ -5665,6 +5665,28 @@ pub async fn start_node_inner(
                             });
                         }
                     }
+                    // ZEB-510: seed same-owner fleet siblings' iroh endpoints
+                    // into the reachability resolver so P can dial a butler
+                    // sibling B2 for async-DM deposits. `fleet_net.cbor` already
+                    // persists each enrolled sibling's endpoint (consumed today
+                    // only to build the pkarr butler-set advert) — this is the
+                    // missing wire from that durable doc to the dialer. The self
+                    // row is excluded (never dial ourselves). Mirrors the
+                    // ReachabilityAnnounce boot-replay further below (~7912).
+                    {
+                        let siblings = {
+                            let doc = fleet_net_doc.lock().await;
+                            crate::fleet_net::sibling_rows(&doc, &device_id)
+                        };
+                        for (_dev_id, row) in siblings {
+                            reachability_resolver.update_with_source(
+                                self_owner,
+                                crate::fleet_net::sibling_reachability_payload(&row),
+                                row.seen_at.clone(),
+                                crate::reachability_resolver::ReachabilitySource::FleetSibling,
+                            );
+                        }
+                    }
                     fleet_net_doc_opt = Some(std::sync::Arc::clone(&fleet_net_doc));
                     fleet_net_tracker_opt = Some(std::sync::Arc::clone(&fleet_net_tracker));
                     fleet_net_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_net_sync));
