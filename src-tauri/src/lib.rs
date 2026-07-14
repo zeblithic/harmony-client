@@ -9088,6 +9088,11 @@ pub async fn start_node_inner(
                         // ZEB-668 S4: event sink for the petname live-refresh
                         // emit below (same sink the trust detector emits on).
                         let task_emit = std::sync::Arc::clone(&app);
+                        // ZEB-510: feed freshly-merged sibling endpoints into
+                        // the dial resolver from inside this refresh task (the
+                        // engine's on_applied nudge fires here on every applied
+                        // remote merge).
+                        let task_resolver = reachability_resolver.clone();
                         let mut nudge_rx = fleet_net_snap_nudge_rx;
                         tokio::spawn(async move {
                             let mut prev_doc: crate::fleet_net::FleetNetDoc = task_snapshot
@@ -9105,6 +9110,22 @@ pub async fn start_node_inner(
                                             break;
                                         };
                                         let new_doc = { task_doc.lock().await.clone() };
+                                        // ZEB-510: a sibling coming online or
+                                        // changing endpoint mid-session must
+                                        // reach the dialer. Re-feed-all is
+                                        // idempotent (LWW rejects rows whose
+                                        // seen_at HLC is not strictly newer),
+                                        // and the self row is excluded.
+                                        for (_dev_id, row) in
+                                            crate::fleet_net::sibling_rows(&new_doc, &task_device_id)
+                                        {
+                                            task_resolver.update_with_source(
+                                                task_self_owner,
+                                                crate::fleet_net::sibling_reachability_payload(&row),
+                                                row.seen_at.clone(),
+                                                crate::reachability_resolver::ReachabilitySource::FleetSibling,
+                                            );
+                                        }
                                         // Re-snapshot the vk map (sequential
                                         // locks, never nested).
                                         let vk_map = {
