@@ -12002,6 +12002,29 @@ pub async fn start_node_inner(
                 }
                 if let Some(mut rx) = pairing_handle.inviter_result_rx.take() {
                     let id_dir = identity_dir.clone();
+                    // ZEB-510 step 3: read the fleet-net handles from NodeState so
+                    // the inviter drainer can upsert the freshly-paired sibling's
+                    // SAS-observed endpoint into P's FleetNetDoc — the store
+                    // `build_butler_set` reads to build P's published butler-set
+                    // advert. Co-located, fleet-net sync never converges, so the
+                    // sibling row would otherwise be absent and A could not dial the
+                    // butler. (The local `fleet_net_*_opt` bindings are already
+                    // moved into the event loop by here; NodeState holds the shared
+                    // Arc handles — the same ones set_butler_pin's IPC uses.)
+                    let (fn_doc, fn_snap, fn_sync, crdt_state, owner_sync, self_owner) = {
+                        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+                        (
+                            guard.fleet_net_doc.clone(),
+                            guard.fleet_net_snapshot.clone(),
+                            guard.fleet_net_sync.clone(),
+                            // ZEB-510 step 4: crdt owner-state + its sync engine +
+                            // self owner, for the owner_device_cache sibling seed
+                            // (a SEPARATE store/engine from fleet-net above).
+                            guard.crdt_state.clone(),
+                            guard.sync_engine.clone(),
+                            guard.dm_self_owner,
+                        )
+                    };
                     tokio::spawn(async move {
                         // ZEB-491: each handoff carries a oneshot `persisted_ack`.
                         // We persist on the blocking pool, then fire the ack so the
@@ -12012,6 +12035,19 @@ pub async fn start_node_inner(
                         // restart could lose the enrollment.
                         while let Some(handoff) = rx.recv().await {
                             let id_dir = id_dir.clone();
+                            // ZEB-510 step 3: capture the sibling's fleet-net key
+                            // (hex of its enrollment ed25519 verify key — the
+                            // `FleetNetDoc.devices` key) + the SAS-observed endpoint
+                            // BEFORE `handoff.result` moves into the blocking
+                            // install. `None` endpoint (pre-step-2 peer) → no upsert.
+                            let sibling_ed =
+                                handoff.result.cert.device_pubkeys.classical.ed25519_verify;
+                            let sibling_seed: Option<(String, [u8; 32], String, [u8; 32])> =
+                                handoff.result.peer_iroh_endpoint.clone().map(
+                                    |(node_id, relay)| {
+                                        (hex::encode(sibling_ed), node_id, relay, sibling_ed)
+                                    },
+                                );
                             let outcome = tokio::task::spawn_blocking(move || {
                                 crate::pairing::persist::install_inviter_state(
                                     &id_dir,
@@ -12022,6 +12058,100 @@ pub async fn start_node_inner(
                             let ack = match outcome {
                                 Ok(Ok(())) => {
                                     tracing::info!("inviter pairing persisted successfully");
+                                    // ZEB-510 step 3: upsert the paired sibling's
+                                    // endpoint into P's FleetNetDoc via the engine
+                                    // (mirror the boot self-row upsert), so P's next
+                                    // butler-set advert carries B2's dialable
+                                    // endpoint co-located. Best-effort; a real B2
+                                    // self-row supersedes this via LWW once fleet-net
+                                    // converges (same node_id either way).
+                                    if let (
+                                        Some((dev_hex, node_id, relay, _)),
+                                        Some(doc_arc),
+                                        Some(snap_arc),
+                                        Some(sync_arc),
+                                    ) = (&sibling_seed, &fn_doc, &fn_snap, &fn_sync)
+                                    {
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        {
+                                            let mut doc = doc_arc.lock().await;
+                                            let feed_binding = doc
+                                                .devices
+                                                .get(dev_hex)
+                                                .and_then(|r| r.feed_binding.clone());
+                                            doc.devices.insert(
+                                                dev_hex.clone(),
+                                                crate::fleet_net::FleetNetRow {
+                                                    iroh_endpoint_id: *node_id,
+                                                    home_relay: relay.clone(),
+                                                    seen_at: crate::owner_state_types::Hlc {
+                                                        wall_ms: now_ms,
+                                                        logical: 0,
+                                                        device_id: dev_hex.clone(),
+                                                    },
+                                                    feed_binding,
+                                                },
+                                            );
+                                            *snap_arc.write().unwrap_or_else(|p| p.into_inner()) =
+                                                doc.clone();
+                                        }
+                                        sync_arc.notify_dirty();
+                                        tracing::info!(
+                                            sibling = %dev_hex,
+                                            relay_empty = relay.is_empty(),
+                                            "ZEB-510 step 3: upserted paired sibling endpoint into FleetNetDoc advert"
+                                        );
+                                        let flush = std::sync::Arc::clone(sync_arc);
+                                        tokio::spawn(async move {
+                                            if let Err(e) = flush.flush_now().await {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "ZEB-510 step 3: fleet-net sibling-seed flush failed; debounced publisher will retry"
+                                                );
+                                            }
+                                        });
+                                    }
+                                    // ZEB-510 step 4: also seed owner_device_cache —
+                                    // a SEPARATE CRDT store from FleetNetDoc above —
+                                    // so build_butler_set's vk_lookup resolves the
+                                    // sibling. Without it the advert SKIPS the sibling
+                                    // ("vk_lookup unresolved") even with a perfect
+                                    // endpoint row. Same endpoint gate as step 3: with
+                                    // no FleetNetDoc row the sibling isn't in the
+                                    // butler-set order, so vk_lookup is never consulted.
+                                    if let (
+                                        Some((_, _, _, sib_ed)),
+                                        Some(crdt_arc),
+                                        Some(owner_sync_arc),
+                                        Some(self_owner),
+                                    ) = (&sibling_seed, &crdt_state, &owner_sync, self_owner)
+                                    {
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        let applied = {
+                                            let mut st = crdt_arc.lock().await;
+                                            crate::fleet_net::seed_sibling_device_cache(
+                                                &mut st, self_owner, *sib_ed, now_ms,
+                                            )
+                                        };
+                                        if applied {
+                                            owner_sync_arc.notify_dirty();
+                                            let flush = std::sync::Arc::clone(owner_sync_arc);
+                                            tokio::spawn(async move {
+                                                if let Err(e) = flush.flush_now().await {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "ZEB-510 step 4: owner-state sibling-seed flush failed; debounced publisher will retry"
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    }
                                     Ok(())
                                 }
                                 Ok(Err(e)) => {

@@ -408,6 +408,94 @@ pub(crate) fn vk_map_from_device_cache(
     map
 }
 
+/// ZEB-510 step 4: record a freshly-paired same-owner sibling in
+/// `owner_device_cache` so `build_butler_set`'s `vk_lookup` resolves it and the
+/// published butler-set advert can dial it. `add_enrollment` records the sibling
+/// in the (separate) harmony-owner enrollment state, but the advert reads THIS
+/// CRDT projection — which, co-located (no community device-intro, no CRDT
+/// convergence between the owner's own devices), never learns the sibling.
+/// Without this the advert SKIPS the sibling ("vk_lookup unresolved") even with
+/// a perfect FleetNetDoc endpoint row (the ZEB-510 s7 failure: the depositor
+/// fell back to the owner's own self-entry and never reached the butler).
+///
+/// Routed through the canonical [`crate::owner_state_crdt::OwnerState::apply_owner_device_update`]
+/// so the sort/dedup, LWW, and pub-preserve invariants hold. That method
+/// REPLACES the device list with the payload, so we UNION the sibling into the
+/// owner's existing self-owner entry rather than clobbering already-known
+/// devices, under a strictly-newer HLC (the LWW guard rejects stale). Idempotent:
+/// a re-pair or a genuine later self-announcement supersedes this with the
+/// identical identity pub (no conflict). Returns `true` iff the cache was
+/// updated (the caller then persists + republishes the advert).
+pub(crate) fn seed_sibling_device_cache(
+    state: &mut crate::owner_state_crdt::OwnerState,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    sibling_ed25519_verify: [u8; 32],
+    wall_ms: u64,
+) -> bool {
+    let x_pub = match crate::dm_signing::ed25519_pub_to_x25519(&sibling_ed25519_verify) {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::warn!(error = %e, "ZEB-510 step 4: sibling ed25519->x25519 failed; owner_device_cache seed skipped");
+            return false;
+        }
+    };
+    let mut identity_pub = [0u8; 64];
+    identity_pub[..32].copy_from_slice(&x_pub);
+    identity_pub[32..].copy_from_slice(&sibling_ed25519_verify);
+    let Some(hash) = crate::dm_signing::derive_device_hash_from_identity_pub(&identity_pub) else {
+        tracing::warn!("ZEB-510 step 4: sibling device-hash derivation failed; owner_device_cache seed skipped");
+        return false;
+    };
+
+    // UNION with the existing self-owner entry: apply_owner_device_update takes
+    // the payload AS the new device list (pub-preserving overlaps), so passing
+    // only the sibling would drop already-known devices.
+    let (mut devices, mut pubs, mut contacts, base_hlc) =
+        match state.owner_device_cache.devices.get(&self_owner) {
+            Some(e) => (
+                e.devices.clone(),
+                e.device_identity_pubs.clone(),
+                e.device_tunnel_contacts.clone(),
+                Some(e.learned_at.clone()),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), None),
+        };
+    if devices.contains(&hash) {
+        return false; // already present — idempotent
+    }
+    devices.push(hash);
+    pubs.push(Some(identity_pub));
+    contacts.push(None);
+
+    let device_id = hex::encode(self_owner.0);
+    let learned_at = match base_hlc {
+        Some(prev) if prev.wall_ms >= wall_ms => crate::owner_state_types::Hlc {
+            wall_ms: prev.wall_ms,
+            logical: prev.logical.saturating_add(1),
+            device_id,
+        },
+        _ => crate::owner_state_types::Hlc {
+            wall_ms,
+            logical: 0,
+            device_id,
+        },
+    };
+
+    match state.apply_owner_device_update(self_owner, devices, pubs, contacts, learned_at) {
+        crate::owner_state_crdt::ApplyOutcome::Rejected(r) => {
+            tracing::warn!(reason = ?r, "ZEB-510 step 4: owner_device_cache seed rejected by LWW/invariant guard");
+            false
+        }
+        _ => {
+            tracing::info!(
+                sibling = %hex::encode(sibling_ed25519_verify),
+                "ZEB-510 step 4: seeded paired sibling into owner_device_cache for butler-set vk_lookup"
+            );
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +523,70 @@ mod tests {
             name: name.into(),
             set_at,
         }
+    }
+
+    // ZEB-510 step 4: seeding a paired sibling into owner_device_cache makes the
+    // butler-set `vk_lookup` (vk_map_from_device_cache) resolve it, without which
+    // build_butler_set skips the sibling and the depositor can't dial the butler.
+    #[test]
+    fn seed_sibling_device_cache_makes_vk_lookup_resolve() {
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_types::OwnerAddr;
+
+        let self_owner = OwnerAddr([0x11; 16]);
+        let self_vk = [0x99u8; 32];
+        // Real ed25519 device identities (a real verifying key always converts
+        // to x25519, unlike an arbitrary 32-byte blob).
+        let sib_ed: [u8; 32] = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+            .verifying_key()
+            .to_bytes();
+        let sib2_ed: [u8; 32] = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32])
+            .verifying_key()
+            .to_bytes();
+
+        let mut state = OwnerState::default();
+        let vk_map = |st: &OwnerState| {
+            vk_map_from_device_cache(&st.owner_device_cache, &self_owner, "self-dev", self_vk)
+        };
+
+        // Before: the sibling does not resolve in the advert's vk map.
+        assert!(!vk_map(&state).contains_key(&hex::encode(sib_ed)));
+
+        // Seed it → vk_lookup now resolves the sibling to its ed25519 vk.
+        assert!(seed_sibling_device_cache(
+            &mut state, self_owner, sib_ed, 1_000
+        ));
+        assert_eq!(vk_map(&state).get(&hex::encode(sib_ed)), Some(&sib_ed));
+
+        // Idempotent: a second seed of the same sibling is a no-op.
+        assert!(!seed_sibling_device_cache(
+            &mut state, self_owner, sib_ed, 2_000
+        ));
+
+        // A DIFFERENT sibling unions in without dropping the first.
+        assert!(seed_sibling_device_cache(
+            &mut state, self_owner, sib2_ed, 3_000
+        ));
+        let after = vk_map(&state);
+        assert_eq!(after.get(&hex::encode(sib_ed)), Some(&sib_ed));
+        assert_eq!(after.get(&hex::encode(sib2_ed)), Some(&sib2_ed));
+
+        // LWW logical-bump branch: seed a THIRD sibling with a wall_ms (1_000)
+        // <= the existing entry's learned_at.wall_ms (3_000 from sib2). The seed
+        // MUST still construct a strictly-newer HLC (bumping `logical`), else
+        // apply_owner_device_update rejects it as StaleHlc and the sibling
+        // silently fails to resolve. Pins the `prev.wall_ms >= wall_ms` arm.
+        let sib3_ed: [u8; 32] = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(seed_sibling_device_cache(
+            &mut state, self_owner, sib3_ed, 1_000
+        ));
+        let after3 = vk_map(&state);
+        assert_eq!(after3.get(&hex::encode(sib3_ed)), Some(&sib3_ed));
+        // ...and the earlier siblings survive the strictly-newer re-write.
+        assert_eq!(after3.get(&hex::encode(sib_ed)), Some(&sib_ed));
+        assert_eq!(after3.get(&hex::encode(sib2_ed)), Some(&sib2_ed));
     }
 
     // Pins the fleet-net-v1 wire format; NEVER regenerate. Mod-level so the
