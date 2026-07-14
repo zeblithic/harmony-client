@@ -48,9 +48,9 @@ describe('RemoveDeviceDialog (ZEB-668 S2)', () => {
 
   it('states the feed cutoff and what is NOT yet severed (honesty rule)', () => {
     render(RemoveDeviceDialog, { props: props() });
-    // ZEB-678 S3: vine feeds now stop accepting posts; DMs still aren't blocked.
+    // ZEB-580 S2: DMs to shared-community contacts now block too; DM-only contacts pending S3.
     expect(screen.getByText(/stop accepting new posts/i)).toBeInTheDocument();
-    expect(screen.getByText(/aren't blocked yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/share a community with you stop being accepted/i)).toBeInTheDocument();
   });
 
   it('maps notMaster errors to friendly copy', () => {
@@ -110,7 +110,7 @@ describe('RemoveDeviceDialog replace mode (ZEB-668 S6)', () => {
   it('keeps the honesty copy about un-severed surfaces in replace mode', () => {
     render(RemoveDeviceDialog, { props: props({ mode: 'replace' }) });
     expect(screen.getByText(/stop accepting new posts/i)).toBeInTheDocument();
-    expect(screen.getByText(/aren't blocked yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/share a community with you stop being accepted/i)).toBeInTheDocument();
   });
 
   it('still requires the exact device name in replace mode', async () => {

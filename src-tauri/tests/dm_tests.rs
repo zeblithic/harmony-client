@@ -24,6 +24,8 @@ mod dm_cert_identity_integration;
 mod dm_create_integration;
 #[path = "dm/dm_ipc_roundtrip.rs"]
 mod dm_ipc_roundtrip;
+#[path = "dm/dm_revocation_cutoff_integration.rs"]
+mod dm_revocation_cutoff_integration;
 #[path = "dm/dm_send_integration.rs"]
 mod dm_send_integration;
 #[path = "dm/dm_thread_integration.rs"]

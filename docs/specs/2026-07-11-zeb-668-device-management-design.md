@@ -294,7 +294,7 @@ out of scope and the spec says so in UI-adjacent docs.
 | Claim the UI might imply | Reality in v1 | Handling |
 |---|---|---|
 | "Remove device" cuts it off everywhere | Cuts #2 surfaces (community posting via S3, fleet sync via S1+S6 epoch, deposits/relay/voice/friend handshake once state propagates) | Confirm-dialog copy enumerates |
-| …including DMs/vines/storage records | PARTIAL — **vine feeds now block** a revoked device's post-revocation records once the feed has migrated to its #2 device key (ZEB-678: revocation-aware `FeedAuthorityRecord`, sticky/first-write-wins cache). DMs and storage records still sign with the device's own #3 node identity | Vines: **retired by ZEB-678** — `revoke_device` publishes a revoked authority (self- and master-revoke); confirm-dialog copy now states the feed cutoff. DMs: ZEB-580. Storage: separate §9 ticket |
+| …including DMs/vines/storage records | PARTIAL — **vine feeds now block** a revoked device's post-revocation records once the feed has migrated to its #2 device key (ZEB-678: revocation-aware `FeedAuthorityRecord`, sticky/first-write-wins cache). **DMs to contacts who share a community with you now block too** (ZEB-580 S2: the community revocation cutoff extends to shared-community DM verification). DMs to contacts you only DM directly (no shared community), and storage records, still sign with the device's own #3 node identity | Vines: **retired by ZEB-678** — `revoke_device` publishes a revoked authority (self- and master-revoke); confirm-dialog copy now states the feed cutoff. DMs to shared-community contacts: ZEB-580 S2 (ZEB-684); DM-only contacts: S3 (ZEB-685). Storage: separate §9 ticket |
 | …and friends/PEX immediately | NO — lone-cert verifiers, certs never expire | Follow-up ticket (§9): revocation-aware friend verification (can reuse retire-announce mechanics) |
 | Last seen = live presence | It is the last fleet heartbeat (~7.5 min cadence, HLC wall time) | Copy + tolerance; null renders nothing |
 | Removed device's data is gone | Local data on that device persists until its owner wipes it | Terminal-state copy on the revoked device says so |
@@ -310,7 +310,9 @@ out of scope and the spec says so in UI-adjacent docs.
 3. Storage-buddy record signing migration #3 → #2.
 4. Revocation-aware friend/PEX verification (consume retire-announce or
    equivalent proof).
-(DM signing migration is existing ZEB-580; ZEB-410 gets a note from §2.)
+(DM signing migration is existing ZEB-580: S2 covers contacts who share a
+community with you and is done (ZEB-684); DM-only contacts with no shared
+community are S3 (ZEB-685). ZEB-410 gets a note from §2.)
 
 ## §10 PR map and gates
 

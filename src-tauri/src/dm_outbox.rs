@@ -1786,6 +1786,12 @@ impl DmOutbox {
         _unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
         packet_bytes: Vec<u8>,
         wall_now_ms: u64,
+        // ZEB-580 S2: this dormant path has no `RevokedDeviceProjection`
+        // handle wired in production (no live caller — see the module doc
+        // and `handle_invite`'s identical dormant-path note). Threaded
+        // through so `handle_ack`'s cutoff has something to consult; test
+        // callers pass `&RevokedDeviceProjection::new()`.
+        revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     ) -> Result<DrainOutcome, DmReceiveError> {
         let packet = crate::dm_envelope::decode_packet(&packet_bytes)
             .map_err(|e| DmReceiveError::Decode(e.to_string()))?;
@@ -1804,8 +1810,15 @@ impl DmOutbox {
                 signature,
                 signed_bytes,
             } => {
-                self.handle_ack(state, signed, signature, &signed_bytes, wall_now_ms)
-                    .await
+                self.handle_ack(
+                    state,
+                    signed,
+                    signature,
+                    &signed_bytes,
+                    wall_now_ms,
+                    revoked,
+                )
+                .await
             }
             // ZEB-241: CidNotify is dispatched via `handle_cidnotify_lifted`
             // (spawned from event_loop pre-decode) so the 500ms CAS fetch
@@ -1902,6 +1915,11 @@ impl DmOutbox {
             None,
             // ZEB-483: dormant authenticated path — refresh the cache as before.
             true,
+            // ZEB-580 S2: this dormant path has no `RevokedDeviceProjection` handle
+            // wired (no live caller); an empty projection is a safe no-op (it is
+            // never reached over an untrusted carrier, mirroring `expected_inviter:
+            // None` above).
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )? {
             // ZEB-236: this dormant path has no pending-invite store wired, so a
             // non-friend invite is staged-and-dropped here (the live ingest
@@ -1953,6 +1971,7 @@ impl DmOutbox {
         signature: [u8; 64],
         signed_bytes: Vec<u8>,
         wall_now_ms: u64,
+        revoked: crate::revoked_device_projection::RevokedDeviceProjection,
     ) {
         // Phase A — locked, fast: verify + resolve + snapshot + cache refresh.
         // Outbox lock is acquired for `device_id` (used in
@@ -1985,6 +2004,7 @@ impl DmOutbox {
                 &signed,
                 &signature,
                 &signed_bytes,
+                &revoked,
             ) {
                 Ok(admitted) => admitted,
                 Err(e) => {
@@ -2191,6 +2211,7 @@ impl DmOutbox {
         signature: [u8; 64],
         signed_bytes: &[u8],
         wall_now_ms: u64,
+        revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     ) -> Result<DrainOutcome, DmReceiveError> {
         // Step 1: look up signing pubkey + verify signature.
         let identity_pub =
@@ -2206,6 +2227,18 @@ impl DmOutbox {
         // Step 2: resolve signing_device_hash → OwnerAddr.
         let resolved_owner =
             resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
+
+        // ZEB-580 S2: defense-in-depth revocation cutoff. `handle_ack` is
+        // dormant in production (Ack is rejected on the live tunnel at
+        // dm_inbox_ingest.rs:556) — this guard exists so a future
+        // re-activation of this path can't reintroduce a bypass for a
+        // signer whose device #2 (Ed25519) has since been revoked.
+        // Uniform/unconditional: no #2-vs-#3 branch (unlike the
+        // membership-recipient checks below, which are outbox-specific).
+        let ack_ed25519: [u8; 32] = identity_pub[32..64].try_into().expect("64 - 32 == 32");
+        if revoked.is_revoked(&resolved_owner, &ack_ed25519) {
+            return Err(DmReceiveError::SignerDeviceRevoked);
+        }
 
         // Step 3: verify ack_from_owner_addr matches the resolved owner.
         // Drops cache-poisoning attempts where a peer claims an
@@ -2374,6 +2407,10 @@ pub(crate) fn apply_invite(
     // NOT let a sender-claimed device list regress that verified state — it
     // bootstraps ONLY the Space.
     refresh_owner_device_cache: bool,
+    // ZEB-580 S2: the shared-community revocation projection — forwarded to the
+    // post-signature-verify cutoff below. Mirrors `verify_cidnotify_sender_binding`'s
+    // `revoked` param on the CidNotify path.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
 ) -> Result<ApplyInviteOutcome, DmReceiveError> {
     // SECURITY (CodeRabbit F1): bind the payload-controlled `signed.inviter` to
     // the authenticated tunnel peer BEFORE touching any trust state (cache or
@@ -2445,6 +2482,17 @@ pub(crate) fn apply_invite(
         &signer_identity_pub,
         signed.signing_device_hash,
     )?;
+
+    // ZEB-580 S2: revocation cutoff — drop a Space invite signed by a revoked #2
+    // device before any cache/Space write. `signed.inviter` is bound to the
+    // authenticated peer above (expected_inviter). No-op for legacy #3 (its
+    // inline pub's ed25519 is never an enrolled key).
+    let inviter_ed25519: [u8; 32] = signer_identity_pub[32..64]
+        .try_into()
+        .expect("64 - 32 == 32");
+    if revoked.is_revoked(&signed.inviter, &inviter_ed25519) {
+        return Err(DmReceiveError::SignerDeviceRevoked);
+    }
 
     // ZEB-236 tier fork: invites from ACTIVE friends keep Phase 3b's
     // auto-accept (the friendship approval was the consent gate). Anything
@@ -2656,6 +2704,8 @@ pub(crate) fn apply_deposited_invite(
     expected_signing_device_hash: DeviceIdentityHash,
     expected_identity_pub: [u8; 64],
     wall_now_ms: u64,
+    // ZEB-580 S2: forwarded to `apply_invite`'s revocation cutoff.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
 ) -> Result<Option<crate::pending_dm_invites::StagedDmInvite>, String> {
     if invite_packet.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
         return Err(format!(
@@ -2705,6 +2755,7 @@ pub(crate) fn apply_deposited_invite(
         // sender was already verified against the pristine cache, so this invite
         // must NOT mutate authenticated device-cache state.
         false,
+        revoked,
     )
     .map_err(|e| format!("apply_invite: {e:?}"))?
     {
@@ -3106,6 +3157,12 @@ pub enum DmReceiveError {
     AadCompute(String),
     #[error("CRDT rejected the apply (invariant violation): {0}")]
     CrdtRejected(String),
+    /// ZEB-580 S2: the CidNotify signer's #2 ed25519 device key is revoked
+    /// for the resolved sender-owner (shared-community revocation cutoff).
+    /// Uniform check — no #2-vs-#3 branch; a legacy #3 signer's identity key
+    /// is never an enrolled #2 device key, so this is a safe no-op for it.
+    #[error("signer device is revoked")]
+    SignerDeviceRevoked,
 }
 
 fn derive_recipients(members: &[OwnerAddr], self_addr: &OwnerAddr) -> Vec<OwnerAddr> {
@@ -3273,9 +3330,10 @@ pub(crate) fn verify_cidnotify_admission(
     signed: &crate::dm_envelope::DmCidNotifySigned,
     signature: &[u8; 64],
     signed_bytes: &[u8],
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
 ) -> Result<(crate::owner_state_types::Space, OwnerAddr, [u8; 64]), DmReceiveError> {
     let (resolved_owner, identity_pub) =
-        verify_cidnotify_sender_binding(state, signed, signature, signed_bytes)?;
+        verify_cidnotify_sender_binding(state, signed, signature, signed_bytes, revoked)?;
     let space = verify_cidnotify_space(state, signed, resolved_owner)?;
     Ok((space, resolved_owner, identity_pub))
 }
@@ -3300,6 +3358,7 @@ pub(crate) fn verify_cidnotify_sender_binding(
     signed: &crate::dm_envelope::DmCidNotifySigned,
     signature: &[u8; 64],
     signed_bytes: &[u8],
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
 ) -> Result<(OwnerAddr, [u8; 64]), DmReceiveError> {
     let identity_pub =
         lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
@@ -3314,6 +3373,13 @@ pub(crate) fn verify_cidnotify_sender_binding(
         resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
     if signed.sender_owner_addr != resolved_owner {
         return Err(DmReceiveError::OwnerFieldMismatch);
+    }
+    // ZEB-580 S2: shared-community revocation cutoff. Drop if the signer's #2
+    // ed25519 (combined_pub[32..64]) is revoked for the resolved owner. No-op
+    // for legacy #3 signers (a #3 key is never an enrolled device key).
+    let ed25519: [u8; 32] = identity_pub[32..64].try_into().expect("64 - 32 == 32");
+    if revoked.is_revoked(&resolved_owner, &ed25519) {
+        return Err(DmReceiveError::SignerDeviceRevoked);
     }
     Ok((resolved_owner, identity_pub))
 }
@@ -4180,7 +4246,14 @@ mod tests {
         padded.extend(std::iter::repeat_n(0_u8, 65)); // 1 byte body + 64 byte sig
 
         let err = outbox
-            .handle_unicast(&mut state, &cas, &tx, padded, 100)
+            .handle_unicast(
+                &mut state,
+                &cas,
+                &tx,
+                padded,
+                100,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -4653,6 +4726,7 @@ mod tests {
             20_000,
             Some(o.self_owner), // expected inviter
             true,               // full apply (Space + cache) on a fresh recipient
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         );
         assert!(
             outcome.is_ok(),
@@ -6105,6 +6179,7 @@ mod tests {
             200,
             None,
             true, // refresh=true variant: cache row must be seeded
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap();
 
@@ -6330,6 +6405,7 @@ mod tests {
             1_700_000_100,
             Some(inviter),
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .expect("apply");
         assert!(matches!(out, ApplyInviteOutcome::Accepted));
@@ -6377,6 +6453,7 @@ mod tests {
             1_700_000_100,
             Some(bogus_inviter),
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .expect_err("cert owner mismatch must reject");
         assert!(
@@ -6431,6 +6508,7 @@ mod tests {
             1_700_000_100,
             Some(victim_owner),
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .expect_err("cert/hash desync must reject");
         assert!(
@@ -6466,6 +6544,7 @@ mod tests {
             200,
             None,
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .expect("apply");
         assert!(matches!(out, ApplyInviteOutcome::Accepted));
@@ -6481,6 +6560,129 @@ mod tests {
             .position(|d| *d == device_hash)
             .unwrap();
         assert_eq!(entry.device_identity_pubs[idx], Some(identity_pub));
+    }
+
+    /// ZEB-580 S2: a Space invite carrying a valid `inviter_enrollment` (#2
+    /// cert) is dropped BEFORE any Space/cache write when the signer's #2
+    /// ed25519 is in the revoked-device projection. Reuses the S1 cert-carrying
+    /// fixture from `apply_invite_with_cert_caches_device2_identity` — the only
+    /// difference is the `revoked` argument. A clean (empty) projection still
+    /// admits the identical invite, isolating the cutoff as the sole cause of
+    /// the rejection.
+    #[test]
+    fn apply_invite_from_revoked_device2_is_cut_off() {
+        use ed25519_dalek::Signer;
+
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let cert = minted.state.enrollments.values().next().unwrap().clone();
+        let sk2 = minted.device_signing_key; // the enrolled device's #2 key
+        let inviter = OwnerAddr(cert.owner_id);
+        let ed25519: [u8; 32] = crate::dm_signing::device2_combined_pub(&cert)[32..64]
+            .try_into()
+            .unwrap();
+
+        let mut state = OwnerState::default();
+        let signed =
+            build_dm_invite_signed_with_cert(&mut state, self_owner, inviter, cert.clone());
+        let space_id = signed.space_id;
+        let signed_bytes = canonical(&signed);
+        let signature = sk2.sign(&signed_bytes).to_bytes();
+
+        // Clean (empty) projection: the identical invite is still admitted —
+        // isolates the revoked projection as the sole cause of the rejection
+        // asserted below.
+        let clean = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let out = apply_invite(
+            &mut state.clone(),
+            self_owner,
+            "dev",
+            signed.clone(),
+            signature,
+            &signed_bytes,
+            1_700_000_100,
+            Some(inviter),
+            true,
+            &clean,
+        )
+        .expect("clean projection must not cut off the invite");
+        assert!(matches!(out, ApplyInviteOutcome::Accepted));
+
+        // Revoked projection: the SAME invite must now be cut off before any
+        // Space/cache write. `state` here is still pristine (only the
+        // `insert_active_friend` from `build_dm_invite_signed_with_cert` — the
+        // call above ran against a clone).
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        revoked.union_from_members(std::iter::once((
+            inviter,
+            &std::collections::BTreeSet::from([ed25519]),
+        )));
+        let err = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &signed_bytes,
+            1_700_000_100,
+            Some(inviter),
+            true,
+            &revoked,
+        )
+        .expect_err("invite from a revoked device must be cut off");
+        assert_eq!(err, DmReceiveError::SignerDeviceRevoked);
+        assert!(
+            !state.spaces.contains_key(&space_id),
+            "no Space must be written for a cut-off invite"
+        );
+        assert!(
+            !state.owner_device_cache.devices.contains_key(&inviter),
+            "no cache entry must be written for the cut-off inviter"
+        );
+    }
+
+    /// ZEB-580 S2: a legacy invite (`inviter_enrollment = None`, #3 signer) is
+    /// still admitted even against a NON-EMPTY revoked-device projection, as
+    /// long as the signer's own key is not a member of it. This pins the
+    /// boundary the cutoff can actually see: `apply_invite`'s check is a plain
+    /// `(owner, ed25519) ∈ revoked` membership test with no #2-vs-#3 branch, so
+    /// it is a no-op for any signer whose key was never enrolled (and thus
+    /// never appears in a real projection) — this test proves that boundary
+    /// with an UNRELATED key in the set, not the #3 signer's own key.
+    #[test]
+    fn apply_invite_legacy_no_cert_not_subject_to_cutoff() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut state = OwnerState::default();
+        insert_active_friend(&mut state, OwnerAddr([1; 16]));
+
+        let (signed, signature, body_bytes) = build_valid_dm_invite(self_owner);
+        assert!(
+            signed.inviter_enrollment.is_none(),
+            "legacy fixture must carry no cert"
+        );
+
+        // Non-empty projection for the same inviter, but keyed to an unrelated
+        // key — the legacy signer's own key is never in it.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        revoked.union_from_members(std::iter::once((
+            OwnerAddr([1; 16]),
+            &std::collections::BTreeSet::from([[0x99u8; 32]]),
+        )));
+
+        let out = apply_invite(
+            &mut state,
+            self_owner,
+            "dev",
+            signed,
+            signature,
+            &body_bytes,
+            200,
+            None,
+            true,
+            &revoked,
+        )
+        .expect("a signer whose key isn't in the revoked set must be admitted");
+        assert!(matches!(out, ApplyInviteOutcome::Accepted));
     }
 
     /// An invite from a NON-friend is staged and writes NOTHING to owner state
@@ -6502,6 +6704,7 @@ mod tests {
             4242,
             None,
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap();
 
@@ -6551,6 +6754,7 @@ mod tests {
             4242,
             None,
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap();
 
@@ -6590,6 +6794,7 @@ mod tests {
             4242,
             None,
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap();
 
@@ -6628,6 +6833,7 @@ mod tests {
             200,
             None,
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap();
 
@@ -6646,6 +6852,7 @@ mod tests {
     /// before comparison to isolate the accept TAIL's effect.
     #[test]
     fn staged_then_accept_tail_matches_direct_auto_accept_golden() {
+        let no_revocations = crate::revoked_device_projection::RevokedDeviceProjection::new();
         for refresh in [true, false] {
             let self_owner = OwnerAddr([0xaa; 16]);
             let inviter = OwnerAddr([1; 16]);
@@ -6655,7 +6862,16 @@ mod tests {
             insert_active_friend(&mut a, inviter);
             let (signed_a, sig_a, bytes_a) = build_valid_dm_invite(self_owner);
             let out_a = apply_invite(
-                &mut a, self_owner, "dev", signed_a, sig_a, &bytes_a, 777, None, refresh,
+                &mut a,
+                self_owner,
+                "dev",
+                signed_a,
+                sig_a,
+                &bytes_a,
+                777,
+                None,
+                refresh,
+                &no_revocations,
             )
             .unwrap();
             assert!(matches!(out_a, ApplyInviteOutcome::Accepted));
@@ -6665,7 +6881,16 @@ mod tests {
             let mut b = OwnerState::default();
             let (signed_b, sig_b, bytes_b) = build_valid_dm_invite(self_owner);
             let staged = match apply_invite(
-                &mut b, self_owner, "dev", signed_b, sig_b, &bytes_b, 777, None, refresh,
+                &mut b,
+                self_owner,
+                "dev",
+                signed_b,
+                sig_b,
+                &bytes_b,
+                777,
+                None,
+                refresh,
+                &no_revocations,
             )
             .unwrap()
             {
@@ -6728,6 +6953,7 @@ mod tests {
             wall_now_ms,
             None,
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap()
         {
@@ -6785,6 +7011,7 @@ mod tests {
             wall_now_ms,
             None,
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap()
         {
@@ -6851,6 +7078,7 @@ mod tests {
             900,
             None,
             true,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap();
         let staged = match outcome {
@@ -7250,6 +7478,7 @@ mod tests {
             200,
             None,
             true, // F2 guard: cache write is sequenced after the Space apply (which rejects first)
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .unwrap_err();
         assert!(
@@ -7456,6 +7685,7 @@ mod tests {
             signature,
             signed_bytes,
             wall_now_ms,
+            crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await;
 
@@ -8131,7 +8361,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let outcome = outbox
-            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                signature,
+                &signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .expect("happy path returns Ok");
 
@@ -8143,6 +8380,47 @@ mod tests {
         let stored = state.outbox.get(&entry_id).unwrap();
         assert!(stored.delivered_to.contains(&bob));
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    /// ZEB-580 S2 (T5): defense-in-depth revocation cutoff on the dormant
+    /// `handle_ack` path — mirrors the `handle_ack` happy-path fixture
+    /// above, but with a projection that revokes the signer's (bob's) #2
+    /// device key. Must be cut off with `SignerDeviceRevoked` rather than
+    /// delivering the ack.
+    #[tokio::test]
+    async fn handle_ack_from_revoked_device2_is_cut_off() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let message_cid = ContentId::from_bytes([0xee; 32]);
+        let (mut state, signed, signature, signed_bytes, entry_id) =
+            build_handle_ack_fixture(alice, bob, space_id, message_cid);
+
+        // Bob's ed25519 half, derived the same way `build_handle_ack_fixture`
+        // derives `bob_identity_pub` (same fixed seed).
+        let bob_identity_pub = harmony_identity::PrivateIdentity::from_seed(&[0x77; 32])
+            .public_identity()
+            .to_public_bytes();
+        let bob_ed25519: [u8; 32] = bob_identity_pub[32..64].try_into().unwrap();
+
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        revoked.union_from_members(std::iter::once((
+            bob,
+            &std::collections::BTreeSet::from([bob_ed25519]),
+        )));
+
+        let mut outbox = make_outbox_synthetic("alice-dev", alice);
+        let err = outbox
+            .handle_ack(&mut state, signed, signature, &signed_bytes, 500, &revoked)
+            .await
+            .expect_err("ack from revoked device dropped");
+        assert_eq!(err, DmReceiveError::SignerDeviceRevoked);
+
+        // delivered_to must still be empty — the cutoff fired before
+        // mark_ack_delivered.
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(stored.delivered_to.is_empty());
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
     }
 
     #[tokio::test]
@@ -8165,7 +8443,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let err = outbox
-            .handle_ack(&mut state, signed, new_signature, &new_signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                new_signature,
+                &new_signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -8220,7 +8505,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let err = outbox
-            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                signature,
+                &signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -8247,7 +8539,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let err = outbox
-            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                signature,
+                &signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -8287,7 +8586,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let err = outbox
-            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                signature,
+                &signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -9096,6 +9402,7 @@ mod tests {
             signature,
             signed_bytes,
             500,
+            crate::revoked_device_projection::RevokedDeviceProjection::new(),
         ));
 
         // Let Phase A run + drop its locks. Phase A is microsecond-
@@ -9204,6 +9511,7 @@ mod tests {
             signature,
             signed_bytes,
             500,
+            crate::revoked_device_projection::RevokedDeviceProjection::new(),
         ));
 
         gated.wait_for_phase_b().await;
@@ -9374,6 +9682,7 @@ mod tests {
             signature,
             signed_bytes,
             500,
+            crate::revoked_device_projection::RevokedDeviceProjection::new(),
         ));
 
         gated.wait_for_phase_b().await;
@@ -9574,6 +9883,7 @@ mod tests {
             signature,
             signed_bytes,
             500,
+            crate::revoked_device_projection::RevokedDeviceProjection::new(),
         )
         .await;
 
@@ -10295,6 +10605,164 @@ mod tests {
             "entry stays Pending without a deposit client, never errored"
         );
         assert!(stored.delivered_to.is_empty());
+    }
+
+    // ── ZEB-580 S2 (T3): CidNotify signer-device revocation cutoff ─────────
+
+    /// Minimal synchronous fixture for `verify_cidnotify_sender_binding`
+    /// tests — the sender-binding-only slice of `build_cidnotify_fixture`
+    /// (Phase 3b Task 10), dropping the Space/CAS/message-encryption
+    /// machinery `verify_cidnotify_sender_binding` never touches (that's
+    /// `verify_cidnotify_space`'s job). Returns `(state, signed, signature,
+    /// signed_bytes, owner, combined_pub)`: `owner` is the signed-origin-
+    /// resolved sender, `combined_pub` her cached 64-byte identity pub
+    /// (X25519 || Ed25519) — `combined_pub[32..64]` is the ed25519 half the
+    /// cutoff checks against the revoked-device projection.
+    fn cidnotify_verify_fixture_with_seed(
+        alice_seed: u8,
+    ) -> (
+        OwnerState,
+        crate::dm_envelope::DmCidNotifySigned,
+        [u8; 64],
+        Vec<u8>,
+        OwnerAddr,
+        [u8; 64],
+    ) {
+        let alice = OwnerAddr([alice_seed; 16]);
+        let space_id = SpaceId([0x5A; 16]);
+
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[alice_seed; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_identity_pub = alice_pub_id.to_public_bytes();
+        let alice_device_hash = DeviceIdentityHash(alice_pub_id.address_hash);
+
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            vec![],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        let message_cid = harmony_content::cid::ContentId::for_book(
+            b"cidnotify-cutoff-fixture-body",
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+
+        (
+            state,
+            signed,
+            signature,
+            signed_bytes,
+            alice,
+            alice_identity_pub,
+        )
+    }
+
+    /// The revocable case: a cached signer whose ed25519 half CAN be placed
+    /// in the revoked set (mirrors an enrolled #2 device key).
+    fn cidnotify_verify_fixture() -> (
+        OwnerState,
+        crate::dm_envelope::DmCidNotifySigned,
+        [u8; 64],
+        Vec<u8>,
+        OwnerAddr,
+        [u8; 64],
+    ) {
+        cidnotify_verify_fixture_with_seed(0xA1)
+    }
+
+    /// The no-downgrade-hole case: a DIFFERENT cached signer, standing in for
+    /// a legacy #3 identity key. `verify_cidnotify_sender_binding` runs the
+    /// UNIFORM cutoff check on whatever ed25519 half is cached — a #3 key is
+    /// simply never a member of `revoked_device_keys` (community enrollment
+    /// only ever revokes #2 keys), so this fixture demonstrates the no-op: a
+    /// signer whose own key isn't in the revoked set is admitted even when
+    /// the projection is non-empty for the same owner.
+    fn cidnotify_verify_fixture_device3() -> (
+        OwnerState,
+        crate::dm_envelope::DmCidNotifySigned,
+        [u8; 64],
+        Vec<u8>,
+        OwnerAddr,
+        [u8; 64],
+    ) {
+        cidnotify_verify_fixture_with_seed(0xC3)
+    }
+
+    #[test]
+    fn cidnotify_from_revoked_device2_is_cut_off() {
+        // Build state with a cached #2 signer whose ed25519 the projection revokes.
+        let (state, signed, signature, signed_bytes, owner, combined_pub) =
+            cidnotify_verify_fixture();
+        let ed25519: [u8; 32] = combined_pub[32..64].try_into().unwrap();
+
+        // Empty projection -> admitted.
+        let clean = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        assert!(verify_cidnotify_sender_binding(
+            &state,
+            &signed,
+            &signature,
+            &signed_bytes,
+            &clean
+        )
+        .is_ok());
+
+        // Revoked projection -> SignerDeviceRevoked.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        revoked.union_from_members(std::iter::once((
+            owner,
+            &std::collections::BTreeSet::from([ed25519]),
+        )));
+        let err =
+            verify_cidnotify_sender_binding(&state, &signed, &signature, &signed_bytes, &revoked)
+                .expect_err("revoked signer must be cut off");
+        assert_eq!(err, DmReceiveError::SignerDeviceRevoked);
+    }
+
+    #[test]
+    fn cidnotify_cutoff_admits_non_revoked_key_of_revoked_owner() {
+        // A #3 signer's cached combined pub — its ed25519 half is a #3
+        // identity key, which is never an enrolled #2 key and so can never be
+        // in revoked_device_keys. Even with a non-empty projection for the
+        // owner, a #3 packet is admitted. (The verify boundary sees only a
+        // cached 64-byte pub and cannot structurally distinguish #2 from #3;
+        // what this pins is that a key ABSENT from a revoked owner's set is
+        // admitted — guarding against a per-owner blanket drop / over-rejection
+        // — which is exactly the no-downgrade-hole property for legacy #3.)
+        let (state, signed, signature, signed_bytes, owner, _combined3) =
+            cidnotify_verify_fixture_device3();
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        // Revoke some OTHER key for the same owner (a #2 key that isn't this
+        // #3 signer).
+        revoked.union_from_members(std::iter::once((
+            owner,
+            &std::collections::BTreeSet::from([[0x99; 32]]),
+        )));
+        assert!(
+            verify_cidnotify_sender_binding(&state, &signed, &signature, &signed_bytes, &revoked)
+                .is_ok(),
+            "legacy #3 signer is not subject to the cutoff (no downgrade hole)"
+        );
     }
 }
 
