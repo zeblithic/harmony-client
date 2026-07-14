@@ -38,6 +38,23 @@ fn persist_peer_seed(identity_dir: &Path, endpoint: &Option<([u8; 32], String)>)
     }
 }
 
+/// ZEB-510: drop any fleet-peer-seed doc left in `identity_dir` by a PRIOR
+/// identity. A Joiner install is a fresh identity binding (its `owner_state`
+/// master seed and fleet KeyTree are already cleared in
+/// [`install_joiner_state_inner`]), so former-owner peer endpoints must not
+/// survive to be fed into the resolver at boot. Best-effort; missing file is a
+/// no-op. Mirrors the `master_seed == None` / `clear_fleet_keytree` clears.
+fn clear_peer_seed(identity_dir: &Path) {
+    let path = identity_dir.join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "ZEB-510: failed to clear stale fleet-peer-seed on Joiner install");
+        }
+    }
+}
+
 /// Persist the Joiner's signing key + OwnerState to disk. Mirrors the
 /// atomicity contract from ZEB-170: keychain first, .cbor last.
 ///
@@ -130,6 +147,11 @@ pub fn install_joiner_state_inner(
         None, // no master_seed on Joiner — clears any stale prior seed
         keychain,
     )?;
+    // ZEB-510: fresh identity binding — drop any prior identity's peer seeds
+    // (former-owner endpoints must not be fed at boot), THEN record this
+    // pairing's peer endpoint (if any). Clears even when there is no current
+    // endpoint to write.
+    clear_peer_seed(identity_dir);
     persist_peer_seed(identity_dir, &result.peer_iroh_endpoint);
     Ok(())
 }
@@ -689,6 +711,58 @@ mod tests {
         assert_eq!(
             row.home_relay, "https://peer.relay/",
             "seed row records the peer's home relay"
+        );
+    }
+
+    /// ZEB-510 (CodeRabbit round): a Joiner install is a FRESH identity binding,
+    /// so a re-pair in the same `identity_dir` must NOT retain a former identity's
+    /// peer seeds — otherwise boot would feed former-owner endpoints into the
+    /// resolver. The clear runs before the current endpoint is written.
+    #[tokio::test]
+    #[serial]
+    async fn install_joiner_clears_prior_peer_seed() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp");
+        let dir = tempdir().unwrap();
+        let seed_path = dir
+            .path()
+            .join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
+
+        // A stale seed left by a PRIOR identity in this dir.
+        persist_peer_seed(
+            dir.path(),
+            &Some(([0xEEu8; 32], "https://former-owner.relay/".into())),
+        );
+        assert!(
+            crate::fleet_peer_seed_persist::load(&seed_path)
+                .unwrap()
+                .seeds
+                .contains_key(&hex::encode([0xEEu8; 32])),
+            "precondition: stale former-owner seed present"
+        );
+
+        // A fresh Joiner install (new identity) with a NEW peer endpoint.
+        let MintResult { state, .. } = mint_owner(1_700_000_000).unwrap();
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_pubkey = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_id = joiner_pubkey.identity_hash();
+        let result = JoinerEnrollResult {
+            our_signing_key: joiner_sk,
+            owner_state: state,
+            our_device_id: joiner_id,
+            fleet_keytree: None,
+            peer_iroh_endpoint: Some(([0x22u8; 32], "https://peer.relay/".into())),
+        };
+        install_joiner_state_inner(dir.path(), result, None, None).unwrap();
+
+        // The stale former-owner seed is GONE; only the current pairing's seed remains.
+        let doc = crate::fleet_peer_seed_persist::load(&seed_path).unwrap();
+        assert!(
+            !doc.seeds.contains_key(&hex::encode([0xEEu8; 32])),
+            "former-owner seed must be cleared on a fresh Joiner identity binding"
+        );
+        assert!(
+            doc.seeds.contains_key(&hex::encode([0x22u8; 32])),
+            "current pairing's seed is written after the clear"
         );
     }
 

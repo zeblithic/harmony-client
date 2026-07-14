@@ -12076,43 +12076,69 @@ pub async fn start_node_inner(
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .map(|d| d.as_millis() as u64)
                                             .unwrap_or(0);
-                                        {
+                                        let changed = {
                                             let mut doc = doc_arc.lock().await;
-                                            let feed_binding = doc
-                                                .devices
-                                                .get(dev_hex)
-                                                .and_then(|r| r.feed_binding.clone());
-                                            doc.devices.insert(
-                                                dev_hex.clone(),
-                                                crate::fleet_net::FleetNetRow {
-                                                    iroh_endpoint_id: *node_id,
-                                                    home_relay: relay.clone(),
-                                                    seen_at: crate::owner_state_types::Hlc {
-                                                        wall_ms: now_ms,
-                                                        logical: 0,
-                                                        device_id: dev_hex.clone(),
-                                                    },
-                                                    feed_binding,
+                                            let existing = doc.devices.get(dev_hex);
+                                            let feed_binding =
+                                                existing.and_then(|r| r.feed_binding.clone());
+                                            // The SAS handshake may observe an EMPTY
+                                            // home_relay (relay unresolved at pairing);
+                                            // that must not clobber a non-empty relay
+                                            // already on a genuine synced row. Preserve
+                                            // the known-good relay when ours is empty.
+                                            let home_relay = if relay.is_empty() {
+                                                existing
+                                                    .map(|r| r.home_relay.clone())
+                                                    .unwrap_or_default()
+                                            } else {
+                                                relay.clone()
+                                            };
+                                            let new_row = crate::fleet_net::FleetNetRow {
+                                                iroh_endpoint_id: *node_id,
+                                                home_relay,
+                                                seen_at: crate::owner_state_types::Hlc {
+                                                    wall_ms: now_ms,
+                                                    logical: 0,
+                                                    device_id: dev_hex.clone(),
                                                 },
-                                            );
-                                            *snap_arc.write().unwrap_or_else(|p| p.into_inner()) =
-                                                doc.clone();
-                                        }
-                                        sync_arc.notify_dirty();
-                                        tracing::info!(
-                                            sibling = %dev_hex,
-                                            relay_empty = relay.is_empty(),
-                                            "ZEB-510 step 3: upserted paired sibling endpoint into FleetNetDoc advert"
-                                        );
-                                        let flush = std::sync::Arc::clone(sync_arc);
-                                        tokio::spawn(async move {
-                                            if let Err(e) = flush.flush_now().await {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "ZEB-510 step 3: fleet-net sibling-seed flush failed; debounced publisher will retry"
-                                                );
+                                                feed_binding,
+                                            };
+                                            // No-op when the advertised fields already
+                                            // match (avoid a needless advert republish +
+                                            // flush); `seen_at` is excluded from equality.
+                                            let unchanged = existing.is_some_and(|r| {
+                                                r.iroh_endpoint_id == new_row.iroh_endpoint_id
+                                                    && r.home_relay == new_row.home_relay
+                                                    && r.feed_binding == new_row.feed_binding
+                                            });
+                                            if unchanged {
+                                                false
+                                            } else {
+                                                doc.devices.insert(dev_hex.clone(), new_row);
+                                                *snap_arc
+                                                    .write()
+                                                    .unwrap_or_else(|p| p.into_inner()) =
+                                                    doc.clone();
+                                                true
                                             }
-                                        });
+                                        };
+                                        if changed {
+                                            sync_arc.notify_dirty();
+                                            tracing::info!(
+                                                sibling = %dev_hex,
+                                                relay_empty = relay.is_empty(),
+                                                "ZEB-510 step 3: upserted paired sibling endpoint into FleetNetDoc advert"
+                                            );
+                                            let flush = std::sync::Arc::clone(sync_arc);
+                                            tokio::spawn(async move {
+                                                if let Err(e) = flush.flush_now().await {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "ZEB-510 step 3: fleet-net sibling-seed flush failed; debounced publisher will retry"
+                                                    );
+                                                }
+                                            });
+                                        }
                                     }
                                     // ZEB-510 step 4: also seed owner_device_cache —
                                     // a SEPARATE CRDT store from FleetNetDoc above —

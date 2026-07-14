@@ -460,8 +460,15 @@ pub(crate) fn seed_sibling_device_cache(
             ),
             None => (Vec::new(), Vec::new(), Vec::new(), None),
         };
-    if devices.contains(&hash) {
-        return false; // already present — idempotent
+    // Idempotent only when the sibling is already present WITH its identity pub.
+    // If the hash exists but its aligned pub is `None` (a Path-B "known by hash,
+    // pub not yet propagated" state), fall through and re-add: `vk_lookup` only
+    // resolves devices carrying `Some(pub)`, and `apply_owner_device_update`'s
+    // Some-over-None dedup then fills the pub without duplicating the device.
+    if let Some(idx) = devices.iter().position(|d| *d == hash) {
+        if pubs.get(idx).is_some_and(|p| p.is_some()) {
+            return false; // present with pub — true no-op
+        }
     }
     devices.push(hash);
     pubs.push(Some(identity_pub));
