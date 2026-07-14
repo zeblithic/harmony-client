@@ -87,6 +87,17 @@ pub enum ReachabilitySource {
     DurableCrdt,
     /// Fetched live from the recipient's pkarr routing blob.
     PkarrLive,
+    /// ZEB-510: a same-owner fleet sibling's iroh endpoint. Fed from two
+    /// verification-exempt sources, each carrying a zero-filled
+    /// `identity_signature` (the ingest boundary is the trust boundary, not a
+    /// per-record signature): (1) step 1 — the owner's durable `FleetNetDoc`
+    /// (fleet_net.cbor), whose boundary is fleet-net's symmetric-key decrypt;
+    /// (2) step 2 — the `fleet_peer_seed` store, whose boundary is the
+    /// SAS-authenticated pairing channel the endpoint was observed on. The step-1
+    /// FleetNetDoc row supersedes a step-2 seed for the same node via LWW once it
+    /// exists (same stable node_id either way). Never present in `self_owner`'s
+    /// pkarr blob (that is the deferred ZEB-513 cross-WAN path).
+    FleetSibling,
 }
 
 impl ReachabilitySource {
@@ -97,6 +108,7 @@ impl ReachabilitySource {
         match self {
             ReachabilitySource::DurableCrdt => "durableCrdt",
             ReachabilitySource::PkarrLive => "pkarrLive",
+            ReachabilitySource::FleetSibling => "fleetSibling",
         }
     }
 }
@@ -136,30 +148,51 @@ pub struct ResolverEntry {
 struct ResolverSlots {
     durable: Option<ResolverEntry>,
     pkarr: Option<ResolverEntry>,
+    /// ZEB-510: same-owner fleet-sibling endpoint, seeded from `FleetNetDoc`.
+    /// A DISTINCT slot (not `durable`) because a sibling that is also a shared-
+    /// community co-member lands its community `DurableCrdt` record under the
+    /// SAME resolver key `(self_owner, sibling_node_id)`; sharing a slot would
+    /// let the two sources clobber each other, breaking the per-source-slot
+    /// invariant this dual/tri-slot storage exists to protect.
+    fleet: Option<ResolverEntry>,
 }
 
 impl ResolverSlots {
     /// Dial authority: the entry whose payload was announced most recently
     /// (greater `effective_announced_at_ms` — the future-skew-clamped announce
-    /// time, ZEB-621); ties resolve to the durable slot. `None` only for an empty
-    /// pair (never stored — `update_with_source` writes at least one slot before
-    /// any entry lands in the map).
+    /// time, ZEB-621). Ties break by source authority (durable > pkarr > fleet)
+    /// so a verified community record still wins a tie against an unsigned
+    /// fleet-sibling one, and the result is deterministic. `None` only for an
+    /// empty triple (never stored — `update_with_source` writes at least one
+    /// slot before any entry lands in the map).
     fn freshest(&self) -> Option<&ResolverEntry> {
-        match (&self.durable, &self.pkarr) {
-            (Some(d), Some(p)) => {
-                if p.effective_announced_at_ms > d.effective_announced_at_ms {
-                    Some(p)
-                } else {
-                    Some(d)
-                }
+        fn rank(s: ReachabilitySource) -> u8 {
+            match s {
+                ReachabilitySource::DurableCrdt => 2,
+                ReachabilitySource::PkarrLive => 1,
+                ReachabilitySource::FleetSibling => 0,
             }
-            (Some(d), None) => Some(d),
-            (None, Some(p)) => Some(p),
-            (None, None) => None,
         }
+        [
+            self.durable.as_ref(),
+            self.pkarr.as_ref(),
+            self.fleet.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .max_by(|a, b| {
+            a.effective_announced_at_ms
+                .cmp(&b.effective_announced_at_ms)
+                .then_with(|| rank(a.source).cmp(&rank(b.source)))
+        })
     }
 
     /// Butler / diagnostics authority: the durable slot if present, else pkarr.
+    /// ZEB-510: the `fleet` slot is deliberately EXCLUDED — fleet entries carry
+    /// an empty `butler_set` and are dial-only, so they must not shape the
+    /// butler-set / diagnostics view. (Excluding them here also keeps a stale
+    /// fleet entry out of the `maybe_refresh_stale` pkarr path when a key has no
+    /// durable/pkarr slot at all.)
     fn durable_preferred(&self) -> Option<&ResolverEntry> {
         self.durable.as_ref().or(self.pkarr.as_ref())
     }
@@ -354,7 +387,7 @@ impl ReachabilityResolver {
                 wall_ms: hlc.wall_ms.min(skew_ceiling),
                 ..hlc
             },
-            ReachabilitySource::DurableCrdt => hlc,
+            ReachabilitySource::DurableCrdt | ReachabilitySource::FleetSibling => hlc,
         };
         let next = ResolverEntry {
             payload,
@@ -374,12 +407,13 @@ impl ReachabilityResolver {
         // `addr_key` (ZEB-621 M1), not a full `payload.clone()`: that is all the
         // gate compares, and it keeps the butler_set / signature copies off every
         // CRDT apply and pkarr cache-back.
-        let was_present = slots.durable.is_some() || slots.pkarr.is_some();
+        let was_present = slots.durable.is_some() || slots.pkarr.is_some() || slots.fleet.is_some();
         let before_view = slots.freshest().map(|e| addr_key(&e.payload));
         // Each source writes ONLY its own slot; same-source replacement is LWW.
         let target = match source {
             ReachabilitySource::DurableCrdt => &mut slots.durable,
             ReachabilitySource::PkarrLive => &mut slots.pkarr,
+            ReachabilitySource::FleetSibling => &mut slots.fleet,
         };
         let do_replace = match target.as_ref() {
             Some(prev) => lww_newer(prev, &next),
@@ -515,6 +549,14 @@ impl ReachabilityResolver {
         let Some((_, entry)) = self.resolve_entry_by_node_id(&node_id) else {
             return;
         };
+        // ZEB-510: a fleet-sibling entry is a same-owner LAN/fleet-net record,
+        // never present in `self_owner`'s pkarr blob. A pkarr re-resolve for
+        // `self_owner` would fetch P's OWN record (or no-op), never the
+        // sibling's endpoint — so never refresh a fleet entry here. (Cross-WAN
+        // sibling rendezvous over pkarr is the deferred ZEB-513 path.)
+        if entry.source == ReachabilitySource::FleetSibling {
+            return;
+        }
         match now_ms.checked_sub(entry.effective_announced_at_ms) {
             Some(age) if age <= STALE_RECORD_REFRESH_MS => return, // fresh
             _ => {} // stale (older than the window) or implausibly future-dated
@@ -1990,5 +2032,157 @@ mod fallback_tests {
             "fan-out bounded to {} (observed peak {observed_peak})",
             PKARR_REFRESH_MAX_CONCURRENT
         );
+    }
+
+    #[test]
+    fn fleet_sibling_dto_tag() {
+        assert_eq!(
+            ReachabilitySource::FleetSibling.as_dto_str(),
+            "fleetSibling"
+        );
+    }
+
+    #[test]
+    fn fleet_sibling_entry_is_dialable_via_node_id_and_freshest() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0x51; 16]);
+        let payload = make_payload(0xB2, 5000);
+        r.update_with_source(
+            owner,
+            payload.clone(),
+            Hlc {
+                wall_ms: 5000,
+                logical: 0,
+                device_id: String::new(),
+            },
+            ReachabilitySource::FleetSibling,
+        );
+        // Dial authority: resolvable by node id (uses freshest()).
+        let (got_owner, got) = r
+            .resolve_by_node_id(&payload.iroh_node_id)
+            .expect("fleet entry resolvable by node id");
+        assert_eq!(got_owner, owner);
+        assert_eq!(got.iroh_node_id, payload.iroh_node_id);
+        // Butler/diagnostics authority (durable_preferred) excludes fleet:
+        // fleet rows carry an empty butler_set and must not shape butler views.
+        assert!(
+            r.resolve(&owner).is_empty(),
+            "fleet-only key must not surface via durable_preferred resolve()"
+        );
+    }
+
+    #[test]
+    fn fleet_and_durable_slots_coexist_without_clobber_on_same_key() {
+        // A sibling that is ALSO a shared-community co-member: its community
+        // DurableCrdt record and its FleetSibling record share the SAME key
+        // (self_owner, node_id). Distinct slots must keep both.
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0x77; 16]);
+        let node = 0xAB;
+        let durable = make_payload(node, 100);
+        let fleet = make_payload(node, 200); // fresher announce
+        assert_eq!(durable.iroh_node_id, fleet.iroh_node_id, "same key");
+
+        r.update_with_source(
+            owner,
+            durable.clone(),
+            Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            ReachabilitySource::DurableCrdt,
+        );
+        r.update_with_source(
+            owner,
+            fleet.clone(),
+            Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: String::new(),
+            },
+            ReachabilitySource::FleetSibling,
+        );
+
+        // freshest() (dial) = the fresher fleet record.
+        let (_, freshest) = r
+            .resolve_by_node_id(&fleet.iroh_node_id)
+            .expect("resolvable");
+        assert_eq!(freshest.announced_at_ms, 200);
+        // durable_preferred() (butler/diag) still returns the durable record —
+        // proof the fleet write did NOT clobber the durable slot.
+        let diag = r.resolve(&owner);
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].announced_at_ms, 100);
+    }
+
+    // Reuses the `CountingFallback` defined above (`payloads: Vec::new()` — this
+    // test only cares about call count, not the returned records).
+    #[tokio::test]
+    async fn maybe_refresh_stale_skips_fleet_sibling_but_fires_for_durable() {
+        let r = ReachabilityResolver::new();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&calls),
+            payloads: Vec::new(),
+        }));
+
+        // A deliberately STALE fleet entry (announced far in the past).
+        let owner_f = OwnerAddr([0xF1; 16]);
+        let fleet = make_payload(0xF1, 1_000);
+        r.update_with_source(
+            owner_f,
+            fleet.clone(),
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: String::new(),
+            },
+            ReachabilitySource::FleetSibling,
+        );
+        // now_ms far past the staleness window; every OTHER early-return
+        // condition (record present, fallback installed, cooldown fresh) is
+        // satisfied, so a non-zero count could ONLY come from a missing guard.
+        r.maybe_refresh_stale(
+            owner_f,
+            fleet.iroh_node_id,
+            1_000 + STALE_RECORD_REFRESH_MS + 1,
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "fleet-sibling stale entry must not trigger a pkarr re-resolve"
+        );
+
+        // Positive control: a stale DURABLE entry DOES trigger the refresh.
+        let owner_d = OwnerAddr([0xD1; 16]);
+        let durable = make_payload(0xD1, 1_000);
+        r.update_with_source(
+            owner_d,
+            durable.clone(),
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            ReachabilitySource::DurableCrdt,
+        );
+        r.maybe_refresh_stale(
+            owner_d,
+            durable.iroh_node_id,
+            1_000 + STALE_RECORD_REFRESH_MS + 1,
+        );
+        let mut fired = false;
+        for _ in 0..200 {
+            if calls.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                fired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(fired, "durable stale entry must trigger a pkarr re-resolve");
     }
 }

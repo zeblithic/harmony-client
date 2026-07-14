@@ -1812,46 +1812,31 @@ async fn s7_butler_deposit_recover() {
         .await
         .expect("a send_dm accepted by the engine");
 
-    // --- Boundary 2 (HELD, characterized): B2 holds the deposit for P while P is
-    //     offline. Generous budget — deposit fires only after DEPOSIT_NOACK_WINDOWS=2.
-    let held = poll_until(Duration::from_secs(120), || async {
+    // --- Boundary 2 (HELD, HARD ASSERT — ZEB-510 step 1): B2 holds the deposit
+    //     for P while P is offline. Generous budget — deposit fires only after
+    //     DEPOSIT_NOACK_WINDOWS=2.
+    //
+    // ZEB-510 (step 1): P now seeds sibling B2's iroh endpoint into its dial
+    // resolver from the persisted FleetNetDoc (FleetNetDoc→ReachabilityResolver
+    // wiring), so P's published butler-set reaches B2 and A's deposit lands on
+    // B2. HARD ASSERT — if this times out, step 1 alone did not converge
+    // fleet-net co-located and the step-2 SAS first-contact seed is required. Do
+    // NOT weaken this assert back to a soft characterize: the timeout IS the
+    // step-1-vs-step-2 gate signal (design doc §"The step-1-vs-step-2 gate").
+    let held_entry = poll_until(Duration::from_secs(120), || async {
         let entries = get_butler_held(&b2).await?;
         Ok(entries
             .into_iter()
             .find(|e| e.get("senderOwnerHex").and_then(Value::as_str) == Some(a_owner.as_str())))
     })
-    .await;
-
-    let held_entry = match held {
-        Ok(e) => e,
-        Err(e) => {
-            // s7 HELD characterized: P's published butler-set carries a stale/wrong
-            // B2 iroh endpoint, so A dials the wrong place and the deposit never
-            // reaches B2. Root cause (artifact logs): the fleet-net P<->B2 endpoint
-            // propagation never converges co-located — P never learns B2's actual
-            // iroh endpoint (its fleet-sync content-fetch from B2 fails over the
-            // same co-located transport class as ZEB-509), so the butler-set entry
-            // for B2's vk carries P's own endpoint instead of B2's. Durable
-            // seal-target RESOLUTION is proven (REACHABILITY barrier above; A
-            // resolves P's durable B2 butler-set and attempts the butler-deposit
-            // dial — not SkippedNoFreshButlerSet). Cross-WAN two-machine (ZEB-477)
-            // is the authoritative butler-rung deposit proof. See ZEB-510.
-            eprintln!(
-                "S7 FINDING (ZEB-510): butler deposit not observed on B2 within 120s \
-                 co-located ({e}). A resolved P's durable butler-set and dialed \
-                 (resolution proven), but P's published butler-set carries a \
-                 stale/wrong B2 iroh endpoint — P never learned B2's endpoint \
-                 co-located (fleet-net P<->B2 endpoint propagation gap; fleet-sync \
-                 content-fetch fails over the co-located transport). Cross-WAN \
-                 Scenario D3 (ZEB-477) is the proof. Skipping HELD/RECV/CLEARED. \
-                 (The preserved error distinguishes a poll_until timeout — deposit \
-                 never landed — from a get_butler_held RPC/contract error.)"
-            );
-            run.mark_success();
-            drop((a, p, b2, a_home, p_home, b2_home));
-            return;
-        }
-    };
+    .await
+    .expect(
+        "S7 HELD (ZEB-510): B2 must hold A's deposit for P within 120s co-located — \
+         P should have learned B2's iroh endpoint via the FleetNetDoc->resolver wiring",
+    );
+    // RESIDUAL (ZEB-510 step 1): RECV/CLEARED below remain soft-characterize
+    // fallbacks — the recover half (B2->P handoff) is validated cross-WAN by
+    // Scenario D3; promote them in a follow-up if they pass co-located.
     let held_space = held_entry
         .get("spaceIdHex")
         .and_then(Value::as_str)

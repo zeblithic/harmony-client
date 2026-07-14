@@ -103,6 +103,7 @@ async fn end_to_end_pair_two_devices() {
             fleet_keytree: None,
             quorum_ctx: None,
             fleet_current_epoch: 0,
+            local_iroh_endpoint: None,
         })
         .await
         .unwrap();
@@ -111,6 +112,7 @@ async fn end_to_end_pair_two_devices() {
         .send(PairingCommand::StartJoiner {
             display_name: "AVALON".to_string(),
             signing_key: joiner_sk.clone(),
+            local_iroh_endpoint: None,
         })
         .await
         .unwrap();
@@ -300,6 +302,7 @@ async fn end_to_end_persists_state_to_disk() {
             fleet_keytree: None,
             quorum_ctx: None,
             fleet_current_epoch: 0,
+            local_iroh_endpoint: None,
         })
         .await
         .unwrap();
@@ -308,6 +311,7 @@ async fn end_to_end_persists_state_to_disk() {
         .send(PairingCommand::StartJoiner {
             display_name: "AVALON".to_string(),
             signing_key: joiner_sk,
+            local_iroh_endpoint: None,
         })
         .await
         .unwrap();
@@ -548,6 +552,7 @@ async fn network_drop_during_enroll() {
             fleet_keytree: None,
             quorum_ctx: None,
             fleet_current_epoch: 0,
+            local_iroh_endpoint: None,
         })
         .await
         .unwrap();
@@ -556,6 +561,7 @@ async fn network_drop_during_enroll() {
         .send(PairingCommand::StartJoiner {
             display_name: "AVALON".to_string(),
             signing_key: joiner_sk,
+            local_iroh_endpoint: None,
         })
         .await
         .unwrap();

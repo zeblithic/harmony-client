@@ -179,6 +179,8 @@ pub mod feed_authority;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
 pub mod fleet_net_persist;
+pub mod fleet_peer_seed;
+pub mod fleet_peer_seed_persist;
 pub mod fleet_sync;
 pub mod folder_ingest;
 pub mod folders;
@@ -5665,6 +5667,74 @@ pub async fn start_node_inner(
                             });
                         }
                     }
+                    // ZEB-510: seed same-owner fleet siblings' iroh endpoints
+                    // into the reachability resolver so P can dial a butler
+                    // sibling B2 for async-DM deposits. `fleet_net.cbor` already
+                    // persists each enrolled sibling's endpoint (consumed today
+                    // only to build the pkarr butler-set advert) — this is the
+                    // missing wire from that durable doc to the dialer. The self
+                    // row is excluded (never dial ourselves). Mirrors the
+                    // ReachabilityAnnounce boot-replay further below (~7912).
+                    {
+                        let siblings = {
+                            let doc = fleet_net_doc.lock().await;
+                            crate::fleet_net::sibling_rows(&doc, &device_id)
+                        };
+                        for (_dev_id, row) in siblings {
+                            reachability_resolver.update_with_source(
+                                self_owner,
+                                crate::fleet_net::sibling_reachability_payload(&row),
+                                row.seen_at.clone(),
+                                crate::reachability_resolver::ReachabilitySource::FleetSibling,
+                            );
+                        }
+                    }
+                    // ZEB-510 step 2: feed SAS first-contact seeds into the
+                    // resolver so P can dial a freshly-paired sibling BEFORE
+                    // fleet-net has ever converged. A real FleetNetDoc row for
+                    // the same node (fed by the step-1 hook above) supersedes a
+                    // seed via LWW once it exists; correctness does not depend on
+                    // the ordering (same stable node_id either way).
+                    {
+                        let self_node_id = iroh_endpoint_arc
+                            .as_ref()
+                            .map(|ep| *ep.node_id().as_bytes());
+                        let seed_path = identity_dir
+                            .join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
+                        // Best-effort (mirrors the write side in
+                        // pairing/persist.rs::persist_peer_seed): a transient read
+                        // failure of this accelerator store must NOT abort boot —
+                        // the device simply proceeds without the seed and gains
+                        // sibling reachability once fleet-net converges (the
+                        // pre-step-2 behavior). load_doc_or_recover already
+                        // self-heals a corrupt file to default(), so only a
+                        // transient I/O error reaches the Err arm.
+                        match crate::fleet_peer_seed_persist::load_doc_or_recover(&seed_path) {
+                            Ok(seed_doc) => {
+                                for row in seed_doc.seeds.values() {
+                                    if Some(row.iroh_node_id) == self_node_id {
+                                        continue; // never seed ourselves
+                                    }
+                                    reachability_resolver.update_with_source(
+                                        self_owner,
+                                        crate::fleet_peer_seed::seed_reachability_payload(row),
+                                        crate::owner_state_types::Hlc {
+                                            wall_ms: row.observed_at_ms,
+                                            logical: 0,
+                                            device_id: String::new(),
+                                        },
+                                        crate::reachability_resolver::ReachabilitySource::FleetSibling,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "fleet-peer-seed load failed at boot; skipping dial-seed feed (sibling reachability will arrive on fleet-net convergence)"
+                                );
+                            }
+                        }
+                    }
                     fleet_net_doc_opt = Some(std::sync::Arc::clone(&fleet_net_doc));
                     fleet_net_tracker_opt = Some(std::sync::Arc::clone(&fleet_net_tracker));
                     fleet_net_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_net_sync));
@@ -9066,6 +9136,11 @@ pub async fn start_node_inner(
                         // ZEB-668 S4: event sink for the petname live-refresh
                         // emit below (same sink the trust detector emits on).
                         let task_emit = std::sync::Arc::clone(&app);
+                        // ZEB-510: feed freshly-merged sibling endpoints into
+                        // the dial resolver from inside this refresh task (the
+                        // engine's on_applied nudge fires here on every applied
+                        // remote merge).
+                        let task_resolver = reachability_resolver.clone();
                         let mut nudge_rx = fleet_net_snap_nudge_rx;
                         tokio::spawn(async move {
                             let mut prev_doc: crate::fleet_net::FleetNetDoc = task_snapshot
@@ -9083,6 +9158,22 @@ pub async fn start_node_inner(
                                             break;
                                         };
                                         let new_doc = { task_doc.lock().await.clone() };
+                                        // ZEB-510: a sibling coming online or
+                                        // changing endpoint mid-session must
+                                        // reach the dialer. Re-feed-all is
+                                        // idempotent (LWW rejects rows whose
+                                        // seen_at HLC is not strictly newer),
+                                        // and the self row is excluded.
+                                        for (_dev_id, row) in
+                                            crate::fleet_net::sibling_rows(&new_doc, &task_device_id)
+                                        {
+                                            task_resolver.update_with_source(
+                                                task_self_owner,
+                                                crate::fleet_net::sibling_reachability_payload(&row),
+                                                row.seen_at.clone(),
+                                                crate::reachability_resolver::ReachabilitySource::FleetSibling,
+                                            );
+                                        }
                                         // Re-snapshot the vk map (sequential
                                         // locks, never nested).
                                         let vk_map = {
@@ -11911,6 +12002,29 @@ pub async fn start_node_inner(
                 }
                 if let Some(mut rx) = pairing_handle.inviter_result_rx.take() {
                     let id_dir = identity_dir.clone();
+                    // ZEB-510 step 3: read the fleet-net handles from NodeState so
+                    // the inviter drainer can upsert the freshly-paired sibling's
+                    // SAS-observed endpoint into P's FleetNetDoc — the store
+                    // `build_butler_set` reads to build P's published butler-set
+                    // advert. Co-located, fleet-net sync never converges, so the
+                    // sibling row would otherwise be absent and A could not dial the
+                    // butler. (The local `fleet_net_*_opt` bindings are already
+                    // moved into the event loop by here; NodeState holds the shared
+                    // Arc handles — the same ones set_butler_pin's IPC uses.)
+                    let (fn_doc, fn_snap, fn_sync, crdt_state, owner_sync, self_owner) = {
+                        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+                        (
+                            guard.fleet_net_doc.clone(),
+                            guard.fleet_net_snapshot.clone(),
+                            guard.fleet_net_sync.clone(),
+                            // ZEB-510 step 4: crdt owner-state + its sync engine +
+                            // self owner, for the owner_device_cache sibling seed
+                            // (a SEPARATE store/engine from fleet-net above).
+                            guard.crdt_state.clone(),
+                            guard.sync_engine.clone(),
+                            guard.dm_self_owner,
+                        )
+                    };
                     tokio::spawn(async move {
                         // ZEB-491: each handoff carries a oneshot `persisted_ack`.
                         // We persist on the blocking pool, then fire the ack so the
@@ -11921,6 +12035,19 @@ pub async fn start_node_inner(
                         // restart could lose the enrollment.
                         while let Some(handoff) = rx.recv().await {
                             let id_dir = id_dir.clone();
+                            // ZEB-510 step 3: capture the sibling's fleet-net key
+                            // (hex of its enrollment ed25519 verify key — the
+                            // `FleetNetDoc.devices` key) + the SAS-observed endpoint
+                            // BEFORE `handoff.result` moves into the blocking
+                            // install. `None` endpoint (pre-step-2 peer) → no upsert.
+                            let sibling_ed =
+                                handoff.result.cert.device_pubkeys.classical.ed25519_verify;
+                            let sibling_seed: Option<(String, [u8; 32], String, [u8; 32])> =
+                                handoff.result.peer_iroh_endpoint.clone().map(
+                                    |(node_id, relay)| {
+                                        (hex::encode(sibling_ed), node_id, relay, sibling_ed)
+                                    },
+                                );
                             let outcome = tokio::task::spawn_blocking(move || {
                                 crate::pairing::persist::install_inviter_state(
                                     &id_dir,
@@ -11931,6 +12058,126 @@ pub async fn start_node_inner(
                             let ack = match outcome {
                                 Ok(Ok(())) => {
                                     tracing::info!("inviter pairing persisted successfully");
+                                    // ZEB-510 step 3: upsert the paired sibling's
+                                    // endpoint into P's FleetNetDoc via the engine
+                                    // (mirror the boot self-row upsert), so P's next
+                                    // butler-set advert carries B2's dialable
+                                    // endpoint co-located. Best-effort; a real B2
+                                    // self-row supersedes this via LWW once fleet-net
+                                    // converges (same node_id either way).
+                                    if let (
+                                        Some((dev_hex, node_id, relay, _)),
+                                        Some(doc_arc),
+                                        Some(snap_arc),
+                                        Some(sync_arc),
+                                    ) = (&sibling_seed, &fn_doc, &fn_snap, &fn_sync)
+                                    {
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        let changed = {
+                                            let mut doc = doc_arc.lock().await;
+                                            let existing = doc.devices.get(dev_hex);
+                                            let feed_binding =
+                                                existing.and_then(|r| r.feed_binding.clone());
+                                            // The SAS handshake may observe an EMPTY
+                                            // home_relay (relay unresolved at pairing);
+                                            // that must not clobber a non-empty relay
+                                            // already on a genuine synced row. Preserve
+                                            // the known-good relay when ours is empty.
+                                            let home_relay = if relay.is_empty() {
+                                                existing
+                                                    .map(|r| r.home_relay.clone())
+                                                    .unwrap_or_default()
+                                            } else {
+                                                relay.clone()
+                                            };
+                                            let new_row = crate::fleet_net::FleetNetRow {
+                                                iroh_endpoint_id: *node_id,
+                                                home_relay,
+                                                seen_at: crate::owner_state_types::Hlc {
+                                                    wall_ms: now_ms,
+                                                    logical: 0,
+                                                    device_id: dev_hex.clone(),
+                                                },
+                                                feed_binding,
+                                            };
+                                            // No-op when the advertised fields already
+                                            // match (avoid a needless advert republish +
+                                            // flush); `seen_at` is excluded from equality.
+                                            let unchanged = existing.is_some_and(|r| {
+                                                r.iroh_endpoint_id == new_row.iroh_endpoint_id
+                                                    && r.home_relay == new_row.home_relay
+                                                    && r.feed_binding == new_row.feed_binding
+                                            });
+                                            if unchanged {
+                                                false
+                                            } else {
+                                                doc.devices.insert(dev_hex.clone(), new_row);
+                                                *snap_arc
+                                                    .write()
+                                                    .unwrap_or_else(|p| p.into_inner()) =
+                                                    doc.clone();
+                                                true
+                                            }
+                                        };
+                                        if changed {
+                                            sync_arc.notify_dirty();
+                                            tracing::info!(
+                                                sibling = %dev_hex,
+                                                relay_empty = relay.is_empty(),
+                                                "ZEB-510 step 3: upserted paired sibling endpoint into FleetNetDoc advert"
+                                            );
+                                            let flush = std::sync::Arc::clone(sync_arc);
+                                            tokio::spawn(async move {
+                                                if let Err(e) = flush.flush_now().await {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "ZEB-510 step 3: fleet-net sibling-seed flush failed; debounced publisher will retry"
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    }
+                                    // ZEB-510 step 4: also seed owner_device_cache —
+                                    // a SEPARATE CRDT store from FleetNetDoc above —
+                                    // so build_butler_set's vk_lookup resolves the
+                                    // sibling. Without it the advert SKIPS the sibling
+                                    // ("vk_lookup unresolved") even with a perfect
+                                    // endpoint row. Same endpoint gate as step 3: with
+                                    // no FleetNetDoc row the sibling isn't in the
+                                    // butler-set order, so vk_lookup is never consulted.
+                                    if let (
+                                        Some((_, _, _, sib_ed)),
+                                        Some(crdt_arc),
+                                        Some(owner_sync_arc),
+                                        Some(self_owner),
+                                    ) = (&sibling_seed, &crdt_state, &owner_sync, self_owner)
+                                    {
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        let applied = {
+                                            let mut st = crdt_arc.lock().await;
+                                            crate::fleet_net::seed_sibling_device_cache(
+                                                &mut st, self_owner, *sib_ed, now_ms,
+                                            )
+                                        };
+                                        if applied {
+                                            owner_sync_arc.notify_dirty();
+                                            let flush = std::sync::Arc::clone(owner_sync_arc);
+                                            tokio::spawn(async move {
+                                                if let Err(e) = flush.flush_now().await {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "ZEB-510 step 4: owner-state sibling-seed flush failed; debounced publisher will retry"
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    }
                                     Ok(())
                                 }
                                 Ok(Err(e)) => {

@@ -509,6 +509,10 @@ pub(crate) fn freshest_butler_set_by_source(
                 ReachabilitySource::PkarrLive => {
                     crate::reachability_record::fresh_butler_set(b, now_ms)
                 }
+                // ZEB-510: fleet-sibling records are dial-only (empty
+                // butler_set by construction) and never shape the butler
+                // view — see ResolverSlots::durable_preferred.
+                ReachabilitySource::FleetSibling => Vec::new(),
             };
             (b.bs_at, set)
         })

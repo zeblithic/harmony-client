@@ -344,6 +344,44 @@ pub fn selection_view(
         .collect()
 }
 
+/// ZEB-510: project a durable fleet-net device row into a dial-target
+/// reachability payload for the [`crate::reachability_resolver::ReachabilityResolver`].
+///
+/// The row's `iroh_endpoint_id` becomes the payload's `iroh_node_id` (the
+/// resolver keys on it). The payload is **verification-exempt**: `identity_
+/// signature` is zero-filled because the trust boundary for a fleet row is
+/// fleet-net's symmetric-key decrypt (only an enrolled sibling holding the
+/// owner's fleet KeyTree produces a decryptable row), not a per-record
+/// identity signature. `butler_set`/`bs_at` are empty — a sibling is a dial
+/// target here, not advertising its own butlers — and `direct_addresses` is
+/// empty because node-id-based dialing holepunches/relays (fleet rows carry no
+/// direct addrs).
+pub fn sibling_reachability_payload(
+    row: &FleetNetRow,
+) -> crate::reachability_record::ReachabilityAnnouncePayload {
+    crate::reachability_record::ReachabilityAnnouncePayload {
+        iroh_node_id: row.iroh_endpoint_id,
+        home_relay_url: row.home_relay.clone(),
+        direct_addresses: Vec::new(),
+        announced_at_ms: row.seen_at.wall_ms,
+        identity_signature: [0u8; 64],
+        butler_set: Vec::new(),
+        bs_at: 0,
+    }
+}
+
+/// ZEB-510: every device row in `doc` EXCEPT `self_device_id`, as owned clones.
+///
+/// Owned clones (not borrows) so callers can drop the `FleetNetDoc` lock before
+/// feeding the resolver. The self row is excluded so P never dials itself.
+pub fn sibling_rows(doc: &FleetNetDoc, self_device_id: &str) -> Vec<(String, FleetNetRow)> {
+    doc.devices
+        .iter()
+        .filter(|(id, _)| id.as_str() != self_device_id)
+        .map(|(id, row)| (id.clone(), row.clone()))
+        .collect()
+}
+
 /// Snapshot the SP1-device-id → ed25519-vk map that `build_butler_set`'s
 /// prod `vk_lookup` reads, from the owner_device_cache (spec §5: "`vk` comes
 /// from `owner_device_cache`"). Fleet-net keys are hex(ed25519 vk); the cache
@@ -368,6 +406,101 @@ pub(crate) fn vk_map_from_device_cache(
     }
     map.insert(self_device_id_hex.to_string(), self_vk);
     map
+}
+
+/// ZEB-510 step 4: record a freshly-paired same-owner sibling in
+/// `owner_device_cache` so `build_butler_set`'s `vk_lookup` resolves it and the
+/// published butler-set advert can dial it. `add_enrollment` records the sibling
+/// in the (separate) harmony-owner enrollment state, but the advert reads THIS
+/// CRDT projection — which, co-located (no community device-intro, no CRDT
+/// convergence between the owner's own devices), never learns the sibling.
+/// Without this the advert SKIPS the sibling ("vk_lookup unresolved") even with
+/// a perfect FleetNetDoc endpoint row (the ZEB-510 s7 failure: the depositor
+/// fell back to the owner's own self-entry and never reached the butler).
+///
+/// Routed through the canonical [`crate::owner_state_crdt::OwnerState::apply_owner_device_update`]
+/// so the sort/dedup, LWW, and pub-preserve invariants hold. That method
+/// REPLACES the device list with the payload, so we UNION the sibling into the
+/// owner's existing self-owner entry rather than clobbering already-known
+/// devices, under a strictly-newer HLC (the LWW guard rejects stale). Idempotent:
+/// a re-pair or a genuine later self-announcement supersedes this with the
+/// identical identity pub (no conflict). Returns `true` iff the cache was
+/// updated (the caller then persists + republishes the advert).
+pub(crate) fn seed_sibling_device_cache(
+    state: &mut crate::owner_state_crdt::OwnerState,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    sibling_ed25519_verify: [u8; 32],
+    wall_ms: u64,
+) -> bool {
+    let x_pub = match crate::dm_signing::ed25519_pub_to_x25519(&sibling_ed25519_verify) {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::warn!(error = %e, "ZEB-510 step 4: sibling ed25519->x25519 failed; owner_device_cache seed skipped");
+            return false;
+        }
+    };
+    let mut identity_pub = [0u8; 64];
+    identity_pub[..32].copy_from_slice(&x_pub);
+    identity_pub[32..].copy_from_slice(&sibling_ed25519_verify);
+    let Some(hash) = crate::dm_signing::derive_device_hash_from_identity_pub(&identity_pub) else {
+        tracing::warn!("ZEB-510 step 4: sibling device-hash derivation failed; owner_device_cache seed skipped");
+        return false;
+    };
+
+    // UNION with the existing self-owner entry: apply_owner_device_update takes
+    // the payload AS the new device list (pub-preserving overlaps), so passing
+    // only the sibling would drop already-known devices.
+    let (mut devices, mut pubs, mut contacts, base_hlc) =
+        match state.owner_device_cache.devices.get(&self_owner) {
+            Some(e) => (
+                e.devices.clone(),
+                e.device_identity_pubs.clone(),
+                e.device_tunnel_contacts.clone(),
+                Some(e.learned_at.clone()),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), None),
+        };
+    // Idempotent only when the sibling is already present WITH its identity pub.
+    // If the hash exists but its aligned pub is `None` (a Path-B "known by hash,
+    // pub not yet propagated" state), fall through and re-add: `vk_lookup` only
+    // resolves devices carrying `Some(pub)`, and `apply_owner_device_update`'s
+    // Some-over-None dedup then fills the pub without duplicating the device.
+    if let Some(idx) = devices.iter().position(|d| *d == hash) {
+        if pubs.get(idx).is_some_and(|p| p.is_some()) {
+            return false; // present with pub — true no-op
+        }
+    }
+    devices.push(hash);
+    pubs.push(Some(identity_pub));
+    contacts.push(None);
+
+    let device_id = hex::encode(self_owner.0);
+    let learned_at = match base_hlc {
+        Some(prev) if prev.wall_ms >= wall_ms => crate::owner_state_types::Hlc {
+            wall_ms: prev.wall_ms,
+            logical: prev.logical.saturating_add(1),
+            device_id,
+        },
+        _ => crate::owner_state_types::Hlc {
+            wall_ms,
+            logical: 0,
+            device_id,
+        },
+    };
+
+    match state.apply_owner_device_update(self_owner, devices, pubs, contacts, learned_at) {
+        crate::owner_state_crdt::ApplyOutcome::Rejected(r) => {
+            tracing::warn!(reason = ?r, "ZEB-510 step 4: owner_device_cache seed rejected by LWW/invariant guard");
+            false
+        }
+        _ => {
+            tracing::info!(
+                sibling = %hex::encode(sibling_ed25519_verify),
+                "ZEB-510 step 4: seeded paired sibling into owner_device_cache for butler-set vk_lookup"
+            );
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -399,10 +532,115 @@ mod tests {
         }
     }
 
+    // ZEB-510 step 4: seeding a paired sibling into owner_device_cache makes the
+    // butler-set `vk_lookup` (vk_map_from_device_cache) resolve it, without which
+    // build_butler_set skips the sibling and the depositor can't dial the butler.
+    #[test]
+    fn seed_sibling_device_cache_makes_vk_lookup_resolve() {
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_types::OwnerAddr;
+
+        let self_owner = OwnerAddr([0x11; 16]);
+        let self_vk = [0x99u8; 32];
+        // Real ed25519 device identities (a real verifying key always converts
+        // to x25519, unlike an arbitrary 32-byte blob).
+        let sib_ed: [u8; 32] = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+            .verifying_key()
+            .to_bytes();
+        let sib2_ed: [u8; 32] = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32])
+            .verifying_key()
+            .to_bytes();
+
+        let mut state = OwnerState::default();
+        let vk_map = |st: &OwnerState| {
+            vk_map_from_device_cache(&st.owner_device_cache, &self_owner, "self-dev", self_vk)
+        };
+
+        // Before: the sibling does not resolve in the advert's vk map.
+        assert!(!vk_map(&state).contains_key(&hex::encode(sib_ed)));
+
+        // Seed it → vk_lookup now resolves the sibling to its ed25519 vk.
+        assert!(seed_sibling_device_cache(
+            &mut state, self_owner, sib_ed, 1_000
+        ));
+        assert_eq!(vk_map(&state).get(&hex::encode(sib_ed)), Some(&sib_ed));
+
+        // Idempotent: a second seed of the same sibling is a no-op.
+        assert!(!seed_sibling_device_cache(
+            &mut state, self_owner, sib_ed, 2_000
+        ));
+
+        // A DIFFERENT sibling unions in without dropping the first.
+        assert!(seed_sibling_device_cache(
+            &mut state, self_owner, sib2_ed, 3_000
+        ));
+        let after = vk_map(&state);
+        assert_eq!(after.get(&hex::encode(sib_ed)), Some(&sib_ed));
+        assert_eq!(after.get(&hex::encode(sib2_ed)), Some(&sib2_ed));
+
+        // LWW logical-bump branch: seed a THIRD sibling with a wall_ms (1_000)
+        // <= the existing entry's learned_at.wall_ms (3_000 from sib2). The seed
+        // MUST still construct a strictly-newer HLC (bumping `logical`), else
+        // apply_owner_device_update rejects it as StaleHlc and the sibling
+        // silently fails to resolve. Pins the `prev.wall_ms >= wall_ms` arm.
+        let sib3_ed: [u8; 32] = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(seed_sibling_device_cache(
+            &mut state, self_owner, sib3_ed, 1_000
+        ));
+        let after3 = vk_map(&state);
+        assert_eq!(after3.get(&hex::encode(sib3_ed)), Some(&sib3_ed));
+        // ...and the earlier siblings survive the strictly-newer re-write.
+        assert_eq!(after3.get(&hex::encode(sib_ed)), Some(&sib_ed));
+        assert_eq!(after3.get(&hex::encode(sib2_ed)), Some(&sib2_ed));
+    }
+
     // Pins the fleet-net-v1 wire format; NEVER regenerate. Mod-level so the
     // additive-decode test can prove pre-S4 bytes still parse (ZEB-668 S4).
     // See EXPECTED_OUTHOLD_DOC_HEX in dm_outhold.rs for the pattern.
     const EXPECTED_FLEET_NET_DOC_HEX: &str = "a3626476a2784061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161a3626570982018aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa18aa6268726f72656c61792e616c7068612e636f6d627361a361771903e8616c006164656465762d61784062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262a3626570982018bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb18bb6268726e72656c61792e626574612e636f6d627361a361771907d0616c006164656465762d6262706e784061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161627061a36177190bb8616c006164696465762d6f776e6572";
+
+    // ── Sibling-dial mapper + helper tests (ZEB-510) ─────────────────────────
+
+    #[test]
+    fn sibling_reachability_payload_maps_fields_and_is_unsigned() {
+        let r = row(0xB2, "https://relay.example/", hlc(4242, "dev"));
+        let p = sibling_reachability_payload(&r);
+        assert_eq!(p.iroh_node_id, [0xB2; 32]);
+        assert_eq!(p.home_relay_url, "https://relay.example/");
+        assert_eq!(p.announced_at_ms, 4242);
+        assert!(p.direct_addresses.is_empty());
+        assert_eq!(p.identity_signature, [0u8; 64]); // verification-exempt
+        assert!(p.butler_set.is_empty());
+        assert_eq!(p.bs_at, 0);
+    }
+
+    #[test]
+    fn sibling_rows_excludes_self_and_returns_the_rest() {
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert("self-id".into(), row(0x01, "a", hlc(10, "dev")));
+        doc.devices
+            .insert("sib-b2".into(), row(0x02, "b", hlc(20, "dev")));
+        doc.devices
+            .insert("sib-b3".into(), row(0x03, "c", hlc(30, "dev")));
+
+        let out = sibling_rows(&doc, "self-id");
+        let ids: std::collections::BTreeSet<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(out.len(), 2);
+        assert!(ids.contains("sib-b2"));
+        assert!(ids.contains("sib-b3"));
+        assert!(!ids.contains("self-id"), "self row must be excluded");
+    }
+
+    #[test]
+    fn sibling_rows_empty_when_only_self_present() {
+        let mut doc = FleetNetDoc::default();
+        doc.devices
+            .insert("self-id".into(), row(0x01, "a", hlc(10, "dev")));
+        assert!(sibling_rows(&doc, "self-id").is_empty());
+    }
 
     // ── Row LWW tests ─────────────────────────────────────────────────────────
 
