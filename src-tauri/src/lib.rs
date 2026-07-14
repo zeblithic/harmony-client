@@ -179,6 +179,8 @@ pub mod feed_authority;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
 pub mod fleet_net_persist;
+pub mod fleet_peer_seed;
+pub mod fleet_peer_seed_persist;
 pub mod fleet_sync;
 pub mod folder_ingest;
 pub mod folders;
