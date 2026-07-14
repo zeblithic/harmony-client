@@ -507,6 +507,7 @@ pub(crate) async fn ingest_dm_packet(
                     Some(expected_inviter),
                     // ZEB-483: authenticated tunnel path — refresh the cache.
                     true,
+                    revoked,
                 )
                 .map_err(|e| format!("apply_invite: {e:?}"))?
             };
@@ -878,6 +879,7 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                     signed.signing_device_hash,
                     identity_pub,
                     self.now_ms(),
+                    &self.revoked,
                 )? {
                     Some(staged) => Some(staged),
                     // ZEB-640 (1): invite consumed without staging (friend-tier
@@ -1001,6 +1003,7 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                 // Deposit-recover: never refresh the OwnerDeviceCache from a
                 // deposited invite (it would let an untrusted invite seed cache rows).
                 false,
+                &self.revoked,
             )
             .map_err(|e| format!("apply_invite: {e:?}"))?
         };

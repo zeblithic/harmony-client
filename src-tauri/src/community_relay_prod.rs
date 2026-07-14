@@ -450,6 +450,7 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     now_epoch_ms(),
                     Some(crate::owner_state_types::OwnerAddr(sender_owner)),
                     false,
+                    &self.revoked,
                 )
                 .map_err(|e| format!("apply_invite: {e:?}"))?
             };
@@ -564,6 +565,7 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     signed.signing_device_hash,
                     identity_pub,
                     now_epoch_ms(),
+                    &self.revoked,
                 )? {
                     Some(staged) => Some(staged),
                     // ZEB-640 (1): invite consumed without staging (friend-tier
