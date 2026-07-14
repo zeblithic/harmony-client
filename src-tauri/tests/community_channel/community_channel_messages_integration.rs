@@ -638,7 +638,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             .lock()
             .expect("received_b lock")
             .iter()
-            .filter(|id| **id == replayed_id_hex)
+            .filter(|id| id.as_str() == replayed_id_hex.as_str())
             .count()
     };
     // The replayed event must already have been delivered exactly once
