@@ -1719,7 +1719,10 @@ impl NodeState {
     /// on-epoch hook / boot-replay seed actually fed it (the regression guard
     /// this seam exists for).
     #[cfg(test)]
-    #[allow(dead_code)] // Consumed by the ZEB-687 boot regression test (separate task).
+    // Consumed by the test-fixtures-gated boot regression test below; the allow
+    // keeps a plain `cargo test` (no feature) — where that test is cfg'd out —
+    // warning-free.
+    #[allow(dead_code)]
     pub(crate) fn revoked_device_projection_for_test(
         &self,
     ) -> Option<crate::revoked_device_projection::RevokedDeviceProjection> {
@@ -58874,9 +58877,10 @@ mod tests {
         );
     }
 
-    /// ZEB-580 S2 (T2): pins the exact feed expression used at both
-    /// materialize choke points (`lib.rs`'s on-epoch hook and boot-replay
-    /// seed loop) against `MemberState`'s shape —
+    /// ZEB-580 S2 (T2): pins the feed expression that
+    /// `feed_revoked_from_materialized` wraps — the helper both materialize
+    /// choke points (`lib.rs`'s on-epoch hook and boot-replay seed loop) call
+    /// (ZEB-687) — against `MemberState`'s shape:
     /// `mat.members.iter().map(|(o, m)| (*o, &m.revoked_device_keys))`.
     /// `MemberState` has no `Default` impl, so the fixture is built as a
     /// full struct literal (mirrors `community_membership.rs`'s own test
@@ -58903,7 +58907,7 @@ mod tests {
         let members: BTreeMap<OwnerAddr, MemberState> = BTreeMap::from([(owner, member)]);
 
         let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
-        // The EXACT feed expression used at both choke points:
+        // The feed expression `feed_revoked_from_materialized` wraps:
         proj.union_from_members(members.iter().map(|(o, m)| (*o, &m.revoked_device_keys)));
 
         assert!(proj.is_revoked(&owner, &[0xcd; 32]));
