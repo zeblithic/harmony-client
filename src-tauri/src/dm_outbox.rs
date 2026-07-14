@@ -1786,6 +1786,12 @@ impl DmOutbox {
         _unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
         packet_bytes: Vec<u8>,
         wall_now_ms: u64,
+        // ZEB-580 S2: this dormant path has no `RevokedDeviceProjection`
+        // handle wired in production (no live caller — see the module doc
+        // and `handle_invite`'s identical dormant-path note). Threaded
+        // through so `handle_ack`'s cutoff has something to consult; test
+        // callers pass `&RevokedDeviceProjection::new()`.
+        revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     ) -> Result<DrainOutcome, DmReceiveError> {
         let packet = crate::dm_envelope::decode_packet(&packet_bytes)
             .map_err(|e| DmReceiveError::Decode(e.to_string()))?;
@@ -1804,8 +1810,15 @@ impl DmOutbox {
                 signature,
                 signed_bytes,
             } => {
-                self.handle_ack(state, signed, signature, &signed_bytes, wall_now_ms)
-                    .await
+                self.handle_ack(
+                    state,
+                    signed,
+                    signature,
+                    &signed_bytes,
+                    wall_now_ms,
+                    revoked,
+                )
+                .await
             }
             // ZEB-241: CidNotify is dispatched via `handle_cidnotify_lifted`
             // (spawned from event_loop pre-decode) so the 500ms CAS fetch
@@ -2198,6 +2211,7 @@ impl DmOutbox {
         signature: [u8; 64],
         signed_bytes: &[u8],
         wall_now_ms: u64,
+        revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     ) -> Result<DrainOutcome, DmReceiveError> {
         // Step 1: look up signing pubkey + verify signature.
         let identity_pub =
@@ -2213,6 +2227,18 @@ impl DmOutbox {
         // Step 2: resolve signing_device_hash → OwnerAddr.
         let resolved_owner =
             resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
+
+        // ZEB-580 S2: defense-in-depth revocation cutoff. `handle_ack` is
+        // dormant in production (Ack is rejected on the live tunnel at
+        // dm_inbox_ingest.rs:556) — this guard exists so a future
+        // re-activation of this path can't reintroduce a bypass for a
+        // signer whose device #2 (Ed25519) has since been revoked.
+        // Uniform/unconditional: no #2-vs-#3 branch (unlike the
+        // membership-recipient checks below, which are outbox-specific).
+        let ack_ed25519: [u8; 32] = identity_pub[32..64].try_into().expect("64 - 32 == 32");
+        if revoked.is_revoked(&resolved_owner, &ack_ed25519) {
+            return Err(DmReceiveError::SignerDeviceRevoked);
+        }
 
         // Step 3: verify ack_from_owner_addr matches the resolved owner.
         // Drops cache-poisoning attempts where a peer claims an
@@ -4220,7 +4246,14 @@ mod tests {
         padded.extend(std::iter::repeat_n(0_u8, 65)); // 1 byte body + 64 byte sig
 
         let err = outbox
-            .handle_unicast(&mut state, &cas, &tx, padded, 100)
+            .handle_unicast(
+                &mut state,
+                &cas,
+                &tx,
+                padded,
+                100,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -8328,7 +8361,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let outcome = outbox
-            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                signature,
+                &signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .expect("happy path returns Ok");
 
@@ -8340,6 +8380,47 @@ mod tests {
         let stored = state.outbox.get(&entry_id).unwrap();
         assert!(stored.delivered_to.contains(&bob));
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    /// ZEB-580 S2 (T5): defense-in-depth revocation cutoff on the dormant
+    /// `handle_ack` path — mirrors the `handle_ack` happy-path fixture
+    /// above, but with a projection that revokes the signer's (bob's) #2
+    /// device key. Must be cut off with `SignerDeviceRevoked` rather than
+    /// delivering the ack.
+    #[tokio::test]
+    async fn handle_ack_from_revoked_device2_is_cut_off() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let message_cid = ContentId::from_bytes([0xee; 32]);
+        let (mut state, signed, signature, signed_bytes, entry_id) =
+            build_handle_ack_fixture(alice, bob, space_id, message_cid);
+
+        // Bob's ed25519 half, derived the same way `build_handle_ack_fixture`
+        // derives `bob_identity_pub` (same fixed seed).
+        let bob_identity_pub = harmony_identity::PrivateIdentity::from_seed(&[0x77; 32])
+            .public_identity()
+            .to_public_bytes();
+        let bob_ed25519: [u8; 32] = bob_identity_pub[32..64].try_into().unwrap();
+
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        revoked.union_from_members(std::iter::once((
+            bob,
+            &std::collections::BTreeSet::from([bob_ed25519]),
+        )));
+
+        let mut outbox = make_outbox_synthetic("alice-dev", alice);
+        let err = outbox
+            .handle_ack(&mut state, signed, signature, &signed_bytes, 500, &revoked)
+            .await
+            .expect_err("ack from revoked device dropped");
+        assert_eq!(err, DmReceiveError::SignerDeviceRevoked);
+
+        // delivered_to must still be empty — the cutoff fired before
+        // mark_ack_delivered.
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(stored.delivered_to.is_empty());
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
     }
 
     #[tokio::test]
@@ -8362,7 +8443,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let err = outbox
-            .handle_ack(&mut state, signed, new_signature, &new_signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                new_signature,
+                &new_signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -8417,7 +8505,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let err = outbox
-            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                signature,
+                &signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -8444,7 +8539,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let err = outbox
-            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                signature,
+                &signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -8484,7 +8586,14 @@ mod tests {
 
         let mut outbox = make_outbox_synthetic("alice-dev", alice);
         let err = outbox
-            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .handle_ack(
+                &mut state,
+                signed,
+                signature,
+                &signed_bytes,
+                500,
+                &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            )
             .await
             .unwrap_err();
         assert!(
