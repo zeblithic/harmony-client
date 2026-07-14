@@ -13548,6 +13548,115 @@ mod zeb_339_signer_verify_tests {
         );
     }
 
+    // ── ZEB-580 S2 (T7): spec §8.5 — DeviceRetire materialize must not ────
+    // expiry-filter ───────────────────────────────────────────────────────
+
+    /// Builds a Joined `admin` plus a `DeviceRetire` whose second-device
+    /// `EnrollmentCert` carries a REAL expiry (unlike `mint_second_device`'s
+    /// `expires_at: None`) that has already passed by the time both the
+    /// retire event itself is stamped AND the returned `now_past_expiry`
+    /// materialize-time floor is set. Returns
+    /// `(log, admin_addr, retired_device2_ed25519, now_past_expiry)`.
+    ///
+    /// Spec §8.5 hazard: DM identity verify is expiry-agnostic (an
+    /// expired-but-not-revoked device still DMs, by design). The
+    /// mirror-image risk is materialize DROPPING a DeviceRetire because its
+    /// backing enrollment cert expired before the retire was materialized —
+    /// which would silently lose the revocation and defeat S2's
+    /// `RevokedDeviceProjection` cutoff. This fixture manufactures exactly
+    /// that scenario: cert expires at 2_000s, the retire event is stamped
+    /// at 3_000_000ms (3_000s, already past expiry), and the materialize
+    /// `now` floor is 10_000_000ms (10_000s, further past still).
+    fn device_retire_expired_fixture(
+    ) -> (Vec<SignedMembershipEvent>, OwnerAddr, [u8; 32], Option<u64>) {
+        use harmony_owner::certs::EnrollmentCert;
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+        let admin = mint_test_owner(0x91);
+        let community_id = SpaceId([0xed; 16]);
+
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "device1".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &admin.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(admin.cert.clone()),
+            ..join
+        };
+
+        // Second device's cert: issued at 1_000s, EXPIRES at 2_000s — a
+        // real, non-open-ended expiry.
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
+        let master_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: master_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device2_sk = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
+        let device2_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device2_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device2_id = device2_bundle.identity_hash();
+        let cert2 = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device2_id,
+            device2_bundle,
+            1_000,       // issued_at (s)
+            Some(2_000), // expires_at (s) — genuinely in the past by materialize time
+        )
+        .expect("sign_master for expiring second device");
+        cert2.verify(0).expect("second-device cert self-verifies");
+        let device2_key = cert2.device_pubkeys.classical.ed25519_verify;
+
+        // Retire signed by the surviving first device, stamped at wall_ms
+        // 3_000_000 (3_000s) — already 1_000s PAST the cert's 2_000s expiry.
+        let rc = mint_revocation_for_second_device(0x91, &device2_sk, &cert2, true);
+        let retire = make_device_retire(&admin, community_id, rc, &cert2, 3_000_000);
+
+        // now floor: 10_000_000ms (10_000s) — well past both the cert's
+        // expiry (2_000s) and the retire event's own wall_ms (3_000s).
+        let now_past_expiry = Some(10_000_000u64);
+
+        (
+            vec![join, retire],
+            admin.owner,
+            device2_key,
+            now_past_expiry,
+        )
+    }
+
+    /// PINS spec §8.5: a `DeviceRetire` whose enrollment cert is already
+    /// expired at materialize time still lands the retired key in
+    /// `revoked_device_keys`. If this ever fails, the materialize path has
+    /// started expiry-filtering `DeviceRetire` and S2's revocation cutoff
+    /// (`RevokedDeviceProjection`, fed from `revoked_device_keys`) can
+    /// silently miss a revocation of an already-expired device.
+    #[test]
+    fn device_retire_materializes_revocation_even_for_expired_cert() {
+        let (log, admin, retired_vk, now_past_expiry) = device_retire_expired_fixture();
+        let mat = materialize_with_now(&log, admin, now_past_expiry);
+        let member = mat.members.get(&admin).expect("member present");
+        assert!(
+            member.revoked_device_keys.contains(&retired_vk),
+            "an expired-cert DeviceRetire must still record the revocation (spec §8.5)"
+        );
+    }
+
     /// End-to-end through CommunityState::insert_event: after a retire, an
     /// event signed by the retired key is rejected exactly as an
     /// unknown-device event — SignerNotEnrolledForActor.
