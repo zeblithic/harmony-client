@@ -4,6 +4,40 @@ use crate::pairing::state_machine::{InviterEnrollResult, JoinerEnrollResult};
 use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
 use std::path::Path;
 
+/// ZEB-510 step 2: upsert a first-contact dial seed for a freshly-paired peer,
+/// keyed by the peer's iroh node_id. No-op when `endpoint` is `None` (pre-step-2
+/// peer). Best-effort: a seed-write failure is logged, never fails the pairing
+/// persist (the owner-state write already succeeded; the seed only accelerates
+/// first dial and is superseded by fleet-net convergence).
+fn persist_peer_seed(identity_dir: &Path, endpoint: &Option<([u8; 32], String)>) {
+    let Some((node_id, home_relay)) = endpoint else {
+        return;
+    };
+    let observed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let path = identity_dir.join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
+    let mut doc = match crate::fleet_peer_seed_persist::load_doc_or_recover(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "fleet-peer-seed load failed; skipping seed write");
+            return;
+        }
+    };
+    doc.seeds.insert(
+        hex::encode(node_id),
+        crate::fleet_peer_seed::FleetPeerSeedRow {
+            iroh_node_id: *node_id,
+            home_relay: home_relay.clone(),
+            observed_at_ms,
+        },
+    );
+    if let Err(e) = crate::fleet_peer_seed_persist::save(&path, &doc) {
+        tracing::warn!(error = %e, "fleet-peer-seed save failed; first dial will wait for fleet-net convergence");
+    }
+}
+
 /// Persist the Joiner's signing key + OwnerState to disk. Mirrors the
 /// atomicity contract from ZEB-170: keychain first, .cbor last.
 ///
@@ -96,6 +130,7 @@ pub fn install_joiner_state_inner(
         None, // no master_seed on Joiner — clears any stale prior seed
         keychain,
     )?;
+    persist_peer_seed(identity_dir, &result.peer_iroh_endpoint);
     Ok(())
 }
 
@@ -178,6 +213,7 @@ pub fn install_inviter_state_inner(
         // silently undone by this enrollment save.
         save_keychain,
     )?;
+    persist_peer_seed(identity_dir, &result.peer_iroh_endpoint);
     Ok(())
 }
 
@@ -610,6 +646,109 @@ mod tests {
         assert!(
             err.contains("no existing owner state"),
             "expected 'no existing owner state' error, got: {err}"
+        );
+    }
+
+    /// ZEB-510 step 2: a completed Joiner pairing that observed the peer's iroh
+    /// endpoint must persist a `fleet_peer_seed` row keyed by the peer's node_id
+    /// hex, so a later boot can seed the resolver with a dial route to the
+    /// freshly-paired same-owner sibling before fleet-net has converged.
+    #[tokio::test]
+    #[serial]
+    async fn install_joiner_writes_peer_seed() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp");
+        let dir = tempdir().unwrap();
+
+        let MintResult { state, .. } = mint_owner(1_700_000_000).unwrap();
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_pubkey = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let joiner_id = joiner_pubkey.identity_hash();
+
+        let result = JoinerEnrollResult {
+            our_signing_key: joiner_sk,
+            owner_state: state,
+            our_device_id: joiner_id,
+            fleet_keytree: None,
+            peer_iroh_endpoint: Some(([0x22u8; 32], "https://peer.relay/".into())),
+        };
+        install_joiner_state_inner(dir.path(), result, None, None).unwrap();
+
+        let seed_path = dir
+            .path()
+            .join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
+        let doc = crate::fleet_peer_seed_persist::load(&seed_path).unwrap();
+        let key = hex::encode([0x22u8; 32]);
+        let row = doc
+            .seeds
+            .get(&key)
+            .expect("seed row keyed by the paired peer's node_id hex");
+        assert_eq!(
+            row.iroh_node_id, [0x22u8; 32],
+            "seed row records the peer node_id"
+        );
+        assert_eq!(
+            row.home_relay, "https://peer.relay/",
+            "seed row records the peer's home relay"
+        );
+    }
+
+    /// ZEB-510 step 2 companion: an Inviter pairing with NO observed endpoint
+    /// (e.g. a pre-step-2 peer) must write no seed — the store stays empty and
+    /// the owner-state persist is unaffected.
+    #[tokio::test]
+    #[serial]
+    async fn install_inviter_none_writes_no_peer_seed() {
+        use crate::owner_state::save_owner_state_atomic;
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        use zeroize::Zeroizing;
+
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp");
+        let dir = tempdir().unwrap();
+
+        // Simulate a freshly-minted Inviter (install_inviter requires existing
+        // owner state on disk), then complete a pairing with no peer endpoint.
+        let MintResult {
+            state: original_state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed_bytes: [u8; 32] = *recovery_artifact.as_bytes();
+        save_owner_state_atomic(
+            dir.path(),
+            &original_state,
+            &device_signing_key,
+            Some(&master_seed_bytes),
+            None,
+        )
+        .unwrap();
+
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_pubkey = PubKeyBundle::classical_only(joiner_sk.verifying_key().to_bytes());
+        let now = 1_700_000_001;
+        let cert = crate::pairing::cert::sign_enrollment_for_joiner(
+            &Zeroizing::new(master_seed_bytes),
+            &original_state,
+            joiner_pubkey,
+            now,
+        )
+        .unwrap();
+        let result = InviterEnrollResult {
+            cert,
+            now,
+            master_seed: Some(Zeroizing::new(master_seed_bytes)),
+            peer_iroh_endpoint: None,
+        };
+        install_inviter_state_inner(dir.path(), result, None, None).unwrap();
+
+        // None endpoint → no seed row. `load` self-heals an absent file to the
+        // default (empty) doc, so an empty `seeds` map proves nothing was written.
+        let seed_path = dir
+            .path()
+            .join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
+        let doc = crate::fleet_peer_seed_persist::load(&seed_path).unwrap();
+        assert!(
+            doc.seeds.is_empty(),
+            "a None peer_iroh_endpoint must write no seed row"
         );
     }
 }
