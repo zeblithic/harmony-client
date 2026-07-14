@@ -117,6 +117,17 @@ pub enum PairingWireMessage {
 pub enum EncryptedPayload {
     Confirm {
         sas_digits: String,
+        /// ZEB-510 step 2: the sender's iroh transport endpoint, observed
+        /// first-hand over the SAS-authenticated channel so each device can seed
+        /// a dial route to its fleet sibling before fleet-net converges. Hex of
+        /// the 32-byte iroh node_id. `#[serde(default)]` keeps pre-step-2 peers
+        /// decodable (they omit it; the receiver tolerates `None`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iroh_node_id_hex: Option<String>,
+        /// ZEB-510 step 2: the sender's iroh home-relay URL (may be empty even
+        /// when `iroh_node_id_hex` is present, if the relay is not yet known).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iroh_home_relay: Option<String>,
     },
     Enroll {
         enrollment_cert_cbor_hex: String,
@@ -169,6 +180,55 @@ mod tests {
     }
 
     #[test]
+    fn confirm_carries_iroh_endpoint_and_omits_when_absent() {
+        // Present: round-trips through CBOR.
+        let with = EncryptedPayload::Confirm {
+            sas_digits: "123456".into(),
+            iroh_node_id_hex: Some("ab".repeat(32)),
+            iroh_home_relay: Some("https://relay.example/".into()),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&with, &mut buf).unwrap();
+        let back: EncryptedPayload = ciborium::from_reader(&buf[..]).unwrap();
+        match back {
+            EncryptedPayload::Confirm {
+                sas_digits,
+                iroh_node_id_hex,
+                iroh_home_relay,
+            } => {
+                assert_eq!(sas_digits, "123456");
+                assert_eq!(iroh_node_id_hex.as_deref(), Some("ab".repeat(32).as_str()));
+                assert_eq!(iroh_home_relay.as_deref(), Some("https://relay.example/"));
+            }
+            _ => panic!("expected Confirm"),
+        }
+
+        // Absent: `skip_serializing_if` omits the endpoint keys from the wire,
+        // and `#[serde(default)]` fills them as None on decode — this IS the
+        // back-compat guarantee (a pre-step-2 peer's Confirm never carries them).
+        let without = EncryptedPayload::Confirm {
+            sas_digits: "654321".into(),
+            iroh_node_id_hex: None,
+            iroh_home_relay: None,
+        };
+        let mut buf2 = Vec::new();
+        ciborium::into_writer(&without, &mut buf2).unwrap();
+        let back2: EncryptedPayload = ciborium::from_reader(&buf2[..]).unwrap();
+        match back2 {
+            EncryptedPayload::Confirm {
+                sas_digits,
+                iroh_node_id_hex,
+                iroh_home_relay,
+            } => {
+                assert_eq!(sas_digits, "654321");
+                assert!(iroh_node_id_hex.is_none());
+                assert!(iroh_home_relay.is_none());
+            }
+            _ => panic!("expected Confirm"),
+        }
+    }
+
+    #[test]
     fn wire_message_roundtrips() {
         let m = PairingWireMessage::Discover {
             session_id: Uuid::nil(),
@@ -188,12 +248,14 @@ mod tests {
     fn encrypted_payload_roundtrips() {
         let p = EncryptedPayload::Confirm {
             sas_digits: "012845".to_string(),
+            iroh_node_id_hex: None,
+            iroh_home_relay: None,
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&p, &mut bytes).unwrap();
         let back: EncryptedPayload = ciborium::from_reader(bytes.as_slice()).unwrap();
         match back {
-            EncryptedPayload::Confirm { sas_digits } => assert_eq!(sas_digits, "012845"),
+            EncryptedPayload::Confirm { sas_digits, .. } => assert_eq!(sas_digits, "012845"),
             _ => panic!("wrong variant"),
         }
     }

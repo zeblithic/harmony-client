@@ -744,6 +744,10 @@ async fn on_confirm_sas(
     // confirmation.
     let payload = EncryptedPayload::Confirm {
         sas_digits: sas_digits.clone(),
+        // ZEB-510 step 2 wires the field; Task 3 populates it from the local
+        // iroh endpoint. Left `None` here preserves current behavior.
+        iroh_node_id_hex: None,
+        iroh_home_relay: None,
     };
     let mut pt = Vec::new();
     if let Err(e) = ciborium::into_writer(&payload, &mut pt) {
@@ -1522,7 +1526,10 @@ async fn on_encrypted_payload(
     quorum_done_tx: &QuorumDoneTx,
 ) {
     match payload {
-        EncryptedPayload::Confirm { sas_digits } => {
+        // ZEB-510 step 2: `iroh_node_id_hex`/`iroh_home_relay` are ignored
+        // here (`..`) — Task 3 adds the seed-dial-route logic that consumes
+        // them.
+        EncryptedPayload::Confirm { sas_digits, .. } => {
             // Defense-in-depth: the SAS in the message must match what we
             // computed locally. (Session_key already authenticates this, but
             // the explicit equality check makes the intent obvious.)
