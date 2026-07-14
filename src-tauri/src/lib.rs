@@ -4270,6 +4270,11 @@ pub async fn start_node_inner(
         // captures, the boot-time replay seed, and the NetworkHealthService
         // install site below.
         let membership_projection = crate::network_health::MembershipProjection::new();
+        // ZEB-580 S2: revoked-device projection, fed from the same community
+        // materialize choke points as membership_projection below; read by the DM
+        // receive cutoff. Sticky union across joined communities.
+        let revoked_device_projection =
+            crate::revoked_device_projection::RevokedDeviceProjection::new();
         let iroh_handles_for_loop: Option<crate::event_loop::IrohRuntimeHandles>;
         // ZEB-329: shared cell holding the NetworkHealthService Arc
         // once boot wiring populates it. The on_epoch_event closure
@@ -6626,6 +6631,11 @@ pub async fn start_node_inner(
                                 // ZEB-329: clone the membership-projection handle
                                 // into the hook so per-invocation clones can feed it.
                                 let membership_projection_for_hook = membership_projection.clone();
+                                // ZEB-580 S2: same pattern for the revoked-device
+                                // projection (fed alongside membership_projection at
+                                // the same choke points below).
+                                let revoked_device_projection_for_hook =
+                                    revoked_device_projection.clone();
                                 // Per-session synthesized-set: avoids re-synthesizing
                                 // the same rotation/catchup within one node session.
                                 // Wrapped in Arc<Mutex<_>> so the FnMut closure can
@@ -6766,6 +6776,10 @@ pub async fn start_node_inner(
                                     // clone because `registry` (above) is consumed by
                                     // self_heal_community_observer.
                                     let membership_projection = membership_projection_for_hook.clone();
+                                    // ZEB-580 S2: per-invocation clone of the
+                                    // revoked-device projection (async block moves it).
+                                    let revoked_device_projection =
+                                        revoked_device_projection_for_hook.clone();
                                     let projection_registry =
                                         std::sync::Arc::clone(&community_registry_for_heal);
                                     // ZEB-495: per-invocation clones for the
@@ -7091,6 +7105,14 @@ pub async fn start_node_inner(
                                             let state_arc = engine.state();
                                             let st = state_arc.lock().await;
                                             let mat = st.materialized(engine.admin_addr());
+                                            // ZEB-580 S2: union this community's revoked #2 keys into the sticky
+                                            // by-owner projection (same materialized view; no retract on leave).
+                                            // Fed unconditionally — even the remove_community branch below must
+                                            // still see this, since a revocation learned right before a leave
+                                            // must survive.
+                                            revoked_device_projection.union_from_members(
+                                                mat.members.iter().map(|(o, m)| (*o, &m.revoked_device_keys)),
+                                            );
                                             let local_joined = mat
                                                 .members
                                                 .get(&self_owner)
@@ -7786,6 +7808,16 @@ pub async fn start_node_inner(
                             > = {
                                 let st = state_arc.lock().await;
                                 let current = st.materialized(engine.admin_addr());
+                                // ZEB-580 S2: seed the revoked projection on restart from persisted
+                                // materialized state (the on-epoch hook only fires on NEW deltas).
+                                // Unconditional — before the is_joined gate that only affects the
+                                // membership seed.
+                                revoked_device_projection.union_from_members(
+                                    current
+                                        .members
+                                        .iter()
+                                        .map(|(o, m)| (*o, &m.revoked_device_keys)),
+                                );
                                 let is_joined = |actor: &crate::owner_state_types::OwnerAddr| {
                                     current
                                         .members
@@ -58795,6 +58827,41 @@ mod tests {
             parse_result.is_err(),
             "bad JSON must not parse as FolderManifest"
         );
+    }
+
+    /// ZEB-580 S2 (T2): pins the exact feed expression used at both
+    /// materialize choke points (`lib.rs`'s on-epoch hook and boot-replay
+    /// seed loop) against `MemberState`'s shape —
+    /// `mat.members.iter().map(|(o, m)| (*o, &m.revoked_device_keys))`.
+    /// `MemberState` has no `Default` impl, so the fixture is built as a
+    /// full struct literal (mirrors `community_membership.rs`'s own test
+    /// helpers, e.g. `joined_with_enrolled`).
+    #[test]
+    fn revoked_projection_feed_expression_reads_member_revoked_keys() {
+        use crate::community_membership::{MemberState, MemberStatus};
+        use crate::owner_state_types::{Hlc, OwnerAddr};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // Build a minimal members map mirroring MaterializedMembership.members.
+        let owner = OwnerAddr([0x33; 16]);
+        let member = MemberState {
+            status: MemberStatus::Joined,
+            joined_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: BTreeSet::new(),
+            revoked_device_keys: BTreeSet::from([[0xcd; 32]]),
+        };
+        let members: BTreeMap<OwnerAddr, MemberState> = BTreeMap::from([(owner, member)]);
+
+        let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        // The EXACT feed expression used at both choke points:
+        proj.union_from_members(members.iter().map(|(o, m)| (*o, &m.revoked_device_keys)));
+
+        assert!(proj.is_revoked(&owner, &[0xcd; 32]));
     }
 }
 
