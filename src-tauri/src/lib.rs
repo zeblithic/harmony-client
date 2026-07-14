@@ -870,6 +870,11 @@ pub struct NodeState {
     /// happens after `registry.shutdown_all()`).
     community_delta_tx:
         Option<tokio::sync::mpsc::Sender<crate::community_state_sync::CommunityMembershipDelta>>,
+    /// ZEB-687: a clone of the live `RevokedDeviceProjection` fed by the
+    /// on-epoch hook / boot-replay seed. Stored only so `#[cfg(test)]` can
+    /// observe that the feed wiring actually runs; production reads go
+    /// through the receive-path handles, not this field.
+    revoked_device_projection: Option<crate::revoked_device_projection::RevokedDeviceProjection>,
     /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
     /// ZEB-678 S2: set true after this device publishes its feed
     /// `FeedAuthorityRecord` (the Zenoh authority sample) for the first time this
@@ -1708,6 +1713,21 @@ impl NodeState {
     ) {
         self.crdt_state = Some(state);
     }
+
+    /// ZEB-687: expose the live `RevokedDeviceProjection` clone stashed by
+    /// `start_node_inner`'s boot populate site, so a test can observe that the
+    /// on-epoch hook / boot-replay seed actually fed it (the regression guard
+    /// this seam exists for).
+    #[cfg(test)]
+    // Consumed by the test-fixtures-gated boot regression test below; the allow
+    // keeps a plain `cargo test` (no feature) — where that test is cfg'd out —
+    // warning-free.
+    #[allow(dead_code)]
+    pub(crate) fn revoked_device_projection_for_test(
+        &self,
+    ) -> Option<crate::revoked_device_projection::RevokedDeviceProjection> {
+        self.revoked_device_projection.clone()
+    }
 }
 
 impl Default for NodeState {
@@ -1757,6 +1777,7 @@ impl Default for NodeState {
             sync_engine: None,
             community_registry: None,
             community_delta_tx: None,
+            revoked_device_projection: None,
             vine_authority_published: false,
             vine_feed_binding_stamped: false,
             dm_outbox: None,
@@ -2256,6 +2277,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
             }
         }
         guard.node_addr.clear();
+        // ZEB-687: clear the observability clone of the revoked-device projection
+        // so a stopped node keeps no live handle — parity with the
+        // community_registry / community_delta_tx takes below. Cheap Arc drop; no
+        // ordered outside-lock teardown needed, so it's cleared in place here
+        // rather than threaded through the `tup` drop-after-unlock dance.
+        guard.revoked_device_projection.take();
         let tup = (
             guard.shutdown_tx.take(),
             guard.thread.take(),
@@ -3169,6 +3196,21 @@ impl std::fmt::Display for SupersededError {
             ),
         }
     }
+}
+
+/// ZEB-687: the single feed point for the revoked-device projection from a
+/// community's materialized view. Both `start_node_inner` choke points (the
+/// live on-epoch hook and the boot-replay seed) call this, so the feed logic
+/// lives in one tested place and a helper-body regression breaks both sites.
+fn feed_revoked_from_materialized(
+    proj: &crate::revoked_device_projection::RevokedDeviceProjection,
+    mat: &crate::community_membership::MaterializedMembership,
+) {
+    proj.union_from_members(
+        mat.members
+            .iter()
+            .map(|(o, m)| (*o, &m.revoked_device_keys)),
+    );
 }
 
 /// Start the harmony node with an embedded NodeRuntime.
@@ -7112,8 +7154,9 @@ pub async fn start_node_inner(
                                             // Fed unconditionally — even the remove_community branch below must
                                             // still see this, since a revocation learned right before a leave
                                             // must survive.
-                                            revoked_device_projection.union_from_members(
-                                                mat.members.iter().map(|(o, m)| (*o, &m.revoked_device_keys)),
+                                            feed_revoked_from_materialized(
+                                                &revoked_device_projection,
+                                                &mat,
                                             );
                                             let local_joined = mat
                                                 .members
@@ -7814,11 +7857,9 @@ pub async fn start_node_inner(
                                 // materialized state (the on-epoch hook only fires on NEW deltas).
                                 // Unconditional — before the is_joined gate that only affects the
                                 // membership seed.
-                                revoked_device_projection.union_from_members(
-                                    current
-                                        .members
-                                        .iter()
-                                        .map(|(o, m)| (*o, &m.revoked_device_keys)),
+                                feed_revoked_from_materialized(
+                                    &revoked_device_projection,
+                                    &current,
                                 );
                                 let is_joined = |actor: &crate::owner_state_types::OwnerAddr| {
                                     current
@@ -10768,6 +10809,11 @@ pub async fn start_node_inner(
                         // `registry.shutdown_all()` and the consumer task winds
                         // down cleanly.
                         guard.community_delta_tx = community_delta_tx_for_state.clone();
+                        // ZEB-687: stash a clone of the revoked-device projection so
+                        // #[cfg(test)] can observe the on-epoch hook / boot-replay
+                        // seed actually feeding it (Clone is over an inner Arc<RwLock<..>>,
+                        // so this clone sees the live hook's writes).
+                        guard.revoked_device_projection = Some(revoked_device_projection.clone());
                         // ZEB-225 Sub-B Phase 2: store DM outbox + per-identity
                         // handles on NodeState for send_dm IPC + (T7) drain tick.
                         guard.dm_outbox = dm_outbox_arc.clone();
@@ -58837,9 +58883,10 @@ mod tests {
         );
     }
 
-    /// ZEB-580 S2 (T2): pins the exact feed expression used at both
-    /// materialize choke points (`lib.rs`'s on-epoch hook and boot-replay
-    /// seed loop) against `MemberState`'s shape —
+    /// ZEB-580 S2 (T2): pins the feed expression that
+    /// `feed_revoked_from_materialized` wraps — the helper both materialize
+    /// choke points (`lib.rs`'s on-epoch hook and boot-replay seed loop) call
+    /// (ZEB-687) — against `MemberState`'s shape:
     /// `mat.members.iter().map(|(o, m)| (*o, &m.revoked_device_keys))`.
     /// `MemberState` has no `Default` impl, so the fixture is built as a
     /// full struct literal (mirrors `community_membership.rs`'s own test
@@ -58866,10 +58913,46 @@ mod tests {
         let members: BTreeMap<OwnerAddr, MemberState> = BTreeMap::from([(owner, member)]);
 
         let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
-        // The EXACT feed expression used at both choke points:
+        // The feed expression `feed_revoked_from_materialized` wraps:
         proj.union_from_members(members.iter().map(|(o, m)| (*o, &m.revoked_device_keys)));
 
         assert!(proj.is_revoked(&owner, &[0xcd; 32]));
+    }
+
+    /// ZEB-687: pins `feed_revoked_from_materialized` — the shared helper both
+    /// `start_node_inner` choke points call — against a `MaterializedMembership`
+    /// fixture (rather than a raw `members` map, unlike the sibling test above).
+    #[test]
+    fn feed_revoked_from_materialized_unions_member_keys() {
+        use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
+        use crate::owner_state_types::OwnerAddr;
+        use crate::revoked_device_projection::RevokedDeviceProjection;
+        use std::collections::BTreeSet;
+
+        let proj = RevokedDeviceProjection::new();
+        let owner = OwnerAddr([0x11; 16]);
+        let revoked = [0xaa; 32];
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: crate::owner_state_types::Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "zeb687".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::from([revoked]),
+            },
+        );
+        assert!(!proj.is_revoked(&owner, &revoked));
+        feed_revoked_from_materialized(&proj, &mat);
+        assert!(
+            proj.is_revoked(&owner, &revoked),
+            "helper must union member revoked keys"
+        );
     }
 }
 
@@ -63026,6 +63109,7 @@ mod start_node_race_tests {
             sync_engine: None,
             community_registry: None,
             community_delta_tx: None,
+            revoked_device_projection: None,
             vine_authority_published: false,
             vine_feed_binding_stamped: false,
             dm_outbox: None,
@@ -66078,5 +66162,258 @@ mod relay_opt_in_tests {
         let g = doc.lock().await;
         assert!(g.is_opted_in(&a), "a opted in");
         assert!(!g.is_opted_in(&b), "b still opted out");
+    }
+}
+
+/// ZEB-687: boot-integration regression guard for the DM revocation cutoff.
+///
+/// Task 1 routed the by-owner `RevokedDeviceProjection` feed through
+/// `feed_revoked_from_materialized(&proj, &mat)` at the live on-epoch
+/// membership-delta hook (lib.rs ~7148). That call is what keeps a revoked
+/// #2 device key out of the DM receive path once a peer's revocation reaches
+/// us. Unit tests cover the helper in isolation, but nothing proved the LIVE
+/// hook actually invokes it on a real booted node — the exact wiring that
+/// broke silently in ZEB-684. This module boots a real node via
+/// `start_node_inner`, drives one membership delta through the private
+/// `community_delta_tx`, and asserts the node's live projection reports the
+/// revoked key. Deleting the feed call makes this test's poll time out
+/// (verified via the RED-check in the task report).
+///
+/// Gated on `test-fixtures` because the boot must load a real owner identity
+/// (the community subsystem — registry, delta consumer, on-epoch hook — only
+/// wires up when `owner_state.cbor` is present), and the only headless way to
+/// mint one is `mint_owner_identity_inner_for_test`, itself `test-fixtures`-
+/// gated. A bare `cargo test` (no feature) simply skips this module.
+#[cfg(all(test, feature = "test-fixtures"))]
+mod zeb_687_revoked_feed_boot_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// RAII guard: sets an env var, restores its prior value (or removes it if
+    /// it was unset) on drop — including on panic. Boot-path env (HOME etc.) is
+    /// process-global; without restore a leaked value contaminates other tests
+    /// under a shared-process `cargo test` run. nextest isolates per process,
+    /// but the guard keeps this correct under both runners; `#[serial]` on the
+    /// test additionally stops a concurrent env reader from racing the set.
+    struct EnvVarGuard {
+        name: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prev = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn live_on_epoch_hook_feeds_revoked_projection() {
+        // NO outer whole-test timeout. A full node boot + the one-time
+        // process-global iroh bind legitimately runs 80-130s under a
+        // `--workspace --all-targets` sweep's CPU contention — the sibling
+        // full-boot tests `api_server::serve_core_drives_full_flow_over_http_and_ws`
+        // and `profile_isolation::named_profile_scopes_both_roots_and_boots`
+        // pass at ~128s / ~78s with no outer cap. An outer kill-switch set
+        // below that legitimate cost is a load-flake generator, not a safety
+        // net (a 90s cap here false-failed under the full sweep). The real
+        // correctness gate is the inner condition-poll deadline in step (i);
+        // a genuinely wedged boot is bounded by the CI job timeout.
+        live_on_epoch_hook_feeds_revoked_projection_inner().await;
+    }
+
+    async fn live_on_epoch_hook_feeds_revoked_projection_inner() {
+        use crate::community_membership::{
+            MaterializedMembership, MemberState, MemberStatus, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+        use crate::community_state_sync::CommunityMembershipDelta;
+        use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
+        use std::collections::BTreeSet;
+        use std::time::{Duration, Instant};
+
+        // (a) Env scaffolding — temp HOME + passphrase route identity to the
+        //     encrypted-file store inside the tempdir. Keychain auto-refuses in
+        //     cfg(test) (ZEB-428); HARMONY_DISABLE_KEYCHAIN=1 is belt-and-braces.
+        //     Each var is set through `EnvVarGuard`, which restores the prior
+        //     value on drop (end of test, incl. panic) so this process-global
+        //     mutation never leaks into another test. The guards are bound to
+        //     named `_g_*` locals so they live to the end of the test scope —
+        //     dropped AFTER `stop_inner` (step (j)), so shutdown still sees the
+        //     tempdir HOME.
+        let home = tempfile::tempdir().expect("tempdir for HOME override");
+        let home_str = home
+            .path()
+            .to_str()
+            .expect("tempdir path is valid utf8")
+            .to_string();
+        let _g_home = EnvVarGuard::set("HOME", &home_str);
+        let _g_userprofile = EnvVarGuard::set("USERPROFILE", &home_str);
+        let _g_pass = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb687-revoked-feed-boot-guard");
+        let _g_xdg = EnvVarGuard::set("XDG_DATA_HOME", &format!("{home_str}/xdg-data"));
+        let _g_appdata = EnvVarGuard::set("APPDATA", &format!("{home_str}/appdata"));
+        let _g_nokeychain = EnvVarGuard::set("HARMONY_DISABLE_KEYCHAIN", "1");
+
+        // (b) Mint a real owner identity FIRST. The community subsystem
+        //     (registry + delta consumer + the on-epoch hook under test) only
+        //     wires up when `start_node_inner` loads an existing owner identity
+        //     (`has_owner_identity`); a bare boot generates only the transport
+        //     `identity.key`. The no-op restart closure just writes
+        //     `owner_state.cbor` to disk (mirrors `mint_owner_lifecycle`'s
+        //     `ok_restart`); the real boot happens in step (c).
+        let state = std::sync::Arc::new(Mutex::new(NodeState::default()));
+        crate::owner_commands::mint_owner_identity_inner_for_test(&state, || {
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("mint owner identity writes owner_state.cbor");
+
+        // (c) Boot the serve core exactly as serve_cli does — now with the
+        //     owner identity on disk, so the community subsystem initializes.
+        //     Prime the one-time process-global iroh bind first so the boot
+        //     doesn't pay it under the assertion budget (ZEB-347).
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        let events = crate::api::events::ApiEventSink::new();
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(events.clone());
+        start_node_inner(None, sink, None, &state)
+            .await
+            .expect("node must boot with the minted owner identity loaded");
+
+        // (d) Pull the live handles. `state` is a std::sync::Mutex (see the
+        //     `start_node_inner(state: &Mutex<NodeState>)` signature — `Mutex`
+        //     is `std::sync::Mutex` at the crate root), so lock synchronously
+        //     and DROP the guard before any `.await` below (never hold a std
+        //     Mutex across an await). The projection is Clone-over-Arc<RwLock>,
+        //     so this clone observes the live hook's writes.
+        let (registry, delta_tx, node_proj) = {
+            let g = state.lock().expect("NodeState lock");
+            (
+                g.community_registry
+                    .clone()
+                    .expect("community_registry present after boot"),
+                g.community_delta_tx
+                    .clone()
+                    .expect("community_delta_tx present after boot"),
+                g.revoked_device_projection_for_test()
+                    .expect("revoked_device_projection stashed at boot"),
+            )
+        };
+
+        // (e) Spawn a bare engine for a fresh community whose id/owner/key are
+        //     invented here (so the freshly-minted node was never joined in it —
+        //     the projection is guaranteed empty until our delta lands). This
+        //     engine lives in the SAME registry the delta consumer's hook reads
+        //     via `projection_registry.engine_arc(&community_id)`, because
+        //     `guard.community_registry` and the hook's `projection_registry`
+        //     are both Arc clones of the one boot-time registry.
+        let cid = SpaceId([0x87; 16]);
+        let admin = OwnerAddr([0x87; 16]);
+        let mk = EpochKey::new([0x87; 32]);
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel(16);
+        registry
+            .spawn_engine_inner_now(cid, mk, admin, false, pub_tx, sub_rx, None, None, None)
+            .await
+            .expect("spawn bare membership engine");
+        let engine = registry
+            .engine_arc(&cid)
+            .await
+            .expect("engine present after spawn");
+
+        // (f) Seed a revoked member with NO signing: `seed_bootstrap_hint` makes
+        //     `materialized()` return this view verbatim while the engine has no
+        //     CRDT events (a fresh bare spawn), so the hook's `materialized()`
+        //     read surfaces `revoked` for `owner`.
+        let owner = OwnerAddr([0x42; 16]);
+        let revoked = [0x99; 32];
+        let mut hint = MaterializedMembership::default();
+        hint.members.insert(
+            owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "zeb687".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::from([revoked]),
+            },
+        );
+        engine.state().lock().await.seed_bootstrap_hint(hint);
+
+        // (g) Discrimination: the live hook has NOT run yet, so the projection
+        //     must still be empty — this is what makes the post-delta assertion
+        //     meaningful rather than vacuous.
+        assert!(
+            !node_proj.is_revoked(&owner, &revoked),
+            "projection must be empty before the delta drives the hook"
+        );
+
+        // (h) Drive ONE delta through the real consumer → live on-epoch hook.
+        //     The hook reads ONLY `delta.community_id` to route to the engine;
+        //     the `SignedMembershipEvent` payload is never inspected on this
+        //     path, so a field-less `Join` with zeroed id/sig and empty
+        //     cert/countersig/enrollment is a valid throwaway.
+        let ev = SignedMembershipEvent {
+            id: [0u8; 16],
+            community_id: cid,
+            kind: MembershipEventKind::Join,
+            actor: owner,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "zeb687".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+            signer_certs: vec![],
+        };
+        delta_tx
+            .send(CommunityMembershipDelta {
+                community_id: cid,
+                event: ev,
+            })
+            .await
+            .expect("send delta on the live community_delta_tx");
+
+        // (i) Condition poll (NOT a quiet-window — ZEB-686 flake anti-pattern):
+        //     succeed the instant the hook feeds the key; the deadline only
+        //     bounds a regression where the feed call is gone.
+        // 30s (not 10s): once boot is done the hook fires in microseconds, but
+        // under full-sweep contention the delta-consumer task's scheduling can
+        // lag; a generous deadline keeps this robust while still failing fast
+        // enough on a real regression (a removed feed call spins the full 30s
+        // then fails — the RED-check path).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !node_proj.is_revoked(&owner, &revoked) {
+            assert!(
+                Instant::now() < deadline,
+                "live on-epoch hook must feed the revoked projection within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            node_proj.is_revoked(&owner, &revoked),
+            "live on-epoch hook fed the revoked key into the node's projection"
+        );
+
+        // (j) Tear the booted node down so its spawned tasks don't outlive the
+        //     test and interfere with a subsequent in-process (`cargo test`)
+        //     test — matches serve_cli / api_server teardown. Runs while HOME is
+        //     still the tempdir; the env guards drop after this at end of scope.
+        let _ = stop_inner(&state, None);
     }
 }
