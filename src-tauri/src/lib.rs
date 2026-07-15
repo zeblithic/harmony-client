@@ -54692,13 +54692,6 @@ pub async fn connectivity_add_friend_by_key_inner(
     // advertise in the request it signs. `None` ships the empty bundle.
     self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
 ) -> Result<AddFriendOutcome, String> {
-    use crate::iroh_friend_acceptor::{
-        decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
-        FRIEND_MAX_PACKET_LEN,
-    };
-    use ed25519_dalek::{Signature, Signer, VerifyingKey};
-
     // 1. Decode the target's 64-byte transport identity pub (the "key" held OOB).
     let identity_pub: [u8; 64] = hex::decode(&identity_pub_hex)
         .map_err(|e| format!("hex decode identity_pub: {e}"))?
@@ -54859,6 +54852,59 @@ pub async fn connectivity_add_friend_by_key_inner(
             last_err.unwrap_or_else(|| "target_unreachable: iroh connect failed".to_string())
         );
     };
+    link_over_connection(
+        conn,
+        dial_config,
+        crate::friend_graph::FriendOrigin::MutualKey,
+        None,
+        self_owner,
+        self_display,
+        self_enrollment,
+        self_device2_signing_key,
+        self_reachability,
+        keytree,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        identity_pub_hex,
+    )
+    .await
+}
+
+/// ZEB-376: reusable Path-A friend-link tail. Given an already-connected iroh
+/// `conn` on the friend ALPN, opens a bi-stream, sends a token-less
+/// `FriendLinkRequest`, reads the `FriendLinkResponse`, verifies the accept
+/// cert+signature, derives the rendezvous secret, and applies the peer as a
+/// friend with `established_via = origin`. `expected_peer` (when `Some`) pins
+/// the owner the accept must come from (Path C introductions); `None` lets the
+/// caller learn the owner from the accept (Case-B `MutualKey`). `peer_label` is
+/// a hex label used only in log lines.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn link_over_connection(
+    conn: iroh::endpoint::Connection,
+    dial_config: HandshakeDialConfig,
+    origin: crate::friend_graph::FriendOrigin,
+    expected_peer: Option<crate::owner_state_types::OwnerAddr>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_display: Option<String>,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    peer_label: String,
+) -> Result<AddFriendOutcome, String> {
+    use crate::iroh_friend_acceptor::{
+        decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
+        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
+        FRIEND_MAX_PACKET_LEN,
+    };
+    use ed25519_dalek::{Signature, Signer, VerifyingKey};
+
     let (mut send, mut recv) =
         match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
             Ok(Ok(s)) => s,
@@ -55011,7 +55057,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         FriendLinkResponse::Accepted(a) => *a,
         FriendLinkResponse::Pending => {
             tracing::info!(
-                target = %identity_pub_hex,
+                target = %peer_label,
                 "ZEB-371 Path A: target recorded request (Pending); no friend written, retry after accept"
             );
             return Ok(classify_pending_outcome());
@@ -55057,6 +55103,16 @@ pub async fn connectivity_add_friend_by_key_inner(
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
 
+    // ZEB-376: when the caller pinned an expected owner (Path C introductions),
+    // the authenticated accept MUST come from that owner — otherwise the peer we
+    // reached is not the subject the introducer vouched for. Case-B passes `None`
+    // (it learns the owner from the accept).
+    if let Some(exp) = expected_peer {
+        if accepted.from_addr != exp {
+            return Err("link: accept came from an unexpected owner".into());
+        }
+    }
+
     // 9. The target's master key came from the chokepoint verification in
     //    step 8; apply them as an Active/MutualKey friend (keyed on their
     //    authenticated master owner_id).
@@ -55087,7 +55143,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         master_ed25519,
         display: display.clone(),
         status: crate::friend_graph::FriendStatus::Active,
-        established_via: crate::friend_graph::FriendOrigin::MutualKey,
+        established_via: origin,
         referrable: false,
         learned_at: learned_at.clone(),
         sealed_secret: Some(sealed),
