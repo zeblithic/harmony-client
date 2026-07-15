@@ -1544,6 +1544,25 @@ async fn handle_wire_message(
     }
 }
 
+/// ZEB-510 step 2 / ZEB-690: decode a peer's SAS-advertised iroh endpoint.
+/// `None` when the node id is absent, non-hex, or not exactly 32 bytes (a
+/// pre-step-2 peer omits it; a malformed value is tolerated, not fatal). An
+/// absent relay defaults to an empty string.
+fn decode_peer_iroh_endpoint(
+    node_id_hex: Option<String>,
+    home_relay: Option<String>,
+) -> Option<([u8; 32], String)> {
+    let nid_hex = node_id_hex?;
+    match hex::decode(&nid_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut nid = [0u8; 32];
+            nid.copy_from_slice(&bytes);
+            Some((nid, home_relay.unwrap_or_default()))
+        }
+        _ => None,
+    }
+}
+
 // ZEB-491: see handle_wire_message — the persist-ack forwarder adds an 8th param.
 #[allow(clippy::too_many_arguments)]
 async fn on_encrypted_payload(
@@ -1575,17 +1594,7 @@ async fn on_encrypted_payload(
             // ZEB-510 step 2: record the peer's dialing coordinates observed
             // over this SAS-authenticated channel (best-effort — a pre-step-2
             // peer omits them, leaving this None).
-            ctx.peer_iroh_endpoint = match (iroh_node_id_hex, iroh_home_relay) {
-                (Some(nid_hex), relay) => match hex::decode(&nid_hex) {
-                    Ok(bytes) if bytes.len() == 32 => {
-                        let mut nid = [0u8; 32];
-                        nid.copy_from_slice(&bytes);
-                        Some((nid, relay.unwrap_or_default()))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
+            ctx.peer_iroh_endpoint = decode_peer_iroh_endpoint(iroh_node_id_hex, iroh_home_relay);
             ctx.peer_confirmed = true;
             // Caveat 1: when we receive peer-CONFIRM AFTER we have already
             // locally confirmed, we must drive the post-confirm transition
@@ -4290,5 +4299,41 @@ mod tests {
                  now {cancels_after} — stale-ctx regression?"
             );
         }
+    }
+
+    // ── ZEB-690 (item 4): decode_peer_iroh_endpoint ──────────────────────────
+
+    #[test]
+    fn decode_peer_iroh_endpoint_valid() {
+        let nid = "ab".repeat(32); // 32 bytes hex
+        let got = decode_peer_iroh_endpoint(Some(nid), Some("https://r/".into()));
+        assert_eq!(got, Some(([0xAB; 32], "https://r/".to_string())));
+    }
+
+    #[test]
+    fn decode_peer_iroh_endpoint_empty_relay_defaults() {
+        let nid = "cd".repeat(32);
+        let got = decode_peer_iroh_endpoint(Some(nid), None);
+        assert_eq!(got, Some(([0xCD; 32], String::new())));
+    }
+
+    #[test]
+    fn decode_peer_iroh_endpoint_malformed_hex_is_none() {
+        // Odd length / non-hex → hex::decode errors → None.
+        assert_eq!(
+            decode_peer_iroh_endpoint(Some("zzz".into()), Some("r".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_peer_iroh_endpoint_wrong_length_is_none() {
+        // Valid hex but not 32 bytes → None.
+        assert_eq!(decode_peer_iroh_endpoint(Some("abab".into()), None), None);
+    }
+
+    #[test]
+    fn decode_peer_iroh_endpoint_absent_is_none() {
+        assert_eq!(decode_peer_iroh_endpoint(None, Some("r".into())), None);
     }
 }

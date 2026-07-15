@@ -259,4 +259,69 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    /// ZEB-690 (item 3): pin the wire back-compat contract that
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` provides —
+    /// a None-Confirm emits NO iroh keys (byte-identical to old wire), and a
+    /// hand-built old-style map decodes to None iroh fields. Distinct from the
+    /// round-trip above, which only proves current-serializer↔deserializer symmetry.
+    #[test]
+    fn confirm_none_fields_omit_iroh_keys_and_old_wire_decodes() {
+        use ciborium::value::Value;
+
+        // (a) Forward: a None-Confirm serializes WITHOUT the iroh keys.
+        let p = EncryptedPayload::Confirm {
+            sas_digits: "012845".to_string(),
+            iroh_node_id_hex: None,
+            iroh_home_relay: None,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&p, &mut bytes).unwrap();
+        let v: Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let keys: Vec<String> = match &v {
+            Value::Map(entries) => entries
+                .iter()
+                .filter_map(|(k, _)| match k {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("expected CBOR map"),
+        };
+        assert!(keys.contains(&"kind".to_string()));
+        assert!(keys.contains(&"sasDigits".to_string()));
+        assert!(
+            !keys.contains(&"irohNodeIdHex".to_string()),
+            "None iroh_node_id_hex must be skipped: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"irohHomeRelay".to_string()),
+            "None iroh_home_relay must be skipped: {keys:?}"
+        );
+
+        // (b) Backward: hand-built old-style wire (kind + sasDigits ONLY) decodes
+        // to a Confirm with both iroh fields None.
+        let old = Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text("confirm".into())),
+            (
+                Value::Text("sasDigits".into()),
+                Value::Text("012845".into()),
+            ),
+        ]);
+        let mut old_bytes = Vec::new();
+        ciborium::into_writer(&old, &mut old_bytes).unwrap();
+        let decoded: EncryptedPayload = ciborium::from_reader(old_bytes.as_slice()).unwrap();
+        match decoded {
+            EncryptedPayload::Confirm {
+                sas_digits,
+                iroh_node_id_hex,
+                iroh_home_relay,
+            } => {
+                assert_eq!(sas_digits, "012845");
+                assert!(iroh_node_id_hex.is_none());
+                assert!(iroh_home_relay.is_none());
+            }
+            _ => panic!("expected Confirm"),
+        }
+    }
 }

@@ -596,6 +596,82 @@ mod tests {
         assert_eq!(after3.get(&hex::encode(sib2_ed)), Some(&sib2_ed));
     }
 
+    // ZEB-690 (item 5): pins the converge-fix fall-through — when the self-owner
+    // entry already holds the sibling's device HASH but with its aligned pub
+    // `None` (a Path-B "known by hash, pub not yet propagated" state), seeding
+    // must fill the pub (so vk_lookup resolves) and NOT duplicate the hash.
+    #[test]
+    fn seed_sibling_fills_pub_when_hash_present_without_pub() {
+        use crate::owner_state_crdt::{ApplyOutcome, OwnerState};
+        use crate::owner_state_types::OwnerAddr;
+
+        let self_owner = OwnerAddr([0x11; 16]);
+        let self_vk = [0x99u8; 32];
+        let sib_ed: [u8; 32] = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+            .verifying_key()
+            .to_bytes();
+        // Reconstruct the sibling's device hash exactly as the seed does.
+        let x_pub = crate::dm_signing::ed25519_pub_to_x25519(&sib_ed).unwrap();
+        let mut identity_pub = [0u8; 64];
+        identity_pub[..32].copy_from_slice(&x_pub);
+        identity_pub[32..].copy_from_slice(&sib_ed);
+        let hash = crate::dm_signing::derive_device_hash_from_identity_pub(&identity_pub).unwrap();
+
+        let mut state = OwnerState::default();
+        // Pre-seed: hash present, pub None (Path-B; older HLC than the seed below).
+        // Assert acceptance so the precondition can't be silently vacuous.
+        let pre = state.apply_owner_device_update(
+            self_owner,
+            vec![hash],
+            vec![None],
+            vec![None],
+            hlc(500, "pre"),
+        );
+        assert!(
+            !matches!(pre, ApplyOutcome::Rejected(_)),
+            "pre-seed must be accepted, else the setup is vacuous: {pre:?}"
+        );
+        // Precondition: the entry holds the sibling's hash with its aligned pub None.
+        {
+            let e = state.owner_device_cache.devices.get(&self_owner).unwrap();
+            let idx = e
+                .devices
+                .iter()
+                .position(|d| *d == hash)
+                .expect("pre-seeded hash present");
+            assert!(
+                e.device_identity_pubs[idx].is_none(),
+                "precondition: aligned pub must be None"
+            );
+        }
+
+        let vk_map = |st: &OwnerState| {
+            vk_map_from_device_cache(&st.owner_device_cache, &self_owner, "self-dev", self_vk)
+        };
+        // vk_lookup does NOT resolve yet — pub is None.
+        assert!(!vk_map(&state).contains_key(&hex::encode(sib_ed)));
+
+        // Seed → falls through the idempotency guard and fills the pub.
+        assert!(seed_sibling_device_cache(
+            &mut state, self_owner, sib_ed, 1_000
+        ));
+        assert_eq!(vk_map(&state).get(&hex::encode(sib_ed)), Some(&sib_ed));
+
+        // Postcondition: the SAME hash is retained (no duplicate) with its aligned
+        // pub now Some — the fall-through filled it in place.
+        let entry = state.owner_device_cache.devices.get(&self_owner).unwrap();
+        assert_eq!(entry.devices.len(), 1, "device hash must not be duplicated");
+        let idx = entry
+            .devices
+            .iter()
+            .position(|d| *d == hash)
+            .expect("seeded hash retained");
+        assert!(
+            entry.device_identity_pubs[idx].is_some(),
+            "seed must fill the previously-None pub"
+        );
+    }
+
     // Pins the fleet-net-v1 wire format; NEVER regenerate. Mod-level so the
     // additive-decode test can prove pre-S4 bytes still parse (ZEB-668 S4).
     // See EXPECTED_OUTHOLD_DOC_HEX in dm_outhold.rs for the pattern.
