@@ -5180,6 +5180,8 @@ pub async fn start_node_inner(
                         enrolled: dm_inbox_enrolled,
                         // ZEB-580 S2: shared-community revocation cutoff handle.
                         revoked: revoked_device_projection.clone(),
+                        // ZEB-691 B6: wire the real hook
+                        notify_owner_state_dirty: None,
                     });
                     // The ingest sweeper: one startup sweep (entries
                     // deposited while this device was offline), then one

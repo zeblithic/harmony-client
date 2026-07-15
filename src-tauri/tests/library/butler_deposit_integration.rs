@@ -498,6 +498,13 @@ impl DmInboxIngestCtx for ProbeIngestCtx {
         Ok(())
     }
 
+    async fn apply_revocation(&self, _entry: &DmInboxEntry) -> Result<bool, String> {
+        // ZEB-691 standalone device-revocation deposits (`cidnotify_packet` and
+        // `invite_packet` both `None`) are not exercised by these message-entry
+        // probes; the recover path is unit-covered in `dm_inbox_ingest.rs`.
+        Ok(true)
+    }
+
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
         let inserted = self
             .dm_store
