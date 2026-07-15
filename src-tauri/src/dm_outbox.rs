@@ -2401,13 +2401,21 @@ pub(crate) enum ApplyInviteOutcome {
 /// `pub` (not `pub(crate)`) so the end-to-end cutoff integration test can drive
 /// the real handler, mirroring the public `DmOutbox::handle_cidnotify_lifted`
 /// receive entrypoint it pairs with.
+///
+/// Returns `Ok(true)` iff a NEW revoked key was inserted into the owner-state
+/// CRDT store (`Ok(false)` on an idempotent re-apply). The caller uses this to
+/// mark the owner-state engine dirty ONLY on a genuine change — the store lives
+/// in the owner-state CRDT, which persists + replicates to sibling devices only
+/// via a `notify_dirty` flush, and RevocationPush has no deposit-rung backstop,
+/// so without this the revocation is lost on restart (boot-replay re-seeds
+/// nothing) and never reaches the owner's other devices.
 pub fn handle_revocation_push(
     state: &mut OwnerState,
     expected_owner: OwnerAddr,
     revocation: &harmony_owner::certs::RevocationCert,
     enrollment: &harmony_owner::certs::EnrollmentCert,
     revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
-) -> Result<(), DmReceiveError> {
+) -> Result<bool, DmReceiveError> {
     // 1. Master-signed revocation — `verify(None)` self-verifies the embedded
     //    master pub and binds `master.identity_hash() == revocation.owner_id`.
     revocation
@@ -2437,11 +2445,11 @@ pub fn handle_revocation_push(
     // 4. Bridge target `device_id` → the revoked `ed25519`, store union-merged
     //    (survives across the owner's devices), and feed the live projection.
     let ed25519 = enrollment.device_pubkeys.classical.ed25519_verify;
-    state.apply_revoked_dm_device(expected_owner, ed25519);
+    let inserted = state.apply_revoked_dm_device(expected_owner, ed25519);
     let mut one = std::collections::BTreeSet::new();
     one.insert(ed25519);
     revoked.union_from_members(std::iter::once((expected_owner, &one)));
-    Ok(())
+    Ok(inserted)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3602,8 +3610,13 @@ mod tests {
         let mut state = OwnerState::default();
         let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
         assert!(!proj.is_revoked(&c.owner, &c.revoked_ed));
-        handle_revocation_push(&mut state, c.owner, &c.revocation, &c.enrollment, &proj)
-            .expect("valid master-signed push accepted");
+        let inserted =
+            handle_revocation_push(&mut state, c.owner, &c.revocation, &c.enrollment, &proj)
+                .expect("valid master-signed push accepted");
+        assert!(
+            inserted,
+            "fresh revocation reports a new insert (drives notify_dirty)"
+        );
         assert!(proj.is_revoked(&c.owner, &c.revoked_ed), "projection fed");
         assert!(
             state
@@ -3613,9 +3626,12 @@ mod tests {
                 .contains(&c.revoked_ed),
             "CRDT stored"
         );
-        // Idempotent re-apply — still exactly one entry.
-        handle_revocation_push(&mut state, c.owner, &c.revocation, &c.enrollment, &proj)
-            .expect("idempotent re-apply");
+        // Idempotent re-apply — still exactly one entry, and reports no new insert
+        // (so the caller does NOT spuriously mark the engine dirty).
+        let reinserted =
+            handle_revocation_push(&mut state, c.owner, &c.revocation, &c.enrollment, &proj)
+                .expect("idempotent re-apply");
+        assert!(!reinserted, "idempotent re-apply reports no new insert");
         assert_eq!(state.revoked_dm_devices.get(&c.owner).unwrap().len(), 1);
     }
 

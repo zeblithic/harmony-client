@@ -4846,6 +4846,15 @@ pub async fn start_node_inner(
                         crate::owner_state_sync::DEFAULT_DEBOUNCE_MS,
                     ));
 
+                    // ZEB-685 (S3): a stable, uniquely-named handle to the
+                    // owner-state engine for the tunnel drain's RevocationPush
+                    // persistence signal. A received friend-revocation mutates
+                    // the owner-state CRDT (`revoked_dm_devices`), which persists
+                    // + replicates ONLY via a `notify_dirty` flush and has no
+                    // deposit-rung backstop — so the drain must mark it dirty or
+                    // the cutoff silently regresses on restart (see the drain).
+                    let owner_state_engine_for_dirty = std::sync::Arc::clone(&engine);
+
                     // Topic key is the OWNER identity (16-byte address from
                     // `harmony_owner::state::OwnerState.owner_id`), not the
                     // per-device Reticulum transport address — every device
@@ -9657,7 +9666,14 @@ pub async fn start_node_inner(
                             let drain_self_owner = self_owner;
                             // ZEB-580 S2: shared-community revocation cutoff handle.
                             let drain_revoked = revoked_device_projection.clone();
+                            // ZEB-685 (S3): owner-state engine handle so a received
+                            // friend-RevocationPush that inserts a new revoked key
+                            // is flushed (persist + replicate to sibling devices).
+                            let drain_owner_engine =
+                                std::sync::Arc::clone(&owner_state_engine_for_dirty);
                             tokio::spawn(async move {
+                                let mark_owner_state_dirty =
+                                    move || drain_owner_engine.notify_dirty();
                                 while let Some(dm) = tunnel_ingest_rx.recv().await {
                                     match crate::dm_inbox_ingest::ingest_dm_packet(
                                         &drain_crdt_state,
@@ -9672,6 +9688,7 @@ pub async fn start_node_inner(
                                         dm.peer_node_id,
                                         &dm.payload,
                                         &drain_revoked,
+                                        Some(&mark_owner_state_dirty),
                                     )
                                     .await
                                     {

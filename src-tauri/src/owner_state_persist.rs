@@ -424,6 +424,36 @@ mod tests {
     }
 
     #[test]
+    fn crdt_file_v2_round_trips_revoked_dm_devices() {
+        // ZEB-685 (S3): the friend-scoped DM-revocation store must survive
+        // save->load or boot-replay re-seeds nothing and the cutoff regresses
+        // on restart. Guards the CrdtFileV2 threading + both From impls.
+        let mut s = OwnerState::default();
+        let owner = crate::owner_state_types::OwnerAddr([0x77; 16]);
+        assert!(s.apply_revoked_dm_device(owner, [0x11; 32]));
+        assert!(s.apply_revoked_dm_device(owner, [0x22; 32]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(loaded.revoked_dm_devices, s.revoked_dm_devices);
+        assert_eq!(loaded.revoked_dm_devices.get(&owner).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pre_revoked_dm_devices_snapshot_loads_empty() {
+        // A V2 file serialized WITHOUT the revoked-DM store (skipped on the wire
+        // when empty) must load to an empty map — backward-compat with snapshots
+        // written before ZEB-685.
+        let s = OwnerState::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert!(loaded.revoked_dm_devices.is_empty());
+    }
+
+    #[test]
     fn pre_friendgraph_snapshot_loads_empty() {
         // A V2 file serialized WITHOUT any friend graph (the field is
         // skipped on the wire when empty) must load to an empty graph —

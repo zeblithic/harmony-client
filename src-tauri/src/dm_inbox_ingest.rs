@@ -445,6 +445,12 @@ pub(crate) async fn ingest_dm_packet(
     // ZEB-580 S2: the shared-community revocation projection — forwarded to
     // `verify_cidnotify_admission` for the CidNotify signer-device cutoff.
     revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
+    // ZEB-685 (S3): mark the owner-state engine dirty after a RevocationPush
+    // inserts a NEW revoked key, so the friend-scoped store is persisted +
+    // replicated to sibling devices (it has no deposit-rung backstop; without
+    // this it is lost on restart). `None` for callers with no engine wired
+    // (unit tests) — the mutation still lands in memory, just isn't flushed.
+    notify_owner_state_dirty: Option<&(dyn Fn() + Send + Sync)>,
 ) -> Result<bool, String> {
     // 1. Decode + dispatch on the DmPacket variant (ZEB-482). The tunnel
     //    carries a discriminated `DmPacket`; today only `Invite` (DM-Space
@@ -584,10 +590,23 @@ pub(crate) async fn ingest_dm_packet(
                 &enrollment,
                 revoked,
             ) {
-                Ok(()) => tracing::info!(
-                    owner = %hex::encode(expected_owner.0),
-                    "ZEB-685: applied friend RevocationPush"
-                ),
+                Ok(inserted) => {
+                    // Persist + replicate the friend-scoped store ONLY on a
+                    // genuine new insert. Drop the owner-state lock first: the
+                    // engine's own publish path takes it (notify_dirty itself is
+                    // non-blocking, but keep the ordering obviously deadlock-free).
+                    drop(state);
+                    if inserted {
+                        if let Some(mark_dirty) = notify_owner_state_dirty {
+                            mark_dirty();
+                        }
+                    }
+                    tracing::info!(
+                        owner = %hex::encode(expected_owner.0),
+                        inserted,
+                        "ZEB-685: applied friend RevocationPush"
+                    );
+                }
                 Err(e) => {
                     tracing::warn!(error = ?e, "ZEB-685: rejected RevocationPush")
                 }
@@ -1703,6 +1722,7 @@ mod tests {
             [0u8; 32],
             &fx.packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("known-good packet must ingest");
@@ -1747,6 +1767,7 @@ mod tests {
             [0u8; 32],
             &fx.packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("duplicate packet is not an error");
@@ -1860,6 +1881,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a known-good invite from a bound peer must apply");
@@ -1981,6 +2003,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a non-friend invite stages (not an error)");
@@ -2116,6 +2139,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a non-friend invite stages (not an error)");
@@ -2143,6 +2167,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a friend-tier invite redelivery must apply");
@@ -2226,6 +2251,7 @@ mod tests {
             [0u8; 32],
             &wire,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a CidNotifyWithBlob from an admitted sender must deliver");
@@ -2292,6 +2318,7 @@ mod tests {
             [0u8; 32],
             &wire,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("an unadmitted CidNotifyWithBlob must be rejected");
@@ -2342,6 +2369,7 @@ mod tests {
             [0u8; 32],
             &wire,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("a CID-mismatched inline blob must be rejected");
@@ -2455,6 +2483,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("an inviter-vs-peer mismatch must be rejected");
@@ -2555,6 +2584,7 @@ mod tests {
             unknown_peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("an invite from an unbindable peer must be rejected");
@@ -2602,6 +2632,7 @@ mod tests {
             [0u8; 32],
             &tampered,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("a tampered packet must be rejected");
@@ -2657,6 +2688,7 @@ mod tests {
             [0u8; 32],
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("an Ack on the tunnel ingest path must be rejected");
@@ -2751,6 +2783,7 @@ mod tests {
             [0u8; 32],
             &fx.packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("a sender kicked mid-fetch must be rejected by the Phase-C re-check");
@@ -2814,6 +2847,7 @@ mod tests {
             [0u8; 32],
             &fx.packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("a CAS blob whose CID != signed message_cid must be rejected");
