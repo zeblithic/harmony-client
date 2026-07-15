@@ -9,6 +9,7 @@ use iroh::endpoint::Connection;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::friend_graph::{FriendGraph, FriendStatus};
+use crate::friend_intro::{decode_pex_frame_or_catalog, PexDecoded, PexFrame};
 use crate::iroh_friend_acceptor::FriendAcceptorConfig;
 use crate::owner_state_crdt::OwnerState;
 use crate::owner_state_types::{Hlc, OwnerAddr};
@@ -80,6 +81,16 @@ pub struct IrohFriendPexAcceptor {
     self_enrollment: EnrollmentCert,
     device2_signing_key: Arc<ed25519_dalek::SigningKey>,
     config: FriendAcceptorConfig,
+    /// ZEB-376 Task 9: F's active-introduction broker deps — the handles the
+    /// `IntroduceRequest` arm needs to Case-D resolve + dial the target (X) and
+    /// relay a signed `Introduction`. All optional (default `None`) so existing
+    /// `new`/`with_config` callers — including the 2a `referral_catalog_roundtrip`
+    /// integration test — keep compiling unchanged. The arm guards on their
+    /// presence (logs + skips the F→X dial when any is absent) rather than
+    /// panicking. (Task 10/11 add MORE deps here for X's `Introduction` arm.)
+    pkarr_resolver: Option<Arc<harmony_pkarr::PkarrResolver>>,
+    iroh_endpoint: Option<Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    owner_keytree: Option<Arc<crate::owner_state_crypto::KeyTree>>,
 }
 
 impl IrohFriendPexAcceptor {
@@ -122,7 +133,42 @@ impl IrohFriendPexAcceptor {
             self_enrollment,
             device2_signing_key,
             config,
+            pkarr_resolver: None,
+            iroh_endpoint: None,
+            owner_keytree: None,
         }
+    }
+
+    /// ZEB-376 Task 9: wire the pkarr resolver F's `IntroduceRequest` arm uses to
+    /// Case-D resolve the target (X)'s reachability. Fluent setter (default
+    /// `None`) so existing call sites keep compiling without an explicit `None`.
+    pub fn with_pkarr_resolver(
+        mut self,
+        resolver: Option<Arc<harmony_pkarr::PkarrResolver>>,
+    ) -> Self {
+        self.pkarr_resolver = resolver;
+        self
+    }
+
+    /// ZEB-376 Task 9: wire the iroh endpoint F dials the target (X) over on the
+    /// `harmony/friend-pex/v1` ALPN. Fluent setter (default `None`).
+    pub fn with_iroh_endpoint(
+        mut self,
+        endpoint: Option<Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    ) -> Self {
+        self.iroh_endpoint = endpoint;
+        self
+    }
+
+    /// ZEB-376 Task 9: wire the owner `KeyTree` F uses to Case-D decrypt its
+    /// sealed rendezvous secret for the target (X). Fluent setter (default
+    /// `None`).
+    pub fn with_owner_keytree(
+        mut self,
+        keytree: Option<Arc<crate::owner_state_crypto::KeyTree>>,
+    ) -> Self {
+        self.owner_keytree = keytree;
+        self
     }
 
     /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
@@ -176,62 +222,191 @@ impl IrohFriendPexAcceptor {
             .map_err(|_| "io timeout reading body".to_string())?
             .map_err(|e| format!("read body: {e}"))?;
 
-        let req = decode_catalog_request(&body).map_err(|e| format!("decode request: {e}"))?;
+        // ZEB-376 Task 9: dispatch on the decoded friend-PEX body. A bare 2a
+        // `CatalogRequest` (browse) falls back to the Catalog arm — UNCHANGED
+        // behavior; the tagged 2b frames route to the introduction arms.
+        match decode_pex_frame_or_catalog(&body).map_err(|e| format!("decode pex body: {e}"))? {
+            // ── 2a browse (UNCHANGED). ─────────────────────────────────────
+            PexDecoded::Catalog(req) => {
+                // Authenticate BEFORE bumping the HLC: an unauthenticated /
+                // wrong-target peer must not be able to increment the server's
+                // `hlc_tracker`. This is fail-closed — an `Err` here early-returns
+                // and closes the stream without touching either lock (no HLC bump,
+                // no catalog served). The pure `serve_catalog_for_request` below
+                // re-runs this same check internally; that redundant second verify
+                // is intentional defense-in-depth and keeps the pure fn
+                // self-contained.
+                // ZEB-378: one expiry-clock sample for BOTH this pre-HLC auth and
+                // the serve-side re-auth below, so the two checks can't straddle an
+                // expiry boundary (nondeterministic accept/reject near a cert's
+                // expiry second).
+                let now_secs = crate::iroh_friend_acceptor::wall_now_secs();
+                crate::referral_catalog::authenticate_catalog_request(
+                    &req,
+                    self.self_owner,
+                    now_secs,
+                )
+                .map_err(|e| format!("{e:?}"))?;
 
-        // Authenticate BEFORE bumping the HLC: an unauthenticated / wrong-target
-        // peer must not be able to increment the server's `hlc_tracker`. This is
-        // fail-closed — an `Err` here early-returns and closes the stream without
-        // touching either lock (no HLC bump, no catalog served). The pure
-        // `serve_catalog_for_request` below re-runs this same check internally;
-        // that redundant second verify is intentional defense-in-depth and keeps
-        // the pure fn self-contained.
-        // ZEB-378: one expiry-clock sample for BOTH this pre-HLC auth and the
-        // serve-side re-auth below, so the two checks can't straddle an expiry
-        // boundary (nondeterministic accept/reject near a cert's expiry second).
-        let now_secs = crate::iroh_friend_acceptor::wall_now_secs();
-        crate::referral_catalog::authenticate_catalog_request(&req, self.self_owner, now_secs)
-            .map_err(|e| format!("{e:?}"))?;
+                // Stamp the catalog clock BEFORE taking the crdt lock so the two
+                // locks (hlc_tracker, crdt_state) are never nested.
+                let at = self.next_hlc().await;
 
-        // Stamp the catalog clock BEFORE taking the crdt lock so the two locks
-        // (hlc_tracker, crdt_state) are never nested.
-        let at = self.next_hlc().await;
+                // Build the catalog under the crdt lock: snapshot the friend graph,
+                // run the pure serve-decision, then DROP the guard before any
+                // network write. The owner-state lock is never held across IO.
+                // Read-only: no mutation.
+                let cat = {
+                    let state = self.crdt_state.lock().await;
+                    serve_catalog_for_request(
+                        &state.friend_graph,
+                        &req,
+                        self.self_owner,
+                        self.self_enrollment.clone(),
+                        &self.device2_signing_key,
+                        at,
+                        now_secs,
+                    )
+                    .map_err(|e| format!("serve decision: {e}"))?
+                }; // guard dropped here — owner-state lock released before the write.
 
-        // Build the catalog under the crdt lock: snapshot the friend graph, run
-        // the pure serve-decision, then DROP the guard before any network write.
-        // The owner-state lock is never held across IO. Read-only: no mutation.
-        let cat = {
-            let state = self.crdt_state.lock().await;
-            serve_catalog_for_request(
-                &state.friend_graph,
-                &req,
-                self.self_owner,
-                self.self_enrollment.clone(),
-                &self.device2_signing_key,
-                at,
-                now_secs,
-            )
-            .map_err(|e| format!("serve decision: {e}"))?
-        }; // guard dropped here — owner-state lock released before the write.
+                let resp =
+                    encode_referral_catalog(&cat).map_err(|e| format!("encode catalog: {e}"))?;
+                let resp_prefix = crate::iroh_framing::encode_len_prefix(
+                    resp.len(),
+                    PEX_MAX_PACKET_LEN,
+                    crate::iroh_framing::Endian::Le,
+                    false,
+                )
+                .map_err(|e| format!("response too large: len={} max={}", e.len, e.max))?;
 
-        let resp = encode_referral_catalog(&cat).map_err(|e| format!("encode catalog: {e}"))?;
-        let resp_prefix = crate::iroh_framing::encode_len_prefix(
-            resp.len(),
+                // Write [u32 LE length-prefix][catalog CBOR] then finish().
+                tokio::time::timeout(self.config.io_deadline, send.write_all(&resp_prefix))
+                    .await
+                    .map_err(|_| "io timeout writing length-prefix".to_string())?
+                    .map_err(|e| format!("write length-prefix: {e}"))?;
+                tokio::time::timeout(self.config.io_deadline, send.write_all(&resp))
+                    .await
+                    .map_err(|_| "io timeout writing body".to_string())?
+                    .map_err(|e| format!("write body: {e}"))?;
+                // `send.finish()` is sync — no timeout needed.
+                send.finish().map_err(|e| format!("send.finish: {e}"))?;
+                Ok(())
+            }
+
+            // ── 2b: F's broker arm (You → F "introduce me to X"). ───────────
+            PexDecoded::Frame(PexFrame::IntroduceRequest(ir)) => {
+                // Authenticate + authorize (X must be an Active + referrable friend)
+                // via the pure broker decision, then relay a signed Introduction to
+                // X out-of-band (spawned) and ack the requester. The ack is
+                // deliberately benign — it does NOT reveal whether X was referrable
+                // (no leak of a non-opted-in friend); the requester learned X from
+                // the catalog it already browsed.
+                let now_secs = crate::iroh_friend_acceptor::wall_now_secs();
+                // Stamp the Introduction clock BEFORE taking the crdt lock so the
+                // two locks (hlc_tracker, crdt_state) are never nested.
+                let at = self.next_hlc().await;
+
+                // Under the crdt lock: run the pure broker decision AND snapshot X's
+                // sealed rendezvous secret (needed to Case-D resolve + dial X), then
+                // DROP the guard before any network IO. Read-only: no mutation.
+                let (decision, target_sealed) = {
+                    let state = self.crdt_state.lock().await;
+                    let decision = crate::friend_intro::build_introduction_for_request(
+                        &ir,
+                        &state.friend_graph,
+                        self.self_owner,
+                        self.self_enrollment.clone(),
+                        &self.device2_signing_key,
+                        at,
+                        now_secs,
+                    );
+                    let sealed = state
+                        .friend_graph
+                        .friends
+                        .get(&ir.target)
+                        .and_then(|e| e.sealed_secret.clone());
+                    (decision, sealed)
+                }; // guard dropped — owner-state lock released before the dial.
+
+                match decision {
+                    Ok(intro) => match (
+                        self.pkarr_resolver.clone(),
+                        self.owner_keytree.clone(),
+                        self.iroh_endpoint.clone(),
+                        target_sealed,
+                    ) {
+                        (Some(resolver), Some(keytree), Some(endpoint), Some(sealed)) => {
+                            // Spawn the F→X delivery so `serve()` stays single-shot
+                            // and non-blocking (the requester's ack does not wait on
+                            // the relay's success).
+                            let target = ir.target;
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::deliver_introduction_to_target(
+                                    resolver, keytree, endpoint, target, sealed, intro,
+                                )
+                                .await
+                                {
+                                    tracing::debug!(
+                                        error = %e,
+                                        "ZEB-376: F→X introduction delivery failed"
+                                    );
+                                }
+                            });
+                        }
+                        _ => tracing::debug!(
+                            "ZEB-376: introduce-request broker: dial deps or target \
+                             rendezvous secret unavailable; skipping F→X delivery"
+                        ),
+                    },
+                    Err(e) => {
+                        tracing::debug!(error = %e, "ZEB-376: introduce-request broker declined")
+                    }
+                }
+
+                self.write_ack(&mut send).await
+            }
+
+            // ── 2b: X's inbound-Introduction arm — DEFERRED to Task 10. ─────
+            PexDecoded::Frame(PexFrame::Introduction(intro)) => {
+                // Task 10 replaces this arm: authenticate (verify_introduction),
+                // enforce PeerIntroPolicy (decide_introduction), and link / stage /
+                // reject. For now: decode (done above) + log + ack so the dialer's
+                // stream completes.
+                let _ = intro;
+                tracing::debug!("introduction arm: Task 10");
+                self.write_ack(&mut send).await
+            }
+        }
+    }
+
+    /// Write a minimal length-prefixed ack (`[u32 LE len][0x01]`) then finish the
+    /// send stream. The 2b introduction directions are fire-and-relay: the dialer
+    /// only needs confirmation its frame was received, not a payload. Same framing
+    /// (bound, endian) as the catalog write-back so the friend-PEX wire stays
+    /// uniform; `deliver_introduction_to_target` reads exactly this ack.
+    async fn write_ack(&self, send: &mut iroh::endpoint::SendStream) -> Result<(), String> {
+        const ACK: [u8; 1] = [0x01];
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            ACK.len(),
             PEX_MAX_PACKET_LEN,
             crate::iroh_framing::Endian::Le,
             false,
         )
-        .map_err(|e| format!("response too large: len={} max={}", e.len, e.max))?;
-
-        // Write [u32 LE length-prefix][catalog CBOR] then finish().
-        tokio::time::timeout(self.config.io_deadline, send.write_all(&resp_prefix))
+        .map_err(|e| {
+            format!(
+                "ack length-prefix out of bounds: len={} max={}",
+                e.len, e.max
+            )
+        })?;
+        tokio::time::timeout(self.config.io_deadline, send.write_all(&prefix))
             .await
-            .map_err(|_| "io timeout writing length-prefix".to_string())?
-            .map_err(|e| format!("write length-prefix: {e}"))?;
-        tokio::time::timeout(self.config.io_deadline, send.write_all(&resp))
+            .map_err(|_| "io timeout writing ack length-prefix".to_string())?
+            .map_err(|e| format!("write ack length-prefix: {e}"))?;
+        tokio::time::timeout(self.config.io_deadline, send.write_all(&ACK))
             .await
-            .map_err(|_| "io timeout writing body".to_string())?
-            .map_err(|e| format!("write body: {e}"))?;
-        // `send.finish()` is sync — no timeout needed.
+            .map_err(|_| "io timeout writing ack body".to_string())?
+            .map_err(|e| format!("write ack body: {e}"))?;
         send.finish().map_err(|e| format!("send.finish: {e}"))?;
         Ok(())
     }

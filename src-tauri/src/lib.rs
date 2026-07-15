@@ -9577,9 +9577,12 @@ pub async fn start_node_inner(
                         // referral-catalog acceptor from the SAME read-only
                         // sources the friend acceptor uses (crdt_state,
                         // hlc_tracker, self_owner, this device's own
-                        // EnrollmentCert + device-#2 signing key). It is strictly
-                        // read-only — no app handle, no pkarr publisher, no
-                        // keytree — and serves a signed catalog on the
+                        // EnrollmentCert + device-#2 signing key). The 2a browse
+                        // path stays strictly read-only; ZEB-376 Task 9 additionally
+                        // threads F's active-introduction broker deps (pkarr
+                        // resolver, iroh endpoint, owner KeyTree) so the
+                        // `IntroduceRequest` arm can Case-D resolve + dial the
+                        // target (X) and relay a signed Introduction. Serves on the
                         // `harmony/friend-pex/v1` ALPN.
                         let pex_acceptor: std::sync::Arc<
                             dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
@@ -9591,7 +9594,15 @@ pub async fn start_node_inner(
                                 self_owner,
                                 own_enrollment_cert_for_friend.clone(),
                                 std::sync::Arc::clone(&community_signing_key_arc),
-                            ),
+                            )
+                            // ZEB-376 Task 9: thread F's active-introduction broker
+                            // deps — the SAME handles `browse_friend_referrals`
+                            // holds (resolver + owner KeyTree + iroh endpoint) — so
+                            // the `IntroduceRequest` arm can dial X and relay the
+                            // signed Introduction.
+                            .with_pkarr_resolver(pkarr_resolver_for_state.clone())
+                            .with_owner_keytree(Some(std::sync::Arc::clone(&kt)))
+                            .with_iroh_endpoint(iroh_endpoint_arc.clone()),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -53930,6 +53941,192 @@ async fn browse_friend_referrals(
         &cat,
         &friend_graph_snapshot,
     ))
+}
+
+/// ZEB-376 (Friends Phase 2b, Task 9): F→X active-introduction delivery. Mirrors
+/// `browse_friend_referrals`' Case-D resolve + dial-`HARMONY_FRIEND_PEX_V1`
+/// pattern verbatim, but resolves the TARGET (X) from F's own sealed rendezvous
+/// secret for X (`target_sealed_secret`), writes a tagged
+/// `PexFrame::Introduction`, and reads a small ack (no catalog). The PEX
+/// acceptor's `IntroduceRequest` arm calls this inside a `tokio::spawn` so
+/// `serve()` stays single-shot and non-blocking. `intro` is F's already-signed
+/// vouch aimed at X.
+pub(crate) async fn deliver_introduction_to_target(
+    resolver: std::sync::Arc<harmony_pkarr::PkarrResolver>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    iroh_endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    target_owner: crate::owner_state_types::OwnerAddr,
+    target_sealed_secret: Vec<u8>,
+    intro: crate::friend_intro::Introduction,
+) -> Result<(), String> {
+    let target_owner_16 = target_owner.0;
+
+    // Decrypt the per-friendship secret + Case-D resolve X's current reachability
+    // — REUSING the same helpers `browse_friend_referrals` uses.
+    let secret = crate::owner_state_crypto::decrypt_friend_secret(
+        &keytree,
+        &target_owner_16,
+        &target_sealed_secret,
+    )
+    .map_err(|_| "target unreachable".to_string())?;
+
+    let Some(blob) =
+        crate::pkarr_friend_publisher::resolve_friend_case_d(&resolver, &secret, &target_owner_16)
+            .await?
+    else {
+        return Err("target unreachable".to_string());
+    };
+    if blob.is_empty() {
+        // Publisher emits an empty blob when iroh is down (un-dial-able).
+        return Err("target unreachable".to_string());
+    }
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| format!("decode case-d routing blob: {e}"))?;
+
+    // Synthesize an EndpointAddr from the verified routing record (same inline
+    // synthesis `browse_friend_referrals` does).
+    let target_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode target iroh_node_id: {e}"))?;
+    let mut target_addr = iroh::EndpointAddr::new(target_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => target_addr = target_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        target_addr = target_addr.with_ip_addr(*da);
+    }
+
+    // Dial the friend-PEX ALPN + open a bi-stream, bounded by the same dial config
+    // the browse path uses.
+    let dial_config = HandshakeDialConfig::from_env();
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint.inner().connect(
+            target_addr,
+            crate::iroh_endpoint::alpn::HARMONY_FRIEND_PEX_V1,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("target unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "target unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("target unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "target unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // Encode the tagged Introduction frame + write [u32 LE len][body].
+    let wire = crate::friend_intro::encode_pex_frame(&crate::friend_intro::PexFrame::Introduction(
+        Box::new(intro),
+    ))
+    .map_err(|e| format!("encode introduction frame: {e:?}"))?;
+    let write_prefix = async {
+        // Caller-bounded packet; cap at the wire-representable max (u32::MAX) — the
+        // acceptor's inbound read enforces `PEX_MAX_PACKET_LEN`. Mirrors browse.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            u32::MAX as usize,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"intro-write-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target unreachable: introduction length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write introduction body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"intro-write-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target unreachable: introduction body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("target unreachable: send.finish failed: {e}"));
+    }
+
+    // Read the small ack [u32 LE length-prefix][body] (no catalog). Content is
+    // ignored — the ack only confirms X received the relayed Introduction.
+    let read_ack = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read ack length-prefix: {e}"))?;
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            crate::referral_catalog::PEX_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("ack length out of bounds: len={} max={}", e.len, e.max))?;
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read ack body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    match tokio::time::timeout(dial_config.response_read_timeout, read_ack).await {
+        Ok(Ok(_ack)) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"ack-read-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"ack-read-timeout");
+            return Err("target unreachable: introduction ack timeout".to_string());
+        }
+    }
+
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"introduction-complete");
+    drop(conn);
+    Ok(())
 }
 
 // ── ZEB-371 Task 13: Path A user-facing friend IPCs ──────────────────

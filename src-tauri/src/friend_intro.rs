@@ -302,6 +302,55 @@ pub fn decode_introduction(bytes: &[u8]) -> Result<Introduction, ReferralCodecEr
     decode_strict(bytes)
 }
 
+/// F's broker error: either the inbound [`IntroduceRequest`] failed
+/// authentication, or the requested `target` is not an Active + referrable
+/// friend of the broker — in which case F relays NOTHING (no envelope leaks a
+/// non-opted-in friend). Mirrors `referral_catalog`'s split of auth vs
+/// authorization failure.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum IntroBrokerError {
+    #[error("introduce request authentication failed: {0}")]
+    Auth(#[from] IntroAuthError),
+    /// The requested target is not an Active + referrable friend of the broker —
+    /// F relays nothing (no leak of a non-opted-in friend).
+    #[error("target is not an active referrable friend")]
+    NotReferrable,
+}
+
+/// F's PURE broker decision: authenticate the request, require `target` is an
+/// Active + `referrable` friend, then build+sign an [`Introduction`] that relays
+/// the subject (requester) + their cert + their reachability, vouched by F, aimed
+/// at the target. Read-only over `fg`. Mirrors `serve_catalog_for_request`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_introduction_for_request(
+    req: &IntroduceRequest,
+    fg: &crate::friend_graph::FriendGraph,
+    self_owner: OwnerAddr,
+    self_enrollment: EnrollmentCert,
+    device2: &SigningKey,
+    at: Hlc,
+    now_secs: u64,
+) -> Result<Introduction, IntroBrokerError> {
+    authenticate_introduce_request(req, self_owner, now_secs)?;
+    let referrable = fg
+        .friends
+        .get(&req.target)
+        .is_some_and(|e| e.status == crate::friend_graph::FriendStatus::Active && e.referrable);
+    if !referrable {
+        return Err(IntroBrokerError::NotReferrable);
+    }
+    Ok(sign_introduction(
+        device2,
+        self_owner,
+        req.target,
+        req.from_addr,
+        req.enrollment.clone(),
+        req.reachability.clone(),
+        at,
+        self_enrollment,
+    ))
+}
+
 /// A tagged frame on the friend-PEX ALPN for the 2b introduction directions.
 /// Browse (`CatalogRequest`, 2a) stays BARE on the wire — it is NOT a variant
 /// here; the acceptor falls back to `decode_catalog_request` when a body does
@@ -475,6 +524,74 @@ mod tests {
             logical: 0,
             device_id: "d".into(),
         }
+    }
+
+    /// A full valid Active `FriendEntry`, varying only the `referrable` opt-in the
+    /// broker keys on. Mirrors the integration test's `friend_entry`:
+    /// `master_ed25519` is derived from `seed` so the friend-graph key invariant
+    /// (map key == owner derived from this master key) holds by construction.
+    fn active_referrable_entry(seed: u8, referrable: bool) -> crate::friend_graph::FriendEntry {
+        crate::friend_graph::FriendEntry {
+            master_ed25519: SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+            display: Some("x".to_string()),
+            status: crate::friend_graph::FriendStatus::Active,
+            established_via: crate::friend_graph::FriendOrigin::Token,
+            referrable,
+            learned_at: hlc(1),
+            sealed_secret: None,
+        }
+    }
+
+    #[test]
+    fn broker_builds_introduction_only_for_active_referrable_target() {
+        let requester = mint_test_owner(0x11);
+        let broker = mint_test_owner(0x22);
+        let target = mint_test_owner(0x33);
+        let mut fg = crate::friend_graph::FriendGraph::default();
+        fg.friends
+            .insert(target.owner, active_referrable_entry(0x33, true));
+        let req = sign_introduce_request(
+            &requester.device_key,
+            requester.owner,
+            broker.owner,
+            target.owner,
+            reach(),
+            requester.cert.clone(),
+        );
+        let intro = build_introduction_for_request(
+            &req,
+            &fg,
+            broker.owner,
+            broker.cert.clone(),
+            &broker.device_key,
+            hlc(1),
+            0,
+        )
+        .expect("active+referrable target → Introduction");
+        // The Introduction relays the subject verbatim, vouched by the broker, aimed at X.
+        assert_eq!(intro.voucher, broker.owner);
+        assert_eq!(intro.to_addr, target.owner);
+        assert_eq!(intro.subject, requester.owner);
+        assert_eq!(intro.reachability, req.reachability);
+        verify_introduction(&intro, broker.owner, target.owner, 0)
+            .expect("F's signature verifies on X");
+        // Non-referrable target → NotReferrable (no envelope leaks a non-opted-in friend).
+        fg.friends
+            .insert(target.owner, active_referrable_entry(0x33, false));
+        assert!(matches!(
+            build_introduction_for_request(
+                &req,
+                &fg,
+                broker.owner,
+                broker.cert.clone(),
+                &broker.device_key,
+                hlc(1),
+                0
+            ),
+            Err(IntroBrokerError::NotReferrable),
+        ));
     }
 
     #[test]
