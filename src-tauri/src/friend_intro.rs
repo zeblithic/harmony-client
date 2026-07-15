@@ -629,6 +629,84 @@ mod tests {
         }
     }
 
+    /// ZEB-376 Task 10: the X-arm reachability checks. Build an `Introduction`
+    /// whose relayed reachability is signed by the SUBJECT's device-#2 key over
+    /// (actor=subject, hlc=intro.at) — the exact convention X re-derives — then
+    /// confirm X's inner-sig + freshness gates accept the honest record and reject
+    /// a tampered sig or a stale stamp, all BEFORE any dial.
+    #[test]
+    fn x_arm_verifies_and_rejects_bad_relayed_reachability() {
+        use crate::reachability_record::{
+            build_signed_payload_with_key, reachability_freshness_check, verify_inner_signature,
+            REACHABILITY_RECORD_TTL_MS,
+        };
+
+        let voucher = mint_test_owner(0x22); // F
+        let subject = mint_test_owner(0x11); // the introducee (reachability owner)
+        let target = mint_test_owner(0x33); // X (self)
+        let at = hlc(1_700_000_000_000);
+
+        // The subject signs their reachability over (actor=subject, hlc=at) with
+        // their enrolled device-#2 key — exactly what X re-derives + verifies.
+        let reachability = build_signed_payload_with_key(
+            [0x44; 32],
+            "https://relay.example/".into(),
+            vec![],
+            at.wall_ms, // announced_at_ms
+            &subject.owner,
+            &at,
+            Vec::new(),
+            0,
+            &subject.device_key,
+        )
+        .expect("sign reachability");
+
+        let intro = sign_introduction(
+            &voucher.device_key,
+            voucher.owner,
+            target.owner,
+            subject.owner,
+            subject.cert.clone(),
+            reachability,
+            at.clone(),
+            voucher.cert.clone(),
+        );
+
+        // X derives the subject's device-#2 verifying key from the relayed cert.
+        let subj_vk = crate::dm_signing::device2_verifying_key(&intro.subject_cert)
+            .expect("subject cert has a device-#2 key");
+
+        // Honest record: inner sig + freshness both pass.
+        verify_inner_signature(&intro.reachability, &intro.subject, &intro.at, &subj_vk)
+            .expect("honest relayed reachability verifies");
+        reachability_freshness_check(&intro.reachability, at.wall_ms)
+            .expect("honest record is fresh at its stamp");
+
+        // Tampered inner sig → rejected (X never dials).
+        let mut bad_sig = intro.clone();
+        bad_sig.reachability.identity_signature[0] ^= 0xFF;
+        assert!(
+            verify_inner_signature(
+                &bad_sig.reachability,
+                &bad_sig.subject,
+                &bad_sig.at,
+                &subj_vk
+            )
+            .is_err(),
+            "a tampered relayed reachability inner-sig must be rejected"
+        );
+
+        // Stale announced_at_ms (older than the TTL) → freshness gate rejects.
+        assert!(
+            reachability_freshness_check(
+                &intro.reachability,
+                at.wall_ms + REACHABILITY_RECORD_TTL_MS + 1
+            )
+            .is_err(),
+            "a relayed reachability past its TTL must be rejected"
+        );
+    }
+
     #[test]
     fn decide_introduction_truth_table() {
         use crate::friend_graph::PeerIntroPolicy::*;

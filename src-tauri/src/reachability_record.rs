@@ -370,6 +370,44 @@ pub fn verify_inner_signature(
         .map_err(|_| InnerSigError::Invalid)
 }
 
+/// ZEB-376: freshness gate for a reachability payload relayed OUT-OF-BAND (an
+/// `Introduction`), where there is NO pkarr [`harmony_pkarr::PkarrRoutingRecord`]
+/// envelope to run `verify_freshness` against — only the payload's self-stamped
+/// `announced_at_ms`. Bounds it the same way the Case-B/Case-D initiator's
+/// `PkarrRoutingRecord::verify_freshness` bounds a resolved record:
+///
+/// * **Forged-future guard** — reject a stamp more than
+///   [`crate::community_membership::REACHABILITY_TIMESTAMP_SKEW_MAX_MS`] ahead of
+///   the reader's clock (a maliciously future-stamped record must not stay fresh
+///   forever, the same PR #221-class hazard `fresh_butler_set` guards).
+/// * **Age bound** — reject a stamp older than one signed reachability TTL
+///   ([`REACHABILITY_RECORD_TTL_MS`]); this mirrors the pkarr record's signed
+///   `valid_until_ms` upper bound synthesized from the epoch TTL, since the
+///   relayed payload carries no separate `valid_until_ms`.
+///
+/// Returns a human-readable `Err(String)` (the acceptor logs it and drops the
+/// introduction) rather than a typed error — the caller has nothing to branch on.
+pub(crate) fn reachability_freshness_check(
+    reachability: &ReachabilityAnnouncePayload,
+    now_ms: u64,
+) -> Result<(), String> {
+    let announced = reachability.announced_at_ms;
+    let future_tolerance = crate::community_membership::REACHABILITY_TIMESTAMP_SKEW_MAX_MS;
+    if announced > now_ms.saturating_add(future_tolerance) {
+        return Err(format!(
+            "relayed reachability announced_at_ms {announced} is implausibly in the future \
+             (now {now_ms}, tolerance {future_tolerance}ms)"
+        ));
+    }
+    if now_ms > announced.saturating_add(REACHABILITY_RECORD_TTL_MS) {
+        return Err(format!(
+            "relayed reachability is stale: announced_at_ms {announced} + TTL \
+             {REACHABILITY_RECORD_TTL_MS}ms < now {now_ms}"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InnerSigError {
     /// Unreachable in practice — `ciborium::into_writer` against a
@@ -653,6 +691,30 @@ mod tests {
             Err(InnerSigError::Invalid),
             "inner sig must fail with wrong hlc"
         );
+    }
+
+    /// ZEB-376: `reachability_freshness_check` bounds a relayed record's
+    /// `announced_at_ms` on both edges — fresh within the TTL, stale past it, and
+    /// forged-future beyond the skew tolerance is rejected.
+    #[test]
+    fn reachability_freshness_check_bounds_announced_at() {
+        let skew = crate::community_membership::REACHABILITY_TIMESTAMP_SKEW_MAX_MS;
+        let mut p = fixture_payload(); // announced_at_ms = 1_700_000_000_000
+        let now = p.announced_at_ms;
+
+        // Fresh exactly at the stamp and anywhere up to the TTL edge.
+        assert!(reachability_freshness_check(&p, now).is_ok());
+        assert!(reachability_freshness_check(&p, now + REACHABILITY_RECORD_TTL_MS).is_ok());
+        // Stale one ms past the TTL → rejected.
+        assert!(reachability_freshness_check(&p, now + REACHABILITY_RECORD_TTL_MS + 1).is_err());
+
+        // Small forward skew (reader behind the stamp, within tolerance) is fine.
+        p.announced_at_ms = now + skew;
+        assert!(reachability_freshness_check(&p, now).is_ok());
+        // Forged-future: one ms beyond the tolerance → rejected (can't stay
+        // fresh-forever until the wall clock catches up).
+        p.announced_at_ms = now + skew + 1;
+        assert!(reachability_freshness_check(&p, now).is_err());
     }
 
     #[test]

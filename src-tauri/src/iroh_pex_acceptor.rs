@@ -10,7 +10,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::friend_graph::{FriendGraph, FriendStatus};
 use crate::friend_intro::{decode_pex_frame_or_catalog, PexDecoded, PexFrame};
-use crate::iroh_friend_acceptor::FriendAcceptorConfig;
+use crate::iroh_friend_acceptor::{FriendAcceptorConfig, SelfHandshakeStatics};
 use crate::owner_state_crdt::OwnerState;
 use crate::owner_state_types::{Hlc, OwnerAddr};
 use crate::referral_catalog::*;
@@ -91,6 +91,22 @@ pub struct IrohFriendPexAcceptor {
     pkarr_resolver: Option<Arc<harmony_pkarr::PkarrResolver>>,
     iroh_endpoint: Option<Arc<crate::iroh_endpoint::IrohEndpoint>>,
     owner_keytree: Option<Arc<crate::owner_state_crypto::KeyTree>>,
+    /// ZEB-376 Task 10: X's `Introduction`-arm self-dial deps (EXTEND Task 9's
+    /// broker deps above). All optional (default `None`) so existing `new`/
+    /// `with_config` callers keep compiling; the arm degrades gracefully (logs +
+    /// skips the X→introducee dial, or falls back to the default policy) when a
+    /// handle is absent rather than panicking.
+    ///
+    /// Path to the connectivity-settings JSON so the `Introduction` arm reads
+    /// `PeerIntroPolicy` FRESH per introduction (live-apply, no restart). `None`
+    /// (tests) → the documented `FriendsOfFriends` default.
+    connectivity_settings_path: Option<std::path::PathBuf>,
+    /// This node's IMMUTABLE self-handshake statics (identity pub + PQ keys) used
+    /// to rebuild X's own dialer `SelfHandshakeReachability` fresh per dial (the
+    /// volatile home relay is read fresh from `iroh_endpoint` at dial time — the
+    /// same per-dial convention `build_self_handshake_reachability` uses). `None`
+    /// (tests / iroh unbound) → X dials advertising the empty self bundle.
+    self_statics: Option<SelfHandshakeStatics>,
 }
 
 impl IrohFriendPexAcceptor {
@@ -136,6 +152,8 @@ impl IrohFriendPexAcceptor {
             pkarr_resolver: None,
             iroh_endpoint: None,
             owner_keytree: None,
+            connectivity_settings_path: None,
+            self_statics: None,
         }
     }
 
@@ -171,6 +189,24 @@ impl IrohFriendPexAcceptor {
         self
     }
 
+    /// ZEB-376 Task 10: wire the connectivity-settings path so X's `Introduction`
+    /// arm reads `PeerIntroPolicy` FRESH per introduction (live-apply, no
+    /// restart). Fluent setter (default `None`).
+    pub fn with_connectivity_settings_path(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.connectivity_settings_path = path;
+        self
+    }
+
+    /// ZEB-376 Task 10: wire this node's IMMUTABLE self-handshake statics so X's
+    /// `Introduction` arm can rebuild X's own dialer `SelfHandshakeReachability`
+    /// (device bundle + node id + PQ keys) fresh per dial. Fluent setter (default
+    /// `None`). The volatile home relay is NOT stored here — it is read fresh from
+    /// the wired `iroh_endpoint` at dial time.
+    pub fn with_self_statics(mut self, statics: Option<SelfHandshakeStatics>) -> Self {
+        self.self_statics = statics;
+        self
+    }
+
     /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
     /// `iroh_friend_acceptor::IrohFriendHandshakeAcceptor::next_hlc`.
     async fn next_hlc(&self) -> Hlc {
@@ -188,6 +224,83 @@ impl IrohFriendPexAcceptor {
             entry.logical = entry.logical.saturating_add(1);
         }
         entry.clone()
+    }
+
+    /// ZEB-376 Task 10: X's `Introduction`-arm `Proceed` action — gather the
+    /// threaded self-dial handles, rebuild X's own dialer reachability fresh, and
+    /// `tokio::spawn` [`crate::complete_introduction`] so `serve()` stays
+    /// single-shot (the F-relayed stream's ack does not block on the X→introducee
+    /// link). When the dial endpoint/keytree are absent (tests / iroh unbound)
+    /// this logs and skips rather than panicking — the same graceful degrade as
+    /// the F-broker `IntroduceRequest` arm.
+    fn spawn_complete_introduction(&self, intro: &crate::friend_intro::Introduction) {
+        let (Some(endpoint), Some(keytree)) =
+            (self.iroh_endpoint.clone(), self.owner_keytree.clone())
+        else {
+            tracing::debug!(
+                "ZEB-376: introduction Proceed: dial endpoint/keytree unavailable; \
+                 skipping X→introducee link"
+            );
+            return;
+        };
+        // Rebuild X's own dialer reachability fresh — including a fresh home-relay
+        // read from the live endpoint — the SAME per-dial convention the
+        // request/redeem paths use via `build_self_handshake_reachability`.
+        let self_reachability = crate::build_self_handshake_reachability(
+            self.self_statics.as_ref().map(|s| s.identity_pub_64),
+            self.self_statics.as_ref().map(|s| s.pq_dsa_pubkey.clone()),
+            self.self_statics.as_ref().map(|s| s.pq_kem_pubkey.clone()),
+            self.iroh_endpoint.as_ref(),
+        );
+        let subject = intro.subject;
+        let reachability = intro.reachability.clone();
+        let self_owner = self.self_owner;
+        let self_enrollment = self.self_enrollment.clone();
+        let self_device2 = Arc::clone(&self.device2_signing_key);
+        let crdt_state = Arc::clone(&self.crdt_state);
+        let hlc_tracker = Arc::clone(&self.hlc_tracker);
+        let device_id = self.device_id.clone();
+        tokio::spawn(async move {
+            match crate::complete_introduction(
+                subject,
+                reachability,
+                endpoint,
+                crate::HandshakeDialConfig::from_env(),
+                self_owner,
+                // self_display: a UX hint only, and not persisted at start_node
+                // (mirrors the friend acceptor's production `None`).
+                None,
+                self_enrollment,
+                self_device2,
+                self_reachability,
+                keytree,
+                crdt_state,
+                hlc_tracker,
+                device_id,
+            )
+            .await
+            {
+                Ok(outcome) => tracing::info!(
+                    subject = %hex::encode(subject.0),
+                    ?outcome,
+                    "ZEB-376: X completed introduction link"
+                ),
+                Err(e) => tracing::debug!(
+                    subject = %hex::encode(subject.0),
+                    error = %e,
+                    "ZEB-376: X introduction link failed"
+                ),
+            }
+        });
+    }
+
+    /// ZEB-376 Task 11 (AskMe) STUB: record an introduction-offer in the pending
+    /// inbox + emit a prompt for the user's explicit accept. Task 10 leaves this a
+    /// debug-log so the `Stage` decision compiles; Task 11 fills the body (and
+    /// reuses [`crate::complete_introduction`] on the user's accept).
+    fn stage_introduction_offer(&self, intro: &crate::friend_intro::Introduction) {
+        let _ = intro;
+        tracing::debug!("ZEB-376: AskMe stage: Task 11");
     }
 
     /// Inbound bi-stream handler: read the length-prefixed `CatalogRequest`,
@@ -367,14 +480,93 @@ impl IrohFriendPexAcceptor {
                 self.write_ack(&mut send).await
             }
 
-            // ── 2b: X's inbound-Introduction arm — DEFERRED to Task 10. ─────
+            // ── 2b: X's inbound-Introduction arm (F → X vouch). ─────────────
             PexDecoded::Frame(PexFrame::Introduction(intro)) => {
-                // Task 10 replaces this arm: authenticate (verify_introduction),
-                // enforce PeerIntroPolicy (decide_introduction), and link / stage /
-                // reject. For now: decode (done above) + log + ack so the dialer's
-                // stream completes.
-                let _ = intro;
-                tracing::debug!("introduction arm: Task 10");
+                // X verifies F's vouch, verifies the RELAYED reachability is
+                // self-authenticated + fresh, enforces `PeerIntroPolicy`, and on
+                // `Proceed` dials the introducee to form the mutual link
+                // (`established_via: Introduction`). ALL verification happens BEFORE
+                // any dial; a bad vouch / reachability propagates as `Err` (the
+                // stream closes, fail-closed — no ack), while a policy `Reject`/
+                // `Stage`/`Proceed` all write the benign ack (which never reveals
+                // the policy outcome). The owner-state lock is read then DROPPED
+                // before the network dial.
+                let intro = *intro;
+                let now_secs = crate::iroh_friend_acceptor::wall_now_secs();
+
+                // 1. Is the voucher (F) currently an ACTIVE friend of ours? Read
+                //    under the crdt lock; the guard drops at the end of this block,
+                //    before any verification / IO.
+                let voucher_is_active_friend = {
+                    let state = self.crdt_state.lock().await;
+                    state
+                        .friend_graph
+                        .friends
+                        .get(&intro.voucher)
+                        .map(|e| e.status == FriendStatus::Active)
+                        .unwrap_or(false)
+                }; // guard dropped — owner-state lock released before the dial.
+
+                // 2. Verify F's vouch (to_addr==us, voucher-match, F's cert+sig,
+                //    subject cert binds subject owner).
+                crate::friend_intro::verify_introduction(
+                    &intro,
+                    intro.voucher,
+                    self.self_owner,
+                    now_secs,
+                )
+                .map_err(|e| format!("introduction verify: {e:?}"))?;
+
+                // 3. Verify the RELAYED reachability is self-authenticated by the
+                //    subject's own device-#2 identity (the same inner check the
+                //    Case-B initiator runs on a resolved record, bound to `intro.at`
+                //    as the reachability's signing clock) + within the freshness
+                //    window.
+                let subj_vk = crate::dm_signing::device2_verifying_key(&intro.subject_cert)
+                    .ok_or_else(|| "introduction subject cert has no device-#2 key".to_string())?;
+                crate::reachability_record::verify_inner_signature(
+                    &intro.reachability,
+                    &intro.subject,
+                    &intro.at,
+                    &subj_vk,
+                )
+                .map_err(|e| format!("relayed reachability inner-sig: {e:?}"))?;
+                crate::reachability_record::reachability_freshness_check(
+                    &intro.reachability,
+                    wall_now_ms(),
+                )?;
+
+                // 4. Enforce policy — read FRESH from the settings file (live-apply,
+                //    no restart). A missing path (tests) falls back to the
+                //    documented default rather than Open.
+                let policy = self
+                    .connectivity_settings_path
+                    .as_ref()
+                    .map(|p| {
+                        crate::connectivity_settings::ConnectivitySettings::load_or_default(p)
+                            .peer_intro_policy
+                    })
+                    .unwrap_or(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
+
+                // 5. Decide + act. All three branches fall through to the ack.
+                match crate::friend_intro::decide_introduction(policy, voucher_is_active_friend) {
+                    crate::friend_intro::IntroDecision::Proceed => {
+                        // X dials the introducee (spawned; `serve()` stays
+                        // single-shot — the ack does not wait on the link).
+                        self.spawn_complete_introduction(&intro);
+                    }
+                    crate::friend_intro::IntroDecision::Stage => {
+                        // Task 11 fills this (record an offer + emit a prompt).
+                        self.stage_introduction_offer(&intro);
+                    }
+                    crate::friend_intro::IntroDecision::Reject => {
+                        tracing::debug!(
+                            voucher = %hex::encode(intro.voucher.0),
+                            "ZEB-376: introduction rejected by PeerIntroPolicy"
+                        );
+                    }
+                }
+
                 self.write_ack(&mut send).await
             }
         }

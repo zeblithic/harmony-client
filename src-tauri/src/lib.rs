@@ -9549,7 +9549,9 @@ pub async fn start_node_inner(
                             // ZEB-461 Task 6 / ZEB-621: advertise our IMMUTABLE
                             // device bundle + node id + PQ keys in the accept we
                             // sign (the volatile relay is wired separately below).
-                            .with_self_statics(self_statics_for_friend)
+                            // Clone: the SAME statics are threaded onto the PEX
+                            // acceptor below for X's introduction self-dial.
+                            .with_self_statics(self_statics_for_friend.clone())
                             // ZEB-521/621: wire a LIVE home-relay read as the SOLE
                             // source of each accept's `home_relay_url` — read fresh
                             // from the (now-resolved / possibly-flapped) endpoint
@@ -9602,7 +9604,16 @@ pub async fn start_node_inner(
                             // signed Introduction.
                             .with_pkarr_resolver(pkarr_resolver_for_state.clone())
                             .with_owner_keytree(Some(std::sync::Arc::clone(&kt)))
-                            .with_iroh_endpoint(iroh_endpoint_arc.clone()),
+                            .with_iroh_endpoint(iroh_endpoint_arc.clone())
+                            // ZEB-376 Task 10: thread X's self-dial handles so the
+                            // `Introduction` arm can rebuild X's own dialer
+                            // reachability (device bundle + node id + PQ keys) and
+                            // enforce the LIVE `PeerIntroPolicy` read fresh from the
+                            // connectivity settings file (live-apply, no restart).
+                            // The iroh endpoint + owner KeyTree threaded above (Task
+                            // 9) double as the dial endpoint + friend-secret seal.
+                            .with_self_statics(self_statics_for_friend)
+                            .with_connectivity_settings_path(pkarr_settings_path_for_state.clone()),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -51428,7 +51439,10 @@ pub struct FriendLinkOutcome {
 /// none — a friend would cache an unreachable hint — so we fall back to empty.
 /// `node_id()` / `home_relay()` are synchronous, so this never blocks. An empty
 /// `home_relay()` string is normalized to `None`.
-fn build_self_handshake_reachability(
+// ZEB-376 Task 10: `pub(crate)` so the friend-PEX acceptor can rebuild X's own
+// dialer `SelfHandshakeReachability` fresh per introduction dial (same per-dial
+// fresh-relay read the request/redeem paths use).
+pub(crate) fn build_self_handshake_reachability(
     self_identity_pub_64: Option<[u8; 64]>,
     self_dsa_pubkey: Option<Vec<u8>>,
     self_kem_pubkey: Option<Vec<u8>>,
@@ -55096,6 +55110,63 @@ pub async fn connectivity_add_friend_by_key_inner(
         hlc_tracker,
         device_id,
         identity_pub_hex,
+    )
+    .await
+}
+
+/// ZEB-376 Task 10: X's "dial the introducee and form the mutual link" action,
+/// shared by the friend-PEX `Introduction` arm (auto-`Proceed`) and the AskMe
+/// accept path (Task 11). The relayed `reachability` has ALREADY been verified
+/// self-authenticated + fresh by the caller; here X synthesizes the dial target
+/// from it, connects on the friend ALPN, and links — pinning `Some(subject)` as
+/// `expected_peer` so the authenticated accept MUST come from the introducee (an
+/// impostor squatting that iroh address is rejected inside `link_over_connection`
+/// at the accept-cert check, never written as a friend). Stamps `established_via:
+/// Introduction`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn complete_introduction(
+    subject: crate::owner_state_types::OwnerAddr,
+    reachability: crate::reachability_record::ReachabilityAnnouncePayload,
+    iroh_endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    dial_config: HandshakeDialConfig,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_display: Option<String>,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+) -> Result<AddFriendOutcome, String> {
+    let target_addr = endpoint_addr_from_routing(&reachability)
+        .map_err(|e| format!("synthesize introducee addr: {e}"))?;
+    let conn = tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint
+            .inner()
+            .connect(target_addr, crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1),
+    )
+    .await
+    .map_err(|_| "introducee unreachable: connect timeout".to_string())?
+    .map_err(|e| format!("introducee unreachable: connect failed: {e}"))?;
+    link_over_connection(
+        conn,
+        dial_config,
+        crate::friend_graph::FriendOrigin::Introduction,
+        Some(subject),
+        self_owner,
+        self_display,
+        self_enrollment,
+        self_device2_signing_key,
+        self_reachability,
+        keytree,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        hex::encode(subject.0),
     )
     .await
 }
