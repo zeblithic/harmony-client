@@ -724,6 +724,7 @@ mod tests {
                 Ok(crate::dm_envelope::DmPacket::CidNotify { .. }) => "CidNotify".into(),
                 Ok(crate::dm_envelope::DmPacket::CidNotifyWithBlob { .. }) => "WithBlob".into(),
                 Ok(crate::dm_envelope::DmPacket::Ack { .. }) => "Ack".into(),
+                Ok(crate::dm_envelope::DmPacket::RevocationPush { .. }) => "RevocationPush".into(),
                 Err(e) => format!("DecodeErr({e})"),
             }
         }

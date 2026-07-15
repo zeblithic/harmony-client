@@ -74,6 +74,14 @@ pub struct OwnerState {
         default
     )]
     pub friend_graph: crate::friend_graph::FriendGraph,
+    /// ZEB-685 (S3): friend-scoped device revocations — owner → set of that
+    /// owner's revoked #2 ed25519 keys, learned from `RevocationPush` frames
+    /// pushed by that owner (a DM-only contact). Feeds `RevokedDeviceProjection`
+    /// for the DM cutoff. GROW-ONLY / union-merged (NOT LWW — a plain LWW field
+    /// would drop concurrent revocations across the owner's own devices; see
+    /// `owner_state_sync::merge_remote_into_local`). Additive on the wire.
+    #[serde(rename = "rd", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub revoked_dm_devices: BTreeMap<crate::owner_state_types::OwnerAddr, BTreeSet<[u8; 32]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -887,6 +895,35 @@ impl OwnerState {
         } else {
             ApplyOutcome::Inserted
         }
+    }
+
+    /// ZEB-685 (S3): union a revoked #2 ed25519 key into the friend-scoped
+    /// store. Returns true iff newly inserted (grow-only; idempotent). The
+    /// store is union-merged across the owner's devices (see
+    /// `owner_state_sync::merge_remote_into_local`), so a plain insert here is
+    /// safe — concurrent inserts converge to the union.
+    pub fn apply_revoked_dm_device(
+        &mut self,
+        owner: crate::owner_state_types::OwnerAddr,
+        ed25519: [u8; 32],
+    ) -> bool {
+        self.revoked_dm_devices
+            .entry(owner)
+            .or_default()
+            .insert(ed25519)
+    }
+
+    /// ZEB-685 (S3): the owners of all currently-`Active` friendships — the DM
+    /// push targets for a device revocation. `Pending` (no mutual link yet) and
+    /// `Revoked` (tombstoned) entries are excluded: neither has an established
+    /// friend-DM tunnel to carry the `RevocationPush`.
+    pub fn active_friend_owners(&self) -> Vec<crate::owner_state_types::OwnerAddr> {
+        self.friend_graph
+            .friends
+            .iter()
+            .filter(|(_, e)| matches!(e.status, crate::friend_graph::FriendStatus::Active))
+            .map(|(addr, _)| *addr)
+            .collect()
     }
 
     /// LWW-apply a friend entry for an `OwnerAddr`. Newer `learned_at` HLC
@@ -4215,6 +4252,34 @@ mod friend_graph_tests {
         owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
     };
     use crate::owner_state_types::{Hlc, OwnerAddr};
+
+    /// ZEB-685 (S3): the friend-scoped revoked-device store unions (grow-only)
+    /// and is idempotent.
+    #[test]
+    fn apply_revoked_dm_device_unions() {
+        let mut s = OwnerState::default();
+        let owner = OwnerAddr([7u8; 16]);
+        assert!(s.apply_revoked_dm_device(owner, [1u8; 32]));
+        assert!(!s.apply_revoked_dm_device(owner, [1u8; 32]), "idempotent");
+        assert!(s.apply_revoked_dm_device(owner, [2u8; 32]));
+        assert_eq!(s.revoked_dm_devices.get(&owner).unwrap().len(), 2);
+    }
+
+    /// ZEB-685 (S3): `active_friend_owners` returns only `Active` friendships —
+    /// the DM RevocationPush targets. `Pending`/`Revoked` are excluded.
+    #[test]
+    fn active_friend_owners_excludes_non_active() {
+        let mut s = OwnerState::default();
+        let (a1, p1) = friend_pair(0x11);
+        let (a2, p2) = friend_pair(0x22);
+        let (a3, p3) = friend_pair(0x33);
+        s.apply_friend_update(a1, entry(p1, 10, FriendStatus::Active));
+        s.apply_friend_update(a2, entry(p2, 10, FriendStatus::Pending));
+        s.apply_friend_update(a3, entry(p3, 10, FriendStatus::Revoked));
+        let owners = s.active_friend_owners();
+        assert_eq!(owners.len(), 1, "only Active friends are push targets");
+        assert!(owners.contains(&a1));
+    }
 
     /// A real `(OwnerAddr, master_ed25519)` pair derived from a seeded
     /// `ed25519_dalek::SigningKey`, so the key↔master-key correspondence

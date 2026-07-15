@@ -237,6 +237,17 @@ pub enum DmPacket {
         signed_bytes: Vec<u8>,
         storage_blob: Vec<u8>,
     },
+    /// ZEB-685 (S3): a friend-scoped device-revocation push. Carries the
+    /// revoking owner's master-signed `RevocationCert` + the paired
+    /// `EnrollmentCert` (needed to bridge the cert's `target` device_id[16] to
+    /// the revoked ed25519[32] the cutoff projection keys on). No outer frame
+    /// signature — both certs are master-signed and the sender is authenticated
+    /// by the tunnel-peer bind + `revocation.owner == peer owner` trust-bind
+    /// (see dm ingest). Wire: `0x05 || cbor(RevocationPushBody)`.
+    RevocationPush {
+        revocation: Box<harmony_owner::certs::RevocationCert>,
+        enrollment: Box<harmony_owner::certs::EnrollmentCert>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -334,6 +345,26 @@ pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
         out.extend_from_slice(storage_blob);
         return Ok(out);
     }
+    // ZEB-685 (S3): RevocationPush has no outer frame signature (both certs
+    // are master-signed already) and only one variable-length field, so it
+    // gets its own early-return rather than participating in the shared
+    // [disc][signed_bytes][64-sig] layout below.
+    if let DmPacket::RevocationPush {
+        revocation,
+        enrollment,
+    } = packet
+    {
+        let body = RevocationPushBody {
+            revocation: (**revocation).clone(),
+            enrollment: (**enrollment).clone(),
+        };
+        let cbor = crate::owner_state_crypto::canonical_cbor_encode(&body)
+            .map_err(|e| EncodeError::ReSerialize(format!("revocation_push body: {e}")))?;
+        let mut out = Vec::with_capacity(1 + cbor.len());
+        out.push(0x05);
+        out.extend_from_slice(&cbor);
+        return Ok(out);
+    }
     let (disc, signed_bytes, signature): (u8, &Vec<u8>, &[u8; 64]) = match packet {
         DmPacket::Invite {
             signed,
@@ -386,12 +417,39 @@ pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
         DmPacket::CidNotifyWithBlob { .. } => {
             unreachable!("CidNotifyWithBlob is handled by the early return above")
         }
+        DmPacket::RevocationPush { .. } => {
+            unreachable!("RevocationPush is handled by the early return above")
+        }
     };
     let mut out = Vec::with_capacity(1 + signed_bytes.len() + 64);
     out.push(disc);
     out.extend_from_slice(signed_bytes);
     out.extend_from_slice(signature);
     Ok(out)
+}
+
+/// ZEB-685 (S3): the CBOR body for `DmPacket::RevocationPush` (everything
+/// after the `0x05` discriminant). Two-character serde renames match the
+/// same-length-keys canonical-CBOR convention this module uses throughout
+/// (see the module doc comment).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RevocationPushBody {
+    #[serde(rename = "rv")]
+    revocation: harmony_owner::certs::RevocationCert,
+    #[serde(rename = "en")]
+    enrollment: harmony_owner::certs::EnrollmentCert,
+}
+
+/// ZEB-685: construct a `RevocationPush` packet (no outer signature). Called by
+/// the send-side friend-push hook (`owner_commands::push_revocation_to_friends`).
+pub(crate) fn build_revocation_push_packet(
+    revocation: harmony_owner::certs::RevocationCert,
+    enrollment: harmony_owner::certs::EnrollmentCert,
+) -> DmPacket {
+    DmPacket::RevocationPush {
+        revocation: Box::new(revocation),
+        enrollment: Box::new(enrollment),
+    }
 }
 
 /// Build + sign a complete DmInvite packet ready for `encode_packet`.
@@ -470,6 +528,19 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
     // fields); it does NOT use the "sig = last 64 bytes" split used below.
     if *disc == 0x04 {
         return decode_cidnotify_with_blob(rest);
+    }
+    // ZEB-685 (S3): RevocationPush (`0x05`) carries no outer frame signature
+    // (both certs inside are already master-signed — see the `DmPacket`
+    // variant doc comment), so it does not fit the "last 64 bytes are a
+    // signature" split below either. Decode the whole remainder as the CBOR
+    // body and return early, mirroring the 0x04 special case above.
+    if *disc == 0x05 {
+        let body: RevocationPushBody = crate::owner_state_crypto::canonical_cbor_decode(rest)
+            .map_err(|e| DecodeError::Cbor(format!("revocation_push body: {e}")))?;
+        return Ok(DmPacket::RevocationPush {
+            revocation: Box::new(body.revocation),
+            enrollment: Box::new(body.enrollment),
+        });
     }
     // Need at least 1 byte of body + 64 bytes of signature.
     if rest.len() < 64 + 1 {
@@ -764,6 +835,11 @@ impl CanonicalPayloadSealed for DmCidNotifySigned {}
 impl CanonicalPayload for DmCidNotifySigned {}
 impl CanonicalPayloadSealed for DmAckSigned {}
 impl CanonicalPayload for DmAckSigned {}
+// ZEB-685 (S3): RevocationPushBody is encoded/decoded via
+// canonical_cbor_encode/canonical_cbor_decode (see encode_packet's 0x05 arm
+// and decode_packet's 0x05 early return), so it needs the same registration.
+impl CanonicalPayloadSealed for RevocationPushBody {}
+impl CanonicalPayload for RevocationPushBody {}
 
 /// Deterministic wire-type fixtures for in-crate tests. ZEB-236 Task 1
 /// extracted `minimal_invite_for_space` from the inline builder in
@@ -1755,5 +1831,52 @@ mod tests {
             matches!(err, DecodeError::TooShortForSignature),
             "got {err:?}"
         );
+    }
+
+    // ── ZEB-685 (S3) Task 1: RevocationPush DM control frame ───────────────
+
+    /// ZEB-685 (S3) test fixture: a master-signed `RevocationCert` paired
+    /// with the master-signed `EnrollmentCert` it targets (same owner,
+    /// `revocation.target == enrollment.device_id`). Built via the real
+    /// `harmony_owner::lifecycle::mint_owner` mint path — mirrors
+    /// `dm_invite_with_inviter_enrollment_round_trips` above — so the master
+    /// signing key is recoverable from the `RecoveryArtifact` to sign the
+    /// revocation with the same owner the enrollment cert is bound to.
+    fn sample_revocation_and_enrollment() -> (
+        harmony_owner::certs::RevocationCert,
+        harmony_owner::certs::EnrollmentCert,
+    ) {
+        let minted = harmony_owner::lifecycle::mint_owner(1_700_000_000).expect("mint");
+        let enrollment = minted.state.enrollments.values().next().unwrap().clone();
+        let master_sk = minted.recovery_artifact.master_signing_key();
+        let master_bundle = minted.recovery_artifact.master_pubkey_bundle();
+        let revocation = harmony_owner::certs::RevocationCert::sign_master(
+            &master_sk,
+            master_bundle,
+            enrollment.device_id,
+            1_700_000_100,
+            harmony_owner::certs::RevocationReason::Lost,
+        )
+        .expect("sign_master revocation");
+        (revocation, enrollment)
+    }
+
+    #[test]
+    fn revocation_push_round_trips() {
+        let (revocation, enrollment) = sample_revocation_and_enrollment();
+        let pkt = build_revocation_push_packet(revocation.clone(), enrollment.clone());
+        let wire = encode_packet(&pkt).expect("encode");
+        assert_eq!(wire[0], 0x05, "discriminant");
+        let back = decode_packet(&wire).expect("decode");
+        match back {
+            DmPacket::RevocationPush {
+                revocation: r,
+                enrollment: e,
+            } => {
+                assert_eq!(*r, revocation);
+                assert_eq!(*e, enrollment);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

@@ -80,6 +80,11 @@ struct RealOwner {
     owner: OwnerAddr,
     device_key: SigningKey,
     cert: harmony_owner::certs::EnrollmentCert,
+    /// ZEB-685 (S3): kept so a test can reconstruct this owner's master key and
+    /// sign a real `RevocationCert` for its own device (the same reconstruction
+    /// `owner_commands::revoke_device_inner` does). The community-cutoff test
+    /// ignores it; the DM-push cutoff test below uses it.
+    recovery_artifact: harmony_owner::lifecycle::RecoveryArtifact,
 }
 
 fn mint_real_owner(ts_secs: u64) -> RealOwner {
@@ -100,6 +105,7 @@ fn mint_real_owner(ts_secs: u64) -> RealOwner {
         owner: OwnerAddr(cert.owner_id),
         device_key: minted.device_signing_key,
         cert,
+        recovery_artifact: minted.recovery_artifact,
     }
 }
 
@@ -872,4 +878,246 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
     })
     .await
     .expect("revoked_device2_dm_is_dropped_after_community_revocation timed out at 60s");
+}
+
+/// ZEB-685 (S3): the DM-only-contact analogue of the community-revocation gate
+/// above. Proves the SAME real receive-path cutoff (`handle_cidnotify_lifted` ->
+/// `verify_cidnotify_admission` -> `verify_cidnotify_sender_binding`), but with
+/// the `RevokedDeviceProjection` populated by the S3 receive-side handler
+/// `dm_outbox::handle_revocation_push` — fed a REAL master-signed
+/// `RevocationCert` + the device's real `EnrollmentCert` — instead of the
+/// community `union_from_members` feed. No shared community is involved; the
+/// friend push is the only revocation signal.
+///
+/// The [16]->[32] bridge is the composition this pins: `handle_revocation_push`
+/// keys the projection on `enrollment.device_pubkeys.classical.ed25519_verify`,
+/// while the cutoff reads the CidNotify signer's `identity_pub[32..64]` — these
+/// must be the same 32 bytes or the cutoff silently misses. Alice's #2 is cached
+/// on Bob's side directly via `apply_owner_device_update` (the blessed
+/// no-second-handshake simplification the control leg above uses for Carol), so
+/// this test needs no live iroh/pkarr machinery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dm_only_contact_cutoff_via_revocation_push() {
+    // ── 1. Two real-minted owners: Alice's device is revoked, Bob enforces. ──
+    let alice = mint_real_owner(1_700_000_000);
+    let bob = mint_real_owner(1_700_000_001);
+
+    let alice_d2_hash = harmony_app::dm_signing::device2_signing_hash(&alice.cert)
+        .expect("alice real cert yields a #2 hash");
+    let alice_d2_pub = harmony_app::dm_signing::device2_combined_pub(&alice.cert);
+    let alice_d2_ed25519: [u8; 32] = alice.device_key.verifying_key().to_bytes();
+    assert_eq!(
+        &alice_d2_pub[32..64],
+        &alice_d2_ed25519[..],
+        "the cutoff reads combined_pub[32..64]; the bridge must land on these bytes"
+    );
+    let alice_device2 = Arc::new(SigningKey::from_bytes(&alice.device_key.to_bytes()));
+
+    let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+    let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+
+    // ── 2. Seed the Alice<->Bob DM Space on both sides + Alice's #2 device in
+    //    Bob's OwnerDeviceCache (the receive-side signer-resolution source). ──
+    let content_key = DmContentKey::new([0x6c; 32]);
+    let space = make_dm_space(SpaceId([0x91; 16]), alice.owner, bob.owner, content_key);
+    let dm_space_id = space.id;
+    {
+        let mut g = alice_crdt_state.lock().await;
+        g.apply_space_with_canonicalization(space.clone());
+    }
+    {
+        let mut g = bob_crdt_state.lock().await;
+        g.apply_space_with_canonicalization(space);
+        let seed = g.apply_owner_device_update(
+            alice.owner,
+            vec![alice_d2_hash],
+            vec![Some(alice_d2_pub)],
+            Vec::new(),
+            Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: "bob-dev".into(),
+            },
+        );
+        assert!(
+            matches!(seed, harmony_app::owner_state_crdt::ApplyOutcome::Inserted),
+            "Bob's cache gained Alice's #2 device"
+        );
+    }
+
+    // ── 3. Alice's + Bob's real DmOutbox instances (Alice sends, Bob receives). ──
+    let cas: Arc<dyn harmony_app::content_store::ContentStore> =
+        Arc::new(harmony_app::content_store::InMemoryStub::default());
+    let (alice_hash3, alice_sk3, alice_priv3) = dummy_hash3_and_key(0x41);
+    let mut alice_outbox = harmony_app::dm_outbox::DmOutbox::new(
+        "alice-dev".into(),
+        alice.owner,
+        alice_hash3,
+        alice_sk3,
+        alice_priv3,
+        Arc::clone(&alice_device2),
+        alice.cert.clone(),
+    );
+    let captured_alice = Arc::new(StdMutex::new(Vec::<
+        harmony_app::butler_deposit::ButlerDepositRequest,
+    >::new()));
+    alice_outbox.set_butler_deposit_client(Arc::new(CapturingDepositClient {
+        captured: Arc::clone(&captured_alice),
+    }));
+
+    let (bob_hash3, bob_sk3, bob_priv3) = dummy_hash3_and_key(0x42);
+    let bob_outbox = Arc::new(TokioMutex::new(harmony_app::dm_outbox::DmOutbox::new(
+        "bob-dev".into(),
+        bob.owner,
+        bob_hash3,
+        bob_sk3,
+        bob_priv3,
+        Arc::new(SigningKey::from_bytes(&bob.device_key.to_bytes())),
+        bob.cert.clone(),
+    )));
+
+    let events = Arc::new(StdMutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(RecordingSink {
+        events: Arc::clone(&events),
+    });
+
+    let t0 = now_ms();
+
+    // ── ASSERTION 1 (baseline): Alice's #2-signed CidNotify delivers via the
+    //    REAL receive path with an EMPTY revocation projection. ─────────────
+    let body1 = b"baseline: alice's device is not revoked yet".to_vec();
+    let (signed1, sig1, bytes1, cid1) = send_and_capture_cidnotify(
+        &mut alice_outbox,
+        &alice_crdt_state,
+        &cas,
+        &captured_alice,
+        dm_space_id,
+        body1.clone(),
+        t0,
+    )
+    .await;
+    assert_eq!(
+        signed1.signing_device_hash, alice_d2_hash,
+        "the REAL drain path signed the baseline CidNotify with Alice's #2"
+    );
+    harmony_app::dm_outbox::DmOutbox::handle_cidnotify_lifted(
+        Arc::clone(&bob_outbox),
+        Arc::clone(&bob_crdt_state),
+        Arc::clone(&cas),
+        Arc::clone(&sink),
+        signed1,
+        sig1,
+        bytes1,
+        now_ms(),
+        RevokedDeviceProjection::new(),
+    )
+    .await;
+    {
+        // Assert BOTH the event and the inbox at the baseline, so ASSERTION 2's
+        // "dm_received == 1" is a genuine delta (baseline delivered, revoked
+        // dropped) rather than a delta-free check that a broken baseline could
+        // also satisfy. (CodeRabbit #471.)
+        let dm_received = events
+            .lock()
+            .expect("events lock")
+            .iter()
+            .filter(|(name, _)| name == "dm-received")
+            .count();
+        assert_eq!(
+            dm_received, 1,
+            "baseline CidNotify delivered exactly one event"
+        );
+        let g = bob_crdt_state.lock().await;
+        assert!(
+            g.inbox.values().any(|e| e.message_cid == cid1),
+            "baseline message landed in Bob's inbox"
+        );
+    }
+
+    // ── 4. Revoke Alice's device via the S3 DM-push path: build her REAL
+    //    master-signed RevocationCert (reconstruct the master from her recovery
+    //    artifact, exactly as revoke_device_inner does), pair it with her device
+    //    EnrollmentCert, and feed it through the receive-side handler onto a
+    //    FRESH projection. No community materialize is involved. ─────────────
+    let proj = RevokedDeviceProjection::new();
+    {
+        let artifact = &alice.recovery_artifact;
+        let master_pubkey = artifact.master_pubkey_bundle();
+        let master_sk = artifact.master_signing_key();
+        let revocation = harmony_owner::certs::RevocationCert::sign_master(
+            &master_sk,
+            master_pubkey,
+            alice.cert.device_id,
+            1_700_000_500,
+            harmony_owner::certs::RevocationReason::Compromised,
+        )
+        .expect("sign master revocation");
+
+        let mut bob_state = bob_crdt_state.lock().await;
+        let inserted = harmony_app::dm_outbox::handle_revocation_push(
+            &mut bob_state,
+            alice.owner,
+            &revocation,
+            &alice.cert,
+            &proj,
+        )
+        .expect("valid master-signed friend RevocationPush accepted");
+        // The "newly inserted" signal the persistence fix depends on (the drain
+        // marks the owner-state engine dirty only on a fresh insert). (CodeRabbit #471.)
+        assert!(inserted, "first push of this device reports a new insert");
+    }
+    assert!(
+        proj.is_revoked(&alice.owner, &alice_d2_ed25519),
+        "the DM-push handler fed the EXACT ed25519 the cutoff keys on ([16]->[32] bridge)"
+    );
+
+    // ── ASSERTION 2 (cutoff): the same device sending again is now dropped by
+    //    the SAME real receive path — the DM-push feed closed the gap. ───────
+    let body2 = b"post-revocation-push: this must be dropped".to_vec();
+    let (signed2, sig2, bytes2, cid2) = send_and_capture_cidnotify(
+        &mut alice_outbox,
+        &alice_crdt_state,
+        &cas,
+        &captured_alice,
+        dm_space_id,
+        body2.clone(),
+        t0 + 120_000,
+    )
+    .await;
+    assert_eq!(
+        signed2.signing_device_hash, alice_d2_hash,
+        "the second send is STILL signed with Alice's (now-revoked) #2"
+    );
+    assert_ne!(cid2, cid1, "distinct content -> distinct CID");
+    harmony_app::dm_outbox::DmOutbox::handle_cidnotify_lifted(
+        Arc::clone(&bob_outbox),
+        Arc::clone(&bob_crdt_state),
+        Arc::clone(&cas),
+        Arc::clone(&sink),
+        signed2,
+        sig2,
+        bytes2,
+        now_ms(),
+        proj,
+    )
+    .await;
+    {
+        let dm_received = events
+            .lock()
+            .expect("events lock")
+            .iter()
+            .filter(|(name, _)| name == "dm-received")
+            .count();
+        assert_eq!(
+            dm_received, 1,
+            "post-push CidNotify must NOT deliver (only the baseline event remains)"
+        );
+    }
+    {
+        let g = bob_crdt_state.lock().await;
+        assert!(
+            !g.inbox.values().any(|e| e.message_cid == cid2),
+            "post-push message must NOT land in Bob's inbox (cut off, not acked)"
+        );
+    }
 }

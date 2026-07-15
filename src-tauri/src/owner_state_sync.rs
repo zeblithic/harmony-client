@@ -234,6 +234,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         libraries,
         outbox_tombstones,
         friend_graph,
+        revoked_dm_devices,
     } = remote;
 
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
@@ -360,6 +361,18 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
                 "friend-graph merge rejected entry on invariant violation"
             );
         }
+    }
+
+    // ZEB-685 (S3): friend-scoped DM revocations are GROW-ONLY — union per
+    // owner key (mirrors `apply_outbox`'s `delivered_to.extend`). NOT LWW: two
+    // of the owner's own devices each learning a different revocation must both
+    // survive the merge, so we extend the set rather than replace the entry.
+    for (owner, set) in revoked_dm_devices {
+        local
+            .revoked_dm_devices
+            .entry(owner)
+            .or_default()
+            .extend(set);
     }
 }
 
@@ -2017,6 +2030,26 @@ mod integration_tests {
             local.outbox_tombstones.get(&id),
             Some(&tomb_hlc),
             "merged tombstone HLC must equal the remote tombstone HLC"
+        );
+    }
+
+    /// ZEB-685 (S3): the friend-scoped `revoked_dm_devices` set is GROW-ONLY —
+    /// two of the owner's own devices each learning a DIFFERENT revocation must
+    /// BOTH survive the merge (union), not LWW-clobber. This pins the union
+    /// arm in `merge_remote_into_local`.
+    #[test]
+    fn revoked_dm_devices_merge_is_union_not_lww() {
+        use crate::owner_state_types::OwnerAddr;
+        let owner = OwnerAddr([7u8; 16]);
+        let mut local = crate::owner_state_crdt::OwnerState::default();
+        local.apply_revoked_dm_device(owner, [1u8; 32]);
+        let mut remote = crate::owner_state_crdt::OwnerState::default();
+        remote.apply_revoked_dm_device(owner, [2u8; 32]);
+        merge_remote_into_local(&mut local, remote);
+        let set = local.revoked_dm_devices.get(&owner).unwrap();
+        assert!(
+            set.contains(&[1u8; 32]) && set.contains(&[2u8; 32]),
+            "merge must UNION concurrent revocations, not clobber: {set:?}"
         );
     }
 

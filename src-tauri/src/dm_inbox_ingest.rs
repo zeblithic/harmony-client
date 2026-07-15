@@ -445,6 +445,12 @@ pub(crate) async fn ingest_dm_packet(
     // ZEB-580 S2: the shared-community revocation projection — forwarded to
     // `verify_cidnotify_admission` for the CidNotify signer-device cutoff.
     revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
+    // ZEB-685 (S3): mark the owner-state engine dirty after a RevocationPush
+    // inserts a NEW revoked key, so the friend-scoped store is persisted +
+    // replicated to sibling devices (it has no deposit-rung backstop; without
+    // this it is lost on restart). `None` for callers with no engine wired
+    // (unit tests) — the mutation still lands in memory, just isn't flushed.
+    notify_owner_state_dirty: Option<&(dyn Fn() + Send + Sync)>,
 ) -> Result<bool, String> {
     // 1. Decode + dispatch on the DmPacket variant (ZEB-482). The tunnel
     //    carries a discriminated `DmPacket`; today only `Invite` (DM-Space
@@ -561,6 +567,51 @@ pub(crate) async fn ingest_dm_packet(
             return Err(
                 "tunnel DM packet is an Ack (not handled on the tunnel ingest path)".into(),
             );
+        }
+        crate::dm_envelope::DmPacket::RevocationPush {
+            revocation,
+            enrollment,
+        } => {
+            // ZEB-685 (S3): a friend-pushed device revocation. Resolve the
+            // tunnel peer to its owner (the SAME bind apply_invite uses), then
+            // verify + trust-bind + store + feed the projection. A control frame:
+            // never delivered as a chat message.
+            let mut state = crdt_state.lock().await;
+            let expected_owner = resolve_owner_for_peer(&state, peer_node_id).ok_or_else(|| {
+                format!(
+                    "revocation_push: unbindable tunnel peer {}",
+                    hex::encode(peer_node_id)
+                )
+            })?;
+            match crate::dm_outbox::handle_revocation_push(
+                &mut state,
+                expected_owner,
+                &revocation,
+                &enrollment,
+                revoked,
+            ) {
+                Ok(inserted) => {
+                    // Persist + replicate the friend-scoped store ONLY on a
+                    // genuine new insert. Drop the owner-state lock first: the
+                    // engine's own publish path takes it (notify_dirty itself is
+                    // non-blocking, but keep the ordering obviously deadlock-free).
+                    drop(state);
+                    if inserted {
+                        if let Some(mark_dirty) = notify_owner_state_dirty {
+                            mark_dirty();
+                        }
+                    }
+                    tracing::info!(
+                        owner = %hex::encode(expected_owner.0),
+                        inserted,
+                        "ZEB-685: applied friend RevocationPush"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "ZEB-685: rejected RevocationPush")
+                }
+            }
+            return Ok(false);
         }
         crate::dm_envelope::DmPacket::CidNotifyWithBlob {
             signed,
@@ -1671,6 +1722,7 @@ mod tests {
             [0u8; 32],
             &fx.packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("known-good packet must ingest");
@@ -1715,6 +1767,7 @@ mod tests {
             [0u8; 32],
             &fx.packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("duplicate packet is not an error");
@@ -1828,6 +1881,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a known-good invite from a bound peer must apply");
@@ -1949,6 +2003,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a non-friend invite stages (not an error)");
@@ -1994,6 +2049,205 @@ mod tests {
                 .all(|(n, _)| n != crate::dm_outbox::DM_RECEIVED_EVENT),
             "an invite must not emit dm-received"
         );
+    }
+
+    /// ZEB-685 (S3): the dispatch arm's own logic — resolve the tunnel peer to
+    /// its owner, apply, and mark the owner-state engine dirty ONLY on a fresh
+    /// insert — verified at the `ingest_dm_packet` level (the handler itself is
+    /// unit-tested in `dm_outbox.rs`). A RevocationPush is a control frame:
+    /// `Ok(false)`, no `dm-received`.
+    #[tokio::test]
+    async fn ingest_dm_packet_applies_revocation_push_and_marks_dirty() {
+        use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bob = OwnerAddr([0xB0; 16]);
+        let state = std::sync::Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(std::sync::Arc::clone(&sink_handle));
+
+        // Alice's master + revoked device D — a real master-signed RevocationPush.
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let master_bundle = PubKeyBundle::classical_only(master_sk.verifying_key().to_bytes());
+        let alice = OwnerAddr(master_bundle.identity_hash());
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+        let device_bundle = PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes());
+        let device_id = device_bundle.identity_hash();
+        let revoked_ed = device_bundle.classical.ed25519_verify;
+        let enrollment = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            device_bundle,
+            1_700_000_000,
+            None,
+        )
+        .unwrap();
+        let revocation = RevocationCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            1_700_000_000,
+            RevocationReason::Compromised,
+        )
+        .unwrap();
+        let packet = crate::dm_envelope::encode_packet(
+            &crate::dm_envelope::build_revocation_push_packet(revocation, enrollment),
+        )
+        .unwrap();
+
+        // Seed one of Alice's tunnel contacts so `resolve_owner_for_peer` binds
+        // the pushing peer to `alice` (the trust-bind's `expected_owner`).
+        let alice_dsa_pubkey = vec![0x17u8; 1952];
+        let peer_node_id = crate::tunnel_manager::node_id_from_dsa_pubkey(&alice_dsa_pubkey);
+        {
+            let mut st = state.lock().await;
+            st.apply_owner_device_update(
+                alice,
+                vec![crate::owner_state_types::DeviceIdentityHash([0x1a; 16])],
+                vec![None],
+                vec![Some(crate::owner_state_types::DeviceTunnelContact {
+                    iroh_node_id: [0x09; 32],
+                    home_relay_url: None,
+                    pq_dsa_pubkey: alice_dsa_pubkey.clone(),
+                    pq_kem_pubkey: vec![0x08u8; 1184],
+                })],
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "handshake".into(),
+                },
+            );
+        }
+
+        let dirty = std::sync::Arc::new(AtomicUsize::new(0));
+        let dirty_cb = {
+            let d = std::sync::Arc::clone(&dirty);
+            move || {
+                d.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        let applied = ingest_dm_packet(
+            &state,
+            &content_store,
+            &sink,
+            None,
+            bob,
+            "bob-device-64hex",
+            peer_node_id,
+            &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            Some(&dirty_cb),
+        )
+        .await
+        .expect("a valid RevocationPush applies (control frame, Ok(false))");
+        assert!(!applied, "a RevocationPush never emits dm-received");
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "a fresh insert marks the owner-state engine dirty exactly once"
+        );
+        {
+            let st = state.lock().await;
+            assert!(
+                st.revoked_dm_devices
+                    .get(&alice)
+                    .unwrap()
+                    .contains(&revoked_ed),
+                "the revoked device landed in the friend-scoped store"
+            );
+        }
+        assert!(
+            sink_handle
+                .frames()
+                .iter()
+                .all(|(n, _)| n != crate::dm_outbox::DM_RECEIVED_EVENT),
+            "a control frame emits no dm-received"
+        );
+    }
+
+    /// ZEB-685 (S3): a RevocationPush from a tunnel peer we cannot bind to a
+    /// known owner is rejected before any store mutation — and the owner-state
+    /// engine is NOT marked dirty (no spurious publish on a rejected frame).
+    #[tokio::test]
+    async fn ingest_dm_packet_rejects_revocation_push_from_unbindable_peer() {
+        use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bob = OwnerAddr([0xB0; 16]);
+        // EMPTY cache — no device contact matches any peer.
+        let state = std::sync::Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(std::sync::Arc::clone(&sink_handle));
+
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let master_bundle = PubKeyBundle::classical_only(master_sk.verifying_key().to_bytes());
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+        let device_bundle = PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes());
+        let device_id = device_bundle.identity_hash();
+        let enrollment = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            device_bundle,
+            1_700_000_000,
+            None,
+        )
+        .unwrap();
+        let revocation = RevocationCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            1_700_000_000,
+            RevocationReason::Compromised,
+        )
+        .unwrap();
+        let packet = crate::dm_envelope::encode_packet(
+            &crate::dm_envelope::build_revocation_push_packet(revocation, enrollment),
+        )
+        .unwrap();
+
+        let dirty = std::sync::Arc::new(AtomicUsize::new(0));
+        let dirty_cb = {
+            let d = std::sync::Arc::clone(&dirty);
+            move || {
+                d.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        let err = ingest_dm_packet(
+            &state,
+            &content_store,
+            &sink,
+            None,
+            bob,
+            "bob-device-64hex",
+            [0x33; 32], // a peer_node_id absent from the empty cache
+            &packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            Some(&dirty_cb),
+        )
+        .await
+        .expect_err("an unbindable tunnel peer must be rejected");
+        assert!(err.contains("unbindable"), "got: {err}");
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            0,
+            "a rejected push never marks the engine dirty"
+        );
+        {
+            let st = state.lock().await;
+            assert!(st.revoked_dm_devices.is_empty(), "nothing stored on reject");
+        }
     }
 
     /// ZEB-640 (1): befriend-then-redeliver. A non-friend tunnel invite is
@@ -2084,6 +2338,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a non-friend invite stages (not an error)");
@@ -2111,6 +2366,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a friend-tier invite redelivery must apply");
@@ -2194,6 +2450,7 @@ mod tests {
             [0u8; 32],
             &wire,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect("a CidNotifyWithBlob from an admitted sender must deliver");
@@ -2260,6 +2517,7 @@ mod tests {
             [0u8; 32],
             &wire,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("an unadmitted CidNotifyWithBlob must be rejected");
@@ -2310,6 +2568,7 @@ mod tests {
             [0u8; 32],
             &wire,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("a CID-mismatched inline blob must be rejected");
@@ -2423,6 +2682,7 @@ mod tests {
             peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("an inviter-vs-peer mismatch must be rejected");
@@ -2523,6 +2783,7 @@ mod tests {
             unknown_peer_node_id,
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("an invite from an unbindable peer must be rejected");
@@ -2570,6 +2831,7 @@ mod tests {
             [0u8; 32],
             &tampered,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("a tampered packet must be rejected");
@@ -2625,6 +2887,7 @@ mod tests {
             [0u8; 32],
             &packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("an Ack on the tunnel ingest path must be rejected");
@@ -2719,6 +2982,7 @@ mod tests {
             [0u8; 32],
             &fx.packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("a sender kicked mid-fetch must be rejected by the Phase-C re-check");
@@ -2782,6 +3046,7 @@ mod tests {
             [0u8; 32],
             &fx.packet,
             &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
         .await
         .expect_err("a CAS blob whose CID != signed message_cid must be rejected");

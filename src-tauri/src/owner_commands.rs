@@ -911,6 +911,16 @@ pub(crate) async fn revoke_device_inner(
             g.fleet_keys.clone(),
         )
     };
+    // ZEB-685 (S3): handles for the friend-DM RevocationPush fan-out (master
+    // revoke only; see the hook after the feed cut-off). Both are `None` when
+    // the node is down or iroh is unbound — the push is best-effort and simply
+    // skipped then (the revocation still lands in trust state).
+    let (crdt_state_for_push, tunnel_manager_for_push) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (g.crdt_state.clone(), g.tunnel_manager.clone())
+    };
     // Fall back to the resolved default identity dir when the node has not
     // populated NodeState (same source get_owner_state uses).
     let dir = match identity_dir {
@@ -963,6 +973,16 @@ pub(crate) async fn revoke_device_inner(
             if let Some(rev) = trust_snapshot.revocations.cert_for(target).cloned() {
                 try_publish_feed_cutoff(&publish_tx, &fleet_net_doc, &rev, now_ms, "sibling-retry")
                     .await;
+                // ZEB-685 (S3): re-drive the best-effort DM friend-push on the
+                // same retry seam. RevocationPush has no deposit rung, so
+                // re-running the revoke is the ONLY manual retry for a friend
+                // missed by an earlier best-effort send (e.g. offline at the
+                // time). Master-issued only, exactly like the main path — the
+                // stored sibling cert is `sign_master` (this arm is `!is_self`);
+                // the receiver + push helper are idempotent. (Qodo #471.)
+                if let (Some(crdt), Some(mgr)) = (&crdt_state_for_push, &tunnel_manager_for_push) {
+                    push_revocation_to_friends(crdt, mgr, &trust_snapshot, &rev).await;
+                }
             }
             return Ok(());
         }
@@ -1058,6 +1078,20 @@ pub(crate) async fn revoke_device_inner(
     // publish failure never fails the revoke (the trust revocation still landed).
     try_publish_feed_cutoff(&publish_tx, &fleet_net_doc, &cert_for_feed, now_ms, "main").await;
 
+    // ZEB-685 (S3): push this revocation to DM-only friends over the friend-DM
+    // tunnel so their §5.2 cutoff rejects device D's DMs. MASTER revoke only —
+    // a SelfDevice-issued revocation is not a master attestation and the
+    // receiver rejects it (design §3.3 / line 60). Best-effort fire-and-forget:
+    // there is no durability rung here (an additive follow-up), and a friend
+    // reached later still learns of the revocation via community retire-announce
+    // where a shared community exists. `trust_snapshot` predates the mutation but
+    // still carries device D's enrollment (revocation does not prune it).
+    if !is_self {
+        if let (Some(crdt), Some(mgr)) = (&crdt_state_for_push, &tunnel_manager_for_push) {
+            push_revocation_to_friends(crdt, mgr, &trust_snapshot, &cert_for_feed).await;
+        }
+    }
+
     // ZEB-668 S5: a master-issued revoke immediately rotates the fleet
     // KeyTree so the revoked device's retained epoch material goes stale
     // (spec §6: master-revoke always bumps; self-revoke never does — no
@@ -1144,6 +1178,51 @@ pub(crate) async fn revoke_device_inner(
             .await;
     }
     Ok(())
+}
+
+/// ZEB-685 (S3): best-effort fan-out of a master `RevocationCert` (+ its paired
+/// `EnrollmentCert`) to every `Active` friend's DM tunnel, so their §5.2 cutoff
+/// rejects device D's DMs even with no shared community. Skips silently when the
+/// revoked device has no enrollment on record (nothing to pair) or the wire
+/// build fails — the revoke already landed; this is the additive DM-only signal.
+async fn push_revocation_to_friends(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    mgr: &std::sync::Arc<crate::tunnel_manager::TunnelManager>,
+    trust_snapshot: &harmony_owner::state::OwnerState,
+    revocation: &RevocationCert,
+) {
+    let Some(enrollment) = trust_snapshot.enrollments.get(&revocation.target).cloned() else {
+        tracing::warn!(
+            target = %hex::encode(revocation.target),
+            "ZEB-685: no enrollment for revoked device; skipping friend RevocationPush"
+        );
+        return;
+    };
+    let packet = crate::dm_envelope::build_revocation_push_packet(revocation.clone(), enrollment);
+    let wire = match crate::dm_envelope::encode_packet(&packet) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = ?e, "ZEB-685: encode RevocationPush failed; skipping push");
+            return;
+        }
+    };
+    let targets = {
+        let s = crdt_state.lock().await;
+        s.active_friend_owners()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    tracing::info!(
+        friends = targets.len(),
+        "ZEB-685: pushing device revocation to DM friends"
+    );
+    for owner in targets {
+        crate::iroh_tunnel_dm_transport::send_packet_to_owner_tunnels(
+            crdt_state, mgr, owner, &wire,
+        )
+        .await;
+    }
 }
 
 /// Terminal state for a self-revoked device: latch once, tell the UI, then

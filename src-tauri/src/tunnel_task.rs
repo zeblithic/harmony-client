@@ -1663,6 +1663,7 @@ mod tests {
                     dm.peer_node_id,
                     &dm.payload,
                     &drain_revoked,
+                    None,
                 )
                 .await;
             }

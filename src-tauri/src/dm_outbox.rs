@@ -1845,6 +1845,16 @@ impl DmOutbox {
                 );
                 Ok(DrainOutcome::default())
             }
+            // ZEB-685 (S3): the RevocationPush wire variant exists; its live
+            // carrier is the tunnel ingest path (`ingest_dm_packet`). This
+            // dormant outbox dispatch never produces it, so drop+warn rather
+            // than mishandle.
+            crate::dm_envelope::DmPacket::RevocationPush { .. } => {
+                tracing::warn!(
+                    "handle_unicast received RevocationPush; its receive path is the tunnel ingest, not this dispatch. Dropping packet."
+                );
+                Ok(DrainOutcome::default())
+            }
         }
     }
 
@@ -2379,6 +2389,69 @@ pub(crate) enum ApplyInviteOutcome {
 // The arg list is the receiver identity + the verified-invite triple + the
 // learned-at clock + the F1 inviter-bind hint; threading them through a struct
 // would not improve clarity at this single shared call boundary.
+/// ZEB-685 (S3): apply a friend-pushed device revocation. `expected_owner` is
+/// the tunnel-peer's resolved owner (a friend). Verifies the master-signed
+/// revocation + the paired enrollment, trust-binds BOTH to `expected_owner` (a
+/// friend may only revoke THEIR OWN devices — never relay a third party's
+/// revocation into our projection), bridges the cert target (`device_id[16]`)
+/// to the revoked `ed25519[32]` via the enrollment, stores it union-merged in
+/// the owner-state CRDT, and feeds the live `RevokedDeviceProjection` so the
+/// §5.2 DM cutoff rejects that device's DMs for this DM-only contact.
+///
+/// `pub` (not `pub(crate)`) so the end-to-end cutoff integration test can drive
+/// the real handler, mirroring the public `DmOutbox::handle_cidnotify_lifted`
+/// receive entrypoint it pairs with.
+///
+/// Returns `Ok(true)` iff a NEW revoked key was inserted into the owner-state
+/// CRDT store (`Ok(false)` on an idempotent re-apply). The caller uses this to
+/// mark the owner-state engine dirty ONLY on a genuine change — the store lives
+/// in the owner-state CRDT, which persists + replicates to sibling devices only
+/// via a `notify_dirty` flush, and RevocationPush has no deposit-rung backstop,
+/// so without this the revocation is lost on restart (boot-replay re-seeds
+/// nothing) and never reaches the owner's other devices.
+pub fn handle_revocation_push(
+    state: &mut OwnerState,
+    expected_owner: OwnerAddr,
+    revocation: &harmony_owner::certs::RevocationCert,
+    enrollment: &harmony_owner::certs::EnrollmentCert,
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
+) -> Result<bool, DmReceiveError> {
+    // 1. Master-signed revocation — `verify(None)` self-verifies the embedded
+    //    master pub and binds `master.identity_hash() == revocation.owner_id`.
+    revocation
+        .verify(None)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    // 2. Trust-bind: the revocation AND the paired enrollment must belong to the
+    //    pushing friend. A friend may only revoke THEIR OWN devices — this is
+    //    what stops A relaying a (valid) third-party revocation into our
+    //    projection. Both owner_ids are master-identity-hashes, so equality to
+    //    `expected_owner` proves the same master signed both.
+    if OwnerAddr(revocation.owner_id) != expected_owner
+        || OwnerAddr(enrollment.owner_id) != expected_owner
+    {
+        return Err(DmReceiveError::OwnerFieldMismatch);
+    }
+    // 3. Verify the enrollment's master→#2 chain + its `device_id ↔ pubkeys`
+    //    binding, EXPIRY-AGNOSTIC (pass `0` so the `now > expires_at` gate never
+    //    fires — spec §8.5: a revoked device may hold an EXPIRED cert; the
+    //    signature + id-binding are what secure the target→ed25519 bridge, not
+    //    current validity), then bind the enrollment to the cert's target.
+    enrollment
+        .verify(0)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    if enrollment.device_id != revocation.target {
+        return Err(DmReceiveError::OwnerFieldMismatch);
+    }
+    // 4. Bridge target `device_id` → the revoked `ed25519`, store union-merged
+    //    (survives across the owner's devices), and feed the live projection.
+    let ed25519 = enrollment.device_pubkeys.classical.ed25519_verify;
+    let inserted = state.apply_revoked_dm_device(expected_owner, ed25519);
+    let mut one = std::collections::BTreeSet::new();
+    one.insert(ed25519);
+    revoked.union_from_members(std::iter::once((expected_owner, &one)));
+    Ok(inserted)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_invite(
     state: &mut OwnerState,
@@ -3474,6 +3547,174 @@ mod tests {
     use super::*;
     use crate::content_store::InMemoryStub;
     use crate::owner_state_types::{ContentId, DmContentKey, InboxEntry, Space};
+
+    // ── ZEB-685 (S3): handle_revocation_push ─────────────────────────────────
+
+    struct RevCase {
+        owner: OwnerAddr,
+        master_sk: ed25519_dalek::SigningKey,
+        master_bundle: harmony_owner::pubkey_bundle::PubKeyBundle,
+        revocation: harmony_owner::certs::RevocationCert,
+        enrollment: harmony_owner::certs::EnrollmentCert,
+        revoked_ed: [u8; 32],
+    }
+
+    /// A self-contained master-signed revocation scenario (mirrors
+    /// `mint_owner`'s internals): a master, a device it enrolled, and a
+    /// master-signed `RevocationCert` for that device.
+    fn sample_revocation_case() -> RevCase {
+        use ed25519_dalek::SigningKey;
+        use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+
+        let master_sk = SigningKey::from_bytes(&[0x11; 32]);
+        let master_bundle = PubKeyBundle::classical_only(master_sk.verifying_key().to_bytes());
+        let owner = OwnerAddr(master_bundle.identity_hash());
+
+        let device_sk = SigningKey::from_bytes(&[0x22; 32]);
+        let device_bundle = PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes());
+        let device_id = device_bundle.identity_hash();
+        let revoked_ed = device_bundle.classical.ed25519_verify;
+
+        let now = 1_700_000_000u64;
+        let enrollment = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            device_bundle,
+            now,
+            None,
+        )
+        .expect("enrollment sign");
+        let revocation = RevocationCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            now,
+            RevocationReason::Compromised,
+        )
+        .expect("revocation sign");
+        RevCase {
+            owner,
+            master_sk,
+            master_bundle,
+            revocation,
+            enrollment,
+            revoked_ed,
+        }
+    }
+
+    #[test]
+    fn handle_revocation_push_accepts_and_feeds_projection() {
+        let c = sample_revocation_case();
+        let mut state = OwnerState::default();
+        let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        assert!(!proj.is_revoked(&c.owner, &c.revoked_ed));
+        let inserted =
+            handle_revocation_push(&mut state, c.owner, &c.revocation, &c.enrollment, &proj)
+                .expect("valid master-signed push accepted");
+        assert!(
+            inserted,
+            "fresh revocation reports a new insert (drives notify_dirty)"
+        );
+        assert!(proj.is_revoked(&c.owner, &c.revoked_ed), "projection fed");
+        assert!(
+            state
+                .revoked_dm_devices
+                .get(&c.owner)
+                .unwrap()
+                .contains(&c.revoked_ed),
+            "CRDT stored"
+        );
+        // Idempotent re-apply — still exactly one entry, and reports no new insert
+        // (so the caller does NOT spuriously mark the engine dirty).
+        let reinserted =
+            handle_revocation_push(&mut state, c.owner, &c.revocation, &c.enrollment, &proj)
+                .expect("idempotent re-apply");
+        assert!(!reinserted, "idempotent re-apply reports no new insert");
+        assert_eq!(state.revoked_dm_devices.get(&c.owner).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn handle_revocation_push_rejects_third_party_owner() {
+        // The trust-bind: a friend may only revoke THEIR OWN devices. A valid
+        // master-signed revocation whose owner != the pushing peer is rejected
+        // (no relaying a third party's revocation into our projection).
+        let c = sample_revocation_case();
+        let wrong = OwnerAddr([0xEE; 16]);
+        let mut state = OwnerState::default();
+        let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let err = handle_revocation_push(&mut state, wrong, &c.revocation, &c.enrollment, &proj);
+        assert!(
+            matches!(err, Err(DmReceiveError::OwnerFieldMismatch)),
+            "third-party owner must be rejected, got {err:?}"
+        );
+        assert!(
+            state.revoked_dm_devices.is_empty(),
+            "nothing stored on reject"
+        );
+    }
+
+    #[test]
+    fn handle_revocation_push_rejects_target_enrollment_mismatch() {
+        use harmony_owner::certs::EnrollmentCert;
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        // A valid enrollment for a DIFFERENT device under the SAME master: its
+        // device_id != revocation.target, so the bridge binding must reject
+        // (else a friend could cut off the wrong device via a mismatched pair).
+        let c = sample_revocation_case();
+        let other = PubKeyBundle::classical_only(
+            ed25519_dalek::SigningKey::from_bytes(&[0x33; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let other_enrollment = EnrollmentCert::sign_master(
+            &c.master_sk,
+            c.master_bundle.clone(),
+            other.identity_hash(),
+            other,
+            1_700_000_000,
+            None,
+        )
+        .expect("sign other enrollment");
+        let mut state = OwnerState::default();
+        let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let err =
+            handle_revocation_push(&mut state, c.owner, &c.revocation, &other_enrollment, &proj);
+        assert!(
+            matches!(err, Err(DmReceiveError::OwnerFieldMismatch)),
+            "target/enrollment mismatch must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn handle_revocation_push_rejects_self_issued() {
+        use harmony_owner::certs::{RevocationCert, RevocationReason};
+        // A SelfDevice-issued revocation (a device revoking itself) is not a
+        // master attestation — §3.3 accepts only Master-issued (design line 60).
+        // `verify(None)` hits the `(SelfDevice, None) => InvalidSignature` arm.
+        let c = sample_revocation_case();
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]);
+        let self_rev = RevocationCert::sign_self(
+            &device_sk,
+            c.owner.0,
+            c.enrollment.device_id,
+            1_700_000_000,
+            RevocationReason::Decommissioned,
+        )
+        .expect("sign_self");
+        let mut state = OwnerState::default();
+        let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let err = handle_revocation_push(&mut state, c.owner, &self_rev, &c.enrollment, &proj);
+        assert!(
+            matches!(err, Err(DmReceiveError::SignatureVerificationFailed)),
+            "SelfDevice-issued push must be rejected, got {err:?}"
+        );
+        assert!(
+            state.revoked_dm_devices.is_empty(),
+            "nothing stored on reject"
+        );
+    }
 
     /// Test-only helper: build a `DmOutbox` with synthetic materials for
     /// tests that don't exercise community-signing paths. Routes through
