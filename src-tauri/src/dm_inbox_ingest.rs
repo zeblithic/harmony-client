@@ -562,11 +562,36 @@ pub(crate) async fn ingest_dm_packet(
                 "tunnel DM packet is an Ack (not handled on the tunnel ingest path)".into(),
             );
         }
-        crate::dm_envelope::DmPacket::RevocationPush { .. } => {
-            // ZEB-685 (S3): the real verify + trust-bind + store + projection-feed
-            // handler is wired in a later step. Until then a received
-            // RevocationPush is dropped (a control frame, never a chat message).
-            tracing::debug!("ZEB-685: RevocationPush received; handler not yet wired");
+        crate::dm_envelope::DmPacket::RevocationPush {
+            revocation,
+            enrollment,
+        } => {
+            // ZEB-685 (S3): a friend-pushed device revocation. Resolve the
+            // tunnel peer to its owner (the SAME bind apply_invite uses), then
+            // verify + trust-bind + store + feed the projection. A control frame:
+            // never delivered as a chat message.
+            let mut state = crdt_state.lock().await;
+            let expected_owner = resolve_owner_for_peer(&state, peer_node_id).ok_or_else(|| {
+                format!(
+                    "revocation_push: unbindable tunnel peer {}",
+                    hex::encode(peer_node_id)
+                )
+            })?;
+            match crate::dm_outbox::handle_revocation_push(
+                &mut state,
+                expected_owner,
+                &revocation,
+                &enrollment,
+                revoked,
+            ) {
+                Ok(()) => tracing::info!(
+                    owner = %hex::encode(expected_owner.0),
+                    "ZEB-685: applied friend RevocationPush"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "ZEB-685: rejected RevocationPush")
+                }
+            }
             return Ok(false);
         }
         crate::dm_envelope::DmPacket::CidNotifyWithBlob {
