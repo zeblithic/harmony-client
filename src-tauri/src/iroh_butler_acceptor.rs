@@ -801,6 +801,9 @@ pub async fn handle_deposit_core(
         cidnotify_packet: payload.cidnotify_packet,
         storage_blob: payload.storage_blob,
         invite_packet: payload.invite_packet,
+        // ZEB-691 Task B1: field wired to `None` here; Task B4 carries
+        // `payload.revocation_push` through once the butler acceptor decodes it.
+        revocation_push: None,
         deposited_at: ctx.mint_hlc().await,
         deposited_by: ctx.device_id(),
         ingested_by: BTreeSet::new(),
@@ -1323,6 +1326,7 @@ mod tests {
             cidnotify_packet: Some(Vec::new()),
             storage_blob: Vec::new(),
             invite_packet: None,
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,

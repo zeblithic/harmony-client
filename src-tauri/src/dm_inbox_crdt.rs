@@ -41,6 +41,17 @@ pub struct DmInboxEntry {
         with = "serde_bytes"
     )]
     pub invite_packet: Option<Vec<u8>>,
+    /// ZEB-691: signed `RevocationPush` frame bytes (a `DmPacket::RevocationPush`),
+    /// carried through from the sealed `DepositPayload` by the butler acceptor.
+    /// Applied on recover via `handle_revocation_push`. `None` for message /
+    /// invite / legacy deposits.
+    #[serde(
+        rename = "rp",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub revocation_push: Option<Vec<u8>>,
     #[serde(rename = "da")]
     pub deposited_at: Hlc,
     /// SP1 device_id (64-hex).
@@ -74,6 +85,20 @@ impl DmInboxDoc {
     /// half is always 64 hex chars — so one standalone invite per space.
     pub fn invite_key(space_id: &[u8; 16]) -> String {
         format!("{}:invite", hex::encode(space_id))
+    }
+
+    /// ZEB-691: deposit key for a standalone device-revocation entry (no message,
+    /// no space). Keyed by the revoking friend's owner + the revoked device id, so
+    /// re-depositing the same revocation is idempotent (one entry per revoked
+    /// device). The literal `revoke` first segment can never be 32 hex chars, so it
+    /// cannot collide with a message key (`{space_hex}:{cid_hex}`) or an invite key
+    /// (`{space_hex}:invite`).
+    pub fn revoke_key(revoked_owner: &[u8; 16], revoked_target: &[u8; 16]) -> String {
+        format!(
+            "revoke:{}:{}",
+            hex::encode(revoked_owner),
+            hex::encode(revoked_target)
+        )
     }
 
     /// Insert-once + ig-union merge. Same key redeposited carries identical
@@ -158,6 +183,7 @@ mod tests {
             cidnotify_packet: Some(vec![1, 2, 3]),
             storage_blob: vec![4, 5, 6],
             invite_packet: None,
+            revocation_push: None,
             deposited_at: at,
             deposited_by: by.into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),
@@ -354,5 +380,45 @@ mod tests {
         let back: DmInboxDoc = canonical_cbor_decode(&bytes).expect("decode");
         assert_eq!(back, d);
         assert_eq!(back.entries[&k].cidnotify_packet, None);
+    }
+
+    #[test]
+    fn revoke_key_de_collides_with_message_and_invite_keys() {
+        let space = [0xAB; 16];
+        let cid = [0xCD; 32];
+        let owner = [0x11; 16];
+        let device = [0x22; 16];
+        let msg = DmInboxDoc::key(&space, &cid);
+        let inv = DmInboxDoc::invite_key(&space);
+        let rev = DmInboxDoc::revoke_key(&owner, &device);
+        assert!(rev.starts_with("revoke:"));
+        assert_ne!(rev, msg);
+        assert_ne!(rev, inv);
+        // A revoke key's first segment is the literal "revoke", never 32 hex chars,
+        // so it can never alias a space-scoped key.
+        assert!(!msg.starts_with("revoke:"));
+        assert!(!inv.starts_with("revoke:"));
+    }
+
+    #[test]
+    fn dm_inbox_entry_round_trips_revocation_push() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+        let e = DmInboxEntry {
+            sender_owner: [1u8; 16],
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: Some(vec![0x05, 0xAA, 0xBB]),
+            deposited_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            deposited_by: "d".into(),
+            ingested_by: Default::default(),
+        };
+        let bytes = canonical_cbor_encode(&e).unwrap();
+        let back: DmInboxEntry = canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(back.revocation_push, Some(vec![0x05, 0xAA, 0xBB]));
     }
 }

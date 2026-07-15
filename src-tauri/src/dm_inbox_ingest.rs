@@ -1178,6 +1178,7 @@ mod tests {
             cidnotify_packet: Some(packet),
             storage_blob: format!("blob-{}", hex::encode(&cid[..4])).into_bytes(),
             invite_packet: None,
+            revocation_push: None,
             deposited_at: hlc(deposited_ms),
             deposited_by: "butler-device".into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),
@@ -1351,6 +1352,7 @@ mod tests {
             cidnotify_packet: None,
             storage_blob: Vec::new(),
             invite_packet: Some(vec![0xAA, 0xBB, 0xCC]),
+            revocation_push: None,
             deposited_at: hlc(500),
             deposited_by: "butler-device".into(),
             ingested_by: Default::default(),
@@ -3317,6 +3319,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 200,
                 logical: 0,
@@ -3632,6 +3635,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 200,
                 logical: 0,
@@ -3852,6 +3856,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 200,
                 logical: 0,
