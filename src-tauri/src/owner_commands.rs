@@ -978,12 +978,15 @@ pub(crate) async fn revoke_device_inner(
                 try_publish_feed_cutoff(&publish_tx, &fleet_net_doc, &rev, now_ms, "sibling-retry")
                     .await;
                 // ZEB-685 (S3): re-drive the best-effort DM friend-push on the
-                // same retry seam. RevocationPush has no deposit rung, so
-                // re-running the revoke is the ONLY manual retry for a friend
-                // missed by an earlier best-effort send (e.g. offline at the
-                // time). Master-issued only, exactly like the main path — the
-                // stored sibling cert is `sign_master` (this arm is `!is_self`);
-                // the receiver + push helper are idempotent. (Qodo #471.)
+                // same retry seam. The live-tunnel half is still best-effort —
+                // ZEB-691 now ALSO deposits the same wire into each friend's
+                // butler for durable offline recovery (the recipient's inbox
+                // sweeper re-verifies + applies it), but re-running the revoke
+                // remains the manual retry for the tunnel half, e.g. a friend
+                // who was offline at push time. Master-issued only, exactly
+                // like the main path — the stored sibling cert is
+                // `sign_master` (this arm is `!is_self`); the receiver + push
+                // helper are idempotent. (Qodo #471.)
                 if let (Some(crdt), Some(mgr)) = (&crdt_state_for_push, &tunnel_manager_for_push) {
                     push_revocation_to_friends(
                         crdt,
@@ -1092,10 +1095,14 @@ pub(crate) async fn revoke_device_inner(
     // ZEB-685 (S3): push this revocation to DM-only friends over the friend-DM
     // tunnel so their §5.2 cutoff rejects device D's DMs. MASTER revoke only —
     // a SelfDevice-issued revocation is not a master attestation and the
-    // receiver rejects it (design §3.3 / line 60). Best-effort fire-and-forget:
-    // there is no durability rung here (an additive follow-up), and a friend
-    // reached later still learns of the revocation via community retire-announce
-    // where a shared community exists. `trust_snapshot` predates the mutation but
+    // receiver rejects it (design §3.3 / line 60). The live-tunnel half is
+    // best-effort fire-and-forget (an offline friend simply misses it, and
+    // re-running the revoke is the manual retry — see the AlreadyRevoked
+    // sibling-retry arm above); ZEB-691 now ALSO deposits the same wire into
+    // each friend's butler for durable offline recovery, recovered by the
+    // recipient's inbox sweeper on reconnect. A friend reached later also
+    // still learns of the revocation via community retire-announce where a
+    // shared community exists. `trust_snapshot` predates the mutation but
     // still carries device D's enrollment (revocation does not prune it).
     if !is_self {
         if let (Some(crdt), Some(mgr)) = (&crdt_state_for_push, &tunnel_manager_for_push) {

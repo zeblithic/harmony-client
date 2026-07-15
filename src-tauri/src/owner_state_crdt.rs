@@ -77,9 +77,13 @@ pub struct OwnerState {
     /// ZEB-685 (S3): friend-scoped device revocations — owner → set of that
     /// owner's revoked #2 ed25519 keys, learned from `RevocationPush` frames
     /// pushed by that owner (a DM-only contact). Feeds `RevokedDeviceProjection`
-    /// for the DM cutoff. GROW-ONLY / union-merged (NOT LWW — a plain LWW field
+    /// for the DM cutoff. Union-merged per owner (NOT LWW — a plain LWW field
     /// would drop concurrent revocations across the owner's own devices; see
-    /// `owner_state_sync::merge_remote_into_local`). Additive on the wire.
+    /// `owner_state_sync::merge_remote_into_local`), THEN bounded (ZEB-692):
+    /// each owner's set is capped at `MAX_REVOKED_DM_DEVICES_PER_OWNER`,
+    /// retaining the smallest-N keys by byte order (deterministic ⇒
+    /// convergent), and entries for de-friended (`Revoked`) owners are
+    /// pruned outright. So the store is NOT grow-only — it can shrink.
     #[serde(rename = "rd", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub revoked_dm_devices: BTreeMap<crate::owner_state_types::OwnerAddr, BTreeSet<[u8; 32]>>,
 }

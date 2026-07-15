@@ -652,6 +652,12 @@ pub async fn handle_deposit_core(
         .as_deref()
     {
         Some(cidnotify_bytes) => {
+            // CodeRabbit: a message deposit carries no revocation; reject
+            // stray bytes fail-closed, mirroring the storage_blob/invite
+            // waste guards in the other two arms.
+            if payload.revocation_push.is_some() {
+                return Err(DepositReject::BadPayload);
+            }
             let packet = decode_packet(cidnotify_bytes).map_err(|_| DepositReject::BadPayload)?;
             let (signed, signature, signed_bytes) = match packet {
                 DmPacket::CidNotify {
@@ -729,6 +735,18 @@ pub async fn handle_deposit_core(
             // depositing friend (`frame.sender_owner`), and key by the
             // revoked device.
             if let Some(rp_bytes) = payload.revocation_push.as_deref() {
+                // ZEB-691 converge (Qodo, security): revocations are
+                // FRIEND-scoped by design — the send side
+                // (`push_revocation_to_friends`) only deposits to ACTIVE
+                // friends, and this persists into the friend-scoped
+                // `revoked_dm_devices` CRDT (`owner_state_crdt.rs`). A live
+                // group-DM co-member is admitted for message/invite
+                // deposits above, but is NOT authorized to deposit a
+                // revocation: doing so would let a mere co-member write
+                // into another owner's friend-scoped revocation set.
+                if !matches!(admission, Admission::Friend(_)) {
+                    return Err(DepositReject::NotAuthorized);
+                }
                 if rp_bytes.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
                     return Err(DepositReject::BadPayload);
                 }
@@ -786,6 +804,12 @@ pub async fn handle_deposit_core(
                 // is unused bytes an admitted sender could attach to waste inbox
                 // storage until TTL. Reject a non-empty blob fail-closed.
                 if !payload.storage_blob.is_empty() {
+                    return Err(DepositReject::BadPayload);
+                }
+                // CodeRabbit: an invite deposit carries no revocation either;
+                // reject stray bytes fail-closed, mirroring the storage_blob
+                // waste guard above.
+                if payload.revocation_push.is_some() {
                     return Err(DepositReject::BadPayload);
                 }
                 let invite_bytes = payload
@@ -2512,6 +2536,53 @@ mod tests {
         assert!(
             ctx.store.lock().unwrap().is_empty(),
             "nothing persisted on an invite-carrying revocation"
+        );
+    }
+
+    /// ZEB-691 converge (Qodo, security): revocations are FRIEND-scoped by
+    /// design — the send side (`push_revocation_to_friends`) only deposits
+    /// to ACTIVE friends, and this persists into the friend-scoped
+    /// `revoked_dm_devices` CRDT. A well-formed, sender-owned revocation
+    /// admitted only as a live group-DM `CoMember` (NOT an Active friend)
+    /// must be rejected `NotAuthorized`, and nothing persisted — mirrors
+    /// `deposit_from_non_friend_group_co_member_is_accepted`'s admission
+    /// setup, but for the revocation arm where co-member admission must NOT
+    /// be sufficient.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_comember_revocation() {
+        let (rp_wire, _target) = revocation_wire(0x51, 0x71);
+        let f = revocation_fixture(rp_wire, Vec::new(), None);
+        let mut ctx = TestCtx::for_fixture(&f);
+        ctx.friends.clear();
+        ctx.group_co_members.insert(f.sender_owner);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a co-member (non-friend) must not be able to deposit a revocation");
+        assert_eq!(err, DepositReject::NotAuthorized);
+        assert!(
+            ctx.store.lock().unwrap().is_empty(),
+            "nothing persisted for a co-member-admitted revocation"
+        );
+    }
+
+    /// CodeRabbit: mirrors `deposit_with_oversized_invite_is_rejected` — a
+    /// revocation-only deposit whose `revocation_push` exceeds
+    /// `MAX_DEPOSIT_INVITE_BYTES` is rejected `BadPayload`, and nothing is
+    /// persisted. Uses an Active-friend admission (the default) so the ONLY
+    /// defect under test is the oversized payload.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_oversized_revocation() {
+        let f = revocation_fixture(vec![0u8; MAX_DEPOSIT_INVITE_BYTES + 1], Vec::new(), None);
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("oversized revocation_push must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(
+            ctx.store.lock().unwrap().is_empty(),
+            "nothing persisted on an oversized revocation"
         );
     }
 }
