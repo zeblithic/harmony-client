@@ -1832,7 +1832,7 @@ async fn s7_butler_deposit_recover() {
     .await
     .expect(
         "S7 HELD (ZEB-510): B2 must hold A's deposit for P within 120s co-located — \
-         P should have learned B2's iroh endpoint via the FleetNetDoc->resolver wiring",
+         P should have learned B2's iroh endpoint via the FleetNetDoc→resolver wiring",
     );
     // RESIDUAL (ZEB-510 step 1): RECV/CLEARED below remain soft-characterize
     // fallbacks — the recover half (B2->P handoff) is validated cross-WAN by
