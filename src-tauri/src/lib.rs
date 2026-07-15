@@ -53015,7 +53015,14 @@ pub async fn unfriend_inner(
     let mut state = crdt_state.lock().await;
     match state.apply_friend_update(peer_addr, tombstone) {
         crate::owner_state_crdt::ApplyOutcome::Inserted
-        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => Ok(true),
+        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {
+            // ZEB-692: a de-friended contact's DM cutoff is moot — drop their
+            // revoked-device set locally. The merge-path prune (Task A2) keeps
+            // this from being re-inflated by a sibling that has not yet seen the
+            // Revoked tombstone, so this is just the immediate local free.
+            state.revoked_dm_devices.remove(&peer_addr);
+            Ok(true)
+        }
         crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
             Err(format!("unfriend apply rejected: {reason:?}"))
         }
@@ -55706,6 +55713,49 @@ mod friend_ipc_tests {
         assert_eq!(
             entry.sealed_secret, None,
             "revoke must clear the rendezvous secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfriend_inner_drops_local_revoked_dm_devices_for_peer() {
+        use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+        let friend_master = [5u8; 32];
+        let peer = crate::friend_graph::owner_id_from_master_ed25519(&friend_master);
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let hlc_tracker =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        {
+            let mut s = crdt_state.lock().await;
+            s.apply_friend_update(
+                peer,
+                FriendEntry {
+                    master_ed25519: friend_master,
+                    display: None,
+                    status: FriendStatus::Active,
+                    established_via: FriendOrigin::Token,
+                    referrable: false,
+                    learned_at: crate::owner_state_types::Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        device_id: "d".into(),
+                    },
+                    sealed_secret: None,
+                },
+            );
+            s.apply_revoked_dm_device(peer, [8u8; 32]);
+            assert!(s.revoked_dm_devices.contains_key(&peer));
+        }
+        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", peer)
+            .await
+            .expect("unfriend ok");
+        assert!(changed);
+        let s = crdt_state.lock().await;
+        assert_eq!(s.friend_graph.friends[&peer].status, FriendStatus::Revoked);
+        assert!(
+            !s.revoked_dm_devices.contains_key(&peer),
+            "revoked-device entry GC'd on de-friend"
         );
     }
 
