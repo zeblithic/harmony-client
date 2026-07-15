@@ -1534,6 +1534,14 @@ pub struct NodeState {
     pub pending_friend_requests:
         Option<std::sync::Arc<crate::friend_requests::PendingFriendRequests>>,
 
+    /// ZEB-376: process-local pre-authorizations for introductions the user
+    /// initiated. Shared with the friend acceptor (which `take`s a pre-auth to
+    /// auto-accept an introduction-driven inbound request) so the outbound
+    /// introduce IPC can `record` into the SAME store. Built once (unconditional,
+    /// non-`Option`) and rebuilt fresh on restart (process-local + ephemeral).
+    pub pending_outbound_introductions:
+        std::sync::Arc<crate::friend_requests::PendingOutboundIntroductions>,
+
     /// ZEB-236: process-local staged DM invites awaiting user accept/decline.
     /// Same lifecycle as `pending_friend_requests`.
     pub(crate) pending_dm_invites:
@@ -1676,6 +1684,10 @@ impl NodeState {
         // rebuilds a fresh one (process-local + ephemeral — pending requests are
         // re-sent by the requester's next dial after a restart).
         self.pending_friend_requests = None;
+        // ZEB-376: rebuild a fresh outbound-introduction pre-auth store so a
+        // restart drops any stale pre-authorizations (process-local + ephemeral).
+        self.pending_outbound_introductions =
+            std::sync::Arc::new(crate::friend_requests::PendingOutboundIntroductions::new());
         // ZEB-236: drop the staged DM-invite store so a restart rebuilds a
         // fresh one (process-local + ephemeral — ZEB-483 re-stages pending
         // invites from the next inbound message after a restart).
@@ -1954,6 +1966,9 @@ impl Default for NodeState {
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
             pending_friend_requests: None,
+            pending_outbound_introductions: std::sync::Arc::new(
+                crate::friend_requests::PendingOutboundIntroductions::new(),
+            ),
             pending_dm_invites: None,
             pkarr_resolver: None,
             pkarr_relay_client: None,
@@ -4290,6 +4305,12 @@ pub async fn start_node_inner(
         // into the friend acceptor at its construction below.
         let pending_friend_requests_for_state =
             std::sync::Arc::new(crate::friend_requests::PendingFriendRequests::new());
+        // ZEB-376: process-local outbound-introduction pre-auth store. Built
+        // unconditionally so the outbound introduce IPC can `record` into it via
+        // NodeState even when pkarr is disabled. Cloned into the friend acceptor
+        // at its construction below and stashed on the guard afterwards.
+        let pending_outbound_introductions_for_state =
+            std::sync::Arc::new(crate::friend_requests::PendingOutboundIntroductions::new());
         // ZEB-236: process-local staged DM-invite store. Built unconditionally
         // so the accept/decline/list IPCs (later tasks) can reach it via
         // NodeState even when pkarr is disabled. Cloned into the guard below.
@@ -9518,6 +9539,12 @@ pub async fn start_node_inner(
                             .with_pending_requests(Some(std::sync::Arc::clone(
                                 &pending_friend_requests_for_state,
                             )))
+                            // ZEB-376: wire the outbound-introduction pre-auth
+                            // store so an introduction the user initiated
+                            // auto-accepts inline (stamped Introduction).
+                            .with_pending_outbound(Some(std::sync::Arc::clone(
+                                &pending_outbound_introductions_for_state,
+                            )))
                             .with_auto_accept_known(friend_auto_accept_known_for_state)
                             // ZEB-461 Task 6 / ZEB-621: advertise our IMMUTABLE
                             // device bundle + node id + PQ keys in the accept we
@@ -11245,6 +11272,11 @@ pub async fn start_node_inner(
                         // acceptor (built above) holds the other strong ref.
                         guard.pending_friend_requests =
                             Some(std::sync::Arc::clone(&pending_friend_requests_for_state));
+                        // ZEB-376: stash the outbound-introduction pre-auth store
+                        // so the outbound introduce IPC reaches the SAME store the
+                        // friend acceptor `take`s pre-authorizations from.
+                        guard.pending_outbound_introductions =
+                            std::sync::Arc::clone(&pending_outbound_introductions_for_state);
                         // ZEB-236: stash the staged DM-invite store so the
                         // accept/decline/list IPCs (later tasks) reach the SAME
                         // store the invite-ingest path will stage into.
@@ -63800,6 +63832,9 @@ mod start_node_race_tests {
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
             pending_friend_requests: None,
+            pending_outbound_introductions: std::sync::Arc::new(
+                crate::friend_requests::PendingOutboundIntroductions::new(),
+            ),
             pending_dm_invites: None,
             pkarr_resolver: None,
             pkarr_relay_client: None,

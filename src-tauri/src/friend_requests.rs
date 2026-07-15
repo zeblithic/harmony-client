@@ -150,6 +150,48 @@ impl PendingFriendRequests {
     }
 }
 
+/// ZEB-376: process-local pre-authorization for introductions the user
+/// initiated. When you send an `IntroduceRequest` for target X you `record(X)`;
+/// X's inbound introduction-driven `FriendLinkRequest` then auto-accepts because
+/// its authenticated sender is `take`-able here. One-shot + TTL-bounded so a
+/// stale pre-auth can't silently accept an unrelated later dial. Not persisted
+/// (ephemeral, like `PendingFriendRequests`).
+#[derive(Default)]
+pub struct PendingOutboundIntroductions {
+    inner: Mutex<HashMap<OwnerAddr, u64>>,
+}
+
+/// TTL bounding a recorded pre-authorization: a `record`ed target older than
+/// this (in wall-clock epoch-ms) never authorizes an inline-introduced accept.
+pub const OUTBOUND_INTRO_TTL_MS: u64 = 10 * 60 * 1000; // 10 min
+
+impl PendingOutboundIntroductions {
+    /// Empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record (idempotent refresh of the deadline for) a pre-authorization for
+    /// `target` at `now_ms`. A later `record` bumps the recorded instant.
+    pub fn record(&self, target: OwnerAddr, now_ms: u64) {
+        self.inner
+            .lock()
+            .expect("outbound-intro mutex poisoned")
+            .insert(target, now_ms);
+    }
+
+    /// Remove + return true iff `target` was recorded AND still within the TTL.
+    /// A present-but-expired entry is removed and returns false. One-shot: even
+    /// a fresh hit is consumed, so a single pre-auth accepts exactly one dial.
+    pub fn take(&self, target: &OwnerAddr, now_ms: u64) -> bool {
+        let mut m = self.inner.lock().expect("outbound-intro mutex poisoned");
+        match m.remove(target) {
+            Some(rec) => now_ms.saturating_sub(rec) < OUTBOUND_INTRO_TTL_MS,
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +318,19 @@ mod tests {
             store.list().is_empty(),
             "record_inbound must not add to inbox when addr is already approved"
         );
+    }
+
+    #[test]
+    fn outbound_intro_take_is_one_shot_and_ttl_bounded() {
+        let s = PendingOutboundIntroductions::new();
+        s.record(addr(1), 1_000);
+        // Fresh + present → true, and consumed (one-shot).
+        assert!(s.take(&addr(1), 1_500));
+        assert!(!s.take(&addr(1), 1_600));
+        // Expired records never authorize.
+        s.record(addr(2), 1_000);
+        assert!(!s.take(&addr(2), 1_000 + OUTBOUND_INTRO_TTL_MS + 1));
+        // Unknown target → false.
+        assert!(!s.take(&addr(3), 2_000));
     }
 }

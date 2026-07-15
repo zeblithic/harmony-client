@@ -816,6 +816,9 @@ pub enum ConsentDecision {
     TokenPath,
     /// Accept now: write an Active/MutualKey friend + reply Accepted.
     AcceptInline,
+    /// ZEB-376: an introduction the user initiated — accept inline AND stamp
+    /// `established_via: Introduction` (distinct from `AcceptInline`'s MutualKey).
+    AcceptInlineIntroduced,
     /// No token, unknown owner, no prior approval: record + reply Pending.
     Pending,
 }
@@ -862,16 +865,27 @@ pub fn decide_consent(
 /// the user a re-tap — the requester re-dials and lands back at `Pending`.
 fn resolve_consent_consuming_approval(
     pending: Option<&crate::friend_requests::PendingFriendRequests>,
+    pending_outbound: Option<&crate::friend_requests::PendingOutboundIntroductions>,
     token_sig: Option<&[u8; 64]>,
     known: bool,
     auto_accept_known: bool,
     from: &OwnerAddr,
+    now_ms: u64,
 ) -> ConsentDecision {
     let decision = decide_consent(token_sig, known, auto_accept_known, false);
-    if matches!(decision, ConsentDecision::Pending)
-        && pending.map(|p| p.take_approved(from)).unwrap_or(false)
-    {
-        return ConsentDecision::AcceptInline;
+    if matches!(decision, ConsentDecision::Pending) {
+        // ZEB-376: an introduction the user PRE-AUTHORIZED (via an outbound
+        // IntroduceRequest) auto-accepts + stamps Introduction. Checked BEFORE
+        // the regular one-shot approval so an introduction lands as such.
+        if pending_outbound
+            .map(|p| p.take(from, now_ms))
+            .unwrap_or(false)
+        {
+            return ConsentDecision::AcceptInlineIntroduced;
+        }
+        if pending.map(|p| p.take_approved(from)).unwrap_or(false) {
+            return ConsentDecision::AcceptInline;
+        }
     }
     decision
 }
@@ -1020,6 +1034,11 @@ pub fn process_friend_request(
     // refresh is wired): the signed accept advertises no relay rather than a stale
     // one. Ignored when `self_statics` is `None` (an empty bundle has no relay).
     home_relay_url: Option<String>,
+    // ZEB-376: when `Some`, overrides the derived `established_via` — the
+    // introduction path passes `Some(FriendOrigin::Introduction)` so an accepted
+    // introduction is stamped as such rather than the no-token `MutualKey`
+    // default. `None` preserves the token/mutual-key derivation below.
+    origin_override: Option<crate::friend_graph::FriendOrigin>,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key (and the
     // master anchor, recovered from the signer bundle for quorum certs).
@@ -1081,11 +1100,13 @@ pub fn process_friend_request(
         master_ed25519,
         display: req.display.clone(),
         status: FriendStatus::Active,
-        established_via: if req.token_sig.is_some() {
-            FriendOrigin::Token
-        } else {
-            FriendOrigin::MutualKey
-        },
+        established_via: origin_override.unwrap_or_else(|| {
+            if req.token_sig.is_some() {
+                FriendOrigin::Token
+            } else {
+                FriendOrigin::MutualKey
+            }
+        }),
         referrable: false,
         learned_at: learned_at.clone(),
         sealed_secret: Some(sealed),
@@ -1256,6 +1277,13 @@ where
     /// when the Path-A flow isn't wired — an absent store collapses the consent
     /// tree to "token path or unknown→Pending-with-no-record".
     pending_requests: Option<Arc<crate::friend_requests::PendingFriendRequests>>,
+    /// ZEB-376: process-local pre-authorizations for introductions the user
+    /// initiated. `Some` lets an inbound introduction-driven request from a
+    /// pre-authorized target auto-accept inline as `established_via:
+    /// Introduction` (one-shot + TTL-bounded, see `PendingOutboundIntroductions`).
+    /// `None` in tests / when the flow isn't wired — introductions then fall
+    /// through to the normal Pending prompt.
+    pending_outbound: Option<Arc<crate::friend_requests::PendingOutboundIntroductions>>,
     /// ZEB-371 Task 12: the per-user "auto-accept known requesters" toggle
     /// (spec §7.1; Jake's "Both" choice, default ON). Only gates whether to
     /// PROMPT a KNOWN requester — never relaxes authentication, and never
@@ -1337,6 +1365,8 @@ where
             owner_sync_engine: None,
             friend_publisher: None,
             pending_requests: None,
+            // ZEB-376: default to no introduction pre-auth; production wires it.
+            pending_outbound: None,
             // ZEB-371 spec §7.1 default: auto-accept KNOWN requesters is ON.
             auto_accept_known: true,
             // ZEB-461: default to the empty self bundle; production fills it.
@@ -1381,6 +1411,19 @@ where
         pending: Option<Arc<crate::friend_requests::PendingFriendRequests>>,
     ) -> Self {
         self.pending_requests = pending;
+        self
+    }
+
+    /// ZEB-376: wire in the process-local outbound-introduction pre-auth store so
+    /// an inbound introduction-driven request from a pre-authorized target
+    /// auto-accepts inline (stamped `established_via: Introduction`). Fluent
+    /// setter (default `None`) so existing call sites — including tests — keep
+    /// compiling without an explicit `None`.
+    pub fn with_pending_outbound(
+        mut self,
+        pending_outbound: Option<Arc<crate::friend_requests::PendingOutboundIntroductions>>,
+    ) -> Self {
+        self.pending_outbound = pending_outbound;
         self
     }
 
@@ -1630,10 +1673,12 @@ where
         // `resolve_consent_consuming_approval`).
         let accepted = match resolve_consent_consuming_approval(
             self.pending_requests.as_deref(),
+            self.pending_outbound.as_deref(),
             req.token_sig.as_ref(),
             known,
             self.auto_accept_known,
             &req.from_addr,
+            wall_now_ms(),
         ) {
             ConsentDecision::TokenPath => {
                 // ZEB-370 token gate (FAIL CLOSED): require `req.token_sig` is a
@@ -1666,6 +1711,7 @@ where
                         now_secs,
                         self.self_statics.as_ref(),
                         fresh_home_relay,
+                        None,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1702,6 +1748,7 @@ where
                         now_secs,
                         self.self_statics.as_ref(),
                         fresh_home_relay,
+                        None,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1709,6 +1756,38 @@ where
                 // stale pending-inbox entry. The requester may have first
                 // received `Pending` (recorded in the inbox) before becoming
                 // known/approved — clear it so the UI shows no ghost request.
+                if let Some(pending) = self.pending_requests.as_ref() {
+                    pending.clear_completed(&req.from_addr);
+                }
+                self.emit_friend_added(&req);
+                accepted
+            }
+            ConsentDecision::AcceptInlineIntroduced => {
+                // ZEB-376: an introduction the user pre-authorized. Accept inline
+                // with NO token gate (same as AcceptInline) but stamp
+                // `established_via: Introduction` via the origin override.
+                let learned_at = self.next_hlc().await;
+                let fresh_home_relay = self.current_fresh_home_relay();
+                let accepted = {
+                    let mut state = self.crdt_state.lock().await;
+                    process_friend_request(
+                        &mut state,
+                        learned_at,
+                        &req,
+                        self.self_owner,
+                        self.self_display.clone(),
+                        &self.self_enrollment,
+                        &self.device2_signing_key,
+                        &self.keytree,
+                        now_secs,
+                        self.self_statics.as_ref(),
+                        fresh_home_relay,
+                        Some(crate::friend_graph::FriendOrigin::Introduction),
+                    )
+                    .map_err(FriendAcceptError::Handshake)?
+                };
+                // Link completed: drop any stale pending-inbox entry (the target
+                // may have first received `Pending` before the introduction dial).
                 if let Some(pending) = self.pending_requests.as_ref() {
                     pending.clear_completed(&req.from_addr);
                 }
@@ -2572,6 +2651,7 @@ mod tests {
             // ZEB-621: the relay is supplied fresh at accept-sign time (the SOLE
             // source), and — like the statics — is folded into the signed digest.
             Some("https://relay.example/accept".to_string()),
+            None,
         )
         .expect("processed");
         // The accept must actually carry the signed reachability (not empty).
@@ -2658,6 +2738,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
             None,
         )
@@ -2759,6 +2840,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .expect("processed");
 
@@ -2799,6 +2881,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
             None,
         )
@@ -2857,6 +2940,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
             None,
         )
@@ -2949,6 +3033,7 @@ mod tests {
             0,
             Some(&sample_statics()),
             Some("https://relay.live/".to_string()),
+            None,
         )
         .expect("processed");
         assert_eq!(
@@ -2985,6 +3070,7 @@ mod tests {
             &kt,
             0,
             Some(&sample_statics()),
+            None,
             None,
         )
         .expect("processed");
@@ -3369,6 +3455,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .expect("processed");
         let entry = state
@@ -3404,6 +3491,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
             None,
         )
@@ -3497,6 +3585,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .expect("processed");
         let entry = state
@@ -3562,6 +3651,7 @@ mod tests {
             &me.device_key,
             &kt,
             0,
+            None,
             None,
             None,
         )
@@ -3661,8 +3751,10 @@ mod tests {
         // Two handshakes race on the single approval (no token, not known/auto).
         // EXACTLY one wins AcceptInline; the loser falls back to Pending so it
         // does NOT derive a second, mismatched friendship secret.
-        let first = resolve_consent_consuming_approval(Some(&pending), None, false, false, &from);
-        let second = resolve_consent_consuming_approval(Some(&pending), None, false, false, &from);
+        let first =
+            resolve_consent_consuming_approval(Some(&pending), None, None, false, false, &from, 0);
+        let second =
+            resolve_consent_consuming_approval(Some(&pending), None, None, false, false, &from, 0);
         assert_eq!(
             first,
             ConsentDecision::AcceptInline,
@@ -3686,7 +3778,15 @@ mod tests {
         let pending = PendingFriendRequests::new();
         pending.approve(from);
         assert_eq!(
-            resolve_consent_consuming_approval(Some(&pending), Some(&tok), false, false, &from),
+            resolve_consent_consuming_approval(
+                Some(&pending),
+                None,
+                Some(&tok),
+                false,
+                false,
+                &from,
+                0
+            ),
             ConsentDecision::TokenPath,
         );
         assert!(
@@ -3697,7 +3797,7 @@ mod tests {
         // known + auto-accept → AcceptInline without needing/consuming an approval.
         let empty = PendingFriendRequests::new();
         assert_eq!(
-            resolve_consent_consuming_approval(Some(&empty), None, true, true, &from),
+            resolve_consent_consuming_approval(Some(&empty), None, None, true, true, &from, 0),
             ConsentDecision::AcceptInline,
         );
     }
