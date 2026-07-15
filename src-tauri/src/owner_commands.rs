@@ -915,11 +915,15 @@ pub(crate) async fn revoke_device_inner(
     // revoke only; see the hook after the feed cut-off). Both are `None` when
     // the node is down or iroh is unbound — the push is best-effort and simply
     // skipped then (the revocation still lands in trust state).
-    let (crdt_state_for_push, tunnel_manager_for_push) = {
+    let (crdt_state_for_push, tunnel_manager_for_push, butler_client_for_push) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (g.crdt_state.clone(), g.tunnel_manager.clone())
+        (
+            g.crdt_state.clone(),
+            g.tunnel_manager.clone(),
+            g.butler_deposit_client.clone(),
+        )
     };
     // Fall back to the resolved default identity dir when the node has not
     // populated NodeState (same source get_owner_state uses).
@@ -974,14 +978,24 @@ pub(crate) async fn revoke_device_inner(
                 try_publish_feed_cutoff(&publish_tx, &fleet_net_doc, &rev, now_ms, "sibling-retry")
                     .await;
                 // ZEB-685 (S3): re-drive the best-effort DM friend-push on the
-                // same retry seam. RevocationPush has no deposit rung, so
-                // re-running the revoke is the ONLY manual retry for a friend
-                // missed by an earlier best-effort send (e.g. offline at the
-                // time). Master-issued only, exactly like the main path — the
-                // stored sibling cert is `sign_master` (this arm is `!is_self`);
-                // the receiver + push helper are idempotent. (Qodo #471.)
+                // same retry seam. The live-tunnel half is still best-effort —
+                // ZEB-691 now ALSO deposits the same wire into each friend's
+                // butler for durable offline recovery (the recipient's inbox
+                // sweeper re-verifies + applies it), but re-running the revoke
+                // remains the manual retry for the tunnel half, e.g. a friend
+                // who was offline at push time. Master-issued only, exactly
+                // like the main path — the stored sibling cert is
+                // `sign_master` (this arm is `!is_self`); the receiver + push
+                // helper are idempotent. (Qodo #471.)
                 if let (Some(crdt), Some(mgr)) = (&crdt_state_for_push, &tunnel_manager_for_push) {
-                    push_revocation_to_friends(crdt, mgr, &trust_snapshot, &rev).await;
+                    push_revocation_to_friends(
+                        crdt,
+                        mgr,
+                        butler_client_for_push.as_ref(),
+                        &trust_snapshot,
+                        &rev,
+                    )
+                    .await;
                 }
             }
             return Ok(());
@@ -1081,14 +1095,25 @@ pub(crate) async fn revoke_device_inner(
     // ZEB-685 (S3): push this revocation to DM-only friends over the friend-DM
     // tunnel so their §5.2 cutoff rejects device D's DMs. MASTER revoke only —
     // a SelfDevice-issued revocation is not a master attestation and the
-    // receiver rejects it (design §3.3 / line 60). Best-effort fire-and-forget:
-    // there is no durability rung here (an additive follow-up), and a friend
-    // reached later still learns of the revocation via community retire-announce
-    // where a shared community exists. `trust_snapshot` predates the mutation but
+    // receiver rejects it (design §3.3 / line 60). The live-tunnel half is
+    // best-effort fire-and-forget (an offline friend simply misses it, and
+    // re-running the revoke is the manual retry — see the AlreadyRevoked
+    // sibling-retry arm above); ZEB-691 now ALSO deposits the same wire into
+    // each friend's butler for durable offline recovery, recovered by the
+    // recipient's inbox sweeper on reconnect. A friend reached later also
+    // still learns of the revocation via community retire-announce where a
+    // shared community exists. `trust_snapshot` predates the mutation but
     // still carries device D's enrollment (revocation does not prune it).
     if !is_self {
         if let (Some(crdt), Some(mgr)) = (&crdt_state_for_push, &tunnel_manager_for_push) {
-            push_revocation_to_friends(crdt, mgr, &trust_snapshot, &cert_for_feed).await;
+            push_revocation_to_friends(
+                crdt,
+                mgr,
+                butler_client_for_push.as_ref(),
+                &trust_snapshot,
+                &cert_for_feed,
+            )
+            .await;
         }
     }
 
@@ -1188,6 +1213,7 @@ pub(crate) async fn revoke_device_inner(
 async fn push_revocation_to_friends(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     mgr: &std::sync::Arc<crate::tunnel_manager::TunnelManager>,
+    butler: Option<&std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>>,
     trust_snapshot: &harmony_owner::state::OwnerState,
     revocation: &RevocationCert,
 ) {
@@ -1222,6 +1248,31 @@ async fn push_revocation_to_friends(
             crdt_state, mgr, owner, &wire,
         )
         .await;
+        // ZEB-691: also deposit to the friend's own butler set (their always-on
+        // fleet) so an OFFLINE DM-only friend recovers the revocation on
+        // reconnect: butler acceptor pre-validates + persists under `revoke_key`,
+        // and the recipient's inbox sweeper re-verifies + applies + notify_dirty.
+        // Best-effort — a `None` butler (iroh unbound) or a failing deposit
+        // simply skips; the live-tunnel path above is untouched. The zero
+        // `entry_id`/`space_id` are inert for a revocation (the butler keys by
+        // inner content via `revoke_key`; this direct deposit does not ride the
+        // outbox retry loop).
+        if let Some(butler) = butler {
+            let req = crate::butler_deposit::ButlerDepositRequest {
+                entry_id: crate::owner_state_types::OutboxEntryId([0u8; 16]),
+                recipient_owner: owner,
+                space_id: crate::owner_state_types::SpaceId([0u8; 16]),
+                message_cid: None,
+                cidnotify_packet: None,
+                invite_packet: None,
+                revocation_push: Some(wire.clone()),
+                now_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            };
+            let _ = butler.deposit(&req).await;
+        }
     }
 }
 
@@ -3650,5 +3701,154 @@ mod revoke_tests {
             ),
             "idempotent no-op: {second:?}"
         );
+    }
+
+    // ── ZEB-691 (Task B7): send-side butler deposit of the friend RevocationPush ──
+
+    /// A mock `ButlerDepositClient` that records every `ButlerDepositRequest`
+    /// handed to it (mirrors `dm_outbox::tests::MockDepositClient`). Always
+    /// reports `Acked`; the fan-out ignores the outcome (best-effort).
+    struct RecordingButler {
+        calls: std::sync::Mutex<Vec<crate::butler_deposit::ButlerDepositRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::butler_deposit::ButlerDepositClient for RecordingButler {
+        async fn deposit(
+            &self,
+            req: &crate::butler_deposit::ButlerDepositRequest,
+        ) -> crate::butler_deposit::DepositRungOutcome {
+            self.calls.lock().unwrap().push(req.clone());
+            crate::butler_deposit::DepositRungOutcome::Acked
+        }
+    }
+
+    /// Build an `Arc<TunnelManager>` over a real hermetic loopback iroh endpoint
+    /// (cheap; this test never completes a dial and the friend targets carry no
+    /// tunnel contacts, so no `send_dm` ever runs). Mirrors
+    /// `iroh_tunnel_dm_transport::tests::test_manager`.
+    async fn test_tunnel_manager() -> std::sync::Arc<crate::tunnel_manager::TunnelManager> {
+        let endpoint = {
+            let sk = iroh::SecretKey::generate();
+            crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
+                .await
+                .expect("bind loopback iroh endpoint")
+        };
+        let local_pq = std::sync::Arc::new(harmony_identity::PqPrivateIdentity::generate(
+            &mut rand::rngs::OsRng,
+        ));
+        let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
+        std::sync::Arc::new(crate::tunnel_manager::TunnelManager::new(
+            endpoint,
+            local_pq,
+            ingest_tx,
+            std::sync::Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+        ))
+    }
+
+    /// Insert a friend of `status` into `crdt`, keyed by the addr derived from a
+    /// seeded master key (so `apply_friend_update`'s key↔master invariant holds).
+    /// Returns the friend's `OwnerAddr`.
+    fn add_friend(
+        crdt: &mut crate::owner_state_crdt::OwnerState,
+        seed: u8,
+        status: crate::friend_graph::FriendStatus,
+    ) -> crate::owner_state_types::OwnerAddr {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let master_ed25519 = sk.verifying_key().to_bytes();
+        let addr = crate::friend_graph::owner_id_from_master_ed25519(&master_ed25519);
+        crdt.apply_friend_update(
+            addr,
+            crate::friend_graph::FriendEntry {
+                master_ed25519,
+                display: None,
+                status,
+                established_via: crate::friend_graph::FriendOrigin::Token,
+                referrable: false,
+                learned_at: crate::owner_state_types::Hlc {
+                    wall_ms: 10,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+                sealed_secret: None,
+            },
+        );
+        addr
+    }
+
+    /// ZEB-691 (B7): the fan-out deposits the SAME `RevocationPush` wire to each
+    /// ACTIVE friend's butler set — exactly one deposit per Active friend, none
+    /// for a non-Active (Pending) friend — with only the `revocation_push` half
+    /// set (no message / invite / CID).
+    #[tokio::test]
+    async fn push_revocation_to_friends_deposits_to_each_active_friend_butler() {
+        let now = 1_700_000_000;
+        // Real trust state: device B is enrolled (its EnrollmentCert is on
+        // record for the RevocationPush pairing) and master-revoked.
+        let (state, _a_sk, seed, b_sk, _b_vk_hex) = two_device_fixture(now);
+        let b_target = crate::owner_state::device_id_from_signing_key(&b_sk);
+        let artifact = RecoveryArtifact::from_seed(seed);
+        let revocation = RevocationCert::sign_master(
+            &artifact.master_signing_key(),
+            artifact.master_pubkey_bundle(),
+            b_target,
+            now,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+
+        // The wire the send side builds + deposits: the RevocationPush the
+        // fan-out encodes from B's (pairing) enrollment.
+        let enrollment = state
+            .enrollments
+            .get(&b_target)
+            .cloned()
+            .expect("B enrollment on record");
+        let expected_wire = crate::dm_envelope::encode_packet(
+            &crate::dm_envelope::build_revocation_push_packet(revocation.clone(), enrollment),
+        )
+        .expect("encode expected wire");
+
+        // CRDT: TWO Active friends + one Pending (non-Active) → only the two
+        // Active friends are deposit targets.
+        let mut crdt = crate::owner_state_crdt::OwnerState::default();
+        let active1 = add_friend(&mut crdt, 0x31, crate::friend_graph::FriendStatus::Active);
+        let active2 = add_friend(&mut crdt, 0x32, crate::friend_graph::FriendStatus::Active);
+        let _pending = add_friend(&mut crdt, 0x33, crate::friend_graph::FriendStatus::Pending);
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(crdt));
+
+        let mgr = test_tunnel_manager().await;
+        let rec = std::sync::Arc::new(RecordingButler {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let butler: std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient> = rec.clone();
+
+        push_revocation_to_friends(&crdt_state, &mgr, Some(&butler), &state, &revocation).await;
+
+        let calls = rec.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "exactly one deposit per ACTIVE friend (Pending excluded)"
+        );
+        let owners: std::collections::HashSet<_> =
+            calls.iter().map(|r| r.recipient_owner).collect();
+        assert_eq!(owners.len(), 2, "two distinct recipients");
+        assert!(owners.contains(&active1), "active friend 1 got a deposit");
+        assert!(owners.contains(&active2), "active friend 2 got a deposit");
+        for req in &calls {
+            assert_eq!(
+                req.revocation_push.as_deref(),
+                Some(expected_wire.as_slice()),
+                "each deposit carries the RevocationPush wire"
+            );
+            assert_eq!(req.cidnotify_packet, None, "no message half");
+            assert_eq!(req.invite_packet, None, "no invite half");
+            assert_eq!(req.message_cid, None, "no message CID");
+            // Inert-for-revocation zero keys (butler keys by inner content via
+            // revoke_key; this direct deposit does not ride the outbox loop).
+            assert_eq!(req.entry_id.0, [0u8; 16], "inert entry_id");
+            assert_eq!(req.space_id.0, [0u8; 16], "inert space_id");
+        }
     }
 }

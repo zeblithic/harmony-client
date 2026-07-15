@@ -647,85 +647,169 @@ pub async fn handle_deposit_core(
     // device→owner binding + packet signature + the co-member space bind — then
     // hand back the persist key + the ack identifier. The invite-only branch has
     // no storage blob, so it skips the `for_book` cid check (there is no cid).
-    let (deposit_space_id, key, ack_message_cid): ([u8; 16], String, Vec<u8>) =
-        match payload.cidnotify_packet.as_deref() {
-            Some(cidnotify_bytes) => {
-                let packet =
-                    decode_packet(cidnotify_bytes).map_err(|_| DepositReject::BadPayload)?;
-                let (signed, signature, signed_bytes) = match packet {
-                    DmPacket::CidNotify {
-                        signed,
-                        signature,
-                        signed_bytes,
-                    } => (signed, signature, signed_bytes),
-                    _ => return Err(DepositReject::BadPayload),
-                };
-                if signed.sender_owner_addr.0 != frame.sender_owner {
-                    return Err(DepositReject::InnerVerifyFailed);
-                }
-                let (resolved_owner, identity_pub) = ctx
-                    .resolve_sender_device(signed.signing_device_hash)
-                    .await
-                    .ok_or(DepositReject::InnerVerifyFailed)?;
-                if resolved_owner != frame.sender_owner {
-                    return Err(DepositReject::InnerVerifyFailed);
-                }
-                verify_dm_packet_signature(
-                    &signed_bytes,
-                    &signature,
-                    &identity_pub,
-                    signed.signing_device_hash,
-                )
-                .map_err(|_| DepositReject::InnerVerifyFailed)?;
-                let computed_cid = ContentId::for_book(
-                    &payload.storage_blob,
-                    ContentFlags {
-                        encrypted: true,
-                        ..Default::default()
-                    },
-                )
-                .map_err(|_| DepositReject::BadPayload)?;
-                if computed_cid != signed.message_cid {
-                    return Err(DepositReject::InnerVerifyFailed);
-                }
+    let (deposit_space_id, key, ack_message_cid): ([u8; 16], String, Vec<u8>) = match payload
+        .cidnotify_packet
+        .as_deref()
+    {
+        Some(cidnotify_bytes) => {
+            // CodeRabbit: a message deposit carries no revocation; reject
+            // stray bytes fail-closed, mirroring the storage_blob/invite
+            // waste guards in the other two arms.
+            if payload.revocation_push.is_some() {
+                return Err(DepositReject::BadPayload);
+            }
+            let packet = decode_packet(cidnotify_bytes).map_err(|_| DepositReject::BadPayload)?;
+            let (signed, signature, signed_bytes) = match packet {
+                DmPacket::CidNotify {
+                    signed,
+                    signature,
+                    signed_bytes,
+                } => (signed, signature, signed_bytes),
+                _ => return Err(DepositReject::BadPayload),
+            };
+            if signed.sender_owner_addr.0 != frame.sender_owner {
+                return Err(DepositReject::InnerVerifyFailed);
+            }
+            let (resolved_owner, identity_pub) = ctx
+                .resolve_sender_device(signed.signing_device_hash)
+                .await
+                .ok_or(DepositReject::InnerVerifyFailed)?;
+            if resolved_owner != frame.sender_owner {
+                return Err(DepositReject::InnerVerifyFailed);
+            }
+            verify_dm_packet_signature(
+                &signed_bytes,
+                &signature,
+                &identity_pub,
+                signed.signing_device_hash,
+            )
+            .map_err(|_| DepositReject::InnerVerifyFailed)?;
+            let computed_cid = ContentId::for_book(
+                &payload.storage_blob,
+                ContentFlags {
+                    encrypted: true,
+                    ..Default::default()
+                },
+            )
+            .map_err(|_| DepositReject::BadPayload)?;
+            if computed_cid != signed.message_cid {
+                return Err(DepositReject::InnerVerifyFailed);
+            }
 
-                // Step 5.5 (ZEB-424 D28.1, security follow-up) — bind co-member
-                // admission to the DEPOSITED space. Step 1 only proved the sender
-                // shares SOME live group DM (the `space_id` was still sealed); now
-                // that the inner packet is open and its signing device is bound to
-                // `frame.sender_owner`, require that the deposit's own
-                // `signed.space_id` is a live `GroupDm` containing BOTH this owner
-                // and the sender. Without it, a co-member of group A could get a
-                // deposit for an unrelated space B persisted+acked, only for
-                // ingestion to reject it until TTL — an inbox-slot-pinning DoS
-                // plus a lying ack. The friend path is intentionally NOT
-                // space-bound here: friendship authorizes 1:1 DM deposits.
-                if matches!(admission, Admission::CoMember)
-                    && !ctx
-                        .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
-                        .await
-                {
+            // Step 5.5 (ZEB-424 D28.1, security follow-up) — bind co-member
+            // admission to the DEPOSITED space. Step 1 only proved the sender
+            // shares SOME live group DM (the `space_id` was still sealed); now
+            // that the inner packet is open and its signing device is bound to
+            // `frame.sender_owner`, require that the deposit's own
+            // `signed.space_id` is a live `GroupDm` containing BOTH this owner
+            // and the sender. Without it, a co-member of group A could get a
+            // deposit for an unrelated space B persisted+acked, only for
+            // ingestion to reject it until TTL — an inbox-slot-pinning DoS
+            // plus a lying ack. The friend path is intentionally NOT
+            // space-bound here: friendship authorizes 1:1 DM deposits.
+            if matches!(admission, Admission::CoMember)
+                && !ctx
+                    .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
+                    .await
+            {
+                return Err(DepositReject::NotAuthorized);
+            }
+            let key = DmInboxDoc::key(&signed.space_id.0, &signed.message_cid.to_bytes());
+            (
+                signed.space_id.0,
+                key,
+                signed.message_cid.to_bytes().to_vec(),
+            )
+        }
+        // ZEB-505 invite-only deposit: the invite is the sole payload and MUST
+        // be present. Verify it with the same device→owner binding + signature
+        // primitives the message path uses (so the butler never persists+acks
+        // a forged invite — D7), bind co-member admission to the invite's
+        // space, then persist keyed by the invite (one standalone invite per
+        // space).
+        None => {
+            // ZEB-691: a device-revocation deposit — no message, no invite,
+            // a signed RevocationPush. Pre-validate the certs (D7: never
+            // persist+ack a forgery) with the SAME authority the recipient
+            // uses on recover, binding the revocation to the AUTHENTICATED
+            // depositing friend (`frame.sender_owner`), and key by the
+            // revoked device.
+            if let Some(rp_bytes) = payload.revocation_push.as_deref() {
+                // ZEB-691 converge (Qodo, security): revocations are
+                // FRIEND-scoped by design — the send side
+                // (`push_revocation_to_friends`) only deposits to ACTIVE
+                // friends, and this persists into the friend-scoped
+                // `revoked_dm_devices` CRDT (`owner_state_crdt.rs`). A live
+                // group-DM co-member is admitted for message/invite
+                // deposits above, but is NOT authorized to deposit a
+                // revocation: doing so would let a mere co-member write
+                // into another owner's friend-scoped revocation set.
+                if !matches!(admission, Admission::Friend(_)) {
                     return Err(DepositReject::NotAuthorized);
                 }
-                let key = DmInboxDoc::key(&signed.space_id.0, &signed.message_cid.to_bytes());
-                (
-                    signed.space_id.0,
-                    key,
-                    signed.message_cid.to_bytes().to_vec(),
+                if rp_bytes.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
+                    return Err(DepositReject::BadPayload);
+                }
+                // The revocation is the SOLE payload: it carries no message,
+                // so any storage_blob is unused bytes an admitted sender could
+                // attach to waste inbox storage. Reject fail-closed (mirrors
+                // the invite-only branch below).
+                if !payload.storage_blob.is_empty() {
+                    return Err(DepositReject::BadPayload);
+                }
+                // Symmetric with the blob check above: a pure revocation also
+                // carries no invite. Beyond wasting inbox storage, an
+                // invite_packet here would make the persisted entry match BOTH
+                // `revocation_push.is_some()` and `invite_packet.is_some()`,
+                // so the recipient's pure-revocation dispatch guard
+                // (`revocation_push.is_some() && cidnotify_packet.is_none() &&
+                // invite_packet.is_none()`) would fail to match and silently
+                // mis-route/drop the revocation. Reject fail-closed to keep
+                // the deposit shape pure.
+                if payload.invite_packet.is_some() {
+                    return Err(DepositReject::BadPayload);
+                }
+                let packet = decode_packet(rp_bytes).map_err(|_| DepositReject::BadPayload)?;
+                let DmPacket::RevocationPush {
+                    revocation,
+                    enrollment,
+                } = packet
+                else {
+                    return Err(DepositReject::BadPayload);
+                };
+                // PRE-VALIDATE the certs with the EXACT authority the recipient
+                // re-applies on recover (Task B5): master-signed revocation +
+                // enrollment, BOTH trust-bound to the AUTHENTICATED depositing
+                // friend (`frame.sender_owner`). A friend may only revoke THEIR
+                // OWN devices, so this fails closed on a relayed third-party
+                // revocation — the butler never persists+acks a forgery (D7).
+                crate::dm_outbox::verify_revocation_push(
+                    crate::owner_state_types::OwnerAddr(frame.sender_owner),
+                    &revocation,
+                    &enrollment,
                 )
-            }
-            // ZEB-505 invite-only deposit: the invite is the sole payload and MUST
-            // be present. Verify it with the same device→owner binding + signature
-            // primitives the message path uses (so the butler never persists+acks
-            // a forged invite — D7), bind co-member admission to the invite's
-            // space, then persist keyed by the invite (one standalone invite per
-            // space).
-            None => {
+                .map_err(|_| DepositReject::InnerVerifyFailed)?;
+                // Keyed by the revoking friend + the revoked device: one entry
+                // per revoked device, idempotent on redelivery. No space, no
+                // message CID — the ack binds to the revocation marker.
+                let key = DmInboxDoc::revoke_key(&frame.sender_owner, &revocation.target);
+                (
+                    [0u8; 16],
+                    key,
+                    crate::butler_deposit::REVOCATION_DEPOSIT_MARKER.to_vec(),
+                )
+            } else {
                 // CodeRabbit (Stability, Major): the invite is the SOLE payload —
                 // an invite-only deposit carries no message, so any storage_blob
                 // is unused bytes an admitted sender could attach to waste inbox
                 // storage until TTL. Reject a non-empty blob fail-closed.
                 if !payload.storage_blob.is_empty() {
+                    return Err(DepositReject::BadPayload);
+                }
+                // CodeRabbit: an invite deposit carries no revocation either;
+                // reject stray bytes fail-closed, mirroring the storage_blob
+                // waste guard above.
+                if payload.revocation_push.is_some() {
                     return Err(DepositReject::BadPayload);
                 }
                 let invite_bytes = payload
@@ -789,7 +873,8 @@ pub async fn handle_deposit_core(
                     crate::butler_deposit::INVITE_ONLY_DEPOSIT_MARKER.to_vec(),
                 )
             }
-        };
+        }
+    };
 
     // Step 6 — atomic persist-with-caps + durable flush BEFORE the ack
     // exists (D7: an ack never lies). Insert-once on the key with the
@@ -801,6 +886,11 @@ pub async fn handle_deposit_core(
         cidnotify_packet: payload.cidnotify_packet,
         storage_blob: payload.storage_blob,
         invite_packet: payload.invite_packet,
+        // ZEB-691 Task B4: carry the decoded RevocationPush wire through. The
+        // butler pre-validated it above, but the recipient RE-verifies it on
+        // recover (Task B5) — never trust the carrier. `None` for message/invite
+        // deposits.
+        revocation_push: payload.revocation_push,
         deposited_at: ctx.mint_hlc().await,
         deposited_by: ctx.device_id(),
         ingested_by: BTreeSet::new(),
@@ -975,6 +1065,7 @@ mod tests {
     use super::*;
     use crate::butler_deposit::{
         encode_deposit_payload, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO, MAX_DEPOSIT_INVITE_BYTES,
+        REVOCATION_DEPOSIT_MARKER,
     };
     use crate::community_membership::{mint_test_owner, TestOwner};
     use crate::dm_envelope::{build_signed_cidnotify, encode_packet, DmCidNotifySigned};
@@ -1088,6 +1179,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1134,6 +1226,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet,
+            revocation_push: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1323,6 +1416,7 @@ mod tests {
             cidnotify_packet: Some(Vec::new()),
             storage_blob: Vec::new(),
             invite_packet: None,
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -1452,6 +1546,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1629,6 +1724,7 @@ mod tests {
             cidnotify_packet: Some(f.cidnotify_packet.clone()),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         };
         let butler_vk = butler_device_sk().verifying_key().to_bytes();
         let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
@@ -1996,6 +2092,7 @@ mod tests {
             cidnotify_packet: Some(tampered_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2018,6 +2115,7 @@ mod tests {
             cidnotify_packet: Some(mismatch_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2042,6 +2140,7 @@ mod tests {
             cidnotify_packet: Some(foreign_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2227,5 +2326,263 @@ mod tests {
             &peer,
             &[0xAB; 16]
         ));
+    }
+
+    // ── ZEB-691 (Task B4): revocation-deposit acceptor tests ────────────────
+
+    /// Build a master-signed `RevocationPush` wire packet revoking one of the
+    /// `master_seed` owner's devices. `master_seed == 0x51` matches the fixture
+    /// `sender()` (`mint_test_owner(0x51)`) master, so the revocation binds to
+    /// `frame.sender_owner`; any OTHER seed forges a THIRD-PARTY revocation whose
+    /// `owner_id != frame.sender_owner` (the relay-a-stranger's-revocation
+    /// attack the trust-bind must reject). Returns the wire bytes + the revoked
+    /// device's `target` id (the second half of `revoke_key`). Mirrors
+    /// `dm_outbox::tests::sample_revocation_case` — no hand-rolled cert crypto.
+    fn revocation_wire(master_seed: u8, target_device_seed: u8) -> (Vec<u8>, [u8; 16]) {
+        use crate::dm_envelope::build_revocation_push_packet;
+        use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+
+        let master_sk = SigningKey::from_bytes(&[master_seed; 32]);
+        let master_bundle = PubKeyBundle::classical_only(master_sk.verifying_key().to_bytes());
+        let target_sk = SigningKey::from_bytes(&[target_device_seed; 32]);
+        let target_bundle = PubKeyBundle::classical_only(target_sk.verifying_key().to_bytes());
+        let target_device_id = target_bundle.identity_hash();
+        let now = 1_700_000_000u64;
+        let enrollment = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            target_device_id,
+            target_bundle,
+            now,
+            None,
+        )
+        .expect("enrollment sign");
+        let revocation = RevocationCert::sign_master(
+            &master_sk,
+            master_bundle,
+            target_device_id,
+            now,
+            RevocationReason::Compromised,
+        )
+        .expect("revocation sign");
+        let packet = build_revocation_push_packet(revocation, enrollment);
+        let wire = encode_packet(&packet).expect("encode revocation push");
+        (wire, target_device_id)
+    }
+
+    /// A deposit frame carrying ONLY a signed `RevocationPush` — no CidNotify, no
+    /// invite. The OUTER frame is a normal, fully valid `sender()` deposit (so
+    /// steps 0–4 pass unchanged); `storage_blob` lets a test inject an illegal
+    /// non-empty blob to exercise the fail-closed blob check, and `invite_packet`
+    /// lets a test inject an illegal non-empty invite to exercise the fail-closed
+    /// invite check.
+    fn revocation_fixture(
+        rp_wire: Vec<u8>,
+        storage_blob: Vec<u8>,
+        invite_packet: Option<Vec<u8>>,
+    ) -> Fixture {
+        let so = sender();
+        // space_id / message_cid are unused by the revocation path, but the
+        // shared `Fixture` shape carries them; keep them well-formed.
+        let space_id = SpaceId([0x77; 16]);
+        let message_cid = ContentId::for_book(
+            b"unused-by-revocation",
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid");
+        let (_dm_sk, identity_pub, dm_device_hash) = dm_identity();
+        let payload = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: storage_blob.clone(),
+            invite_packet,
+            revocation_push: Some(rp_wire),
+        };
+        let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
+        let sealed = seal_payload_bytes(&payload_bytes);
+        let sig = sign_frame(&BUTLER_OWNER, &sealed, &so.device_key);
+        let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
+        Fixture {
+            frame: DepositFrame {
+                signer_certs_cbor: Vec::new(),
+                recipient_owner: BUTLER_OWNER,
+                sender_owner: so.owner.0,
+                sender_enrollment_cert: cert_bytes,
+                sig,
+                sealed_blob: sealed,
+            },
+            sender_owner: so.owner.0,
+            sender_master: master_from_cert(&so.cert),
+            space_id,
+            message_cid,
+            cidnotify_packet: Vec::new(),
+            storage_blob,
+            dm_device_hash,
+            identity_pub,
+        }
+    }
+
+    /// A revocation-only deposit from an Active friend is persisted under
+    /// `revoke:{sender_owner_hex}:{target_hex}` and acked with the
+    /// `REVOCATION_DEPOSIT_MARKER` (no space, no message CID).
+    #[tokio::test]
+    async fn handle_deposit_core_persists_revocation_under_revoke_key() {
+        // master 0x51 == sender()'s master → revocation binds to frame.sender_owner.
+        let (rp_wire, target) = revocation_wire(0x51, 0x71);
+        let f = revocation_fixture(rp_wire.clone(), Vec::new(), None);
+        let ctx = TestCtx::for_fixture(&f);
+
+        let ack = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect("valid revocation deposit from active friend must be accepted");
+
+        // Ack: zero space + the revocation marker.
+        assert_eq!(ack.space_id, [0u8; 16]);
+        assert_eq!(ack.message_cid, REVOCATION_DEPOSIT_MARKER.to_vec());
+
+        // Persisted under EXACTLY revoke:{sender_hex}:{target_hex}.
+        let key = DmInboxDoc::revoke_key(&f.sender_owner, &target);
+        let store = ctx.store.lock().unwrap();
+        let entry = store.get(&key).expect("entry persisted under revoke_key");
+        assert_eq!(entry.sender_owner, f.sender_owner);
+        assert_eq!(
+            entry.revocation_push,
+            Some(rp_wire),
+            "the signed RevocationPush is carried into the persisted entry verbatim"
+        );
+        assert!(entry.cidnotify_packet.is_none(), "no message half");
+        assert!(entry.invite_packet.is_none(), "no invite half");
+        assert!(entry.storage_blob.is_empty(), "no storage blob");
+    }
+
+    /// D7 trust boundary: an AUTHENTICATED friend deposits a revocation signed by
+    /// a DIFFERENT master (`revocation.owner_id != frame.sender_owner`) — relaying
+    /// a third party's revocation. The butler PRE-VALIDATES and fails closed with
+    /// `InnerVerifyFailed`, and — crucially — NOTHING is persisted (never ack a
+    /// forgery).
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_forged_revocation() {
+        // master 0x71 != sender()'s master (0x51) → owner-field mismatch inside
+        // verify_revocation_push (the revocation is validly master-signed, just
+        // not by the depositing friend's master).
+        let (rp_wire, _target) = revocation_wire(0x71, 0x33);
+        let f = revocation_fixture(rp_wire, Vec::new(), None);
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a revocation the depositing friend does not own must be rejected");
+        assert_eq!(err, DepositReject::InnerVerifyFailed);
+
+        // Nothing persisted, and persist was never even reached (the mock records
+        // "persist:<key>" only AFTER a durable write).
+        assert!(
+            ctx.store.lock().unwrap().is_empty(),
+            "a forged revocation must never be persisted"
+        );
+        assert!(
+            !ctx.events().iter().any(|e| e.starts_with("persist")),
+            "persist must never run for a forged revocation: {:?}",
+            ctx.events()
+        );
+    }
+
+    /// A revocation deposit carries no message, so any `storage_blob` is unused
+    /// bytes an admitted sender could attach to waste inbox storage — rejected
+    /// fail-closed (`BadPayload`) and nothing persisted. Uses a well-formed,
+    /// sender-owned revocation so the ONLY defect is the blob.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_revocation_with_blob() {
+        let (rp_wire, _target) = revocation_wire(0x51, 0x71);
+        let f = revocation_fixture(rp_wire, b"unexpected-storage-blob".to_vec(), None);
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a revocation deposit with a non-empty storage blob must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(
+            ctx.store.lock().unwrap().is_empty(),
+            "nothing persisted on a blob-carrying revocation"
+        );
+    }
+
+    /// ZEB-691 whole-branch-review finding: a pure revocation deposit carries no
+    /// invite either — an `invite_packet` alongside `revocation_push` is unused
+    /// bytes an admitted sender could attach, AND (worse than mere waste) it
+    /// would make the persisted entry match BOTH `revocation_push.is_some()` and
+    /// `invite_packet.is_some()`, so the recipient's pure-revocation dispatch
+    /// guard (`revocation_push.is_some() && cidnotify_packet.is_none() &&
+    /// invite_packet.is_none()`) fails to match and the revocation is silently
+    /// mis-routed/dropped. Reject fail-closed at the butler, symmetric with the
+    /// blob check above, and confirm nothing is persisted.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_revocation_with_invite() {
+        let (rp_wire, _target) = revocation_wire(0x51, 0x71);
+        let f = revocation_fixture(
+            rp_wire,
+            Vec::new(),
+            Some(b"unexpected-invite-bytes".to_vec()),
+        );
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a revocation deposit with a non-empty invite_packet must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(
+            ctx.store.lock().unwrap().is_empty(),
+            "nothing persisted on an invite-carrying revocation"
+        );
+    }
+
+    /// ZEB-691 converge (Qodo, security): revocations are FRIEND-scoped by
+    /// design — the send side (`push_revocation_to_friends`) only deposits
+    /// to ACTIVE friends, and this persists into the friend-scoped
+    /// `revoked_dm_devices` CRDT. A well-formed, sender-owned revocation
+    /// admitted only as a live group-DM `CoMember` (NOT an Active friend)
+    /// must be rejected `NotAuthorized`, and nothing persisted — mirrors
+    /// `deposit_from_non_friend_group_co_member_is_accepted`'s admission
+    /// setup, but for the revocation arm where co-member admission must NOT
+    /// be sufficient.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_comember_revocation() {
+        let (rp_wire, _target) = revocation_wire(0x51, 0x71);
+        let f = revocation_fixture(rp_wire, Vec::new(), None);
+        let mut ctx = TestCtx::for_fixture(&f);
+        ctx.friends.clear();
+        ctx.group_co_members.insert(f.sender_owner);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a co-member (non-friend) must not be able to deposit a revocation");
+        assert_eq!(err, DepositReject::NotAuthorized);
+        assert!(
+            ctx.store.lock().unwrap().is_empty(),
+            "nothing persisted for a co-member-admitted revocation"
+        );
+    }
+
+    /// CodeRabbit: mirrors `deposit_with_oversized_invite_is_rejected` — a
+    /// revocation-only deposit whose `revocation_push` exceeds
+    /// `MAX_DEPOSIT_INVITE_BYTES` is rejected `BadPayload`, and nothing is
+    /// persisted. Uses an Active-friend admission (the default) so the ONLY
+    /// defect under test is the oversized payload.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_oversized_revocation() {
+        let f = revocation_fixture(vec![0u8; MAX_DEPOSIT_INVITE_BYTES + 1], Vec::new(), None);
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("oversized revocation_push must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(
+            ctx.store.lock().unwrap().is_empty(),
+            "nothing persisted on an oversized revocation"
+        );
     }
 }

@@ -1725,6 +1725,10 @@ impl DmOutbox {
             message_cid: entry.message_cid,
             cidnotify_packet,
             invite_packet,
+            // ZEB-691: this candidate builder only ever produces message /
+            // invite-only deposits; revocation deposits are a separate
+            // production path (Task B4).
+            revocation_push: None,
             now_ms,
         });
     }
@@ -2377,18 +2381,44 @@ pub(crate) enum ApplyInviteOutcome {
     IgnoredExistingSpace,
 }
 
-/// ZEB-482: auto-accept a received DmInvite — write the DM Space + cache the
-/// inviter's devices/identity-pub. Idempotent on `space_id`. Shared by the
-/// (dormant) outbox `handle_invite` method and the tunnel ingest path so both
-/// apply identical trust gates. No IPC emit (invites carry no `dm-received`).
-///
-/// Parameterized on `self_owner` / `device_id` (the receiver's identity)
-/// instead of `&self.*` so the ingest path — which holds the owner-state lock
-/// but has no `DmOutbox` handle — can call it directly. Behavior is identical
-/// to the prior `handle_invite` body.
-// The arg list is the receiver identity + the verified-invite triple + the
-// learned-at clock + the F1 inviter-bind hint; threading them through a struct
-// would not improve clarity at this single shared call boundary.
+/// ZEB-691: the cert-verification + trust-bind core of `handle_revocation_push`,
+/// factored out so the butler acceptor can PRE-VALIDATE a deposited revocation
+/// (D7: never persist+ack a forgery) with the SAME authority the recipient uses
+/// on recover. Returns the bridged revoked #2 ed25519 verify key.
+pub(crate) fn verify_revocation_push(
+    expected_owner: OwnerAddr,
+    revocation: &harmony_owner::certs::RevocationCert,
+    enrollment: &harmony_owner::certs::EnrollmentCert,
+) -> Result<[u8; 32], DmReceiveError> {
+    // 1. Master-signed revocation — `verify(None)` self-verifies the embedded
+    //    master pub and binds `master.identity_hash() == revocation.owner_id`.
+    revocation
+        .verify(None)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    // 2. Trust-bind: the revocation AND the paired enrollment must belong to the
+    //    pushing friend. A friend may only revoke THEIR OWN devices — this is
+    //    what stops A relaying a (valid) third-party revocation into our
+    //    projection. Both owner_ids are master-identity-hashes, so equality to
+    //    `expected_owner` proves the same master signed both.
+    if OwnerAddr(revocation.owner_id) != expected_owner
+        || OwnerAddr(enrollment.owner_id) != expected_owner
+    {
+        return Err(DmReceiveError::OwnerFieldMismatch);
+    }
+    // 3. Verify the enrollment's master→#2 chain + its `device_id ↔ pubkeys`
+    //    binding, EXPIRY-AGNOSTIC (pass `0` so the `now > expires_at` gate never
+    //    fires — spec §8.5: a revoked device may hold an EXPIRED cert; the
+    //    signature + id-binding are what secure the target→ed25519 bridge, not
+    //    current validity), then bind the enrollment to the cert's target.
+    enrollment
+        .verify(0)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    if enrollment.device_id != revocation.target {
+        return Err(DmReceiveError::OwnerFieldMismatch);
+    }
+    Ok(enrollment.device_pubkeys.classical.ed25519_verify)
+}
+
 /// ZEB-685 (S3): apply a friend-pushed device revocation. `expected_owner` is
 /// the tunnel-peer's resolved owner (a friend). Verifies the master-signed
 /// revocation + the paired enrollment, trust-binds BOTH to `expected_owner` (a
@@ -2416,35 +2446,9 @@ pub fn handle_revocation_push(
     enrollment: &harmony_owner::certs::EnrollmentCert,
     revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
 ) -> Result<bool, DmReceiveError> {
-    // 1. Master-signed revocation — `verify(None)` self-verifies the embedded
-    //    master pub and binds `master.identity_hash() == revocation.owner_id`.
-    revocation
-        .verify(None)
-        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
-    // 2. Trust-bind: the revocation AND the paired enrollment must belong to the
-    //    pushing friend. A friend may only revoke THEIR OWN devices — this is
-    //    what stops A relaying a (valid) third-party revocation into our
-    //    projection. Both owner_ids are master-identity-hashes, so equality to
-    //    `expected_owner` proves the same master signed both.
-    if OwnerAddr(revocation.owner_id) != expected_owner
-        || OwnerAddr(enrollment.owner_id) != expected_owner
-    {
-        return Err(DmReceiveError::OwnerFieldMismatch);
-    }
-    // 3. Verify the enrollment's master→#2 chain + its `device_id ↔ pubkeys`
-    //    binding, EXPIRY-AGNOSTIC (pass `0` so the `now > expires_at` gate never
-    //    fires — spec §8.5: a revoked device may hold an EXPIRED cert; the
-    //    signature + id-binding are what secure the target→ed25519 bridge, not
-    //    current validity), then bind the enrollment to the cert's target.
-    enrollment
-        .verify(0)
-        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
-    if enrollment.device_id != revocation.target {
-        return Err(DmReceiveError::OwnerFieldMismatch);
-    }
-    // 4. Bridge target `device_id` → the revoked `ed25519`, store union-merged
-    //    (survives across the owner's devices), and feed the live projection.
-    let ed25519 = enrollment.device_pubkeys.classical.ed25519_verify;
+    let ed25519 = verify_revocation_push(expected_owner, revocation, enrollment)?;
+    // Bridge target `device_id` → the revoked `ed25519`, store union-merged
+    // (survives across the owner's devices), and feed the live projection.
     let inserted = state.apply_revoked_dm_device(expected_owner, ed25519);
     let mut one = std::collections::BTreeSet::new();
     one.insert(ed25519);
@@ -2452,6 +2456,18 @@ pub fn handle_revocation_push(
     Ok(inserted)
 }
 
+/// ZEB-482: auto-accept a received DmInvite — write the DM Space + cache the
+/// inviter's devices/identity-pub. Idempotent on `space_id`. Shared by the
+/// (dormant) outbox `handle_invite` method and the tunnel ingest path so both
+/// apply identical trust gates. No IPC emit (invites carry no `dm-received`).
+///
+/// Parameterized on `self_owner` / `device_id` (the receiver's identity)
+/// instead of `&self.*` so the ingest path — which holds the owner-state lock
+/// but has no `DmOutbox` handle — can call it directly. Behavior is identical
+/// to the prior `handle_invite` body.
+// The arg list is the receiver identity + the verified-invite triple + the
+// learned-at clock + the F1 inviter-bind hint; threading them through a struct
+// would not improve clarity at this single shared call boundary.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_invite(
     state: &mut OwnerState,
@@ -3602,6 +3618,20 @@ mod tests {
             enrollment,
             revoked_ed,
         }
+    }
+
+    #[test]
+    fn verify_revocation_push_accepts_valid_and_rejects_tampered() {
+        let case = sample_revocation_case(); // existing test helper (RevCase)
+        let ed = verify_revocation_push(case.owner, &case.revocation, &case.enrollment)
+            .expect("valid pair verifies");
+        assert_eq!(ed, case.revoked_ed);
+        // Third-party owner (expected != revocation.owner) → OwnerFieldMismatch.
+        let other = crate::owner_state_types::OwnerAddr([0xEE; 16]);
+        assert!(matches!(
+            verify_revocation_push(other, &case.revocation, &case.enrollment),
+            Err(DmReceiveError::OwnerFieldMismatch)
+        ));
     }
 
     #[test]

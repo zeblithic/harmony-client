@@ -241,6 +241,7 @@ mod tests {
             cidnotify_packet: Some(vec![1, 2, 3]),
             storage_blob: vec![4, 5, 6],
             invite_packet: None,
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,

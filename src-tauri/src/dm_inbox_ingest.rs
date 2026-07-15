@@ -104,6 +104,13 @@ pub trait DmInboxIngestCtx: Send + Sync {
     /// `Err` leaves the entry PENDING for retry, like `verify`.
     async fn apply_invite_only(&self, entry: &DmInboxEntry) -> Result<(), String>;
 
+    /// ZEB-691: apply a deposited device-revocation entry. Re-verifies the certs
+    /// (never trust the butler — it pre-validated, but a sibling doc merge is
+    /// also a trust boundary), applies via `handle_revocation_push`, and marks
+    /// owner-state dirty on a genuine insert. Returns `Ok(inserted)`. An `Err`
+    /// leaves the entry PENDING for retry, like the message/invite arms.
+    async fn apply_revocation(&self, entry: &DmInboxEntry) -> Result<bool, String>;
+
     /// `OwnerState::apply_inbox` under the owner-state lock (idempotent on
     /// `(space_id, message_cid)`). Returns `true` iff the entry was NEWLY
     /// inserted (`ApplyOutcome::Inserted`) — the `dm-received` emit gate,
@@ -161,6 +168,33 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
 
     for (key, entry) in doc.entries.iter_mut() {
         if entry.ingested_by.contains(&self_id) {
+            continue;
+        }
+        // ZEB-691: a PURE device-revocation deposit (no cidnotify, no invite).
+        // Apply it before the invite-only branch would otherwise swallow the
+        // `cidnotify_packet == None` case. The guard is intentionally a
+        // pure-revocation check, NOT a bare `revocation_push.is_some()`:
+        // `revocation_push` rides UNCONDITIONALLY on the persisted entry, so a
+        // message (cidnotify Some) or invite entry could also carry a
+        // stray/malicious `revocation_push` — a bare `is_some()` would route that
+        // entry into this arm and `continue`, DROPPING the real message/invite.
+        if entry.revocation_push.is_some()
+            && entry.cidnotify_packet.is_none()
+            && entry.invite_packet.is_none()
+        {
+            match ctx.apply_revocation(entry).await {
+                Ok(_) => {
+                    entry.ingested_by.insert(self_id.clone());
+                    changed = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "ZEB-691: revocation recover failed; leaving entry pending for retry"
+                    );
+                }
+            }
             continue;
         }
         // ZEB-505: invite-only entry (no CidNotify) — apply the bootstrap
@@ -835,6 +869,11 @@ pub struct ProdDmInboxIngestCtx {
     /// by-value style. Forwarded to `verify_cidnotify_sender_binding` for the
     /// CidNotify signer-device cutoff.
     pub revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    /// ZEB-691: owner-state SyncEngine dirty hook. A deposited revocation entry
+    /// is eventually GC'd, so unlike CidNotify/invite (which lean on
+    /// re-delivery), the recover MUST persist the owner-state mutation itself.
+    /// `None` only in unit tests that assert without persistence.
+    pub notify_owner_state_dirty: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[async_trait]
@@ -1096,6 +1135,47 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         }
     }
 
+    async fn apply_revocation(&self, entry: &DmInboxEntry) -> Result<bool, String> {
+        // Never trust the carrier: the butler pre-validated the deposit, but a
+        // sibling doc merge is also a trust boundary, so re-run the FULL
+        // `handle_revocation_push` verification (master-signed revocation +
+        // paired enrollment, trust-bound to the depositing friend).
+        let rp = entry
+            .revocation_push
+            .as_deref()
+            .ok_or("apply_revocation: entry has no revocation_push")?;
+        let packet = crate::dm_envelope::decode_packet(rp)
+            .map_err(|e| format!("decode revocation_push: {e}"))?;
+        let crate::dm_envelope::DmPacket::RevocationPush {
+            revocation,
+            enrollment,
+        } = packet
+        else {
+            return Err("revocation_push is not a RevocationPush packet".into());
+        };
+        let inserted = {
+            let mut state = self.crdt_state.lock().await;
+            crate::dm_outbox::handle_revocation_push(
+                &mut state,
+                OwnerAddr(entry.sender_owner),
+                &revocation,
+                &enrollment,
+                &self.revoked,
+            )
+            .map_err(|e| format!("handle_revocation_push: {e:?}"))?
+        };
+        // The revoked-device store lives in the owner-state CRDT and has NO
+        // deposit-rung re-delivery backstop (the entry is GC'd once covered), so
+        // persistence + sibling replication MUST come from notify_dirty here —
+        // ONLY on a genuine new insert (an idempotent re-apply must not churn).
+        if inserted {
+            if let Some(mark) = &self.notify_owner_state_dirty {
+                mark();
+            }
+        }
+        Ok(inserted)
+    }
+
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
         let mut state = self.crdt_state.lock().await;
         match state.apply_inbox(entry) {
@@ -1178,6 +1258,7 @@ mod tests {
             cidnotify_packet: Some(packet),
             storage_blob: format!("blob-{}", hex::encode(&cid[..4])).into_bytes(),
             invite_packet: None,
+            revocation_push: None,
             deposited_at: hlc(deposited_ms),
             deposited_by: "butler-device".into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),
@@ -1273,6 +1354,11 @@ mod tests {
             Ok(())
         }
 
+        async fn apply_revocation(&self, _entry: &DmInboxEntry) -> Result<bool, String> {
+            self.calls.lock().unwrap().push("apply_revocation".into());
+            Ok(true)
+        }
+
         async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
             self.calls.lock().unwrap().push("apply_inbox".into());
             self.applied.lock().unwrap().push(entry);
@@ -1351,6 +1437,7 @@ mod tests {
             cidnotify_packet: None,
             storage_blob: Vec::new(),
             invite_packet: Some(vec![0xAA, 0xBB, 0xCC]),
+            revocation_push: None,
             deposited_at: hlc(500),
             deposited_by: "butler-device".into(),
             ingested_by: Default::default(),
@@ -1698,6 +1785,329 @@ mod tests {
             applied_before,
             "no duplicate ingestion/emit for a resurrected entry"
         );
+    }
+
+    // ── ZEB-691: recipient inbox-sweeper revocation arm ──────────────────────
+
+    /// ZEB-691: a self-contained master-signed revocation scenario (mirrors
+    /// `dm_outbox::tests::sample_revocation_case`): a master, a device it
+    /// enrolled, and a master-signed `RevocationCert` for that device. Returns
+    /// `(owner, revocation, enrollment, revoked_ed25519)`.
+    fn sample_revocation() -> (
+        OwnerAddr,
+        harmony_owner::certs::RevocationCert,
+        harmony_owner::certs::EnrollmentCert,
+        [u8; 32],
+    ) {
+        use ed25519_dalek::SigningKey;
+        use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+
+        let master_sk = SigningKey::from_bytes(&[0x11; 32]);
+        let master_bundle = PubKeyBundle::classical_only(master_sk.verifying_key().to_bytes());
+        let owner = OwnerAddr(master_bundle.identity_hash());
+
+        let device_sk = SigningKey::from_bytes(&[0x22; 32]);
+        let device_bundle = PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes());
+        let device_id = device_bundle.identity_hash();
+        let revoked_ed = device_bundle.classical.ed25519_verify;
+
+        let now = 1_700_000_000u64;
+        let enrollment = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            device_bundle,
+            now,
+            None,
+        )
+        .expect("enrollment sign");
+        let revocation = RevocationCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            now,
+            RevocationReason::Compromised,
+        )
+        .expect("revocation sign");
+        (owner, revocation, enrollment, revoked_ed)
+    }
+
+    /// Build a `ProdDmInboxIngestCtx` over stub handles with a counting
+    /// `notify_owner_state_dirty`. Returns `(ctx, crdt_state, dirty_counter)`.
+    fn prod_ctx_with_dirty() -> (
+        ProdDmInboxIngestCtx,
+        Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+        Arc<AtomicUsize>,
+        crate::revoked_device_projection::RevokedDeviceProjection,
+    ) {
+        let crdt_state = Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(Arc::clone(&sink_handle));
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let dirty = Arc::new(AtomicUsize::new(0));
+        let notify: Arc<dyn Fn() + Send + Sync> = {
+            let dirty = Arc::clone(&dirty);
+            Arc::new(move || {
+                dirty.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let ctx = ProdDmInboxIngestCtx {
+            device_id: SELF_ID.to_string(),
+            self_owner: OwnerAddr([0x01; 16]),
+            crdt_state: Arc::clone(&crdt_state),
+            content_store,
+            sink,
+            pending_dm_invites: None,
+            enrolled: BTreeSet::new(),
+            revoked: revoked.clone(),
+            notify_owner_state_dirty: Some(notify),
+        };
+        (ctx, crdt_state, dirty, revoked)
+    }
+
+    /// Build a PURE revocation deposit entry (no cidnotify, no invite) carrying a
+    /// real signed `RevocationPush` frame, keyed on `sender_owner`.
+    fn revocation_entry(
+        sender_owner: [u8; 16],
+        revocation: harmony_owner::certs::RevocationCert,
+        enrollment: harmony_owner::certs::EnrollmentCert,
+    ) -> DmInboxEntry {
+        let packet = crate::dm_envelope::build_revocation_push_packet(revocation, enrollment);
+        let bytes = crate::dm_envelope::encode_packet(&packet).expect("encode revocation push");
+        DmInboxEntry {
+            sender_owner,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: Some(bytes),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_revocation_applies_and_marks_dirty_once() {
+        // ZEB-691 SECURITY: the recipient re-verifies the deposited revocation
+        // (never trust the butler) via the FULL `handle_revocation_push`, stores
+        // it in the owner-state CRDT, and marks owner-state dirty EXACTLY once —
+        // on the genuine insert, NOT the idempotent re-apply. A deposited
+        // revocation is eventually GC'd, so persistence has no re-delivery
+        // backstop: it MUST come from notify_owner_state_dirty.
+        let (owner, revocation, enrollment, revoked_ed) = sample_revocation();
+        let (ctx, crdt_state, dirty, revoked) = prod_ctx_with_dirty();
+        let entry = revocation_entry(owner.0, revocation, enrollment);
+
+        // First apply: Ok(true) — CRDT gains the revoked key, projection fed,
+        // dirty fires once.
+        let inserted = ctx
+            .apply_revocation(&entry)
+            .await
+            .expect("a valid master-signed revocation applies");
+        assert!(inserted, "a fresh revocation is a genuine insert");
+        assert!(
+            revoked.is_revoked(&owner, &revoked_ed),
+            "the live projection is fed"
+        );
+        {
+            let state = crdt_state.lock().await;
+            assert!(
+                state
+                    .revoked_dm_devices
+                    .get(&owner)
+                    .expect("owner has a revoked set")
+                    .contains(&revoked_ed),
+                "owner-state CRDT stored the revoked device key"
+            );
+        }
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "dirty fires exactly once on the genuine insert"
+        );
+
+        // Second apply: idempotent Ok(false) — dirty must NOT re-fire.
+        let again = ctx
+            .apply_revocation(&entry)
+            .await
+            .expect("idempotent re-apply is not an error");
+        assert!(
+            !again,
+            "re-applying the same revocation is not a new insert"
+        );
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "no spurious dirty on the idempotent re-apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_revocation_rejects_forged_entry_and_stores_nothing() {
+        // ZEB-691 trust boundary: apply_revocation re-runs the FULL verification
+        // — it never trusts the carrier. A revocation whose deposit `sender_owner`
+        // does not match the cert owner (a relayed third-party revocation the
+        // butler failed to catch) is rejected, NOTHING is stored, and dirty never
+        // fires.
+        let (owner, revocation, enrollment, revoked_ed) = sample_revocation();
+        let (ctx, crdt_state, dirty, revoked) = prod_ctx_with_dirty();
+        // Claim a DIFFERENT sender than the cert's owner → OwnerFieldMismatch.
+        let entry = revocation_entry([0xEE; 16], revocation, enrollment);
+
+        let err = ctx.apply_revocation(&entry).await;
+        assert!(
+            err.is_err(),
+            "a forged/mismatched revocation must be rejected, got {err:?}"
+        );
+        assert!(
+            crdt_state.lock().await.revoked_dm_devices.is_empty(),
+            "nothing stored on reject"
+        );
+        assert!(
+            !revoked.is_revoked(&owner, &revoked_ed),
+            "projection not fed on reject"
+        );
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            0,
+            "no dirty notification on reject"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_pending_routes_pure_revocation_entry_and_marks_ingested() {
+        // ZEB-691: a PURE revocation deposit (no cidnotify, no invite) is applied
+        // via `apply_revocation`, marked ingested, and reported as a doc change —
+        // never routed through the message or invite-only paths.
+        let key = DmInboxDoc::revoke_key(&SENDER_OWNER, &[0x11; 16]);
+        let entry = DmInboxEntry {
+            sender_owner: SENDER_OWNER,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: Some(vec![0x05, 0xDE, 0xAD]),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let ctx = ProbeCtx::new();
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed, "revocation ingest mutated the doc (ig growth)");
+        assert_eq!(
+            ctx.calls(),
+            vec!["apply_revocation"],
+            "a pure revocation routes ONLY to apply_revocation"
+        );
+        assert!(
+            ctx.applied().is_empty(),
+            "no message apply_inbox on a revocation"
+        );
+        assert!(
+            ctx.emitted().is_empty(),
+            "no dm-received emit on a revocation"
+        );
+        assert!(
+            doc.entries[&key].ingested_by.contains(SELF_ID),
+            "self added to the grow-only ig set"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_pending_revocation_deposit_arms_recipient_cutoff() {
+        // ZEB-691 (B7 e2e): a butler-deposited revocation — the EXACT
+        // `DmInboxEntry` shape `iroh_butler_acceptor::handle_deposit_core`
+        // persists under `revoke_key` (its B4 acceptor test pins
+        // `entry.revocation_push == Some(wire)` + a `REVOCATION_DEPOSIT_MARKER`
+        // ack) — is recovered by the REAL recipient sweeper. `ingest_pending`
+        // re-verifies through `handle_revocation_push` (never trusting the
+        // carrier), and arms BOTH cutoff surfaces: the live
+        // `RevokedDeviceProjection` and the owner-state `revoked_dm_devices`
+        // CRDT, marking owner-state dirty so the recovered revocation persists.
+        // This closes the B2-review gap: no prior test drove the SWEEPER (vs.
+        // `apply_revocation` directly) over a deposited revocation and proved
+        // the cutoff ends up armed.
+        let (owner, revocation, enrollment, revoked_ed) = sample_revocation();
+        let target = revocation.target;
+        let (ctx, crdt_state, dirty, revoked) = prod_ctx_with_dirty();
+
+        // Persist EXACTLY as the acceptor does: under revoke:{sender}:{target},
+        // carrying the signed RevocationPush and no message/invite half.
+        let key = DmInboxDoc::revoke_key(&owner.0, &target);
+        let entry = revocation_entry(owner.0, revocation, enrollment);
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+
+        assert!(
+            !revoked.is_revoked(&owner, &revoked_ed),
+            "projection empty before the sweep (baseline)"
+        );
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed, "the sweep applied the revocation (doc ig grew)");
+
+        // The recipient §5.2 cutoff is now armed on BOTH surfaces.
+        assert!(
+            revoked.is_revoked(&owner, &revoked_ed),
+            "the live RevokedDeviceProjection now rejects the revoked device"
+        );
+        {
+            let state = crdt_state.lock().await;
+            assert!(
+                state
+                    .revoked_dm_devices
+                    .get(&owner)
+                    .expect("owner has a revoked set")
+                    .contains(&revoked_ed),
+                "owner-state CRDT stored the revoked device key (cutoff armed)"
+            );
+        }
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "the recovered revocation marks owner-state dirty exactly once"
+        );
+        // The entry is applied then coverage-GC'd by the prod sweep (a fully
+        // ingested revocation has no re-delivery backstop — persistence rode the
+        // notify_dirty above); `changed` already confirmed the sweep mutated the
+        // doc, so we assert on the durable cutoff state, not the transient entry.
+    }
+
+    #[tokio::test]
+    async fn stray_revocation_on_message_entry_is_not_hijacked() {
+        // ZEB-691 (B4 review): `revocation_push` rides UNCONDITIONALLY on the
+        // persisted entry, so a MESSAGE entry (cidnotify Some) carrying a
+        // stray/malicious `revocation_push` must STILL take the message path —
+        // never the revocation arm (which `continue`s and would DROP the real
+        // message). The dispatch guard is a PURE-revocation check, not a bare
+        // `revocation_push.is_some()`.
+        let (key, mut entry) = make_entry([1; 16], [2; 32], 500, &[]);
+        entry.revocation_push = Some(vec![0x05, 0xBA, 0xAD]); // stray garbage
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let ctx = ProbeCtx::new();
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed);
+        // The message path ran end-to-end; the revocation arm was NOT taken.
+        assert_eq!(
+            ctx.calls(),
+            vec!["cas_put", "verify", "apply_inbox", "emit"],
+            "a stray revocation_push must not divert a message entry"
+        );
+        assert!(
+            !ctx.calls().contains(&"apply_revocation".to_string()),
+            "the revocation arm must never fire for a message entry"
+        );
+        assert_eq!(ctx.applied().len(), 1, "the real message was applied");
+        assert_eq!(ctx.emitted().len(), 1, "the real message was emitted");
+        assert!(doc.entries[&key].ingested_by.contains(SELF_ID));
     }
 
     // ── ZEB-473 Task 9: inbound tunnel DM ingest (`ingest_dm_packet`) ─────────
@@ -3317,6 +3727,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 200,
                 logical: 0,
@@ -3368,6 +3779,7 @@ mod tests {
             pending_dm_invites: None,
             enrolled: BTreeSet::new(),
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            notify_owner_state_dirty: None,
         };
 
         RecoverInviteFixture {
@@ -3632,6 +4044,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 200,
                 logical: 0,
@@ -3705,6 +4118,7 @@ mod tests {
             pending_dm_invites: Some(Arc::clone(&pending)),
             enrolled: BTreeSet::new(),
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            notify_owner_state_dirty: None,
         };
 
         let err = prod_ctx
@@ -3852,6 +4266,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet),
             storage_blob,
             invite_packet: Some(invite_wire),
+            revocation_push: None,
             deposited_at: Hlc {
                 wall_ms: 200,
                 logical: 0,
@@ -3911,6 +4326,7 @@ mod tests {
             pending_dm_invites: Some(Arc::clone(&pending)),
             enrolled: BTreeSet::new(),
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            notify_owner_state_dirty: None,
         };
         (prod_ctx, pending, sink_handle)
     }

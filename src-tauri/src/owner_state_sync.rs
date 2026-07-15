@@ -363,17 +363,32 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         }
     }
 
-    // ZEB-685 (S3): friend-scoped DM revocations are GROW-ONLY — union per
-    // owner key (mirrors `apply_outbox`'s `delivered_to.extend`). NOT LWW: two
-    // of the owner's own devices each learning a different revocation must both
-    // survive the merge, so we extend the set rather than replace the entry.
+    // ZEB-685 (S3): friend-scoped DM revocations are GROW-ONLY — union per owner
+    // key (mirrors `apply_outbox`'s `delivered_to.extend`). NOT LWW: two of the
+    // owner's own devices each learning a different revocation must both survive.
+    // ZEB-692: after the union, re-apply the two convergent bounds so a sibling
+    // snapshot cannot re-inflate past them —
+    //   (a) cap each touched owner's set to the smallest-N by byte order;
+    //   (b) prune the set for any owner whose merged friend status is `Revoked`
+    //       (a de-friended contact's DM cutoff is moot). friend_graph is merged
+    //       ABOVE this loop, so the status is already converged here.
     for (owner, set) in revoked_dm_devices {
-        local
-            .revoked_dm_devices
-            .entry(owner)
-            .or_default()
-            .extend(set);
+        let local_set = local.revoked_dm_devices.entry(owner).or_default();
+        local_set.extend(set);
+        while local_set.len() > crate::owner_state_crdt::MAX_REVOKED_DM_DEVICES_PER_OWNER {
+            local_set.pop_last();
+        }
     }
+    // GC-on-de-friend (convergent prune): drop entries whose owner is present in the
+    // merged friend graph AS `Revoked`. Runs over the whole store (not just touched
+    // keys) so a Revoked tombstone that arrived in THIS merge also cleans a
+    // pre-existing local entry.
+    local.revoked_dm_devices.retain(|owner, _| {
+        !matches!(
+            local.friend_graph.friends.get(owner).map(|e| &e.status),
+            Some(crate::friend_graph::FriendStatus::Revoked)
+        )
+    });
 }
 
 #[cfg(test)]
@@ -2050,6 +2065,100 @@ mod integration_tests {
         assert!(
             set.contains(&[1u8; 32]) && set.contains(&[2u8; 32]),
             "merge must UNION concurrent revocations, not clobber: {set:?}"
+        );
+    }
+
+    /// ZEB-692: the per-owner union in `merge_remote_into_local` must re-apply
+    /// the same `MAX_REVOKED_DM_DEVICES_PER_OWNER` cap Task A1 put on
+    /// `apply_revoked_dm_device`, else a sibling snapshot can re-inflate a
+    /// capped set past the bound via the merge path.
+    #[test]
+    fn merge_caps_revoked_dm_devices_to_smallest_n_and_converges() {
+        use crate::owner_state_crdt::{OwnerState, MAX_REVOKED_DM_DEVICES_PER_OWNER};
+        let owner = crate::owner_state_types::OwnerAddr([0x22; 16]);
+        let mk = |base: u8| {
+            let mut s = OwnerState::default();
+            for i in 0..MAX_REVOKED_DM_DEVICES_PER_OWNER {
+                let mut ed = [0u8; 32];
+                ed[0] = base;
+                ed[1] = ((i >> 8) & 0xff) as u8;
+                ed[2] = (i & 0xff) as u8;
+                s.apply_revoked_dm_device(owner, ed);
+            }
+            s
+        };
+        let mut a = mk(0x00);
+        let b = mk(0x01); // disjoint key space (base byte differs)
+        merge_remote_into_local(&mut a, b.clone());
+        assert_eq!(
+            a.revoked_dm_devices.get(&owner).unwrap().len(),
+            MAX_REVOKED_DM_DEVICES_PER_OWNER,
+            "union capped back to N"
+        );
+        // Convergence: merging b again is a no-op (already the N-smallest of a∪b).
+        let before = a.revoked_dm_devices.clone();
+        merge_remote_into_local(&mut a, b);
+        assert_eq!(a.revoked_dm_devices, before, "re-merge is idempotent");
+    }
+
+    /// ZEB-692: a de-friended contact's DM revocation entries are moot — the
+    /// merge must prune `revoked_dm_devices[owner]` once the merged friend
+    /// graph shows that owner as `Revoked`. The friend_graph merge loop runs
+    /// BEFORE the revoked_dm_devices union, so the status is already
+    /// converged when the prune runs.
+    #[test]
+    fn merge_prunes_revoked_dm_devices_for_revoked_friends() {
+        use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+        use crate::owner_state_crdt::OwnerState;
+        // A friend we hold a revoked-device entry for, whose friendship the remote
+        // snapshot has just tombstoned (Revoked). The merge must drop the entry.
+        let friend_master = [7u8; 32];
+        let friend_addr = crate::friend_graph::owner_id_from_master_ed25519(&friend_master);
+        let mut local = OwnerState::default();
+        local.apply_revoked_dm_device(friend_addr, [9u8; 32]);
+        // Local still thinks the friend is Active.
+        local.apply_friend_update(
+            friend_addr,
+            FriendEntry {
+                master_ed25519: friend_master,
+                display: None,
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: crate::owner_state_types::Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "x".into(),
+                },
+                sealed_secret: None,
+            },
+        );
+        // Remote snapshot carries a strictly-newer Revoked tombstone.
+        let mut remote = OwnerState::default();
+        remote.apply_friend_update(
+            friend_addr,
+            FriendEntry {
+                master_ed25519: friend_master,
+                display: None,
+                status: FriendStatus::Revoked,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: crate::owner_state_types::Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "x".into(),
+                },
+                sealed_secret: None,
+            },
+        );
+        merge_remote_into_local(&mut local, remote);
+        assert_eq!(
+            local.friend_graph.friends[&friend_addr].status,
+            FriendStatus::Revoked
+        );
+        assert!(
+            !local.revoked_dm_devices.contains_key(&friend_addr),
+            "revoked-device entry pruned for a de-friended owner"
         );
     }
 
