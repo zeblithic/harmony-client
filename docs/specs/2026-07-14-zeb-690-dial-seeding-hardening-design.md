@@ -13,39 +13,39 @@ Close the deferred Minors from PR #469 with focused tests, one small testability
 Reading the merged tree shrank the bundle:
 
 - **Item 5 (owner_device_cache idempotency) — code already fixed.** PR #469's converge fix `fleet_net.rs:463–472` already makes `seed_sibling_device_cache` no-op *only* when the sibling is present *with* `Some(pub)`; if the hash exists with `pub == None` it falls through and re-adds, letting `apply_owner_device_update`'s Some-over-None dedup fill the pub without duplicating. → **Remaining work: a regression test** for the `pub == None` fall-through (the existing test starts from empty state and never hits it).
-- **Item 3 (Confirm back-compat) — mechanism already load-bearing.** The new fields carry `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a `None`-Confirm serializes byte-identical to old wire; the existing `without` round-trip test already exercises that path. → **Remaining work: a tight hard-fixture** pinning both halves of the contract.
+- **Item 3 (Confirm back-compat) — mechanism already load-bearing.** The new fields carry `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a `None`-Confirm serializes to the same wire shape as an old peer (the iroh keys are skipped entirely); the existing `without` round-trip test already exercises that path. → **Remaining work: a tight hard-fixture** pinning both halves of the contract.
 
 ## Work items
 
 ### Test additions (existing infra; no new scaffolding)
 
-1. **Item 1 — fleet heartbeat re-feed does not re-fire `NewPeer`** (`reachability_resolver.rs`).
+- **Item 1 — fleet heartbeat re-feed does not re-fire `NewPeer`** (`reachability_resolver.rs`).
    Uses the existing `SupervisorHandle::new()` + `pending_trigger()` spy (same pattern as `first_learn_kicks_new_peer` / `changed_relay_kicks_record_changed`). Steps: feed a `FleetSibling` entry with **no** supervisor installed (no kick recorded); install a fresh `SupervisorHandle`; re-feed a **newer-HLC, identical-addressing** heartbeat via `update_with_source(.., ReachabilitySource::FleetSibling)`; assert `pending_trigger(node_id) == None`. Pins that `was_present` (fleet slot populated) suppresses `NewPeer` and that unchanged `addr_key` keeps `RecordChanged` silent.
 
-2. **Item 2 — persist branch coverage** (`fleet_peer_seed_persist.rs`), two tests:
+- **Item 2 — persist branch coverage** (`fleet_peer_seed_persist.rs`), two tests:
    - *Trailing-bytes rejection:* write `[version] || valid-CBOR || extra byte`; assert `load` errors with the "trailing bytes after fleet-peer-seed value" `CborDecode` (distinct from the existing junk-CBOR quarantine test).
    - *Transient-IO propagation:* drive `load_doc_or_recover` at a path whose read fails with a non-`NotFound`, non-decode error (e.g. a path that is a directory), and assert the error **propagates** (`Err`) rather than quarantining to `default()`.
 
-3. **Item 3 — Confirm back-compat hard-fixture** (`pairing/types.rs`).
-   Pin both halves of the wire contract that `#[serde(default, skip_serializing_if = "Option::is_none")]` provides: (a) serialize a `Confirm` with `iroh_node_id_hex: None` / `iroh_home_relay: None` and assert the CBOR carries no `irohNodeIdHex`/`irohHomeRelay` key (forward: step-2 peers emit old-wire bytes); (b) decode a hand-built old-style CBOR map (`kind` + `sasDigits` only) and assert it yields a `Confirm` with both iroh fields `None` (backward: old wire decodes). Distinct from the existing `without` round-trip, which only proves current-serializer↔current-deserializer symmetry.
+- **Item 3 — Confirm back-compat hard-fixture** (`pairing/types.rs`).
+   Pin both halves of the wire contract that `#[serde(default, skip_serializing_if = "Option::is_none")]` provides: (a) serialize a `Confirm` with `iroh_node_id_hex: None` / `iroh_home_relay: None` and assert the CBOR carries no `irohNodeIdHex`/`irohHomeRelay` key (forward: a `None`-Confirm emits the same key set an old peer does — this is structural/semantic equivalence, not a byte-pin against a captured legacy fixture); (b) decode a hand-built old-style CBOR map (`kind` + `sasDigits` only) and assert it yields a `Confirm` with both iroh fields `None` (backward: old wire decodes). Distinct from the existing `without` round-trip, which only proves current-serializer↔current-deserializer symmetry.
 
-5. **Item 5 — partial-pub idempotency regression** (`fleet_net.rs`).
+- **Item 5 — partial-pub idempotency regression** (`fleet_net.rs`).
    Construct a self-owner `owner_device_cache` entry that already holds the sibling's device hash with its aligned pub `None`; call `seed_sibling_device_cache`; assert `vk_lookup` (`vk_map_from_device_cache`) now resolves the sibling **and** the device list carries no duplicate hash. Pins the converge fix's fall-through arm.
 
 ### Testability refactor + test
 
-4. **Item 4 — extract `decode_peer_iroh_endpoint`** (`pairing/state_machine.rs`).
+- **Item 4 — extract `decode_peer_iroh_endpoint`** (`pairing/state_machine.rs`).
    Lift the inline decode in the Confirm handler (`match hex::decode(&nid_hex) { Ok(bytes) if bytes.len()==32 => Some(..), _ => None }`) into a pure helper `fn decode_peer_iroh_endpoint(node_id_hex: Option<String>, home_relay: Option<String>) -> Option<([u8; 32], String)>`; call it from the handler (behavior unchanged); unit-test 4 cases: valid → `Some`, malformed hex → `None`, wrong length → `None`, absent (`None` hex) → `None`. Makes the defensive branch testable without the transport/channel/ctx rig.
 
 ### Docs / cosmetic
 
-6. **Item 6 — docstring drift** (`reachability_resolver.rs::resolve_entry_by_node_id`). "across the peer's durable and pkarr slots (ties → durable)" predates ZEB-510's fleet slot, which `freshest()` includes. Correct to name the fleet slot and its precedence.
+- **Item 6 — docstring drift** (`reachability_resolver.rs::resolve_entry_by_node_id`). "across the peer's durable and pkarr slots (ties → durable)" predates ZEB-510's fleet slot, which `freshest()` includes. Correct to name the fleet slot and its precedence.
 
-7. **Item 7 — arrow char** (`e2e_two_node.rs:1835`). `.expect()` message uses ASCII `->`; the header comment uses `→`. One-char consistency fix.
+- **Item 7 — arrow char** (`e2e_two_node.rs:1835`). `.expect()` message uses ASCII `->`; the header comment uses `→`. One-char consistency fix.
 
 ### Harness freshness guard
 
-8. **Item 8 — stale-binary freshness assert** (`e2e-harness/src/bin_resolver.rs`).
+- **Item 8 — stale-binary freshness assert** (`e2e-harness/src/bin_resolver.rs`).
 
    **Mechanism: mtime-vs-source.** This is the correct primitive: the harness does not depend on the `harmony-app` crate, so a build-stamp handshake would be blind to app-source edits in the common dirty-tree dev loop — only the source files' mtime tracks what matters.
 
@@ -57,7 +57,7 @@ Reading the merged tree shrank the bundle:
 
 ## Testing
 
-Every item ships with its own test except items 6 and 7 (doc/cosmetic — covered by compile + `fmt`). Item 8's guard is exercised by unit tests in `bin_resolver.rs`: stale binary → error; fresh binary → ok; missing source tree → skip; `HARMONY_APP_FRESHNESS=off` → bypass. Full-suite gate: `cargo nextest run --locked --workspace --all-targets --features test-fixtures` from `src-tauri/`, plus the standalone `e2e-harness` crate's own `cargo nextest run` for `bin_resolver`. CI-parity `fmt` + `clippy --all-targets` as the final gate.
+Every item ships with its own test except items 6 and 7 (doc/cosmetic — covered by compile + `fmt`). Item 8's guard is exercised by unit tests in `bin_resolver.rs`: stale binary → error; fresh binary → ok; missing source tree → skip; `HARMONY_APP_FRESHNESS=off` → bypass. Full-suite gate: `cargo nextest run --locked --workspace --all-targets --features test-fixtures` from `src-tauri/`, plus the standalone `e2e-harness` crate's own `cargo nextest run --locked` for `bin_resolver` (its e2e scenario tests are opt-in via `--features e2e` and need a built binary, so `--all-targets` is not used for the unit run here). CI-parity `fmt` + `clippy --locked --all-targets` as the final gate.
 
 ## Non-goals
 

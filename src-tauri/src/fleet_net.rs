@@ -602,7 +602,7 @@ mod tests {
     // must fill the pub (so vk_lookup resolves) and NOT duplicate the hash.
     #[test]
     fn seed_sibling_fills_pub_when_hash_present_without_pub() {
-        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_crdt::{ApplyOutcome, OwnerState};
         use crate::owner_state_types::OwnerAddr;
 
         let self_owner = OwnerAddr([0x11; 16]);
@@ -618,14 +618,33 @@ mod tests {
         let hash = crate::dm_signing::derive_device_hash_from_identity_pub(&identity_pub).unwrap();
 
         let mut state = OwnerState::default();
-        // Pre-seed: hash present, pub None (older HLC than the seed below).
-        let _ = state.apply_owner_device_update(
+        // Pre-seed: hash present, pub None (Path-B; older HLC than the seed below).
+        // Assert acceptance so the precondition can't be silently vacuous.
+        let pre = state.apply_owner_device_update(
             self_owner,
             vec![hash],
             vec![None],
             vec![None],
             hlc(500, "pre"),
         );
+        assert!(
+            !matches!(pre, ApplyOutcome::Rejected(_)),
+            "pre-seed must be accepted, else the setup is vacuous: {pre:?}"
+        );
+        // Precondition: the entry holds the sibling's hash with its aligned pub None.
+        {
+            let e = state.owner_device_cache.devices.get(&self_owner).unwrap();
+            let idx = e
+                .devices
+                .iter()
+                .position(|d| *d == hash)
+                .expect("pre-seeded hash present");
+            assert!(
+                e.device_identity_pubs[idx].is_none(),
+                "precondition: aligned pub must be None"
+            );
+        }
+
         let vk_map = |st: &OwnerState| {
             vk_map_from_device_cache(&st.owner_device_cache, &self_owner, "self-dev", self_vk)
         };
@@ -638,9 +657,19 @@ mod tests {
         ));
         assert_eq!(vk_map(&state).get(&hex::encode(sib_ed)), Some(&sib_ed));
 
-        // No duplicate: the union deduped the re-added hash to a single device.
+        // Postcondition: the SAME hash is retained (no duplicate) with its aligned
+        // pub now Some — the fall-through filled it in place.
         let entry = state.owner_device_cache.devices.get(&self_owner).unwrap();
         assert_eq!(entry.devices.len(), 1, "device hash must not be duplicated");
+        let idx = entry
+            .devices
+            .iter()
+            .position(|d| *d == hash)
+            .expect("seeded hash retained");
+        assert!(
+            entry.device_identity_pubs[idx].is_some(),
+            "seed must fill the previously-None pub"
+        );
     }
 
     // Pins the fleet-net-v1 wire format; NEVER regenerate. Mod-level so the

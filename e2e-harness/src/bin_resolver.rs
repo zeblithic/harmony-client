@@ -119,11 +119,18 @@ fn newest_source_under(dir: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
     use std::time::{Duration, UNIX_EPOCH};
+
+    /// Serializes the process-global env-var mutation in the tests below so they
+    /// are safe under any test runner (nextest isolates by process, but plain
+    /// `cargo test` shares threads). Poison-tolerant: a panicking test must not
+    /// wedge the others.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn env_override_to_missing_file_errors() {
-        // SAFETY: single-threaded unit test; restore after.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("HARMONY_APP_BIN", "/definitely/not/here/harmony-app");
         let err = resolve_harmony_app_bin().unwrap_err().to_string();
         std::env::remove_var("HARMONY_APP_BIN");
@@ -195,7 +202,7 @@ mod tests {
 
     #[test]
     fn freshness_disabled_reads_env() {
-        // nextest runs each test in its own process → env mutation is isolated.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("HARMONY_APP_FRESHNESS");
         assert!(!freshness_disabled());
         std::env::set_var("HARMONY_APP_FRESHNESS", "off");
