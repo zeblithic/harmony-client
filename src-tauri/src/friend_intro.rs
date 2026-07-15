@@ -12,7 +12,7 @@ use crate::owner_state_types::{
     deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
 };
 use crate::reachability_record::ReachabilityAnnouncePayload;
-use crate::referral_catalog::{decode_strict, ReferralCodecError};
+use crate::referral_catalog::{decode_catalog_request, decode_strict, ReferralCodecError};
 use harmony_owner::certs::EnrollmentCert;
 
 /// Failure modes when authenticating an [`IntroduceRequest`] (on F) or verifying
@@ -302,6 +302,53 @@ pub fn decode_introduction(bytes: &[u8]) -> Result<Introduction, ReferralCodecEr
     decode_strict(bytes)
 }
 
+/// A tagged frame on the friend-PEX ALPN for the 2b introduction directions.
+/// Browse (`CatalogRequest`, 2a) stays BARE on the wire — it is NOT a variant
+/// here; the acceptor falls back to `decode_catalog_request` when a body does
+/// not parse as a `PexFrame`. This keeps every 2a peer working with no flag-day
+/// and leaves the `zeb375_pex_fixtures` bytes untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PexFrame {
+    #[serde(rename = "ir")]
+    IntroduceRequest(Box<IntroduceRequest>),
+    #[serde(rename = "in")]
+    Introduction(Box<Introduction>),
+}
+
+/// What `decode_pex_frame_or_catalog` resolved a friend-PEX body to.
+///
+/// `CatalogRequest` is left unboxed to match the documented `PexDecoded`
+/// interface (and the direct, un-dereferenced `PexDecoded::Catalog(g)` match
+/// callers use). One `decode_pex_frame_or_catalog` call happens per inbound
+/// friend-PEX body — not a hot loop — so the ~400-byte size delta clippy flags
+/// here isn't a real perf concern.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum PexDecoded {
+    /// A bare 2a `CatalogRequest` (browse). Fallback path.
+    Catalog(crate::referral_catalog::CatalogRequest),
+    /// A tagged 2b frame.
+    Frame(PexFrame),
+}
+
+pub fn encode_pex_frame(frame: &PexFrame) -> Result<Vec<u8>, ReferralCodecError> {
+    let mut out = Vec::new();
+    ciborium::into_writer(frame, &mut out)
+        .map_err(|e| ReferralCodecError::Encode(e.to_string()))?;
+    Ok(out)
+}
+
+/// Try `PexFrame` first (a single-key tagged map); on ANY decode failure, fall
+/// back to a bare `CatalogRequest` (a multi-key map that cannot match the
+/// single-key enum shape, so the disambiguation is unambiguous). Both attempts
+/// use the strict, bounded, trailing-byte-rejecting decoder.
+pub fn decode_pex_frame_or_catalog(bytes: &[u8]) -> Result<PexDecoded, ReferralCodecError> {
+    match decode_strict::<PexFrame>(bytes) {
+        Ok(frame) => Ok(PexDecoded::Frame(frame)),
+        Err(_) => Ok(PexDecoded::Catalog(decode_catalog_request(bytes)?)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +442,41 @@ mod tests {
             wall_ms: w,
             logical: 0,
             device_id: "d".into(),
+        }
+    }
+
+    #[test]
+    fn pex_frame_round_trips_and_bare_catalog_falls_back() {
+        use crate::referral_catalog::{encode_catalog_request, sign_catalog_request};
+        let from = mint_test_owner(0x11);
+        let broker = mint_test_owner(0x22);
+        // A tagged IntroduceRequest frame decodes as a Frame.
+        let ir = sign_introduce_request(
+            &from.device_key,
+            from.owner,
+            broker.owner,
+            OwnerAddr([0x33; 16]),
+            reach(),
+            from.cert.clone(),
+        );
+        let frame = PexFrame::IntroduceRequest(Box::new(ir.clone()));
+        let bytes = encode_pex_frame(&frame).unwrap();
+        match decode_pex_frame_or_catalog(&bytes).unwrap() {
+            PexDecoded::Frame(PexFrame::IntroduceRequest(g)) => assert_eq!(*g, ir),
+            other => panic!("expected IntroduceRequest frame, got {other:?}"),
+        }
+        // A BARE (2a) CatalogRequest — a 4-key map — falls back to Catalog, never
+        // mis-decoding as a single-key frame.
+        let cr = sign_catalog_request(
+            &from.device_key,
+            from.owner,
+            broker.owner,
+            from.cert.clone(),
+        );
+        let bare = encode_catalog_request(&cr).unwrap();
+        match decode_pex_frame_or_catalog(&bare).unwrap() {
+            PexDecoded::Catalog(g) => assert_eq!(g, cr),
+            other => panic!("expected Catalog fallback, got {other:?}"),
         }
     }
 }

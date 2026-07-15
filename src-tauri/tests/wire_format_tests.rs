@@ -71,3 +71,5 @@ mod zeb303_dfrost_fixtures;
 mod zeb370_fixtures;
 #[path = "wire_format/zeb375_pex_fixtures.rs"]
 mod zeb375_pex_fixtures;
+#[path = "wire_format/zeb376_intro_fixtures.rs"]
+mod zeb376_intro_fixtures;
