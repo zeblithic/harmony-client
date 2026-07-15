@@ -4290,18 +4290,22 @@ mod friend_graph_tests {
     fn apply_revoked_dm_device_caps_at_max_keeping_smallest() {
         let mut s = OwnerState::default();
         let owner = crate::owner_state_types::OwnerAddr([0x11; 16]);
-        // Insert MAX distinct keys 1..=MAX (byte-encoded), all retained.
+        // Fill N distinct keys tagged ed[0]=0x10 so keys with ed[0] < 0x10 stay
+        // genuinely fresh for the eviction case below.
         for i in 0..MAX_REVOKED_DM_DEVICES_PER_OWNER {
             let mut ed = [0u8; 32];
-            ed[0] = ((i >> 8) & 0xff) as u8;
-            ed[1] = (i & 0xff) as u8;
+            ed[0] = 0x10;
+            ed[1] = ((i >> 8) & 0xff) as u8;
+            ed[2] = (i & 0xff) as u8;
             assert!(s.apply_revoked_dm_device(owner, ed), "fresh key retained");
         }
         assert_eq!(
             s.revoked_dm_devices.get(&owner).unwrap().len(),
             MAX_REVOKED_DM_DEVICES_PER_OWNER
         );
-        // A key GREATER than the current max is inserted-then-evicted → no net change → false.
+        let current_max = *s.revoked_dm_devices.get(&owner).unwrap().last().unwrap();
+
+        // (a) A key GREATER than the current max is inserted-then-evicted → false, no growth.
         let big = [0xff; 32];
         assert!(
             !s.apply_revoked_dm_device(owner, big),
@@ -4312,15 +4316,34 @@ mod friend_graph_tests {
             s.revoked_dm_devices.get(&owner).unwrap().len(),
             MAX_REVOKED_DM_DEVICES_PER_OWNER
         );
-        // A key SMALLER than the current max evicts the max → net change → true.
-        let small = [0u8; 32]; // 0x0000… is smaller than any two-byte-tagged key above except itself
-        let was_present = s.revoked_dm_devices.get(&owner).unwrap().contains(&small);
-        let ret = s.apply_revoked_dm_device(owner, small);
-        assert_eq!(ret, !was_present, "small key retained iff it was new");
+
+        // (b) A genuinely fresh SMALLER key evicts the current max → true; max now absent.
+        let small = [0u8; 32]; // ed[0]=0 < 0x10, not among the setup keys
+        assert!(
+            !s.revoked_dm_devices.get(&owner).unwrap().contains(&small),
+            "precondition: small must be fresh"
+        );
+        assert!(
+            s.apply_revoked_dm_device(owner, small),
+            "fresh smaller key retained (evicts the max)"
+        );
         assert!(s.revoked_dm_devices.get(&owner).unwrap().contains(&small));
+        assert!(
+            !s.revoked_dm_devices
+                .get(&owner)
+                .unwrap()
+                .contains(&current_max),
+            "former max evicted"
+        );
         assert_eq!(
             s.revoked_dm_devices.get(&owner).unwrap().len(),
             MAX_REVOKED_DM_DEVICES_PER_OWNER
+        );
+
+        // (c) Re-applying an already-present key → false (idempotent).
+        assert!(
+            !s.apply_revoked_dm_device(owner, small),
+            "idempotent re-apply"
         );
     }
 
