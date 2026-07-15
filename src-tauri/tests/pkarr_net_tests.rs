@@ -1,7 +1,7 @@
 //! ZEB-442: consolidated pkarr_net test harness (ZEB-440 lever 3 — test-binary
 //! consolidation).
 //!
-//! Scope: the **pkarr / iroh / network-transport** domain — pkarr publish/resolve + community fallback, identity discovery, invite redemption, iroh key-file fallback + zenoh registration, and two-endpoint network health. (The real-iroh dynamic-dial test stays standalone under `#[ignore]` for ZEB-402.)
+//! Scope: the **pkarr / iroh / network-transport** domain — pkarr publish/resolve + community fallback, identity discovery, invite redemption, iroh key-file fallback + zenoh registration, and two-endpoint network health. (The real-iroh dynamic-dial test stays standalone in `zeb_373_dynamic_dial_integration.rs`; its ZEB-402 `#[ignore]` was removed once ZEB-626 fixed the first-bind stall behind the flake.)
 //!
 //! Each former `tests/*.rs` here compiled as its own integration-test binary,
 //! statically re-linking the whole `harmony-app` lib (the link-time multiplier
