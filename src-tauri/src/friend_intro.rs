@@ -445,6 +445,35 @@ pub(crate) fn introduction_reachability_hlc() -> crate::owner_state_types::Hlc {
     }
 }
 
+/// ZEB-376 Task 12: build the SUBJECT's ("your") own current reachability
+/// announce for an outbound [`IntroduceRequest`]. A thin wrapper over
+/// [`crate::reachability_record::build_signed_payload_with_key`] pinned to the
+/// CANONICAL [`introduction_reachability_hlc`] — the exact HLC X's Task-10
+/// verifier re-derives — with an EMPTY butler set (`bs_at = 0`); an empty set is
+/// acceptable for a first-contact dial target. The HLC is deliberately NOT a
+/// parameter: signing with any other clock would make X reject every
+/// introduction, so it must not be caller-overridable.
+pub(crate) fn build_self_reachability_announce(
+    iroh_node_id: [u8; 32],
+    home_relay_url: String,
+    direct_addresses: Vec<std::net::SocketAddr>,
+    announced_at_ms: u64,
+    actor: &OwnerAddr,
+    device2_signing_key: &SigningKey,
+) -> Result<ReachabilityAnnouncePayload, crate::owner_state_crypto::CryptoError> {
+    crate::reachability_record::build_signed_payload_with_key(
+        iroh_node_id,
+        home_relay_url,
+        direct_addresses,
+        announced_at_ms,
+        actor,
+        &introduction_reachability_hlc(),
+        Vec::new(),
+        0,
+        device2_signing_key,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +777,46 @@ mod tests {
             )
             .is_err(),
             "a relayed reachability past its TTL must be rejected"
+        );
+    }
+
+    /// ZEB-376 Task 12: the SELF side's reachability assembly. Build our OWN
+    /// reachability announce via `build_self_reachability_announce` (signed by our
+    /// device-#2 key over the CANONICAL `introduction_reachability_hlc()`) and
+    /// prove it verifies against that same canonical HLC — the exact convention
+    /// X's Task-10 verifier re-derives. A non-canonical HLC MUST fail, pinning the
+    /// sign/verify HLC convention as coherent end-to-end (and guarding against a
+    /// verifier that trivially accepts).
+    #[test]
+    fn build_self_reachability_announce_verifies_against_canonical_hlc() {
+        use crate::reachability_record::verify_inner_signature;
+        let me = mint_test_owner(0x55);
+        let announced_at_ms = 1_700_000_000_000u64;
+        let payload = build_self_reachability_announce(
+            [0x44; 32],
+            "https://relay.example/".into(),
+            vec![],
+            announced_at_ms,
+            &me.owner,
+            &me.device_key,
+        )
+        .expect("sign self reachability");
+        // The wrapper stamps our inputs verbatim + an EMPTY butler set.
+        assert_eq!(payload.iroh_node_id, [0x44; 32]);
+        assert_eq!(payload.home_relay_url, "https://relay.example/");
+        assert_eq!(payload.announced_at_ms, announced_at_ms);
+        assert!(payload.butler_set.is_empty());
+        assert_eq!(payload.bs_at, 0);
+        // The inner sig verifies against the CANONICAL HLC (what X re-derives).
+        let vk = me.device_key.verifying_key();
+        verify_inner_signature(&payload, &me.owner, &introduction_reachability_hlc(), &vk)
+            .expect("self reachability verifies against the canonical HLC");
+        // A non-canonical HLC MUST fail — proving the canonical HLC is load-bearing.
+        let wrong_hlc = hlc(announced_at_ms);
+        assert_ne!(wrong_hlc, introduction_reachability_hlc());
+        assert!(
+            verify_inner_signature(&payload, &me.owner, &wrong_hlc, &vk).is_err(),
+            "verifying self reachability against a non-canonical HLC must fail"
         );
     }
 
