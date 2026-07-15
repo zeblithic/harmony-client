@@ -94,15 +94,14 @@ fn check_freshness(bin: &Path, src_tauri: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Newest (mtime, path) among `*.rs` files under `dir`, pruning `target/` and
-/// `vendor/` subtrees. `None` if the dir has no readable `.rs` files.
+/// Newest (mtime, path) among `*.rs` files under `dir`. Callers pass
+/// `src-tauri/src`, so `target/` and `vendor/` (siblings of `src`, under
+/// `src-tauri/`) are already outside this walk — no explicit prune needed, and
+/// pruning by dir name here would wrongly skip a legitimate first-party
+/// `src/target|vendor/` module. `None` if the dir has no readable `.rs` files.
 fn newest_source_under(dir: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
     walkdir::WalkDir::new(dir)
         .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_str().unwrap_or("");
-            !(e.file_type().is_dir() && (name == "target" || name == "vendor"))
-        })
         .filter_map(Result::ok)
         .filter(|e| {
             e.file_type().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("rs")
