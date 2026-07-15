@@ -512,9 +512,10 @@ impl ReachabilityResolver {
     /// the full [`ResolverEntry`] — source + HLC + timestamps — so the dialer can
     /// inspect the winning record's provenance and freshness, not just its
     /// payload. Returns the entry with the most recent `effective_announced_at_ms`
-    /// (future-skew-clamped announce time, ZEB-621) across the peer's durable and
-    /// pkarr slots (ties → durable), matching `resolve_by_node_id`'s freshest-wins
-    /// dial semantics.
+    /// (future-skew-clamped announce time, ZEB-621) across the peer's durable,
+    /// pkarr, and fleet slots (ties → durable), matching `resolve_by_node_id`'s
+    /// freshest-wins dial semantics. (ZEB-510 added the fleet slot, which
+    /// `freshest()` includes.)
     pub fn resolve_entry_by_node_id(
         &self,
         node_id_bytes: &[u8; 32],
@@ -1373,6 +1374,40 @@ mod tests {
             sup.pending_trigger(node_id),
             None,
             "byte-identical addressing replay must not kick"
+        );
+    }
+
+    /// ZEB-510/ZEB-690: a FLEET-source heartbeat re-feed (a `FleetSibling`
+    /// republish with a newer HLC but identical addressing) must NOT re-fire
+    /// `NewPeer` — `was_present` (the fleet slot already exists) suppresses the
+    /// first-learn kick, and the unchanged `addr_key` keeps `RecordChanged`
+    /// silent too. Mirrors `identical_payload_replay_does_not_kick` on the fleet
+    /// slot (the ZEB-510 step-1 addition that the durable-path tests don't cover).
+    #[test]
+    fn fleet_heartbeat_refeed_does_not_refire_new_peer() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0xAA; 16]);
+        let node_id = [0x11; 32];
+        // First fleet-sibling learn with NO supervisor installed — no kick recorded.
+        r.update_with_source(
+            owner,
+            make_payload(0x11, 1000),
+            make_hlc(1000, 0, "a"),
+            ReachabilitySource::FleetSibling,
+        );
+        let sup = SupervisorHandle::new();
+        r.set_supervisor(sup.clone());
+        // Fleet heartbeat: same key + source, newer HLC, IDENTICAL addressing.
+        r.update_with_source(
+            owner,
+            make_payload(0x11, 1000),
+            make_hlc(2000, 0, "a"),
+            ReachabilitySource::FleetSibling,
+        );
+        assert_eq!(
+            sup.pending_trigger(node_id),
+            None,
+            "fleet heartbeat re-feed must not re-fire NewPeer",
         );
     }
 
