@@ -21,6 +21,39 @@ use crate::owner_state_types::OwnerAddr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+/// ZEB-376 Task 11: what KIND of pending inbox entry this is. A plain Path-A
+/// `LinkRequest` (mutual-key dial) is accepted by marking the requester approved
+/// so their next dial links inline; an `IntroductionOffer` (AskMe-staged F→X
+/// vouch) is accepted by X actively dialing the introducee via
+/// `complete_introduction` — the SAME action an auto-`Proceed` runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingKind {
+    /// Path-A mutual-key inbound request (the historical default).
+    LinkRequest,
+    /// AskMe-staged introduction offer carrying the already-verified vouch +
+    /// relayed reachability the accept path needs to dial the introducee. Boxed
+    /// so the enum (and `PendingInbound`) stays small for the common
+    /// `LinkRequest` case.
+    IntroductionOffer(Box<StoredIntroductionOffer>),
+}
+
+/// ZEB-376 Task 11: the introduction data staged for an AskMe accept. Recorded
+/// by the friend-PEX `Introduction` arm AFTER it has already verified F's vouch,
+/// the relayed reachability's inner signature, and its freshness — so a staged
+/// offer is trustworthy. On the user's explicit accept, `take_offer` hands this
+/// back and X runs `complete_introduction(subject, reachability, …)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIntroductionOffer {
+    /// The voucher (F) who relayed this introduction — surfaced to the UI as
+    /// `introducedBy` and used only for display / provenance.
+    pub voucher: OwnerAddr,
+    /// The introducee (X's prospective friend) X dials on accept.
+    pub subject: OwnerAddr,
+    /// The subject's relayed, already-verified reachability X synthesizes the
+    /// dial target from.
+    pub reachability: crate::reachability_record::ReachabilityAnnouncePayload,
+}
+
 /// One recorded inbound friend request awaiting the user's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInbound {
@@ -29,6 +62,10 @@ pub struct PendingInbound {
     /// Wall-clock epoch-ms the request was first recorded (idempotent: a
     /// re-dial before acceptance does NOT bump this).
     pub received_at_ms: u64,
+    /// ZEB-376 Task 11: whether this is a plain Path-A `LinkRequest` or an
+    /// AskMe-staged `IntroductionOffer` (which the accept path runs as a
+    /// self-dial link rather than a `prior_accept` approval).
+    pub kind: PendingKind,
 }
 
 #[derive(Default)]
@@ -68,7 +105,47 @@ impl PendingFriendRequests {
         inner.inbound.entry(addr).or_insert(PendingInbound {
             display,
             received_at_ms: now_ms,
+            kind: PendingKind::LinkRequest,
         });
+    }
+
+    /// ZEB-376 Task 11: stage an AskMe introduction OFFER for `subject` in the
+    /// pending inbox. IDEMPOTENT (like [`record_inbound`](Self::record_inbound)):
+    /// a re-delivered introduction keeps the original entry rather than resetting
+    /// its timestamp. The offer carries the already-verified vouch + relayed
+    /// reachability the accept path consumes via [`take_offer`](Self::take_offer).
+    pub fn record_introduction_offer(
+        &self,
+        subject: OwnerAddr,
+        display: Option<String>,
+        now_ms: u64,
+        offer: StoredIntroductionOffer,
+    ) {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.inbound.entry(subject).or_insert(PendingInbound {
+            display,
+            received_at_ms: now_ms,
+            kind: PendingKind::IntroductionOffer(Box::new(offer)),
+        });
+    }
+
+    /// ZEB-376 Task 11: remove + return the staged introduction offer for
+    /// `subject` (the user tapped Accept on an introduction). Returns `None` when
+    /// `subject` has no entry OR its entry is a plain `LinkRequest` — leaving a
+    /// `LinkRequest` entry INTACT so the accept-IPC falls through to the Path-A
+    /// [`approve`](Self::approve) branch. One-shot: a second call returns `None`.
+    pub fn take_offer(&self, subject: &OwnerAddr) -> Option<StoredIntroductionOffer> {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        // Only consume the entry when it is actually an IntroductionOffer.
+        match inner.inbound.get(subject) {
+            Some(p) if matches!(p.kind, PendingKind::IntroductionOffer(_)) => {
+                match inner.inbound.remove(subject).map(|p| p.kind) {
+                    Some(PendingKind::IntroductionOffer(offer)) => Some(*offer),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Snapshot the currently-pending inbound requests (for the list IPC).
@@ -198,6 +275,53 @@ mod tests {
 
     fn addr(b: u8) -> OwnerAddr {
         OwnerAddr([b; 16])
+    }
+
+    /// Minimal (unsigned) reachability payload — `take_offer`/`record_*` never
+    /// inspect its contents, so a zeroed record suffices for the store tests.
+    fn fixture_reach() -> crate::reachability_record::ReachabilityAnnouncePayload {
+        crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: [7u8; 32],
+            home_relay_url: String::new(),
+            direct_addresses: Vec::new(),
+            announced_at_ms: 0,
+            identity_signature: [0u8; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        }
+    }
+
+    #[test]
+    fn introduction_offer_stages_and_take_consumes() {
+        let store = PendingFriendRequests::new();
+        let offer = StoredIntroductionOffer {
+            voucher: addr(2),
+            subject: addr(1),
+            reachability: fixture_reach(),
+        };
+        store.record_introduction_offer(addr(1), Some("alice".into()), 1_000, offer);
+        // Surfaces in the inbox with its introduced_by voucher.
+        let list = store.list();
+        assert_eq!(list.len(), 1);
+        assert!(
+            matches!(&list[0].1.kind, PendingKind::IntroductionOffer(o) if o.voucher == addr(2))
+        );
+        // take_offer consumes it once.
+        assert!(store.take_offer(&addr(1)).is_some());
+        assert!(store.take_offer(&addr(1)).is_none());
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn take_offer_leaves_link_request_intact() {
+        // A plain Path-A LinkRequest must NOT be consumed by the introduction
+        // accept path — take_offer returns None and leaves the row so the accept
+        // IPC falls through to the `approve` branch.
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(3), Some("bob".into()), 2_000);
+        assert!(store.take_offer(&addr(3)).is_none());
+        assert_eq!(store.list().len(), 1, "LinkRequest row must remain");
+        assert!(matches!(&store.list()[0].1.kind, PendingKind::LinkRequest));
     }
 
     #[test]

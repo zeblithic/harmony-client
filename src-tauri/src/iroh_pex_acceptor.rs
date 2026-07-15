@@ -124,6 +124,11 @@ pub struct IrohFriendPexAcceptor {
     /// Event sink for `friend-list-changed` so the UI refreshes on the auto-link.
     /// `None` (tests) → skipped.
     event_sink: Option<Arc<dyn crate::node_event_sink::NodeEventSink>>,
+    /// ZEB-376 Task 11 (AskMe): the process-local pending-request inbox X stages
+    /// an `IntroductionOffer` into when `PeerIntroPolicy` is `AskMe`. The SAME
+    /// store the friend handshake acceptor + accept/decline IPCs hold. `None`
+    /// (tests) → the `Stage` decision logs and skips rather than staging.
+    pending_requests: Option<Arc<crate::friend_requests::PendingFriendRequests>>,
 }
 
 impl IrohFriendPexAcceptor {
@@ -174,6 +179,7 @@ impl IrohFriendPexAcceptor {
             owner_sync_engine: None,
             friend_publisher: None,
             event_sink: None,
+            pending_requests: None,
         }
     }
 
@@ -259,6 +265,18 @@ impl IrohFriendPexAcceptor {
         sink: Option<Arc<dyn crate::node_event_sink::NodeEventSink>>,
     ) -> Self {
         self.event_sink = sink;
+        self
+    }
+
+    /// ZEB-376 Task 11 (AskMe): wire the process-local pending-request inbox X
+    /// stages an `IntroductionOffer` into when `PeerIntroPolicy` is `AskMe`. The
+    /// SAME store the friend handshake acceptor + accept/decline IPCs hold.
+    /// Fluent setter (default `None`).
+    pub fn with_pending_requests(
+        mut self,
+        pending: Option<Arc<crate::friend_requests::PendingFriendRequests>>,
+    ) -> Self {
+        self.pending_requests = pending;
         self
     }
 
@@ -358,13 +376,49 @@ impl IrohFriendPexAcceptor {
         });
     }
 
-    /// ZEB-376 Task 11 (AskMe) STUB: record an introduction-offer in the pending
-    /// inbox + emit a prompt for the user's explicit accept. Task 10 leaves this a
-    /// debug-log so the `Stage` decision compiles; Task 11 fills the body (and
-    /// reuses [`crate::complete_introduction`] on the user's accept).
+    /// ZEB-376 Task 11 (AskMe): record an introduction-offer in the pending inbox
+    /// and emit the existing `friend-request-received` prompt for the user's
+    /// explicit accept. On accept, `accept_friend_request` `take_offer`s this and
+    /// runs [`crate::complete_introduction`] — the SAME self-dial action an
+    /// auto-`Proceed` runs.
+    ///
+    /// The offer is stored AFTER the arm already verified the introduction
+    /// (`verify_introduction` + reachability inner-sig + freshness all ran before
+    /// the `decide_introduction` match), so a staged offer is trustworthy. When no
+    /// pending store / event sink is wired (tests) each step logs + skips rather
+    /// than panicking.
     fn stage_introduction_offer(&self, intro: &crate::friend_intro::Introduction) {
-        let _ = intro;
-        tracing::debug!("ZEB-376: AskMe stage: Task 11");
+        let Some(pending) = self.pending_requests.as_ref() else {
+            tracing::debug!(
+                "ZEB-376: AskMe stage: no pending-request store wired (test path); \
+                 skipping introduction-offer stage"
+            );
+            return;
+        };
+        pending.record_introduction_offer(
+            intro.subject,
+            // display: a UX hint only; the acceptor has no verified name for the
+            // introducee here (mirrors the friend acceptor's production `None`).
+            None,
+            wall_now_ms(),
+            crate::friend_requests::StoredIntroductionOffer {
+                voucher: intro.voucher,
+                subject: intro.subject,
+                reachability: intro.reachability.clone(),
+            },
+        );
+        // Reuse the existing `friend-request-received` event (same one Path A
+        // fires) via the acceptor's event sink — the SAME sink that emits
+        // `friend-list-changed` on an auto-`Proceed` link.
+        match self.event_sink.as_ref() {
+            Some(sink) => {
+                crate::node_event_sink::emit_ser(sink.as_ref(), "friend-request-received", &())
+            }
+            None => tracing::debug!(
+                "ZEB-376: AskMe stage: no event sink wired (test path); \
+                 not emitting friend-request-received"
+            ),
+        }
     }
 
     /// Inbound bi-stream handler: read the length-prefixed `CatalogRequest`,

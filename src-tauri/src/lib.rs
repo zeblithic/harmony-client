@@ -9626,7 +9626,14 @@ pub async fn start_node_inner(
                             // `app` already aliases the mode-agnostic
                             // `Arc<dyn NodeEventSink>` (start_node_inner:
                             // `let app = sink`), so clone it directly.
-                            .with_event_sink(Some(app.clone())),
+                            .with_event_sink(Some(app.clone()))
+                            // ZEB-376 Task 11 (AskMe): thread the SAME pending-
+                            // request inbox the friend acceptor + accept/decline
+                            // IPCs hold, so an `AskMe`-staged introduction records
+                            // an `IntroductionOffer` the user can explicitly accept.
+                            .with_pending_requests(Some(
+                                std::sync::Arc::clone(&pending_friend_requests_for_state),
+                            )),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -54178,12 +54185,18 @@ pub(crate) async fn deliver_introduction_to_target(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingFriendRequestDto {
-    /// The requester's 16-byte master `owner_id`, hex-encoded.
+    /// The requester's 16-byte master `owner_id`, hex-encoded. For an
+    /// introduction offer this is the INTRODUCEE (the subject X would dial).
     pub owner_id_hex: String,
     /// The requester's advertised display name (UX hint), if any.
     pub display: Option<String>,
     /// Epoch-ms the request was first recorded.
     pub received_at_ms: u64,
+    /// ZEB-376 Task 11 (AskMe): the voucher (F) owner hex when this row is an
+    /// AskMe-staged `IntroductionOffer` (X accepts by dialing the introducee via
+    /// `complete_introduction`); `None` for a plain Path-A `LinkRequest`. Lets the
+    /// UI badge the row as "introduced by …".
+    pub introduced_by: Option<String>,
 }
 
 /// Project the process-local pending-inbound store into the frontend DTO list.
@@ -54194,10 +54207,21 @@ pub fn list_pending_friend_requests_inner(
     store
         .list()
         .into_iter()
-        .map(|(addr, p)| PendingFriendRequestDto {
-            owner_id_hex: hex::encode(addr.0),
-            display: p.display,
-            received_at_ms: p.received_at_ms,
+        .map(|(addr, p)| {
+            // ZEB-376 Task 11: surface the voucher hex for an AskMe-staged
+            // introduction offer; a plain Path-A LinkRequest has no introducer.
+            let introduced_by = match &p.kind {
+                crate::friend_requests::PendingKind::IntroductionOffer(o) => {
+                    Some(hex::encode(o.voucher.0))
+                }
+                crate::friend_requests::PendingKind::LinkRequest => None,
+            };
+            PendingFriendRequestDto {
+                owner_id_hex: hex::encode(addr.0),
+                display: p.display,
+                received_at_ms: p.received_at_ms,
+                introduced_by,
+            }
         })
         .collect()
 }
@@ -54238,10 +54262,15 @@ pub(crate) async fn list_pending_friend_requests_impl(
     Ok(list_pending_friend_requests_inner(&store))
 }
 
-/// Accept a pending inbound friend request: mark the requester APPROVED so their
-/// NEXT dial is accepted inline by the acceptor's `prior_accept` consent gate.
-/// This does NOT dial out — the link completes on the requester's re-dial. Emits
-/// `friend-list-changed` so the UI refreshes its inbox/friend views.
+/// Accept a pending inbound friend request. Two shapes:
+///   * Path-A `LinkRequest` — mark the requester APPROVED so their NEXT dial is
+///     accepted inline by the acceptor's `prior_accept` consent gate. This does
+///     NOT dial out — the link completes on the requester's re-dial.
+///   * ZEB-376 AskMe `IntroductionOffer` — X actively dials the introducee via
+///     `complete_introduction` (the SAME action an auto-`Proceed` runs), forming
+///     the mutual link now (persisted + replicated + surfaced).
+/// Either way emits `friend-list-changed` so the UI refreshes its inbox/friend
+/// views.
 #[tauri::command]
 async fn accept_friend_request(
     app: tauri::AppHandle,
@@ -54259,16 +54288,123 @@ pub(crate) async fn accept_friend_request_impl(
     owner_id_hex: String,
 ) -> Result<(), String> {
     let addr = decode_owner_id_16(&owner_id_hex)?;
-    let store = {
-        state
+    // Snapshot the pending store + the self-dial/durability handles the AskMe
+    // accept path feeds to `complete_introduction` (the SAME handles
+    // `add_friend_by_key_impl` sources). Cloning them on the common LinkRequest
+    // path is a few cheap Arc bumps.
+    let (
+        store,
+        iroh_endpoint,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        sync_engine,
+        owner_keytree,
+        friend_publisher,
+        self_identity_pub_64,
+        self_dsa_pubkey,
+        self_kem_pubkey,
+    ) = {
+        let g = state
             .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pending_friend_requests
-            .clone()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pending_friend_requests.clone(),
+            g.iroh_endpoint.clone(),
+            g.crdt_state.clone(),
+            g.hlc_tracker.clone(),
+            g.dm_device_id.clone(),
+            g.dm_self_owner,
+            g.dm_outbox.clone(),
+            g.sync_engine.clone(),
+            g.owner_keytree.clone(),
+            g.pkarr_friend_publisher.clone(),
+            g.dm_identity_pub_64,
+            g.dm_local_dsa_pubkey.clone(),
+            g.dm_local_kem_pubkey.clone(),
+        )
     };
     let Some(store) = store else {
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
+
+    // ZEB-376 AskMe: an `IntroductionOffer` runs the introducee self-dial. A plain
+    // `LinkRequest` leaves `take_offer` returning `None` (row intact) → the Path-A
+    // `approve` branch below, UNCHANGED.
+    if let Some(offer) = store.take_offer(&addr) {
+        let (
+            Some(iroh_endpoint),
+            Some(crdt_state),
+            Some(hlc_tracker),
+            Some(device_id),
+            Some(self_owner),
+            Some(dm_outbox),
+            Some(owner_keytree),
+        ) = (
+            iroh_endpoint,
+            crdt_state,
+            hlc_tracker,
+            device_id,
+            self_owner,
+            dm_outbox,
+            owner_keytree,
+        )
+        else {
+            // The offer was already consumed by `take_offer`; refresh the inbox so
+            // the row disappears, then report we can't complete the link now.
+            crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+            return Err(OWNER_NOT_LOADED_MSG.into());
+        };
+
+        let (device2_key, enrollment_cert) = {
+            let o = dm_outbox.lock().await;
+            (
+                std::sync::Arc::clone(&o.community_signing_key),
+                o.enrollment_cert.clone(),
+            )
+        };
+        // Rebuild X's own dialer reachability fresh (same discipline as
+        // `add_friend_by_key_impl`) — the volatile home relay is read live.
+        let self_reachability = build_self_handshake_reachability(
+            self_identity_pub_64,
+            self_dsa_pubkey,
+            self_kem_pubkey,
+            Some(&iroh_endpoint),
+        );
+
+        // Run the SAME action Task 10's auto-`Proceed` uses. On a `Linked`
+        // outcome `complete_introduction` internally arms `notify_dirty()` +
+        // Case-D reconcile + emits `friend-list-changed`.
+        let result = complete_introduction(
+            offer.subject,
+            offer.reachability,
+            iroh_endpoint,
+            HandshakeDialConfig::from_env(),
+            self_owner,
+            None, // self_display — not persisted at this layer (see acceptor note).
+            enrollment_cert,
+            device2_key,
+            self_reachability,
+            owner_keytree,
+            crdt_state,
+            hlc_tracker,
+            device_id,
+            sync_engine,
+            friend_publisher,
+            Some(std::sync::Arc::clone(&sink)),
+        )
+        .await;
+
+        // Refresh the inbox regardless of outcome (the offer row was consumed by
+        // `take_offer`). `complete_introduction` already emitted this on a
+        // `Linked` outcome; a second emit is harmless (the frontend re-fetches).
+        crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+        return result.map(|_outcome| ());
+    }
+
+    // Path A (unchanged): approve so the requester's next dial links inline.
     store.approve(addr);
     // Refresh the UI (friend list + pending inbox both re-fetch on this event).
     crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
