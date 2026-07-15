@@ -973,6 +973,16 @@ pub(crate) async fn revoke_device_inner(
             if let Some(rev) = trust_snapshot.revocations.cert_for(target).cloned() {
                 try_publish_feed_cutoff(&publish_tx, &fleet_net_doc, &rev, now_ms, "sibling-retry")
                     .await;
+                // ZEB-685 (S3): re-drive the best-effort DM friend-push on the
+                // same retry seam. RevocationPush has no deposit rung, so
+                // re-running the revoke is the ONLY manual retry for a friend
+                // missed by an earlier best-effort send (e.g. offline at the
+                // time). Master-issued only, exactly like the main path — the
+                // stored sibling cert is `sign_master` (this arm is `!is_self`);
+                // the receiver + push helper are idempotent. (Qodo #471.)
+                if let (Some(crdt), Some(mgr)) = (&crdt_state_for_push, &tunnel_manager_for_push) {
+                    push_revocation_to_friends(crdt, mgr, &trust_snapshot, &rev).await;
+                }
             }
             return Ok(());
         }
