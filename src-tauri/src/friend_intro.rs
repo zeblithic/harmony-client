@@ -488,6 +488,22 @@ pub const INTRO_PER_VOUCHER_MAX: usize = 20; // per key per window
 /// A repeat `(key, subject)` seen within this TTL is shed as a duplicate.
 pub const INTRO_DEDUPE_TTL_MS: u64 = 5 * 60 * 1000; // 5 min
 
+/// Hard ceiling on tracked dedupe pairs. Bounds the limiter's OWN memory
+/// against an attacker spraying frames with rotating spoofed `(key, subject)`
+/// values — [`IntroRateLimiter::admit`] runs BEFORE frame authentication, so
+/// any peer on the friend-PEX ALPN can grow these maps. When `last_seen`
+/// exceeds this cap, `admit` first drops entries already past
+/// [`INTRO_DEDUPE_TTL_MS`] (they can no longer shed a duplicate, so removing
+/// them changes no decision) and then, if a genuine fresh flood keeps it over,
+/// evicts the oldest-timestamped entries down to a low-watermark below the cap.
+/// 8192 pairs is well under a MB and orders of magnitude above the volume of
+/// legitimate, rare, human-initiated introductions.
+const MAX_DEDUPE_ENTRIES: usize = 8192;
+/// Hard ceiling on tracked window keys — the `windows` counterpart to
+/// [`MAX_DEDUPE_ENTRIES`], with the same pre-auth-flood rationale and the same
+/// stale-then-oldest eviction discipline.
+const MAX_WINDOW_KEYS: usize = 8192;
+
 /// Process-local DoS hygiene layered BEFORE the (primary) policy/authentication
 /// defenses on both friend-PEX introduction arms: a per-`key` sliding-window cap
 /// plus a `(key, subject)` dedupe, so a compromised/spammy voucher (F) or
@@ -498,6 +514,11 @@ pub const INTRO_DEDUPE_TTL_MS: u64 = 5 * 60 * 1000; // 5 min
 ///
 /// Guarded by a `std::sync::Mutex`; [`admit`](Self::admit) never `.await`s, so
 /// the lock is never held across a suspension point.
+///
+/// Because `admit` runs BEFORE frame authentication, its own two maps are
+/// bounded by [`MAX_DEDUPE_ENTRIES`] / [`MAX_WINDOW_KEYS`] with amortized-O(1)
+/// eviction, so a peer spraying frames with rotating spoofed addresses cannot
+/// turn this DoS-hygiene layer into a remote pre-auth memory-DoS of its own.
 pub struct IntroRateLimiter {
     inner: Mutex<IntroRateLimiterInner>,
 }
@@ -509,6 +530,84 @@ struct IntroRateLimiterInner {
     windows: HashMap<OwnerAddr, VecDeque<u64>>,
     /// Last time a `(key, subject)` pair was admitted, for TTL dedupe.
     last_seen: HashMap<(OwnerAddr, OwnerAddr), u64>,
+}
+
+impl IntroRateLimiterInner {
+    /// Bound `last_seen` against a pre-auth flood of rotating spoofed
+    /// `(key, subject)` pairs. Runs only when the map is over its cap (an O(1)
+    /// `len()` guard), so legitimate load — always far below the cap — never
+    /// pays for it, while a flood pays O(1) amortized: each firing frees
+    /// ~`MAX_DEDUPE_ENTRIES / 4` slots, so the next firing is ~cap/4 admits away.
+    ///
+    /// The stale pass is the EXACT complement of the dedupe-shed predicate, so
+    /// it can never drop a pair that would still shed a duplicate. The
+    /// oldest-eviction fallback runs only for a genuine fresh flood (every
+    /// remaining pair is within the TTL), where dropping the oldest pairs merely
+    /// forgets long-idle dedupe state — it can never wrongly reject legitimate
+    /// traffic, which lives nowhere near the cap.
+    fn evict_last_seen(&mut self, now_ms: u64) {
+        if self.last_seen.len() <= MAX_DEDUPE_ENTRIES {
+            return;
+        }
+        // 1. Stale pass: drop pairs past the dedupe TTL.
+        self.last_seen
+            .retain(|_, &mut ts| now_ms.saturating_sub(ts) < INTRO_DEDUPE_TTL_MS);
+        if self.last_seen.len() <= MAX_DEDUPE_ENTRIES {
+            return;
+        }
+        // 2. Fresh-flood pass: evict the oldest-timestamped pairs down to a
+        //    low-watermark (3/4 cap) so the map never exceeds the cap yet the
+        //    next eviction is ~cap/4 admits away (→ O(1) amortized).
+        let target = MAX_DEDUPE_ENTRIES / 4 * 3;
+        let mut stamps: Vec<(u64, (OwnerAddr, OwnerAddr))> =
+            self.last_seen.iter().map(|(&k, &ts)| (ts, k)).collect();
+        let excess = stamps.len() - target;
+        stamps.select_nth_unstable_by_key(excess, |&(ts, _)| ts);
+        for &(_, k) in &stamps[..excess] {
+            self.last_seen.remove(&k);
+        }
+    }
+
+    /// Bound `windows` against the same pre-auth flood (rotating spoofed keys),
+    /// with the same over-cap guard and O(1)-amortized cost as
+    /// [`evict_last_seen`](Self::evict_last_seen). The stale pass prunes every
+    /// key's deque to the sliding window and drops keys that empty out (an empty
+    /// window counts zero admits, so removing it changes no cap decision); the
+    /// fresh-flood fallback evicts the keys with the oldest most-recent admit
+    /// (deque back) down to the low-watermark.
+    fn evict_windows(&mut self, now_ms: u64) {
+        if self.windows.len() <= MAX_WINDOW_KEYS {
+            return;
+        }
+        // 1. Stale pass: prune each deque to the window; drop now-empty keys.
+        let cutoff = now_ms.saturating_sub(INTRO_PER_VOUCHER_WINDOW_MS);
+        self.windows.retain(|_, dq| {
+            while dq.front().is_some_and(|&t| t < cutoff) {
+                dq.pop_front();
+            }
+            !dq.is_empty()
+        });
+        if self.windows.len() <= MAX_WINDOW_KEYS {
+            return;
+        }
+        // 2. Fresh-flood pass: evict keys with the oldest most-recent admit.
+        let target = MAX_WINDOW_KEYS / 4 * 3;
+        let mut recents: Vec<(u64, OwnerAddr)> = self
+            .windows
+            .iter()
+            .map(|(&k, dq)| {
+                (
+                    *dq.back().expect("deque is non-empty after the stale prune"),
+                    k,
+                )
+            })
+            .collect();
+        let excess = recents.len() - target;
+        recents.select_nth_unstable_by_key(excess, |&(ts, _)| ts);
+        for &(_, k) in &recents[..excess] {
+            self.windows.remove(&k);
+        }
+    }
 }
 
 impl IntroRateLimiter {
@@ -562,10 +661,26 @@ impl IntroRateLimiter {
             }
             window.push_back(now_ms);
         }
+        // Bound `windows` (see `evict_windows`): a no-op O(1) `len()` check for
+        // legitimate load; only a pre-auth flood ever triggers the sweep.
+        inner.evict_windows(now_ms);
 
-        // 3. Record the admit for future dedupe.
+        // 3. Record the admit for future dedupe, then bound `last_seen` (same
+        //    over-cap-only, O(1)-amortized eviction as `windows`).
         inner.last_seen.insert((key, subject), now_ms);
+        inner.evict_last_seen(now_ms);
         Ok(())
+    }
+
+    /// Test-only view of the two tracked-map sizes `(last_seen, windows)`, so a
+    /// test can assert the pre-auth-flood memory bound holds.
+    #[cfg(test)]
+    pub(crate) fn tracked_len(&self) -> (usize, usize) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (inner.last_seen.len(), inner.windows.len())
     }
 }
 
@@ -591,6 +706,16 @@ mod tests {
             butler_set: vec![],
             bs_at: 0,
         }
+    }
+
+    /// A distinct 16-byte owner address from a counter — the low 8 bytes carry
+    /// `n`, so every `addr16(n)` is unique and every value with a non-zero byte
+    /// in positions 8..16 (e.g. `[0xC7; 16]`) is disjoint from all of them.
+    /// Used by the flood/bound tests to spray rotating spoofed addresses.
+    fn addr16(n: u64) -> OwnerAddr {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&n.to_le_bytes());
+        OwnerAddr(b)
     }
 
     #[test]
@@ -992,6 +1117,75 @@ mod tests {
             rl.admit(key, OwnerAddr([0xFD; 16]), INTRO_PER_VOUCHER_WINDOW_MS + 1),
             Ok(()),
         );
+    }
+
+    /// ZEB-376 Task 13 (memory bound): `admit` runs BEFORE frame authentication,
+    /// so a peer spraying friend-PEX frames with rotating spoofed
+    /// `from_addr`/`voucher`/`subject` values would grow BOTH limiter maps
+    /// without bound — a remote pre-auth memory-DoS inside the very DoS-hygiene
+    /// layer. Fire well over both hard caps with distinct keys AND subjects at
+    /// monotonically increasing `now_ms` (so every admit is a fresh pair on a
+    /// fresh key: no dedupe / cap shed, unbounded growth without eviction) and
+    /// assert both tracked-entry counts stay bounded by the caps.
+    #[test]
+    fn intro_rate_limiter_bounds_memory_under_rotating_flood() {
+        let rl = IntroRateLimiter::new();
+        // now_ms stays far inside the window/TTL, so the stale passes free
+        // nothing → the oldest-eviction fallback is what actually holds the bound.
+        let inserted = MAX_DEDUPE_ENTRIES.max(MAX_WINDOW_KEYS) * 2;
+        for i in 0..inserted as u64 {
+            assert_eq!(
+                rl.admit(addr16(2 * i), addr16(2 * i + 1), i + 1),
+                Ok(()),
+                "fresh key+subject at t={i} must admit",
+            );
+        }
+        let (dedupe_len, window_len) = rl.tracked_len();
+        assert!(
+            dedupe_len <= MAX_DEDUPE_ENTRIES,
+            "last_seen must stay bounded under a rotating flood: {dedupe_len} > {MAX_DEDUPE_ENTRIES}",
+        );
+        assert!(
+            window_len <= MAX_WINDOW_KEYS,
+            "windows must stay bounded under a rotating flood: {window_len} > {MAX_WINDOW_KEYS}",
+        );
+        // Sanity: we really pushed far past both caps, so eviction was exercised.
+        assert!(inserted > MAX_DEDUPE_ENTRIES.max(MAX_WINDOW_KEYS));
+    }
+
+    /// Eviction must never disturb legitimate, within-cap traffic: after a flood
+    /// forces eviction on both maps, a fresh legit key (disjoint from the flood
+    /// namespace — a non-zero high byte `addr16` never sets) still admits exactly
+    /// up to the per-voucher cap and still dedupes a repeat pair. The live
+    /// cap/dedupe logic is unchanged by the memory bound; eviction only ever
+    /// removes stale-or-oldest flood entries, never the newest legit ones.
+    #[test]
+    fn intro_rate_limiter_eviction_preserves_legit_sequence() {
+        let rl = IntroRateLimiter::new();
+        let flood = MAX_DEDUPE_ENTRIES.max(MAX_WINDOW_KEYS) * 2;
+        for i in 0..flood as u64 {
+            let _ = rl.admit(addr16(2 * i), addr16(2 * i + 1), i + 1);
+        }
+        // A fresh legit key, newest in the maps → survives any later eviction.
+        let now = flood as u64 + 10;
+        let key = OwnerAddr([0xC7; 16]);
+        for j in 0..INTRO_PER_VOUCHER_MAX {
+            assert_eq!(
+                rl.admit(key, OwnerAddr([0x80 | j as u8; 16]), now),
+                Ok(()),
+                "legit subject {j} within the cap must still admit after a flood",
+            );
+        }
+        // Cap still enforced for the legit key.
+        assert_eq!(
+            rl.admit(key, OwnerAddr([0xFF; 16]), now),
+            Err("per-voucher cap"),
+        );
+        // Dedupe still enforced for a repeated legit pair within the TTL.
+        let key2 = OwnerAddr([0xC8; 16]);
+        let subj = OwnerAddr([0xC9; 16]);
+        assert_eq!(rl.admit(key2, subj, now), Ok(()));
+        assert_eq!(rl.admit(key2, subj, now + 1), Err("duplicate"));
     }
 
     #[test]
