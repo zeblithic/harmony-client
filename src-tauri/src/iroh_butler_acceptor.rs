@@ -739,6 +739,18 @@ pub async fn handle_deposit_core(
                 if !payload.storage_blob.is_empty() {
                     return Err(DepositReject::BadPayload);
                 }
+                // Symmetric with the blob check above: a pure revocation also
+                // carries no invite. Beyond wasting inbox storage, an
+                // invite_packet here would make the persisted entry match BOTH
+                // `revocation_push.is_some()` and `invite_packet.is_some()`,
+                // so the recipient's pure-revocation dispatch guard
+                // (`revocation_push.is_some() && cidnotify_packet.is_none() &&
+                // invite_packet.is_none()`) would fail to match and silently
+                // mis-route/drop the revocation. Reject fail-closed to keep
+                // the deposit shape pure.
+                if payload.invite_packet.is_some() {
+                    return Err(DepositReject::BadPayload);
+                }
                 let packet = decode_packet(rp_bytes).map_err(|_| DepositReject::BadPayload)?;
                 let DmPacket::RevocationPush {
                     revocation,
@@ -2338,8 +2350,14 @@ mod tests {
     /// A deposit frame carrying ONLY a signed `RevocationPush` — no CidNotify, no
     /// invite. The OUTER frame is a normal, fully valid `sender()` deposit (so
     /// steps 0–4 pass unchanged); `storage_blob` lets a test inject an illegal
-    /// non-empty blob to exercise the fail-closed blob check.
-    fn revocation_fixture(rp_wire: Vec<u8>, storage_blob: Vec<u8>) -> Fixture {
+    /// non-empty blob to exercise the fail-closed blob check, and `invite_packet`
+    /// lets a test inject an illegal non-empty invite to exercise the fail-closed
+    /// invite check.
+    fn revocation_fixture(
+        rp_wire: Vec<u8>,
+        storage_blob: Vec<u8>,
+        invite_packet: Option<Vec<u8>>,
+    ) -> Fixture {
         let so = sender();
         // space_id / message_cid are unused by the revocation path, but the
         // shared `Fixture` shape carries them; keep them well-formed.
@@ -2356,7 +2374,7 @@ mod tests {
         let payload = DepositPayload {
             cidnotify_packet: None,
             storage_blob: storage_blob.clone(),
-            invite_packet: None,
+            invite_packet,
             revocation_push: Some(rp_wire),
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
@@ -2390,7 +2408,7 @@ mod tests {
     async fn handle_deposit_core_persists_revocation_under_revoke_key() {
         // master 0x51 == sender()'s master → revocation binds to frame.sender_owner.
         let (rp_wire, target) = revocation_wire(0x51, 0x71);
-        let f = revocation_fixture(rp_wire.clone(), Vec::new());
+        let f = revocation_fixture(rp_wire.clone(), Vec::new(), None);
         let ctx = TestCtx::for_fixture(&f);
 
         let ack = handle_deposit_core(&f.frame, &ctx)
@@ -2427,7 +2445,7 @@ mod tests {
         // verify_revocation_push (the revocation is validly master-signed, just
         // not by the depositing friend's master).
         let (rp_wire, _target) = revocation_wire(0x71, 0x33);
-        let f = revocation_fixture(rp_wire, Vec::new());
+        let f = revocation_fixture(rp_wire, Vec::new(), None);
         let ctx = TestCtx::for_fixture(&f);
 
         let err = handle_deposit_core(&f.frame, &ctx)
@@ -2455,7 +2473,7 @@ mod tests {
     #[tokio::test]
     async fn handle_deposit_core_rejects_revocation_with_blob() {
         let (rp_wire, _target) = revocation_wire(0x51, 0x71);
-        let f = revocation_fixture(rp_wire, b"unexpected-storage-blob".to_vec());
+        let f = revocation_fixture(rp_wire, b"unexpected-storage-blob".to_vec(), None);
         let ctx = TestCtx::for_fixture(&f);
 
         let err = handle_deposit_core(&f.frame, &ctx)
@@ -2465,6 +2483,35 @@ mod tests {
         assert!(
             ctx.store.lock().unwrap().is_empty(),
             "nothing persisted on a blob-carrying revocation"
+        );
+    }
+
+    /// ZEB-691 whole-branch-review finding: a pure revocation deposit carries no
+    /// invite either — an `invite_packet` alongside `revocation_push` is unused
+    /// bytes an admitted sender could attach, AND (worse than mere waste) it
+    /// would make the persisted entry match BOTH `revocation_push.is_some()` and
+    /// `invite_packet.is_some()`, so the recipient's pure-revocation dispatch
+    /// guard (`revocation_push.is_some() && cidnotify_packet.is_none() &&
+    /// invite_packet.is_none()`) fails to match and the revocation is silently
+    /// mis-routed/dropped. Reject fail-closed at the butler, symmetric with the
+    /// blob check above, and confirm nothing is persisted.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_revocation_with_invite() {
+        let (rp_wire, _target) = revocation_wire(0x51, 0x71);
+        let f = revocation_fixture(
+            rp_wire,
+            Vec::new(),
+            Some(b"unexpected-invite-bytes".to_vec()),
+        );
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a revocation deposit with a non-empty invite_packet must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(
+            ctx.store.lock().unwrap().is_empty(),
+            "nothing persisted on an invite-carrying revocation"
         );
     }
 }
