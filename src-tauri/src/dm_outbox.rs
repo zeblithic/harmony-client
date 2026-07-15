@@ -3667,6 +3667,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handle_revocation_push_rejects_self_issued() {
+        use harmony_owner::certs::{RevocationCert, RevocationReason};
+        // A SelfDevice-issued revocation (a device revoking itself) is not a
+        // master attestation — §3.3 accepts only Master-issued (design line 60).
+        // `verify(None)` hits the `(SelfDevice, None) => InvalidSignature` arm.
+        let c = sample_revocation_case();
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]);
+        let self_rev = RevocationCert::sign_self(
+            &device_sk,
+            c.owner.0,
+            c.enrollment.device_id,
+            1_700_000_000,
+            RevocationReason::Decommissioned,
+        )
+        .expect("sign_self");
+        let mut state = OwnerState::default();
+        let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let err = handle_revocation_push(&mut state, c.owner, &self_rev, &c.enrollment, &proj);
+        assert!(
+            matches!(err, Err(DmReceiveError::SignatureVerificationFailed)),
+            "SelfDevice-issued push must be rejected, got {err:?}"
+        );
+        assert!(
+            state.revoked_dm_devices.is_empty(),
+            "nothing stored on reject"
+        );
+    }
+
     /// Test-only helper: build a `DmOutbox` with synthetic materials for
     /// tests that don't exercise community-signing paths. Routes through
     /// `DmOutbox::new_synthetic` (which bypasses `DmOutbox::new`'s `assert!`
