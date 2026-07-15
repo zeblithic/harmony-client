@@ -107,6 +107,23 @@ pub struct IrohFriendPexAcceptor {
     /// same per-dial convention `build_self_handshake_reachability` uses). `None`
     /// (tests / iroh unbound) → X dials advertising the empty self bundle.
     self_statics: Option<SelfHandshakeStatics>,
+    /// ZEB-376 Task 10 (durability fix): the post-`Linked` handles
+    /// [`crate::complete_introduction`] needs so an auto-`Proceed` introduction is
+    /// PERSISTED + REPLICATED + SURFACED — the SAME handles the friend acceptor /
+    /// `add_friend_by_key_impl` thread. All optional (default `None`) so existing
+    /// `new`/`with_config` callers keep compiling; a missing handle skips that step
+    /// (logs) inside `complete_introduction` rather than panicking.
+    ///
+    /// Owner-state `SyncEngine`: `notify_dirty()` after a successful link so the
+    /// introduced friend is flushed on shutdown + replicated (both are
+    /// dirty-gated). `None` (tests) → not armed.
+    owner_sync_engine: Option<Arc<crate::owner_state_sync::SyncEngine>>,
+    /// Case-D friend publisher: reconcile the new friend's reachability slot
+    /// immediately (no wait for the next tick). `None` (tests) → skipped.
+    friend_publisher: Option<Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+    /// Event sink for `friend-list-changed` so the UI refreshes on the auto-link.
+    /// `None` (tests) → skipped.
+    event_sink: Option<Arc<dyn crate::node_event_sink::NodeEventSink>>,
 }
 
 impl IrohFriendPexAcceptor {
@@ -154,6 +171,9 @@ impl IrohFriendPexAcceptor {
             owner_keytree: None,
             connectivity_settings_path: None,
             self_statics: None,
+            owner_sync_engine: None,
+            friend_publisher: None,
+            event_sink: None,
         }
     }
 
@@ -204,6 +224,41 @@ impl IrohFriendPexAcceptor {
     /// the wired `iroh_endpoint` at dial time.
     pub fn with_self_statics(mut self, statics: Option<SelfHandshakeStatics>) -> Self {
         self.self_statics = statics;
+        self
+    }
+
+    /// ZEB-376 Task 10 (durability fix): wire the owner-state `SyncEngine` so a
+    /// successful auto-`Proceed` introduction link arms a debounced publish +
+    /// shutdown-flush (both dirty-gated). The SAME engine the friend acceptor
+    /// holds. Fluent setter (default `None`).
+    pub fn with_owner_sync_engine(
+        mut self,
+        engine: Option<Arc<crate::owner_state_sync::SyncEngine>>,
+    ) -> Self {
+        self.owner_sync_engine = engine;
+        self
+    }
+
+    /// ZEB-376 Task 10 (durability fix): wire the Case-D friend publisher so a
+    /// successful auto-`Proceed` introduction link immediately reconciles the new
+    /// friend's reachability slot. The SAME publisher the friend acceptor holds.
+    /// Fluent setter (default `None`).
+    pub fn with_friend_publisher(
+        mut self,
+        publisher: Option<Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+    ) -> Self {
+        self.friend_publisher = publisher;
+        self
+    }
+
+    /// ZEB-376 Task 10 (durability fix): wire the event sink so a successful
+    /// auto-`Proceed` introduction link emits `friend-list-changed` and the UI
+    /// refreshes. Fluent setter (default `None`).
+    pub fn with_event_sink(
+        mut self,
+        sink: Option<Arc<dyn crate::node_event_sink::NodeEventSink>>,
+    ) -> Self {
+        self.event_sink = sink;
         self
     }
 
@@ -260,6 +315,12 @@ impl IrohFriendPexAcceptor {
         let crdt_state = Arc::clone(&self.crdt_state);
         let hlc_tracker = Arc::clone(&self.hlc_tracker);
         let device_id = self.device_id.clone();
+        // ZEB-376 Task 10 (durability fix): the post-`Linked` handles so the
+        // introduced friend is persisted + replicated + surfaced (skipped
+        // gracefully inside `complete_introduction` when a handle is `None`).
+        let sync_engine = self.owner_sync_engine.clone();
+        let friend_publisher = self.friend_publisher.clone();
+        let event_sink = self.event_sink.clone();
         tokio::spawn(async move {
             match crate::complete_introduction(
                 subject,
@@ -277,6 +338,9 @@ impl IrohFriendPexAcceptor {
                 crdt_state,
                 hlc_tracker,
                 device_id,
+                sync_engine,
+                friend_publisher,
+                event_sink,
             )
             .await
             {
@@ -509,6 +573,15 @@ impl IrohFriendPexAcceptor {
 
                 // 2. Verify F's vouch (to_addr==us, voucher-match, F's cert+sig,
                 //    subject cert binds subject owner).
+                //
+                //    NOTE: `expected_voucher == intro.voucher` here is INTENTIONALLY
+                //    self-referential — X accepts a vouch from *any* authenticated
+                //    voucher; trust derives from the voucher-cert binding
+                //    (`verify_introduction` proves F's device-#2 signed this exact
+                //    Introduction) plus the `voucher_is_active_friend` policy gate
+                //    below (`FriendsOfFriends`/`Closed` reject a non-friend voucher).
+                //    Do NOT "tighten" this into a fixed expected voucher — there is
+                //    no single expected F for an inbound introduction.
                 crate::friend_intro::verify_introduction(
                     &intro,
                     intro.voucher,
@@ -519,15 +592,19 @@ impl IrohFriendPexAcceptor {
 
                 // 3. Verify the RELAYED reachability is self-authenticated by the
                 //    subject's own device-#2 identity (the same inner check the
-                //    Case-B initiator runs on a resolved record, bound to `intro.at`
-                //    as the reachability's signing clock) + within the freshness
-                //    window.
+                //    Case-B initiator runs on a resolved record) + within the
+                //    freshness window. The inner-sig HLC is the fixed CANONICAL
+                //    `introduction_reachability_hlc()` — NOT `intro.at` (which is
+                //    F's broker clock, unrelated to the subject's signing clock).
+                //    The reachability's real HLC never rides the wire, so both the
+                //    subject signer (Task 12) and X pin the same constant; freshness
+                //    lives in `announced_at_ms`, checked next.
                 let subj_vk = crate::dm_signing::device2_verifying_key(&intro.subject_cert)
                     .ok_or_else(|| "introduction subject cert has no device-#2 key".to_string())?;
                 crate::reachability_record::verify_inner_signature(
                     &intro.reachability,
                     &intro.subject,
-                    &intro.at,
+                    &crate::friend_intro::introduction_reachability_hlc(),
                     &subj_vk,
                 )
                 .map_err(|e| format!("relayed reachability inner-sig: {e:?}"))?;

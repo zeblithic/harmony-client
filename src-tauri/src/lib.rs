@@ -9613,7 +9613,20 @@ pub async fn start_node_inner(
                             // The iroh endpoint + owner KeyTree threaded above (Task
                             // 9) double as the dial endpoint + friend-secret seal.
                             .with_self_statics(self_statics_for_friend)
-                            .with_connectivity_settings_path(pkarr_settings_path_for_state.clone()),
+                            .with_connectivity_settings_path(pkarr_settings_path_for_state.clone())
+                            // ZEB-376 Task 10 (durability fix): thread the SAME
+                            // post-`Linked` handles the friend acceptor holds so an
+                            // auto-`Proceed` introduction link is persisted +
+                            // replicated + surfaced (via `complete_introduction`),
+                            // identically to `add_friend_by_key_impl`. Without
+                            // `notify_dirty()` the introduced friend would evaporate
+                            // on restart (shutdown flush is dirty-gated).
+                            .with_owner_sync_engine(Some(std::sync::Arc::clone(&engine)))
+                            .with_friend_publisher(Some(std::sync::Arc::clone(&pkarr_friend_pub)))
+                            // `app` already aliases the mode-agnostic
+                            // `Arc<dyn NodeEventSink>` (start_node_inner:
+                            // `let app = sink`), so clone it directly.
+                            .with_event_sink(Some(app.clone())),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -55123,6 +55136,14 @@ pub async fn connectivity_add_friend_by_key_inner(
 /// impostor squatting that iroh address is rejected inside `link_over_connection`
 /// at the accept-cert check, never written as a friend). Stamps `established_via:
 /// Introduction`.
+///
+/// On a successful `Linked`, mirrors `add_friend_by_key_impl`'s post-`Linked`
+/// block: arms the owner-state `SyncEngine` (`notify_dirty()`), reconciles the
+/// new friend's Case-D slot, and emits `friend-list-changed` — so the introduced
+/// friend is PERSISTED + REPLICATED + SURFACED (a local crdt mutation without
+/// `notify_dirty()` is never flushed on shutdown nor replicated). Each step is
+/// skipped (logged) when its handle is `None` (test path). `Pending`/`Unreachable`
+/// write nothing and emit nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn complete_introduction(
     subject: crate::owner_state_types::OwnerAddr,
@@ -55140,6 +55161,18 @@ pub(crate) async fn complete_introduction(
         tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
+    // ZEB-376 Task 10 (durability fix): the post-`Linked` handles this shared
+    // action needs so an introduced friend is PERSISTED + REPLICATED + SURFACED —
+    // mirroring `add_friend_by_key_impl`'s post-`Linked` block. A LOCAL crdt
+    // mutation (`link_over_connection` → `apply_handshaked_friend`) without
+    // `notify_dirty()` is NEVER persisted (shutdown flush is dirty-gated) NOR
+    // replicated — the introduced friend would evaporate on restart. All three are
+    // `Option` so the test path (no engine/publisher/sink wired) skips each step
+    // gracefully (logs) rather than panicking. Both callers (Task 10's auto-Proceed
+    // spawn AND Task 11's AskMe-accept path) get durability for free.
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    friend_publisher: Option<std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+    event_sink: Option<std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>>,
 ) -> Result<AddFriendOutcome, String> {
     let target_addr = endpoint_addr_from_routing(&reachability)
         .map_err(|e| format!("synthesize introducee addr: {e}"))?;
@@ -55152,7 +55185,13 @@ pub(crate) async fn complete_introduction(
     .await
     .map_err(|_| "introducee unreachable: connect timeout".to_string())?
     .map_err(|e| format!("introducee unreachable: connect failed: {e}"))?;
-    link_over_connection(
+
+    // Clone the reconcile handles BEFORE `link_over_connection` moves the
+    // originals — mirrors `add_friend_by_key_impl`.
+    let crdt_state_for_reconcile = std::sync::Arc::clone(&crdt_state);
+    let keytree_for_reconcile = std::sync::Arc::clone(&keytree);
+
+    let outcome = link_over_connection(
         conn,
         dial_config,
         crate::friend_graph::FriendOrigin::Introduction,
@@ -55168,7 +55207,58 @@ pub(crate) async fn complete_introduction(
         device_id,
         hex::encode(subject.0),
     )
-    .await
+    .await?;
+
+    // Only a `Linked` outcome mutated owner-state → arm sync + reconcile Case-D +
+    // refresh the UI. `Pending`/`Unreachable` wrote nothing. This block is a
+    // deliberate mirror of `add_friend_by_key_impl`'s post-`Linked` steps (same
+    // functions, same event name) so BOTH friend-add paths behave identically.
+    if matches!(outcome, AddFriendOutcome::Linked { .. }) {
+        // (1) Arm the owner-state SyncEngine: persist-on-shutdown is dirty-gated
+        //     and replication is dirty-driven, so without this the introduced
+        //     friend is neither saved nor pushed to the user's other devices.
+        match sync_engine {
+            Some(engine) => engine.notify_dirty(),
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no owner-state SyncEngine wired \
+                 (test path); skipping notify_dirty — introduced friend will NOT \
+                 persist/replicate"
+            ),
+        }
+        // (2) Case-D reconcile: publish the just-added friend's reachability slot
+        //     now (no wait for the next reachability tick). Snapshot `friends` out
+        //     from under the owner-state lock BEFORE the network `.await`s.
+        match friend_publisher {
+            Some(friend_pub) => {
+                let friends_snapshot = {
+                    let s = crdt_state_for_reconcile.lock().await;
+                    s.friend_graph.friends.clone()
+                };
+                crate::pkarr_friend_publisher::sync_case_d_handles(
+                    &friend_pub,
+                    &friends_snapshot,
+                    &keytree_for_reconcile,
+                )
+                .await;
+            }
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no Case-D friend publisher wired \
+                 (test path); skipping reconcile"
+            ),
+        }
+        // (3) Surface the new friend to the UI.
+        match event_sink {
+            Some(sink) => {
+                crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &())
+            }
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no event sink wired (test path); \
+                 skipping friend-list-changed emit"
+            ),
+        }
+    }
+
+    Ok(outcome)
 }
 
 /// ZEB-376: reusable Path-A friend-link tail. Given an already-connected iroh

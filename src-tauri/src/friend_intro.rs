@@ -430,6 +430,21 @@ pub fn decide_introduction(
     }
 }
 
+/// The canonical HLC both the introducee's reachability signer and X's
+/// verifier use for a relayed introduction reachability's inner signature.
+/// The reachability's real HLC never travels on the wire (the payload doesn't
+/// carry it), and CRDT ordering is irrelevant to a one-shot dial hint — so
+/// both sides pin a constant. Freshness comes from `announced_at_ms`; F cannot
+/// fabricate the payload without the subject's device-#2 key. NOTE: `Hlc` does
+/// NOT derive Default, so this must be spelled explicitly.
+pub(crate) fn introduction_reachability_hlc() -> crate::owner_state_types::Hlc {
+    crate::owner_state_types::Hlc {
+        wall_ms: 0,
+        logical: 0,
+        device_id: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,9 +646,12 @@ mod tests {
 
     /// ZEB-376 Task 10: the X-arm reachability checks. Build an `Introduction`
     /// whose relayed reachability is signed by the SUBJECT's device-#2 key over
-    /// (actor=subject, hlc=intro.at) — the exact convention X re-derives — then
-    /// confirm X's inner-sig + freshness gates accept the honest record and reject
-    /// a tampered sig or a stale stamp, all BEFORE any dial.
+    /// the CANONICAL `introduction_reachability_hlc()` — the exact convention X
+    /// re-derives — while the broker stamps a DIFFERENT `intro.at`. This proves X
+    /// verifies against the canonical HLC and IGNORES `intro.at` (verifying with
+    /// `intro.at` must fail), then confirms X's inner-sig + freshness gates accept
+    /// the honest record and reject a tampered sig or a stale stamp, all BEFORE
+    /// any dial.
     #[test]
     fn x_arm_verifies_and_rejects_bad_relayed_reachability() {
         use crate::reachability_record::{
@@ -644,17 +662,22 @@ mod tests {
         let voucher = mint_test_owner(0x22); // F
         let subject = mint_test_owner(0x11); // the introducee (reachability owner)
         let target = mint_test_owner(0x33); // X (self)
-        let at = hlc(1_700_000_000_000);
+        let announced_at_ms = 1_700_000_000_000u64;
+        // The broker's clock (`intro.at`) is DELIBERATELY different from the
+        // canonical reachability-signing HLC — the reachability's real signing
+        // clock never rides the wire, so X must ignore `intro.at` entirely.
+        let broker_at = hlc(announced_at_ms);
 
-        // The subject signs their reachability over (actor=subject, hlc=at) with
-        // their enrolled device-#2 key — exactly what X re-derives + verifies.
+        // The subject signs their reachability over (actor=subject,
+        // hlc=introduction_reachability_hlc()) with their enrolled device-#2 key —
+        // exactly the canonical HLC X re-derives + verifies against.
         let reachability = build_signed_payload_with_key(
             [0x44; 32],
             "https://relay.example/".into(),
             vec![],
-            at.wall_ms, // announced_at_ms
+            announced_at_ms, // announced_at_ms carries freshness
             &subject.owner,
-            &at,
+            &introduction_reachability_hlc(),
             Vec::new(),
             0,
             &subject.device_key,
@@ -668,7 +691,7 @@ mod tests {
             subject.owner,
             subject.cert.clone(),
             reachability,
-            at.clone(),
+            broker_at.clone(),
             voucher.cert.clone(),
         );
 
@@ -676,11 +699,32 @@ mod tests {
         let subj_vk = crate::dm_signing::device2_verifying_key(&intro.subject_cert)
             .expect("subject cert has a device-#2 key");
 
-        // Honest record: inner sig + freshness both pass.
-        verify_inner_signature(&intro.reachability, &intro.subject, &intro.at, &subj_vk)
-            .expect("honest relayed reachability verifies");
-        reachability_freshness_check(&intro.reachability, at.wall_ms)
+        // Honest record verified against the CANONICAL HLC (what X's arm uses):
+        // inner sig + freshness both pass.
+        verify_inner_signature(
+            &intro.reachability,
+            &intro.subject,
+            &introduction_reachability_hlc(),
+            &subj_vk,
+        )
+        .expect("honest relayed reachability verifies against the canonical HLC");
+        reachability_freshness_check(&intro.reachability, announced_at_ms)
             .expect("honest record is fresh at its stamp");
+
+        // Verifying with `intro.at` (the broker clock) MUST fail — the reachability
+        // was NOT signed over it. This is the axis the arm's fix is about: X pins
+        // the canonical HLC, never `intro.at`.
+        assert_ne!(
+            intro.at,
+            introduction_reachability_hlc(),
+            "fixture must use a broker clock distinct from the canonical HLC"
+        );
+        assert!(
+            verify_inner_signature(&intro.reachability, &intro.subject, &intro.at, &subj_vk)
+                .is_err(),
+            "verifying the relayed reachability against intro.at (not the canonical \
+             HLC) must fail — X ignores intro.at"
+        );
 
         // Tampered inner sig → rejected (X never dials).
         let mut bad_sig = intro.clone();
@@ -689,7 +733,7 @@ mod tests {
             verify_inner_signature(
                 &bad_sig.reachability,
                 &bad_sig.subject,
-                &bad_sig.at,
+                &introduction_reachability_hlc(),
                 &subj_vk
             )
             .is_err(),
@@ -700,7 +744,7 @@ mod tests {
         assert!(
             reachability_freshness_check(
                 &intro.reachability,
-                at.wall_ms + REACHABILITY_RECORD_TTL_MS + 1
+                announced_at_ms + REACHABILITY_RECORD_TTL_MS + 1
             )
             .is_err(),
             "a relayed reachability past its TTL must be rejected"
