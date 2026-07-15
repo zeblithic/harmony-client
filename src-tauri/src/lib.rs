@@ -54089,6 +54089,14 @@ async fn request_introduction(
         .home_relay()
         .map(|r| r.to_string())
         .unwrap_or_default();
+    // DELIBERATE: raw `direct_addresses()`, NOT the routable-filtered
+    // `gather_routable_direct_addrs_async` used by the pkarr publisher. Loopback
+    // MUST survive here so the hermetic 3-node introduction e2e can dial. This is
+    // safe because X (the introducee's acceptor) independently re-checks the
+    // relayed reachability's freshness and binds `complete_introduction`'s
+    // `expected_peer` to the named target — so the addresses are never trusted
+    // blindly. Do NOT "parity-fix" this to the filtered variant: it would silently
+    // break the e2e without improving production safety.
     let direct_addrs = iroh_endpoint.direct_addresses();
     let reachability = crate::friend_intro::build_self_reachability_announce(
         node_id_bytes,
@@ -54638,9 +54646,15 @@ pub(crate) async fn accept_friend_request_impl(
     };
 
     // ZEB-376 AskMe: an `IntroductionOffer` runs the introducee self-dial. A plain
-    // `LinkRequest` leaves `take_offer` returning `None` (row intact) → the Path-A
-    // `approve` branch below, UNCHANGED.
-    if let Some(offer) = store.take_offer(&addr) {
+    // `LinkRequest` has no offer (`has_offer` is false) → the Path-A `approve`
+    // branch below, UNCHANGED.
+    //
+    // HARD-RULE (verify before an irreversible write): validate the self-dial
+    // handles BEFORE `take_offer` consumes the ONE-SHOT offer, so a missing handle
+    // leaves the offer row intact (recoverable) instead of destroying it. The
+    // non-consuming `has_offer` peek gates on the offer path ONLY — Path A never
+    // required these handles and still doesn't.
+    if store.has_offer(&addr) {
         let (
             Some(iroh_endpoint),
             Some(crdt_state),
@@ -54659,8 +54673,19 @@ pub(crate) async fn accept_friend_request_impl(
             owner_keytree,
         )
         else {
-            // The offer was already consumed by `take_offer`; refresh the inbox so
-            // the row disappears, then report we can't complete the link now.
+            // Handles unavailable: the offer is NOT yet consumed, so leave the row
+            // intact (a later accept, once the node is fully loaded, can still
+            // complete it). Refresh the inbox and report we can't complete now.
+            crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+            return Err(OWNER_NOT_LOADED_MSG.into());
+        };
+
+        // Handles present — NOW irreversibly consume the one-shot offer.
+        // `has_offer` above confirmed an offer; only a concurrent accept racing
+        // between the peek and here could win first, in which case `take_offer`
+        // returns `None` and we simply refresh the inbox + report (no link, no
+        // double-consume).
+        let Some(offer) = store.take_offer(&addr) else {
             crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
             return Err(OWNER_NOT_LOADED_MSG.into());
         };

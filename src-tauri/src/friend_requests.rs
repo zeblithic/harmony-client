@@ -148,6 +148,20 @@ impl PendingFriendRequests {
         }
     }
 
+    /// ZEB-376 Task 11: non-consuming peek — true iff `subject` has a staged
+    /// `IntroductionOffer` (NOT a plain `LinkRequest`). Lets the accept path
+    /// validate its self-dial handles BEFORE the one-shot [`take_offer`](Self::take_offer)
+    /// irreversibly consumes the offer (HARD-RULE: verify before an irreversible
+    /// write — a missing handle must leave the offer row intact + recoverable).
+    /// Read-only; a subsequent `take_offer` is still the single consuming op.
+    pub fn has_offer(&self, subject: &OwnerAddr) -> bool {
+        let inner = self.inner.lock().expect("pending inner mutex poisoned");
+        matches!(
+            inner.inbound.get(subject),
+            Some(p) if matches!(p.kind, PendingKind::IntroductionOffer(_))
+        )
+    }
+
     /// Snapshot the currently-pending inbound requests (for the list IPC).
     pub fn list(&self) -> Vec<(OwnerAddr, PendingInbound)> {
         let inner = self.inner.lock().expect("pending inner mutex poisoned");

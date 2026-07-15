@@ -562,6 +562,30 @@ impl IrohFriendPexAcceptor {
                 // (no leak of a non-opted-in friend); the requester learned X from
                 // the catalog it already browsed.
                 let now_secs = crate::iroh_friend_acceptor::wall_now_secs();
+                // Authenticate BEFORE bumping the HLC: an unauthenticated /
+                // wrong-target peer must not be able to increment the server's
+                // `hlc_tracker` (the SAME invariant the Catalog arm documents above
+                // its pre-HLC `authenticate_catalog_request`). On failure we still
+                // write the SAME benign ack a normal outcome writes — an auth
+                // failure stays network-indistinguishable (no oracle, exactly as
+                // today, when this check ran only inside
+                // `build_introduction_for_request`) — but WITHOUT the HLC bump, the
+                // graph read, or the F→X dial. `build_introduction_for_request`
+                // re-runs this exact check internally; that redundant second verify
+                // is intentional defense-in-depth (the Catalog arm double-checks
+                // too). One `now_secs` sample feeds BOTH checks so they can't
+                // straddle a cert-expiry second (ZEB-378, as in the Catalog arm).
+                if let Err(e) = crate::friend_intro::authenticate_introduce_request(
+                    &ir,
+                    self.self_owner,
+                    now_secs,
+                ) {
+                    tracing::debug!(
+                        error = ?e,
+                        "ZEB-376: introduce-request pre-HLC auth failed; benign ack, no HLC bump"
+                    );
+                    return self.write_ack(&mut send).await;
+                }
                 // Stamp the Introduction clock BEFORE taking the crdt lock so the
                 // two locks (hlc_tracker, crdt_state) are never nested.
                 let at = self.next_hlc().await;

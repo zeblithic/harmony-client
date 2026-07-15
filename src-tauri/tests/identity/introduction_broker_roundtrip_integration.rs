@@ -122,10 +122,19 @@ const CASE_D_VISIBLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bound on how long we poll for the mutual introduction link (or a staged
 /// offer) to appear.
 const LINK_TIMEOUT: Duration = Duration::from_secs(30);
-/// Negative-assertion settle window: a link that a different policy WOULD form
-/// links within ~1-2s (the Open case proves this on the identical harness), so a
-/// full settle here well exceeds that before asserting the link did NOT form.
-const NO_LINK_SETTLE: Duration = Duration::from_secs(6);
+/// Negative-assertion settle window for the Closed case (a SECURITY property:
+/// must-not-link). Equal to the positive `LINK_TIMEOUT` ON PURPOSE: a
+/// wrongly-formed link (e.g. a regressed Closed policy that self-dialed) gets the
+/// EXACT same budget to appear as the positive cases get to succeed — under known
+/// iroh contention a link can take many seconds, so a shorter negative window
+/// could false-pass by asserting absence before a slow-but-real link surfaced.
+/// The Closed→Reject decision is also pinned by the `decide_introduction_truth_table`
+/// unit test, so this settle is the end-to-end belt to that suspenders. (Option
+/// (a) of the T15-M2 fix: no clean already-observable positive signal exists for
+/// X's Closed-policy processing — a rejection leaves no CRDT/inbox trace and F's
+/// F→X delivery is fire-and-forget-spawned, not surfaced — so equalizing the time
+/// budget is the sound, deterministic, non-flaky choice over gating on a signal.)
+const NO_LINK_SETTLE: Duration = LINK_TIMEOUT;
 
 // ── seeds (avoid the mint_test_owner `N ^ 0xFF` device/master collision) ──────
 const YOU_SEED: u8 = 0x10;
@@ -754,9 +763,15 @@ async fn introduction_broker_roundtrip_open_policy_links_both_sides() {
         h.request_introduction().await;
 
         // Poll until BOTH sides hold the mutual `established_via: Introduction`
-        // friend with a sealed rendezvous secret (Case-D armed). The friend-graph
-        // read after the link is the in-process proof that the introduced friend
-        // was written into owner-state (the `notify_dirty` durability path).
+        // friend with a sealed rendezvous secret (Case-D armed). This asserts only
+        // the IN-MEMORY CRDT link state: the harness builds X's acceptor WITHOUT
+        // `.with_owner_sync_engine(...)`, so `complete_introduction` runs with
+        // `sync_engine: None` and does NOT exercise `notify_dirty`. Persistence /
+        // replication (the `notify_dirty` + `friend-list-changed` durability path)
+        // is scoped OUT of this e2e and covered elsewhere: Task 10 wires the
+        // acceptor's `with_owner_sync_engine` (production, lib.rs) and the friend
+        // acceptor's `notify_owner_state_dirty` is pinned by
+        // `friend_write_arms_owner_state_sync_engine`.
         let you_has_x = wait_until(LINK_TIMEOUT, || {
             let crdt = Arc::clone(&h.you_crdt);
             let x = h.x.owner;
@@ -966,9 +981,10 @@ async fn introduction_broker_roundtrip_closed_policy_rejects() {
         // You requests the introduction to X, via F.
         h.request_introduction().await;
 
-        // Closed rejects the introduction: over a settle window that comfortably
-        // exceeds the Open case's link time (on this identical harness), NO link
-        // may ever form on either side and NO offer may be staged.
+        // Closed rejects the introduction: over a settle window equal to the
+        // positive `LINK_TIMEOUT` budget (so a slow-but-real link would have had
+        // the SAME time to appear as the Open case gets to succeed), NO link may
+        // ever form on either side and NO offer may be staged.
         let linked_or_staged = wait_until(NO_LINK_SETTLE, || {
             let you_crdt = Arc::clone(&h.you_crdt);
             let x_crdt = Arc::clone(&h.x_crdt);
