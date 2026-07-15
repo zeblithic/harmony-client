@@ -30,6 +30,8 @@ mod common;
 
 #[path = "identity/identity_state_recovery_integration.rs"]
 mod identity_state_recovery_integration;
+#[path = "identity/introduction_broker_roundtrip_integration.rs"]
+mod introduction_broker_roundtrip_integration;
 #[path = "identity/keychain_isolation.rs"]
 mod keychain_isolation;
 #[path = "identity/owner_integration.rs"]
