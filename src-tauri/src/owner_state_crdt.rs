@@ -897,19 +897,6 @@ impl OwnerState {
         }
     }
 
-    /// LWW-apply a friend entry for an `OwnerAddr`. Newer `learned_at` HLC
-    /// wins; an equal HLC with an identical payload is idempotent; an equal
-    /// HLC with a diverging payload is rejected (two replicas concurrently
-    /// issuing different entries under the same HLC would otherwise diverge
-    /// silently); an older HLC is rejected as stale.
-    ///
-    /// Equal-HLC semantics mirror `apply_owner_device_update`: `FriendEntry`
-    /// carries a payload separate from its HLC, so equal-HLC replay must
-    /// additionally check payload equality before treating it as idempotent.
-    /// `Revoked` is a tombstone (kept as state), so a strictly-newer revoke
-    /// cannot be silently resurrected by a stale `Active` from another device.
-    ///
-    /// See ZEB-370 §4.1 and the spec's "Revocation" note in §7.
     /// ZEB-685 (S3): union a revoked #2 ed25519 key into the friend-scoped
     /// store. Returns true iff newly inserted (grow-only; idempotent). The
     /// store is union-merged across the owner's devices (see
@@ -926,6 +913,32 @@ impl OwnerState {
             .insert(ed25519)
     }
 
+    /// ZEB-685 (S3): the owners of all currently-`Active` friendships — the DM
+    /// push targets for a device revocation. `Pending` (no mutual link yet) and
+    /// `Revoked` (tombstoned) entries are excluded: neither has an established
+    /// friend-DM tunnel to carry the `RevocationPush`.
+    pub fn active_friend_owners(&self) -> Vec<crate::owner_state_types::OwnerAddr> {
+        self.friend_graph
+            .friends
+            .iter()
+            .filter(|(_, e)| matches!(e.status, crate::friend_graph::FriendStatus::Active))
+            .map(|(addr, _)| *addr)
+            .collect()
+    }
+
+    /// LWW-apply a friend entry for an `OwnerAddr`. Newer `learned_at` HLC
+    /// wins; an equal HLC with an identical payload is idempotent; an equal
+    /// HLC with a diverging payload is rejected (two replicas concurrently
+    /// issuing different entries under the same HLC would otherwise diverge
+    /// silently); an older HLC is rejected as stale.
+    ///
+    /// Equal-HLC semantics mirror `apply_owner_device_update`: `FriendEntry`
+    /// carries a payload separate from its HLC, so equal-HLC replay must
+    /// additionally check payload equality before treating it as idempotent.
+    /// `Revoked` is a tombstone (kept as state), so a strictly-newer revoke
+    /// cannot be silently resurrected by a stale `Active` from another device.
+    ///
+    /// See ZEB-370 §4.1 and the spec's "Revocation" note in §7.
     pub fn apply_friend_update(
         &mut self,
         addr: crate::owner_state_types::OwnerAddr,
@@ -4250,6 +4263,22 @@ mod friend_graph_tests {
         assert!(!s.apply_revoked_dm_device(owner, [1u8; 32]), "idempotent");
         assert!(s.apply_revoked_dm_device(owner, [2u8; 32]));
         assert_eq!(s.revoked_dm_devices.get(&owner).unwrap().len(), 2);
+    }
+
+    /// ZEB-685 (S3): `active_friend_owners` returns only `Active` friendships —
+    /// the DM RevocationPush targets. `Pending`/`Revoked` are excluded.
+    #[test]
+    fn active_friend_owners_excludes_non_active() {
+        let mut s = OwnerState::default();
+        let (a1, p1) = friend_pair(0x11);
+        let (a2, p2) = friend_pair(0x22);
+        let (a3, p3) = friend_pair(0x33);
+        s.apply_friend_update(a1, entry(p1, 10, FriendStatus::Active));
+        s.apply_friend_update(a2, entry(p2, 10, FriendStatus::Pending));
+        s.apply_friend_update(a3, entry(p3, 10, FriendStatus::Revoked));
+        let owners = s.active_friend_owners();
+        assert_eq!(owners.len(), 1, "only Active friends are push targets");
+        assert!(owners.contains(&a1));
     }
 
     /// A real `(OwnerAddr, master_ed25519)` pair derived from a seeded

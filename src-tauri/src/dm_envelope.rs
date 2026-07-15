@@ -440,10 +440,8 @@ struct RevocationPushBody {
     enrollment: harmony_owner::certs::EnrollmentCert,
 }
 
-/// ZEB-685: construct a `RevocationPush` packet (no outer signature).
-// `allow(dead_code)`: the production caller is the send-side revoke hook, wired
-// in a later step; only the round-trip test references it until then.
-#[allow(dead_code)]
+/// ZEB-685: construct a `RevocationPush` packet (no outer signature). Called by
+/// the send-side friend-push hook (`owner_commands::push_revocation_to_friends`).
 pub(crate) fn build_revocation_push_packet(
     revocation: harmony_owner::certs::RevocationCert,
     enrollment: harmony_owner::certs::EnrollmentCert,
