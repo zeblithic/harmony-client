@@ -349,6 +349,38 @@ pub fn decode_pex_frame_or_catalog(bytes: &[u8]) -> Result<PexDecoded, ReferralC
     }
 }
 
+/// Outcome of X's `PeerIntroPolicy` decision for an inbound `Introduction`.
+/// Pure; no I/O — mirrors `iroh_friend_acceptor::ConsentDecision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntroDecision {
+    /// Form the link now (X dials the introducee).
+    Proceed,
+    /// Stage an introduction-offer in the pending inbox; proceed only on the
+    /// user's explicit accept (`AskMe`).
+    Stage,
+    /// Reject (relay a benign "declined" to the requester).
+    Reject,
+}
+
+/// Enforce `PeerIntroPolicy` on X for an inbound `Introduction`.
+/// `voucher_is_active_friend` = the voucher (F) is currently an `Active` friend
+/// of X (already established by `verify_introduction` + a graph check at the
+/// call site). Authentication ALWAYS runs before this — policy only gates
+/// whether to proceed/prompt/reject, never whether to authenticate.
+pub fn decide_introduction(
+    policy: crate::friend_graph::PeerIntroPolicy,
+    voucher_is_active_friend: bool,
+) -> IntroDecision {
+    use crate::friend_graph::PeerIntroPolicy::*;
+    match policy {
+        Open => IntroDecision::Proceed,
+        FriendsOfFriends if voucher_is_active_friend => IntroDecision::Proceed,
+        FriendsOfFriends => IntroDecision::Reject,
+        AskMe => IntroDecision::Stage,
+        Closed => IntroDecision::Reject,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,5 +510,28 @@ mod tests {
             PexDecoded::Catalog(g) => assert_eq!(g, cr),
             other => panic!("expected Catalog fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decide_introduction_truth_table() {
+        use crate::friend_graph::PeerIntroPolicy::*;
+        // Open: always proceed, regardless of voucher.
+        assert_eq!(decide_introduction(Open, true), IntroDecision::Proceed);
+        assert_eq!(decide_introduction(Open, false), IntroDecision::Proceed);
+        // FriendsOfFriends: proceed iff the voucher is an Active friend.
+        assert_eq!(
+            decide_introduction(FriendsOfFriends, true),
+            IntroDecision::Proceed
+        );
+        assert_eq!(
+            decide_introduction(FriendsOfFriends, false),
+            IntroDecision::Reject
+        );
+        // AskMe: always stage a prompt (voucher-active is irrelevant to staging).
+        assert_eq!(decide_introduction(AskMe, true), IntroDecision::Stage);
+        assert_eq!(decide_introduction(AskMe, false), IntroDecision::Stage);
+        // Closed: always reject.
+        assert_eq!(decide_introduction(Closed, true), IntroDecision::Reject);
+        assert_eq!(decide_introduction(Closed, false), IntroDecision::Reject);
     }
 }
