@@ -1725,6 +1725,10 @@ impl DmOutbox {
             message_cid: entry.message_cid,
             cidnotify_packet,
             invite_packet,
+            // ZEB-691: this candidate builder only ever produces message /
+            // invite-only deposits; revocation deposits are a separate
+            // production path (Task B4).
+            revocation_push: None,
             now_ms,
         });
     }

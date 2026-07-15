@@ -61,6 +61,11 @@ pub const MAX_DEPOSIT_INVITE_BYTES: usize = 4096;
 /// binds the ack without inventing a fake content id.
 pub const INVITE_ONLY_DEPOSIT_MARKER: &[u8] = b"zeb505-invite-only";
 
+/// ZEB-691: ack marker returned for a device-revocation deposit (no message
+/// CID). Mirrors `INVITE_ONLY_DEPOSIT_MARKER`; the sender's `IrohButlerDepositClient`
+/// binds the ack to this value for a `revocation_push` request.
+pub const REVOCATION_DEPOSIT_MARKER: &[u8] = b"zeb691-revocation";
+
 /// Maximum number of [`crate::reachability_record::ButlerSetEntry`]s carried
 /// in the pkarr routing blob's butler set (spec §3: ordered priority list,
 /// max 2 in v1). Readers truncate anything longer (defence against oversized
@@ -222,6 +227,16 @@ pub struct DepositPayload {
         with = "serde_bytes"
     )]
     pub invite_packet: Option<Vec<u8>>,
+    /// ZEB-691: signed `RevocationPush` frame bytes for the recipient's inbox
+    /// sweeper to apply via `handle_revocation_push`. `None` for message /
+    /// invite / legacy deposits.
+    #[serde(
+        rename = "rp",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub revocation_push: Option<Vec<u8>>,
 }
 
 // Manual CanonicalPayload registration (the `impl_canonical!` macro in
@@ -388,6 +403,10 @@ pub struct ButlerDepositRequest {
     /// into the sealed `DepositPayload` by each deposit client. ZEB-505: MUST be
     /// `Some` when `cidnotify_packet` is `None` (an invite-only deposit).
     pub invite_packet: Option<Vec<u8>>,
+    /// ZEB-691: signed `RevocationPush` frame bytes. When `Some`, this is a
+    /// revocation deposit — `cidnotify_packet`/`invite_packet`/`message_cid` are
+    /// all `None` and the ack binds to `REVOCATION_DEPOSIT_MARKER`.
+    pub revocation_push: Option<Vec<u8>>,
     /// Wall-clock now (ms) at candidacy time — drives the `bs_at` freshness
     /// check against the resolved routing blob.
     pub now_ms: u64,
@@ -643,12 +662,18 @@ impl ButlerDepositClient for IrohButlerDepositClient {
                 };
                 (blob, message_cid.to_bytes().to_vec())
             }
+            // ZEB-691: a revocation deposit has no message CID and its own ack
+            // marker; an invite-only deposit keeps the ZEB-505 marker.
+            None if req.revocation_push.is_some() => {
+                (Vec::new(), REVOCATION_DEPOSIT_MARKER.to_vec())
+            }
             None => (Vec::new(), INVITE_ONLY_DEPOSIT_MARKER.to_vec()),
         };
         let payload = DepositPayload {
             cidnotify_packet: req.cidnotify_packet.clone(),
             storage_blob,
             invite_packet: req.invite_packet.clone(),
+            revocation_push: req.revocation_push.clone(),
         };
 
         // 3. Priority order, first ack wins. The frame is rebuilt per
@@ -782,10 +807,36 @@ mod tests {
             cidnotify_packet: Some(vec![0x01, 0x02, 0x03]),
             storage_blob: vec![0x04, 0x05, 0x06, 0x07],
             invite_packet: None,
+            revocation_push: None,
         };
         let bytes = encode_deposit_payload(&payload).expect("encode");
         let back = decode_deposit_payload(&bytes).expect("decode");
         assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn deposit_payload_round_trips_revocation_push_and_decodes_legacy_as_none() {
+        let with_rev = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: Some(vec![0x05, 1, 2, 3]),
+        };
+        let bytes = encode_deposit_payload(&with_rev).unwrap();
+        assert_eq!(decode_deposit_payload(&bytes).unwrap(), with_rev);
+
+        // Legacy payload (no `rp`) decodes revocation_push to None.
+        let legacy = DepositPayload {
+            cidnotify_packet: Some(vec![9]),
+            storage_blob: vec![1],
+            invite_packet: None,
+            revocation_push: None,
+        };
+        let lbytes = encode_deposit_payload(&legacy).unwrap();
+        assert_eq!(
+            decode_deposit_payload(&lbytes).unwrap().revocation_push,
+            None
+        );
     }
 
     #[test]
@@ -795,6 +846,7 @@ mod tests {
             cidnotify_packet: Some(vec![1, 2, 3]),
             storage_blob: vec![4, 5, 6],
             invite_packet: Some(vec![7, 8, 9]),
+            revocation_push: None,
         };
         let bytes = encode_deposit_payload(&with_invite).expect("encode");
         assert_eq!(decode_deposit_payload(&bytes).expect("decode"), with_invite);
@@ -804,6 +856,7 @@ mod tests {
             cidnotify_packet: Some(vec![1]),
             storage_blob: vec![2],
             invite_packet: None,
+            revocation_push: None,
         };
         let bytes_none = encode_deposit_payload(&without).expect("encode none");
         assert_eq!(
@@ -844,6 +897,7 @@ mod tests {
             cidnotify_packet: None,
             storage_blob: Vec::new(),
             invite_packet: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            revocation_push: None,
         };
         let bytes = encode_deposit_payload(&invite_only).expect("encode invite-only");
         assert_eq!(

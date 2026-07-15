@@ -1082,6 +1082,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_bytes),
             storage_blob,
             invite_packet: None,
+            revocation_push: None,
         };
 
         let cert_bytes = harmony_owner::cbor::to_canonical(&s.cert).expect("encode cert");
@@ -1330,6 +1331,7 @@ mod tests {
             cidnotify_packet: Some(b"fake-cidnotify-packet".to_vec()),
             storage_blob: b"dm-storage-blob-opaque-to-relay".to_vec(),
             invite_packet: None,
+            revocation_push: None,
         };
         let cert_bytes =
             harmony_owner::cbor::to_canonical(&world.c_quorum_cert).expect("encode cert");

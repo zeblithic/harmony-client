@@ -1091,6 +1091,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1137,6 +1138,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet,
+            revocation_push: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1456,6 +1458,7 @@ mod tests {
             cidnotify_packet: Some(cidnotify_packet.clone()),
             storage_blob: storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1633,6 +1636,7 @@ mod tests {
             cidnotify_packet: Some(f.cidnotify_packet.clone()),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         };
         let butler_vk = butler_device_sk().verifying_key().to_bytes();
         let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
@@ -2000,6 +2004,7 @@ mod tests {
             cidnotify_packet: Some(tampered_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2022,6 +2027,7 @@ mod tests {
             cidnotify_packet: Some(mismatch_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2046,6 +2052,7 @@ mod tests {
             cidnotify_packet: Some(foreign_packet),
             storage_blob: f.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();

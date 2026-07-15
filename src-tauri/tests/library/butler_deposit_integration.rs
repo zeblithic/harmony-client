@@ -611,6 +611,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
             cidnotify_packet: Some(fx.cidnotify_packet.clone()),
             storage_blob: fx.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         },
     )
     .expect("sender-side frame build");
@@ -911,6 +912,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
             cidnotify_packet: Some(fx.cidnotify_packet.clone()),
             storage_blob: fx.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         },
     )
     .expect("sender-side frame build");
@@ -1069,6 +1071,7 @@ async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
             cidnotify_packet: Some(fx.cidnotify_packet.clone()),
             storage_blob: fx.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         },
     )
     .expect("sender-side frame build");
@@ -1161,6 +1164,7 @@ async fn co_member_deposit_for_unrelated_space_is_rejected_and_not_persisted() {
             cidnotify_packet: Some(fx.cidnotify_packet.clone()),
             storage_blob: fx.storage_blob.clone(),
             invite_packet: None,
+            revocation_push: None,
         },
     )
     .expect("sender-side frame build");
