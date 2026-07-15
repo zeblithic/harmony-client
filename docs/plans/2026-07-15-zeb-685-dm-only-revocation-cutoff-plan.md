@@ -54,7 +54,7 @@ fn revocation_push_round_trips() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(revocation_push_round_trips)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(revocation_push_round_trips)'`
 Expected: FAIL to compile — `RevocationPush` / `build_revocation_push_packet` undefined.
 
 - [ ] **Step 3: Add the variant**
@@ -137,7 +137,7 @@ In `decode_packet` (dm_envelope.rs:486), add a `0x05` discriminant arm (find whe
 
 - [ ] **Step 6: Run to verify pass**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(revocation_push_round_trips)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(revocation_push_round_trips)'`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
@@ -195,7 +195,7 @@ fn revoked_dm_devices_merge_is_union_not_lww() {
 
 - [ ] **Step 2: Run to verify fail**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(apply_revoked_dm_device_unions) + test(revoked_dm_devices_merge_is_union_not_lww)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(apply_revoked_dm_device_unions) + test(revoked_dm_devices_merge_is_union_not_lww)'`
 Expected: FAIL to compile.
 
 - [ ] **Step 3: Add the field**
@@ -249,7 +249,7 @@ In `merge_remote_into_local` (owner_state_sync.rs:224-360): add `revoked_dm_devi
 
 - [ ] **Step 6: Run to verify pass**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(apply_revoked_dm_device_unions) + test(revoked_dm_devices_merge_is_union_not_lww)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(apply_revoked_dm_device_unions) + test(revoked_dm_devices_merge_is_union_not_lww)'`
 Expected: PASS. (If `merge_remote_into_local` is private to the module, put the merge test in the same module or use a `pub(crate)`-visible path — check its visibility.)
 
 - [ ] **Step 7: Commit**
@@ -304,7 +304,7 @@ fn handle_revocation_push_rejects_third_party_owner() {
 
 - [ ] **Step 2: Run to verify fail**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(handle_revocation_push)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(handle_revocation_push)'`
 Expected: FAIL to compile.
 
 - [ ] **Step 3: Implement the applier**
@@ -376,7 +376,7 @@ In `dm_inbox_ingest.rs` `ingest_dm_packet`'s `decode_packet` match (~:457), add 
 
 - [ ] **Step 5: Run to verify pass + covering tests**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(handle_revocation_push)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(handle_revocation_push)'`
 Expected: PASS (accept + all reject cases).
 
 - [ ] **Step 6: Commit**
@@ -416,7 +416,7 @@ fn revocation_push_targets_are_active_friends_only() {
 
 - [ ] **Step 2: Run to verify fail**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(revocation_push_targets)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(revocation_push_targets)'`
 Expected: FAIL to compile.
 
 - [ ] **Step 3: Add the enumeration helper + send hook**
@@ -465,7 +465,7 @@ In `revoke_device_inner`: (a) snapshot the CRDT-doc handle + tunnel-manager hand
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(revocation_push_targets)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(revocation_push_targets)'`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -503,7 +503,7 @@ fn feed_revoked_from_dm_store_seeds_projection() {
 
 - [ ] **Step 2: Run to verify fail**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(feed_revoked_from_dm_store)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(feed_revoked_from_dm_store)'`
 Expected: FAIL to compile.
 
 - [ ] **Step 3: Add the feed helper + boot wiring**
@@ -527,7 +527,7 @@ In `start_node_inner`, at the boot-replay seed alongside the community feed (~li
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(feed_revoked_from_dm_store)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(feed_revoked_from_dm_store)'`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -571,7 +571,7 @@ fn dm_only_contact_cutoff_after_revocation_push() {
 
 - [ ] **Step 2: Run to verify pass**
 
-Run: `cd src-tauri && cargo nextest run --features test-fixtures -E 'test(dm_only_contact_cutoff_after_revocation_push)'`
+Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(dm_only_contact_cutoff_after_revocation_push)'`
 Expected: PASS (before: ok; after: `SignerDeviceRevoked`).
 
 - [ ] **Step 3: Commit**

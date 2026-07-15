@@ -1013,6 +1013,20 @@ async fn dm_only_contact_cutoff_via_revocation_push() {
     )
     .await;
     {
+        // Assert BOTH the event and the inbox at the baseline, so ASSERTION 2's
+        // "dm_received == 1" is a genuine delta (baseline delivered, revoked
+        // dropped) rather than a delta-free check that a broken baseline could
+        // also satisfy. (CodeRabbit #471.)
+        let dm_received = events
+            .lock()
+            .expect("events lock")
+            .iter()
+            .filter(|(name, _)| name == "dm-received")
+            .count();
+        assert_eq!(
+            dm_received, 1,
+            "baseline CidNotify delivered exactly one event"
+        );
         let g = bob_crdt_state.lock().await;
         assert!(
             g.inbox.values().any(|e| e.message_cid == cid1),
@@ -1040,7 +1054,7 @@ async fn dm_only_contact_cutoff_via_revocation_push() {
         .expect("sign master revocation");
 
         let mut bob_state = bob_crdt_state.lock().await;
-        harmony_app::dm_outbox::handle_revocation_push(
+        let inserted = harmony_app::dm_outbox::handle_revocation_push(
             &mut bob_state,
             alice.owner,
             &revocation,
@@ -1048,6 +1062,9 @@ async fn dm_only_contact_cutoff_via_revocation_push() {
             &proj,
         )
         .expect("valid master-signed friend RevocationPush accepted");
+        // The "newly inserted" signal the persistence fix depends on (the drain
+        // marks the owner-state engine dirty only on a fresh insert). (CodeRabbit #471.)
+        assert!(inserted, "first push of this device reports a new insert");
     }
     assert!(
         proj.is_revoked(&alice.owner, &alice_d2_ed25519),
