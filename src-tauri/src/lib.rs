@@ -3215,6 +3215,20 @@ fn feed_revoked_from_materialized(
     );
 }
 
+/// ZEB-685 (S3): seed the revoked-device projection from the persisted
+/// friend-scoped DM-revocation store (`OwnerState::revoked_dm_devices`). The
+/// boot-replay analogue of [`feed_revoked_from_materialized`]: that feed covers
+/// shared-community revocations, this covers DM-only contacts (no shared
+/// community). Called once at boot from the loaded owner-state CRDT; the
+/// receive-side handler (`dm_outbox::handle_revocation_push`) feeds the live
+/// projection thereafter.
+fn feed_revoked_from_dm_store(
+    proj: &crate::revoked_device_projection::RevokedDeviceProjection,
+    crdt: &crate::owner_state_crdt::OwnerState,
+) {
+    proj.union_from_members(crdt.revoked_dm_devices.iter().map(|(o, set)| (*o, set)));
+}
+
 /// Start the harmony node with an embedded NodeRuntime.
 ///
 /// Generates/loads identity, creates the runtime, and spawns the event loop
@@ -4692,6 +4706,13 @@ pub async fn start_node_inner(
                         .map_err(|e| format!("load owner_state_crdt.cbor: {e}"))?;
                     let initial_replay = crate::owner_state_persist::load_replay(&replay_path)
                         .map_err(|e| format!("load state_root_replay.cbor: {e}"))?;
+
+                    // ZEB-685 (S3): boot-replay seed the revoked-device
+                    // projection from the persisted DM-only revocation store
+                    // (single, unconditional read of the just-loaded CRDT — the
+                    // community feed at the per-community replay only covers
+                    // shared-community revocations).
+                    feed_revoked_from_dm_store(&revoked_device_projection, &initial_crdt);
 
                     let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(initial_crdt));
                     let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(initial_replay));
@@ -59199,6 +59220,28 @@ mod tests {
         assert!(
             proj.is_revoked(&owner, &revoked),
             "helper must union member revoked keys"
+        );
+    }
+
+    /// ZEB-685 (S3): `feed_revoked_from_dm_store` seeds the projection from the
+    /// persisted friend-scoped DM-revocation store at boot (the DM-only analogue
+    /// of the community-materialized feed above).
+    #[test]
+    fn feed_revoked_from_dm_store_seeds_projection() {
+        use crate::owner_state_types::OwnerAddr;
+        use crate::revoked_device_projection::RevokedDeviceProjection;
+
+        let mut crdt = crate::owner_state_crdt::OwnerState::default();
+        let owner = OwnerAddr([0x22; 16]);
+        let revoked = [0x9a; 32];
+        crdt.apply_revoked_dm_device(owner, revoked);
+
+        let proj = RevokedDeviceProjection::new();
+        assert!(!proj.is_revoked(&owner, &revoked));
+        feed_revoked_from_dm_store(&proj, &crdt);
+        assert!(
+            proj.is_revoked(&owner, &revoked),
+            "boot-replay must union the persisted DM-revocation store"
         );
     }
 }
