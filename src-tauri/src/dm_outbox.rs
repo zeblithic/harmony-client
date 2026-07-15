@@ -1845,6 +1845,16 @@ impl DmOutbox {
                 );
                 Ok(DrainOutcome::default())
             }
+            // ZEB-685 (S3): the RevocationPush wire variant exists; its live
+            // carrier is the tunnel ingest path (`ingest_dm_packet`). This
+            // dormant outbox dispatch never produces it, so drop+warn rather
+            // than mishandle.
+            crate::dm_envelope::DmPacket::RevocationPush { .. } => {
+                tracing::warn!(
+                    "handle_unicast received RevocationPush; its receive path is the tunnel ingest, not this dispatch. Dropping packet."
+                );
+                Ok(DrainOutcome::default())
+            }
         }
     }
 

@@ -562,6 +562,13 @@ pub(crate) async fn ingest_dm_packet(
                 "tunnel DM packet is an Ack (not handled on the tunnel ingest path)".into(),
             );
         }
+        crate::dm_envelope::DmPacket::RevocationPush { .. } => {
+            // ZEB-685 (S3): the real verify + trust-bind + store + projection-feed
+            // handler is wired in a later step. Until then a received
+            // RevocationPush is dropped (a control frame, never a chat message).
+            tracing::debug!("ZEB-685: RevocationPush received; handler not yet wired");
+            return Ok(false);
+        }
         crate::dm_envelope::DmPacket::CidNotifyWithBlob {
             signed,
             signature,
