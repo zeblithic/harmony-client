@@ -88,12 +88,16 @@ fn payload_for(ep: &IrohEndpoint, announced_at_ms: u64) -> ReachabilityAnnounceP
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// ZEB-402: real-iroh dial completion is subject to live network timing and
-// flakes in CI even with warm_up_iroh_global_init + a 60s outer / 20s inner
-// timeout guard. Ignored from the blocking gate until it's made deterministic
-// (loopback transport seam) or moved to the non-blocking large-tests lane.
-// Still runnable locally with `--ignored`.
-#[ignore = "ZEB-402: real-iroh dial flakes in CI; make deterministic or move to non-blocking lane"]
+// ZEB-402: this was `#[ignore]`d (2026-06-07, #201) because the real-iroh dial
+// timed out under CI dial-latency spikes. The ROOT CAUSE was the iroh first-bind
+// stalls (netdev CoreWLAN XPC + iroh's eager system-DNS-config read), fixed at
+// the source in ZEB-626 (#396) — the same change that added the
+// `hermetic_dns_resolver` this test now uses (see `build_hermetic_endpoint`).
+// Post-fix the dial completes in ~130 ms on loopback: 20/20 in isolation and
+// steady under concurrent real-iroh contention, ~150x headroom under the 20s
+// inner budget. So the test is back on the blocking gate (the `#[ignore]` was
+// simply left behind after ZEB-626). The tight inner budget stays deliberately
+// tight — it fails fast on a routing regression (ZEB-373), not on live timing.
 async fn mid_session_dial_connects_to_a_peer_learned_after_open() {
     // ZEB-347: prime the one-time process-global iroh bind init before the
     // asserted timeout (see `iroh_endpoint::warm_up_iroh_global_init`).
