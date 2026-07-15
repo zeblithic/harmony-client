@@ -4,6 +4,9 @@
 //! the two sub-protocols share one wire codec (`referral_catalog::decode_strict`,
 //! `PEX_MAX_PACKET_LEN`) so their framing can never diverge.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
+
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
@@ -474,6 +477,104 @@ pub(crate) fn build_self_reachability_announce(
     )
 }
 
+/// ZEB-376 Task 13 (abuse hygiene): the sliding window over which a single
+/// `key` (a voucher on X's arm, or a requester on F's arm) may drive
+/// [`INTRO_PER_VOUCHER_MAX`] introductions before being shed.
+pub const INTRO_PER_VOUCHER_WINDOW_MS: u64 = 60 * 60 * 1000; // 1h
+/// Max introductions a single `key` may drive within
+/// [`INTRO_PER_VOUCHER_WINDOW_MS`]; the (`INTRO_PER_VOUCHER_MAX` + 1)-th within
+/// the window is shed.
+pub const INTRO_PER_VOUCHER_MAX: usize = 20; // per key per window
+/// A repeat `(key, subject)` seen within this TTL is shed as a duplicate.
+pub const INTRO_DEDUPE_TTL_MS: u64 = 5 * 60 * 1000; // 5 min
+
+/// Process-local DoS hygiene layered BEFORE the (primary) policy/authentication
+/// defenses on both friend-PEX introduction arms: a per-`key` sliding-window cap
+/// plus a `(key, subject)` dedupe, so a compromised/spammy voucher (F) or
+/// requester cannot flood a node with introductions. It is deliberately NOT an
+/// authorization decision — it only sheds volume; every shed is LOGGED by the
+/// caller ("no silent truncation") and answered with the same benign ack a
+/// normal outcome writes, so a shed is network-indistinguishable (no oracle).
+///
+/// Guarded by a `std::sync::Mutex`; [`admit`](Self::admit) never `.await`s, so
+/// the lock is never held across a suspension point.
+pub struct IntroRateLimiter {
+    inner: Mutex<IntroRateLimiterInner>,
+}
+
+struct IntroRateLimiterInner {
+    /// Per-`key` admit timestamps (epoch-ms), pruned to
+    /// [`INTRO_PER_VOUCHER_WINDOW_MS`] on each `admit`; `len()` is the in-window
+    /// count checked against [`INTRO_PER_VOUCHER_MAX`].
+    windows: HashMap<OwnerAddr, VecDeque<u64>>,
+    /// Last time a `(key, subject)` pair was admitted, for TTL dedupe.
+    last_seen: HashMap<(OwnerAddr, OwnerAddr), u64>,
+}
+
+impl IntroRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(IntroRateLimiterInner {
+                windows: HashMap::new(),
+                last_seen: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Returns `Ok(())` to admit (and RECORDS the event: bumps the `key`'s
+    /// window and the `(key, subject)` last-seen), or `Err(reason)` to shed
+    /// WITHOUT recording. Sheds `"duplicate"` when `(key, subject)` was admitted
+    /// within [`INTRO_DEDUPE_TTL_MS`], or `"per-voucher cap"` when `key` already
+    /// has [`INTRO_PER_VOUCHER_MAX`] admits inside
+    /// [`INTRO_PER_VOUCHER_WINDOW_MS`]. Pure over `now_ms`; the caller LOGS every
+    /// shed.
+    pub fn admit(
+        &self,
+        key: OwnerAddr,
+        subject: OwnerAddr,
+        now_ms: u64,
+    ) -> Result<(), &'static str> {
+        // Poison-tolerant: a panic elsewhere must not wedge the acceptor — the
+        // guarded state is plain counters, safe to keep using.
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // 1. Dedupe: a repeat of the SAME (key, subject) within the TTL is shed
+        //    (a shed does NOT refresh the last-seen stamp — only an admit does).
+        if let Some(&last) = inner.last_seen.get(&(key, subject)) {
+            if now_ms.saturating_sub(last) < INTRO_DEDUPE_TTL_MS {
+                return Err("duplicate");
+            }
+        }
+
+        // 2. Per-`key` sliding window: drop entries older than the window, then
+        //    enforce the cap on what remains.
+        {
+            let window = inner.windows.entry(key).or_default();
+            let cutoff = now_ms.saturating_sub(INTRO_PER_VOUCHER_WINDOW_MS);
+            while window.front().is_some_and(|&t| t < cutoff) {
+                window.pop_front();
+            }
+            if window.len() >= INTRO_PER_VOUCHER_MAX {
+                return Err("per-voucher cap");
+            }
+            window.push_back(now_ms);
+        }
+
+        // 3. Record the admit for future dedupe.
+        inner.last_seen.insert((key, subject), now_ms);
+        Ok(())
+    }
+}
+
+impl Default for IntroRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +918,79 @@ mod tests {
         assert!(
             verify_inner_signature(&payload, &me.owner, &wrong_hlc, &vk).is_err(),
             "verifying self reachability against a non-canonical HLC must fail"
+        );
+    }
+
+    // ── ZEB-376 Task 13: IntroRateLimiter (abuse hygiene). ──────────────────
+
+    /// Admitting up to `INTRO_PER_VOUCHER_MAX` DISTINCT subjects from one key is
+    /// fine; the next distinct subject in the same window sheds the per-voucher
+    /// cap. A different key is accounted independently.
+    #[test]
+    fn intro_rate_limiter_per_voucher_cap_sheds_over_max() {
+        let rl = IntroRateLimiter::new();
+        let key = OwnerAddr([0xAA; 16]);
+        // INTRO_PER_VOUCHER_MAX distinct subjects, all at the same instant, admit.
+        for i in 0..INTRO_PER_VOUCHER_MAX {
+            let subject = OwnerAddr([i as u8; 16]);
+            assert_eq!(
+                rl.admit(key, subject, 1_000),
+                Ok(()),
+                "subject {i} is within the cap and must admit"
+            );
+        }
+        // The (MAX + 1)-th distinct subject in the window sheds.
+        assert_eq!(
+            rl.admit(key, OwnerAddr([0xFF; 16]), 1_000),
+            Err("per-voucher cap"),
+        );
+        // A DIFFERENT key has its own budget — unaffected by the first key's cap.
+        assert_eq!(
+            rl.admit(OwnerAddr([0xBB; 16]), OwnerAddr([0xFF; 16]), 1_000),
+            Ok(())
+        );
+    }
+
+    /// A repeat of the SAME (key, subject) within the dedupe TTL sheds
+    /// `"duplicate"`; the same pair at/after the TTL boundary admits again (the
+    /// earlier shed did NOT refresh the last-seen stamp).
+    #[test]
+    fn intro_rate_limiter_dedupes_repeat_within_ttl_then_admits_after() {
+        let rl = IntroRateLimiter::new();
+        let key = OwnerAddr([0x01; 16]);
+        let subject = OwnerAddr([0x02; 16]);
+        assert_eq!(rl.admit(key, subject, 0), Ok(()), "first sighting admits");
+        // Same pair strictly within the TTL → duplicate.
+        assert_eq!(
+            rl.admit(key, subject, INTRO_DEDUPE_TTL_MS - 1),
+            Err("duplicate"),
+        );
+        // Same pair exactly at the TTL boundary (measured from the last ADMIT at
+        // t=0, not the shed) → admits again.
+        assert_eq!(rl.admit(key, subject, INTRO_DEDUPE_TTL_MS), Ok(()));
+    }
+
+    /// Entries older than `INTRO_PER_VOUCHER_WINDOW_MS` are pruned and do NOT
+    /// count toward the cap: a key at the cap admits again once its entries age
+    /// out of the window.
+    #[test]
+    fn intro_rate_limiter_prunes_entries_older_than_window() {
+        let rl = IntroRateLimiter::new();
+        let key = OwnerAddr([0x03; 16]);
+        // Fill the window to the cap at t=0 with distinct subjects.
+        for i in 0..INTRO_PER_VOUCHER_MAX {
+            assert_eq!(rl.admit(key, OwnerAddr([i as u8; 16]), 0), Ok(()));
+        }
+        // At the cap now → a fresh subject at t=0 sheds.
+        assert_eq!(
+            rl.admit(key, OwnerAddr([0xFE; 16]), 0),
+            Err("per-voucher cap"),
+        );
+        // Advance past the window: all cap-counted entries are now stale and must
+        // not count → a fresh subject admits again.
+        assert_eq!(
+            rl.admit(key, OwnerAddr([0xFD; 16]), INTRO_PER_VOUCHER_WINDOW_MS + 1),
+            Ok(()),
         );
     }
 

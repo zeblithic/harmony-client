@@ -129,6 +129,15 @@ pub struct IrohFriendPexAcceptor {
     /// store the friend handshake acceptor + accept/decline IPCs hold. `None`
     /// (tests) → the `Stage` decision logs and skips rather than staging.
     pending_requests: Option<Arc<crate::friend_requests::PendingFriendRequests>>,
+    /// ZEB-376 Task 13 (abuse hygiene): process-local per-`key` cap +
+    /// `(key, subject)` dedupe applied at the TOP of BOTH introduction arms —
+    /// F's `IntroduceRequest` (per-requester) and X's `Introduction`
+    /// (per-voucher) — before any real work, so a compromised/spammy F or
+    /// requester cannot flood. It needs no external handle, so it is a plain
+    /// (non-`Option`) field constructed in `with_config`: the production acceptor
+    /// AND every test path always has one. A shed is LOGGED then answered with
+    /// the same benign ack a normal outcome writes (no oracle).
+    intro_rate_limiter: Arc<crate::friend_intro::IntroRateLimiter>,
 }
 
 impl IrohFriendPexAcceptor {
@@ -180,6 +189,7 @@ impl IrohFriendPexAcceptor {
             friend_publisher: None,
             event_sink: None,
             pending_requests: None,
+            intro_rate_limiter: Arc::new(crate::friend_intro::IntroRateLimiter::new()),
         }
     }
 
@@ -527,6 +537,24 @@ impl IrohFriendPexAcceptor {
 
             // ── 2b: F's broker arm (You → F "introduce me to X"). ───────────
             PexDecoded::Frame(PexFrame::IntroduceRequest(ir)) => {
+                // ZEB-376 Task 13 (abuse hygiene): shed a flooding requester BEFORE
+                // any real work (auth, HLC bump, graph read, F→X dial). Keyed on
+                // the requester with dedupe of a repeated (requester, target). On a
+                // shed we LOG ("no silent truncation") and still write the SAME
+                // benign ack a normal outcome writes — a shed is
+                // network-indistinguishable (no oracle) and never reaches
+                // `build_introduction_for_request` or the dial.
+                if let Err(reason) =
+                    self.intro_rate_limiter
+                        .admit(ir.from_addr, ir.target, wall_now_ms())
+                {
+                    tracing::warn!(
+                        reason,
+                        key = %hex::encode(ir.from_addr.0),
+                        "introduction shed by rate limiter"
+                    );
+                    return self.write_ack(&mut send).await;
+                }
                 // Authenticate + authorize (X must be an Active + referrable friend)
                 // via the pure broker decision, then relay a signed Introduction to
                 // X out-of-band (spawned) and ack the requester. The ack is
@@ -610,6 +638,26 @@ impl IrohFriendPexAcceptor {
                 // the policy outcome). The owner-state lock is read then DROPPED
                 // before the network dial.
                 let intro = *intro;
+
+                // ZEB-376 Task 13 (abuse hygiene): shed a flooding voucher BEFORE
+                // any real work (verify, reachability checks, policy, dial). Keyed
+                // on the voucher with dedupe of a repeated (voucher, subject). On a
+                // shed we LOG ("no silent truncation") and still write the SAME
+                // benign ack a normal outcome writes — a shed is
+                // network-indistinguishable (no oracle) and never reaches
+                // `verify_introduction` or the dial.
+                if let Err(reason) =
+                    self.intro_rate_limiter
+                        .admit(intro.voucher, intro.subject, wall_now_ms())
+                {
+                    tracing::warn!(
+                        reason,
+                        key = %hex::encode(intro.voucher.0),
+                        "introduction shed by rate limiter"
+                    );
+                    return self.write_ack(&mut send).await;
+                }
+
                 let now_secs = crate::iroh_friend_acceptor::wall_now_secs();
 
                 // 1. Is the voucher (F) currently an ACTIVE friend of ours? Read
