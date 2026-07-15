@@ -2381,19 +2381,6 @@ pub(crate) enum ApplyInviteOutcome {
     IgnoredExistingSpace,
 }
 
-/// ZEB-482: auto-accept a received DmInvite — write the DM Space + cache the
-/// inviter's devices/identity-pub. Idempotent on `space_id`. Shared by the
-/// (dormant) outbox `handle_invite` method and the tunnel ingest path so both
-/// apply identical trust gates. No IPC emit (invites carry no `dm-received`).
-///
-/// Parameterized on `self_owner` / `device_id` (the receiver's identity)
-/// instead of `&self.*` so the ingest path — which holds the owner-state lock
-/// but has no `DmOutbox` handle — can call it directly. Behavior is identical
-/// to the prior `handle_invite` body.
-// The arg list is the receiver identity + the verified-invite triple + the
-// learned-at clock + the F1 inviter-bind hint; threading them through a struct
-// would not improve clarity at this single shared call boundary.
-
 /// ZEB-691: the cert-verification + trust-bind core of `handle_revocation_push`,
 /// factored out so the butler acceptor can PRE-VALIDATE a deposited revocation
 /// (D7: never persist+ack a forgery) with the SAME authority the recipient uses
@@ -2469,6 +2456,18 @@ pub fn handle_revocation_push(
     Ok(inserted)
 }
 
+/// ZEB-482: auto-accept a received DmInvite — write the DM Space + cache the
+/// inviter's devices/identity-pub. Idempotent on `space_id`. Shared by the
+/// (dormant) outbox `handle_invite` method and the tunnel ingest path so both
+/// apply identical trust gates. No IPC emit (invites carry no `dm-received`).
+///
+/// Parameterized on `self_owner` / `device_id` (the receiver's identity)
+/// instead of `&self.*` so the ingest path — which holds the owner-state lock
+/// but has no `DmOutbox` handle — can call it directly. Behavior is identical
+/// to the prior `handle_invite` body.
+// The arg list is the receiver identity + the verified-invite triple + the
+// learned-at clock + the F1 inviter-bind hint; threading them through a struct
+// would not improve clarity at this single shared call boundary.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_invite(
     state: &mut OwnerState,
