@@ -137,4 +137,33 @@ mod tests {
         // Original path is gone (renamed to .corrupt-*).
         assert!(!path.exists());
     }
+
+    #[test]
+    fn trailing_bytes_after_value_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FLEET_PEER_SEED_FILENAME);
+        // Write a valid doc, then append one extra CBOR token after the value.
+        save(&path, &FleetPeerSeedDoc::default()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0x00); // integer 0 — a distinct trailing value
+        std::fs::write(&path, &bytes).unwrap();
+        match load(&path) {
+            Err(SyncError::CborDecode(msg)) => {
+                assert!(msg.contains("trailing bytes"), "got: {msg}")
+            }
+            other => panic!("expected CborDecode trailing-bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transient_io_error_propagates_not_quarantined() {
+        // Reading a path that IS a directory fails with a non-NotFound,
+        // non-decode IO error → load_doc_or_recover must PROPAGATE it, not
+        // self-heal to default() (which is reserved for genuinely-corrupt files).
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            load_doc_or_recover(dir.path()).is_err(),
+            "transient IO error must propagate, not quarantine-to-default"
+        );
+    }
 }
