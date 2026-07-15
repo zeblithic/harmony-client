@@ -2397,7 +2397,11 @@ pub(crate) enum ApplyInviteOutcome {
 /// to the revoked `ed25519[32]` via the enrollment, stores it union-merged in
 /// the owner-state CRDT, and feeds the live `RevokedDeviceProjection` so the
 /// §5.2 DM cutoff rejects that device's DMs for this DM-only contact.
-pub(crate) fn handle_revocation_push(
+///
+/// `pub` (not `pub(crate)`) so the end-to-end cutoff integration test can drive
+/// the real handler, mirroring the public `DmOutbox::handle_cidnotify_lifted`
+/// receive entrypoint it pairs with.
+pub fn handle_revocation_push(
     state: &mut OwnerState,
     expected_owner: OwnerAddr,
     revocation: &harmony_owner::certs::RevocationCert,
