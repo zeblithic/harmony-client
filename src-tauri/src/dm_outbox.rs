@@ -2413,20 +2413,22 @@ pub(crate) enum ApplyInviteOutcome {
 /// via a `notify_dirty` flush, and RevocationPush has no deposit-rung backstop,
 /// so without this the revocation is lost on restart (boot-replay re-seeds
 /// nothing) and never reaches the owner's other devices.
-pub fn handle_revocation_push(
-    state: &mut OwnerState,
+/// ZEB-691: the cert-verification + trust-bind core of `handle_revocation_push`,
+/// factored out so the butler acceptor can PRE-VALIDATE a deposited revocation
+/// (D7: never persist+ack a forgery) with the SAME authority the recipient uses
+/// on recover. Returns the bridged revoked #2 ed25519 verify key.
+pub(crate) fn verify_revocation_push(
     expected_owner: OwnerAddr,
     revocation: &harmony_owner::certs::RevocationCert,
     enrollment: &harmony_owner::certs::EnrollmentCert,
-    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
-) -> Result<bool, DmReceiveError> {
+) -> Result<[u8; 32], DmReceiveError> {
     // 1. Master-signed revocation — `verify(None)` self-verifies the embedded
     //    master pub and binds `master.identity_hash() == revocation.owner_id`.
     revocation
         .verify(None)
         .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
     // 2. Trust-bind: the revocation AND the paired enrollment must belong to the
-    //    pushing friend. A friend may only revoke THEIR OWN devices — this is
+    //    pushing friend. A friend may only revoke THEIR OWN devices. This is
     //    what stops A relaying a (valid) third-party revocation into our
     //    projection. Both owner_ids are master-identity-hashes, so equality to
     //    `expected_owner` proves the same master signed both.
@@ -2446,9 +2448,19 @@ pub fn handle_revocation_push(
     if enrollment.device_id != revocation.target {
         return Err(DmReceiveError::OwnerFieldMismatch);
     }
-    // 4. Bridge target `device_id` → the revoked `ed25519`, store union-merged
-    //    (survives across the owner's devices), and feed the live projection.
-    let ed25519 = enrollment.device_pubkeys.classical.ed25519_verify;
+    Ok(enrollment.device_pubkeys.classical.ed25519_verify)
+}
+
+pub fn handle_revocation_push(
+    state: &mut OwnerState,
+    expected_owner: OwnerAddr,
+    revocation: &harmony_owner::certs::RevocationCert,
+    enrollment: &harmony_owner::certs::EnrollmentCert,
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
+) -> Result<bool, DmReceiveError> {
+    let ed25519 = verify_revocation_push(expected_owner, revocation, enrollment)?;
+    // Bridge target `device_id` → the revoked `ed25519`, store union-merged
+    // (survives across the owner's devices), and feed the live projection.
     let inserted = state.apply_revoked_dm_device(expected_owner, ed25519);
     let mut one = std::collections::BTreeSet::new();
     one.insert(ed25519);
@@ -3606,6 +3618,20 @@ mod tests {
             enrollment,
             revoked_ed,
         }
+    }
+
+    #[test]
+    fn verify_revocation_push_accepts_valid_and_rejects_tampered() {
+        let case = sample_revocation_case(); // existing test helper (RevCase)
+        let ed = verify_revocation_push(case.owner, &case.revocation, &case.enrollment)
+            .expect("valid pair verifies");
+        assert_eq!(ed, case.revoked_ed);
+        // Third-party owner (expected != revocation.owner) → OwnerFieldMismatch.
+        let other = crate::owner_state_types::OwnerAddr([0xEE; 16]);
+        assert!(matches!(
+            verify_revocation_push(other, &case.revocation, &case.enrollment),
+            Err(DmReceiveError::OwnerFieldMismatch)
+        ));
     }
 
     #[test]
