@@ -118,6 +118,14 @@ pub enum RejectionReason {
     OutboxEntryTombstoned,
 }
 
+/// ZEB-692: hard cap on the number of revoked #2 ed25519 keys retained per
+/// friend `OwnerAddr` in `revoked_dm_devices`. A real fleet is single-digit
+/// devices; 256 is a generous DoS backstop against a friend minting + revoking
+/// many synthetic devices. Enforced as "keep the smallest-N by byte order"
+/// (deterministic ⇒ convergent under the union merge — see
+/// `owner_state_sync::merge_remote_into_local`).
+pub const MAX_REVOKED_DM_DEVICES_PER_OWNER: usize = 256;
+
 impl OwnerState {
     /// Apply an incoming Space to the CRDT, handling per-kind dedupe,
     /// LWW field merge, ULID tie-break, and tombstone rejection.
@@ -898,19 +906,29 @@ impl OwnerState {
     }
 
     /// ZEB-685 (S3): union a revoked #2 ed25519 key into the friend-scoped
-    /// store. Returns true iff newly inserted (grow-only; idempotent). The
-    /// store is union-merged across the owner's devices (see
-    /// `owner_state_sync::merge_remote_into_local`), so a plain insert here is
-    /// safe — concurrent inserts converge to the union.
+    /// store, then enforce `MAX_REVOKED_DM_DEVICES_PER_OWNER` (ZEB-692).
+    /// Returns true iff a new key was added *and retained* (idempotent for
+    /// keys already present or evicted back out by the cap). The store is
+    /// union-merged across the owner's devices (see
+    /// `owner_state_sync::merge_remote_into_local`), so a plain insert
+    /// followed by the deterministic cap is safe — concurrent inserts
+    /// converge to the same capped set.
     pub fn apply_revoked_dm_device(
         &mut self,
         owner: crate::owner_state_types::OwnerAddr,
         ed25519: [u8; 32],
     ) -> bool {
-        self.revoked_dm_devices
-            .entry(owner)
-            .or_default()
-            .insert(ed25519)
+        let set = self.revoked_dm_devices.entry(owner).or_default();
+        let was_new = set.insert(ed25519);
+        // ZEB-692: keep the smallest-N by byte order. `pop_last` removes the
+        // greatest; a deterministic set→set function, so every device converges to
+        // the same capped set under the union merge. If the just-inserted key was
+        // itself the evicted max, the store is unchanged → report no net change so
+        // the caller does not spuriously `notify_dirty`.
+        while set.len() > MAX_REVOKED_DM_DEVICES_PER_OWNER {
+            set.pop_last();
+        }
+        was_new && set.contains(&ed25519)
     }
 
     /// ZEB-685 (S3): the owners of all currently-`Active` friendships — the DM
@@ -4263,6 +4281,47 @@ mod friend_graph_tests {
         assert!(!s.apply_revoked_dm_device(owner, [1u8; 32]), "idempotent");
         assert!(s.apply_revoked_dm_device(owner, [2u8; 32]));
         assert_eq!(s.revoked_dm_devices.get(&owner).unwrap().len(), 2);
+    }
+
+    /// ZEB-692: the friend-scoped revoked-device store caps at
+    /// `MAX_REVOKED_DM_DEVICES_PER_OWNER`, retaining the smallest-N keys by
+    /// byte order (`BTreeSet::pop_last` evicts the greatest).
+    #[test]
+    fn apply_revoked_dm_device_caps_at_max_keeping_smallest() {
+        let mut s = OwnerState::default();
+        let owner = crate::owner_state_types::OwnerAddr([0x11; 16]);
+        // Insert MAX distinct keys 1..=MAX (byte-encoded), all retained.
+        for i in 0..MAX_REVOKED_DM_DEVICES_PER_OWNER {
+            let mut ed = [0u8; 32];
+            ed[0] = ((i >> 8) & 0xff) as u8;
+            ed[1] = (i & 0xff) as u8;
+            assert!(s.apply_revoked_dm_device(owner, ed), "fresh key retained");
+        }
+        assert_eq!(
+            s.revoked_dm_devices.get(&owner).unwrap().len(),
+            MAX_REVOKED_DM_DEVICES_PER_OWNER
+        );
+        // A key GREATER than the current max is inserted-then-evicted → no net change → false.
+        let big = [0xff; 32];
+        assert!(
+            !s.apply_revoked_dm_device(owner, big),
+            "over-cap larger key not retained"
+        );
+        assert!(!s.revoked_dm_devices.get(&owner).unwrap().contains(&big));
+        assert_eq!(
+            s.revoked_dm_devices.get(&owner).unwrap().len(),
+            MAX_REVOKED_DM_DEVICES_PER_OWNER
+        );
+        // A key SMALLER than the current max evicts the max → net change → true.
+        let small = [0u8; 32]; // 0x0000… is smaller than any two-byte-tagged key above except itself
+        let was_present = s.revoked_dm_devices.get(&owner).unwrap().contains(&small);
+        let ret = s.apply_revoked_dm_device(owner, small);
+        assert_eq!(ret, !was_present, "small key retained iff it was new");
+        assert!(s.revoked_dm_devices.get(&owner).unwrap().contains(&small));
+        assert_eq!(
+            s.revoked_dm_devices.get(&owner).unwrap().len(),
+            MAX_REVOKED_DM_DEVICES_PER_OWNER
+        );
     }
 
     /// ZEB-685 (S3): `active_friend_owners` returns only `Active` friendships —
