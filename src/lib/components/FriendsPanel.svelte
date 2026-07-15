@@ -25,6 +25,7 @@
     FriendDto,
     PendingFriendRequestDto,
     ReferralView,
+    PeerIntroPolicy,
   } from '../friend-service';
   import type { DmInviteService, PendingDmInviteDto } from '../dm-invite-service';
   import {
@@ -95,6 +96,15 @@
   let referralsResults = $state<Map<string, ReferralView[]>>(new Map());
   let referralsError = $state<Map<string, string>>(new Map());
 
+  // ZEB-376 Phase 2b Task 14: per-row "request introduction" state, keyed by
+  // `${viaOwnerIdHex}:${targetOwnerIdHex}` (a referral target could in
+  // principle be browsed via more than one friend, so the composite key
+  // avoids collisions between rows). `requestIntroInFlight` guards duplicate
+  // clicks; `requestIntroStatus` holds a transient success/error message for
+  // that row. Mirrors the referrals* trio above.
+  let requestIntroInFlight = $state<Set<string>>(new Set());
+  let requestIntroStatus = $state<Map<string, string>>(new Map());
+
   // ── Phase 1b state ────────────────────────────────────────────────────────
 
   // Pending friend requests inbox.
@@ -158,6 +168,15 @@
   let autoAcceptLoading = $state(true);
   let autoAcceptSaving = $state(false);
   let autoAcceptError = $state<string | null>(null);
+
+  // ZEB-376 Phase 2b Task 14: inbound-introduction policy select. Mirrors the
+  // autoAccept* quartet above. Default mirrors the Rust `PeerIntroPolicy`
+  // derive default ('fof' — FriendsOfFriends) so the select shows a sane
+  // value even before `loadPeerIntroPolicy()` resolves.
+  let peerIntroPolicy = $state<PeerIntroPolicy>('fof');
+  let peerIntroPolicyLoading = $state(true);
+  let peerIntroPolicySaving = $state(false);
+  let peerIntroPolicyError = $state<string | null>(null);
 
   // Unsubscribe handles for our event listeners (set in onMount).
   let unsubscribeChanged: (() => void) | null = null;
@@ -228,6 +247,18 @@
       autoAcceptError = e instanceof Error ? e.message : String(e);
     } finally {
       autoAcceptLoading = false;
+    }
+  }
+
+  // ZEB-376 Phase 2b Task 14: mirrors loadAutoAccept above.
+  async function loadPeerIntroPolicy(): Promise<void> {
+    try {
+      peerIntroPolicy = await service.getPeerIntroPolicy();
+      peerIntroPolicyError = null;
+    } catch (e) {
+      peerIntroPolicyError = e instanceof Error ? e.message : String(e);
+    } finally {
+      peerIntroPolicyLoading = false;
     }
   }
 
@@ -314,6 +345,7 @@
     void refresh();
     void refreshPending();
     void loadAutoAccept();
+    void loadPeerIntroPolicy();
     void loadMyKey();
     void loadDiscoverable();
     // Keep the warning in lockstep with the discovery toggle wherever it's
@@ -497,6 +529,29 @@
       const next = new Set(referralsLoading);
       next.delete(ownerIdHex);
       referralsLoading = next;
+    }
+  }
+
+  // ZEB-376 Phase 2b Task 14: ask a friend (`viaOwnerIdHex`, the friend whose
+  // catalog we're browsing) to introduce us to one of their referrable friends
+  // (`targetOwnerIdHex`, the referral entry). The eventual link is async — it
+  // surfaces later via `friend-list-changed` — so this only reports whether the
+  // request was successfully SENT. Mirrors handleBrowseReferrals's per-row
+  // in-flight guard + transient status pattern.
+  async function handleRequestIntro(viaOwnerIdHex: string, targetOwnerIdHex: string): Promise<void> {
+    const key = `${viaOwnerIdHex}:${targetOwnerIdHex}`;
+    if (requestIntroInFlight.has(key)) return;
+    requestIntroInFlight = new Set(requestIntroInFlight).add(key);
+    try {
+      await service.requestIntroduction(viaOwnerIdHex, targetOwnerIdHex);
+      requestIntroStatus = new Map(requestIntroStatus).set(key, 'Introduction requested.');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      requestIntroStatus = new Map(requestIntroStatus).set(key, `Failed: ${msg}`);
+    } finally {
+      const next = new Set(requestIntroInFlight);
+      next.delete(key);
+      requestIntroInFlight = next;
     }
   }
 
@@ -696,6 +751,23 @@
     }
   }
 
+  // ZEB-376 Phase 2b Task 14: mirrors handleAutoAcceptToggle above, but the new
+  // value comes from the <select>'s change event rather than a toggle.
+  async function handlePeerIntroPolicyChange(e: Event): Promise<void> {
+    if (peerIntroPolicySaving) return;
+    const next = (e.target as HTMLSelectElement).value as PeerIntroPolicy;
+    peerIntroPolicySaving = true;
+    try {
+      await service.setPeerIntroPolicy(next);
+      peerIntroPolicy = next;
+      peerIntroPolicyError = null;
+    } catch (err) {
+      peerIntroPolicyError = err instanceof Error ? err.message : String(err);
+    } finally {
+      peerIntroPolicySaving = false;
+    }
+  }
+
   function shortId(hex: string): string {
     return hex.length > 12 ? `${hex.slice(0, 12)}…` : hex;
   }
@@ -885,6 +957,7 @@
             {:else}
               <ul class="referrals-list" data-testid="referrals-list">
                 {#each referralsResults.get(f.ownerIdHex)! as r (r.ownerIdHex)}
+                  {@const introKey = `${f.ownerIdHex}:${r.ownerIdHex}`}
                   <li class="referral-item" data-testid="referral-item">
                     <span class="referral-name" title={r.ownerIdHex}>
                       {r.display ?? shortId(r.ownerIdHex)}
@@ -892,6 +965,21 @@
                     {#if r.alreadyFriend}
                       <span class="already-friend-badge" data-testid="already-friend-badge">
                         already friends
+                      </span>
+                    {:else}
+                      <button
+                        type="button"
+                        class="secondary-btn small-btn"
+                        disabled={requestIntroInFlight.has(introKey)}
+                        onclick={() => handleRequestIntro(f.ownerIdHex, r.ownerIdHex)}
+                        data-testid="request-intro-btn"
+                      >
+                        {requestIntroInFlight.has(introKey) ? 'Requesting…' : 'Request introduction'}
+                      </button>
+                    {/if}
+                    {#if requestIntroStatus.has(introKey)}
+                      <span class="muted request-intro-status" data-testid="request-intro-status">
+                        {requestIntroStatus.get(introKey)}
                       </span>
                     {/if}
                   </li>
@@ -983,6 +1071,15 @@
             />
             <div class="friend-id">
               <span class="friend-name" data-testid="friend-name-{req.ownerIdHex}">{requestLabel(req)}</span>
+              {#if req.introducedBy}
+                <!-- ZEB-376 Task 11/14: this row is an AskMe-staged introduction
+                     offer rather than a plain Path-A link request — badge the
+                     voucher (F) so the user knows who's vouching before they
+                     Accept/Decline. -->
+                <span class="introduced-by-badge" data-testid="introduced-by-badge-{req.ownerIdHex}">
+                  introduced by {shortId(req.introducedBy)}
+                </span>
+              {/if}
               <button
                 type="button"
                 class="friend-addr identity-btn"
@@ -1152,6 +1249,29 @@
       <span class="toggle-label-text">Auto-accept friends I already know</span>
     </label>
   </div>
+
+  <!-- ── ZEB-376 Phase 2b Task 14: inbound-introduction policy ───────────── -->
+  <div class="action-block" data-testid="peer-intro-policy-section">
+    {#if peerIntroPolicyError}
+      <p class="error-text" data-testid="peer-intro-policy-error">{peerIntroPolicyError}</p>
+    {/if}
+    <label class="add-label" for="peer-intro-policy-select">
+      Who can ask a mutual friend to introduce them to me
+    </label>
+    <select
+      id="peer-intro-policy-select"
+      class="policy-select"
+      value={peerIntroPolicy}
+      disabled={peerIntroPolicyLoading || peerIntroPolicySaving}
+      onchange={handlePeerIntroPolicyChange}
+      data-testid="peer-intro-policy-select"
+    >
+      <option value="open">Open</option>
+      <option value="fof">Friends of friends</option>
+      <option value="ask">Ask me</option>
+      <option value="closed">Closed</option>
+    </select>
+  </div>
 </div>
 
 <style>
@@ -1257,6 +1377,7 @@
   .referral-item {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
     padding: 3px 0;
   }
@@ -1495,5 +1616,38 @@
   .toggle-label-text {
     font-size: 12px;
     color: var(--text-primary);
+  }
+
+  /* ZEB-376 Phase 2b Task 14: inbound-introduction policy select. */
+  .policy-select {
+    font-size: 12px;
+    padding: 6px 8px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+  }
+
+  .policy-select:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  /* ZEB-376 Task 11/14: "introduced by F" offer badge — mirrors
+     .already-friend-badge's pill shape. */
+  .introduced-by-badge {
+    align-self: flex-start;
+    font-size: 10px;
+    padding: 1px 8px;
+    border-radius: 20px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    font-family: var(--font-ui);
+  }
+
+  .request-intro-status {
+    flex-basis: 100%;
   }
 </style>

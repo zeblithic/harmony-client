@@ -383,6 +383,33 @@ describe('FriendService', () => {
     adapter.listeners.get('friend-request-received')!({ payload: null });
     expect(pendingCb).not.toHaveBeenCalled();
   });
+
+  // ── ZEB-376 Phase 2b: peer intro policy + request introduction ───────────
+
+  it('getPeerIntroPolicy invokes get_peer_intro_policy and returns the policy', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('ask');
+    const result = await service.getPeerIntroPolicy();
+    expect(adapter.invoke).toHaveBeenCalledWith('get_peer_intro_policy', {});
+    expect(result).toBe('ask');
+  });
+
+  it('setPeerIntroPolicy invokes set_peer_intro_policy with the policy arg', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.setPeerIntroPolicy('ask');
+    expect(adapter.invoke).toHaveBeenCalledWith('set_peer_intro_policy', { policy: 'ask' });
+  });
+
+  it('requestIntroduction invokes request_introduction with camelCase via/target args', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.requestIntroduction('ffee', 'aabb');
+    expect(adapter.invoke).toHaveBeenCalledWith('request_introduction', {
+      viaOwnerIdHex: 'ffee',
+      targetOwnerIdHex: 'aabb',
+    });
+  });
 });
 
 describe('contactsFromFriends', () => {

@@ -39,6 +39,11 @@ export type FriendStatus = 'pending' | 'active' | 'revoked';
  *  produces `token`. */
 export type FriendOrigin = 'mutual_key' | 'token' | 'introduction';
 
+/** Inbound-introduction policy (mirrors Rust `friend_graph::PeerIntroPolicy`).
+ *  Governs whether — and how — this node accepts an `IntroduceRequest` from a
+ *  friend on behalf of one of the local user's referrable friends. */
+export type PeerIntroPolicy = 'open' | 'fof' | 'ask' | 'closed';
+
 /**
  * Mirrors `FriendDto` in src-tauri/src/lib.rs (`#[serde(rename_all =
  * "camelCase")]`). `status` / `establishedVia` arrive as their lowercase
@@ -70,6 +75,10 @@ export interface PendingFriendRequestDto {
   ownerIdHex: string;
   display: string | null;
   receivedAtMs: number;
+  /** ZEB-376 Task 11 (AskMe): the voucher (F) owner hex when this row is an
+   *  AskMe-staged introduction offer; `null` for a plain Path-A link request.
+   *  Lets the UI badge the row as "introduced by …". */
+  introducedBy: string | null;
 }
 
 /**
@@ -336,6 +345,24 @@ export class FriendService {
    */
   async browseReferrals(ownerIdHex: string): Promise<ReferralView[]> {
     return this.invoke<ReferralView[]>('browse_friend_referrals', { ownerIdHex });
+  }
+
+  // ── Phase 2b: introduction broker ───────────────────────────────────────
+
+  /** Read the current inbound-introduction policy. */
+  async getPeerIntroPolicy(): Promise<PeerIntroPolicy> {
+    return this.invoke<PeerIntroPolicy>('get_peer_intro_policy', {});
+  }
+
+  /** Set the inbound-introduction policy (applies live on the next introduction). */
+  async setPeerIntroPolicy(policy: PeerIntroPolicy): Promise<void> {
+    await this.invoke<void>('set_peer_intro_policy', { policy });
+  }
+
+  /** Ask a friend (`viaOwnerIdHex`) to introduce us to one of their referrable
+   *  friends (`targetOwnerIdHex`). The eventual link surfaces via friend-list-changed. */
+  async requestIntroduction(viaOwnerIdHex: string, targetOwnerIdHex: string): Promise<void> {
+    await this.invoke<void>('request_introduction', { viaOwnerIdHex, targetOwnerIdHex });
   }
 
   destroy(): void {
