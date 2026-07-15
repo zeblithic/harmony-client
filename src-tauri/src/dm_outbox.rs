@@ -2393,26 +2393,7 @@ pub(crate) enum ApplyInviteOutcome {
 // The arg list is the receiver identity + the verified-invite triple + the
 // learned-at clock + the F1 inviter-bind hint; threading them through a struct
 // would not improve clarity at this single shared call boundary.
-/// ZEB-685 (S3): apply a friend-pushed device revocation. `expected_owner` is
-/// the tunnel-peer's resolved owner (a friend). Verifies the master-signed
-/// revocation + the paired enrollment, trust-binds BOTH to `expected_owner` (a
-/// friend may only revoke THEIR OWN devices — never relay a third party's
-/// revocation into our projection), bridges the cert target (`device_id[16]`)
-/// to the revoked `ed25519[32]` via the enrollment, stores it union-merged in
-/// the owner-state CRDT, and feeds the live `RevokedDeviceProjection` so the
-/// §5.2 DM cutoff rejects that device's DMs for this DM-only contact.
-///
-/// `pub` (not `pub(crate)`) so the end-to-end cutoff integration test can drive
-/// the real handler, mirroring the public `DmOutbox::handle_cidnotify_lifted`
-/// receive entrypoint it pairs with.
-///
-/// Returns `Ok(true)` iff a NEW revoked key was inserted into the owner-state
-/// CRDT store (`Ok(false)` on an idempotent re-apply). The caller uses this to
-/// mark the owner-state engine dirty ONLY on a genuine change — the store lives
-/// in the owner-state CRDT, which persists + replicates to sibling devices only
-/// via a `notify_dirty` flush, and RevocationPush has no deposit-rung backstop,
-/// so without this the revocation is lost on restart (boot-replay re-seeds
-/// nothing) and never reaches the owner's other devices.
+
 /// ZEB-691: the cert-verification + trust-bind core of `handle_revocation_push`,
 /// factored out so the butler acceptor can PRE-VALIDATE a deposited revocation
 /// (D7: never persist+ack a forgery) with the SAME authority the recipient uses
@@ -2428,7 +2409,7 @@ pub(crate) fn verify_revocation_push(
         .verify(None)
         .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
     // 2. Trust-bind: the revocation AND the paired enrollment must belong to the
-    //    pushing friend. A friend may only revoke THEIR OWN devices. This is
+    //    pushing friend. A friend may only revoke THEIR OWN devices — this is
     //    what stops A relaying a (valid) third-party revocation into our
     //    projection. Both owner_ids are master-identity-hashes, so equality to
     //    `expected_owner` proves the same master signed both.
@@ -2451,6 +2432,26 @@ pub(crate) fn verify_revocation_push(
     Ok(enrollment.device_pubkeys.classical.ed25519_verify)
 }
 
+/// ZEB-685 (S3): apply a friend-pushed device revocation. `expected_owner` is
+/// the tunnel-peer's resolved owner (a friend). Verifies the master-signed
+/// revocation + the paired enrollment, trust-binds BOTH to `expected_owner` (a
+/// friend may only revoke THEIR OWN devices — never relay a third party's
+/// revocation into our projection), bridges the cert target (`device_id[16]`)
+/// to the revoked `ed25519[32]` via the enrollment, stores it union-merged in
+/// the owner-state CRDT, and feeds the live `RevokedDeviceProjection` so the
+/// §5.2 DM cutoff rejects that device's DMs for this DM-only contact.
+///
+/// `pub` (not `pub(crate)`) so the end-to-end cutoff integration test can drive
+/// the real handler, mirroring the public `DmOutbox::handle_cidnotify_lifted`
+/// receive entrypoint it pairs with.
+///
+/// Returns `Ok(true)` iff a NEW revoked key was inserted into the owner-state
+/// CRDT store (`Ok(false)` on an idempotent re-apply). The caller uses this to
+/// mark the owner-state engine dirty ONLY on a genuine change — the store lives
+/// in the owner-state CRDT, which persists + replicates to sibling devices only
+/// via a `notify_dirty` flush, and RevocationPush has no deposit-rung backstop,
+/// so without this the revocation is lost on restart (boot-replay re-seeds
+/// nothing) and never reaches the owner's other devices.
 pub fn handle_revocation_push(
     state: &mut OwnerState,
     expected_owner: OwnerAddr,
