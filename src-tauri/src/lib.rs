@@ -896,6 +896,10 @@ pub struct NodeState {
     /// Phase 2: in-process StubTransport. Phase 3b replaces with a real
     /// adapter that pushes RuntimeAction::SendUnicastToDevice.
     dm_transport: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>>,
+    /// ZEB-691: the butler deposit client (same `Arc` set on the `DmOutbox`),
+    /// exposed here so `push_revocation_to_friends` can deposit a revocation to a
+    /// friend's own butler set. `None` until the node binds iroh.
+    butler_deposit_client: Option<std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>>,
     /// CRDT state Mutex (already constructed for SyncEngine; we hold a
     /// clone so the IPC handler can lock it independently of SyncEngine).
     /// Stored as Option because identity-restore can null out everything.
@@ -1784,6 +1788,7 @@ impl Default for NodeState {
             vine_feed_binding_stamped: false,
             dm_outbox: None,
             dm_transport: None,
+            butler_deposit_client: None,
             crdt_state: None,
             hlc_tracker: None,
             dm_device_id: None,
@@ -4080,6 +4085,13 @@ pub async fn start_node_inner(
             std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
         > = None;
         let mut dm_transport_arc: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>> = None;
+        // ZEB-691: lifted alongside `dm_outbox_arc` so the butler deposit client
+        // (built below only when iroh binds) is stored onto NodeState under the
+        // SAME install guard as `dm_outbox`/`crdt_state` — kept consistent with
+        // them on both the install and supersede paths. `None` until iroh binds.
+        let mut butler_deposit_client_for_state: Option<
+            std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>,
+        > = None;
         // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
         // adapter requests handed to the event loop. Both stay None /
         // empty when no owner identity is loaded (registry depends on
@@ -5180,8 +5192,15 @@ pub async fn start_node_inner(
                         enrolled: dm_inbox_enrolled,
                         // ZEB-580 S2: shared-community revocation cutoff handle.
                         revoked: revoked_device_projection.clone(),
-                        // ZEB-691 B6: wire the real hook
-                        notify_owner_state_dirty: None,
+                        // ZEB-691 B6: flush the owner-state CRDT after an
+                        // ingested friend-revocation mutates `revoked_dm_devices`
+                        // (persist + replicate). Same owner-state engine handle the
+                        // tunnel drain uses to build its `mark_owner_state_dirty`.
+                        notify_owner_state_dirty: {
+                            let e = std::sync::Arc::clone(&owner_state_engine_for_dirty);
+                            Some(std::sync::Arc::new(move || e.notify_dirty())
+                                as std::sync::Arc<dyn Fn() + Send + Sync>)
+                        },
                     });
                     // The ingest sweeper: one startup sweep (entries
                     // deposited while this device was offline), then one
@@ -9796,6 +9815,12 @@ pub async fn start_node_inner(
                                             ),
                                         },
                                     );
+                                    // ZEB-691: capture the SAME deposit-client
+                                    // Arc for NodeState (clone BEFORE the move
+                                    // below) so `push_revocation_to_friends` can
+                                    // deposit revocations to a friend's butler set.
+                                    butler_deposit_client_for_state =
+                                        Some(std::sync::Arc::clone(&deposit_client));
                                     outbox
                                         .lock()
                                         .await
@@ -10949,6 +10974,11 @@ pub async fn start_node_inner(
                         // handles on NodeState for send_dm IPC + (T7) drain tick.
                         guard.dm_outbox = dm_outbox_arc.clone();
                         guard.dm_transport = dm_transport_arc.clone();
+                        // ZEB-691: expose the butler deposit client for the
+                        // revocation fan-out (push_revocation_to_friends). Stored
+                        // through the SAME install guard as dm_outbox so both land
+                        // together on the non-superseded path (None if iroh unbound).
+                        guard.butler_deposit_client = butler_deposit_client_for_state.clone();
                         guard.crdt_state = crdt_state_for_state.clone();
                         guard.hlc_tracker = tracker_for_state.clone();
                         guard.dm_device_id = device_id_for_state.clone();
@@ -63473,6 +63503,7 @@ mod start_node_race_tests {
             vine_feed_binding_stamped: false,
             dm_outbox: None,
             dm_transport: None,
+            butler_deposit_client: None,
             crdt_state: None,
             hlc_tracker: None,
             dm_device_id: None,
