@@ -54440,6 +54440,74 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
     )
 }
 
+/// Set the per-user introduction policy (ZEB-376) and persist it to
+/// `connectivity-settings.json`. Unlike the friend-acceptor's auto-accept toggle
+/// (which is captured by value at start_node), this applies LIVE: X's
+/// `Introduction` handler reads the policy fresh from the settings file per
+/// inbound introduction, so a change takes effect on the next introduction with
+/// no restart.
+#[tauri::command]
+async fn set_peer_intro_policy(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    policy: crate::friend_graph::PeerIntroPolicy,
+) -> Result<(), String> {
+    let path = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .connectivity_settings_path
+            .clone()
+    };
+    let Some(path) = path else {
+        return Err("connectivity_settings_path missing".into());
+    };
+
+    {
+        // ZEB-629: file RMW under the process-global settings write lock.
+        let _settings_guard = connectivity_settings_write_lock().lock().await;
+        let rmw_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut settings =
+                connectivity_settings::ConnectivitySettings::load_or_default(&rmw_path);
+            settings.peer_intro_policy = policy;
+            settings
+                .save(&rmw_path)
+                .map_err(|e| format!("save connectivity-settings: {e}"))
+        })
+        .await
+        .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    }
+
+    if let Err(e) = app.emit(
+        "connectivity-peer-intro-policy-changed",
+        serde_json::json!({ "policy": policy }),
+    ) {
+        tracing::warn!(error = %e, "set_peer_intro_policy: emit failed");
+    }
+    Ok(())
+}
+
+/// Read the current introduction policy from the persisted settings. Returns the
+/// spec default (`FriendsOfFriends`) when the settings path is not initialized.
+#[tauri::command]
+async fn get_peer_intro_policy(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<crate::friend_graph::PeerIntroPolicy, String> {
+    let path = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .connectivity_settings_path
+            .clone()
+    };
+    let Some(path) = path else {
+        // Node not running / pkarr not initialized — return the spec default.
+        return Ok(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
+    };
+    Ok(connectivity_settings::ConnectivitySettings::load_or_default(&path).peer_intro_policy)
+}
+
 /// ZEB-419: serializes the nickname-file read-modify-write so two concurrent
 /// `set_friend_nickname` calls can't lose an update (load A, load B, save A, save
 /// B → A's change is lost). Reads in `list_friends` don't need it —
@@ -56234,6 +56302,48 @@ mod friend_ipc_tests {
             crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
                 .friend_auto_accept_known,
             "toggle back ON persists"
+        );
+    }
+
+    #[test]
+    fn set_peer_intro_policy_persists_round_trips() {
+        // Mirrors `set_friend_auto_accept_persists_round_trips`: the IPC's
+        // persistence half (independent of NodeState) — `set_peer_intro_policy`
+        // and `get_peer_intro_policy` both funnel through
+        // `ConnectivitySettings::load_or_default` / `::save`, so exercising that
+        // round trip directly covers the same logic without needing a live
+        // `tauri::AppHandle`/`State`.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Default (no file) is FriendsOfFriends (ZEB-376 spec default) — what
+        // `get_peer_intro_policy` returns when the file is absent.
+        assert_eq!(
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::FriendsOfFriends
+        );
+
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.peer_intro_policy = crate::friend_graph::PeerIntroPolicy::AskMe;
+        settings.save(&path).expect("save");
+        assert_eq!(
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::AskMe,
+            "AskMe persists"
+        );
+
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.peer_intro_policy = crate::friend_graph::PeerIntroPolicy::Closed;
+        settings.save(&path).expect("save");
+        assert_eq!(
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::Closed,
+            "Closed persists"
         );
     }
 
@@ -58417,6 +58527,9 @@ pub fn run() {
             decline_dm_invite,
             set_friend_auto_accept,
             get_friend_auto_accept,
+            // ZEB-376 Phase 2b Task 5: per-user introduction policy IPCs.
+            set_peer_intro_policy,
+            get_peer_intro_policy,
             set_friend_nickname,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
