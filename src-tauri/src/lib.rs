@@ -186,6 +186,7 @@ pub mod folder_ingest;
 pub mod folders;
 mod follows;
 pub mod friend_graph;
+pub mod friend_intro;
 pub mod friend_nicknames;
 pub mod friend_rendezvous;
 pub mod friend_requests;
