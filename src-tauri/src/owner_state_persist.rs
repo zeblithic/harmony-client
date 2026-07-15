@@ -121,6 +121,12 @@ struct CrdtFileV2 {
         default
     )]
     friend_graph: crate::friend_graph::FriendGraph,
+    /// ZEB-685 (S3): persisted friend-scoped DM device revocations (owner →
+    /// revoked #2 ed25519 keys). Absent in pre-ZEB-685 V2 files; `serde(default)`
+    /// loads those as empty (no schema-version bump — absent == empty).
+    /// `skip_serializing_if` keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    revoked_dm_devices: BTreeMap<crate::owner_state_types::OwnerAddr, BTreeSet<[u8; 32]>>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -135,6 +141,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             libraries: s.libraries.clone(),
             outbox_tombstones: s.outbox_tombstones.clone(),
             friend_graph: s.friend_graph.clone(),
+            revoked_dm_devices: s.revoked_dm_devices.clone(),
         }
     }
 }
@@ -151,6 +158,7 @@ impl From<CrdtFileV2> for OwnerState {
             libraries: f.libraries,
             outbox_tombstones: f.outbox_tombstones,
             friend_graph: f.friend_graph,
+            revoked_dm_devices: f.revoked_dm_devices,
         }
     }
 }

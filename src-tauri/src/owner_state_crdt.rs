@@ -74,6 +74,14 @@ pub struct OwnerState {
         default
     )]
     pub friend_graph: crate::friend_graph::FriendGraph,
+    /// ZEB-685 (S3): friend-scoped device revocations — owner → set of that
+    /// owner's revoked #2 ed25519 keys, learned from `RevocationPush` frames
+    /// pushed by that owner (a DM-only contact). Feeds `RevokedDeviceProjection`
+    /// for the DM cutoff. GROW-ONLY / union-merged (NOT LWW — a plain LWW field
+    /// would drop concurrent revocations across the owner's own devices; see
+    /// `owner_state_sync::merge_remote_into_local`). Additive on the wire.
+    #[serde(rename = "rd", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub revoked_dm_devices: BTreeMap<crate::owner_state_types::OwnerAddr, BTreeSet<[u8; 32]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -902,6 +910,22 @@ impl OwnerState {
     /// cannot be silently resurrected by a stale `Active` from another device.
     ///
     /// See ZEB-370 §4.1 and the spec's "Revocation" note in §7.
+    /// ZEB-685 (S3): union a revoked #2 ed25519 key into the friend-scoped
+    /// store. Returns true iff newly inserted (grow-only; idempotent). The
+    /// store is union-merged across the owner's devices (see
+    /// `owner_state_sync::merge_remote_into_local`), so a plain insert here is
+    /// safe — concurrent inserts converge to the union.
+    pub fn apply_revoked_dm_device(
+        &mut self,
+        owner: crate::owner_state_types::OwnerAddr,
+        ed25519: [u8; 32],
+    ) -> bool {
+        self.revoked_dm_devices
+            .entry(owner)
+            .or_default()
+            .insert(ed25519)
+    }
+
     pub fn apply_friend_update(
         &mut self,
         addr: crate::owner_state_types::OwnerAddr,
@@ -4215,6 +4239,18 @@ mod friend_graph_tests {
         owner_id_from_master_ed25519, FriendEntry, FriendOrigin, FriendStatus,
     };
     use crate::owner_state_types::{Hlc, OwnerAddr};
+
+    /// ZEB-685 (S3): the friend-scoped revoked-device store unions (grow-only)
+    /// and is idempotent.
+    #[test]
+    fn apply_revoked_dm_device_unions() {
+        let mut s = OwnerState::default();
+        let owner = OwnerAddr([7u8; 16]);
+        assert!(s.apply_revoked_dm_device(owner, [1u8; 32]));
+        assert!(!s.apply_revoked_dm_device(owner, [1u8; 32]), "idempotent");
+        assert!(s.apply_revoked_dm_device(owner, [2u8; 32]));
+        assert_eq!(s.revoked_dm_devices.get(&owner).unwrap().len(), 2);
+    }
 
     /// A real `(OwnerAddr, master_ed25519)` pair derived from a seeded
     /// `ed25519_dalek::SigningKey`, so the key↔master-key correspondence
