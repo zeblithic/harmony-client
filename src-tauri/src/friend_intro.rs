@@ -8,7 +8,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::iroh_friend_acceptor::verify_enrolled_device;
-use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr, OwnerAddr};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
+};
 use crate::reachability_record::ReachabilityAnnouncePayload;
 use crate::referral_catalog::{decode_strict, ReferralCodecError};
 use harmony_owner::certs::EnrollmentCert;
@@ -153,6 +155,153 @@ pub fn decode_introduce_request(bytes: &[u8]) -> Result<IntroduceRequest, Referr
     decode_strict(bytes)
 }
 
+/// F → X: a signed vouch. F's `sig` covers the subject's cert + reachability, so
+/// X can trust "F vouches this subject, reachable here, asked to meet me" — F
+/// cannot forge the subject (their Master-issued cert rides inside; F only
+/// relays it). `to_addr` binds X (re-aim guard).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Introduction {
+    #[serde(rename = "v")]
+    pub voucher: OwnerAddr,
+    #[serde(rename = "d")]
+    pub to_addr: OwnerAddr,
+    #[serde(rename = "u")]
+    pub subject: OwnerAddr,
+    #[serde(rename = "c")]
+    pub subject_cert: EnrollmentCert,
+    #[serde(rename = "r")]
+    pub reachability: ReachabilityAnnouncePayload,
+    #[serde(rename = "t")]
+    pub at: Hlc,
+    #[serde(
+        rename = "s",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub sig: [u8; 64],
+    #[serde(rename = "e")]
+    pub voucher_enrollment: EnrollmentCert,
+    #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
+    pub signer_certs: Vec<EnrollmentCert>,
+}
+
+/// Bytes F's device-#2 key signs for an [`Introduction`]. `"hin1"` domain tag +
+/// voucher + target(X) + subject + subject's cert + reachability + clock.
+pub fn introduction_sig_preimage(
+    voucher: OwnerAddr,
+    to_addr: OwnerAddr,
+    subject: OwnerAddr,
+    subject_cert: &EnrollmentCert,
+    reachability: &ReachabilityAnnouncePayload,
+    at: &Hlc,
+) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct P<'a> {
+        d: &'static str,
+        v: OwnerAddr,
+        t: OwnerAddr,
+        u: OwnerAddr,
+        c: &'a EnrollmentCert,
+        r: &'a ReachabilityAnnouncePayload,
+        h: &'a Hlc,
+    }
+    let mut out = Vec::new();
+    ciborium::into_writer(
+        &P {
+            d: "hin1",
+            v: voucher,
+            t: to_addr,
+            u: subject,
+            c: subject_cert,
+            r: reachability,
+            h: at,
+        },
+        &mut out,
+    )
+    .expect("fixed-shape encode is infallible");
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sign_introduction(
+    device2: &SigningKey,
+    voucher: OwnerAddr,
+    to_addr: OwnerAddr,
+    subject: OwnerAddr,
+    subject_cert: EnrollmentCert,
+    reachability: ReachabilityAnnouncePayload,
+    at: Hlc,
+    voucher_enrollment: EnrollmentCert,
+) -> Introduction {
+    let preimage =
+        introduction_sig_preimage(voucher, to_addr, subject, &subject_cert, &reachability, &at);
+    let sig = device2.sign(&preimage).to_bytes();
+    Introduction {
+        voucher,
+        to_addr,
+        subject,
+        subject_cert,
+        reachability,
+        at,
+        sig,
+        voucher_enrollment,
+        signer_certs: Vec::new(),
+    }
+}
+
+/// Verify an [`Introduction`] on X. Order: `to_addr`(us) → voucher-match →
+/// voucher cert+sig → subject cert. Does NOT run the reachability inner check
+/// (the caller runs `reachability_record::verify_inner_signature` +
+/// freshness, mapping failure to `ReachabilityInvalid`, so it can pass X's own
+/// clock/window) nor policy enforcement.
+pub fn verify_introduction(
+    intro: &Introduction,
+    expected_voucher: OwnerAddr,
+    expected_target: OwnerAddr,
+    now_secs: u64,
+) -> Result<(), IntroAuthError> {
+    if intro.to_addr != expected_target {
+        return Err(IntroAuthError::WrongTarget);
+    }
+    if intro.voucher != expected_voucher {
+        return Err(IntroAuthError::VoucherMismatch);
+    }
+    let vverified = verify_enrolled_device(
+        &intro.voucher_enrollment,
+        &intro.signer_certs,
+        intro.voucher,
+        now_secs,
+    )
+    .map_err(|_| IntroAuthError::Auth)?;
+    let vk = VerifyingKey::from_bytes(&vverified.device_ed25519)
+        .map_err(|_| IntroAuthError::SignatureInvalid)?;
+    let preimage = introduction_sig_preimage(
+        intro.voucher,
+        intro.to_addr,
+        intro.subject,
+        &intro.subject_cert,
+        &intro.reachability,
+        &intro.at,
+    );
+    vk.verify_strict(&preimage, &Signature::from_bytes(&intro.sig))
+        .map_err(|_| IntroAuthError::SignatureInvalid)?;
+    // Bind the subject's cert → subject owner (X pins this into the FriendEntry).
+    verify_enrolled_device(&intro.subject_cert, &[], intro.subject, now_secs)
+        .map_err(|_| IntroAuthError::Auth)?;
+    Ok(())
+}
+
+pub fn encode_introduction(intro: &Introduction) -> Result<Vec<u8>, ReferralCodecError> {
+    let mut out = Vec::new();
+    ciborium::into_writer(intro, &mut out)
+        .map_err(|e| ReferralCodecError::Encode(e.to_string()))?;
+    Ok(out)
+}
+
+pub fn decode_introduction(bytes: &[u8]) -> Result<Introduction, ReferralCodecError> {
+    decode_strict(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +359,42 @@ mod tests {
             authenticate_introduce_request(&req, broker.owner, 0),
             Err(IntroAuthError::SignatureInvalid),
         );
+    }
+
+    #[test]
+    fn introduction_verifies_and_binds_voucher_and_target() {
+        let voucher = mint_test_owner(0x22);
+        let subject = mint_test_owner(0x11);
+        let target = mint_test_owner(0x33); // X (self)
+        let intro = sign_introduction(
+            &voucher.device_key,
+            voucher.owner,
+            target.owner,
+            subject.owner,
+            subject.cert.clone(),
+            reach(),
+            hlc(5),
+            voucher.cert.clone(),
+        );
+        // X verifies: voucher == who we think F is, target == us.
+        verify_introduction(&intro, voucher.owner, target.owner, 0).expect("authentic");
+        // Wrong expected voucher → VoucherMismatch (before sig spend).
+        assert_eq!(
+            verify_introduction(&intro, OwnerAddr([0x77; 16]), target.owner, 0),
+            Err(IntroAuthError::VoucherMismatch),
+        );
+        // Relayed to the wrong X → WrongTarget.
+        assert_eq!(
+            verify_introduction(&intro, voucher.owner, OwnerAddr([0x88; 16]), 0),
+            Err(IntroAuthError::WrongTarget),
+        );
+    }
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "d".into(),
+        }
     }
 }
