@@ -2020,6 +2020,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_pending_revocation_deposit_arms_recipient_cutoff() {
+        // ZEB-691 (B7 e2e): a butler-deposited revocation — the EXACT
+        // `DmInboxEntry` shape `iroh_butler_acceptor::handle_deposit_core`
+        // persists under `revoke_key` (its B4 acceptor test pins
+        // `entry.revocation_push == Some(wire)` + a `REVOCATION_DEPOSIT_MARKER`
+        // ack) — is recovered by the REAL recipient sweeper. `ingest_pending`
+        // re-verifies through `handle_revocation_push` (never trusting the
+        // carrier), and arms BOTH cutoff surfaces: the live
+        // `RevokedDeviceProjection` and the owner-state `revoked_dm_devices`
+        // CRDT, marking owner-state dirty so the recovered revocation persists.
+        // This closes the B2-review gap: no prior test drove the SWEEPER (vs.
+        // `apply_revocation` directly) over a deposited revocation and proved
+        // the cutoff ends up armed.
+        let (owner, revocation, enrollment, revoked_ed) = sample_revocation();
+        let target = revocation.target;
+        let (ctx, crdt_state, dirty, revoked) = prod_ctx_with_dirty();
+
+        // Persist EXACTLY as the acceptor does: under revoke:{sender}:{target},
+        // carrying the signed RevocationPush and no message/invite half.
+        let key = DmInboxDoc::revoke_key(&owner.0, &target);
+        let entry = revocation_entry(owner.0, revocation, enrollment);
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+
+        assert!(
+            !revoked.is_revoked(&owner, &revoked_ed),
+            "projection empty before the sweep (baseline)"
+        );
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed, "the sweep applied the revocation (doc ig grew)");
+
+        // The recipient §5.2 cutoff is now armed on BOTH surfaces.
+        assert!(
+            revoked.is_revoked(&owner, &revoked_ed),
+            "the live RevokedDeviceProjection now rejects the revoked device"
+        );
+        {
+            let state = crdt_state.lock().await;
+            assert!(
+                state
+                    .revoked_dm_devices
+                    .get(&owner)
+                    .expect("owner has a revoked set")
+                    .contains(&revoked_ed),
+                "owner-state CRDT stored the revoked device key (cutoff armed)"
+            );
+        }
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "the recovered revocation marks owner-state dirty exactly once"
+        );
+        // The entry is applied then coverage-GC'd by the prod sweep (a fully
+        // ingested revocation has no re-delivery backstop — persistence rode the
+        // notify_dirty above); `changed` already confirmed the sweep mutated the
+        // doc, so we assert on the durable cutoff state, not the transient entry.
+    }
+
+    #[tokio::test]
     async fn stray_revocation_on_message_entry_is_not_hijacked() {
         // ZEB-691 (B4 review): `revocation_push` rides UNCONDITIONALLY on the
         // persisted entry, so a MESSAGE entry (cidnotify Some) carrying a
