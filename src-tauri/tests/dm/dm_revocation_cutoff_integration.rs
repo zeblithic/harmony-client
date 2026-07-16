@@ -532,6 +532,7 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
                 write_timeout: Duration::from_millis(10_000),
             },
             None,
+            None, // self_trust_doc — no revocations carried in this test
         )
         .await
         .expect("friend handshake must succeed");

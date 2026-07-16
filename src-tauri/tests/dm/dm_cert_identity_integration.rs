@@ -445,6 +445,7 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
                 write_timeout: Duration::from_millis(10_000),
             },
             None,
+            None, // self_trust_doc — no revocations carried in this test
         )
         .await
         .expect("friend handshake must succeed");

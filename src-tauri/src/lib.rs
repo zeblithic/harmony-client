@@ -9575,7 +9575,12 @@ pub async fn start_node_inner(
                             // the inbound friend verifiers reject a revoked device.
                             // The empty `with_config` default would silently disable
                             // enforcement — production MUST pass the live handle.
-                            .with_revoked(revoked_device_projection.clone()),
+                            .with_revoked(revoked_device_projection.clone())
+                            // ZEB-680 §2: wire the LIVE owner trust doc so each
+                            // signed accept carries this node's own-fleet
+                            // revocations, built fresh per handshake (a device
+                            // revoked after start_node is still carried).
+                            .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc))),
                         );
 
                         // ZEB-375 (Friends Phase 2a): build the friend-PEX
@@ -9640,7 +9645,11 @@ pub async fn start_node_inner(
                             // ZEB-680 §1: wire the REAL revoked-device projection so
                             // the inbound catalog + introduction verifiers reject a
                             // revoked device (empty default = no enforcement).
-                            .with_revoked(revoked_device_projection.clone()),
+                            .with_revoked(revoked_device_projection.clone())
+                            // ZEB-680 §2: wire the LIVE owner trust doc so X's
+                            // auto-Proceed introduction link carries X's own-fleet
+                            // revocations (built fresh per introduction).
+                            .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc))),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -51632,6 +51641,12 @@ pub async fn connectivity_link_friend_iroh_inner(
     // empty bundle; `Some` fills real values. The IPC wrapper builds this from
     // NodeState (identity pub + PQ keys) + the iroh endpoint.
     self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+    // ZEB-680 §2: live handle to this node's owner trust doc. Read FRESH at
+    // request-build time (below) to carry our own-fleet revocations on the
+    // FriendLinkRequest, so a NEW friend learns of past revokes at link time.
+    // `None` (tests) carries none. Obtained the same way the `revoke_device`
+    // path reaches its trust snapshot: `owner_trust_doc.lock().await.clone()`.
+    self_trust_doc: Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
 ) -> Result<FriendLinkOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
@@ -51803,6 +51818,13 @@ pub async fn connectivity_link_friend_iroh_inner(
             &req_devices_digest,
         ))
         .to_bytes();
+    // ZEB-680 §2: carry our own-fleet revocations, built FRESH from the live
+    // trust doc at request-build time (the revoke set is not folded into the
+    // request signature — each attestation is independently self-authenticating).
+    let self_revocations = match &self_trust_doc {
+        Some(doc) => crate::iroh_friend_acceptor::build_revocation_attestations(&*doc.lock().await),
+        None => Vec::new(),
+    };
     let request = FriendLinkRequest {
         from_addr: self_owner,
         display: self_display,
@@ -51819,7 +51841,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         home_relay_url: req_bundle.home_relay_url,
         pq_dsa_pubkey: req_bundle.pq_dsa_pubkey,
         pq_kem_pubkey: req_bundle.pq_kem_pubkey,
-        revocations: Vec::new(),
+        revocations: self_revocations,
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     // Write [u32 LE length-prefix][body], each bounded by write_timeout.
@@ -52101,6 +52123,7 @@ mod friend_redeem_expiry_tests {
                 write_timeout: Duration::from_millis(100),
             },
             None, // self_reachability — empty bundle for this test
+            None, // self_trust_doc — no revocations carried in this test
         )
         .await
         .expect_err("an expired friend token must be rejected before dialing");
@@ -53369,6 +53392,7 @@ pub(crate) async fn redeem_friend_token_impl(
         self_dsa_pubkey,
         self_kem_pubkey,
         revoked_device_projection,
+        owner_trust_doc,
     ) = {
         let g = state
             .lock()
@@ -53393,6 +53417,9 @@ pub(crate) async fn redeem_friend_token_impl(
             // `Some` whenever the owner is loaded). Threaded into the dialer driver
             // for revocation-aware verification. Required-`Some` below.
             g.revoked_device_projection.clone(),
+            // ZEB-680 §2: live owner trust doc handle, so the outbound request
+            // carries our own-fleet revocations (built fresh in the driver).
+            g.owner_trust_doc.clone(),
         )
     };
 
@@ -53460,6 +53487,7 @@ pub(crate) async fn redeem_friend_token_impl(
         revoked,
         HandshakeDialConfig::from_env(),
         self_reachability,
+        owner_trust_doc,
     )
     .await?;
 
@@ -54790,6 +54818,7 @@ pub(crate) async fn accept_friend_request_impl(
         self_dsa_pubkey,
         self_kem_pubkey,
         revoked_device_projection,
+        owner_trust_doc,
     ) = {
         let g = state
             .lock()
@@ -54813,6 +54842,10 @@ pub(crate) async fn accept_friend_request_impl(
             // `Some` whenever the owner is loaded). Threaded into the dialer driver
             // for revocation-aware verification. Required-`Some` below.
             g.revoked_device_projection.clone(),
+            // ZEB-680 §2: live owner trust doc handle, forwarded to
+            // `complete_introduction` so X's request carries our own-fleet
+            // revocations (built fresh in the driver).
+            g.owner_trust_doc.clone(),
         )
     };
     let Some(store) = store else {
@@ -54914,6 +54947,7 @@ pub(crate) async fn accept_friend_request_impl(
             friend_publisher,
             Some(std::sync::Arc::clone(&sink)),
             revoked,
+            owner_trust_doc,
         )
         .await;
 
@@ -55674,6 +55708,9 @@ pub async fn connectivity_add_friend_by_key_inner(
     // ZEB-461 Task 6: this node's own device bundle + reachability + PQ keys to
     // advertise in the request it signs. `None` ships the empty bundle.
     self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+    // ZEB-680 §2: live handle to this node's owner trust doc, forwarded to
+    // `link_over_connection` so the request carries our own-fleet revocations.
+    self_trust_doc: Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
 ) -> Result<AddFriendOutcome, String> {
     // 1. Decode the target's 64-byte transport identity pub (the "key" held OOB).
     let identity_pub: [u8; 64] = hex::decode(&identity_pub_hex)
@@ -55851,6 +55888,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         device_id,
         identity_pub_hex,
         revoked,
+        self_trust_doc,
     )
     .await
 }
@@ -55905,6 +55943,10 @@ pub(crate) async fn complete_introduction(
     // `link_over_connection` so the introducee's Accepted response is
     // revocation-checked. Owned (Arc-backed clone).
     revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    // ZEB-680 §2: live handle to this node's owner trust doc, forwarded to
+    // `link_over_connection` so X's request to the introducee carries X's
+    // own-fleet revocations. `None` (tests) carries none.
+    self_trust_doc: Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
 ) -> Result<AddFriendOutcome, String> {
     let target_addr = endpoint_addr_from_routing(&reachability)
         .map_err(|e| format!("synthesize introducee addr: {e}"))?;
@@ -55939,6 +55981,7 @@ pub(crate) async fn complete_introduction(
         device_id,
         hex::encode(subject.0),
         revoked,
+        self_trust_doc,
     )
     .await?;
 
@@ -56025,6 +56068,10 @@ pub(crate) async fn link_over_connection(
     // clone) so it survives the spawned introduction path; callers pass the real
     // NodeState handle, tests pass `RevokedDeviceProjection::new()`.
     revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    // ZEB-680 §2: live handle to this node's owner trust doc, read FRESH at
+    // request-build time (below) to carry our own-fleet revocations on the
+    // token-less FriendLinkRequest. `None` (tests) carries none.
+    self_trust_doc: Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
 ) -> Result<AddFriendOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
@@ -56075,6 +56122,12 @@ pub(crate) async fn link_over_connection(
             &req_devices_digest,
         ))
         .to_bytes();
+    // ZEB-680 §2: carry our own-fleet revocations, built FRESH from the live
+    // trust doc at request-build time (see the token-path build for rationale).
+    let self_revocations = match &self_trust_doc {
+        Some(doc) => crate::iroh_friend_acceptor::build_revocation_attestations(&*doc.lock().await),
+        None => Vec::new(),
+    };
     let request = FriendLinkRequest {
         from_addr: self_owner,
         display: self_display,
@@ -56090,7 +56143,7 @@ pub(crate) async fn link_over_connection(
         home_relay_url: req_bundle.home_relay_url,
         pq_dsa_pubkey: req_bundle.pq_dsa_pubkey,
         pq_kem_pubkey: req_bundle.pq_kem_pubkey,
-        revocations: Vec::new(),
+        revocations: self_revocations,
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     let write_prefix = async {
@@ -56355,6 +56408,7 @@ pub(crate) async fn add_friend_by_key_impl(
         self_dsa_pubkey,
         self_kem_pubkey,
         revoked_device_projection,
+        owner_trust_doc,
     ) = {
         let g = state
             .lock()
@@ -56379,6 +56433,9 @@ pub(crate) async fn add_friend_by_key_impl(
             // `Some` whenever the owner is loaded). Threaded into the dialer driver
             // for revocation-aware verification. Required-`Some` below.
             g.revoked_device_projection.clone(),
+            // ZEB-680 §2: live owner trust doc handle, so the outbound request
+            // carries our own-fleet revocations (built fresh in the driver).
+            g.owner_trust_doc.clone(),
         )
     };
 
@@ -56438,6 +56495,7 @@ pub(crate) async fn add_friend_by_key_impl(
         revoked,
         HandshakeDialConfig::from_env(),
         self_reachability,
+        owner_trust_doc,
     )
     .await?;
 

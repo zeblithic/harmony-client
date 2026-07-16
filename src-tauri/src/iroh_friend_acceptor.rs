@@ -337,6 +337,52 @@ pub struct RevocationAttestation {
     pub enrollment: Box<EnrollmentCert>,
 }
 
+/// ZEB-680 §2 (send side): build the own-fleet revocation attestations to carry
+/// on an outbound friend-link frame, from the owner's live trust snapshot.
+///
+/// Mirrors `owner_commands::push_revocation_to_friends`'s pairing: for each
+/// `RevocationCert` in the trust `OwnerState`, pair it with the retired device's
+/// `EnrollmentCert` (`enrollments.get(&rc.target)`), skipping — with the same
+/// warn as the push path — any revocation with no enrollment on record.
+///
+/// Only **Master-issued** revocations are carried. The receive-side
+/// `dm_outbox::verify_revocation_push` accepts Master-issued certs only, so
+/// carrying a `SelfDevice`/`Quorum`-issued revocation would make an honest
+/// receiver reject the *entire* handshake (fail-closed) — the worst outcome for
+/// a legitimate link. Excluding them here keeps the carry purely additive.
+///
+/// The result is capped at [`MAX_CARRIED_REVOCATIONS`], keeping the smallest-N
+/// by `revocation.target` byte order (the ZEB-692 store-cap convention) so the
+/// selection is deterministic and the emitted bytes are stable.
+pub fn build_revocation_attestations(
+    trust: &harmony_owner::state::OwnerState,
+) -> Vec<RevocationAttestation> {
+    use harmony_owner::certs::RevocationIssuer;
+    let mut atts: Vec<RevocationAttestation> = trust
+        .revocations
+        .iter()
+        .filter(|rc| matches!(rc.issuer, RevocationIssuer::Master { .. }))
+        .filter_map(|rc| match trust.enrollments.get(&rc.target) {
+            Some(enrollment) => Some(RevocationAttestation {
+                revocation: rc.clone(),
+                enrollment: Box::new(enrollment.clone()),
+            }),
+            None => {
+                tracing::warn!(
+                    target = %hex::encode(rc.target),
+                    "ZEB-680: no enrollment for revoked device; skipping carried attestation"
+                );
+                None
+            }
+        })
+        .collect();
+    // Deterministic smallest-N selection (`RevocationSet::iter` yields HashMap
+    // order): sort by revocation target, then truncate to the cap.
+    atts.sort_unstable_by(|a, b| a.revocation.target.cmp(&b.revocation.target));
+    atts.truncate(MAX_CARRIED_REVOCATIONS);
+    atts
+}
+
 /// A friend-link request: "I am owner `from_addr`; here is my proof (cert +
 /// device-#2 signature) and the friend-token signature I am redeeming; please
 /// add me and reply with your own proof."
@@ -1193,6 +1239,13 @@ pub fn process_friend_request(
     // introduction is stamped as such rather than the no-token `MutualKey`
     // default. `None` preserves the token/mutual-key derivation below.
     origin_override: Option<crate::friend_graph::FriendOrigin>,
+    // ZEB-680 §2: this node's own-fleet revocation attestations to carry on the
+    // signed accept, built FRESH from the live trust snapshot by the dispatch
+    // caller (`build_revocation_attestations`). Placed verbatim into the Accepted
+    // literal; `Vec::new()` (tests / pre-identity) carries nothing. Not folded
+    // into the accept signature — each pair is independently self-authenticating
+    // (ZEB-677 `signer_certs` precedent).
+    self_revocations: Vec<RevocationAttestation>,
 ) -> Result<FriendLinkAccepted, FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key (and the
     // master anchor, recovered from the signer bundle for quorum certs).
@@ -1389,7 +1442,7 @@ pub fn process_friend_request(
         home_relay_url,
         pq_dsa_pubkey,
         pq_kem_pubkey,
-        revocations: Vec::new(),
+        revocations: self_revocations,
     })
 }
 
@@ -1462,6 +1515,14 @@ where
     /// round-trip resolves (or flaps) after `start_node`. `None` in tests / when
     /// iroh didn't bind — the accept advertises no relay.
     self_home_relay_refresh: Option<HomeRelayRefresh>,
+    /// ZEB-680 §2: live handle to this node's owner trust doc, read FRESH each
+    /// handshake to build the own-fleet revocation attestations carried on the
+    /// signed accept (`current_fresh_revocations` →
+    /// `build_revocation_attestations`). A live handle — NOT a frozen boot
+    /// snapshot — so a device revoked after `start_node` is still carried
+    /// (mirrors the ZEB-621 `self_home_relay_refresh` fresh-read discipline).
+    /// `None` in tests / when the owner isn't loaded → the accept carries none.
+    self_trust_doc: Option<Arc<TokioMutex<harmony_owner::state::OwnerState>>>,
     /// ZEB-680 §1: the live by-owner revoked-device projection, consulted by the
     /// inbound `verify_enrolled_device` (via `authenticate_friend_request` +
     /// `process_friend_request`). A plain (non-`Option`) field — every path,
@@ -1543,6 +1604,10 @@ where
             // ZEB-521: default to no live refresh; production wires it from the
             // iroh endpoint so the advertised home relay is read fresh per accept.
             self_home_relay_refresh: None,
+            // ZEB-680 §2: default to no trust doc → the accept carries no
+            // revocations; production wires the live handle via
+            // `with_self_trust_doc` so they are built fresh per handshake.
+            self_trust_doc: None,
             // ZEB-680 §1: default to the EMPTY projection (revokes nothing) —
             // production overrides via `with_revoked` with the real NodeState
             // handle. Tests keep the empty default.
@@ -1641,6 +1706,19 @@ where
         self
     }
 
+    /// ZEB-680 §2: wire the live owner trust doc so each signed accept carries
+    /// this node's own-fleet revocation attestations, built FRESH per handshake
+    /// (a device revoked after `start_node` is still carried — no boot snapshot).
+    /// Fluent setter (default `None`, used by tests) so existing call sites keep
+    /// compiling; `None` carries no revocations.
+    pub fn with_self_trust_doc(
+        mut self,
+        trust_doc: Option<Arc<TokioMutex<harmony_owner::state::OwnerState>>>,
+    ) -> Self {
+        self.self_trust_doc = trust_doc;
+        self
+    }
+
     /// ZEB-521/621: the live endpoint's CURRENT home relay (or `None` when no
     /// refresh closure is wired — tests/iroh-unbound — or the relay still hasn't
     /// resolved). Passed into [`process_friend_request`] as the SOLE `home_relay_url`
@@ -1648,6 +1726,19 @@ where
     /// `Option<String>`, no bundle clone.
     fn current_fresh_home_relay(&self) -> Option<String> {
         self.self_home_relay_refresh.as_ref().and_then(|f| f())
+    }
+
+    /// ZEB-680 §2: build this node's own-fleet revocation attestations FRESH from
+    /// the live trust doc, for the accept about to be signed. Locks the trust doc
+    /// (cloned under the guard is avoided — the builder borrows it) and drops the
+    /// guard before returning, so it is never held across the subsequent
+    /// `crdt_state` lock at the call site. `None` trust doc (tests / owner not
+    /// loaded) → carries nothing.
+    async fn current_fresh_revocations(&self) -> Vec<RevocationAttestation> {
+        match &self.self_trust_doc {
+            Some(doc) => build_revocation_attestations(&*doc.lock().await),
+            None => Vec::new(),
+        }
     }
 
     /// Reconcile the published Case-D friend slots with the current friend graph
@@ -1884,6 +1975,9 @@ where
                 // signed accept advertises a resolvable relay even though iroh's
                 // relay round-trip often hasn't resolved at start_node time.
                 let fresh_home_relay = self.current_fresh_home_relay();
+                // ZEB-680 §2: build our own-fleet revocations fresh from the live
+                // trust doc, before the crdt_state lock (never both at once).
+                let self_revocations = self.current_fresh_revocations().await;
                 let accepted = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
@@ -1900,6 +1994,7 @@ where
                         self.self_statics.as_ref(),
                         fresh_home_relay,
                         None,
+                        self_revocations,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1922,6 +2017,9 @@ where
                 // signed accept advertises a resolvable relay even though iroh's
                 // relay round-trip often hasn't resolved at start_node time.
                 let fresh_home_relay = self.current_fresh_home_relay();
+                // ZEB-680 §2: build our own-fleet revocations fresh from the live
+                // trust doc, before the crdt_state lock (never both at once).
+                let self_revocations = self.current_fresh_revocations().await;
                 let accepted = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
@@ -1938,6 +2036,7 @@ where
                         self.self_statics.as_ref(),
                         fresh_home_relay,
                         None,
+                        self_revocations,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -1957,6 +2056,9 @@ where
                 // `established_via: Introduction` via the origin override.
                 let learned_at = self.next_hlc().await;
                 let fresh_home_relay = self.current_fresh_home_relay();
+                // ZEB-680 §2: build our own-fleet revocations fresh from the live
+                // trust doc, before the crdt_state lock (never both at once).
+                let self_revocations = self.current_fresh_revocations().await;
                 let accepted = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
@@ -1973,6 +2075,7 @@ where
                         self.self_statics.as_ref(),
                         fresh_home_relay,
                         Some(crate::friend_graph::FriendOrigin::Introduction),
+                        self_revocations,
                     )
                     .map_err(FriendAcceptError::Handshake)?
                 };
@@ -2613,6 +2716,144 @@ mod tests {
         );
     }
 
+    // ---- ZEB-680 T4: `build_revocation_attestations` (send-side builder) ----
+
+    /// ZEB-680 T4: the builder pairs each Master-issued revocation with its
+    /// device enrollment, skips revocations with no enrollment on record, and
+    /// caps the result at `MAX_CARRIED_REVOCATIONS`, keeping the smallest-N by
+    /// `revocation.target` byte order (deterministic selection + stable wire).
+    #[test]
+    fn builder_pairs_and_caps() {
+        use harmony_owner::crdt::RevocationSet;
+
+        // Case 1: three Master-issued revocations, one with no enrollment on
+        // record → exactly two paired attestations (the unpaired one skipped).
+        let a = revocation_attestation(0x01);
+        let b = revocation_attestation(0x02);
+        let c = revocation_attestation(0x03);
+        let mut trust = harmony_owner::state::OwnerState {
+            revocations: RevocationSet::from(vec![
+                a.revocation.clone(),
+                b.revocation.clone(),
+                c.revocation.clone(),
+            ]),
+            ..Default::default()
+        };
+        trust
+            .enrollments
+            .insert(a.revocation.target, (*a.enrollment).clone());
+        trust
+            .enrollments
+            .insert(b.revocation.target, (*b.enrollment).clone());
+        // c's enrollment is deliberately absent.
+
+        let out = build_revocation_attestations(&trust);
+        assert_eq!(out.len(), 2, "the unpaired revocation (c) must be skipped");
+        let carried: std::collections::HashSet<[u8; 16]> =
+            out.iter().map(|att| att.revocation.target).collect();
+        assert!(carried.contains(&a.revocation.target));
+        assert!(carried.contains(&b.revocation.target));
+        assert!(
+            !carried.contains(&c.revocation.target),
+            "c has no enrollment on record → skipped"
+        );
+
+        // Case 2: 33 Master-issued revocations, all with enrollments → capped at
+        // 32, keeping the smallest-N by target byte order, returned ascending.
+        let atts: Vec<RevocationAttestation> = (0u8..=MAX_CARRIED_REVOCATIONS as u8)
+            .map(revocation_attestation)
+            .collect();
+        assert_eq!(atts.len(), MAX_CARRIED_REVOCATIONS + 1);
+        let mut trust = harmony_owner::state::OwnerState {
+            revocations: RevocationSet::from(
+                atts.iter()
+                    .map(|att| att.revocation.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            ..Default::default()
+        };
+        for att in &atts {
+            trust
+                .enrollments
+                .insert(att.revocation.target, (*att.enrollment).clone());
+        }
+
+        let out = build_revocation_attestations(&trust);
+        assert_eq!(
+            out.len(),
+            MAX_CARRIED_REVOCATIONS,
+            "over-cap set truncated to the cap"
+        );
+        // Expected: the 32 smallest targets, ascending (targets derive from a
+        // device-key hash, so we compute the ordering from the actual set).
+        let mut all_targets: Vec<[u8; 16]> = atts.iter().map(|att| att.revocation.target).collect();
+        all_targets.sort_unstable();
+        let expected: Vec<[u8; 16]> = all_targets[..MAX_CARRIED_REVOCATIONS].to_vec();
+        let got: Vec<[u8; 16]> = out.iter().map(|att| att.revocation.target).collect();
+        assert_eq!(got, expected, "keep smallest-N by target, sorted ascending");
+        assert!(
+            !got.contains(all_targets.last().unwrap()),
+            "the single largest target is dropped"
+        );
+    }
+
+    /// ZEB-680 T4: a SelfDevice-issued revocation — even WITH its enrollment on
+    /// record — is excluded (only Master-issued are carried; the receive-side
+    /// `verify_revocation_push` accepts Master only, so a SelfDevice attestation
+    /// would fail-close an honest handshake).
+    #[test]
+    fn builder_skips_non_master_issued() {
+        use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
+        use harmony_owner::crdt::RevocationSet;
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+
+        let seed = 0x40u8;
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let master_bundle = PubKeyBundle::classical_only(master_sk.verifying_key().to_bytes());
+        let owner_id = master_bundle.identity_hash();
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0x5a; 32]);
+        let device_bundle = PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes());
+        let device_id = device_bundle.identity_hash();
+        let self_enrollment = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            device_bundle,
+            1_700_000_000,
+            None,
+        )
+        .expect("mint enrollment");
+        let self_rev = RevocationCert::sign_self(
+            &device_sk,
+            owner_id,
+            device_id,
+            1_700_000_000,
+            RevocationReason::Compromised,
+        )
+        .expect("mint self-issued revocation");
+
+        // A Master-issued attestation that MUST be carried, to prove the filter
+        // excludes by issuer (not by dropping everything).
+        let master = revocation_attestation(0x41);
+
+        let mut trust = harmony_owner::state::OwnerState {
+            revocations: RevocationSet::from(vec![self_rev.clone(), master.revocation.clone()]),
+            ..Default::default()
+        };
+        trust.enrollments.insert(device_id, self_enrollment);
+        trust
+            .enrollments
+            .insert(master.revocation.target, (*master.enrollment).clone());
+
+        let out = build_revocation_attestations(&trust);
+        assert_eq!(out.len(), 1, "the SelfDevice-issued revocation is excluded");
+        assert_eq!(out[0].revocation.target, master.revocation.target);
+        assert!(matches!(
+            out[0].revocation.issuer,
+            harmony_owner::certs::RevocationIssuer::Master { .. }
+        ));
+    }
+
     #[test]
     fn verify_enrolled_device_accepts_valid_cert() {
         let owner = mint_test_owner(0x31);
@@ -3043,6 +3284,7 @@ mod tests {
             // source), and — like the statics — is folded into the signed digest.
             Some("https://relay.example/accept".to_string()),
             None,
+            vec![],
         )
         .expect("processed");
         // The accept must actually carry the signed reachability (not empty).
@@ -3138,6 +3380,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
         .expect("valid request processed");
 
@@ -3241,6 +3484,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
         .expect("processed");
 
@@ -3285,6 +3529,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
         .expect_err("bad sig rejected");
         assert!(matches!(err, FriendHandshakeError::SignatureInvalid));
@@ -3346,6 +3591,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
         .expect_err("owner-mismatched cert rejected");
         assert!(matches!(err, FriendHandshakeError::EnrollmentOwnerMismatch));
@@ -3438,6 +3684,7 @@ mod tests {
             Some(&sample_statics()),
             Some("https://relay.live/".to_string()),
             None,
+            vec![],
         )
         .expect("processed");
         assert_eq!(
@@ -3477,6 +3724,7 @@ mod tests {
             Some(&sample_statics()),
             None,
             None,
+            vec![],
         )
         .expect("processed");
         assert!(
@@ -3864,6 +4112,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
         .expect("processed");
         let entry = state
@@ -3903,6 +4152,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
         .expect("processed");
         assert!(
@@ -3997,6 +4247,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
         .expect("processed");
         let entry = state
@@ -4092,6 +4343,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
         .expect("no-token request processed");
         let entry = state

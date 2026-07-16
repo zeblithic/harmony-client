@@ -150,6 +150,12 @@ pub struct IrohFriendPexAcceptor {
     /// nothing) and production overrides it with the real `NodeState` handle via
     /// [`Self::with_revoked`]. Clone shares the inner `Arc<RwLock<..>>`.
     revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    /// ZEB-680 §2: live handle to this node's owner trust doc. Cloned into the
+    /// spawned X→introducee link (`spawn_complete_introduction`) so X's request
+    /// carries X's own-fleet revocations, built FRESH from the live trust snapshot
+    /// per introduction. `None` (tests / owner not loaded) carries none;
+    /// production wires the real `NodeState` handle via [`Self::with_self_trust_doc`].
+    self_trust_doc: Option<Arc<TokioMutex<harmony_owner::state::OwnerState>>>,
 }
 
 impl IrohFriendPexAcceptor {
@@ -206,6 +212,9 @@ impl IrohFriendPexAcceptor {
             // production overrides via `with_revoked` with the real NodeState
             // handle. Tests keep the empty default.
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            // ZEB-680 §2: default to no trust doc → X's introduction link carries
+            // no revocations; production wires the live handle.
+            self_trust_doc: None,
         }
     }
 
@@ -319,6 +328,17 @@ impl IrohFriendPexAcceptor {
         self
     }
 
+    /// ZEB-680 §2: wire the live owner trust doc so X's auto-`Proceed`
+    /// introduction link carries X's own-fleet revocations (built fresh per
+    /// introduction). Fluent setter (default `None` from `with_config`).
+    pub fn with_self_trust_doc(
+        mut self,
+        trust_doc: Option<Arc<TokioMutex<harmony_owner::state::OwnerState>>>,
+    ) -> Self {
+        self.self_trust_doc = trust_doc;
+        self
+    }
+
     /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
     /// `iroh_friend_acceptor::IrohFriendHandshakeAcceptor::next_hlc`.
     async fn next_hlc(&self) -> Hlc {
@@ -381,6 +401,9 @@ impl IrohFriendPexAcceptor {
         // ZEB-680 §1: clone the live projection into the spawned task so X's
         // introducee link verifies the Accepted response against revocations.
         let revoked = self.revoked.clone();
+        // ZEB-680 §2: clone the live trust doc handle so X's request carries X's
+        // own-fleet revocations (built fresh from the snapshot in the driver).
+        let self_trust_doc = self.self_trust_doc.clone();
         tokio::spawn(async move {
             match crate::complete_introduction(
                 subject,
@@ -402,6 +425,7 @@ impl IrohFriendPexAcceptor {
                 friend_publisher,
                 event_sink,
                 revoked,
+                self_trust_doc,
             )
             .await
             {
