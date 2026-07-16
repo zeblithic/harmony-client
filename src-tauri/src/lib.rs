@@ -54108,10 +54108,12 @@ async fn request_introduction(
     )
     .map_err(|e| format!("build self reachability: {e}"))?;
 
-    // 5. Pre-authorize X BEFORE dialing F — so X's introduction-driven inbound
-    //    link auto-accepts (Task 8's `AcceptInlineIntroduced`) even if F relays
-    //    and X dials us back before this call returns.
-    pending_outbound.record(target_owner, crate::iroh_friend_acceptor::wall_now_ms());
+    // 5. (Pre-authorization of X is deliberately DEFERRED to step 11, AFTER F
+    //    acks receipt of the IntroduceRequest — see there. Arming it here, before
+    //    the resolve/dial/send below, would leave a stale one-shot auto-accept
+    //    for X on ANY of those failures: an ordinary authenticated handshake from
+    //    X within the TTL could then bypass consent and be mislabeled as an
+    //    introduction, even though none was ever delivered.)
 
     // 6. Build + device-#2-sign the IntroduceRequest (subject=us, broker=F,
     //    target=X), folding in our fresh reachability + our enrollment cert.
@@ -54284,6 +54286,16 @@ async fn request_introduction(
             return Err("friend unreachable: introduce request ack timeout".to_string());
         }
     }
+
+    // 11. F acked — it received the IntroduceRequest and will relay the
+    //     Introduction, so X will dial us back. ONLY NOW arm the one-shot
+    //     pre-authorization so X's introduction-driven inbound link auto-accepts
+    //     (Task 8's `AcceptInlineIntroduced`). Deferring to here — vs. before the
+    //     resolve/dial/send — means a failed or undelivered request leaves NO
+    //     stale auto-accept for X (closes the consent-bypass-on-failure raised in
+    //     review). No race: X can only dial after the full F→X relay, many
+    //     round-trips after this returns.
+    pending_outbound.record(target_owner, crate::iroh_friend_acceptor::wall_now_ms());
 
     drop(send);
     drop(recv);
