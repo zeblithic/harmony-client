@@ -51806,6 +51806,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         home_relay_url: req_bundle.home_relay_url,
         pq_dsa_pubkey: req_bundle.pq_dsa_pubkey,
         pq_kem_pubkey: req_bundle.pq_kem_pubkey,
+        revocations: Vec::new(),
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     // Write [u32 LE length-prefix][body], each bounded by write_timeout.
@@ -56025,6 +56026,7 @@ pub(crate) async fn link_over_connection(
         home_relay_url: req_bundle.home_relay_url,
         pq_dsa_pubkey: req_bundle.pq_dsa_pubkey,
         pq_kem_pubkey: req_bundle.pq_kem_pubkey,
+        revocations: Vec::new(),
     };
     let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
     let write_prefix = async {

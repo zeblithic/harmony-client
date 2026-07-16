@@ -32,7 +32,7 @@
 use crate::owner_state_types::{
     deserialize_bytes_from_bstr, serialize_bytes_as_bstr, DeviceIdentityHash, OwnerAddr,
 };
-use harmony_owner::certs::EnrollmentCert;
+use harmony_owner::certs::{EnrollmentCert, RevocationCert};
 use serde::{Deserialize, Serialize};
 
 /// Serde for `Option<[u8; 64]>` as an optional CBOR bstr (None → CBOR null /
@@ -239,6 +239,65 @@ mod vec_devhash_capped {
     }
 }
 
+/// Serde for `revocations: Vec<RevocationAttestation>` (ZEB-680) that REJECTS a
+/// sequence longer than [`MAX_CARRIED_REVOCATIONS`] on decode — the established
+/// hostile-peer convention (same shape as [`vec_devhash_capped`] /
+/// `vec_opt_bstr64`: over-cap is a HARD decode error that rejects the frame,
+/// never truncation). Serialize is a plain pass-through (byte-identical to the
+/// derived `Vec` impl), so the send side never emits more than the sender chose
+/// to carry.
+mod vec_revocation_capped {
+    use super::{RevocationAttestation, MAX_CARRIED_REVOCATIONS};
+    use serde::de::{Error as DeError, SeqAccess, Visitor};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[RevocationAttestation], s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for a in v {
+            seq.serialize_element(a)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<RevocationAttestation>, D::Error> {
+        struct CapVisitor;
+        impl<'de> Visitor<'de> for CapVisitor {
+            type Value = Vec<RevocationAttestation>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "an array of at most {MAX_CARRIED_REVOCATIONS} revocation attestations"
+                )
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                if let Some(n) = seq.size_hint() {
+                    if n > MAX_CARRIED_REVOCATIONS {
+                        return Err(A::Error::custom(format!(
+                            "revocations array length {n} exceeds MAX_CARRIED_REVOCATIONS ({MAX_CARRIED_REVOCATIONS})"
+                        )));
+                    }
+                }
+                let cap = seq.size_hint().unwrap_or(0).min(MAX_CARRIED_REVOCATIONS);
+                let mut out: Vec<RevocationAttestation> = Vec::with_capacity(cap);
+                while let Some(elem) = seq.next_element::<RevocationAttestation>()? {
+                    if out.len() >= MAX_CARRIED_REVOCATIONS {
+                        return Err(A::Error::custom(format!(
+                            "revocations array exceeds MAX_CARRIED_REVOCATIONS ({MAX_CARRIED_REVOCATIONS})"
+                        )));
+                    }
+                    out.push(elem);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(CapVisitor)
+    }
+}
+
 /// Maximum bytes the acceptor reads per friend-handshake packet. The wire shape
 /// is `[u32 LE length-prefix][body]`; any prefix exceeding this is rejected to
 /// defend against memory-exhaustion by an adversarial dialer. 256 KiB matches
@@ -246,6 +305,37 @@ mod vec_devhash_capped {
 /// legitimate request (an `EnrollmentCert` + two `[u8;64]` sigs fit in single-
 /// digit KB).
 pub const FRIEND_MAX_PACKET_LEN: usize = 256 * 1024;
+
+/// ZEB-680: hard cap on the number of [`RevocationAttestation`]s carried on a
+/// single friend-link frame. Exceeding it on decode is a HARD error that rejects
+/// the frame (the hostile-peer convention shared with `MAX_DEVICES_PER_OWNER`),
+/// never truncation. Send side sends at most this many (smallest-N by byte order
+/// for determinism, matching the ZEB-692 per-owner store cap).
+pub const MAX_CARRIED_REVOCATIONS: usize = 32;
+
+/// ZEB-680: a self-authenticating device-revocation attestation carried on the
+/// friend-link frames — a Master-issued [`RevocationCert`] paired with the
+/// retired device's [`EnrollmentCert`]. Each pair is independently verifiable
+/// (`dm_outbox::verify_revocation_push` binds `revocation.owner_id` to the link
+/// peer and `revocation.target` to the enrollment's `device_id`), so it carries
+/// no outer signature. `enrollment` is `Box`ed to keep the element small (the
+/// cert is large and a frame can carry up to [`MAX_CARRIED_REVOCATIONS`] of
+/// them); `Box<T>` serializes byte-identically to `T`.
+///
+/// Single-char serde keys match this module's canonical-CBOR convention:
+/// `revocation` "r", `enrollment` "e". (`dm_envelope::RevocationPushBody` is the
+/// same cert pair but module-private with two-char keys, so it is not reusable
+/// across the module boundary.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationAttestation {
+    /// Master-issued revocation cert for one of the sender's own devices.
+    #[serde(rename = "r")]
+    pub revocation: RevocationCert,
+    /// The retired device's enrollment cert (binds `revocation.target` to the
+    /// device's identity so the pair verifies without an outer signature).
+    #[serde(rename = "e")]
+    pub enrollment: Box<EnrollmentCert>,
+}
 
 /// A friend-link request: "I am owner `from_addr`; here is my proof (cert +
 /// device-#2 signature) and the friend-token signature I am redeeming; please
@@ -362,6 +452,20 @@ pub struct FriendLinkRequest {
     /// Not signature-bound — each cert is independently self-authenticating.
     #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
     pub signer_certs: Vec<EnrollmentCert>,
+    /// ZEB-680: the sender's own fleet's device revocations (Master-issued
+    /// `RevocationCert` + the retired device's `EnrollmentCert`), so a NEW friend
+    /// learns of past revocations at link time. Not signature-bound — each pair
+    /// is independently self-authenticating (ZEB-677 `signer_certs` precedent).
+    /// Absent/empty for pre-ZEB-680 peers (the key is omitted on the wire).
+    /// Decode is capped at [`MAX_CARRIED_REVOCATIONS`]; over-cap is a hard decode
+    /// error that rejects the frame (never truncation).
+    #[serde(
+        rename = "v",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "vec_revocation_capped"
+    )]
+    pub revocations: Vec<RevocationAttestation>,
 }
 
 /// The acceptor's reply: "accepted; here is my own proof so you can add me back
@@ -446,6 +550,17 @@ pub struct FriendLinkAccepted {
     /// `FriendLinkRequest.signer_certs`.
     #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
     pub signer_certs: Vec<EnrollmentCert>,
+    /// ZEB-680: the accepter's own fleet's device revocations; see
+    /// `FriendLinkRequest.revocations`. Attached so the requester (a possibly-new
+    /// friend) learns of the accepter's past revocations at link time. Capped at
+    /// [`MAX_CARRIED_REVOCATIONS`] on decode; over-cap rejects the frame.
+    #[serde(
+        rename = "v",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "vec_revocation_capped"
+    )]
+    pub revocations: Vec<RevocationAttestation>,
 }
 
 /// The acceptor's reply on the `harmony/friend/v1` ALPN. ZEB-371 Task 12:
@@ -1230,6 +1345,7 @@ pub fn process_friend_request(
         home_relay_url,
         pq_dsa_pubkey,
         pq_kem_pubkey,
+        revocations: Vec::new(),
     })
 }
 
@@ -2038,6 +2154,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         };
         (req, device_key, eph_pub)
     }
@@ -2106,6 +2223,7 @@ mod tests {
             home_relay_url: Some("https://relay.example/accept".into()),
             pq_dsa_pubkey: vec![42; 8],
             pq_kem_pubkey: vec![7; 4],
+            revocations: Vec::new(),
         };
         let bytes = encode_friend_accepted(&acc).expect("encode");
         let back = decode_friend_accepted(&bytes).expect("decode");
@@ -2128,6 +2246,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         };
         let bytes = encode_friend_accepted(&acc).expect("encode");
         let back = decode_friend_accepted(&bytes).expect("decode");
@@ -2190,6 +2309,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         };
 
         // 257-byte display → must FAIL to decode.
@@ -2247,6 +2367,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         };
         let bytes = encode_friend_accepted(&acc).expect("encode");
 
@@ -2262,6 +2383,153 @@ mod tests {
         assert!(
             matches!(err, FriendHandshakeError::TrailingBytes { .. }),
             "expected TrailingBytes, got {err:?}"
+        );
+    }
+
+    // ---- ZEB-680: `revocations` carry field (RevocationAttestation) ----
+
+    /// ZEB-680: mint one self-consistent `RevocationAttestation` — a Master-issued
+    /// `RevocationCert` for a device paired with that device's `EnrollmentCert`,
+    /// using the same recipe as the DM RevocationPush tests (`dm_inbox_ingest.rs`).
+    /// `seed` varies both the master and device keys so a caller can build a list
+    /// of distinct pairs.
+    fn revocation_attestation(seed: u8) -> RevocationAttestation {
+        use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let master_bundle = PubKeyBundle::classical_only(master_sk.verifying_key().to_bytes());
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0x5a; 32]);
+        let device_bundle = PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes());
+        let device_id = device_bundle.identity_hash();
+        let enrollment = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            device_bundle,
+            1_700_000_000,
+            None,
+        )
+        .expect("mint enrollment");
+        let revocation = RevocationCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            1_700_000_000,
+            RevocationReason::Compromised,
+        )
+        .expect("mint revocation");
+        RevocationAttestation {
+            revocation,
+            enrollment: Box::new(enrollment),
+        }
+    }
+
+    /// ZEB-680: a minimal well-formed `FriendLinkAccepted` for pure codec tests
+    /// (the `sig` need not verify for a round-trip through the CBOR codec).
+    fn accepted_base(seed: u8) -> FriendLinkAccepted {
+        let owner = mint_test_owner(seed);
+        FriendLinkAccepted {
+            from_addr: owner.owner,
+            display: None,
+            eph_x25519_pub: [0x77; 32],
+            enrollment: owner.cert,
+            signer_certs: Vec::new(),
+            sig: [4u8; 64],
+            sender_devices: vec![],
+            device_identity_pubs: vec![],
+            iroh_node_id: [0u8; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: vec![],
+            pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn revocations_field_round_trips() {
+        // A request carrying one valid attestation round-trips through the codec.
+        let (mut req, _, _) = signed_request(0x21, [9u8; 64]);
+        req.revocations = vec![revocation_attestation(0x60)];
+        let bytes = encode_friend_request(&req).expect("encode");
+        let back = decode_friend_request(&bytes).expect("decode");
+        assert_eq!(req, back);
+        assert_eq!(back.revocations.len(), 1);
+    }
+
+    #[test]
+    fn revocations_absent_decodes_empty() {
+        // Back-compat proof: an empty list emits NO "v" key (skip_serializing_if),
+        // so the frame is byte-identical to a pre-ZEB-680 request; decode → empty.
+        let (req, _, _) = signed_request(0x21, [9u8; 64]);
+        assert!(req.revocations.is_empty());
+        let bytes = encode_friend_request(&req).expect("encode");
+        let value: ciborium::value::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("decode as generic CBOR");
+        let map = value.as_map().expect("request is a CBOR map");
+        assert!(
+            !map.iter().any(|(k, _)| k.as_text() == Some("v")),
+            "empty revocations must omit the \"v\" key"
+        );
+        let back = decode_friend_request(&bytes).expect("decode");
+        assert!(back.revocations.is_empty());
+    }
+
+    #[test]
+    fn revocations_over_cap_is_decode_error() {
+        // 33 attestations (> MAX_CARRIED_REVOCATIONS) → HARD decode error, never
+        // truncation. Serialize is pass-through, so the oversized wire builds; the
+        // cap fires on the receive side (mirrors `sender_devices`).
+        let (mut req, _, _) = signed_request(0x21, [9u8; 64]);
+        req.revocations = (0..=MAX_CARRIED_REVOCATIONS as u8)
+            .map(revocation_attestation)
+            .collect();
+        assert!(req.revocations.len() > MAX_CARRIED_REVOCATIONS);
+        let bytes = encode_friend_request(&req).expect("encode (serialize is uncapped)");
+        let err = decode_friend_request(&bytes);
+        assert!(
+            matches!(err, Err(FriendHandshakeError::Decode(_))),
+            "over-cap revocations must be rejected on decode, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn revocations_field_round_trips_accepted() {
+        let mut acc = accepted_base(0x22);
+        acc.revocations = vec![revocation_attestation(0x61)];
+        let bytes = encode_friend_accepted(&acc).expect("encode");
+        let back = decode_friend_accepted(&bytes).expect("decode");
+        assert_eq!(acc, back);
+        assert_eq!(back.revocations.len(), 1);
+    }
+
+    #[test]
+    fn revocations_absent_decodes_empty_accepted() {
+        let acc = accepted_base(0x22);
+        assert!(acc.revocations.is_empty());
+        let bytes = encode_friend_accepted(&acc).expect("encode");
+        let value: ciborium::value::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("decode as generic CBOR");
+        let map = value.as_map().expect("accepted is a CBOR map");
+        assert!(
+            !map.iter().any(|(k, _)| k.as_text() == Some("v")),
+            "empty revocations must omit the \"v\" key"
+        );
+        let back = decode_friend_accepted(&bytes).expect("decode");
+        assert!(back.revocations.is_empty());
+    }
+
+    #[test]
+    fn revocations_over_cap_is_decode_error_accepted() {
+        let mut acc = accepted_base(0x22);
+        acc.revocations = (0..=MAX_CARRIED_REVOCATIONS as u8)
+            .map(revocation_attestation)
+            .collect();
+        assert!(acc.revocations.len() > MAX_CARRIED_REVOCATIONS);
+        let bytes = encode_friend_accepted(&acc).expect("encode (serialize is uncapped)");
+        let err = decode_friend_accepted(&bytes);
+        assert!(
+            matches!(err, Err(FriendHandshakeError::Decode(_))),
+            "over-cap revocations must be rejected on decode, got: {err:?}"
         );
     }
 
@@ -2571,6 +2839,7 @@ mod tests {
             home_relay_url,
             pq_dsa_pubkey,
             pq_kem_pubkey,
+            revocations: Vec::new(),
         };
         // Untampered: BOTH verify paths accept.
         authenticate_friend_request(&req, 0).expect("untampered request authenticates");
@@ -2824,6 +3093,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         };
 
         let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
@@ -2926,6 +3196,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         };
 
         let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
@@ -3395,6 +3666,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         }
     }
 
@@ -3428,6 +3700,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         };
         (req, devices)
     }
@@ -3557,6 +3830,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey,
             pq_kem_pubkey,
+            revocations: Vec::new(),
         }
     }
 
@@ -3686,6 +3960,7 @@ mod tests {
             home_relay_url: None,
             pq_dsa_pubkey: vec![],
             pq_kem_pubkey: vec![],
+            revocations: Vec::new(),
         };
         for resp in [
             FriendLinkResponse::Accepted(Box::new(acc)),

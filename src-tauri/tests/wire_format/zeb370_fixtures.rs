@@ -304,6 +304,7 @@ fn friend_link_request_cbor() {
         home_relay_url: None,
         pq_dsa_pubkey: vec![],
         pq_kem_pubkey: vec![],
+        revocations: Vec::new(),
     };
     let encoded = encode_friend_request(&req).expect("encode");
     pin_hex(
@@ -348,6 +349,7 @@ fn friend_link_accepted_cbor() {
         home_relay_url: None,
         pq_dsa_pubkey: vec![],
         pq_kem_pubkey: vec![],
+        revocations: Vec::new(),
     };
     let encoded = encode_friend_accepted(&acc).expect("encode");
     pin_hex(
@@ -411,6 +413,7 @@ fn friend_link_response_accepted_cbor() {
         home_relay_url: None,
         pq_dsa_pubkey: vec![],
         pq_kem_pubkey: vec![],
+        revocations: Vec::new(),
     };
     let encoded = encode_friend_response(&FriendLinkResponse::Accepted(Box::new(acc)))
         .expect("encode accepted response");
