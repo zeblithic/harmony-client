@@ -19,7 +19,7 @@
 
 use crate::owner_state_types::OwnerAddr;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// ZEB-376 Task 11: what KIND of pending inbox entry this is. A plain Path-A
 /// `LinkRequest` (mutual-key dial) is accepted by marking the requester approved
@@ -72,6 +72,9 @@ pub struct PendingInbound {
 struct Inner {
     inbound: HashMap<OwnerAddr, PendingInbound>,
     approved: HashSet<OwnerAddr>,
+    /// ZEB-694: subjects with an introduction accept currently dialing — blocks a
+    /// concurrent second accept from double-dialing.
+    accepting: HashSet<OwnerAddr>,
 }
 
 /// Process-local store of pending inbound friend requests and the set of
@@ -259,6 +262,41 @@ impl PendingFriendRequests {
         let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
         inner.inbound.remove(addr);
         inner.approved.remove(addr);
+    }
+
+    /// Test-and-set: `true` and marks in-flight if no accept for `subject` is
+    /// already dialing; `false` if one is. Pair with `end_accept` (or the RAII
+    /// `AcceptInFlightGuard`).
+    #[must_use]
+    pub fn try_begin_accept(&self, subject: OwnerAddr) -> bool {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.accepting.insert(subject) // HashSet::insert returns false if already present
+    }
+
+    /// Clear the in-flight marker for `subject`.
+    pub fn end_accept(&self, subject: &OwnerAddr) {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.accepting.remove(subject);
+    }
+}
+
+/// RAII: clears the in-flight accept marker on drop, so every accept exit path
+/// (early return, dial error, panic) releases it.
+#[must_use = "dropping this immediately releases the in-flight accept marker"]
+pub struct AcceptInFlightGuard {
+    store: Arc<PendingFriendRequests>,
+    subject: OwnerAddr,
+}
+
+impl AcceptInFlightGuard {
+    pub fn new(store: Arc<PendingFriendRequests>, subject: OwnerAddr) -> Self {
+        Self { store, subject }
+    }
+}
+
+impl Drop for AcceptInFlightGuard {
+    fn drop(&mut self) {
+        self.store.end_accept(&self.subject);
     }
 }
 
@@ -567,6 +605,29 @@ mod tests {
         assert!(
             !s.take(&addr(1), 1_500),
             "the backward-clock take still consumed the entry (one-shot)"
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_blocks_concurrent_accept() {
+        use std::sync::Arc;
+        let store = Arc::new(PendingFriendRequests::default());
+        let subj = OwnerAddr([1; 16]);
+        assert!(store.try_begin_accept(subj), "first accept begins");
+        assert!(
+            !store.try_begin_accept(subj),
+            "second concurrent accept is blocked"
+        );
+        {
+            // RAII guard clears the marker on drop.
+            let _g = AcceptInFlightGuard::new(Arc::clone(&store), subj);
+            // still in flight while the guard lives
+            assert!(!store.try_begin_accept(subj));
+        } // _g drops here → end_accept
+          // NOTE: try_begin_accept above set the flag; the guard's drop cleared it.
+        assert!(
+            store.try_begin_accept(subj),
+            "after the guard drops, a new accept can begin"
         );
     }
 }
