@@ -148,14 +148,22 @@ pub fn sign_introduce_request(
 pub fn authenticate_introduce_request(
     req: &IntroduceRequest,
     self_owner: OwnerAddr,
+    // ZEB-680 §1: consulted (via the inner `verify_enrolled_device`) against the
+    // requester's owner + verified device key.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     now_secs: u64,
 ) -> Result<(), IntroAuthError> {
     if req.to_addr != self_owner {
         return Err(IntroAuthError::WrongTarget);
     }
-    let verified =
-        verify_enrolled_device(&req.enrollment, &req.signer_certs, req.from_addr, now_secs)
-            .map_err(|_| IntroAuthError::Auth)?;
+    let verified = verify_enrolled_device(
+        &req.enrollment,
+        &req.signer_certs,
+        req.from_addr,
+        revoked,
+        now_secs,
+    )
+    .map_err(|_| IntroAuthError::Auth)?;
     let vk = VerifyingKey::from_bytes(&verified.device_ed25519)
         .map_err(|_| IntroAuthError::SignatureInvalid)?;
     let preimage =
@@ -289,6 +297,11 @@ pub fn verify_introduction(
     intro: &Introduction,
     expected_voucher: OwnerAddr,
     expected_target: OwnerAddr,
+    // ZEB-680 §1: consulted for BOTH carried certs — the voucher (a friend whose
+    // revocations we likely know; the security-relevant check) and the subject
+    // (opportunistic — the subject's owner may be a stranger). Each consult binds
+    // the projection against that cert's own owner.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     now_secs: u64,
 ) -> Result<(), IntroAuthError> {
     if intro.to_addr != expected_target {
@@ -314,6 +327,7 @@ pub fn verify_introduction(
         &intro.voucher_enrollment,
         &intro.signer_certs,
         intro.voucher,
+        revoked,
         now_secs,
     )
     .map_err(|_| IntroAuthError::Auth)?;
@@ -337,6 +351,7 @@ pub fn verify_introduction(
         &intro.subject_cert,
         &intro.subject_signer_certs,
         intro.subject,
+        revoked,
         now_secs,
     )
     .map_err(|_| IntroAuthError::Auth)?;
@@ -389,9 +404,12 @@ pub fn build_introduction_for_request(
     self_enrollment: EnrollmentCert,
     device2: &SigningKey,
     at: Hlc,
+    // ZEB-680 §1: threaded to the inner `authenticate_introduce_request` so F
+    // refuses to vouch for a revoked requester.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     now_secs: u64,
 ) -> Result<Introduction, IntroBrokerError> {
-    authenticate_introduce_request(req, self_owner, now_secs)?;
+    authenticate_introduce_request(req, self_owner, revoked, now_secs)?;
     // ZEB-376 (Q1): friend-gate the REQUESTER. Authentication only proves the
     // requester controls `from_addr`; it does NOT prove they are F's friend.
     // Without this an authenticated non-friend could make F vouch for them.
@@ -849,6 +867,12 @@ mod tests {
     use crate::community_membership::mint_test_owner;
     use crate::owner_state_types::OwnerAddr;
 
+    /// ZEB-680: an empty revoked-device projection for verifier call sites that
+    /// don't exercise revocation (it revokes nothing).
+    fn no_revocations() -> crate::revoked_device_projection::RevokedDeviceProjection {
+        crate::revoked_device_projection::RevokedDeviceProjection::new()
+    }
+
     fn reach() -> crate::reachability_record::ReachabilityAnnouncePayload {
         crate::reachability_record::ReachabilityAnnouncePayload {
             iroh_node_id: [0x11; 32],
@@ -885,10 +909,11 @@ mod tests {
             from.cert.clone(),
         );
         // Authentic request to the correct broker verifies.
-        authenticate_introduce_request(&req, broker.owner, 0).expect("authentic to broker");
+        authenticate_introduce_request(&req, broker.owner, &no_revocations(), 0)
+            .expect("authentic to broker");
         // Re-aimed at a different broker → WrongTarget (before any sig spend).
         assert_eq!(
-            authenticate_introduce_request(&req, OwnerAddr([0x99; 16]), 0),
+            authenticate_introduce_request(&req, OwnerAddr([0x99; 16]), &no_revocations(), 0),
             Err(IntroAuthError::WrongTarget),
         );
     }
@@ -907,7 +932,7 @@ mod tests {
         );
         req.target = OwnerAddr([0x44; 16]); // swap whom we asked to meet
         assert_eq!(
-            authenticate_introduce_request(&req, broker.owner, 0),
+            authenticate_introduce_request(&req, broker.owner, &no_revocations(), 0),
             Err(IntroAuthError::SignatureInvalid),
         );
     }
@@ -929,15 +954,28 @@ mod tests {
             Vec::new(),
         );
         // X verifies: voucher == who we think F is, target == us.
-        verify_introduction(&intro, voucher.owner, target.owner, 0).expect("authentic");
+        verify_introduction(&intro, voucher.owner, target.owner, &no_revocations(), 0)
+            .expect("authentic");
         // Wrong expected voucher → VoucherMismatch (before sig spend).
         assert_eq!(
-            verify_introduction(&intro, OwnerAddr([0x77; 16]), target.owner, 0),
+            verify_introduction(
+                &intro,
+                OwnerAddr([0x77; 16]),
+                target.owner,
+                &no_revocations(),
+                0
+            ),
             Err(IntroAuthError::VoucherMismatch),
         );
         // Relayed to the wrong X → WrongTarget.
         assert_eq!(
-            verify_introduction(&intro, voucher.owner, OwnerAddr([0x88; 16]), 0),
+            verify_introduction(
+                &intro,
+                voucher.owner,
+                OwnerAddr([0x88; 16]),
+                &no_revocations(),
+                0
+            ),
             Err(IntroAuthError::WrongTarget),
         );
     }
@@ -995,6 +1033,7 @@ mod tests {
             broker.cert.clone(),
             &broker.device_key,
             hlc(1),
+            &no_revocations(),
             0,
         )
         .expect("active+referrable target → Introduction");
@@ -1003,7 +1042,7 @@ mod tests {
         assert_eq!(intro.to_addr, target.owner);
         assert_eq!(intro.subject, requester.owner);
         assert_eq!(intro.reachability, req.reachability);
-        verify_introduction(&intro, broker.owner, target.owner, 0)
+        verify_introduction(&intro, broker.owner, target.owner, &no_revocations(), 0)
             .expect("F's signature verifies on X");
         // Non-referrable target → NotReferrable (no envelope leaks a non-opted-in friend).
         fg.friends
@@ -1016,6 +1055,7 @@ mod tests {
                 broker.cert.clone(),
                 &broker.device_key,
                 hlc(1),
+                &no_revocations(),
                 0
             ),
             Err(IntroBrokerError::NotReferrable),
@@ -1046,7 +1086,8 @@ mod tests {
             requester.cert.clone(),
         );
         // The request authenticates (correct broker, valid cert + sig)…
-        authenticate_introduce_request(&req, broker.owner, 0).expect("request authenticates");
+        authenticate_introduce_request(&req, broker.owner, &no_revocations(), 0)
+            .expect("request authenticates");
         // …but the broker refuses because the requester is not F's friend.
         assert!(matches!(
             build_introduction_for_request(
@@ -1056,6 +1097,7 @@ mod tests {
                 broker.cert.clone(),
                 &broker.device_key,
                 hlc(1),
+                &no_revocations(),
                 0,
             ),
             Err(IntroBrokerError::RequesterNotFriend),
@@ -1074,6 +1116,7 @@ mod tests {
                 broker.cert.clone(),
                 &broker.device_key,
                 hlc(1),
+                &no_revocations(),
                 0,
             ),
             Err(IntroBrokerError::RequesterNotFriend),
@@ -1112,15 +1155,27 @@ mod tests {
         );
 
         // WITH the forwarded bundle the quorum subject cert verifies through X.
-        verify_introduction(&intro, voucher.owner, target.owner, WORLD_NOW)
-            .expect("quorum subject cert verifies via the forwarded signer bundle");
+        verify_introduction(
+            &intro,
+            voucher.owner,
+            target.owner,
+            &no_revocations(),
+            WORLD_NOW,
+        )
+        .expect("quorum subject cert verifies via the forwarded signer bundle");
 
         // WITHOUT it, the subject-cert verify fails closed (the exact bug Q2 fixes:
         // an empty bundle cannot verify a quorum cert).
         let mut stripped = intro.clone();
         stripped.subject_signer_certs.clear();
         assert_eq!(
-            verify_introduction(&stripped, voucher.owner, target.owner, WORLD_NOW),
+            verify_introduction(
+                &stripped,
+                voucher.owner,
+                target.owner,
+                &no_revocations(),
+                WORLD_NOW
+            ),
             Err(IntroAuthError::Auth),
             "a quorum subject cert with no signer bundle must fail closed",
         );
@@ -1153,13 +1208,25 @@ mod tests {
         };
 
         // Fresh `at` (== now) verifies.
-        verify_introduction(&sign_at(now_ms), voucher.owner, target.owner, now_secs)
-            .expect("a fresh envelope verifies");
+        verify_introduction(
+            &sign_at(now_ms),
+            voucher.owner,
+            target.owner,
+            &no_revocations(),
+            now_secs,
+        )
+        .expect("a fresh envelope verifies");
 
         // Far in the past (> max age) → Stale.
         let stale = sign_at(now_ms - INTRODUCTION_MAX_ENVELOPE_AGE_MS - 1);
         assert_eq!(
-            verify_introduction(&stale, voucher.owner, target.owner, now_secs),
+            verify_introduction(
+                &stale,
+                voucher.owner,
+                target.owner,
+                &no_revocations(),
+                now_secs
+            ),
             Err(IntroAuthError::Stale),
             "an envelope older than the max age must be rejected",
         );
@@ -1167,7 +1234,13 @@ mod tests {
         // Far in the future (> forward skew) → Stale.
         let future = sign_at(now_ms + INTRODUCTION_MAX_FORWARD_SKEW_MS + 1);
         assert_eq!(
-            verify_introduction(&future, voucher.owner, target.owner, now_secs),
+            verify_introduction(
+                &future,
+                voucher.owner,
+                target.owner,
+                &no_revocations(),
+                now_secs
+            ),
             Err(IntroAuthError::Stale),
             "an envelope beyond the forward-skew must be rejected",
         );

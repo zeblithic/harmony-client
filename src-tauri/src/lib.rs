@@ -9561,18 +9561,21 @@ pub async fn start_node_inner(
                             // per-dial (`build_self_handshake_reachability`); ZEB-621
                             // brings this long-lived acceptor to parity (it no longer
                             // freezes the relay at all).
-                            .with_self_home_relay_refresh(
-                                iroh_endpoint_arc.as_ref().map(|ep| {
-                                    let ep = std::sync::Arc::clone(ep);
-                                    let refresh: crate::iroh_friend_acceptor::HomeRelayRefresh =
-                                        std::sync::Arc::new(move || {
-                                            ep.home_relay()
-                                                .map(|r| r.to_string())
-                                                .filter(|s| !s.is_empty())
-                                        });
-                                    refresh
-                                }),
-                            ),
+                            .with_self_home_relay_refresh(iroh_endpoint_arc.as_ref().map(|ep| {
+                                let ep = std::sync::Arc::clone(ep);
+                                let refresh: crate::iroh_friend_acceptor::HomeRelayRefresh =
+                                    std::sync::Arc::new(move || {
+                                        ep.home_relay()
+                                            .map(|r| r.to_string())
+                                            .filter(|s| !s.is_empty())
+                                    });
+                                refresh
+                            }))
+                            // ZEB-680 §1: wire the REAL revoked-device projection so
+                            // the inbound friend verifiers reject a revoked device.
+                            // The empty `with_config` default would silently disable
+                            // enforcement — production MUST pass the live handle.
+                            .with_revoked(revoked_device_projection.clone()),
                         );
 
                         // ZEB-375 (Friends Phase 2a): build the friend-PEX
@@ -9631,9 +9634,13 @@ pub async fn start_node_inner(
                             // request inbox the friend acceptor + accept/decline
                             // IPCs hold, so an `AskMe`-staged introduction records
                             // an `IntroductionOffer` the user can explicitly accept.
-                            .with_pending_requests(Some(
-                                std::sync::Arc::clone(&pending_friend_requests_for_state),
-                            )),
+                            .with_pending_requests(Some(std::sync::Arc::clone(
+                                &pending_friend_requests_for_state,
+                            )))
+                            // ZEB-680 §1: wire the REAL revoked-device projection so
+                            // the inbound catalog + introduction verifiers reject a
+                            // revoked device (empty default = no enforcement).
+                            .with_revoked(revoked_device_projection.clone()),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -51614,6 +51621,11 @@ pub async fn connectivity_link_friend_iroh_inner(
     >,
     device_id: String,
     keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    // ZEB-680 §1: the live by-owner revoked-device projection, consulted by the
+    // dialer-side `verify_enrolled_device` calls (inviter cert + Accepted
+    // response). The IPC wrapper reads the real handle from `NodeState`; tests
+    // pass `RevokedDeviceProjection::new()`.
+    revoked: crate::revoked_device_projection::RevokedDeviceProjection,
     dial_config: HandshakeDialConfig,
     // ZEB-461 Task 6: this node's own device bundle + reachability + PQ keys to
     // advertise in the request it signs. `None` (tests / pre-identity) ships the
@@ -51639,6 +51651,7 @@ pub async fn connectivity_link_friend_iroh_inner(
         &payload.inviter_enrollment,
         &payload.inviter_signer_certs,
         payload.inviter_addr,
+        &revoked,
         crate::iroh_friend_acceptor::wall_now_secs(),
     )
     .map_err(|e| format!("verify inviter enrollment: {e}"))?
@@ -51922,6 +51935,7 @@ pub async fn connectivity_link_friend_iroh_inner(
             &accepted.enrollment,
             &accepted.signer_certs,
             payload.inviter_addr,
+            &revoked,
             crate::iroh_friend_acceptor::wall_now_secs(),
         )
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
@@ -52079,6 +52093,7 @@ mod friend_redeem_expiry_tests {
             hlc_tracker,
             "redeem-dev".to_string(),
             Arc::new(crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt")),
+            crate::revoked_device_projection::RevokedDeviceProjection::new(),
             HandshakeDialConfig {
                 connect_timeout: Duration::from_millis(100),
                 open_bi_timeout: Duration::from_millis(100),
@@ -53353,6 +53368,7 @@ pub(crate) async fn redeem_friend_token_impl(
         self_identity_pub_64,
         self_dsa_pubkey,
         self_kem_pubkey,
+        revoked_device_projection,
     ) = {
         let g = state
             .lock()
@@ -53372,6 +53388,11 @@ pub(crate) async fn redeem_friend_token_impl(
             g.dm_identity_pub_64,
             g.dm_local_dsa_pubkey.clone(),
             g.dm_local_kem_pubkey.clone(),
+            // ZEB-680 §1: the live revoked-device projection, stashed on
+            // NodeState at boot alongside the other owner-loaded handles (so it is
+            // `Some` whenever the owner is loaded). Threaded into the dialer driver
+            // for revocation-aware verification. Required-`Some` below.
+            g.revoked_device_projection.clone(),
         )
     };
 
@@ -53382,6 +53403,7 @@ pub(crate) async fn redeem_friend_token_impl(
         Some(self_owner),
         Some(dm_outbox),
         Some(owner_keytree),
+        Some(revoked),
     ) = (
         crdt_state,
         hlc_tracker,
@@ -53389,6 +53411,7 @@ pub(crate) async fn redeem_friend_token_impl(
         self_owner,
         dm_outbox,
         owner_keytree,
+        revoked_device_projection,
     )
     else {
         return Err(OWNER_NOT_LOADED_MSG.into());
@@ -53434,6 +53457,7 @@ pub(crate) async fn redeem_friend_token_impl(
         hlc_tracker,
         device_id,
         owner_keytree,
+        revoked,
         HandshakeDialConfig::from_env(),
         self_reachability,
     )
@@ -53761,7 +53785,15 @@ async fn browse_friend_referrals(
     //    drop the guard before any owner-state `.await` or network IO. Mirrors
     //    `connectivity_resolve_friend` (resolver/crdt/keytree) + `add_friend_by_key`
     //    (iroh endpoint, self owner/cert/device-#2 key via the DmOutbox).
-    let (resolver, crdt_state, owner_keytree, iroh_endpoint, self_owner, dm_outbox) = {
+    let (
+        resolver,
+        crdt_state,
+        owner_keytree,
+        iroh_endpoint,
+        self_owner,
+        dm_outbox,
+        revoked_device_projection,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -53772,6 +53804,10 @@ async fn browse_friend_referrals(
             g.iroh_endpoint.clone(),
             g.dm_self_owner,
             g.dm_outbox.clone(),
+            // ZEB-680 §1: the live revoked-device projection for the catalog
+            // author verify below. Required-`Some` (stashed at boot with the
+            // other owner-loaded handles).
+            g.revoked_device_projection.clone(),
         )
     };
     let (
@@ -53781,6 +53817,7 @@ async fn browse_friend_referrals(
         Some(iroh_endpoint),
         Some(self_owner),
         Some(dm_outbox),
+        Some(revoked),
     ) = (
         resolver,
         crdt_state,
@@ -53788,6 +53825,7 @@ async fn browse_friend_referrals(
         iroh_endpoint,
         self_owner,
         dm_outbox,
+        revoked_device_projection,
     )
     else {
         return Err(OWNER_NOT_LOADED_MSG.into());
@@ -54009,6 +54047,7 @@ async fn browse_friend_referrals(
         &cat,
         friend_owner,
         self_owner,
+        &revoked,
         crate::iroh_friend_acceptor::wall_now_secs(),
     )
     .map_err(|e| format!("catalog verify failed: {e:?}"))?;
@@ -54750,6 +54789,7 @@ pub(crate) async fn accept_friend_request_impl(
         self_identity_pub_64,
         self_dsa_pubkey,
         self_kem_pubkey,
+        revoked_device_projection,
     ) = {
         let g = state
             .lock()
@@ -54768,6 +54808,11 @@ pub(crate) async fn accept_friend_request_impl(
             g.dm_identity_pub_64,
             g.dm_local_dsa_pubkey.clone(),
             g.dm_local_kem_pubkey.clone(),
+            // ZEB-680 §1: the live revoked-device projection, stashed on
+            // NodeState at boot alongside the other owner-loaded handles (so it is
+            // `Some` whenever the owner is loaded). Threaded into the dialer driver
+            // for revocation-aware verification. Required-`Some` below.
+            g.revoked_device_projection.clone(),
         )
     };
     let Some(store) = store else {
@@ -54816,6 +54861,7 @@ pub(crate) async fn accept_friend_request_impl(
             Some(self_owner),
             Some(dm_outbox),
             Some(owner_keytree),
+            Some(revoked),
         ) = (
             iroh_endpoint,
             crdt_state,
@@ -54824,6 +54870,7 @@ pub(crate) async fn accept_friend_request_impl(
             self_owner,
             dm_outbox,
             owner_keytree,
+            revoked_device_projection,
         )
         else {
             crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
@@ -54866,6 +54913,7 @@ pub(crate) async fn accept_friend_request_impl(
             sync_engine,
             friend_publisher,
             Some(std::sync::Arc::clone(&sink)),
+            revoked,
         )
         .await;
 
@@ -55617,6 +55665,11 @@ pub async fn connectivity_add_friend_by_key_inner(
     >,
     device_id: String,
     keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    // ZEB-680 §1: the live by-owner revoked-device projection, consulted by the
+    // dialer-side `verify_enrolled_device` calls (inviter cert + Accepted
+    // response). The IPC wrapper reads the real handle from `NodeState`; tests
+    // pass `RevokedDeviceProjection::new()`.
+    revoked: crate::revoked_device_projection::RevokedDeviceProjection,
     dial_config: HandshakeDialConfig,
     // ZEB-461 Task 6: this node's own device bundle + reachability + PQ keys to
     // advertise in the request it signs. `None` ships the empty bundle.
@@ -55797,6 +55850,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         hlc_tracker,
         device_id,
         identity_pub_hex,
+        revoked,
     )
     .await
 }
@@ -55847,6 +55901,10 @@ pub(crate) async fn complete_introduction(
     sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
     friend_publisher: Option<std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
     event_sink: Option<std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>>,
+    // ZEB-680 §1: the live revoked-device projection, threaded to
+    // `link_over_connection` so the introducee's Accepted response is
+    // revocation-checked. Owned (Arc-backed clone).
+    revoked: crate::revoked_device_projection::RevokedDeviceProjection,
 ) -> Result<AddFriendOutcome, String> {
     let target_addr = endpoint_addr_from_routing(&reachability)
         .map_err(|e| format!("synthesize introducee addr: {e}"))?;
@@ -55880,6 +55938,7 @@ pub(crate) async fn complete_introduction(
         hlc_tracker,
         device_id,
         hex::encode(subject.0),
+        revoked,
     )
     .await?;
 
@@ -55961,6 +56020,11 @@ pub(crate) async fn link_over_connection(
     >,
     device_id: String,
     peer_label: String,
+    // ZEB-680 §1: the live revoked-device projection, consulted by the
+    // Accepted-response `verify_enrolled_device` below. Owned (cheap Arc-backed
+    // clone) so it survives the spawned introduction path; callers pass the real
+    // NodeState handle, tests pass `RevokedDeviceProjection::new()`.
+    revoked: crate::revoked_device_projection::RevokedDeviceProjection,
 ) -> Result<AddFriendOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
@@ -56141,6 +56205,7 @@ pub(crate) async fn link_over_connection(
             &accepted.enrollment,
             &accepted.signer_certs,
             target_addr_master,
+            &revoked,
             crate::iroh_friend_acceptor::wall_now_secs(),
         )
         .map_err(|e| format!("verify accept enrollment: {e}"))?;
@@ -56289,6 +56354,7 @@ pub(crate) async fn add_friend_by_key_impl(
         self_identity_pub_64,
         self_dsa_pubkey,
         self_kem_pubkey,
+        revoked_device_projection,
     ) = {
         let g = state
             .lock()
@@ -56308,6 +56374,11 @@ pub(crate) async fn add_friend_by_key_impl(
             g.dm_identity_pub_64,
             g.dm_local_dsa_pubkey.clone(),
             g.dm_local_kem_pubkey.clone(),
+            // ZEB-680 §1: the live revoked-device projection, stashed on
+            // NodeState at boot alongside the other owner-loaded handles (so it is
+            // `Some` whenever the owner is loaded). Threaded into the dialer driver
+            // for revocation-aware verification. Required-`Some` below.
+            g.revoked_device_projection.clone(),
         )
     };
 
@@ -56318,6 +56389,7 @@ pub(crate) async fn add_friend_by_key_impl(
         Some(self_owner),
         Some(dm_outbox),
         Some(owner_keytree),
+        Some(revoked),
     ) = (
         crdt_state,
         hlc_tracker,
@@ -56325,6 +56397,7 @@ pub(crate) async fn add_friend_by_key_impl(
         self_owner,
         dm_outbox,
         owner_keytree,
+        revoked_device_projection,
     )
     else {
         return Err(OWNER_NOT_LOADED_MSG.into());
@@ -56362,6 +56435,7 @@ pub(crate) async fn add_friend_by_key_impl(
         hlc_tracker,
         device_id,
         owner_keytree,
+        revoked,
         HandshakeDialConfig::from_env(),
         self_reachability,
     )

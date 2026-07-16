@@ -437,6 +437,7 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
             Arc::clone(&bob_hlc_tracker),
             "bob-dev".to_string(),
             Arc::clone(&bob_keytree),
+            harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),
             harmony_app::HandshakeDialConfig {
                 connect_timeout: Duration::from_millis(10_000),
                 open_bi_timeout: Duration::from_millis(10_000),
