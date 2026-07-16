@@ -733,6 +733,61 @@ mod tests {
         assert!(authenticate_catalog_request(&bad, f_owner, &no_revocations(), 0).is_err());
     }
 
+    /// ZEB-680 §1 (T3 regression pin): `authenticate_catalog_request` consults the
+    /// revoked-device projection through the inner `verify_enrolled_device`. A
+    /// request from a revoked requester fails auth (`DeviceRevoked` maps to
+    /// `ReferralAuthError::Auth`); the SAME request with an empty projection
+    /// authenticates. The only difference is the projection, so the rejection can
+    /// only come from the revocation consult — pinning the per-site enforcement.
+    #[test]
+    fn authenticate_catalog_request_rejects_revoked_requester() {
+        let r = mint_test_owner(0x21);
+        let f_owner = OwnerAddr([0x42; 16]);
+        let req = sign_catalog_request(&r.device_key, r.owner, f_owner, r.cert.clone());
+        // Empty projection revokes nothing: authenticates.
+        assert!(authenticate_catalog_request(&req, f_owner, &no_revocations(), 0).is_ok());
+        // Seed the requester's enrolled device key against its own owner.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let keys: std::collections::BTreeSet<[u8; 32]> =
+            std::iter::once(r.cert.device_pubkeys.classical.ed25519_verify).collect();
+        revoked.union_from_members(std::iter::once((r.owner, &keys)));
+        let err = authenticate_catalog_request(&req, f_owner, &revoked, 0).unwrap_err();
+        assert!(
+            matches!(err, ReferralAuthError::Auth),
+            "expected Auth (from DeviceRevoked), got {err:?}"
+        );
+    }
+
+    /// ZEB-680 §1 (T3 regression pin): `verify_referral_catalog` — the separable
+    /// author-verify seam (referral_catalog.rs :329) — consults the projection for
+    /// the catalog AUTHOR's cert. Seeding the author's device key rejects the
+    /// catalog; the same catalog with an empty projection verifies.
+    #[test]
+    fn verify_referral_catalog_rejects_revoked_author() {
+        let f = mint_test_owner(0x11);
+        let subject = OwnerAddr([0x22; 16]);
+        let cat = sign_referral_catalog(
+            &f.device_key,
+            f.owner,
+            subject,
+            one_entry(),
+            hlc(7),
+            f.cert.clone(),
+        );
+        // Empty projection revokes nothing: verifies.
+        assert!(verify_referral_catalog(&cat, f.owner, subject, &no_revocations(), 0).is_ok());
+        // Seed the AUTHOR's enrolled device key against the author owner.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let keys: std::collections::BTreeSet<[u8; 32]> =
+            std::iter::once(f.cert.device_pubkeys.classical.ed25519_verify).collect();
+        revoked.union_from_members(std::iter::once((f.owner, &keys)));
+        let err = verify_referral_catalog(&cat, f.owner, subject, &revoked, 0).unwrap_err();
+        assert!(
+            matches!(err, ReferralAuthError::Auth),
+            "expected Auth (from DeviceRevoked), got {err:?}"
+        );
+    }
+
     /// Build a FULL valid `FriendEntry` with deterministic field values, varying
     /// only the lifecycle/opt-in/label the referral-collection logic keys on.
     fn entry(status: FriendStatus, referrable: bool, display: Option<&str>) -> FriendEntry {

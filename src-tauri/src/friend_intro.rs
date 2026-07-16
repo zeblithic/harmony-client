@@ -980,6 +980,116 @@ mod tests {
         );
     }
 
+    /// ZEB-680 §1 (T3 regression pin): `authenticate_introduce_request` consults
+    /// the revoked-device projection through the inner `verify_enrolled_device`.
+    /// A request from a revoked requester fails auth (`verify_enrolled_device`'s
+    /// `DeviceRevoked` maps to `IntroAuthError::Auth`); the SAME request with an
+    /// empty projection authenticates. The only difference between the two calls
+    /// is the projection, so the rejection can only come from the revocation
+    /// consult — pinning the per-site enforcement.
+    #[test]
+    fn authenticate_introduce_request_rejects_revoked_requester() {
+        let from = mint_test_owner(0x11);
+        let broker = mint_test_owner(0x22);
+        let target = OwnerAddr([0x33; 16]);
+        let req = sign_introduce_request(
+            &from.device_key,
+            from.owner,
+            broker.owner,
+            target,
+            reach(),
+            from.cert.clone(),
+        );
+        // Empty projection revokes nothing: authenticates.
+        authenticate_introduce_request(&req, broker.owner, &no_revocations(), 0)
+            .expect("empty projection revokes nothing");
+        // Seed the requester's enrolled device key against its own owner.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let keys: std::collections::BTreeSet<[u8; 32]> =
+            std::iter::once(from.cert.device_pubkeys.classical.ed25519_verify).collect();
+        revoked.union_from_members(std::iter::once((from.owner, &keys)));
+        let err = authenticate_introduce_request(&req, broker.owner, &revoked, 0).unwrap_err();
+        assert!(
+            matches!(err, IntroAuthError::Auth),
+            "expected Auth (from DeviceRevoked), got {err:?}"
+        );
+    }
+
+    /// ZEB-680 §1 (T3 regression pin): `verify_introduction` consults the
+    /// projection for the VOUCHER cert (the security-relevant check — a friend
+    /// whose revocations we likely know). Seeding the voucher's device key rejects
+    /// the envelope; the same envelope with an empty projection verifies.
+    #[test]
+    fn verify_introduction_rejects_revoked_voucher() {
+        let voucher = mint_test_owner(0x22);
+        let subject = mint_test_owner(0x11);
+        let target = mint_test_owner(0x33); // X (self)
+        let intro = sign_introduction(
+            &voucher.device_key,
+            voucher.owner,
+            target.owner,
+            subject.owner,
+            subject.cert.clone(),
+            reach(),
+            hlc(5),
+            voucher.cert.clone(),
+            Vec::new(),
+        );
+        // Empty projection revokes nothing: verifies.
+        verify_introduction(&intro, voucher.owner, target.owner, &no_revocations(), 0)
+            .expect("empty projection revokes nothing");
+        // Seed the VOUCHER's enrolled device key against the voucher owner.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let keys: std::collections::BTreeSet<[u8; 32]> =
+            std::iter::once(voucher.cert.device_pubkeys.classical.ed25519_verify).collect();
+        revoked.union_from_members(std::iter::once((voucher.owner, &keys)));
+        let err =
+            verify_introduction(&intro, voucher.owner, target.owner, &revoked, 0).unwrap_err();
+        assert!(
+            matches!(err, IntroAuthError::Auth),
+            "expected Auth (from DeviceRevoked), got {err:?}"
+        );
+    }
+
+    /// ZEB-680 §1 (T3 regression pin): `verify_introduction` ALSO consults the
+    /// projection for the SUBJECT cert (opportunistic — the subject may be a
+    /// stranger). This proves that consult independently: the voucher stays clean
+    /// (so the voucher consult and the signature verify both pass), and ONLY the
+    /// subject's device key is revoked — the rejection therefore originates at the
+    /// subject-side consult, not the voucher one.
+    #[test]
+    fn verify_introduction_rejects_revoked_subject() {
+        let voucher = mint_test_owner(0x22);
+        let subject = mint_test_owner(0x11);
+        let target = mint_test_owner(0x33); // X (self)
+        let intro = sign_introduction(
+            &voucher.device_key,
+            voucher.owner,
+            target.owner,
+            subject.owner,
+            subject.cert.clone(),
+            reach(),
+            hlc(5),
+            voucher.cert.clone(),
+            Vec::new(),
+        );
+        // Empty projection revokes nothing: verifies.
+        verify_introduction(&intro, voucher.owner, target.owner, &no_revocations(), 0)
+            .expect("empty projection revokes nothing");
+        // Seed ONLY the SUBJECT's enrolled device key against the subject owner;
+        // the voucher is left clean so the voucher-side consult passes.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let keys: std::collections::BTreeSet<[u8; 32]> =
+            std::iter::once(subject.cert.device_pubkeys.classical.ed25519_verify).collect();
+        revoked.union_from_members(std::iter::once((subject.owner, &keys)));
+        let err =
+            verify_introduction(&intro, voucher.owner, target.owner, &revoked, 0).unwrap_err();
+        assert!(
+            matches!(err, IntroAuthError::Auth),
+            "expected Auth (from DeviceRevoked), got {err:?}"
+        );
+    }
+
     fn hlc(w: u64) -> Hlc {
         Hlc {
             wall_ms: w,

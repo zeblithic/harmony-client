@@ -4044,6 +4044,31 @@ mod tests {
         );
     }
 
+    /// ZEB-680 §1 (T3 regression pin): `authenticate_friend_request` consults the
+    /// revoked-device projection through the inner `verify_enrolled_device`. A
+    /// request whose enrolled device-#2 key is revoked for its own owner fails
+    /// with `DeviceRevoked`; the SAME request with an empty projection
+    /// authenticates. Because the only difference between the two calls is the
+    /// projection, the rejection can only come from the revocation consult — so
+    /// this pins the per-site enforcement against a later refactor dropping it.
+    #[test]
+    fn authenticate_friend_request_rejects_revoked_requester() {
+        let req = signed_request_no_token(0x81);
+        // Empty projection revokes nothing: the request authenticates.
+        authenticate_friend_request(&req, &no_revocations(), 0)
+            .expect("empty projection revokes nothing");
+        // Seed the requester's enrolled device key against its own owner.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let keys: std::collections::BTreeSet<[u8; 32]> =
+            std::iter::once(req.enrollment.device_pubkeys.classical.ed25519_verify).collect();
+        revoked.union_from_members(std::iter::once((req.from_addr, &keys)));
+        let err = authenticate_friend_request(&req, &revoked, 0).unwrap_err();
+        assert!(
+            matches!(err, FriendHandshakeError::DeviceRevoked),
+            "expected DeviceRevoked, got {err:?}"
+        );
+    }
+
     #[test]
     fn process_no_token_request_yields_mutual_key_friend() {
         // AcceptInline path: a no-token request resolves established_via to
