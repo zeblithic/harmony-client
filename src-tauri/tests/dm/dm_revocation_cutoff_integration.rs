@@ -524,6 +524,7 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
             Arc::clone(&bob_hlc_tracker),
             "bob-dev".to_string(),
             Arc::clone(&bob_keytree),
+            harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),
             harmony_app::HandshakeDialConfig {
                 connect_timeout: Duration::from_millis(10_000),
                 open_bi_timeout: Duration::from_millis(10_000),
@@ -531,6 +532,7 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
                 write_timeout: Duration::from_millis(10_000),
             },
             None,
+            None, // self_trust_doc — no revocations carried in this test
         )
         .await
         .expect("friend handshake must succeed");

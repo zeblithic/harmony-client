@@ -46,11 +46,18 @@ describe('RemoveDeviceDialog (ZEB-668 S2)', () => {
     expect(screen.queryByText(/holds your master key/i)).toBeNull();
   });
 
-  it('states the feed cutoff and what is NOT yet severed (honesty rule)', () => {
+  it('states the feed, DM, and friend/PEX cutoffs (honesty rule)', () => {
     render(RemoveDeviceDialog, { props: props() });
-    // ZEB-580 S2: DMs to shared-community contacts now block too; DM-only contacts pending S3.
+    // ZEB-685 shipped the DM-only cutoff; ZEB-680 shipped the friend/PEX cutoff.
     expect(screen.getByText(/stop accepting new posts/i)).toBeInTheDocument();
-    expect(screen.getByText(/share a community with you stop being accepted/i)).toBeInTheDocument();
+    expect(screen.getByText(/direct[\s\S]*messages also stop being accepted/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /can no longer add a new friend, introduce itself, or vouch for an introduction/i,
+      ),
+    ).toBeInTheDocument();
+    // The stale "lands in follow-up work" clause is gone now that ZEB-685 shipped.
+    expect(screen.queryByText(/follow-up work/i)).toBeNull();
   });
 
   it('maps notMaster errors to friendly copy', () => {
@@ -107,10 +114,14 @@ describe('RemoveDeviceDialog replace mode (ZEB-668 S6)', () => {
     expect(screen.getByText(/owner identity and master key are unchanged/i)).toBeInTheDocument();
   });
 
-  it('keeps the honesty copy about un-severed surfaces in replace mode', () => {
+  it('keeps the honesty copy in replace mode', () => {
     render(RemoveDeviceDialog, { props: props({ mode: 'replace' }) });
     expect(screen.getByText(/stop accepting new posts/i)).toBeInTheDocument();
-    expect(screen.getByText(/share a community with you stop being accepted/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /can no longer add a new friend, introduce itself, or vouch for an introduction/i,
+      ),
+    ).toBeInTheDocument();
   });
 
   it('still requires the exact device name in replace mode', async () => {

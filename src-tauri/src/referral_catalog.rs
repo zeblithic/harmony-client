@@ -264,14 +264,22 @@ pub fn sign_catalog_request(
 pub fn authenticate_catalog_request(
     req: &CatalogRequest,
     self_owner: OwnerAddr,
+    // ZEB-680 §1: consulted (via the inner `verify_enrolled_device`) against the
+    // requester's owner + verified device key.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     now_secs: u64,
 ) -> Result<(), ReferralAuthError> {
     if req.to_addr != self_owner {
         return Err(ReferralAuthError::WrongTarget);
     }
-    let verified =
-        verify_enrolled_device(&req.enrollment, &req.signer_certs, req.from_addr, now_secs)
-            .map_err(|_| ReferralAuthError::Auth)?;
+    let verified = verify_enrolled_device(
+        &req.enrollment,
+        &req.signer_certs,
+        req.from_addr,
+        revoked,
+        now_secs,
+    )
+    .map_err(|_| ReferralAuthError::Auth)?;
     let vk = VerifyingKey::from_bytes(&verified.device_ed25519)
         .map_err(|_| ReferralAuthError::SignatureInvalid)?;
     let preimage = catalog_request_sig_preimage(req.from_addr, req.to_addr);
@@ -321,13 +329,22 @@ pub fn verify_referral_catalog(
     cat: &ReferralCatalog,
     expected_author: OwnerAddr,
     expected_subject: OwnerAddr,
+    // ZEB-680 §1: consulted (via the inner `verify_enrolled_device`) against the
+    // catalog author's owner + verified device key.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     now_secs: u64,
 ) -> Result<(), ReferralAuthError> {
     if cat.author != expected_author {
         return Err(ReferralAuthError::AuthorMismatch);
     }
-    let verified = verify_enrolled_device(&cat.enrollment, &cat.signer_certs, cat.author, now_secs)
-        .map_err(|_| ReferralAuthError::Auth)?;
+    let verified = verify_enrolled_device(
+        &cat.enrollment,
+        &cat.signer_certs,
+        cat.author,
+        revoked,
+        now_secs,
+    )
+    .map_err(|_| ReferralAuthError::Auth)?;
     let vk = VerifyingKey::from_bytes(&verified.device_ed25519)
         .map_err(|_| ReferralAuthError::SignatureInvalid)?;
     let preimage =
@@ -433,6 +450,12 @@ mod tests {
     use crate::community_membership::mint_test_owner;
     use crate::friend_graph::{FriendEntry, FriendOrigin};
     use crate::owner_state_types::{Hlc, OwnerAddr};
+
+    /// ZEB-680: an empty revoked-device projection for verifier call sites that
+    /// don't exercise revocation (it revokes nothing).
+    fn no_revocations() -> crate::revoked_device_projection::RevokedDeviceProjection {
+        crate::revoked_device_projection::RevokedDeviceProjection::new()
+    }
 
     /// Deterministic HLC for fixtures.
     fn hlc(n: u64) -> Hlc {
@@ -574,18 +597,34 @@ mod tests {
         );
 
         // Happy path: correct author + subject verifies.
-        assert!(verify_referral_catalog(&cat, f.owner, subject, 0).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, subject, &no_revocations(), 0).is_ok());
 
         // Wrong subject → the signature no longer covers the expected preimage.
-        assert!(verify_referral_catalog(&cat, f.owner, OwnerAddr([0x99; 16]), 0).is_err());
+        assert!(verify_referral_catalog(
+            &cat,
+            f.owner,
+            OwnerAddr([0x99; 16]),
+            &no_revocations(),
+            0
+        )
+        .is_err());
 
         // Wrong expected author → AuthorMismatch (checked before crypto).
-        assert!(verify_referral_catalog(&cat, OwnerAddr([0x88; 16]), subject, 0).is_err());
+        assert!(verify_referral_catalog(
+            &cat,
+            OwnerAddr([0x88; 16]),
+            subject,
+            &no_revocations(),
+            0
+        )
+        .is_err());
 
         // Tampered entry display → signature over the entries no longer matches.
         let mut tampered = cat.clone();
         tampered.entries[0].display = Some("eve".to_string());
-        assert!(verify_referral_catalog(&tampered, f.owner, subject, 0).is_err());
+        assert!(
+            verify_referral_catalog(&tampered, f.owner, subject, &no_revocations(), 0).is_err()
+        );
     }
 
     #[test]
@@ -631,14 +670,14 @@ mod tests {
         // Expired: now_ms = 2_001 > expires_at = 2_000 → Err(Auth).
         assert!(
             matches!(
-                verify_referral_catalog(&cat, author, subject, 2_001),
+                verify_referral_catalog(&cat, author, subject, &no_revocations(), 2_001),
                 Err(ReferralAuthError::Auth)
             ),
             "a catalog with an expired cert must be rejected"
         );
         // Before expiry (now_ms = 1_500): must succeed.
         assert!(
-            verify_referral_catalog(&cat, author, subject, 1_500).is_ok(),
+            verify_referral_catalog(&cat, author, subject, &no_revocations(), 1_500).is_ok(),
             "a catalog with a non-expired cert must be accepted"
         );
     }
@@ -658,7 +697,7 @@ mod tests {
         );
         // Swap in G's cert: now cert.owner_id (G) != author (F).
         cat.enrollment = g.cert.clone();
-        assert!(verify_referral_catalog(&cat, f.owner, subject, 0).is_err());
+        assert!(verify_referral_catalog(&cat, f.owner, subject, &no_revocations(), 0).is_err());
     }
 
     #[test]
@@ -670,7 +709,7 @@ mod tests {
         let f_owner = OwnerAddr([0x42; 16]);
         let mut req = sign_catalog_request(&r.device_key, r.owner, f_owner, r.cert.clone());
         req.enrollment = s.cert.clone();
-        assert!(authenticate_catalog_request(&req, f_owner, 0).is_err());
+        assert!(authenticate_catalog_request(&req, f_owner, &no_revocations(), 0).is_err());
     }
 
     #[test]
@@ -680,15 +719,73 @@ mod tests {
         let req = sign_catalog_request(&r.device_key, r.owner, f_owner, r.cert.clone());
 
         // Happy path: addressed to f_owner, valid sig.
-        assert!(authenticate_catalog_request(&req, f_owner, 0).is_ok());
+        assert!(authenticate_catalog_request(&req, f_owner, &no_revocations(), 0).is_ok());
 
         // Wrong target server → WrongTarget (checked before crypto).
-        assert!(authenticate_catalog_request(&req, OwnerAddr([0x43; 16]), 0).is_err());
+        assert!(
+            authenticate_catalog_request(&req, OwnerAddr([0x43; 16]), &no_revocations(), 0)
+                .is_err()
+        );
 
         // Flipped signature bit → SignatureInvalid.
         let mut bad = req.clone();
         bad.sig[0] ^= 1;
-        assert!(authenticate_catalog_request(&bad, f_owner, 0).is_err());
+        assert!(authenticate_catalog_request(&bad, f_owner, &no_revocations(), 0).is_err());
+    }
+
+    /// ZEB-680 §1 (T3 regression pin): `authenticate_catalog_request` consults the
+    /// revoked-device projection through the inner `verify_enrolled_device`. A
+    /// request from a revoked requester fails auth (`DeviceRevoked` maps to
+    /// `ReferralAuthError::Auth`); the SAME request with an empty projection
+    /// authenticates. The only difference is the projection, so the rejection can
+    /// only come from the revocation consult — pinning the per-site enforcement.
+    #[test]
+    fn authenticate_catalog_request_rejects_revoked_requester() {
+        let r = mint_test_owner(0x21);
+        let f_owner = OwnerAddr([0x42; 16]);
+        let req = sign_catalog_request(&r.device_key, r.owner, f_owner, r.cert.clone());
+        // Empty projection revokes nothing: authenticates.
+        assert!(authenticate_catalog_request(&req, f_owner, &no_revocations(), 0).is_ok());
+        // Seed the requester's enrolled device key against its own owner.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let keys: std::collections::BTreeSet<[u8; 32]> =
+            std::iter::once(r.cert.device_pubkeys.classical.ed25519_verify).collect();
+        revoked.union_from_members(std::iter::once((r.owner, &keys)));
+        let err = authenticate_catalog_request(&req, f_owner, &revoked, 0).unwrap_err();
+        assert!(
+            matches!(err, ReferralAuthError::Auth),
+            "expected Auth (from DeviceRevoked), got {err:?}"
+        );
+    }
+
+    /// ZEB-680 §1 (T3 regression pin): `verify_referral_catalog` — the separable
+    /// author-verify seam (referral_catalog.rs :329) — consults the projection for
+    /// the catalog AUTHOR's cert. Seeding the author's device key rejects the
+    /// catalog; the same catalog with an empty projection verifies.
+    #[test]
+    fn verify_referral_catalog_rejects_revoked_author() {
+        let f = mint_test_owner(0x11);
+        let subject = OwnerAddr([0x22; 16]);
+        let cat = sign_referral_catalog(
+            &f.device_key,
+            f.owner,
+            subject,
+            one_entry(),
+            hlc(7),
+            f.cert.clone(),
+        );
+        // Empty projection revokes nothing: verifies.
+        assert!(verify_referral_catalog(&cat, f.owner, subject, &no_revocations(), 0).is_ok());
+        // Seed the AUTHOR's enrolled device key against the author owner.
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let keys: std::collections::BTreeSet<[u8; 32]> =
+            std::iter::once(f.cert.device_pubkeys.classical.ed25519_verify).collect();
+        revoked.union_from_members(std::iter::once((f.owner, &keys)));
+        let err = verify_referral_catalog(&cat, f.owner, subject, &revoked, 0).unwrap_err();
+        assert!(
+            matches!(err, ReferralAuthError::Auth),
+            "expected Auth (from DeviceRevoked), got {err:?}"
+        );
     }
 
     /// Build a FULL valid `FriendEntry` with deterministic field values, varying
@@ -758,7 +855,7 @@ mod tests {
             build_referral_catalog(&fg, subject, f.owner, f.cert.clone(), &f.device_key, hlc(7));
 
         assert_eq!(cat.entries.len(), 1);
-        assert!(verify_referral_catalog(&cat, f.owner, subject, 0).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, subject, &no_revocations(), 0).is_ok());
     }
 
     #[test]

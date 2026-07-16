@@ -28,6 +28,7 @@ use harmony_owner::certs::EnrollmentCert;
 ///   nothing — fail closed).
 ///
 /// Read-only: takes `fg` by shared ref; never mutates owner-state.
+#[allow(clippy::too_many_arguments)]
 pub fn serve_catalog_for_request(
     fg: &FriendGraph,
     req: &CatalogRequest,
@@ -35,11 +36,14 @@ pub fn serve_catalog_for_request(
     self_enrollment: EnrollmentCert,
     device2: &ed25519_dalek::SigningKey,
     at: Hlc,
+    // ZEB-680 §1: threaded to the inner `authenticate_catalog_request` so a
+    // revoked requester is rejected before any catalog is served.
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     now_secs: u64,
 ) -> Result<ReferralCatalog, ReferralAuthError> {
     // 1. Authenticate the request against OUR owner address (rejects a request
     //    addressed to someone else, a bad cert, or a bad signature).
-    authenticate_catalog_request(req, self_owner, now_secs)?;
+    authenticate_catalog_request(req, self_owner, revoked, now_secs)?;
     // 2. Friend-gate: only an ACTIVE friend gets a non-empty catalog. Anyone
     //    else (authenticated but unknown, or Pending/Revoked) gets EMPTY.
     let is_friend = fg
@@ -138,6 +142,20 @@ pub struct IrohFriendPexAcceptor {
     /// AND every test path always has one. A shed is LOGGED then answered with
     /// the same benign ack a normal outcome writes (no oracle).
     intro_rate_limiter: Arc<crate::friend_intro::IntroRateLimiter>,
+    /// ZEB-680 §1: the live by-owner revoked-device projection, consulted by the
+    /// inbound catalog + introduction verifiers (`serve_catalog_for_request`,
+    /// `authenticate_introduce_request`, `build_introduction_for_request`,
+    /// `verify_introduction`). A plain (non-`Option`) field like
+    /// `intro_rate_limiter` — `with_config` seeds the EMPTY projection (revokes
+    /// nothing) and production overrides it with the real `NodeState` handle via
+    /// [`Self::with_revoked`]. Clone shares the inner `Arc<RwLock<..>>`.
+    revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    /// ZEB-680 §2: live handle to this node's owner trust doc. Cloned into the
+    /// spawned X→introducee link (`spawn_complete_introduction`) so X's request
+    /// carries X's own-fleet revocations, built FRESH from the live trust snapshot
+    /// per introduction. `None` (tests / owner not loaded) carries none;
+    /// production wires the real `NodeState` handle via [`Self::with_self_trust_doc`].
+    self_trust_doc: Option<Arc<TokioMutex<harmony_owner::state::OwnerState>>>,
 }
 
 impl IrohFriendPexAcceptor {
@@ -190,6 +208,13 @@ impl IrohFriendPexAcceptor {
             event_sink: None,
             pending_requests: None,
             intro_rate_limiter: Arc::new(crate::friend_intro::IntroRateLimiter::new()),
+            // ZEB-680 §1: default to the EMPTY projection (revokes nothing) —
+            // production overrides via `with_revoked` with the real NodeState
+            // handle. Tests keep the empty default.
+            revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            // ZEB-680 §2: default to no trust doc → X's introduction link carries
+            // no revocations; production wires the live handle.
+            self_trust_doc: None,
         }
     }
 
@@ -290,6 +315,30 @@ impl IrohFriendPexAcceptor {
         self
     }
 
+    /// ZEB-680 §1: wire in the live `RevokedDeviceProjection` so the inbound
+    /// catalog + introduction verifiers reject a revoked device. Fluent setter
+    /// (default: the EMPTY projection from `with_config`). PRODUCTION MUST call
+    /// this with the real `NodeState` handle; a fresh `new()` here would silently
+    /// disable enforcement.
+    pub fn with_revoked(
+        mut self,
+        revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    ) -> Self {
+        self.revoked = revoked;
+        self
+    }
+
+    /// ZEB-680 §2: wire the live owner trust doc so X's auto-`Proceed`
+    /// introduction link carries X's own-fleet revocations (built fresh per
+    /// introduction). Fluent setter (default `None` from `with_config`).
+    pub fn with_self_trust_doc(
+        mut self,
+        trust_doc: Option<Arc<TokioMutex<harmony_owner::state::OwnerState>>>,
+    ) -> Self {
+        self.self_trust_doc = trust_doc;
+        self
+    }
+
     /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
     /// `iroh_friend_acceptor::IrohFriendHandshakeAcceptor::next_hlc`.
     async fn next_hlc(&self) -> Hlc {
@@ -349,6 +398,12 @@ impl IrohFriendPexAcceptor {
         let sync_engine = self.owner_sync_engine.clone();
         let friend_publisher = self.friend_publisher.clone();
         let event_sink = self.event_sink.clone();
+        // ZEB-680 §1: clone the live projection into the spawned task so X's
+        // introducee link verifies the Accepted response against revocations.
+        let revoked = self.revoked.clone();
+        // ZEB-680 §2: clone the live trust doc handle so X's request carries X's
+        // own-fleet revocations (built fresh from the snapshot in the driver).
+        let self_trust_doc = self.self_trust_doc.clone();
         tokio::spawn(async move {
             match crate::complete_introduction(
                 subject,
@@ -369,6 +424,8 @@ impl IrohFriendPexAcceptor {
                 sync_engine,
                 friend_publisher,
                 event_sink,
+                revoked,
+                self_trust_doc,
             )
             .await
             {
@@ -485,6 +542,7 @@ impl IrohFriendPexAcceptor {
                 crate::referral_catalog::authenticate_catalog_request(
                     &req,
                     self.self_owner,
+                    &self.revoked,
                     now_secs,
                 )
                 .map_err(|e| format!("{e:?}"))?;
@@ -506,6 +564,7 @@ impl IrohFriendPexAcceptor {
                         self.self_enrollment.clone(),
                         &self.device2_signing_key,
                         at,
+                        &self.revoked,
                         now_secs,
                     )
                     .map_err(|e| format!("serve decision: {e}"))?
@@ -575,6 +634,7 @@ impl IrohFriendPexAcceptor {
                 if let Err(e) = crate::friend_intro::authenticate_introduce_request(
                     &ir,
                     self.self_owner,
+                    &self.revoked,
                     now_secs,
                 ) {
                     tracing::debug!(
@@ -613,6 +673,7 @@ impl IrohFriendPexAcceptor {
                         self.self_enrollment.clone(),
                         &self.device2_signing_key,
                         at,
+                        &self.revoked,
                         now_secs,
                     );
                     let sealed = state
@@ -721,6 +782,7 @@ impl IrohFriendPexAcceptor {
                     &intro,
                     intro.voucher,
                     self.self_owner,
+                    &self.revoked,
                     now_secs,
                 )
                 .map_err(|e| format!("introduction verify: {e:?}"))?;
@@ -860,6 +922,12 @@ mod tests {
     use crate::community_membership::mint_test_owner;
     use crate::friend_graph::{FriendEntry, FriendOrigin};
 
+    /// ZEB-680: an empty revoked-device projection for verifier call sites that
+    /// don't exercise revocation (it revokes nothing).
+    fn no_revocations() -> crate::revoked_device_projection::RevokedDeviceProjection {
+        crate::revoked_device_projection::RevokedDeviceProjection::new()
+    }
+
     /// Deterministic HLC for fixtures.
     fn hlc(n: u64) -> Hlc {
         Hlc {
@@ -900,9 +968,17 @@ mod tests {
         );
 
         let req = sign_catalog_request(&r.device_key, r.owner, f.owner, r.cert.clone());
-        let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
-                .expect("active friend is served a catalog");
+        let cat = serve_catalog_for_request(
+            &fg,
+            &req,
+            f.owner,
+            f.cert.clone(),
+            &f.device_key,
+            hlc(7),
+            &no_revocations(),
+            0,
+        )
+        .expect("active friend is served a catalog");
 
         assert_eq!(
             cat.entries.len(),
@@ -911,7 +987,7 @@ mod tests {
         );
         assert_eq!(cat.entries[0].peer_owner, OwnerAddr([7; 16]));
         // The catalog is validly signed by F and subject-bound to R.
-        assert!(verify_referral_catalog(&cat, f.owner, r.owner, 0).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, r.owner, &no_revocations(), 0).is_ok());
     }
 
     #[test]
@@ -932,9 +1008,17 @@ mod tests {
             f.owner,
             stranger.cert.clone(),
         );
-        let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
-                .expect("a non-friend still gets a (benign, empty) signed catalog");
+        let cat = serve_catalog_for_request(
+            &fg,
+            &req,
+            f.owner,
+            f.cert.clone(),
+            &f.device_key,
+            hlc(7),
+            &no_revocations(),
+            0,
+        )
+        .expect("a non-friend still gets a (benign, empty) signed catalog");
 
         // SECURITY: a non-friend leaks NOTHING about F's referrable friends.
         assert!(
@@ -943,7 +1027,9 @@ mod tests {
         );
         // The empty catalog is still validly signed + subject-bound to the
         // stranger (benign: indistinguishable from "F has no referrables").
-        assert!(verify_referral_catalog(&cat, f.owner, stranger.owner, 0).is_ok());
+        assert!(
+            verify_referral_catalog(&cat, f.owner, stranger.owner, &no_revocations(), 0).is_ok()
+        );
     }
 
     #[test]
@@ -959,8 +1045,16 @@ mod tests {
             OwnerAddr([0x99; 16]),
             r.cert.clone(),
         );
-        let res =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0);
+        let res = serve_catalog_for_request(
+            &fg,
+            &req,
+            f.owner,
+            f.cert.clone(),
+            &f.device_key,
+            hlc(7),
+            &no_revocations(),
+            0,
+        );
         assert_eq!(
             res.unwrap_err(),
             ReferralAuthError::WrongTarget,
@@ -991,9 +1085,17 @@ mod tests {
             f.owner,
             requester.cert.clone(),
         );
-        let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
-                .expect("a Pending requester still gets a (benign, empty) signed catalog");
+        let cat = serve_catalog_for_request(
+            &fg,
+            &req,
+            f.owner,
+            f.cert.clone(),
+            &f.device_key,
+            hlc(7),
+            &no_revocations(),
+            0,
+        )
+        .expect("a Pending requester still gets a (benign, empty) signed catalog");
 
         // SECURITY: a non-Active friend leaks NOTHING about F's referrables.
         assert!(
@@ -1001,7 +1103,9 @@ mod tests {
             "a Pending requester must not learn any referrable friends"
         );
         // Still a validly signed catalog, subject-bound to the requester.
-        assert!(verify_referral_catalog(&cat, f.owner, requester.owner, 0).is_ok());
+        assert!(
+            verify_referral_catalog(&cat, f.owner, requester.owner, &no_revocations(), 0).is_ok()
+        );
     }
 
     #[test]
@@ -1027,9 +1131,17 @@ mod tests {
             f.owner,
             requester.cert.clone(),
         );
-        let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
-                .expect("a Revoked requester still gets a (benign, empty) signed catalog");
+        let cat = serve_catalog_for_request(
+            &fg,
+            &req,
+            f.owner,
+            f.cert.clone(),
+            &f.device_key,
+            hlc(7),
+            &no_revocations(),
+            0,
+        )
+        .expect("a Revoked requester still gets a (benign, empty) signed catalog");
 
         // SECURITY: a Revoked friend leaks NOTHING about F's referrables.
         assert!(
@@ -1037,7 +1149,9 @@ mod tests {
             "a Revoked requester must not learn any referrable friends"
         );
         // Still a validly signed catalog, subject-bound to the requester.
-        assert!(verify_referral_catalog(&cat, f.owner, requester.owner, 0).is_ok());
+        assert!(
+            verify_referral_catalog(&cat, f.owner, requester.owner, &no_revocations(), 0).is_ok()
+        );
     }
 
     #[test]
@@ -1060,9 +1174,17 @@ mod tests {
             .insert(revoked_peer, entry(FriendStatus::Revoked, true, Some("z")));
 
         let req = sign_catalog_request(&r.device_key, r.owner, f.owner, r.cert.clone());
-        let cat =
-            serve_catalog_for_request(&fg, &req, f.owner, f.cert.clone(), &f.device_key, hlc(7), 0)
-                .expect("active friend is served a catalog");
+        let cat = serve_catalog_for_request(
+            &fg,
+            &req,
+            f.owner,
+            f.cert.clone(),
+            &f.device_key,
+            hlc(7),
+            &no_revocations(),
+            0,
+        )
+        .expect("active friend is served a catalog");
 
         // Only the Active+referrable peer is served; the Revoked one is excluded.
         assert_eq!(
@@ -1076,6 +1198,6 @@ mod tests {
             "a Revoked peer must never be served even if flagged referrable"
         );
         // The catalog is validly signed by F and subject-bound to R.
-        assert!(verify_referral_catalog(&cat, f.owner, r.owner, 0).is_ok());
+        assert!(verify_referral_catalog(&cat, f.owner, r.owner, &no_revocations(), 0).is_ok());
     }
 }

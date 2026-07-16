@@ -297,8 +297,14 @@ async fn referral_catalog_roundtrip_serves_referrable_friends_over_iroh() {
         let cat = browse_catalog(&b_ep, target.clone(), &b_req_bytes).await;
 
         // The catalog must be validly signed by A and subject-bound to B.
-        verify_referral_catalog(&cat, a.owner, b.owner, 0)
-            .expect("Case 1: catalog must verify as authored by A, addressed to B");
+        verify_referral_catalog(
+            &cat,
+            a.owner,
+            b.owner,
+            &harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),
+            0,
+        )
+        .expect("Case 1: catalog must verify as authored by A, addressed to B");
         // Only X (Active + referrable) is served. Y is excluded (not referrable);
         // B is excluded (B is referrable=false, and is the requester).
         assert_eq!(
@@ -329,8 +335,14 @@ async fn referral_catalog_roundtrip_serves_referrable_friends_over_iroh() {
 
         // Still a validly signed catalog, subject-bound to C — but EMPTY: a
         // non-friend leaks NOTHING about A's referrable friends.
-        verify_referral_catalog(&cat, a.owner, c.owner, 0)
-            .expect("Case 2: empty catalog must verify as authored by A, addressed to C");
+        verify_referral_catalog(
+            &cat,
+            a.owner,
+            c.owner,
+            &harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),
+            0,
+        )
+        .expect("Case 2: empty catalog must verify as authored by A, addressed to C");
         assert!(
             cat.entries.is_empty(),
             "Case 2: a non-friend must receive an empty catalog (no leak), got {:?}",

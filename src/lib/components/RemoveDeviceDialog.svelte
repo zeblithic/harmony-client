@@ -97,8 +97,11 @@
   <p class="dialog-message honesty">
     Once the removal syncs, its vine feeds stop accepting new posts from this device — except a feed
     it never posted to, which has nothing to cut, and reactions, which are best-effort. Its direct
-    messages to people who share a community with you stop being accepted once the removal syncs;
-    blocking messages to contacts you only DM directly lands in follow-up work.
+    messages also stop being accepted, including to the contacts you only message directly. And it
+    can no longer add a new friend, introduce itself, or vouch for an introduction to anyone who has
+    heard of the removal — your friends are told right away, and new friends find out when they link
+    with you; someone it reaches who has never heard of you and shares no community with you may not
+    know yet.
   </p>
   {#if quorum}
     <p class="dialog-message warning" data-testid="remove-quorum-copy">
