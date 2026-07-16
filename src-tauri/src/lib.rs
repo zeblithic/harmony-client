@@ -51650,8 +51650,8 @@ pub async fn connectivity_link_friend_iroh_inner(
 ) -> Result<FriendLinkOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
-        FRIEND_MAX_PACKET_LEN,
+        friend_request_sig_preimage, verify_carried_revocations, verify_enrolled_device,
+        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -51985,6 +51985,14 @@ pub async fn connectivity_link_friend_iroh_inner(
             &Signature::from_bytes(&accepted.sig),
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
+
+    // ZEB-680 §2 (Task 5): fail-closed phase-1 verify of the responder's carried
+    // own-fleet revocation attestations, bound to the inviter's owner. A
+    // present-but-invalid attestation rejects the link; an empty/absent list is
+    // the back-compat no-op. Errors format to String here (the site's convention)
+    // — the variant's Display text keeps it distinguishable from DeviceRevoked.
+    verify_carried_revocations(payload.inviter_addr, &accepted.revocations)
+        .map_err(|e| format!("verify accept revocations: {e}"))?;
 
     // 8. The inviter's master key (their friend-graph anchor) came from the
     //    chokepoint verification in step 7; apply them as an Active/Token
@@ -56075,8 +56083,8 @@ pub(crate) async fn link_over_connection(
 ) -> Result<AddFriendOutcome, String> {
     use crate::iroh_friend_acceptor::{
         decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
-        FRIEND_MAX_PACKET_LEN,
+        friend_request_sig_preimage, verify_carried_revocations, verify_enrolled_device,
+        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
     };
     use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -56285,6 +56293,14 @@ pub(crate) async fn link_over_connection(
             &Signature::from_bytes(&accepted.sig),
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
+
+    // ZEB-680 §2 (Task 5): fail-closed phase-1 verify of the target's carried
+    // own-fleet revocation attestations, bound to the target's authenticated
+    // owner. A present-but-invalid attestation rejects the link; an empty/absent
+    // list is the back-compat no-op. Errors format to String here (the site's
+    // convention) — the variant's Display text keeps it distinguishable.
+    verify_carried_revocations(target_addr_master, &accepted.revocations)
+        .map_err(|e| format!("verify accept revocations: {e}"))?;
 
     // ZEB-376: when the caller pinned an expected owner (Path C introductions),
     // the authenticated accept MUST come from that owner — otherwise the peer we

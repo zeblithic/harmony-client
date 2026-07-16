@@ -994,6 +994,32 @@ pub fn verify_enrolled_device(
     Ok(verified)
 }
 
+/// ZEB-680 §2 (Task 5, receive phase 1): fail-closed verification of the
+/// revocation attestations a peer carried on a friend-link frame. For each pair,
+/// [`crate::dm_outbox::verify_revocation_push`] enforces the trust-bind — both
+/// the revocation's and the paired enrollment's `owner_id` must equal
+/// `peer_owner` (a peer may only attest ITS OWN devices, never relay a third
+/// party's), the revocation is Master-issued, and the enrollment's `device_id`
+/// binds `revocation.target`. A single present-but-invalid attestation REJECTS
+/// the whole handshake (spec §2 fail-closed, mapped to
+/// [`FriendHandshakeError::RevocationAttestationInvalid`]); an empty/absent slice
+/// is the back-compat no-op (`Ok(())`).
+///
+/// Pure — no writes. Applying the verified pairs to the owner-state store + live
+/// projection is receive phase 2 (Task 6), gated on established friendship.
+/// (`att.enrollment` is `Box<EnrollmentCert>`; `&att.enrollment` deref-coerces to
+/// the `&EnrollmentCert` the verifier expects.)
+pub fn verify_carried_revocations(
+    peer_owner: OwnerAddr,
+    attestations: &[RevocationAttestation],
+) -> Result<(), FriendHandshakeError> {
+    for att in attestations {
+        crate::dm_outbox::verify_revocation_push(peer_owner, &att.revocation, &att.enrollment)
+            .map_err(|e| FriendHandshakeError::RevocationAttestationInvalid(e.to_string()))?;
+    }
+    Ok(())
+}
+
 // =====================================================================
 // ZEB-371 Task 12 — Path A consent decision tree (spec §7.1)
 // =====================================================================
@@ -1193,6 +1219,10 @@ pub fn authenticate_friend_request(
     );
     vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
+    // ZEB-680 §2 (Task 5): fail-closed phase-1 verify of the requester's carried
+    // own-fleet revocation attestations. A present-but-invalid attestation
+    // rejects the handshake; an empty/absent list is the back-compat no-op.
+    verify_carried_revocations(req.from_addr, &req.revocations)?;
     Ok(())
 }
 
@@ -4317,6 +4347,110 @@ mod tests {
         assert!(
             matches!(err, FriendHandshakeError::DeviceRevoked),
             "expected DeviceRevoked, got {err:?}"
+        );
+    }
+
+    // ---- ZEB-680 T5: receive phase 1 — carried-attestation verification ----
+
+    #[test]
+    fn carried_revocations_valid_pass() {
+        // An own-fleet Master pair verifies when `peer_owner` is the pair's own
+        // master (both the revocation's and the enrollment's `owner_id`).
+        let att = revocation_attestation(0x60);
+        let peer_owner = OwnerAddr(att.revocation.owner_id);
+        verify_carried_revocations(peer_owner, std::slice::from_ref(&att))
+            .expect("a valid own-fleet attestation passes");
+    }
+
+    #[test]
+    fn carried_revocations_empty_ok() {
+        // Absence is the back-compat no-op regardless of the claimed owner.
+        verify_carried_revocations(OwnerAddr([0xAB; 16]), &[])
+            .expect("empty slice is Ok (back-compat no-op)");
+    }
+
+    #[test]
+    fn carried_revocations_third_party_owner_rejected() {
+        // Trust-bind: a valid pair whose owner != the link peer is rejected — a
+        // peer may only attest ITS OWN devices, never relay a third party's
+        // (mirrors dm_outbox::handle_revocation_push_rejects_third_party_owner).
+        let att = revocation_attestation(0x60);
+        let wrong = OwnerAddr([0xEE; 16]);
+        assert_ne!(wrong, OwnerAddr(att.revocation.owner_id));
+        let err = verify_carried_revocations(wrong, std::slice::from_ref(&att)).unwrap_err();
+        assert!(
+            matches!(err, FriendHandshakeError::RevocationAttestationInvalid(_)),
+            "third-party owner must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn carried_revocations_target_enrollment_mismatch_rejected() {
+        use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
+        use harmony_owner::pubkey_bundle::PubKeyBundle;
+        // A valid revocation for device A paired with a valid enrollment for a
+        // DIFFERENT device B under the SAME master: enrollment.device_id !=
+        // revocation.target, so the target↔enrollment binding rejects (mirrors
+        // dm_outbox::handle_revocation_push_rejects_target_enrollment_mismatch).
+        let master_sk = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let master_bundle = PubKeyBundle::classical_only(master_sk.verifying_key().to_bytes());
+        let owner = OwnerAddr(master_bundle.identity_hash());
+        let dev_a = PubKeyBundle::classical_only(
+            ed25519_dalek::SigningKey::from_bytes(&[0x72; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let revocation = RevocationCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            dev_a.identity_hash(),
+            1_700_000_000,
+            RevocationReason::Compromised,
+        )
+        .expect("mint revocation for device A");
+        let dev_b = PubKeyBundle::classical_only(
+            ed25519_dalek::SigningKey::from_bytes(&[0x73; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let other_enrollment = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            dev_b.identity_hash(),
+            dev_b,
+            1_700_000_000,
+            None,
+        )
+        .expect("mint enrollment for device B");
+        let att = RevocationAttestation {
+            revocation,
+            enrollment: Box::new(other_enrollment),
+        };
+        let err = verify_carried_revocations(owner, std::slice::from_ref(&att)).unwrap_err();
+        assert!(
+            matches!(err, FriendHandshakeError::RevocationAttestationInvalid(_)),
+            "target/enrollment mismatch must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn authenticate_friend_request_rejects_invalid_attestation() {
+        // A fully valid signed request carrying one bogus attestation (a valid
+        // pair whose owner != req.from_addr → third-party) fails the whole
+        // handshake closed; the SAME request with the attestation removed
+        // authenticates. The only difference between the two calls is the carried
+        // list, so the rejection can only come from the phase-1 carried-revocation
+        // verify — pinning that wire-in against a later refactor dropping it.
+        let (mut req, _, _) = signed_request(0x84, [7u8; 64]);
+        authenticate_friend_request(&req, &no_revocations(), 0)
+            .expect("valid request with no attestations authenticates");
+        let bogus = revocation_attestation(0x62);
+        assert_ne!(OwnerAddr(bogus.revocation.owner_id), req.from_addr);
+        req.revocations = vec![bogus];
+        let err = authenticate_friend_request(&req, &no_revocations(), 0).unwrap_err();
+        assert!(
+            matches!(err, FriendHandshakeError::RevocationAttestationInvalid(_)),
+            "a present-but-invalid attestation must fail the handshake closed, got {err:?}"
         );
     }
 
