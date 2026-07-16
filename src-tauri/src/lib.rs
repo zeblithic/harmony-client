@@ -55209,8 +55209,15 @@ async fn set_friend_auto_accept_impl(
     // CodeRabbit PR #397 R1: offload the sync load+save to spawn_blocking
     // (mirrors connectivity_set_identity_discoverable_impl) so a Tokio
     // worker isn't parked on disk I/O while the lock is held.
-    let _settings_guard = connectivity_settings_write_lock().lock().await;
+    // CodeRabbit PR #476: acquire the lock INSIDE the blocking closure —
+    // spawn_blocking keeps running if this future is cancelled (e.g. a
+    // headless-API client disconnect drops the handler future), and a guard
+    // held out here would be released at cancellation, letting a concurrent
+    // setter interleave its RMW with the still-running orphaned write.
+    // blocking_lock is safe on the blocking pool (it only panics on async
+    // runtime workers).
     tokio::task::spawn_blocking(move || {
+        let _settings_guard = connectivity_settings_write_lock().blocking_lock();
         let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.friend_auto_accept_known = enabled;
         settings
@@ -55218,7 +55225,13 @@ async fn set_friend_auto_accept_impl(
             .map_err(|e| format!("save connectivity-settings: {e}"))
     })
     .await
-    .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    .map_err(|e| {
+        // Qodo PR #476: a JoinError means the blocking task panicked (or was
+        // aborted at shutdown) — log it backend-side so the frontend Err
+        // isn't the only diagnostic signal.
+        tracing::warn!(error = %e, "set_friend_auto_accept: settings RMW task failed");
+        format!("save connectivity-settings task: {e}")
+    })??;
     Ok(())
 }
 
@@ -55264,7 +55277,12 @@ async fn get_friend_auto_accept_impl(
         connectivity_settings::ConnectivitySettings::load_or_default(&path).friend_auto_accept_known
     })
     .await
-    .map_err(|e| format!("load connectivity-settings task: {e}"))
+    .map_err(|e| {
+        // Qodo PR #476: log JoinErrors backend-side (panic in the blocking
+        // task would otherwise surface only as a frontend exception).
+        tracing::warn!(error = %e, "get_friend_auto_accept: settings load task failed");
+        format!("load connectivity-settings task: {e}")
+    })
 }
 
 /// Read the current "auto-accept known requesters" toggle from the persisted
@@ -55299,8 +55317,10 @@ async fn set_peer_intro_policy_impl(
     };
 
     // ZEB-629: file RMW under the process-global settings write lock.
-    let _settings_guard = connectivity_settings_write_lock().lock().await;
+    // CodeRabbit PR #476: lock INSIDE the closure — see
+    // `set_friend_auto_accept_impl` for the cancellation-safety rationale.
     tokio::task::spawn_blocking(move || {
+        let _settings_guard = connectivity_settings_write_lock().blocking_lock();
         let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
         settings.peer_intro_policy = policy;
         settings
@@ -55308,7 +55328,10 @@ async fn set_peer_intro_policy_impl(
             .map_err(|e| format!("save connectivity-settings: {e}"))
     })
     .await
-    .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    .map_err(|e| {
+        tracing::warn!(error = %e, "set_peer_intro_policy: settings RMW task failed");
+        format!("save connectivity-settings task: {e}")
+    })??;
     Ok(())
 }
 
@@ -55350,7 +55373,10 @@ async fn get_peer_intro_policy_impl(
         connectivity_settings::ConnectivitySettings::load_or_default(&path).peer_intro_policy
     })
     .await
-    .map_err(|e| format!("load connectivity-settings task: {e}"))
+    .map_err(|e| {
+        tracing::warn!(error = %e, "get_peer_intro_policy: settings load task failed");
+        format!("load connectivity-settings task: {e}")
+    })
 }
 
 /// Read the current introduction policy from the persisted settings. Returns the
@@ -57423,6 +57449,59 @@ mod friend_ipc_tests {
                 .expect("get default"),
             crate::friend_graph::PeerIntroPolicy::FriendsOfFriends
         );
+    }
+
+    #[tokio::test]
+    async fn setter_rmw_survives_future_cancellation() {
+        // CodeRabbit PR #476 regression: the settings write lock is acquired
+        // INSIDE the spawn_blocking closure, so cancelling the setter future
+        // (e.g. a headless-API client disconnect dropping the handler) can
+        // neither abandon the lock mid-RMW nor abort the write.
+        //
+        // Sequence: hold the write lock, poll the setter once (this submits
+        // the blocking task, which parks in blocking_lock), CANCEL the setter,
+        // then release the lock. The orphaned blocking task must still land
+        // the write. Under the pre-fix shape (guard from lock().await held
+        // across the JoinHandle await) the first poll parks at the outer lock
+        // instead — cancellation then means the RMW never starts, and this
+        // test fails waiting for the write.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        let gate = super::connectivity_settings_write_lock().lock().await;
+
+        let mut fut = Box::pin(super::set_friend_auto_accept_impl(
+            Some(path.clone()),
+            false,
+        ));
+        // Poll at least once; Elapsed is expected — the blocking closure is
+        // parked on the gate we hold, so the future cannot complete yet.
+        let polled = tokio::time::timeout(std::time::Duration::from_millis(50), &mut fut).await;
+        assert!(
+            polled.is_err(),
+            "setter must not complete while the write lock is held"
+        );
+        drop(fut); // cancel the caller mid-RMW
+
+        drop(gate); // release the lock; the orphaned task may now proceed
+
+        // The write must still land (generous budget; typical completion is
+        // single-digit ms — the budget only bounds a genuine regression).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !super::get_friend_auto_accept_impl(Some(path.clone()))
+                .await
+                .expect("get")
+            {
+                break; // the cancelled setter's write landed
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled setter's RMW never landed — has the lock \
+                 acquisition moved back outside the blocking closure?"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     #[test]

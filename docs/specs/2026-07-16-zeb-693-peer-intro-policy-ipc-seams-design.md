@@ -91,9 +91,11 @@ In the existing `#[cfg(test)]` mod in `lib.rs`, as `#[tokio::test]`
 
 * No behavior change: RMW-under-write-lock semantics, emit payloads, error
   strings, and spec defaults all preserved verbatim.
-* Gates: `cargo fmt --check`, `clippy --locked --all-targets
-  --features test-fixtures -D warnings`, nextest (scoped during dev, full
-  CI-parity sweep before PR), `tsc` + `vitest` untouched-but-run-by-CI.
+* Gates: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets
+  --features test-fixtures --no-deps -- -D warnings`, `cargo nextest run
+  --locked --workspace --all-targets --features test-fixtures` (scoped during
+  dev, full CI-parity sweep before PR), `tsc` + `vitest`
+  untouched-but-run-by-CI.
 * Execution: inline TDD in-session (single file, one cohesive pattern) —
   approved by Jake in the design review; whole-branch review + bot pass at
   PR time as usual.
