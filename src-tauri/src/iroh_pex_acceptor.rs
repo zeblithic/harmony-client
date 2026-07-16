@@ -537,22 +537,19 @@ impl IrohFriendPexAcceptor {
 
             // ── 2b: F's broker arm (You → F "introduce me to X"). ───────────
             PexDecoded::Frame(PexFrame::IntroduceRequest(ir)) => {
-                // ZEB-376 Task 13 (abuse hygiene): shed a flooding requester BEFORE
-                // any real work (auth, HLC bump, graph read, F→X dial). Keyed on
-                // the requester with dedupe of a repeated (requester, target). On a
-                // shed we LOG ("no silent truncation") and still write the SAME
-                // benign ack a normal outcome writes — a shed is
-                // network-indistinguishable (no oracle) and never reaches
+                // ZEB-694 Tier 1 (pre-auth flood shield): shed a flooding endpoint
+                // BEFORE any real work (auth, HLC bump, graph read, F→X dial), keyed
+                // on the connecting endpoint's authenticated iroh id — un-spoofable,
+                // before any verification. On a shed we LOG ("no silent truncation")
+                // and still write the SAME benign ack a normal outcome writes — a
+                // shed is network-indistinguishable (no oracle) and never reaches
                 // `build_introduction_for_request` or the dial.
-                if let Err(reason) =
-                    self.intro_rate_limiter
-                        .admit(ir.from_addr, ir.target, wall_now_ms())
+                let now = wall_now_ms();
+                if let Err(reason) = self
+                    .intro_rate_limiter
+                    .admit_connection(*conn.remote_id().as_bytes(), now)
                 {
-                    tracing::warn!(
-                        reason,
-                        key = %hex::encode(ir.from_addr.0),
-                        "introduction shed by rate limiter"
-                    );
+                    tracing::warn!(reason, "introduction shed by connection shield");
                     return self.write_ack(&mut send).await;
                 }
                 // Authenticate + authorize (X must be an Active + referrable friend)
@@ -583,6 +580,20 @@ impl IrohFriendPexAcceptor {
                     tracing::debug!(
                         error = ?e,
                         "ZEB-376: introduce-request pre-HLC auth failed; benign ack, no HLC bump"
+                    );
+                    return self.write_ack(&mut send).await;
+                }
+                // ZEB-694 Tier 2 (post-auth): `ir.from_addr` is now authenticated,
+                // so the per-requester quota keys on a real owner. A shed still
+                // writes the benign ack — no HLC bump, no graph read, no F→X dial.
+                if let Err(reason) =
+                    self.intro_rate_limiter
+                        .admit_requester(ir.from_addr, ir.target, now)
+                {
+                    tracing::warn!(
+                        reason,
+                        key = %hex::encode(ir.from_addr.0),
+                        "introduction shed by requester quota"
                     );
                     return self.write_ack(&mut send).await;
                 }
@@ -663,22 +674,20 @@ impl IrohFriendPexAcceptor {
                 // before the network dial.
                 let intro = *intro;
 
-                // ZEB-376 Task 13 (abuse hygiene): shed a flooding voucher BEFORE
-                // any real work (verify, reachability checks, policy, dial). Keyed
-                // on the voucher with dedupe of a repeated (voucher, subject). On a
-                // shed we LOG ("no silent truncation") and still write the SAME
+                // ZEB-694 Tier 1: the connecting endpoint here is the DELIVERER
+                // (F dialing X). Shed a flooding endpoint BEFORE any real work
+                // (verify, reachability checks, policy, dial), keyed on its
+                // authenticated iroh id — un-spoofable, before any verification. On
+                // a shed we LOG ("no silent truncation") and still write the SAME
                 // benign ack a normal outcome writes — a shed is
                 // network-indistinguishable (no oracle) and never reaches
                 // `verify_introduction` or the dial.
-                if let Err(reason) =
-                    self.intro_rate_limiter
-                        .admit(intro.voucher, intro.subject, wall_now_ms())
+                let now = wall_now_ms();
+                if let Err(reason) = self
+                    .intro_rate_limiter
+                    .admit_connection(*conn.remote_id().as_bytes(), now)
                 {
-                    tracing::warn!(
-                        reason,
-                        key = %hex::encode(intro.voucher.0),
-                        "introduction shed by rate limiter"
-                    );
+                    tracing::warn!(reason, "introduction shed by connection shield");
                     return self.write_ack(&mut send).await;
                 }
 
@@ -715,6 +724,21 @@ impl IrohFriendPexAcceptor {
                     now_secs,
                 )
                 .map_err(|e| format!("introduction verify: {e:?}"))?;
+
+                // ZEB-694 Tier 2 (post-auth): `intro.voucher` is now verified, so
+                // the per-voucher quota keys on a real owner. A shed still writes
+                // the benign ack and never reaches the reachability checks or dial.
+                if let Err(reason) =
+                    self.intro_rate_limiter
+                        .admit_voucher(intro.voucher, intro.subject, now)
+                {
+                    tracing::warn!(
+                        reason,
+                        key = %hex::encode(intro.voucher.0),
+                        "introduction shed by voucher quota"
+                    );
+                    return self.write_ack(&mut send).await;
+                }
 
                 // 3. Verify the RELAYED reachability is self-authenticated by the
                 //    subject's own device-#2 identity (the same inner check the

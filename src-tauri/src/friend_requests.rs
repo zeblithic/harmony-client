@@ -19,7 +19,7 @@
 
 use crate::owner_state_types::OwnerAddr;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// ZEB-376 Task 11: what KIND of pending inbox entry this is. A plain Path-A
 /// `LinkRequest` (mutual-key dial) is accepted by marking the requester approved
@@ -54,6 +54,15 @@ pub struct StoredIntroductionOffer {
     pub reachability: crate::reachability_record::ReachabilityAnnouncePayload,
 }
 
+/// ZEB-694: a staged AskMe offer older than this is treated as dead (its relayed
+/// reachability is past the intro/reachability freshness bound anyway) — swept
+/// from the inbox and rejected at accept time with an "expired" message.
+pub const INTRODUCTION_OFFER_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7d
+
+pub fn is_offer_expired(received_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(received_at_ms) >= INTRODUCTION_OFFER_TTL_MS
+}
+
 /// One recorded inbound friend request awaiting the user's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInbound {
@@ -72,6 +81,9 @@ pub struct PendingInbound {
 struct Inner {
     inbound: HashMap<OwnerAddr, PendingInbound>,
     approved: HashSet<OwnerAddr>,
+    /// ZEB-694: subjects with an introduction accept currently dialing — blocks a
+    /// concurrent second accept from double-dialing.
+    accepting: HashSet<OwnerAddr>,
 }
 
 /// Process-local store of pending inbound friend requests and the set of
@@ -168,6 +180,21 @@ impl PendingFriendRequests {
         )
     }
 
+    /// Non-consuming clone of a staged `IntroductionOffer` plus its `received_at_ms`.
+    /// Returns `None` if the entry is absent or a plain `LinkRequest`. The accept
+    /// path uses this (instead of `take_offer`) so a failed dial leaves the offer
+    /// staged for retry (ZEB-694).
+    pub fn peek_offer(&self, subject: &OwnerAddr) -> Option<(StoredIntroductionOffer, u64)> {
+        let inner = self.inner.lock().expect("pending inner mutex poisoned");
+        match inner.inbound.get(subject) {
+            Some(p) => match &p.kind {
+                PendingKind::IntroductionOffer(o) => Some(((**o).clone(), p.received_at_ms)),
+                PendingKind::LinkRequest => None,
+            },
+            None => None,
+        }
+    }
+
     /// Snapshot the currently-pending inbound requests (for the list IPC).
     pub fn list(&self) -> Vec<(OwnerAddr, PendingInbound)> {
         let inner = self.inner.lock().expect("pending inner mutex poisoned");
@@ -244,6 +271,54 @@ impl PendingFriendRequests {
         let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
         inner.inbound.remove(addr);
         inner.approved.remove(addr);
+    }
+
+    /// Test-and-set: `true` and marks in-flight if no accept for `subject` is
+    /// already dialing; `false` if one is. Pair with `end_accept` (or the RAII
+    /// `AcceptInFlightGuard`).
+    #[must_use]
+    pub fn try_begin_accept(&self, subject: OwnerAddr) -> bool {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.accepting.insert(subject) // HashSet::insert returns false if already present
+    }
+
+    /// Clear the in-flight marker for `subject`.
+    pub fn end_accept(&self, subject: &OwnerAddr) {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.accepting.remove(subject);
+    }
+
+    /// Remove every staged `IntroductionOffer` older than the TTL. Plain
+    /// `LinkRequest` entries have their own lifecycle and are left untouched.
+    /// Returns the number of offers swept.
+    pub fn sweep_expired_offers(&self, now_ms: u64) -> usize {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        let before = inner.inbound.len();
+        inner.inbound.retain(|_, p| match p.kind {
+            PendingKind::IntroductionOffer(_) => !is_offer_expired(p.received_at_ms, now_ms),
+            PendingKind::LinkRequest => true,
+        });
+        before - inner.inbound.len()
+    }
+}
+
+/// RAII: clears the in-flight accept marker on drop, so every accept exit path
+/// (early return, dial error, panic) releases it.
+#[must_use = "dropping this immediately releases the in-flight accept marker"]
+pub struct AcceptInFlightGuard {
+    store: Arc<PendingFriendRequests>,
+    subject: OwnerAddr,
+}
+
+impl AcceptInFlightGuard {
+    pub fn new(store: Arc<PendingFriendRequests>, subject: OwnerAddr) -> Self {
+        Self { store, subject }
+    }
+}
+
+impl Drop for AcceptInFlightGuard {
+    fn drop(&mut self) {
+        self.store.end_accept(&self.subject);
     }
 }
 
@@ -377,6 +452,29 @@ mod tests {
         assert!(store.take_offer(&addr(3)).is_none());
         assert_eq!(store.list().len(), 1, "LinkRequest row must remain");
         assert!(matches!(&store.list()[0].1.kind, PendingKind::LinkRequest));
+    }
+
+    #[test]
+    fn peek_offer_clones_without_consuming() {
+        let store = PendingFriendRequests::default();
+        let subj = OwnerAddr([1; 16]);
+        let offer = StoredIntroductionOffer {
+            voucher: OwnerAddr([2; 16]),
+            subject: subj,
+            reachability: fixture_reach(), // existing helper in this test module (:383)
+        };
+        store.record_introduction_offer(subj, Some("x".into()), 4242, offer.clone());
+        let (peeked, received_at) = store.peek_offer(&subj).expect("offer present");
+        assert_eq!(peeked, offer);
+        assert_eq!(received_at, 4242);
+        assert!(store.has_offer(&subj), "peek did NOT consume the offer");
+        // a plain LinkRequest yields None
+        let other = OwnerAddr([9; 16]);
+        store.record_inbound(other, None, 1);
+        assert!(
+            store.peek_offer(&other).is_none(),
+            "a LinkRequest is not an offer"
+        );
     }
 
     #[test]
@@ -529,6 +627,64 @@ mod tests {
         assert!(
             !s.take(&addr(1), 1_500),
             "the backward-clock take still consumed the entry (one-shot)"
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_blocks_concurrent_accept() {
+        use std::sync::Arc;
+        let store = Arc::new(PendingFriendRequests::default());
+        let subj = OwnerAddr([1; 16]);
+        assert!(store.try_begin_accept(subj), "first accept begins");
+        assert!(
+            !store.try_begin_accept(subj),
+            "second concurrent accept is blocked"
+        );
+        {
+            // RAII guard clears the marker on drop.
+            let _g = AcceptInFlightGuard::new(Arc::clone(&store), subj);
+            // still in flight while the guard lives
+            assert!(!store.try_begin_accept(subj));
+        } // _g drops here → end_accept
+          // NOTE: try_begin_accept above set the flag; the guard's drop cleared it.
+        assert!(
+            store.try_begin_accept(subj),
+            "after the guard drops, a new accept can begin"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_only_expired_offers() {
+        let store = PendingFriendRequests::default();
+        let fresh = OwnerAddr([1; 16]);
+        let stale = OwnerAddr([2; 16]);
+        let link = OwnerAddr([3; 16]);
+        let mk = |s: OwnerAddr| StoredIntroductionOffer {
+            voucher: OwnerAddr([9; 16]),
+            subject: s,
+            reachability: fixture_reach(), // existing helper in this test module (friend_requests.rs:383)
+        };
+        let now = 10 * INTRODUCTION_OFFER_TTL_MS;
+        store.record_introduction_offer(fresh, None, now, mk(fresh)); // received now → fresh
+        store.record_introduction_offer(stale, None, now - INTRODUCTION_OFFER_TTL_MS, mk(stale)); // exactly TTL old → expired
+        store.record_inbound(link, None, 0); // a LinkRequest, never swept
+
+        assert!(is_offer_expired(now - INTRODUCTION_OFFER_TTL_MS, now));
+        assert!(!is_offer_expired(now, now));
+
+        let swept = store.sweep_expired_offers(now);
+        assert_eq!(swept, 1, "only the stale offer is swept");
+        assert!(store.has_offer(&fresh), "fresh offer retained");
+        assert!(!store.has_offer(&stale), "stale offer removed");
+        // LinkRequest untouched: the inbound entry must SURVIVE the sweep as a
+        // LinkRequest (peek_offer is None for it by design either way, so it can't
+        // catch a regression in the `LinkRequest => true` retain arm — check list()).
+        let after = store.list();
+        assert!(
+            after
+                .iter()
+                .any(|(a, p)| *a == link && matches!(p.kind, PendingKind::LinkRequest)),
+            "the LinkRequest entry must survive the sweep"
         );
     }
 }

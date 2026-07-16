@@ -54526,11 +54526,15 @@ pub struct PendingFriendRequestDto {
     pub introduced_by: Option<String>,
 }
 
-/// Project the process-local pending-inbound store into the frontend DTO list.
-/// Pure over the store so it's unit-testable without a NodeState harness.
+/// Sweeps expired offers, then projects the process-local pending-inbound store
+/// into the frontend DTO list. Synchronous and deterministic (the sweep mutates
+/// the store as a side effect), so unit-testable without a NodeState harness.
 pub fn list_pending_friend_requests_inner(
     store: &crate::friend_requests::PendingFriendRequests,
+    now_ms: u64,
 ) -> Vec<PendingFriendRequestDto> {
+    // ZEB-694: drop offers past the TTL so the UI stops showing dead introductions.
+    store.sweep_expired_offers(now_ms);
     store
         .list()
         .into_iter()
@@ -54586,7 +54590,10 @@ pub(crate) async fn list_pending_friend_requests_impl(
     let Some(store) = store else {
         return Ok(Vec::new());
     };
-    Ok(list_pending_friend_requests_inner(&store))
+    Ok(list_pending_friend_requests_inner(
+        &store,
+        crate::iroh_friend_acceptor::wall_now_ms(),
+    ))
 }
 
 /// Accept a pending inbound friend request. Two shapes:
@@ -54606,6 +54613,73 @@ async fn accept_friend_request(
 ) -> Result<(), String> {
     let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
     accept_friend_request_impl(state.inner(), sink, owner_id_hex).await
+}
+
+use crate::friend_requests::{AcceptInFlightGuard, PendingFriendRequests, StoredIntroductionOffer};
+
+/// ZEB-694: outcome of the accept-branch entry gate (guard + peek + TTL), decided
+/// with only the store + clock (no NodeState).
+///
+/// `large_enum_variant` is intentionally allowed: this is a transient return
+/// value — constructed by `begin_introduction_accept` and immediately matched +
+/// destructured by its single caller. It is never stored, boxed into a
+/// collection, or held long-term, so the lint's memory-footprint rationale does
+/// not apply, and boxing `offer` would only add a needless allocation on the hot
+/// `Proceed` path.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum IntroAcceptGate {
+    Proceed {
+        offer: StoredIntroductionOffer,
+        guard: AcceptInFlightGuard,
+    },
+    AlreadyInFlight,
+    Expired,
+    Vanished,
+}
+
+/// Acquire the in-flight guard, peek the staged offer, and apply the TTL — WITHOUT
+/// consuming the offer. On `Proceed` the returned `guard` must be held across the
+/// dial so a concurrent accept can't double-dial; it clears the marker on drop.
+pub(crate) fn begin_introduction_accept(
+    store: &std::sync::Arc<PendingFriendRequests>,
+    addr: crate::owner_state_types::OwnerAddr,
+    now_ms: u64,
+) -> IntroAcceptGate {
+    if !store.try_begin_accept(addr) {
+        return IntroAcceptGate::AlreadyInFlight;
+    }
+    // CRITICAL: construct the guard IMMEDIATELY after `try_begin_accept` returns
+    // true, with no fallible/panicking code in between — otherwise a panic would
+    // leak the in-flight marker.
+    let guard = AcceptInFlightGuard::new(std::sync::Arc::clone(store), addr);
+    let Some((offer, received_at)) = store.peek_offer(&addr) else {
+        return IntroAcceptGate::Vanished; // guard drops → clears marker
+    };
+    if crate::friend_requests::is_offer_expired(received_at, now_ms) {
+        store.take_offer(&addr); // drop the dead entry
+        return IntroAcceptGate::Expired; // guard drops → clears marker
+    }
+    IntroAcceptGate::Proceed { offer, guard }
+}
+
+/// Consume the staged offer IFF the dial reached `Linked`; otherwise leave it
+/// staged for retry and surface a distinguishable message.
+pub(crate) fn finalize_introduction_accept(
+    store: &PendingFriendRequests,
+    addr: crate::owner_state_types::OwnerAddr,
+    result: Result<AddFriendOutcome, String>,
+) -> Result<(), String> {
+    match result {
+        Ok(AddFriendOutcome::Linked { .. }) => {
+            store.take_offer(&addr);
+            Ok(())
+        }
+        Ok(AddFriendOutcome::Pending) | Ok(AddFriendOutcome::Unreachable) => Err(
+            "Couldn't reach them right now — the introduction is saved, try Accept again later."
+                .into(),
+        ),
+        Err(e) => Err(e),
+    }
 }
 
 /// ZEB-445: shared IPC/RPC seam.
@@ -54661,12 +54735,36 @@ pub(crate) async fn accept_friend_request_impl(
     // `LinkRequest` has no offer (`has_offer` is false) → the Path-A `approve`
     // branch below, UNCHANGED.
     //
-    // HARD-RULE (verify before an irreversible write): validate the self-dial
-    // handles BEFORE `take_offer` consumes the ONE-SHOT offer, so a missing handle
-    // leaves the offer row intact (recoverable) instead of destroying it. The
-    // non-consuming `has_offer` peek gates on the offer path ONLY — Path A never
-    // required these handles and still doesn't.
+    // ZEB-694: the accept entry gate (`begin_introduction_accept`) takes the
+    // in-flight guard, NON-CONSUMINGLY peeks the staged offer, and applies the
+    // TTL — all before the dial. The offer is consumed ONLY when the dial reaches
+    // `Linked` (`finalize_introduction_accept`); a failed/pending dial leaves the
+    // row staged so the user can Accept again later. The `_accept_guard` binding
+    // lives to function exit and clears the in-flight marker on drop.
     if store.has_offer(&addr) {
+        let (offer, _accept_guard) = match begin_introduction_accept(
+            &store,
+            addr,
+            crate::iroh_friend_acceptor::wall_now_ms(),
+        ) {
+            IntroAcceptGate::Proceed { offer, guard } => (offer, guard),
+            IntroAcceptGate::AlreadyInFlight => {
+                crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+                return Err("This introduction is already being accepted.".into());
+            }
+            IntroAcceptGate::Expired => {
+                crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+                return Err("This introduction has expired — ask them for a fresh one.".into());
+            }
+            IntroAcceptGate::Vanished => {
+                crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+                return Err("This introduction is no longer available.".into());
+            }
+        };
+
+        // Validate the self-dial/durability handles (unchanged) — a missing handle
+        // returns without consuming (the guard clears the in-flight marker on drop,
+        // the offer stays staged).
         let (
             Some(iroh_endpoint),
             Some(crdt_state),
@@ -54685,19 +54783,6 @@ pub(crate) async fn accept_friend_request_impl(
             owner_keytree,
         )
         else {
-            // Handles unavailable: the offer is NOT yet consumed, so leave the row
-            // intact (a later accept, once the node is fully loaded, can still
-            // complete it). Refresh the inbox and report we can't complete now.
-            crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
-            return Err(OWNER_NOT_LOADED_MSG.into());
-        };
-
-        // Handles present — NOW irreversibly consume the one-shot offer.
-        // `has_offer` above confirmed an offer; only a concurrent accept racing
-        // between the peek and here could win first, in which case `take_offer`
-        // returns `None` and we simply refresh the inbox + report (no link, no
-        // double-consume).
-        let Some(offer) = store.take_offer(&addr) else {
             crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
             return Err(OWNER_NOT_LOADED_MSG.into());
         };
@@ -54741,11 +54826,11 @@ pub(crate) async fn accept_friend_request_impl(
         )
         .await;
 
-        // Refresh the inbox regardless of outcome (the offer row was consumed by
-        // `take_offer`). `complete_introduction` already emitted this on a
-        // `Linked` outcome; a second emit is harmless (the frontend re-fetches).
+        // ZEB-694: consume the offer ONLY on `Linked`; otherwise it stays staged
+        // for retry. `_accept_guard` drops at function exit, clearing the marker.
+        let outcome = finalize_introduction_accept(&store, addr, result);
         crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
-        return result.map(|_outcome| ());
+        return outcome;
     }
 
     // Path A (unchanged): approve so the requester's next dial links inline.
@@ -56928,7 +57013,7 @@ mod friend_ipc_tests {
         store.record_inbound(OwnerAddr([0xA1; 16]), Some("alice".into()), 1_000);
         store.record_inbound(OwnerAddr([0xB2; 16]), None, 2_000);
 
-        let mut dtos = list_pending_friend_requests_inner(&store);
+        let mut dtos = list_pending_friend_requests_inner(&store, 0);
         // Map iteration order is unspecified — sort for a stable assert.
         dtos.sort_by(|a, b| a.received_at_ms.cmp(&b.received_at_ms));
         assert_eq!(dtos.len(), 2);
@@ -56944,7 +57029,7 @@ mod friend_ipc_tests {
     fn list_pending_friend_requests_inner_empty_store_is_empty() {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
-        assert!(list_pending_friend_requests_inner(&store).is_empty());
+        assert!(list_pending_friend_requests_inner(&store, 0).is_empty());
     }
 
     // ── ZEB-236 Task 4: DM-invite projector ──────────────────────────────
@@ -57144,7 +57229,7 @@ mod friend_ipc_tests {
         store.mark_approved(addr);
         store.decline(&addr);
         assert!(
-            list_pending_friend_requests_inner(&store).is_empty(),
+            list_pending_friend_requests_inner(&store, 0).is_empty(),
             "decline drops the inbound request"
         );
         assert!(!store.is_approved(&addr), "decline drops the approval too");
@@ -67851,5 +67936,115 @@ mod zeb_687_revoked_feed_boot_tests {
         //     test — matches serve_cli / api_server teardown. Runs while HOME is
         //     still the tempdir; the env guards drop after this at end of scope.
         let _ = stop_inner(&state, None);
+    }
+}
+
+#[cfg(test)]
+mod zeb694_accept_tests {
+    use super::*;
+    use crate::friend_requests::{
+        PendingFriendRequests, StoredIntroductionOffer, INTRODUCTION_OFFER_TTL_MS,
+    };
+    use crate::owner_state_types::OwnerAddr;
+    use std::sync::Arc;
+
+    // ReachabilityAnnouncePayload has no Default; build the 7-field zeroed payload
+    // (mirrors friend_requests.rs:383 fixture_reach — the store never inspects it).
+    fn fixture_reach() -> crate::reachability_record::ReachabilityAnnouncePayload {
+        crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: [7u8; 32],
+            home_relay_url: String::new(),
+            direct_addresses: Vec::new(),
+            announced_at_ms: 0,
+            identity_signature: [0u8; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        }
+    }
+
+    fn stage(store: &PendingFriendRequests, subj: OwnerAddr, received_at: u64) {
+        store.record_introduction_offer(
+            subj,
+            None,
+            received_at,
+            StoredIntroductionOffer {
+                voucher: OwnerAddr([9; 16]),
+                subject: subj,
+                reachability: fixture_reach(),
+            },
+        );
+    }
+
+    #[test]
+    fn begin_gate_proceeds_then_blocks_concurrent() {
+        let store = Arc::new(PendingFriendRequests::default());
+        let subj = OwnerAddr([1; 16]);
+        stage(&store, subj, 1000);
+        let gate = begin_introduction_accept(&store, subj, 2000);
+        assert!(matches!(gate, IntroAcceptGate::Proceed { .. }));
+        // guard held by `gate` → a second begin is blocked
+        assert!(matches!(
+            begin_introduction_accept(&store, subj, 2000),
+            IntroAcceptGate::AlreadyInFlight
+        ));
+        drop(gate); // releases the guard
+        assert!(matches!(
+            begin_introduction_accept(&store, subj, 2000),
+            IntroAcceptGate::Proceed { .. }
+        ));
+    }
+
+    #[test]
+    fn begin_gate_expires_stale_offer() {
+        let store = Arc::new(PendingFriendRequests::default());
+        let subj = OwnerAddr([1; 16]);
+        stage(&store, subj, 0);
+        let gate = begin_introduction_accept(&store, subj, INTRODUCTION_OFFER_TTL_MS + 1);
+        assert!(matches!(gate, IntroAcceptGate::Expired));
+        assert!(!store.has_offer(&subj), "expired offer dropped");
+    }
+
+    #[test]
+    fn begin_gate_vanished_when_no_offer() {
+        let store = Arc::new(PendingFriendRequests::default());
+        let subj = OwnerAddr([1; 16]);
+        assert!(matches!(
+            begin_introduction_accept(&store, subj, 1),
+            IntroAcceptGate::Vanished
+        ));
+    }
+
+    #[test]
+    fn finalize_consumes_only_on_linked() {
+        let store = PendingFriendRequests::default();
+        let subj = OwnerAddr([1; 16]);
+        // Linked → consumed + Ok
+        stage(&store, subj, 0);
+        let r = finalize_introduction_accept(
+            &store,
+            subj,
+            Ok(AddFriendOutcome::Linked {
+                owner_id_hex: "aa".into(),
+                display: None,
+            }),
+        );
+        assert!(r.is_ok());
+        assert!(!store.has_offer(&subj), "Linked consumes the offer");
+        // Unreachable → retained + Err
+        stage(&store, subj, 0);
+        let r = finalize_introduction_accept(&store, subj, Ok(AddFriendOutcome::Unreachable));
+        assert!(r.is_err());
+        assert!(
+            store.has_offer(&subj),
+            "Unreachable retains the offer for retry"
+        );
+        // Pending → retained + Err
+        let r = finalize_introduction_accept(&store, subj, Ok(AddFriendOutcome::Pending));
+        assert!(r.is_err());
+        assert!(store.has_offer(&subj));
+        // dial Err → retained + propagates message
+        let r = finalize_introduction_accept(&store, subj, Err("boom".into()));
+        assert_eq!(r, Err("boom".into()));
+        assert!(store.has_offer(&subj));
     }
 }

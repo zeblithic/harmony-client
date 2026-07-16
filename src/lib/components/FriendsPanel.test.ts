@@ -684,3 +684,72 @@ describe('FriendsPanel — introduction broker (ZEB-376 Phase 2b)', () => {
     expect(queryByTestId(`introduced-by-badge-${requesterId}`)).toBeNull();
   });
 });
+
+describe('FriendsPanel — friend request accept (ZEB-694 Task B5)', () => {
+  const ownerIdHex = 'a1'.repeat(16); // 16-byte owner_id = 32 hex chars
+
+  const REQ = { ownerIdHex, display: 'Alice', receivedAtMs: 0, introducedBy: null };
+
+  it('keeps the pending row and surfaces the backend message when accept is rejected (not linked)', async () => {
+    const listPendingRequests = vi.fn().mockResolvedValue([REQ]);
+    const acceptRequest = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Couldn't reach them right now — the introduction is saved, try Accept again later.",
+        ),
+      );
+    const service = mockService({ listPendingRequests, acceptRequest });
+    const { findByTestId, getByTestId } = render(FriendsPanel, { props: { service } });
+
+    await findByTestId('pending-list');
+    await fireEvent.click(getByTestId('accept-btn'));
+
+    // The backend rejection message surfaces near the requests inbox…
+    const err = await findByTestId('pending-error');
+    expect(err.textContent).toContain('introduction is saved');
+
+    // …and the row is NOT optimistically removed — a non-linked accept leaves
+    // the staged offer in place backend-side, so the row must only disappear
+    // once a fresh `list_pending_friend_requests` (via `friend-list-changed`)
+    // actually drops it. `listPendingRequests` should still have been called
+    // only once (the initial mount fetch) — no refetch was triggered by the
+    // failure, so nothing could have removed the row.
+    expect(listPendingRequests).toHaveBeenCalledTimes(1);
+    expect(getByTestId('pending-list')).toBeTruthy();
+    expect(getByTestId(`friend-name-${ownerIdHex}`).textContent).toContain('Alice');
+  });
+
+  it('accepts successfully, clears any prior error, and refreshes the pending list', async () => {
+    // ZEB-694 CR#10: the first accept REJECTS (so pendingError is genuinely set),
+    // then a retry RESOLVES — proving handleAccept's success path clears the
+    // stale error rather than the test trivially passing with no error ever set.
+    const listPendingRequests = vi
+      .fn()
+      .mockResolvedValueOnce([REQ])
+      .mockResolvedValueOnce([]);
+    const acceptRequest = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Introduction not delivered — try again.'))
+      .mockResolvedValueOnce(undefined);
+    const service = mockService({ listPendingRequests, acceptRequest });
+    const { findByTestId, getByTestId, queryByTestId } = render(FriendsPanel, {
+      props: { service },
+    });
+
+    await findByTestId('pending-list');
+    await fireEvent.click(getByTestId('accept-btn'));
+
+    const err = await findByTestId('pending-error');
+    expect(err.textContent).toContain('Introduction not delivered');
+    expect(listPendingRequests).toHaveBeenCalledTimes(1);
+
+    await fireEvent.click(getByTestId('accept-btn'));
+    expect(acceptRequest).toHaveBeenCalledWith(ownerIdHex);
+    expect(acceptRequest).toHaveBeenCalledTimes(2);
+
+    await vi.waitFor(() => expect(listPendingRequests).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(queryByTestId('pending-error')).toBeNull());
+    expect(queryByTestId(`friend-name-${ownerIdHex}`)).toBeNull();
+  });
+});
