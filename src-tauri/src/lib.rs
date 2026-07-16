@@ -51615,6 +51615,58 @@ async fn apply_handshaked_friend(
     Ok(())
 }
 
+/// ZEB-680 §2: build this node's own-fleet revocation attestations to carry on an
+/// outbound friend-link request, read FRESH from the live owner trust doc at
+/// request-build time (the set is NOT folded into the request signature — each
+/// attestation is independently self-authenticating). `None` handle (tests /
+/// pre-identity) carries none. Shared by both friend-link dialers so the build
+/// step can't diverge between them.
+async fn build_self_revocations(
+    self_trust_doc: &Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+) -> Vec<crate::iroh_friend_acceptor::RevocationAttestation> {
+    match self_trust_doc {
+        Some(doc) => crate::iroh_friend_acceptor::build_revocation_attestations(&*doc.lock().await),
+        None => Vec::new(),
+    }
+}
+
+/// ZEB-680 §2 (Task 6): apply a just-linked peer's carried own-fleet revocations
+/// to the DM revoked-device store + live projection, AFTER the friendship is
+/// established (friend entry written). Phase-1 `verify_carried_revocations` at the
+/// call site already proved every pair valid + bound to `peer_owner`;
+/// `apply_carried_revocations` re-verifies per-pair inside `handle_revocation_push`.
+/// Takes the `crdt_state` lock only for the sync apply, then drops it. This holds
+/// no owner-state engine handle by design — the friend write shares the SAME
+/// OwnerState CRDT and the caller arms `notify_dirty` on the established path, so
+/// any genuine insert is flushed by that publish. Emits the learn-at-link audit
+/// log on a genuine insert. Shared by both friend-link dialers so the apply step
+/// (and its ordering/lock discipline) can't diverge between them.
+async fn apply_accepted_revocations(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    peer_owner: crate::owner_state_types::OwnerAddr,
+    revocations: &[crate::iroh_friend_acceptor::RevocationAttestation],
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
+) {
+    if revocations.is_empty() {
+        return;
+    }
+    let inserted = {
+        let mut state = crdt_state.lock().await;
+        crate::iroh_friend_acceptor::apply_carried_revocations(
+            &mut state,
+            peer_owner,
+            revocations,
+            revoked,
+        )
+    };
+    if inserted {
+        tracing::info!(
+            friend = %hex::encode(peer_owner.0),
+            "ZEB-680: learned new device revocation(s) from a peer at friend-link time"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn connectivity_link_friend_iroh_inner(
     token_url: String,
@@ -51821,10 +51873,7 @@ pub async fn connectivity_link_friend_iroh_inner(
     // ZEB-680 §2: carry our own-fleet revocations, built FRESH from the live
     // trust doc at request-build time (the revoke set is not folded into the
     // request signature — each attestation is independently self-authenticating).
-    let self_revocations = match &self_trust_doc {
-        Some(doc) => crate::iroh_friend_acceptor::build_revocation_attestations(&*doc.lock().await),
-        None => Vec::new(),
-    };
+    let self_revocations = build_self_revocations(&self_trust_doc).await;
     let request = FriendLinkRequest {
         from_addr: self_owner,
         display: self_display,
@@ -52060,24 +52109,16 @@ pub async fn connectivity_link_friend_iroh_inner(
     .await?;
 
     // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is established (friend entry
-    // written above). Apply the inviter's carried own-fleet revocations to the DM
-    // revoked-device store + live projection. `verify_carried_revocations` above
-    // (phase 1) already proved every pair valid + bound to `payload.inviter_addr`;
-    // `apply_carried_revocations` re-verifies per-pair inside
-    // `handle_revocation_push`. Take the crdt lock only for the sync applies, then
-    // drop it. This inner fn holds no owner-state engine handle by design — the
-    // friend write it just did shares the SAME OwnerState CRDT and this fn's caller
-    // arms `notify_dirty` on the established path, so any genuine insert here is
-    // persisted + replicated by that same publish (hence the discarded flag).
-    if !accepted.revocations.is_empty() {
-        let mut state = crdt_state.lock().await;
-        let _ = crate::iroh_friend_acceptor::apply_carried_revocations(
-            &mut state,
-            payload.inviter_addr,
-            &accepted.revocations,
-            &revoked,
-        );
-    }
+    // written above), so apply the inviter's carried own-fleet revocations. See
+    // `apply_accepted_revocations` for the phase-1/phase-2 split, lock discipline,
+    // and the notify_dirty rationale (shared with the introduction-path dialer).
+    apply_accepted_revocations(
+        &crdt_state,
+        payload.inviter_addr,
+        &accepted.revocations,
+        &revoked,
+    )
+    .await;
 
     tracing::info!(
         friend = %hex::encode(payload.inviter_addr.0),
@@ -56152,10 +56193,7 @@ pub(crate) async fn link_over_connection(
         .to_bytes();
     // ZEB-680 §2: carry our own-fleet revocations, built FRESH from the live
     // trust doc at request-build time (see the token-path build for rationale).
-    let self_revocations = match &self_trust_doc {
-        Some(doc) => crate::iroh_friend_acceptor::build_revocation_attestations(&*doc.lock().await),
-        None => Vec::new(),
-    };
+    let self_revocations = build_self_revocations(&self_trust_doc).await;
     let request = FriendLinkRequest {
         from_addr: self_owner,
         display: self_display,
@@ -56393,22 +56431,17 @@ pub(crate) async fn link_over_connection(
 
     // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is established (friend entry
     // written above, AFTER the `expected_peer` owner-pin check — a pin-failed
-    // Path-C peer returned early at the mismatch guard and wrote NOTHING). Apply
-    // the target's carried own-fleet revocations to the DM revoked-device store +
-    // live projection. `verify_carried_revocations` above (phase 1) already bound
-    // every pair to `target_addr_master`; `apply_carried_revocations` re-verifies
-    // per-pair inside `handle_revocation_push`. No engine handle here by design —
-    // the friend write shares the SAME OwnerState CRDT and this fn's caller arms
-    // `notify_dirty` on the Linked path, flushing any insert (hence the discard).
-    if !accepted.revocations.is_empty() {
-        let mut state = crdt_state.lock().await;
-        let _ = crate::iroh_friend_acceptor::apply_carried_revocations(
-            &mut state,
-            target_addr_master,
-            &accepted.revocations,
-            &revoked,
-        );
-    }
+    // Path-C peer returned early at the mismatch guard and wrote NOTHING), so
+    // apply the target's carried own-fleet revocations. See
+    // `apply_accepted_revocations` for the phase-1/phase-2 split, lock discipline,
+    // and the notify_dirty rationale (shared with the token-path dialer).
+    apply_accepted_revocations(
+        &crdt_state,
+        target_addr_master,
+        &accepted.revocations,
+        &revoked,
+    )
+    .await;
 
     tracing::info!(
         friend = %hex::encode(target_addr_master.0),

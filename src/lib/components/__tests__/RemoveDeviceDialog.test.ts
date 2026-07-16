@@ -52,7 +52,9 @@ describe('RemoveDeviceDialog (ZEB-668 S2)', () => {
     expect(screen.getByText(/stop accepting new posts/i)).toBeInTheDocument();
     expect(screen.getByText(/direct[\s\S]*messages also stop being accepted/i)).toBeInTheDocument();
     expect(
-      screen.getByText(/can no longer add a new friend, introduce itself/i),
+      screen.getByText(
+        /can no longer add a new friend, introduce itself, or vouch for an introduction/i,
+      ),
     ).toBeInTheDocument();
     // The stale "lands in follow-up work" clause is gone now that ZEB-685 shipped.
     expect(screen.queryByText(/follow-up work/i)).toBeNull();
@@ -116,7 +118,9 @@ describe('RemoveDeviceDialog replace mode (ZEB-668 S6)', () => {
     render(RemoveDeviceDialog, { props: props({ mode: 'replace' }) });
     expect(screen.getByText(/stop accepting new posts/i)).toBeInTheDocument();
     expect(
-      screen.getByText(/can no longer add a new friend, introduce itself/i),
+      screen.getByText(
+        /can no longer add a new friend, introduce itself, or vouch for an introduction/i,
+      ),
     ).toBeInTheDocument();
   });
 

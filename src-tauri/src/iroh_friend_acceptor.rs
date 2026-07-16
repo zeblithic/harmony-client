@@ -1426,16 +1426,6 @@ pub fn process_friend_request(
         }
     }
 
-    // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is now established, so apply
-    // the requester's carried own-fleet revocations to the DM revoked-device store
-    // + live projection. The phase-1 verify above already proved every pair valid
-    // + owner-bound (`req.from_addr`), so no partial apply is possible.
-    // `revocations_inserted` rides back to the dispatch for the learn-at-link log
-    // + the direct-call tests; the friendship write already arms the owner-state
-    // publish that flushes these (same CRDT).
-    let revocations_inserted =
-        apply_carried_revocations(state, req.from_addr, &req.revocations, revoked);
-
     // ZEB-580 S1: cache the requester's cert-attested #2 DM identity (the
     // combined pub keyed by the #2 DM hash), derived from the EnrollmentCert
     // already verified in step 1 above (`verify_enrolled_device`). This is what
@@ -1488,6 +1478,21 @@ pub fn process_friend_request(
             )));
         }
     }
+
+    // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is established AND every
+    // fallible in-memory update above (friend-entry write + device-cache write)
+    // has succeeded, so now apply the requester's carried own-fleet revocations
+    // to the DM revoked-device store + live projection. Ordering matters: placing
+    // this AFTER the device-cache write means a device-cache rejection returns
+    // early WITHOUT stranding an applied-but-unreturned revocation (review: a
+    // post-mutation failure must not leave learned revocations locally applied but
+    // never flushed). The phase-1 verify already proved every pair valid +
+    // owner-bound (`req.from_addr`), so no partial apply is possible; everything
+    // after this point is infallible. `revocations_inserted` rides back to the
+    // dispatch, which arms the owner-state publish (same CRDT) BEFORE the
+    // accept-write.
+    let revocations_inserted =
+        apply_carried_revocations(state, req.from_addr, &req.revocations, revoked);
 
     // 6. Build + sign the mutual accept reply. The accept sig binds to the same
     // token_sig as the request it answers (domain-separated from the request),
@@ -2220,6 +2225,26 @@ where
             }
         };
 
+        // Arm the OWNER-state debounced publish-root + persist BEFORE the
+        // peer-facing accept-write. `process_friend_request` above wrote a new
+        // Active/Token FriendEntry (and MAY have folded the requester's carried
+        // own-fleet revocations into the SAME OwnerState CRDT). Notifying here —
+        // ahead of the fallible `write_friend_response` below — guarantees those
+        // local CRDT mutations reach the user's other devices and survive a clean
+        // shutdown even if the accept-write IO fails: a write failure must not
+        // strand an applied-but-unpersisted mutation (review). The peer simply
+        // re-handshakes on a failed accept and the idempotent re-apply converges.
+        // No-op when no engine is wired in (tests). The Pending arm returned
+        // earlier and never reaches here, so this only fires on an actual accept.
+        // The `revocations_inserted` flag drives only the learn-at-link log.
+        if revocations_inserted {
+            tracing::info!(
+                from_addr = %hex::encode(req.from_addr.0),
+                "ZEB-680: accepted friend link carried a new device revocation; folded into the owner-state publish"
+            );
+        }
+        self.notify_owner_state_dirty();
+
         // Write [u32 LE length-prefix][FriendLinkResponse::Accepted CBOR].
         let resp = encode_friend_response(&FriendLinkResponse::Accepted(Box::new(accepted)))
             .map_err(FriendAcceptError::Handshake)?;
@@ -2232,29 +2257,6 @@ where
         // same `token_sig` cannot both pass. The connection is already established
         // by the time we consume, so stopping the publish early is safe even if a
         // later step fails — a re-redeem would find the token already consumed.
-
-        // The inbound handshake wrote a new Active/Token FriendEntry into
-        // owner-state (`process_friend_request` above). Arm the OWNER-state
-        // debounced publish-root + persist so the new friend reaches the user's
-        // other devices and survives a clean shutdown — otherwise the dirty flag
-        // is never set and a clean shutdown skips the publish entirely. No-op
-        // when no engine is wired in (tests). Fires even if the accept-write IO
-        // above succeeded-then-something-later-failed because the local CRDT
-        // mutation is already committed (see the unregister rationale).
-        //
-        // ZEB-680 §2 (Task 6): process_friend_request may ALSO have applied the
-        // requester's carried own-fleet revocations into the SAME OwnerState CRDT.
-        // That insert needs no separate publish — this one unconditional
-        // notify_dirty (armed by the friendship write, which happens on every
-        // accept path) flushes the whole CRDT, revocations included. The
-        // `revocations_inserted` flag only drives the learn-at-link log below.
-        if revocations_inserted {
-            tracing::info!(
-                from_addr = %hex::encode(req.from_addr.0),
-                "ZEB-680: accepted friend link carried a new device revocation; folded into the owner-state publish"
-            );
-        }
-        self.notify_owner_state_dirty();
 
         // ZEB-371: publish the just-accepted friend's Case-D reachability slot
         // immediately (rather than waiting for the next reachability tick) so the

@@ -31,7 +31,9 @@ Svelte 5 + vitest frontend.
 - Over-cap decode is a **hard error** (frame rejected), never truncation — the
   `MAX_DEVICES_PER_OWNER` visitor convention (`iroh_friend_acceptor.rs:160-185`).
 - Error strings/variants: additive only; existing variants unchanged.
-- Gates per task: `scripts/test-select --context task`; final: `cargo fmt --all -- --check`,
+- Gates per task: `scripts/test-select --context task` (paste its printed `round=… bucket=…`
+  summary line into the task report, per CLAUDE.md, so the selection is auditable); final:
+  `cargo fmt --all -- --check`,
   `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`,
   `cargo nextest run --locked --workspace --all-targets --features test-fixtures`,
   `npx tsc --noEmit` + `npx vitest run` from repo root.
