@@ -40,8 +40,11 @@ export type FriendStatus = 'pending' | 'active' | 'revoked';
 export type FriendOrigin = 'mutual_key' | 'token' | 'introduction';
 
 /** Inbound-introduction policy (mirrors Rust `friend_graph::PeerIntroPolicy`).
- *  Governs whether — and how — this node accepts an `IntroduceRequest` from a
- *  friend on behalf of one of the local user's referrable friends. */
+ *  Enforced on THIS node as the *target* of an introduction: governs whether —
+ *  and how — it accepts an inbound `Introduction` in which a friend vouches for
+ *  a stranger. `open` accepts any; `fof` accepts only when the voucher is an
+ *  active friend; `ask` stages a prompt; `closed` rejects. (It does not govern
+ *  this node's own broker behavior when relaying an `IntroduceRequest`.) */
 export type PeerIntroPolicy = 'open' | 'fof' | 'ask' | 'closed';
 
 /**
