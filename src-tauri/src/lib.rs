@@ -52059,6 +52059,26 @@ pub async fn connectivity_link_friend_iroh_inner(
     )
     .await?;
 
+    // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is established (friend entry
+    // written above). Apply the inviter's carried own-fleet revocations to the DM
+    // revoked-device store + live projection. `verify_carried_revocations` above
+    // (phase 1) already proved every pair valid + bound to `payload.inviter_addr`;
+    // `apply_carried_revocations` re-verifies per-pair inside
+    // `handle_revocation_push`. Take the crdt lock only for the sync applies, then
+    // drop it. This inner fn holds no owner-state engine handle by design — the
+    // friend write it just did shares the SAME OwnerState CRDT and this fn's caller
+    // arms `notify_dirty` on the established path, so any genuine insert here is
+    // persisted + replicated by that same publish (hence the discarded flag).
+    if !accepted.revocations.is_empty() {
+        let mut state = crdt_state.lock().await;
+        let _ = crate::iroh_friend_acceptor::apply_carried_revocations(
+            &mut state,
+            payload.inviter_addr,
+            &accepted.revocations,
+            &revoked,
+        );
+    }
+
     tracing::info!(
         friend = %hex::encode(payload.inviter_addr.0),
         "ZEB-370: friend link established (inviter added as Active/Token friend)"
@@ -56370,6 +56390,25 @@ pub(crate) async fn link_over_connection(
         learned_at,
     )
     .await?;
+
+    // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is established (friend entry
+    // written above, AFTER the `expected_peer` owner-pin check — a pin-failed
+    // Path-C peer returned early at the mismatch guard and wrote NOTHING). Apply
+    // the target's carried own-fleet revocations to the DM revoked-device store +
+    // live projection. `verify_carried_revocations` above (phase 1) already bound
+    // every pair to `target_addr_master`; `apply_carried_revocations` re-verifies
+    // per-pair inside `handle_revocation_push`. No engine handle here by design —
+    // the friend write shares the SAME OwnerState CRDT and this fn's caller arms
+    // `notify_dirty` on the Linked path, flushing any insert (hence the discard).
+    if !accepted.revocations.is_empty() {
+        let mut state = crdt_state.lock().await;
+        let _ = crate::iroh_friend_acceptor::apply_carried_revocations(
+            &mut state,
+            target_addr_master,
+            &accepted.revocations,
+            &revoked,
+        );
+    }
 
     tracing::info!(
         friend = %hex::encode(target_addr_master.0),

@@ -1020,6 +1020,60 @@ pub fn verify_carried_revocations(
     Ok(())
 }
 
+/// ZEB-680 §2 (Task 6): receive PHASE 2 — apply a peer's carried own-fleet
+/// revocations to the DM revoked-device store + live projection, at
+/// friendship-**establishment** time (never before consent/auth). Shared by the
+/// acceptor ([`process_friend_request`]) and both dialer drivers
+/// (`link_over_connection`, `connectivity_link_friend_iroh_inner`) so all three
+/// apply identically.
+///
+/// Each pair is (re-)verified + trust-bound to `peer_owner` INSIDE
+/// [`crate::dm_outbox::handle_revocation_push`] (a peer may only revoke ITS OWN
+/// devices), so a mis-bound pair is skipped, never applied — the apply is safe
+/// even if some future caller reached it without the fail-closed phase-1
+/// [`verify_carried_revocations`] gate. Callers MUST still run that phase-1 gate
+/// BEFORE writing the friendship so a present-but-invalid attestation rejects the
+/// whole handshake with nothing written (spec §2); by the time we get here every
+/// pair is known-valid, so no per-pair error fires and the apply is all-or-none.
+///
+/// Returns whether ANY pair was a genuine NEW insert. The revoked-device store
+/// lives in the SAME `OwnerState` CRDT as the friend graph, so the friendship
+/// write on this SAME establishment path already arms the owner-state
+/// `notify_dirty` that persists + replicates these (ZEB-248/#473) — the flag is
+/// returned only so the dispatch can log the learn-at-link event and the
+/// direct-call unit tests can assert idempotency; it is NOT a separate
+/// notification trigger.
+pub fn apply_carried_revocations(
+    state: &mut OwnerState,
+    peer_owner: OwnerAddr,
+    attestations: &[RevocationAttestation],
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
+) -> bool {
+    let mut inserted_any = false;
+    for att in attestations {
+        match crate::dm_outbox::handle_revocation_push(
+            state,
+            peer_owner,
+            &att.revocation,
+            &att.enrollment,
+            revoked,
+        ) {
+            Ok(true) => inserted_any = true,
+            Ok(false) => {}
+            // Unreachable after the phase-1 verify_carried_revocations gate: a
+            // pair that verified there cannot fail handle_revocation_push's
+            // identical trust-bind here. Warn (never apply, never unwind an
+            // already-established friendship) rather than silently swallow.
+            Err(e) => tracing::warn!(
+                error = ?e,
+                owner = %hex::encode(peer_owner.0),
+                "ZEB-680: carried revocation rejected at establishment-apply (phase-1 verify should have caught it)"
+            ),
+        }
+    }
+    inserted_any
+}
+
 // =====================================================================
 // ZEB-371 Task 12 — Path A consent decision tree (spec §7.1)
 // =====================================================================
@@ -1228,7 +1282,9 @@ pub fn authenticate_friend_request(
 
 /// PURE, testable core of the friend handshake. Authenticates `req`, writes the
 /// resulting `FriendEntry` into `state`, and returns a signed
-/// `FriendLinkAccepted` for the requester. No I/O.
+/// `FriendLinkAccepted` for the requester plus a `bool` reporting whether the
+/// requester's carried own-fleet revocations (ZEB-680 §2 phase 2) produced a
+/// genuine NEW insert into the DM revoked-device store. No I/O.
 ///
 /// Steps (spec §5.2 accept side):
 /// 1. `verify_enrolled_device(&req.enrollment, &req.signer_certs,
@@ -1276,7 +1332,7 @@ pub fn process_friend_request(
     // into the accept signature — each pair is independently self-authenticating
     // (ZEB-677 `signer_certs` precedent).
     self_revocations: Vec<RevocationAttestation>,
-) -> Result<FriendLinkAccepted, FriendHandshakeError> {
+) -> Result<(FriendLinkAccepted, bool), FriendHandshakeError> {
     // 1. Authenticate the requester's cert → enrolled device-#2 key (and the
     // master anchor, recovered from the signer bundle for quorum certs).
     let verified = verify_enrolled_device(
@@ -1308,6 +1364,16 @@ pub fn process_friend_request(
     );
     vk.verify_strict(&preimage, &Signature::from_bytes(&req.sig))
         .map_err(|_| FriendHandshakeError::SignatureInvalid)?;
+
+    // ZEB-680 §2 (Task 6 / T5-review BINDING REQ 1): process_friend_request does
+    // NOT call authenticate_friend_request — it inlines cert+sig verify only — so
+    // it CANNOT lean on serve()'s phase-1 precheck across the function boundary.
+    // Re-run the fail-closed carried-revocation verify HERE, before ANY write, so
+    // a present-but-invalid attestation rejects the whole handshake with nothing
+    // written (friend or revocation) even when a caller drives this fn directly.
+    // Cheap bounded ed25519; empty/absent list is the back-compat no-op. The
+    // phase-2 apply below re-verifies per-pair inside handle_revocation_push.
+    verify_carried_revocations(req.from_addr, &req.revocations)?;
 
     // ZEB-371: generate this side's ephemeral X25519 keypair for the rendezvous
     // secret.
@@ -1359,6 +1425,16 @@ pub fn process_friend_request(
             return Err(FriendHandshakeError::ApplyRejected(format!("{reason:?}")));
         }
     }
+
+    // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is now established, so apply
+    // the requester's carried own-fleet revocations to the DM revoked-device store
+    // + live projection. The phase-1 verify above already proved every pair valid
+    // + owner-bound (`req.from_addr`), so no partial apply is possible.
+    // `revocations_inserted` rides back to the dispatch for the learn-at-link log
+    // + the direct-call tests; the friendship write already arms the owner-state
+    // publish that flushes these (same CRDT).
+    let revocations_inserted =
+        apply_carried_revocations(state, req.from_addr, &req.revocations, revoked);
 
     // ZEB-580 S1: cache the requester's cert-attested #2 DM identity (the
     // combined pub keyed by the #2 DM hash), derived from the EnrollmentCert
@@ -1457,23 +1533,26 @@ pub fn process_friend_request(
         &accept_devices_digest,
     );
     let sig = self_device2.sign(&accept_preimage).to_bytes();
-    Ok(FriendLinkAccepted {
-        from_addr: self_owner,
-        display: self_display,
-        eph_x25519_pub: self_eph_pub,
-        enrollment: self_enrollment.clone(),
-        // ZEB-677: bundle threading for a quorum-certed self lands with the
-        // ceremony slices (S4); every self-cert today is Master-issued.
-        signer_certs: Vec::new(),
-        sig,
-        sender_devices: accept_devices,
-        device_identity_pubs: accept_device_pubs,
-        iroh_node_id,
-        home_relay_url,
-        pq_dsa_pubkey,
-        pq_kem_pubkey,
-        revocations: self_revocations,
-    })
+    Ok((
+        FriendLinkAccepted {
+            from_addr: self_owner,
+            display: self_display,
+            eph_x25519_pub: self_eph_pub,
+            enrollment: self_enrollment.clone(),
+            // ZEB-677: bundle threading for a quorum-certed self lands with the
+            // ceremony slices (S4); every self-cert today is Master-issued.
+            signer_certs: Vec::new(),
+            sig,
+            sender_devices: accept_devices,
+            device_identity_pubs: accept_device_pubs,
+            iroh_node_id,
+            home_relay_url,
+            pq_dsa_pubkey,
+            pq_kem_pubkey,
+            revocations: self_revocations,
+        },
+        revocations_inserted,
+    ))
 }
 
 /// Inbound dispatcher for the `harmony/friend/v1` ALPN. Holds the handles the
@@ -1979,7 +2058,7 @@ where
         // concurrent handshakes from the same approved requester cannot all
         // inline-accept and derive mismatched Case-D secrets (see
         // `resolve_consent_consuming_approval`).
-        let accepted = match resolve_consent_consuming_approval(
+        let (accepted, revocations_inserted) = match resolve_consent_consuming_approval(
             self.pending_requests.as_deref(),
             self.pending_outbound.as_deref(),
             req.token_sig.as_ref(),
@@ -2008,7 +2087,7 @@ where
                 // ZEB-680 §2: build our own-fleet revocations fresh from the live
                 // trust doc, before the crdt_state lock (never both at once).
                 let self_revocations = self.current_fresh_revocations().await;
-                let accepted = {
+                let (accepted, revocations_inserted) = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
                         &mut state,
@@ -2035,7 +2114,7 @@ where
                     pending.clear_completed(&req.from_addr);
                 }
                 self.emit_friend_added(&req);
-                accepted
+                (accepted, revocations_inserted)
             }
             ConsentDecision::AcceptInline => {
                 // Path A, known-or-pre-approved: accept inline with NO token gate.
@@ -2050,7 +2129,7 @@ where
                 // ZEB-680 §2: build our own-fleet revocations fresh from the live
                 // trust doc, before the crdt_state lock (never both at once).
                 let self_revocations = self.current_fresh_revocations().await;
-                let accepted = {
+                let (accepted, revocations_inserted) = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
                         &mut state,
@@ -2078,7 +2157,7 @@ where
                     pending.clear_completed(&req.from_addr);
                 }
                 self.emit_friend_added(&req);
-                accepted
+                (accepted, revocations_inserted)
             }
             ConsentDecision::AcceptInlineIntroduced => {
                 // ZEB-376: an introduction the user pre-authorized. Accept inline
@@ -2089,7 +2168,7 @@ where
                 // ZEB-680 §2: build our own-fleet revocations fresh from the live
                 // trust doc, before the crdt_state lock (never both at once).
                 let self_revocations = self.current_fresh_revocations().await;
-                let accepted = {
+                let (accepted, revocations_inserted) = {
                     let mut state = self.crdt_state.lock().await;
                     process_friend_request(
                         &mut state,
@@ -2115,7 +2194,7 @@ where
                     pending.clear_completed(&req.from_addr);
                 }
                 self.emit_friend_added(&req);
-                accepted
+                (accepted, revocations_inserted)
             }
             ConsentDecision::Pending => {
                 // Path A, NEW owner: record the request + reply Pending. WRITE NO
@@ -2162,6 +2241,19 @@ where
         // when no engine is wired in (tests). Fires even if the accept-write IO
         // above succeeded-then-something-later-failed because the local CRDT
         // mutation is already committed (see the unregister rationale).
+        //
+        // ZEB-680 §2 (Task 6): process_friend_request may ALSO have applied the
+        // requester's carried own-fleet revocations into the SAME OwnerState CRDT.
+        // That insert needs no separate publish — this one unconditional
+        // notify_dirty (armed by the friendship write, which happens on every
+        // accept path) flushes the whole CRDT, revocations included. The
+        // `revocations_inserted` flag only drives the learn-at-link log below.
+        if revocations_inserted {
+            tracing::info!(
+                from_addr = %hex::encode(req.from_addr.0),
+                "ZEB-680: accepted friend link carried a new device revocation; folded into the owner-state publish"
+            );
+        }
         self.notify_owner_state_dirty();
 
         // ZEB-371: publish the just-accepted friend's Case-D reachability slot
@@ -3298,7 +3390,7 @@ mod tests {
         let req = signed_request_no_token(0x75);
         let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
         let mut state = OwnerState::default();
-        let accepted = process_friend_request(
+        let (accepted, _revocations_inserted) = process_friend_request(
             &mut state,
             test_hlc(1),
             &req,
@@ -3396,7 +3488,7 @@ mod tests {
 
         let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
         let mut state = OwnerState::default();
-        let accepted = process_friend_request(
+        let (accepted, _revocations_inserted) = process_friend_request(
             &mut state,
             test_hlc(1_000),
             &req,
@@ -3500,7 +3592,7 @@ mod tests {
 
         let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
         let mut state = OwnerState::default();
-        let accepted = process_friend_request(
+        let (accepted, _revocations_inserted) = process_friend_request(
             &mut state,
             test_hlc(1000),
             &req,
@@ -3700,7 +3792,7 @@ mod tests {
         let req = signed_request_no_token(0x79);
         let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
         let mut state = OwnerState::default();
-        let accepted = process_friend_request(
+        let (accepted, _revocations_inserted) = process_friend_request(
             &mut state,
             test_hlc(1),
             &req,
@@ -3740,7 +3832,7 @@ mod tests {
         let req = signed_request_no_token(0x7b);
         let kt = crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt");
         let mut state = OwnerState::default();
-        let accepted = process_friend_request(
+        let (accepted, _revocations_inserted) = process_friend_request(
             &mut state,
             test_hlc(1),
             &req,
@@ -4451,6 +4543,250 @@ mod tests {
         assert!(
             matches!(err, FriendHandshakeError::RevocationAttestationInvalid(_)),
             "a present-but-invalid attestation must fail the handshake closed, got {err:?}"
+        );
+    }
+
+    // ---- ZEB-680 T6: receive phase 2 — apply carried revocations at establishment ----
+
+    /// ZEB-680 §2 (Task 6): a full `process_friend_request` with one valid
+    /// own-fleet attestation lands the revoked device key in BOTH the DM
+    /// revoked-device store AND the live projection, and reports the genuine
+    /// insert. Phase-2 (apply-at-establishment) counterpart to the T5 phase-1
+    /// verify tests.
+    #[test]
+    fn accepted_handshake_applies_carried_revocations() {
+        use crate::owner_state_crypto::KeyTree;
+        let me = mint_test_owner(0x60); // acceptor (self)
+        let token_sig = [0x5a; 64];
+        let (mut req, _, _) = signed_request(0x61, token_sig);
+        // Same master seed → the attestation's owner == the requester's owner, so
+        // the peer attests ITS OWN device (identity_hash excludes x25519, so the
+        // classical_only-vs-explicit-bundle x25519 difference is irrelevant).
+        let att = revocation_attestation(0x61);
+        assert_eq!(
+            OwnerAddr(att.revocation.owner_id),
+            req.from_addr,
+            "fixture: attestation must be bound to the requester's own owner"
+        );
+        let revoked_key = att.enrollment.device_pubkeys.classical.ed25519_verify;
+        req.revocations = vec![att];
+
+        let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let (_accepted, inserted) = process_friend_request(
+            &mut state,
+            test_hlc(1_000),
+            &req,
+            me.owner,
+            Some("me".into()),
+            &me.cert,
+            &me.device_key,
+            &kt,
+            &projection,
+            0,
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .expect("valid request with an own-fleet attestation is processed");
+
+        assert!(inserted, "a genuine new revoked key must report inserted");
+        assert!(
+            state
+                .revoked_dm_devices
+                .get(&req.from_addr)
+                .is_some_and(|s| s.contains(&revoked_key)),
+            "the revoked device key must land in the DM revoked-device store"
+        );
+        assert!(
+            projection.is_revoked(&req.from_addr, &revoked_key),
+            "the revoked device key must feed the live projection"
+        );
+    }
+
+    /// ZEB-680 §2 (Task 6): the carried-revocation apply is establishment-gated —
+    /// an auth-FAILING request (bad signature) carrying a valid attestation is
+    /// rejected before any write, so nothing (friend or revocation) is applied.
+    #[test]
+    fn carried_revocation_apply_is_establishment_gated() {
+        use crate::owner_state_crypto::KeyTree;
+        let me = mint_test_owner(0x62);
+        let (mut req, _, _) = signed_request(0x63, [0x5a; 64]);
+        // A valid own-fleet attestation — but the request signature is corrupted,
+        // so the handshake fails auth BEFORE the establishment apply is reached.
+        req.revocations = vec![revocation_attestation(0x63)];
+        req.sig[0] ^= 0xFF;
+
+        let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let err = process_friend_request(
+            &mut state,
+            test_hlc(1_000),
+            &req,
+            me.owner,
+            Some("me".into()),
+            &me.cert,
+            &me.device_key,
+            &kt,
+            &projection,
+            0,
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .expect_err("a bad-signature request must be rejected");
+
+        assert!(
+            matches!(err, FriendHandshakeError::SignatureInvalid),
+            "a bad-signature request must fail auth, got {err:?}"
+        );
+        assert!(
+            state.revoked_dm_devices.is_empty(),
+            "an auth-failed handshake must apply no carried revocations"
+        );
+        assert!(
+            state.friend_graph.friends.is_empty(),
+            "an auth-failed handshake must write no friend"
+        );
+    }
+
+    /// ZEB-680 §2 (Task 6): applying the same carried attestation twice reports a
+    /// genuine insert the FIRST time and NO insert the second — the flag the
+    /// dispatch/driver uses to skip a redundant owner-state publish for an
+    /// all-duplicate re-apply.
+    #[test]
+    fn duplicate_carried_revocation_reports_no_insert() {
+        use crate::owner_state_crypto::KeyTree;
+        let me = mint_test_owner(0x64);
+        let (mut req, _, _) = signed_request(0x65, [0x5a; 64]);
+        req.revocations = vec![revocation_attestation(0x65)];
+
+        let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let (_, first) = process_friend_request(
+            &mut state,
+            test_hlc(1_000),
+            &req,
+            me.owner,
+            Some("me".into()),
+            &me.cert,
+            &me.device_key,
+            &kt,
+            &projection,
+            0,
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .expect("first apply");
+        assert!(first, "first apply of a fresh revocation inserts");
+        let (_, second) = process_friend_request(
+            &mut state,
+            test_hlc(2_000),
+            &req,
+            me.owner,
+            Some("me".into()),
+            &me.cert,
+            &me.device_key,
+            &kt,
+            &projection,
+            0,
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .expect("second apply");
+        assert!(
+            !second,
+            "a duplicate carried revocation must report no insert (dirty gate)"
+        );
+    }
+
+    /// ZEB-680 §2 (Task 6 / BINDING REQ 1): a valid signed request carrying a
+    /// BOGUS attestation (owner != req.from_addr → third-party) passed DIRECTLY to
+    /// process_friend_request (bypassing serve()'s phase-1 precheck) is rejected
+    /// in-function with the typed error, writing NOTHING. Pins the in-function
+    /// re-verify so no refactor/new-caller can apply unverified pairs or establish
+    /// a friendship on a bad carried list.
+    #[test]
+    fn process_friend_request_rejects_invalid_attestation_in_function() {
+        use crate::owner_state_crypto::KeyTree;
+        let me = mint_test_owner(0x66);
+        let (mut req, _, _) = signed_request(0x67, [0x5a; 64]);
+        let bogus = revocation_attestation(0xAA); // third-party master
+        assert_ne!(OwnerAddr(bogus.revocation.owner_id), req.from_addr);
+        req.revocations = vec![bogus];
+
+        let kt = KeyTree::derive(&[9u8; 32]).expect("kt");
+        let mut state = OwnerState::default();
+        let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let err = process_friend_request(
+            &mut state,
+            test_hlc(1_000),
+            &req,
+            me.owner,
+            Some("me".into()),
+            &me.cert,
+            &me.device_key,
+            &kt,
+            &projection,
+            0,
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .expect_err("a bogus carried attestation must reject");
+
+        assert!(
+            matches!(err, FriendHandshakeError::RevocationAttestationInvalid(_)),
+            "a bogus carried attestation must reject in-function, got {err:?}"
+        );
+        assert!(
+            state.friend_graph.friends.is_empty(),
+            "a rejected handshake writes no friend"
+        );
+        assert!(
+            state.revoked_dm_devices.is_empty(),
+            "a rejected handshake writes no revocation"
+        );
+    }
+
+    /// ZEB-680 §2 (Task 6): direct coverage of the shared establishment-apply
+    /// helper both dialer drivers call (their apply cannot be unit-driven without
+    /// an iroh harness). A valid own-fleet pair stores + feeds the projection and
+    /// reports the insert; re-applying reports no insert.
+    #[test]
+    fn apply_carried_revocations_stores_dedupes_and_feeds_projection() {
+        let att = revocation_attestation(0x68);
+        let peer_owner = OwnerAddr(att.revocation.owner_id);
+        let revoked_key = att.enrollment.device_pubkeys.classical.ed25519_verify;
+        let atts = vec![att];
+
+        let mut state = OwnerState::default();
+        let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        assert!(
+            apply_carried_revocations(&mut state, peer_owner, &atts, &projection),
+            "first apply reports a genuine insert"
+        );
+        assert!(
+            state
+                .revoked_dm_devices
+                .get(&peer_owner)
+                .is_some_and(|s| s.contains(&revoked_key)),
+            "the revoked key must land in the DM store"
+        );
+        assert!(projection.is_revoked(&peer_owner, &revoked_key));
+        assert!(
+            !apply_carried_revocations(&mut state, peer_owner, &atts, &projection),
+            "an idempotent re-apply reports no insert"
         );
     }
 
