@@ -62492,8 +62492,10 @@ mod settings_rmw_cancellation_tests {
     /// lock, then assert the orphaned task still lands the write (`landed`
     /// flips true). Under the pre-fix shape the first poll parks at the outer
     /// `lock().await` instead — the RMW never starts and the test times out.
-    async fn assert_cancelled_setter_write_lands<Fut>(fut: Fut, landed: impl Fn() -> bool)
-    where
+    async fn assert_cancelled_setter_write_lands<Fut>(
+        fut: Fut,
+        landed: impl Fn() -> bool + Send + Sync + 'static,
+    ) where
         Fut: std::future::Future<Output = Result<(), String>>,
     {
         let gate = connectivity_settings_write_lock().lock().await;
@@ -62512,8 +62514,19 @@ mod settings_rmw_cancellation_tests {
 
         // The write must still land (generous budget; typical completion is
         // single-digit ms — the budget only bounds a genuine regression).
+        let landed = std::sync::Arc::new(landed);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !landed() {
+        loop {
+            // Qodo PR #477: probe on the blocking pool — the probe reads the
+            // settings file with sync std::fs, which would otherwise block
+            // the test's Tokio worker on every poll.
+            let probe = std::sync::Arc::clone(&landed);
+            if tokio::task::spawn_blocking(move || probe())
+                .await
+                .expect("landed probe task")
+            {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "cancelled setter's RMW never landed — has the lock \
