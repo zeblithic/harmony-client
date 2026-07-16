@@ -54526,11 +54526,15 @@ pub struct PendingFriendRequestDto {
     pub introduced_by: Option<String>,
 }
 
-/// Project the process-local pending-inbound store into the frontend DTO list.
-/// Pure over the store so it's unit-testable without a NodeState harness.
+/// Sweeps expired offers, then projects the process-local pending-inbound store
+/// into the frontend DTO list. Synchronous and deterministic (the sweep mutates
+/// the store as a side effect), so unit-testable without a NodeState harness.
 pub fn list_pending_friend_requests_inner(
     store: &crate::friend_requests::PendingFriendRequests,
+    now_ms: u64,
 ) -> Vec<PendingFriendRequestDto> {
+    // ZEB-694: drop offers past the TTL so the UI stops showing dead introductions.
+    store.sweep_expired_offers(now_ms);
     store
         .list()
         .into_iter()
@@ -54586,7 +54590,10 @@ pub(crate) async fn list_pending_friend_requests_impl(
     let Some(store) = store else {
         return Ok(Vec::new());
     };
-    Ok(list_pending_friend_requests_inner(&store))
+    Ok(list_pending_friend_requests_inner(
+        &store,
+        crate::iroh_friend_acceptor::wall_now_ms(),
+    ))
 }
 
 /// Accept a pending inbound friend request. Two shapes:
@@ -56928,7 +56935,7 @@ mod friend_ipc_tests {
         store.record_inbound(OwnerAddr([0xA1; 16]), Some("alice".into()), 1_000);
         store.record_inbound(OwnerAddr([0xB2; 16]), None, 2_000);
 
-        let mut dtos = list_pending_friend_requests_inner(&store);
+        let mut dtos = list_pending_friend_requests_inner(&store, 0);
         // Map iteration order is unspecified — sort for a stable assert.
         dtos.sort_by(|a, b| a.received_at_ms.cmp(&b.received_at_ms));
         assert_eq!(dtos.len(), 2);
@@ -56944,7 +56951,7 @@ mod friend_ipc_tests {
     fn list_pending_friend_requests_inner_empty_store_is_empty() {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
-        assert!(list_pending_friend_requests_inner(&store).is_empty());
+        assert!(list_pending_friend_requests_inner(&store, 0).is_empty());
     }
 
     // ── ZEB-236 Task 4: DM-invite projector ──────────────────────────────
@@ -57144,7 +57151,7 @@ mod friend_ipc_tests {
         store.mark_approved(addr);
         store.decline(&addr);
         assert!(
-            list_pending_friend_requests_inner(&store).is_empty(),
+            list_pending_friend_requests_inner(&store, 0).is_empty(),
             "decline drops the inbound request"
         );
         assert!(!store.is_approved(&addr), "decline drops the approval too");

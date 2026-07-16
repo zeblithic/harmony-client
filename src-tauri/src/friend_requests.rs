@@ -54,6 +54,15 @@ pub struct StoredIntroductionOffer {
     pub reachability: crate::reachability_record::ReachabilityAnnouncePayload,
 }
 
+/// ZEB-694: a staged AskMe offer older than this is treated as dead (its relayed
+/// reachability is past the intro/reachability freshness bound anyway) — swept
+/// from the inbox and rejected at accept time with an "expired" message.
+pub const INTRODUCTION_OFFER_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7d
+
+pub fn is_offer_expired(received_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(received_at_ms) >= INTRODUCTION_OFFER_TTL_MS
+}
+
 /// One recorded inbound friend request awaiting the user's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInbound {
@@ -277,6 +286,19 @@ impl PendingFriendRequests {
     pub fn end_accept(&self, subject: &OwnerAddr) {
         let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
         inner.accepting.remove(subject);
+    }
+
+    /// Remove every staged `IntroductionOffer` older than the TTL. Plain
+    /// `LinkRequest` entries have their own lifecycle and are left untouched.
+    /// Returns the number of offers swept.
+    pub fn sweep_expired_offers(&self, now_ms: u64) -> usize {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        let before = inner.inbound.len();
+        inner.inbound.retain(|_, p| match p.kind {
+            PendingKind::IntroductionOffer(_) => !is_offer_expired(p.received_at_ms, now_ms),
+            PendingKind::LinkRequest => true,
+        });
+        before - inner.inbound.len()
     }
 }
 
@@ -628,6 +650,41 @@ mod tests {
         assert!(
             store.try_begin_accept(subj),
             "after the guard drops, a new accept can begin"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_only_expired_offers() {
+        let store = PendingFriendRequests::default();
+        let fresh = OwnerAddr([1; 16]);
+        let stale = OwnerAddr([2; 16]);
+        let link = OwnerAddr([3; 16]);
+        let mk = |s: OwnerAddr| StoredIntroductionOffer {
+            voucher: OwnerAddr([9; 16]),
+            subject: s,
+            reachability: fixture_reach(), // existing helper in this test module (friend_requests.rs:308)
+        };
+        let now = 10 * INTRODUCTION_OFFER_TTL_MS;
+        store.record_introduction_offer(fresh, None, now, mk(fresh)); // received now → fresh
+        store.record_introduction_offer(stale, None, now - INTRODUCTION_OFFER_TTL_MS, mk(stale)); // exactly TTL old → expired
+        store.record_inbound(link, None, 0); // a LinkRequest, never swept
+
+        assert!(is_offer_expired(now - INTRODUCTION_OFFER_TTL_MS, now));
+        assert!(!is_offer_expired(now, now));
+
+        let swept = store.sweep_expired_offers(now);
+        assert_eq!(swept, 1, "only the stale offer is swept");
+        assert!(store.has_offer(&fresh), "fresh offer retained");
+        assert!(!store.has_offer(&stale), "stale offer removed");
+        // LinkRequest untouched: the inbound entry must SURVIVE the sweep as a
+        // LinkRequest (peek_offer is None for it by design either way, so it can't
+        // catch a regression in the `LinkRequest => true` retain arm — check list()).
+        let after = store.list();
+        assert!(
+            after
+                .iter()
+                .any(|(a, p)| *a == link && matches!(p.kind, PendingKind::LinkRequest)),
+            "the LinkRequest entry must survive the sweep"
         );
     }
 }
