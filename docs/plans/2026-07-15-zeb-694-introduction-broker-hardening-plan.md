@@ -25,7 +25,7 @@
 | File | Responsibility in this plan |
 |---|---|
 | `src-tauri/src/friend_intro.rs` | Rate-limiter primitives + two-tier container. Tasks A1, A2, A3. |
-| `src-tauri/src/iroh_pex_acceptor.rs` | Both `serve` arms call the new tiered methods at the correct auth boundary. Task A4. |
+| `src-tauri/src/iroh_pex_acceptor.rs` | Both `serve` arms call the new tiered methods at the correct auth boundary. Task A3 (atomic with the limiter restructure). |
 | `src-tauri/src/friend_requests.rs` | `peek_offer`; in-flight guard (`accepting` set + `AcceptInFlightGuard`); TTL (`INTRODUCTION_OFFER_TTL_MS`, `is_offer_expired`, `sweep_expired_offers`). Tasks B1, B2, B3. |
 | `src-tauri/src/lib.rs` | Accept-branch seams (`begin_introduction_accept`, `finalize_introduction_accept`) + reworked branch; `now_ms` threaded through `list_pending_friend_requests_inner`. Tasks B3, B4. |
 | `src/lib/friend-service.ts`, `src/lib/components/FriendsPanel.svelte` | Keep the request row on a non-linked accept; surface the backend message. Task B5. |
@@ -276,11 +276,16 @@ git commit -m "feat(zeb-694): extract KeyedDedupe<K> rate-limit primitive"
 
 ---
 
-### Task A3: Restructure `IntroRateLimiter` into the two-tier container
+### Task A3: Restructure `IntroRateLimiter` + migrate Task-13 tests + rewire acceptor (ATOMIC)
+
+**This task is compilation-atomic.** Removing the old `admit` method breaks its callers in the SAME compile unit — the two acceptor arms AND five existing ZEB-376 Task-13 unit tests. All three (restructure, test migration, acceptor rewire) MUST land in one commit or `cargo` won't build. Do not split them.
 
 **Files:**
-- Modify: `src-tauri/src/friend_intro.rs` — replace the `IntroRateLimiter` struct/`IntroRateLimiterInner`/`new`/`admit`/`evict_windows`/`evict_last_seen` (`:594-745`) with the container below; add `INTRO_PER_CONNECTION_MAX`.
-- Test: inline `#[cfg(test)]` in `src-tauri/src/friend_intro.rs`
+- Modify: `src-tauri/src/friend_intro.rs` — replace the `IntroRateLimiter` struct/`IntroRateLimiterInner`/`new`/`admit`/`evict_windows`/`evict_last_seen`/`tracked_len` (`:594-745` + the `tracked_len` helper) with the container below; add `INTRO_PER_CONNECTION_MAX`; migrate the five Task-13 tests (`:1284-1418`).
+- Modify: `src-tauri/src/iroh_pex_acceptor.rs` — both `serve` arms (broker `:539-557`, voucher `:654-683`): `admit_connection` pre-auth + `admit_requester`/`admit_voucher` post-auth.
+- Test: inline `#[cfg(test)]` in `src-tauri/src/friend_intro.rs`; regression via the 3-node e2e `src-tauri/tests/identity/introduction_broker_roundtrip_integration.rs`.
+
+**Coverage note (no silent cap):** the shed/role-independence assertions live in the limiter unit tests below. `serve(&self, conn: &Connection)` has no unit harness for real iroh connections (the existing `iroh_pex_acceptor::tests` drive the pure decision fns, not `serve`), so a per-connection flood test at the acceptor would need a real two-endpoint integration harness of marginal value over the unit tests. The acceptor-level verification is therefore the existing 3-node e2e (happy path through both arms) staying green.
 
 **Interfaces:**
 - Consumes: `KeyedSlidingWindow<K>` (A1), `KeyedDedupe<K>` (A2), consts.
@@ -288,7 +293,8 @@ git commit -m "feat(zeb-694): extract KeyedDedupe<K> rate-limit primitive"
   - `pub fn admit_connection(&self, remote_id: [u8; 32], now_ms: u64) -> Result<(), &'static str>`
   - `pub fn admit_requester(&self, requester: OwnerAddr, target: OwnerAddr, now_ms: u64) -> Result<(), &'static str>`
   - `pub fn admit_voucher(&self, voucher: OwnerAddr, subject: OwnerAddr, now_ms: u64) -> Result<(), &'static str>`
-  The old `pub fn admit(&self, key, subject, now_ms)` is REMOVED (Task A4 updates its only two callers).
+  The old `pub fn admit(&self, key, subject, now_ms)` is REMOVED; this task updates its only callers (two acceptor arms + five Task-13 tests) in the same commit.
+- Also consumes: `conn.remote_id()` (iroh authenticated endpoint id; `*conn.remote_id().as_bytes()` is `[u8; 32]`) — already in scope in `serve`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -423,6 +429,15 @@ impl IntroRateLimiter {
         inner.vouch_dedupe.record((voucher, subject), now_ms);
         Ok(())
     }
+
+    /// Test helper: (voucher-role dedupe entries, voucher-role window keys). The
+    /// migrated Task-13 flood tests exercise `admit_voucher`, so they assert on the
+    /// voucher role's maps. Same-module access to the primitives' private fields.
+    #[cfg(test)]
+    pub(crate) fn tracked_len(&self) -> (usize, usize) {
+        let inner = self.lock();
+        (inner.vouch_dedupe.last_seen.len(), inner.vouch_window.windows.len())
+    }
 }
 
 impl Default for IntroRateLimiter {
@@ -431,38 +446,17 @@ impl Default for IntroRateLimiter {
     }
 }
 ```
+(If the existing `tracked_len` is not `#[cfg(test)]`, match its existing visibility/gating; only its BODY changes to read the voucher-role maps.)
 
 Notes: the borrow-split in `admit_requester`/`admit_voucher` (calling `is_duplicate` then `admit` then `record` on distinct fields of `*inner`) compiles because they touch different fields; if the borrow checker objects, split into `let inner = &mut *self.lock();` and access `inner.req_dedupe` / `inner.req_window` as separate field borrows. `OwnerAddr` and `[u8; 32]` are `Copy + Eq + Hash` (existing derives), satisfying the primitive bound.
 
-- [ ] **Step 4: Run to verify they pass**
+- [ ] **Step 4: Migrate the five existing Task-13 tests to `admit_voucher`**
 
-Run: `cd src-tauri && cargo nextest run --locked --lib --features test-fixtures -E 'test(limiter_) | test(keyed_)'`
-Expected: PASS (all A1/A2/A3 tests). If any test that referenced the OLD `admit` method exists, it will fail to compile — delete/replace it (there should be none besides the two acceptor call sites handled in A4).
+In `friend_intro.rs` (`:1284-1418`), the five `intro_rate_limiter_*` tests call the removed `admit`. They are voucher-shaped (key + subject), so migrate each call `rl.admit(k, s, t)` → `rl.admit_voucher(k, s, t)`. Semantics and error strings are identical (`"duplicate"`, `"per-voucher cap"`), so the assertions stand unchanged. The two flood tests (`intro_rate_limiter_bounds_memory_under_rotating_flood`, `intro_rate_limiter_eviction_preserves_legit_sequence`) keep using `tracked_len()` — now reporting the voucher-role maps, which is exactly what `admit_voucher` populates. Do NOT weaken these tests; they are the 8192-cap regression at the limiter level.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Rewire both acceptor arms (`iroh_pex_acceptor.rs`)**
 
-```bash
-git add src-tauri/src/friend_intro.rs
-git commit -m "feat(zeb-694): two-tier role-separated IntroRateLimiter (pre-auth conn shield + post-auth owner quotas)"
-```
-
----
-
-### Task A4: Wire the acceptor arms to the tiered limiter
-
-**Files:**
-- Modify: `src-tauri/src/iroh_pex_acceptor.rs` — broker arm (`:539-557`) and voucher arm (`:654-683`) inside `serve(&self, conn: &Connection)`.
-- Test: regression only — the existing 3-node e2e `src-tauri/tests/identity/introduction_broker_roundtrip_integration.rs`.
-
-**Interfaces:**
-- Consumes: `IntroRateLimiter::{admit_connection, admit_requester, admit_voucher}` (A3). `conn.remote_id()` (iroh authenticated endpoint id; `*conn.remote_id().as_bytes()` is `[u8; 32]`).
-
-**Coverage note (no silent cap):** the shed/role-independence behavior is unit-tested at the limiter level in A3. `serve(&self, conn: &Connection)` has no unit harness for real iroh connections (the existing `iroh_pex_acceptor::tests` drive the pure decision fns, not `serve`), so a per-connection flood test at the acceptor would require a real two-endpoint integration harness of marginal value over A3. This task's acceptor-level verification is therefore the existing 3-node e2e (happy path through both arms) staying green, plus fmt/clippy.
-
-- [ ] **Step 1: Broker/requester arm — connection shield pre-auth, requester quota post-auth**
-
-Replace the pre-auth block at `:544-557` (`self.intro_rate_limiter.admit(ir.from_addr, ir.target, wall_now_ms())`) with a single `now` + connection-shield call:
-
+Broker/requester arm — replace the pre-auth block at `:544-557` (`self.intro_rate_limiter.admit(ir.from_addr, ir.target, wall_now_ms())`) with one `now` + the connection shield:
 ```rust
     let now = wall_now_ms();
     // ZEB-694 Tier 1 (pre-auth flood shield): key on the connecting endpoint's
@@ -472,62 +466,48 @@ Replace the pre-auth block at `:544-557` (`self.intro_rate_limiter.admit(ir.from
         return self.write_ack(&mut send).await;
     }
 ```
-
-Then, immediately AFTER `authenticate_introduce_request(&ir, self.self_owner, now_secs)` succeeds (`:578`), add the post-auth requester quota:
-
+Then IMMEDIATELY AFTER `authenticate_introduce_request(&ir, self.self_owner, now_secs)` succeeds (`:578`), add the post-auth requester quota:
 ```rust
-    // ZEB-694 Tier 2 (post-auth): now that `ir.from_addr` is authenticated, apply
-    // the per-requester quota + dedupe. Benign-ack shed (no oracle).
+    // ZEB-694 Tier 2 (post-auth): `ir.from_addr` is now authenticated.
     if let Err(reason) = self.intro_rate_limiter.admit_requester(ir.from_addr, ir.target, now) {
         tracing::warn!(reason, key = %hex::encode(ir.from_addr.0), "introduction shed by requester quota");
         return self.write_ack(&mut send).await;
     }
 ```
 
-(Use the same `now` computed pre-auth so a single frame is stamped consistently; `now_secs` is the existing seconds value the auth call already uses.)
-
-- [ ] **Step 2: Voucher/target arm — connection shield pre-auth, voucher quota post-auth**
-
-Replace the pre-auth block at `:669-683` (`self.intro_rate_limiter.admit(intro.voucher, intro.subject, wall_now_ms())`) with:
-
+Voucher/target arm — replace the pre-auth block at `:669-683` (`self.intro_rate_limiter.admit(intro.voucher, intro.subject, wall_now_ms())`) with:
 ```rust
     let now = wall_now_ms();
-    // ZEB-694 Tier 1 (pre-auth flood shield): the connecting endpoint here is the
-    // DELIVERER (F dialing X) — a correct, un-spoofable per-endpoint flood key.
+    // ZEB-694 Tier 1: the connecting endpoint here is the DELIVERER (F dialing X).
     if let Err(reason) = self.intro_rate_limiter.admit_connection(*conn.remote_id().as_bytes(), now) {
         tracing::warn!(reason, "introduction shed by connection shield");
         return self.write_ack(&mut send).await;
     }
 ```
-
-Then, immediately AFTER `verify_introduction(...)` succeeds (`:711`), add:
-
+Then IMMEDIATELY AFTER `verify_introduction(...)` succeeds (`:711`), add:
 ```rust
-    // ZEB-694 Tier 2 (post-auth): `intro.voucher` is now verified — apply the
-    // per-voucher quota + dedupe. Benign-ack shed (no oracle).
+    // ZEB-694 Tier 2 (post-auth): `intro.voucher` is now verified.
     if let Err(reason) = self.intro_rate_limiter.admit_voucher(intro.voucher, intro.subject, now) {
         tracing::warn!(reason, key = %hex::encode(intro.voucher.0), "introduction shed by voucher quota");
         return self.write_ack(&mut send).await;
     }
 ```
+Match the exact local `send` variable the surrounding `write_ack(&mut send)` calls use; reuse the existing `now_secs` for the auth call. Confirm the post-auth insert lands AFTER the verify/auth returns Ok and BEFORE the reachability/policy/dial work, so a shed still does no dial.
 
-Confirm the post-auth insert lands AFTER `verify_introduction` returns Ok and BEFORE the reachability/policy/dial work, so a shed still does no dial. Match the exact local variable name `send` used by the surrounding `write_ack(&mut send)` calls.
-
-- [ ] **Step 3: fmt + clippy (lib-scoped)**
-
-Run: `cd src-tauri && cargo fmt --all && cargo clippy --locked --lib --features test-fixtures --no-deps -- -D warnings`
-Expected: clean. (`--lib` avoids relinking all integration binaries; the final sweep runs `--all-targets`.)
-
-- [ ] **Step 4: Regression — the 3-node e2e still passes**
-
-Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(introduction_broker_roundtrip)' --test-threads 1`
-Expected: PASS (all policy cases) — the production caps (40/conn, 20/role) are far above the handful of frames the e2e sends, so the new admits never shed a legitimate flow.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Run limiter unit tests + e2e regression + lib clippy (FOREGROUND)**
 
 ```bash
-git add src-tauri/src/iroh_pex_acceptor.rs
-git commit -m "feat(zeb-694): acceptor arms use tiered limiter (conn shield pre-auth, owner quota post-auth)"
+cd src-tauri && cargo nextest run --locked --lib --features test-fixtures -E 'test(limiter_) | test(keyed_) | test(intro_rate_limiter)'
+cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(introduction_broker_roundtrip)' --test-threads 1
+cd src-tauri && cargo fmt --all && cargo clippy --locked --lib --features test-fixtures --no-deps -- -D warnings
+```
+Expected: all limiter tests PASS (7 new/migrated + 5 Task-13); the 3-node e2e PASS (production caps 40/conn, 20/role are far above the handful of frames it sends); clippy clean. (`--lib` clippy avoids relinking all integration binaries; the final sweep runs `--all-targets`.)
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src-tauri/src/friend_intro.rs src-tauri/src/iroh_pex_acceptor.rs
+git commit -m "feat(zeb-694): two-tier role-separated IntroRateLimiter + acceptor rewire (conn shield pre-auth, owner quotas post-auth)"
 ```
 
 ---
@@ -1153,7 +1133,7 @@ Plus confirm the wire fixtures are byte-identical: `git diff --stat -- src-tauri
 
 ## Self-Review
 
-**Spec coverage:** Part 1 (limiter) → A1 (window primitive), A2 (dedupe primitive), A3 (two-tier container + role independence + conn shield + dedupe tests), A4 (acceptor wiring both arms at the auth boundary). Part 2 (accept path) → B1 (peek), B2 (guard), B3 (TTL + sweep + list wiring), B4 (consume-on-`Linked` seams + branch rewrite + Gap-2 coverage), B5 (frontend keep-row). Global constraints: no-wire-change asserted in the final gate; benign-ack preserved in A4; 8192-cap eviction preserved in A1/A2; `Linked`-gated durability untouched (B4 leaves `complete_introduction` and its call args verbatim). ZEB-693 Gap 2 closed by B4's `begin_/finalize_introduction_accept` unit coverage.
+**Spec coverage:** Part 1 (limiter) → A1 (window primitive), A2 (dedupe primitive), A3 (ATOMIC: two-tier container + role-independence + conn-shield tests + five migrated Task-13 tests + both acceptor arms rewired at the auth boundary + e2e regression). Part 2 (accept path) → B1 (peek), B2 (guard), B3 (TTL + sweep + list wiring), B4 (consume-on-`Linked` seams + branch rewrite + Gap-2 coverage), B5 (frontend keep-row). Global constraints: no-wire-change asserted in the final gate; benign-ack preserved in A3's acceptor rewire; 8192-cap eviction preserved in A1/A2 (primitive-level) + the migrated flood tests (limiter-level); `Linked`-gated durability untouched (B4 leaves `complete_introduction` and its call args verbatim). ZEB-693 Gap 2 closed by B4's `begin_/finalize_introduction_accept` unit coverage. **Note:** A3 is compilation-atomic — removing `admit` breaks the acceptor + 5 tests in one compile unit, so restructure + migrate + rewire land together (8 tasks total: A1–A3, B1–B5).
 
 **Placeholder scan:** No TBD/TODO. The two "reuse the existing test helper" notes (ReachabilityAnnouncePayload construction in B1/B4, the frontend accept test shape in B5) point at concrete existing code the implementer reads, not invented content — flagged because the exact helper name lives in files outside this plan's excerpts.
 
