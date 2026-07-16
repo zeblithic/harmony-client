@@ -37236,6 +37236,35 @@ fn persist_presence_visibility(path: &std::path::Path, visible: bool) -> Result<
         .map_err(|e| format!("save connectivity-settings: {e}"))
 }
 
+/// Durable half of `set_presence_visibility` (ZEB-696): the settings RMW on
+/// the blocking pool — this seam is reachable over the async IPC/headless
+/// surface (PR #207/#305). The process-global write lock is acquired INSIDE
+/// the blocking closure: spawn_blocking keeps running if the caller's future
+/// is cancelled (e.g. a headless-API client disconnect drops the handler
+/// future), and a guard held on the async frame would be released at
+/// cancellation, letting a concurrent setter interleave its RMW with the
+/// still-running orphaned write. blocking_lock is safe on the blocking pool
+/// (it only panics on async runtime workers).
+async fn persist_presence_visibility_locked(
+    path: std::path::PathBuf,
+    visible: bool,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        // ZEB-629: file RMW under the process-global settings write lock.
+        let _settings_guard = connectivity_settings_write_lock().blocking_lock();
+        persist_presence_visibility(&path, visible)
+    })
+    .await
+    .map_err(|e| {
+        // A JoinError means the blocking task panicked (or was aborted at
+        // shutdown) — log it backend-side so the frontend Err isn't the only
+        // diagnostic signal.
+        tracing::warn!(error = %e, "set_presence_visibility: settings RMW task failed");
+        format!("persist presence visibility task: {e}")
+    })??;
+    Ok(())
+}
+
 /// IPC: ZEB-600. Set node-global presence visibility ("appear offline" when
 /// `false`). Flips the live gate on the shared presence map (publishers act on
 /// their next tick — no re-spawn) AND persists to `connectivity-settings.json`
@@ -37261,18 +37290,10 @@ async fn set_presence_visibility(
     if let Some(m) = map {
         m.lock().await.set_visible(visible);
     }
-    // Durable: persist so an invisible user stays hidden across restarts. Offload
-    // the sync std::fs load+save off the Tokio worker — this seam is reachable
-    // over the async IPC/headless surface (matches connectivity_set_identity_
-    // discoverable; PR #207/#305).
+    // Durable: persist so an invisible user stays hidden across restarts. The
+    // offload + locking rationale lives on persist_presence_visibility_locked.
     let path = connectivity_settings_path(settings_path)?;
-    {
-        // ZEB-629: file RMW under the process-global settings write lock.
-        let _settings_guard = connectivity_settings_write_lock().lock().await;
-        tokio::task::spawn_blocking(move || persist_presence_visibility(&path, visible))
-            .await
-            .map_err(|e| format!("persist presence visibility task: {e}"))??;
-    }
+    persist_presence_visibility_locked(path, visible).await?;
 
     // Notify the frontend so any panel showing self-presence (e.g. the member
     // list self-dot) re-renders without polling. Mirrors the identity-
@@ -52079,6 +52100,39 @@ mod friend_redeem_expiry_tests {
     }
 }
 
+/// Settings RMW for the identity-discoverable toggle (ZEB-696), offloaded to
+/// the blocking pool — this seam is reachable over the async headless API
+/// surface. The process-global write lock is acquired INSIDE the blocking
+/// closure: spawn_blocking keeps running if the caller's future is cancelled
+/// (e.g. a headless-API client disconnect drops the handler future), and a
+/// guard held on the async frame would be released at cancellation, letting a
+/// concurrent setter interleave its RMW with the still-running orphaned
+/// write. blocking_lock is safe on the blocking pool (it only panics on async
+/// runtime workers).
+async fn persist_identity_discoverable_locked(
+    path: std::path::PathBuf,
+    enabled: bool,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        // ZEB-629: file RMW under the process-global settings write lock.
+        let _settings_guard = connectivity_settings_write_lock().blocking_lock();
+        let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.identity_discoverable = enabled;
+        settings
+            .save(&path)
+            .map_err(|e| format!("save connectivity-settings: {e}"))
+    })
+    .await
+    .map_err(|e| {
+        // A JoinError means the blocking task panicked (or was aborted at
+        // shutdown) — log it backend-side so the frontend Err isn't the only
+        // diagnostic signal.
+        tracing::warn!(error = %e, "connectivity_set_identity_discoverable: settings RMW task failed");
+        format!("save connectivity-settings task: {e}")
+    })??;
+    Ok(())
+}
+
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
 /// `connectivity-settings.json` and registers / unregisters the pkarr
 /// identity publication accordingly.
@@ -52106,21 +52160,9 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
         return Err("connectivity_settings_path missing".into());
     };
 
-    // Persist the preference. Offload the sync std::fs load+save off the Tokio
-    // worker — this seam is reachable over the async headless API surface.
-    {
-        // ZEB-629: file RMW under the process-global settings write lock.
-        let _settings_guard = connectivity_settings_write_lock().lock().await;
-        tokio::task::spawn_blocking(move || {
-            let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
-            settings.identity_discoverable = enabled;
-            settings
-                .save(&path)
-                .map_err(|e| format!("save connectivity-settings: {e}"))
-        })
-        .await
-        .map_err(|e| format!("save connectivity-settings task: {e}"))??;
-    }
+    // Persist the preference. The offload + locking rationale lives on
+    // persist_identity_discoverable_locked.
+    persist_identity_discoverable_locked(path, enabled).await?;
 
     // Toggle the publication.
     if enabled {
@@ -62435,6 +62477,98 @@ mod create_channel_delta_tests {
 // can't populate it with the test fixture's `MockRuntime` registry.
 // End-to-end IPC roundtrips with a populated registry are therefore
 // out of scope here — see Task 6's integration test for that coverage.
+#[cfg(test)]
+mod settings_rmw_cancellation_tests {
+    // ZEB-696: both pre-existing settings-RMW sites must acquire the process-
+    // global write lock INSIDE their spawn_blocking closure (the PR #476
+    // pattern). A guard held on the async frame across the JoinHandle await
+    // is released when the caller is cancelled (e.g. a headless-API client
+    // disconnect dropping the handler future), while the orphaned closure
+    // keeps writing outside the lock — a concurrent RMW can then interleave.
+    use super::*;
+
+    /// Shared harness: hold the write lock, poll `fut` once (this submits the
+    /// blocking task, which parks in blocking_lock), CANCEL `fut`, release the
+    /// lock, then assert the orphaned task still lands the write (`landed`
+    /// flips true). Under the pre-fix shape the first poll parks at the outer
+    /// `lock().await` instead — the RMW never starts and the test times out.
+    async fn assert_cancelled_setter_write_lands<Fut>(
+        fut: Fut,
+        landed: impl Fn() -> bool + Send + Sync + 'static,
+    ) where
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        let gate = connectivity_settings_write_lock().lock().await;
+
+        let mut fut = Box::pin(fut);
+        // Poll at least once; Elapsed is expected — the blocking closure is
+        // parked on the gate we hold, so the future cannot complete yet.
+        let polled = tokio::time::timeout(std::time::Duration::from_millis(50), &mut fut).await;
+        assert!(
+            polled.is_err(),
+            "setter must not complete while the write lock is held"
+        );
+        drop(fut); // cancel the caller mid-RMW
+
+        drop(gate); // release the lock; the orphaned task may now proceed
+
+        // The write must still land (generous budget; typical completion is
+        // single-digit ms — the budget only bounds a genuine regression).
+        let landed = std::sync::Arc::new(landed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // Qodo PR #477: probe on the blocking pool — the probe reads the
+            // settings file with sync std::fs, which would otherwise block
+            // the test's Tokio worker on every poll.
+            let probe = std::sync::Arc::clone(&landed);
+            if tokio::task::spawn_blocking(move || probe())
+                .await
+                .expect("landed probe task")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled setter's RMW never landed — has the lock \
+                 acquisition moved back outside the blocking closure?"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn presence_visibility_rmw_survives_future_cancellation() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        let check = path.clone();
+        assert_cancelled_setter_write_lands(
+            super::persist_presence_visibility_locked(path, false),
+            // visible=false persists presence_invisible=true (non-default).
+            move || {
+                connectivity_settings::ConnectivitySettings::load_or_default(&check)
+                    .presence_invisible
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn identity_discoverable_rmw_survives_future_cancellation() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        let check = path.clone();
+        assert_cancelled_setter_write_lands(
+            super::persist_identity_discoverable_locked(path, true),
+            // enabled=true persists identity_discoverable=true (non-default).
+            move || {
+                connectivity_settings::ConnectivitySettings::load_or_default(&check)
+                    .identity_discoverable
+            },
+        )
+        .await;
+    }
+}
+
 #[cfg(test)]
 mod channel_message_ipc_tests {
     use super::*;
