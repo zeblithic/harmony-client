@@ -351,9 +351,15 @@ pub struct RevocationAttestation {
 /// receiver reject the *entire* handshake (fail-closed) — the worst outcome for
 /// a legitimate link. Excluding them here keeps the carry purely additive.
 ///
-/// The result is capped at [`MAX_CARRIED_REVOCATIONS`], keeping the smallest-N
-/// by `revocation.target` byte order (the ZEB-692 store-cap convention) so the
-/// selection is deterministic and the emitted bytes are stable.
+/// The result is capped at [`MAX_CARRIED_REVOCATIONS`], keeping the
+/// most-recently-issued N (`revocation.issued_at` descending, ZEB-701): recent
+/// revocations are the security-relevant subset for a brand-new friend who has
+/// no other propagation channel yet, whereas the previous smallest-N-by-target
+/// order permanently starved every revocation past the cap out of this
+/// channel. Ties break on `revocation.target` byte order so the selection is
+/// deterministic and the emitted bytes are stable. (The ZEB-692 persisted
+/// store keeps its own smallest-N-by-byte-order cap — the wire carry
+/// deliberately diverges from the store's eviction order.)
 pub fn build_revocation_attestations(
     trust: &harmony_owner::state::OwnerState,
 ) -> Vec<RevocationAttestation> {
@@ -376,9 +382,15 @@ pub fn build_revocation_attestations(
             }
         })
         .collect();
-    // Deterministic smallest-N selection (`RevocationSet::iter` yields HashMap
-    // order): sort by revocation target, then truncate to the cap.
-    atts.sort_unstable_by(|a, b| a.revocation.target.cmp(&b.revocation.target));
+    // ZEB-701: deterministic most-recent-N selection (`RevocationSet::iter`
+    // yields HashMap order): sort by issued_at DESCENDING with the target
+    // byte order as tie-break, then truncate to the cap.
+    atts.sort_unstable_by(|a, b| {
+        b.revocation
+            .issued_at
+            .cmp(&a.revocation.issued_at)
+            .then_with(|| a.revocation.target.cmp(&b.revocation.target))
+    });
     atts.truncate(MAX_CARRIED_REVOCATIONS);
     atts
 }
@@ -2710,6 +2722,12 @@ mod tests {
     /// `seed` varies both the master and device keys so a caller can build a list
     /// of distinct pairs.
     fn revocation_attestation(seed: u8) -> RevocationAttestation {
+        revocation_attestation_at(seed, 1_700_000_000)
+    }
+
+    /// ZEB-701: like [`revocation_attestation`] but with a caller-chosen
+    /// `issued_at` on the revocation cert, for recency-selection tests.
+    fn revocation_attestation_at(seed: u8, issued_at: u64) -> RevocationAttestation {
         use harmony_owner::certs::{EnrollmentCert, RevocationCert, RevocationReason};
         use harmony_owner::pubkey_bundle::PubKeyBundle;
         let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
@@ -2730,7 +2748,7 @@ mod tests {
             &master_sk,
             master_bundle,
             device_id,
-            1_700_000_000,
+            issued_at,
             RevocationReason::Compromised,
         )
         .expect("mint revocation");
@@ -2853,8 +2871,12 @@ mod tests {
 
     /// ZEB-680 T4: the builder pairs each Master-issued revocation with its
     /// device enrollment, skips revocations with no enrollment on record, and
-    /// caps the result at `MAX_CARRIED_REVOCATIONS`, keeping the smallest-N by
+    /// caps the result at `MAX_CARRIED_REVOCATIONS`. All attestations here
+    /// share one `issued_at` (the helper's fixed timestamp), so Case 2 pins
+    /// the ZEB-701 tie-break: at equal recency, keep the smallest-N by
     /// `revocation.target` byte order (deterministic selection + stable wire).
+    /// The recency ordering itself is pinned by
+    /// `builder_carries_most_recent_over_cap` below.
     #[test]
     fn builder_pairs_and_caps() {
         use harmony_owner::crdt::RevocationSet;
@@ -2891,8 +2913,9 @@ mod tests {
             "c has no enrollment on record → skipped"
         );
 
-        // Case 2: 33 Master-issued revocations, all with enrollments → capped at
-        // 32, keeping the smallest-N by target byte order, returned ascending.
+        // Case 2: 33 Master-issued revocations, all with enrollments and all
+        // sharing one `issued_at` → capped at 32 via the ZEB-701 tie-break:
+        // equal recency keeps the smallest-N by target byte order, ascending.
         let atts: Vec<RevocationAttestation> = (0u8..=MAX_CARRIED_REVOCATIONS as u8)
             .map(revocation_attestation)
             .collect();
@@ -2928,6 +2951,55 @@ mod tests {
             !got.contains(all_targets.last().unwrap()),
             "the single largest target is dropped"
         );
+    }
+
+    /// ZEB-701: over the cap, the builder carries the MOST-RECENTLY-issued 32
+    /// revocations (`issued_at` descending), not the smallest-32 by target
+    /// hash — recent revocations are the security-relevant subset for a brand
+    /// new friend who has no other propagation channel yet. Determinism at
+    /// equal `issued_at` comes from the target tie-break (pinned by
+    /// `builder_pairs_and_caps` Case 2).
+    #[test]
+    fn builder_carries_most_recent_over_cap() {
+        use harmony_owner::crdt::RevocationSet;
+
+        // 33 attestations with strictly increasing issued_at: seed i is issued
+        // at BASE + i, so seed 0 is the single OLDEST revocation.
+        const BASE: u64 = 1_700_000_000;
+        let atts: Vec<RevocationAttestation> = (0u8..=MAX_CARRIED_REVOCATIONS as u8)
+            .map(|i| revocation_attestation_at(i, BASE + u64::from(i)))
+            .collect();
+        assert_eq!(atts.len(), MAX_CARRIED_REVOCATIONS + 1);
+        let mut trust = harmony_owner::state::OwnerState {
+            revocations: RevocationSet::from(
+                atts.iter()
+                    .map(|att| att.revocation.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            ..Default::default()
+        };
+        for att in &atts {
+            trust
+                .enrollments
+                .insert(att.revocation.target, (*att.enrollment).clone());
+        }
+
+        let out = build_revocation_attestations(&trust);
+        assert_eq!(out.len(), MAX_CARRIED_REVOCATIONS);
+        // The oldest revocation (seed 0, issued_at == BASE) is the one dropped.
+        assert!(
+            !out.iter()
+                .any(|att| att.revocation.target == atts[0].revocation.target),
+            "the single oldest revocation must be the one past the cap"
+        );
+        // Carried set = seeds 1..=32, ordered most-recent-first (issued_at
+        // descending: BASE+32, BASE+31, …, BASE+1).
+        let got: Vec<u64> = out.iter().map(|att| att.revocation.issued_at).collect();
+        let expected: Vec<u64> = (1..=MAX_CARRIED_REVOCATIONS as u64)
+            .rev()
+            .map(|i| BASE + i)
+            .collect();
+        assert_eq!(got, expected, "carried most-recent-first");
     }
 
     /// ZEB-680 T4: a SelfDevice-issued revocation — even WITH its enrollment on

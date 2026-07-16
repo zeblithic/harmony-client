@@ -2450,6 +2450,17 @@ pub fn handle_revocation_push(
     // Bridge target `device_id` → the revoked `ed25519`, store union-merged
     // (survives across the owner's devices), and feed the live projection.
     let inserted = state.apply_revoked_dm_device(expected_owner, ed25519);
+    // ZEB-699: the projection feed is DELIBERATELY unconditional — even when
+    // the capped store evicted the key (`inserted == false` at the ZEB-692
+    // 256-cap edge), the revocation is cryptographically proven above, and the
+    // projection is the live ENFORCEMENT surface while the store is the
+    // durability record. The resulting projection ⊇ store divergence is
+    // fail-closed (over-reject only, never under-reject) and self-heals on
+    // restart (the projection boot-seeds from the capped store). Gating the
+    // feed on store survival would not restore projection == store anyway:
+    // a later smaller-key insert evicts an already-fed max and the union-only
+    // projection has no removal, so the divergence is inherent — enforcing
+    // the proven revocation is the better half of the trade.
     let mut one = std::collections::BTreeSet::new();
     one.insert(ed25519);
     revoked.union_from_members(std::iter::once((expected_owner, &one)));
@@ -3663,6 +3674,69 @@ mod tests {
                 .expect("idempotent re-apply");
         assert!(!reinserted, "idempotent re-apply reports no new insert");
         assert_eq!(state.revoked_dm_devices.get(&c.owner).unwrap().len(), 1);
+    }
+
+    /// ZEB-699: pins the 256-cap eviction edge as INTENTIONAL fail-closed
+    /// defense. When the pushed key is the byte-order max of an at-cap store,
+    /// `apply_revoked_dm_device` evicts it back out (ZEB-692 keeps the
+    /// smallest-256) — but the revocation was cryptographically verified, so
+    /// the live projection must still learn it (enforcement over durability;
+    /// projection ⊇ store, transient, self-heals on restart). The `false`
+    /// return pins that the caller does NOT `notify_dirty`: the store is
+    /// unchanged, so there is nothing to persist.
+    #[test]
+    fn handle_revocation_push_feeds_projection_even_when_store_evicts_at_cap() {
+        let c = sample_revocation_case();
+        let mut state = OwnerState::default();
+        let proj = crate::revoked_device_projection::RevokedDeviceProjection::new();
+
+        // Pre-fill the owner's store to exactly the cap with keys that are all
+        // byte-order-smaller than the real revoked ed25519 key (30 leading zero
+        // bytes; a real ed25519 point encoding never starts with 30 zero
+        // bytes — asserted below against this test's FIXED seed, so the
+        // precondition is deterministic, not probabilistic).
+        let filler_keys: Vec<[u8; 32]> = (0
+            ..crate::owner_state_crdt::MAX_REVOKED_DM_DEVICES_PER_OWNER)
+            .map(|i| {
+                let mut k = [0u8; 32];
+                k[30] = (i / 256) as u8;
+                k[31] = (i % 256) as u8;
+                k
+            })
+            .collect();
+        assert!(
+            filler_keys.iter().all(|k| *k < c.revoked_ed),
+            "precondition: every filler key sorts below the pushed key"
+        );
+        for k in &filler_keys {
+            assert!(state.apply_revoked_dm_device(c.owner, *k));
+        }
+        assert_eq!(
+            state.revoked_dm_devices.get(&c.owner).unwrap().len(),
+            crate::owner_state_crdt::MAX_REVOKED_DM_DEVICES_PER_OWNER,
+            "store at cap before the push"
+        );
+
+        let inserted =
+            handle_revocation_push(&mut state, c.owner, &c.revocation, &c.enrollment, &proj)
+                .expect("valid master-signed push accepted at the cap edge");
+
+        // Store: unchanged — the pushed key was the max, evicted by the cap.
+        assert!(!inserted, "evicted-at-cap insert reports no net change");
+        let stored = state.revoked_dm_devices.get(&c.owner).unwrap();
+        assert_eq!(
+            stored.len(),
+            crate::owner_state_crdt::MAX_REVOKED_DM_DEVICES_PER_OWNER
+        );
+        assert!(
+            !stored.contains(&c.revoked_ed),
+            "the capped store evicted the byte-order-max pushed key"
+        );
+        // Projection: fed anyway — the verified revocation is enforced live.
+        assert!(
+            proj.is_revoked(&c.owner, &c.revoked_ed),
+            "projection must learn the verified key even when the store evicts it"
+        );
     }
 
     #[test]
@@ -10579,12 +10653,16 @@ mod tests {
         )
         .await;
 
-        // Wait until the spawned Phase C has marked bob delivered.
-        wait_until(|| {
-            let s = state_arc.try_lock();
-            matches!(s, Ok(g) if g.outbox.get(&entry_id).is_some_and(|e| e.delivered_to.contains(&bob)))
-        })
-        .await;
+        // Wait on the spawned Phase C's FINAL observable effect: the
+        // `dm-delivered` IPC emit. Phase C orders relay-ack → mark
+        // `delivered_to` under the outbox/state locks → drop locks → emit
+        // (the lock-drop-before-emit order is load-bearing, ZEB-233).
+        // Waiting on the state mark alone (the previous condition) raced the
+        // emit: the mark becomes observable the instant the locks drop —
+        // strictly BEFORE the emit loop runs — so the frame assertions below
+        // could read an empty sink under CI shard contention (ZEB-698 flake).
+        // The emit is last, so once it lands every earlier effect has too.
+        wait_until(|| sink.frames().iter().any(|(ev, _)| ev == "dm-delivered")).await;
 
         // Relay was consulted exactly once, for bob.
         let relay_calls = relay_mock.calls();
