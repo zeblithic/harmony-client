@@ -645,6 +645,51 @@ impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
     }
 }
 
+/// A per-key "last admitted at" map with a TTL duplicate check, bounded to
+/// `MAX_DEDUPE_ENTRIES` distinct keys. Extracted from the ZEB-376 limiter.
+struct KeyedDedupe<K> {
+    ttl_ms: u64,
+    last_seen: HashMap<K, u64>,
+}
+
+impl<K: Copy + Eq + Hash> KeyedDedupe<K> {
+    fn new(ttl_ms: u64) -> Self {
+        Self {
+            ttl_ms,
+            last_seen: HashMap::new(),
+        }
+    }
+
+    fn is_duplicate(&self, key: K, now_ms: u64) -> bool {
+        self.last_seen
+            .get(&key)
+            .is_some_and(|&last| now_ms.saturating_sub(last) < self.ttl_ms)
+    }
+
+    fn record(&mut self, key: K, now_ms: u64) {
+        self.last_seen.insert(key, now_ms);
+        self.evict(now_ms);
+    }
+
+    fn evict(&mut self, now_ms: u64) {
+        if self.last_seen.len() <= MAX_DEDUPE_ENTRIES {
+            return;
+        }
+        self.last_seen
+            .retain(|_, &mut ts| now_ms.saturating_sub(ts) < self.ttl_ms);
+        if self.last_seen.len() <= MAX_DEDUPE_ENTRIES {
+            return;
+        }
+        let target = MAX_DEDUPE_ENTRIES / 4 * 3;
+        let mut stamps: Vec<(u64, K)> = self.last_seen.iter().map(|(&k, &ts)| (ts, k)).collect();
+        let excess = stamps.len() - target;
+        stamps.select_nth_unstable_by_key(excess, |&(ts, _)| ts);
+        for &(_, k) in &stamps[..excess] {
+            self.last_seen.remove(&k);
+        }
+    }
+}
+
 /// Process-local DoS hygiene layered BEFORE the (primary) policy/authentication
 /// defenses on both friend-PEX introduction arms: a per-`key` sliding-window cap
 /// plus a `(key, subject)` dedupe, so a compromised/spammy voucher (F) or
@@ -1545,6 +1590,39 @@ mod tests {
         assert!(
             w.windows.len() <= MAX_WINDOW_KEYS,
             "map bounded after eviction"
+        );
+    }
+
+    // ── ZEB-694 Task A2: KeyedDedupe<K> primitive. ───────────────────────────
+
+    #[test]
+    fn keyed_dedupe_flags_repeat_within_ttl() {
+        let mut d = KeyedDedupe::new(1000);
+        assert!(
+            !d.is_duplicate(5u64, 0),
+            "never-seen key is not a duplicate"
+        );
+        d.record(5u64, 0);
+        assert!(
+            d.is_duplicate(5u64, 500),
+            "repeat within ttl is a duplicate"
+        );
+        assert!(!d.is_duplicate(5u64, 1000), "past ttl is not a duplicate");
+        assert!(
+            !d.is_duplicate(6u64, 500),
+            "different key is not a duplicate"
+        );
+    }
+
+    #[test]
+    fn keyed_dedupe_evicts_over_cap() {
+        let mut d = KeyedDedupe::new(1_000_000);
+        for k in 0u64..(MAX_DEDUPE_ENTRIES as u64 + 100) {
+            d.record(k, k);
+        }
+        assert!(
+            d.last_seen.len() <= MAX_DEDUPE_ENTRIES,
+            "map bounded after record-time eviction"
         );
     }
 }
