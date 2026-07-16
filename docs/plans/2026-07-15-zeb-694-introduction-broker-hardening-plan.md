@@ -533,7 +533,7 @@ fn peek_offer_clones_without_consuming() {
     let offer = StoredIntroductionOffer {
         voucher: OwnerAddr([2; 16]),
         subject: subj,
-        reachability: crate::reachability_record::ReachabilityAnnouncePayload::default(),
+        reachability: fixture_reach(), // existing helper in this test module (:308)
     };
     store.record_introduction_offer(subj, Some("x".into()), 4242, offer.clone());
     let (peeked, received_at) = store.peek_offer(&subj).expect("offer present");
@@ -547,7 +547,7 @@ fn peek_offer_clones_without_consuming() {
 }
 ```
 
-(If `ReachabilityAnnouncePayload` has no `Default`, construct it with the same helper the existing `friend_requests`/`reachability_record` tests use — check `reachability_record::tests` for a `sample_payload()` / builder and reuse it verbatim rather than inventing fields.)
+Note: `ReachabilityAnnouncePayload` has NO `Default`. Use the existing `fixture_reach()` helper already in this test module (`friend_requests.rs:308` — builds the 7-field zeroed payload) and the existing `addr(n)` helper / `OwnerAddr([n; 16])` literals; do not invent fields or add a `Default`.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -715,7 +715,7 @@ fn sweep_removes_only_expired_offers() {
     let mk = |s: OwnerAddr| StoredIntroductionOffer {
         voucher: OwnerAddr([9; 16]),
         subject: s,
-        reachability: crate::reachability_record::ReachabilityAnnouncePayload::default(),
+        reachability: fixture_reach(), // existing helper in this test module (friend_requests.rs:308)
     };
     let now = 10 * INTRODUCTION_OFFER_TTL_MS;
     store.record_introduction_offer(fresh, None, now, mk(fresh)); // received now → fresh
@@ -829,6 +829,20 @@ mod zeb694_accept_tests {
     use crate::owner_state_types::OwnerAddr;
     use std::sync::Arc;
 
+    // ReachabilityAnnouncePayload has no Default; build the 7-field zeroed payload
+    // (mirrors friend_requests.rs:308 fixture_reach — the store never inspects it).
+    fn fixture_reach() -> crate::reachability_record::ReachabilityAnnouncePayload {
+        crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: [7u8; 32],
+            home_relay_url: String::new(),
+            direct_addresses: Vec::new(),
+            announced_at_ms: 0,
+            identity_signature: [0u8; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        }
+    }
+
     fn stage(store: &PendingFriendRequests, subj: OwnerAddr, received_at: u64) {
         store.record_introduction_offer(
             subj,
@@ -837,7 +851,7 @@ mod zeb694_accept_tests {
             StoredIntroductionOffer {
                 voucher: OwnerAddr([9; 16]),
                 subject: subj,
-                reachability: crate::reachability_record::ReachabilityAnnouncePayload::default(),
+                reachability: fixture_reach(),
             },
         );
     }
