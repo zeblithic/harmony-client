@@ -4962,4 +4962,322 @@ mod tests {
             ConsentDecision::AcceptInline,
         );
     }
+
+    // ==================================================================
+    // ZEB-680 T7 — handshake-level revocation regressions
+    // ==================================================================
+    //
+    // These drive the REAL serve handler (`handle_friend_handshake_inbound`)
+    // over a live iroh loopback bi-stream, with the TEST playing the dialer so
+    // the exact request frame — including its carried `revocations` — is under
+    // test control. This is the integration seam the pure-core T2/T5/T6 unit
+    // tests can't reach on their own: wire decode → `authenticate_friend_request`
+    // (consulting `self.revoked`) → `process_friend_request` (applying the
+    // carried revocations), end to end. NOTE: the acceptor test module had no
+    // pre-existing serve-level harness — the only prior end-to-end rig lives in
+    // `tests/dm/friend_token_roundtrip_integration.rs`, whose full pkarr/token
+    // machinery the dialer controls (so it can't inject a carried attestation).
+    // This minimal rig mirrors that harness's hermetic-endpoint pattern but
+    // hands the dialer to the test.
+
+    /// Build a hermetic, relay-disabled iroh endpoint on loopback registered
+    /// with the friend ALPN. Mirrors the integration harness's
+    /// `build_hermetic_endpoint`, minus the zenoh/handshake ALPNs this
+    /// direct-dial rig never negotiates.
+    async fn t7_loopback_endpoint() -> iroh::endpoint::Endpoint {
+        use iroh::endpoint::{presets, Endpoint, RelayMode};
+        use iroh::SecretKey;
+        Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .dns_resolver(crate::iroh_endpoint::hermetic_dns_resolver())
+            .clear_ip_transports()
+            .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind_addr loopback")
+            .bind()
+            .await
+            .expect("bind hermetic iroh endpoint")
+    }
+
+    /// Build a friend acceptor for the T7 rig: self identity from `self_seed`,
+    /// the given owner-state + revoked projection wired in, no pkarr publisher
+    /// (the refuse + AcceptInline paths under test never touch the token gate).
+    fn t7_build_acceptor(
+        self_seed: u8,
+        crdt_state: Arc<TokioMutex<OwnerState>>,
+        projection: crate::revoked_device_projection::RevokedDeviceProjection,
+    ) -> IrohFriendHandshakeAcceptor<()> {
+        let me = mint_test_owner(self_seed);
+        let hlc_tracker = Arc::new(TokioMutex::new(
+            std::collections::BTreeMap::<String, Hlc>::new(),
+        ));
+        let device2 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &me.device_key.to_bytes(),
+        ));
+        let keytree = Arc::new(
+            crate::owner_state_crypto::KeyTree::derive(&[self_seed; 32]).expect("keytree derive"),
+        );
+        IrohFriendHandshakeAcceptor::<()>::new(
+            crdt_state,
+            hlc_tracker,
+            format!("dev-{self_seed:02x}"),
+            me.owner,
+            Some("me".to_string()),
+            me.cert.clone(),
+            device2,
+            keytree,
+            None,
+            None,
+        )
+        .with_revoked(projection)
+    }
+
+    /// Drive one full inbound friend handshake against `acceptor` over an iroh
+    /// loopback pair. Returns the handler's own `Result` (the authoritative
+    /// server-side outcome) plus the decoded response the dialer read back, if
+    /// any — a refused handshake resets the stream with no response, surfacing
+    /// as `Err` on the dialer's read.
+    async fn t7_drive_handshake(
+        acceptor: Arc<IrohFriendHandshakeAcceptor<()>>,
+        req: FriendLinkRequest,
+    ) -> (
+        Result<(), FriendAcceptError>,
+        Result<FriendLinkResponse, String>,
+    ) {
+        let server_ep = t7_loopback_endpoint().await;
+        let client_ep = t7_loopback_endpoint().await;
+
+        let mut server_addr = iroh::EndpointAddr::new(server_ep.id());
+        for sock in server_ep.bound_sockets() {
+            server_addr = server_addr.with_ip_addr(sock);
+        }
+
+        // Server: accept exactly one connection and run the REAL handler, then
+        // hold the connection open (bounded) until the dialer drives the close —
+        // mirroring the production `handle_connection`, which waits on
+        // `conn.closed()` so response bytes flush before `conn`/`server_ep` drop.
+        // `server_ep` is owned by this block, so it — and the connection derived
+        // from it — stays alive until the block completes.
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep
+                .accept()
+                .await
+                .expect("server: incoming connection");
+            let conn = incoming.await.expect("server: accept→connect");
+            let result = acceptor.handle_friend_handshake_inbound(&conn).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+            result
+        });
+
+        // Client (the dialer): connect on the friend ALPN, open a bi-stream, and
+        // write the length-prefixed request frame under full test control.
+        let conn = client_ep
+            .connect(server_addr, crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1)
+            .await
+            .expect("client: dial");
+        let (mut send, mut recv) = conn.open_bi().await.expect("client: open_bi");
+        let body = encode_friend_request(&req).expect("client: encode request");
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            body.len(),
+            FRIEND_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .expect("client: len prefix");
+        send.write_all(&prefix).await.expect("client: write prefix");
+        send.write_all(&body).await.expect("client: write body");
+        send.finish().expect("client: finish");
+
+        // Read the response frame, BOUNDED: a refused handshake writes nothing
+        // and (endpoint-drop resets don't reach the dialer promptly) the read
+        // would otherwise block, so a timeout is the dialer's "refused" signal →
+        // `Err`. A happy-path accept resolves it well inside the bound.
+        let resp = match tokio::time::timeout(Duration::from_secs(3), async {
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf)
+                .await
+                .map_err(|e| e.to_string())?;
+            let len = crate::iroh_framing::decode_len_prefix(
+                len_buf,
+                FRIEND_MAX_PACKET_LEN,
+                crate::iroh_framing::Endian::Le,
+                false,
+            )
+            .map_err(|e| e.to_string())?;
+            let mut buf = vec![0u8; len];
+            recv.read_exact(&mut buf).await.map_err(|e| e.to_string())?;
+            decode_friend_response(&buf).map_err(|e| e.to_string())
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err("dialer response read timed out (handshake refused)".to_string()),
+        };
+
+        // Close from the dialer so the server's `conn.closed()` completes, then
+        // join the handler for its authoritative outcome.
+        conn.close(0u32.into(), b"t7-done");
+        let result = server_task.await.expect("server task join");
+        (result, resp)
+    }
+
+    /// ZEB-680 T7(a): the ACCEPTOR's `revoked` projection (seeded via
+    /// `with_revoked` at construction) names the requester's enrolled device
+    /// key → the full inbound handshake is refused with `DeviceRevoked` (surfaced
+    /// as `FriendAcceptError::Handshake(DeviceRevoked)`), no response is written,
+    /// and NO friend entry lands in the acceptor's owner-state. Pins the T2
+    /// serve-side wire-in of the projection through `authenticate_friend_request`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_refuses_revoked_requester() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let req = signed_request_no_token(0x71);
+            let revoked_key = req.enrollment.device_pubkeys.classical.ed25519_verify;
+
+            let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+            let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+            let keys: std::collections::BTreeSet<[u8; 32]> = std::iter::once(revoked_key).collect();
+            projection.union_from_members(std::iter::once((req.from_addr, &keys)));
+
+            let acceptor = Arc::new(t7_build_acceptor(0x70, Arc::clone(&crdt_state), projection));
+            let (result, resp) = t7_drive_handshake(acceptor, req).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(FriendAcceptError::Handshake(
+                        FriendHandshakeError::DeviceRevoked
+                    ))
+                ),
+                "a revoked requester must be refused with DeviceRevoked, got {result:?}"
+            );
+            assert!(
+                resp.is_err(),
+                "a refused handshake writes no response frame, got {resp:?}"
+            );
+            assert!(
+                crdt_state.lock().await.friend_graph.friends.is_empty(),
+                "a refused handshake must write no friend entry"
+            );
+        })
+        .await
+        .expect("serve_refuses_revoked_requester completes within 30s");
+    }
+
+    /// ZEB-680 T7(b): a request that carries one valid own-fleet revocation
+    /// attestation → the handshake is accepted AND the carried revoked device key
+    /// lands in the acceptor's DM revoked-device store and its live projection.
+    /// Pins the serve-side thread-through of `req.revocations` into
+    /// `process_friend_request`'s apply-at-establishment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_applies_carried_revocations_end_to_end() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            // The attestation is bound to the requester's OWN owner (same master
+            // seed), so the phase-1 own-fleet trust-bind passes.
+            let mut req = signed_request_no_token(0x73);
+            let att = revocation_attestation(0x73);
+            assert_eq!(
+                OwnerAddr(att.revocation.owner_id),
+                req.from_addr,
+                "fixture: the attestation must attest the requester's own device"
+            );
+            let revoked_key = att.enrollment.device_pubkeys.classical.ed25519_verify;
+            req.revocations = vec![att];
+            let requester_owner = req.from_addr;
+
+            let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+            let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+            // Pre-approve the requester so the no-token request accepts inline
+            // (the accept path is what runs the carried-revocation apply).
+            let pending = Arc::new(crate::friend_requests::PendingFriendRequests::new());
+            pending.mark_approved(requester_owner);
+
+            let acceptor = Arc::new(
+                t7_build_acceptor(0x72, Arc::clone(&crdt_state), projection.clone())
+                    .with_pending_requests(Some(pending)),
+            );
+            let (result, resp) = t7_drive_handshake(acceptor, req).await;
+
+            assert!(
+                result.is_ok(),
+                "a carried-revocation handshake must be accepted, got {result:?}"
+            );
+            assert!(
+                matches!(resp, Ok(FriendLinkResponse::Accepted(_))),
+                "the dialer must read an Accepted response, got {resp:?}"
+            );
+            let state = crdt_state.lock().await;
+            assert!(
+                state
+                    .revoked_dm_devices
+                    .get(&requester_owner)
+                    .is_some_and(|s| s.contains(&revoked_key)),
+                "the carried revoked device key must land in the DM revoked-device store"
+            );
+            drop(state);
+            assert!(
+                projection.is_revoked(&requester_owner, &revoked_key),
+                "the acceptor's live projection must report the carried key revoked"
+            );
+        })
+        .await
+        .expect("serve_applies_carried_revocations_end_to_end completes within 30s");
+    }
+
+    /// ZEB-680 T7(c) — back-compat pin: a pre-ZEB-680 frame carries
+    /// `revocations: vec![]`, which T1's codec encodes WITHOUT the "v" key, so
+    /// the wire is byte-identical to an old dialer's. The handshake must complete
+    /// exactly as before — an Active friend written, `Accepted` returned — and
+    /// touch no revocation state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_accepts_pre_zeb680_frame_unchanged() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let req = signed_request_no_token(0x75);
+            assert!(
+                req.revocations.is_empty(),
+                "pre-ZEB-680 shape carries no revocations (codec omits the \"v\" key)"
+            );
+            let requester_owner = req.from_addr;
+
+            let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+            let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+            let pending = Arc::new(crate::friend_requests::PendingFriendRequests::new());
+            pending.mark_approved(requester_owner);
+
+            let acceptor = Arc::new(
+                t7_build_acceptor(0x74, Arc::clone(&crdt_state), projection)
+                    .with_pending_requests(Some(pending)),
+            );
+            let (result, resp) = t7_drive_handshake(acceptor, req).await;
+
+            assert!(
+                result.is_ok(),
+                "a pre-ZEB-680 frame must complete the handshake, got {result:?}"
+            );
+            assert!(
+                matches!(resp, Ok(FriendLinkResponse::Accepted(_))),
+                "the dialer must read an Accepted response, got {resp:?}"
+            );
+            let state = crdt_state.lock().await;
+            let entry = state
+                .friend_graph
+                .friends
+                .get(&requester_owner)
+                .expect("friend entry written");
+            assert_eq!(
+                entry.status,
+                FriendStatus::Active,
+                "the requester becomes an Active friend"
+            );
+            assert!(
+                state.revoked_dm_devices.is_empty(),
+                "a pre-ZEB-680 frame carries no revocations to apply"
+            );
+        })
+        .await
+        .expect("serve_accepts_pre_zeb680_frame_unchanged completes within 30s");
+    }
 }
