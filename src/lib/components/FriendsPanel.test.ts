@@ -721,11 +721,17 @@ describe('FriendsPanel — friend request accept (ZEB-694 Task B5)', () => {
   });
 
   it('accepts successfully, clears any prior error, and refreshes the pending list', async () => {
+    // ZEB-694 CR#10: the first accept REJECTS (so pendingError is genuinely set),
+    // then a retry RESOLVES — proving handleAccept's success path clears the
+    // stale error rather than the test trivially passing with no error ever set.
     const listPendingRequests = vi
       .fn()
       .mockResolvedValueOnce([REQ])
       .mockResolvedValueOnce([]);
-    const acceptRequest = vi.fn().mockResolvedValue(undefined);
+    const acceptRequest = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Introduction not delivered — try again.'))
+      .mockResolvedValueOnce(undefined);
     const service = mockService({ listPendingRequests, acceptRequest });
     const { findByTestId, getByTestId, queryByTestId } = render(FriendsPanel, {
       props: { service },
@@ -733,7 +739,14 @@ describe('FriendsPanel — friend request accept (ZEB-694 Task B5)', () => {
 
     await findByTestId('pending-list');
     await fireEvent.click(getByTestId('accept-btn'));
+
+    const err = await findByTestId('pending-error');
+    expect(err.textContent).toContain('Introduction not delivered');
+    expect(listPendingRequests).toHaveBeenCalledTimes(1);
+
+    await fireEvent.click(getByTestId('accept-btn'));
     expect(acceptRequest).toHaveBeenCalledWith(ownerIdHex);
+    expect(acceptRequest).toHaveBeenCalledTimes(2);
 
     await vi.waitFor(() => expect(listPendingRequests).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(queryByTestId('pending-error')).toBeNull());

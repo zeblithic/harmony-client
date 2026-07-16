@@ -603,6 +603,9 @@ impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
 
     /// `true` if admitted (recorded), `false` if the key is at its in-window cap.
     fn admit(&mut self, key: K, now_ms: u64) -> bool {
+        if self.max == 0 {
+            return false; // a zero cap admits nothing; avoid inserting an unbounded empty entry
+        }
         {
             let window = self.windows.entry(key).or_default();
             let cutoff = now_ms.saturating_sub(self.window_ms);
@@ -1561,6 +1564,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keyed_window_zero_cap_admits_nothing_and_stays_empty() {
+        let mut w = KeyedSlidingWindow::new(0, 1000);
+        assert!(!w.admit(1u64, 0));
+        assert!(!w.admit(2u64, 0));
+        assert!(
+            w.windows.is_empty(),
+            "a zero cap must not insert map entries"
+        );
+    }
+
     // ── ZEB-694 Task A2: KeyedDedupe<K> primitive. ───────────────────────────
 
     #[test]
@@ -1603,16 +1617,18 @@ mod tests {
         let o = OwnerAddr([1; 16]);
         let t = OwnerAddr([2; 16]);
         let t2 = OwnerAddr([3; 16]);
-        let s = OwnerAddr([4; 16]);
         assert!(rl.admit_requester(o, t, 0).is_ok());
         assert_eq!(
             rl.admit_requester(o, t2, 1),
             Err("per-requester cap"),
             "requester at cap"
         );
+        // Disjoint dedupe AND window: the SAME (o, t) pair recorded in the requester
+        // dedupe must still admit as a voucher (separate dedupe map) and exercises the
+        // voucher window independently of the exhausted requester window.
         assert!(
-            rl.admit_voucher(o, s, 2).is_ok(),
-            "voucher role has its own budget"
+            rl.admit_voucher(o, t, 2).is_ok(),
+            "voucher role has disjoint window AND dedupe from the requester role"
         );
     }
 

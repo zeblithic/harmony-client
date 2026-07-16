@@ -60,7 +60,7 @@ struct KeyedSlidingWindow<K> {
     windows: HashMap<K, VecDeque<u64>>,
 }
 impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
-    fn admit(&mut self, key: K, now_ms: u64) -> Result<(), &'static str>; // prune → cap check → push → evict
+    fn admit(&mut self, key: K, now_ms: u64) -> bool; // prune → cap check → push → evict; true = admitted
     fn evict(&mut self, now_ms: u64);                                     // 8192-cap two-pass (from evict_windows)
 }
 ```
@@ -237,7 +237,7 @@ No wire-format files (`tests/wire_format/zeb37{5,6}_*`) change.
 - **Connection shield:** flood `admit_connection(idA, ..)` to its cap → shed; `admit_connection(idB, ..)` still admits.
 - **Pre-auth cannot poison post-auth:** post-auth methods are only reached by the acceptor after auth — assert at the limiter level that requester/voucher windows are untouched by `admit_connection` calls (disjoint state).
 
-**Acceptor (`iroh_pex_acceptor.rs` test):** a pre-auth flood over one connection identity is shed by the shield before auth runs (benign ack returned, no verify/dial side effects).
+**Acceptor coverage (no bespoke flood harness):** `serve(&self, conn: &Connection)` has no unit harness for real iroh connections (the existing `iroh_pex_acceptor::tests` drive the pure decision fns, not `serve`), so a per-connection flood test at the acceptor would need a real two-endpoint integration harness of marginal value over the limiter unit tests above. Acceptor-level coverage of the shed/role-independence behavior is therefore split across two layers: the shed and role-independence *decisions* are proven by the limiter unit tests (`admit_connection`/`admit_requester`/`admit_voucher`, above), and the acceptor's wiring of those decisions at the correct auth boundary is proven by the 3-node e2e `introduction_broker_roundtrip` staying green (happy path through both arms).
 
 **Accept path (`lib.rs` in-crate `#[cfg(test)]`, ZEB-693 Gap 2):** peek-not-consume (offer present after a `Pending` dial); consume-on-`Linked` (offer gone after `Linked`); in-flight guard (concurrent second accept returns the in-progress error, single dial); TTL expiry (stale offer dropped + expired error; `list_pending_friend_requests_inner` filters it).
 
