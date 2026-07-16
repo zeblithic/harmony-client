@@ -101,7 +101,9 @@ pub struct CatalogRequest {
 /// rejecting any trailing bytes. Mirrors `iroh_friend_acceptor::decode_strict`
 /// (which is private to that module) so the two sub-protocols share one wire
 /// discipline.
-fn decode_strict<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ReferralCodecError> {
+pub(crate) fn decode_strict<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, ReferralCodecError> {
     if bytes.len() > PEX_MAX_PACKET_LEN {
         return Err(ReferralCodecError::TooLarge {
             len: bytes.len(),

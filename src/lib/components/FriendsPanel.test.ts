@@ -21,6 +21,11 @@ function mockService(overrides: Partial<FriendService> = {}): FriendService {
     listFriends: vi.fn().mockResolvedValue([]),
     listPendingRequests: vi.fn().mockResolvedValue([]),
     getAutoAccept: vi.fn().mockResolvedValue(false),
+    // ZEB-376 Phase 2b Task 14: mirrors getAutoAccept's default — loaded
+    // unconditionally on mount, so every test needs a resolved value even
+    // when it doesn't exercise the policy select. 'fof' mirrors the Rust
+    // `PeerIntroPolicy` derive default.
+    getPeerIntroPolicy: vi.fn().mockResolvedValue('fof'),
     onFriendsChanged: vi.fn().mockReturnValue(() => {}),
     onPendingRequestsChanged: vi.fn().mockReturnValue(() => {}),
     getMyIdentityPubHex: vi.fn().mockResolvedValue(null),
@@ -569,5 +574,113 @@ describe('FriendsPanel — DM invites pending section (ZEB-236 T7)', () => {
     await fireEvent.click(getByTestId('dm-invite-accept-btn')); // in-flight
     expect(accept).toHaveBeenCalledTimes(1);
     resolveAccept();
+  });
+});
+
+describe('FriendsPanel — introduction broker (ZEB-376 Phase 2b)', () => {
+  const ID = (b: string) => b.repeat(32); // 16-byte owner_id = 32 hex chars
+
+  it('loads the peer-intro policy and saves a change via the select', async () => {
+    const setPeerIntroPolicy = vi.fn().mockResolvedValue(undefined);
+    const service = mockService({
+      getPeerIntroPolicy: vi.fn().mockResolvedValue('ask'),
+      setPeerIntroPolicy,
+    });
+    const { findByTestId } = render(FriendsPanel, { props: { service } });
+
+    const select = (await findByTestId('peer-intro-policy-select')) as HTMLSelectElement;
+    await vi.waitFor(() => expect(select.value).toBe('ask'));
+
+    await fireEvent.change(select, { target: { value: 'closed' } });
+    expect(setPeerIntroPolicy).toHaveBeenCalledWith('closed');
+    await vi.waitFor(() => expect(select.value).toBe('closed'));
+  });
+
+  it('surfaces a peer-intro policy load failure', async () => {
+    const service = mockService({
+      getPeerIntroPolicy: vi.fn().mockRejectedValue(new Error('boom')),
+    });
+    const { findByTestId } = render(FriendsPanel, { props: { service } });
+    const err = await findByTestId('peer-intro-policy-error');
+    expect(err.textContent).toContain('boom');
+  });
+
+  it('shows a "Request introduction" button (not the already-friend badge) for a browsable referral and requests it', async () => {
+    const via = ID('a');
+    const target = ID('b');
+    const friends = [
+      { ownerIdHex: via, display: 'Alice', status: 'active', establishedVia: 'mutual_key', referrable: true },
+    ];
+    const browseReferrals = vi.fn().mockResolvedValue([
+      { ownerIdHex: target, display: 'Carol', alreadyFriend: false },
+    ]);
+    const requestIntroduction = vi.fn().mockResolvedValue(undefined);
+    const service = mockService({
+      listFriends: vi.fn().mockResolvedValue(friends),
+      browseReferrals,
+      requestIntroduction,
+    });
+    const { findByTestId, getByTestId, queryByTestId } = render(FriendsPanel, {
+      props: { service },
+    });
+    await findByTestId('friend-list');
+
+    await fireEvent.click(getByTestId('browse-referrals-btn'));
+    const btn = await findByTestId('request-intro-btn');
+    expect(queryByTestId('already-friend-badge')).toBeNull();
+
+    await fireEvent.click(btn);
+    expect(requestIntroduction).toHaveBeenCalledWith(via, target);
+    const status = await findByTestId('request-intro-status');
+    expect(status.textContent).toContain('Introduction requested.');
+  });
+
+  it('shows only the already-friend badge (no button) when the referral is already a friend', async () => {
+    const via = ID('a');
+    const target = ID('c');
+    const friends = [
+      { ownerIdHex: via, display: 'Alice', status: 'active', establishedVia: 'mutual_key', referrable: true },
+    ];
+    const browseReferrals = vi.fn().mockResolvedValue([
+      { ownerIdHex: target, display: 'Dave', alreadyFriend: true },
+    ]);
+    const service = mockService({
+      listFriends: vi.fn().mockResolvedValue(friends),
+      browseReferrals,
+    });
+    const { findByTestId, getByTestId, queryByTestId } = render(FriendsPanel, {
+      props: { service },
+    });
+    await findByTestId('friend-list');
+
+    await fireEvent.click(getByTestId('browse-referrals-btn'));
+    await findByTestId('already-friend-badge');
+    expect(queryByTestId('request-intro-btn')).toBeNull();
+  });
+
+  it('badges a pending request with its introducer when introducedBy is set', async () => {
+    const requesterId = ID('d');
+    const voucherId = ID('e');
+    const pending = [
+      { ownerIdHex: requesterId, display: 'Eve', receivedAtMs: 0, introducedBy: voucherId },
+    ];
+    const service = mockService({ listPendingRequests: vi.fn().mockResolvedValue(pending) });
+    const { findByTestId } = render(FriendsPanel, { props: { service } });
+
+    const badge = await findByTestId(`introduced-by-badge-${requesterId}`);
+    expect(badge.textContent).toContain('introduced by');
+    expect(badge.textContent).toContain(voucherId.slice(0, 12));
+  });
+
+  it('renders no introducer badge for a plain (non-introduction) pending request', async () => {
+    const requesterId = ID('f');
+    const pending = [
+      { ownerIdHex: requesterId, display: 'Frank', receivedAtMs: 0, introducedBy: null },
+    ];
+    const service = mockService({ listPendingRequests: vi.fn().mockResolvedValue(pending) });
+    const { findByTestId, queryByTestId } = render(FriendsPanel, { props: { service } });
+
+    await findByTestId('pending-list');
+    expect(queryByTestId(`introduced-by-badge-${requesterId}`)).toBeNull();
   });
 });

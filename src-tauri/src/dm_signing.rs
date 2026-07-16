@@ -301,6 +301,19 @@ pub fn device2_combined_pub(cert: &harmony_owner::certs::EnrollmentCert) -> [u8;
     out
 }
 
+/// ZEB-376: the device-#2 Ed25519 VERIFYING key from an EnrollmentCert (the
+/// `ed25519_verify` half of the classical device pubkeys). Parallels
+/// [`device2_combined_pub`], but returns just the signature-verifying half —
+/// what a relayed reachability's inner-signature check needs to authenticate the
+/// subject who signed it. `None` when the bytes are not a valid Ed25519 point (a
+/// degenerate / pre-ZEB-372 stub cert); callers treat `None` as "no usable #2
+/// key" and reject.
+pub fn device2_verifying_key(
+    cert: &harmony_owner::certs::EnrollmentCert,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    ed25519_dalek::VerifyingKey::from_bytes(&cert.device_pubkeys.classical.ed25519_verify).ok()
+}
+
 /// ZEB-580 S1: the DM device hash for a device's #2 identity, or `None` when
 /// the cert lacks a usable X25519 pub (all-zero pre-ZEB-372 stub or a
 /// degenerate synthetic cert) or the combined pub is not a valid Identity

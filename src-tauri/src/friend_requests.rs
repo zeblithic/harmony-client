@@ -21,6 +21,39 @@ use crate::owner_state_types::OwnerAddr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+/// ZEB-376 Task 11: what KIND of pending inbox entry this is. A plain Path-A
+/// `LinkRequest` (mutual-key dial) is accepted by marking the requester approved
+/// so their next dial links inline; an `IntroductionOffer` (AskMe-staged F→X
+/// vouch) is accepted by X actively dialing the introducee via
+/// `complete_introduction` — the SAME action an auto-`Proceed` runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingKind {
+    /// Path-A mutual-key inbound request (the historical default).
+    LinkRequest,
+    /// AskMe-staged introduction offer carrying the already-verified vouch +
+    /// relayed reachability the accept path needs to dial the introducee. Boxed
+    /// so the enum (and `PendingInbound`) stays small for the common
+    /// `LinkRequest` case.
+    IntroductionOffer(Box<StoredIntroductionOffer>),
+}
+
+/// ZEB-376 Task 11: the introduction data staged for an AskMe accept. Recorded
+/// by the friend-PEX `Introduction` arm AFTER it has already verified F's vouch,
+/// the relayed reachability's inner signature, and its freshness — so a staged
+/// offer is trustworthy. On the user's explicit accept, `take_offer` hands this
+/// back and X runs `complete_introduction(subject, reachability, …)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIntroductionOffer {
+    /// The voucher (F) who relayed this introduction — surfaced to the UI as
+    /// `introducedBy` and used only for display / provenance.
+    pub voucher: OwnerAddr,
+    /// The introducee (X's prospective friend) X dials on accept.
+    pub subject: OwnerAddr,
+    /// The subject's relayed, already-verified reachability X synthesizes the
+    /// dial target from.
+    pub reachability: crate::reachability_record::ReachabilityAnnouncePayload,
+}
+
 /// One recorded inbound friend request awaiting the user's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInbound {
@@ -29,6 +62,10 @@ pub struct PendingInbound {
     /// Wall-clock epoch-ms the request was first recorded (idempotent: a
     /// re-dial before acceptance does NOT bump this).
     pub received_at_ms: u64,
+    /// ZEB-376 Task 11: whether this is a plain Path-A `LinkRequest` or an
+    /// AskMe-staged `IntroductionOffer` (which the accept path runs as a
+    /// self-dial link rather than a `prior_accept` approval).
+    pub kind: PendingKind,
 }
 
 #[derive(Default)]
@@ -68,7 +105,67 @@ impl PendingFriendRequests {
         inner.inbound.entry(addr).or_insert(PendingInbound {
             display,
             received_at_ms: now_ms,
+            kind: PendingKind::LinkRequest,
         });
+    }
+
+    /// ZEB-376 Task 11: stage an AskMe introduction OFFER for `subject` in the
+    /// pending inbox. The offer SUPERSEDES any prior inbound entry for `subject`
+    /// (an unconditional `insert`, not an `or_insert`): a verified,
+    /// F-vouched + reachability-checked offer is strictly more actionable than a
+    /// bare Path-A `LinkRequest` staged earlier for the same owner — dropping it
+    /// (#6) would strand the user with a request they can't accept-as-introduction.
+    /// A re-delivered SAME offer just replaces itself (resetting `received_at_ms`
+    /// to `now_ms` — acceptable; it is the same verified offer).
+    pub fn record_introduction_offer(
+        &self,
+        subject: OwnerAddr,
+        display: Option<String>,
+        now_ms: u64,
+        offer: StoredIntroductionOffer,
+    ) {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        inner.inbound.insert(
+            subject,
+            PendingInbound {
+                display,
+                received_at_ms: now_ms,
+                kind: PendingKind::IntroductionOffer(Box::new(offer)),
+            },
+        );
+    }
+
+    /// ZEB-376 Task 11: remove + return the staged introduction offer for
+    /// `subject` (the user tapped Accept on an introduction). Returns `None` when
+    /// `subject` has no entry OR its entry is a plain `LinkRequest` — leaving a
+    /// `LinkRequest` entry INTACT so the accept-IPC falls through to the Path-A
+    /// [`approve`](Self::approve) branch. One-shot: a second call returns `None`.
+    pub fn take_offer(&self, subject: &OwnerAddr) -> Option<StoredIntroductionOffer> {
+        let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        // Only consume the entry when it is actually an IntroductionOffer.
+        match inner.inbound.get(subject) {
+            Some(p) if matches!(p.kind, PendingKind::IntroductionOffer(_)) => {
+                match inner.inbound.remove(subject).map(|p| p.kind) {
+                    Some(PendingKind::IntroductionOffer(offer)) => Some(*offer),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// ZEB-376 Task 11: non-consuming peek — true iff `subject` has a staged
+    /// `IntroductionOffer` (NOT a plain `LinkRequest`). Lets the accept path
+    /// validate its self-dial handles BEFORE the one-shot [`take_offer`](Self::take_offer)
+    /// irreversibly consumes the offer (HARD-RULE: verify before an irreversible
+    /// write — a missing handle must leave the offer row intact + recoverable).
+    /// Read-only; a subsequent `take_offer` is still the single consuming op.
+    pub fn has_offer(&self, subject: &OwnerAddr) -> bool {
+        let inner = self.inner.lock().expect("pending inner mutex poisoned");
+        matches!(
+            inner.inbound.get(subject),
+            Some(p) if matches!(p.kind, PendingKind::IntroductionOffer(_))
+        )
     }
 
     /// Snapshot the currently-pending inbound requests (for the list IPC).
@@ -150,12 +247,136 @@ impl PendingFriendRequests {
     }
 }
 
+/// ZEB-376: process-local pre-authorization for introductions the user
+/// initiated. When you send an `IntroduceRequest` for target X you `record(X)`;
+/// X's inbound introduction-driven `FriendLinkRequest` then auto-accepts because
+/// its authenticated sender is `take`-able here. One-shot + TTL-bounded so a
+/// stale pre-auth can't silently accept an unrelated later dial. Not persisted
+/// (ephemeral, like `PendingFriendRequests`).
+#[derive(Default)]
+pub struct PendingOutboundIntroductions {
+    inner: Mutex<HashMap<OwnerAddr, u64>>,
+}
+
+/// TTL bounding a recorded pre-authorization: a `record`ed target older than
+/// this (in wall-clock epoch-ms) never authorizes an inline-introduced accept.
+pub const OUTBOUND_INTRO_TTL_MS: u64 = 10 * 60 * 1000; // 10 min
+
+impl PendingOutboundIntroductions {
+    /// Empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record (idempotent refresh of the deadline for) a pre-authorization for
+    /// `target` at `now_ms`. A later `record` bumps the recorded instant.
+    pub fn record(&self, target: OwnerAddr, now_ms: u64) {
+        self.inner
+            .lock()
+            .expect("outbound-intro mutex poisoned")
+            .insert(target, now_ms);
+    }
+
+    /// Remove + return true iff `target` was recorded AND still within the TTL.
+    /// A present-but-expired entry is removed and returns false. One-shot: even
+    /// a fresh hit is consumed, so a single pre-auth accepts exactly one dial.
+    ///
+    /// #7 (security): fails CLOSED on a BACKWARD clock. `saturating_sub` returns
+    /// `0 < TTL` when `now_ms < rec` (the clock moved back after recording),
+    /// which would keep a stale pre-auth valid indefinitely. Require
+    /// `now_ms >= rec` explicitly so a backward-clock record is rejected — and it
+    /// is still consumed (the `remove` already ran), preserving one-shot.
+    pub fn take(&self, target: &OwnerAddr, now_ms: u64) -> bool {
+        let mut m = self.inner.lock().expect("outbound-intro mutex poisoned");
+        match m.remove(target) {
+            Some(rec) => now_ms >= rec && now_ms - rec < OUTBOUND_INTRO_TTL_MS,
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn addr(b: u8) -> OwnerAddr {
         OwnerAddr([b; 16])
+    }
+
+    /// Minimal (unsigned) reachability payload — `take_offer`/`record_*` never
+    /// inspect its contents, so a zeroed record suffices for the store tests.
+    fn fixture_reach() -> crate::reachability_record::ReachabilityAnnouncePayload {
+        crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: [7u8; 32],
+            home_relay_url: String::new(),
+            direct_addresses: Vec::new(),
+            announced_at_ms: 0,
+            identity_signature: [0u8; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        }
+    }
+
+    #[test]
+    fn introduction_offer_stages_and_take_consumes() {
+        let store = PendingFriendRequests::new();
+        let offer = StoredIntroductionOffer {
+            voucher: addr(2),
+            subject: addr(1),
+            reachability: fixture_reach(),
+        };
+        store.record_introduction_offer(addr(1), Some("alice".into()), 1_000, offer);
+        // Surfaces in the inbox with its introduced_by voucher.
+        let list = store.list();
+        assert_eq!(list.len(), 1);
+        assert!(
+            matches!(&list[0].1.kind, PendingKind::IntroductionOffer(o) if o.voucher == addr(2))
+        );
+        // take_offer consumes it once.
+        assert!(store.take_offer(&addr(1)).is_some());
+        assert!(store.take_offer(&addr(1)).is_none());
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn introduction_offer_supersedes_prior_link_request() {
+        // #6 regression: a bare Path-A LinkRequest staged first for owner O must
+        // NOT block a later verified IntroductionOffer for O — the offer supersedes
+        // the prior inbound entry (unconditional insert, not or_insert). Before the
+        // fix, `take_offer(O)` returned None because the LinkRequest still occupied
+        // the slot, stranding the user with an unacceptable-as-introduction row.
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(1), Some("link".into()), 1_000);
+        assert!(matches!(&store.list()[0].1.kind, PendingKind::LinkRequest));
+        let offer = StoredIntroductionOffer {
+            voucher: addr(2),
+            subject: addr(1),
+            reachability: fixture_reach(),
+        };
+        store.record_introduction_offer(addr(1), Some("offer".into()), 2_000, offer);
+        // The offer now occupies the slot and is take-able.
+        let taken = store.take_offer(&addr(1));
+        assert!(
+            taken.is_some(),
+            "the verified offer must supersede the prior LinkRequest and be take-able"
+        );
+        assert_eq!(taken.unwrap().voucher, addr(2));
+        assert!(
+            store.list().is_empty(),
+            "take consumed the superseding offer"
+        );
+    }
+
+    #[test]
+    fn take_offer_leaves_link_request_intact() {
+        // A plain Path-A LinkRequest must NOT be consumed by the introduction
+        // accept path — take_offer returns None and leaves the row so the accept
+        // IPC falls through to the `approve` branch.
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(3), Some("bob".into()), 2_000);
+        assert!(store.take_offer(&addr(3)).is_none());
+        assert_eq!(store.list().len(), 1, "LinkRequest row must remain");
+        assert!(matches!(&store.list()[0].1.kind, PendingKind::LinkRequest));
     }
 
     #[test]
@@ -275,6 +496,39 @@ mod tests {
         assert!(
             store.list().is_empty(),
             "record_inbound must not add to inbox when addr is already approved"
+        );
+    }
+
+    #[test]
+    fn outbound_intro_take_is_one_shot_and_ttl_bounded() {
+        let s = PendingOutboundIntroductions::new();
+        s.record(addr(1), 1_000);
+        // Fresh + present → true, and consumed (one-shot).
+        assert!(s.take(&addr(1), 1_500));
+        assert!(!s.take(&addr(1), 1_600));
+        // Expired records never authorize.
+        s.record(addr(2), 1_000);
+        assert!(!s.take(&addr(2), 1_000 + OUTBOUND_INTRO_TTL_MS + 1));
+        // Unknown target → false.
+        assert!(!s.take(&addr(3), 2_000));
+    }
+
+    #[test]
+    fn outbound_intro_take_fails_closed_on_backward_clock() {
+        // #7 (security): a record made at t=1000 must NOT authorize a `take` at
+        // t=500 (the wall clock moved backward after recording). `saturating_sub`
+        // would have returned 0 < TTL → true, keeping the pre-auth valid. The
+        // explicit `now_ms >= rec` guard rejects it — and still consumes the entry
+        // (one-shot preserved: a second take returns false regardless).
+        let s = PendingOutboundIntroductions::new();
+        s.record(addr(1), 1_000);
+        assert!(
+            !s.take(&addr(1), 500),
+            "a backward clock must not authorize a stale pre-auth"
+        );
+        assert!(
+            !s.take(&addr(1), 1_500),
+            "the backward-clock take still consumed the entry (one-shot)"
         );
     }
 }

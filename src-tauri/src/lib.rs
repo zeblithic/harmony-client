@@ -186,6 +186,7 @@ pub mod folder_ingest;
 pub mod folders;
 mod follows;
 pub mod friend_graph;
+pub mod friend_intro;
 pub mod friend_nicknames;
 pub mod friend_rendezvous;
 pub mod friend_requests;
@@ -1533,6 +1534,14 @@ pub struct NodeState {
     pub pending_friend_requests:
         Option<std::sync::Arc<crate::friend_requests::PendingFriendRequests>>,
 
+    /// ZEB-376: process-local pre-authorizations for introductions the user
+    /// initiated. Shared with the friend acceptor (which `take`s a pre-auth to
+    /// auto-accept an introduction-driven inbound request) so the outbound
+    /// introduce IPC can `record` into the SAME store. Built once (unconditional,
+    /// non-`Option`) and rebuilt fresh on restart (process-local + ephemeral).
+    pub pending_outbound_introductions:
+        std::sync::Arc<crate::friend_requests::PendingOutboundIntroductions>,
+
     /// ZEB-236: process-local staged DM invites awaiting user accept/decline.
     /// Same lifecycle as `pending_friend_requests`.
     pub(crate) pending_dm_invites:
@@ -1675,6 +1684,10 @@ impl NodeState {
         // rebuilds a fresh one (process-local + ephemeral — pending requests are
         // re-sent by the requester's next dial after a restart).
         self.pending_friend_requests = None;
+        // ZEB-376: rebuild a fresh outbound-introduction pre-auth store so a
+        // restart drops any stale pre-authorizations (process-local + ephemeral).
+        self.pending_outbound_introductions =
+            std::sync::Arc::new(crate::friend_requests::PendingOutboundIntroductions::new());
         // ZEB-236: drop the staged DM-invite store so a restart rebuilds a
         // fresh one (process-local + ephemeral — ZEB-483 re-stages pending
         // invites from the next inbound message after a restart).
@@ -1953,6 +1966,9 @@ impl Default for NodeState {
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
             pending_friend_requests: None,
+            pending_outbound_introductions: std::sync::Arc::new(
+                crate::friend_requests::PendingOutboundIntroductions::new(),
+            ),
             pending_dm_invites: None,
             pkarr_resolver: None,
             pkarr_relay_client: None,
@@ -4289,6 +4305,12 @@ pub async fn start_node_inner(
         // into the friend acceptor at its construction below.
         let pending_friend_requests_for_state =
             std::sync::Arc::new(crate::friend_requests::PendingFriendRequests::new());
+        // ZEB-376: process-local outbound-introduction pre-auth store. Built
+        // unconditionally so the outbound introduce IPC can `record` into it via
+        // NodeState even when pkarr is disabled. Cloned into the friend acceptor
+        // at its construction below and stashed on the guard afterwards.
+        let pending_outbound_introductions_for_state =
+            std::sync::Arc::new(crate::friend_requests::PendingOutboundIntroductions::new());
         // ZEB-236: process-local staged DM-invite store. Built unconditionally
         // so the accept/decline/list IPCs (later tasks) can reach it via
         // NodeState even when pkarr is disabled. Cloned into the guard below.
@@ -9517,11 +9539,19 @@ pub async fn start_node_inner(
                             .with_pending_requests(Some(std::sync::Arc::clone(
                                 &pending_friend_requests_for_state,
                             )))
+                            // ZEB-376: wire the outbound-introduction pre-auth
+                            // store so an introduction the user initiated
+                            // auto-accepts inline (stamped Introduction).
+                            .with_pending_outbound(Some(std::sync::Arc::clone(
+                                &pending_outbound_introductions_for_state,
+                            )))
                             .with_auto_accept_known(friend_auto_accept_known_for_state)
                             // ZEB-461 Task 6 / ZEB-621: advertise our IMMUTABLE
                             // device bundle + node id + PQ keys in the accept we
                             // sign (the volatile relay is wired separately below).
-                            .with_self_statics(self_statics_for_friend)
+                            // Clone: the SAME statics are threaded onto the PEX
+                            // acceptor below for X's introduction self-dial.
+                            .with_self_statics(self_statics_for_friend.clone())
                             // ZEB-521/621: wire a LIVE home-relay read as the SOLE
                             // source of each accept's `home_relay_url` — read fresh
                             // from the (now-resolved / possibly-flapped) endpoint
@@ -9549,9 +9579,12 @@ pub async fn start_node_inner(
                         // referral-catalog acceptor from the SAME read-only
                         // sources the friend acceptor uses (crdt_state,
                         // hlc_tracker, self_owner, this device's own
-                        // EnrollmentCert + device-#2 signing key). It is strictly
-                        // read-only — no app handle, no pkarr publisher, no
-                        // keytree — and serves a signed catalog on the
+                        // EnrollmentCert + device-#2 signing key). The 2a browse
+                        // path stays strictly read-only; ZEB-376 Task 9 additionally
+                        // threads F's active-introduction broker deps (pkarr
+                        // resolver, iroh endpoint, owner KeyTree) so the
+                        // `IntroduceRequest` arm can Case-D resolve + dial the
+                        // target (X) and relay a signed Introduction. Serves on the
                         // `harmony/friend-pex/v1` ALPN.
                         let pex_acceptor: std::sync::Arc<
                             dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
@@ -9563,7 +9596,44 @@ pub async fn start_node_inner(
                                 self_owner,
                                 own_enrollment_cert_for_friend.clone(),
                                 std::sync::Arc::clone(&community_signing_key_arc),
-                            ),
+                            )
+                            // ZEB-376 Task 9: thread F's active-introduction broker
+                            // deps — the SAME handles `browse_friend_referrals`
+                            // holds (resolver + owner KeyTree + iroh endpoint) — so
+                            // the `IntroduceRequest` arm can dial X and relay the
+                            // signed Introduction.
+                            .with_pkarr_resolver(pkarr_resolver_for_state.clone())
+                            .with_owner_keytree(Some(std::sync::Arc::clone(&kt)))
+                            .with_iroh_endpoint(iroh_endpoint_arc.clone())
+                            // ZEB-376 Task 10: thread X's self-dial handles so the
+                            // `Introduction` arm can rebuild X's own dialer
+                            // reachability (device bundle + node id + PQ keys) and
+                            // enforce the LIVE `PeerIntroPolicy` read fresh from the
+                            // connectivity settings file (live-apply, no restart).
+                            // The iroh endpoint + owner KeyTree threaded above (Task
+                            // 9) double as the dial endpoint + friend-secret seal.
+                            .with_self_statics(self_statics_for_friend)
+                            .with_connectivity_settings_path(pkarr_settings_path_for_state.clone())
+                            // ZEB-376 Task 10 (durability fix): thread the SAME
+                            // post-`Linked` handles the friend acceptor holds so an
+                            // auto-`Proceed` introduction link is persisted +
+                            // replicated + surfaced (via `complete_introduction`),
+                            // identically to `add_friend_by_key_impl`. Without
+                            // `notify_dirty()` the introduced friend would evaporate
+                            // on restart (shutdown flush is dirty-gated).
+                            .with_owner_sync_engine(Some(std::sync::Arc::clone(&engine)))
+                            .with_friend_publisher(Some(std::sync::Arc::clone(&pkarr_friend_pub)))
+                            // `app` already aliases the mode-agnostic
+                            // `Arc<dyn NodeEventSink>` (start_node_inner:
+                            // `let app = sink`), so clone it directly.
+                            .with_event_sink(Some(app.clone()))
+                            // ZEB-376 Task 11 (AskMe): thread the SAME pending-
+                            // request inbox the friend acceptor + accept/decline
+                            // IPCs hold, so an `AskMe`-staged introduction records
+                            // an `IntroductionOffer` the user can explicitly accept.
+                            .with_pending_requests(Some(
+                                std::sync::Arc::clone(&pending_friend_requests_for_state),
+                            )),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -11244,6 +11314,11 @@ pub async fn start_node_inner(
                         // acceptor (built above) holds the other strong ref.
                         guard.pending_friend_requests =
                             Some(std::sync::Arc::clone(&pending_friend_requests_for_state));
+                        // ZEB-376: stash the outbound-introduction pre-auth store
+                        // so the outbound introduce IPC reaches the SAME store the
+                        // friend acceptor `take`s pre-authorizations from.
+                        guard.pending_outbound_introductions =
+                            std::sync::Arc::clone(&pending_outbound_introductions_for_state);
                         // ZEB-236: stash the staged DM-invite store so the
                         // accept/decline/list IPCs (later tasks) reach the SAME
                         // store the invite-ingest path will stage into.
@@ -51384,7 +51459,10 @@ pub struct FriendLinkOutcome {
 /// none — a friend would cache an unreachable hint — so we fall back to empty.
 /// `node_id()` / `home_relay()` are synchronous, so this never blocks. An empty
 /// `home_relay()` string is normalized to `None`.
-fn build_self_handshake_reachability(
+// ZEB-376 Task 10: `pub(crate)` so the friend-PEX acceptor can rebuild X's own
+// dialer `SelfHandshakeReachability` fresh per introduction dial (same per-dial
+// fresh-relay read the request/redeem paths use).
+pub(crate) fn build_self_handshake_reachability(
     self_identity_pub_64: Option<[u8; 64]>,
     self_dsa_pubkey: Option<Vec<u8>>,
     self_kem_pubkey: Option<Vec<u8>>,
@@ -53899,6 +53977,519 @@ async fn browse_friend_referrals(
     ))
 }
 
+/// ZEB-376 (Friends Phase 2b, Task 12): request an introduction to F's
+/// referrable friend X — the SUBJECT/"you" side. Pre-authorizes X (so X's
+/// introduction-driven return link auto-accepts even under a fast round-trip),
+/// builds your OWN device-#2-signed reachability over the CANONICAL introduction
+/// HLC (`friend_intro::introduction_reachability_hlc` — the exact clock X's
+/// Task-10 verifier re-derives), and sends a `PexFrame::IntroduceRequest` to the
+/// VIA friend F over `HARMONY_FRIEND_PEX_V1`.
+///
+/// Mirrors `browse_friend_referrals`' Case-D resolve + dial verbatim, but writes
+/// a tagged `IntroduceRequest` frame and reads F's benign ack. Returns `Ok(())`
+/// once F acks delivery; the actual X→you link arrives ASYNCHRONOUSLY (X dials us
+/// back, the friend acceptor `take`s the pre-auth) and surfaces via
+/// `friend-list-changed`. `via_owner_id_hex` is F's 16-byte master owner_id in
+/// hex; `target_owner_id_hex` is X's.
+#[tauri::command]
+async fn request_introduction(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    via_owner_id_hex: String,
+    target_owner_id_hex: String,
+) -> Result<(), String> {
+    // 1. Snapshot the resources we need out of NodeState under the std lock, then
+    //    drop the guard before any owner-state `.await` or network IO. Mirrors
+    //    `browse_friend_referrals`, plus the `pending_outbound_introductions`
+    //    store (Task 8) so we can pre-authorize X's return link.
+    let (
+        resolver,
+        crdt_state,
+        owner_keytree,
+        iroh_endpoint,
+        self_owner,
+        dm_outbox,
+        pending_outbound,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.crdt_state.clone(),
+            g.owner_keytree.clone(),
+            g.iroh_endpoint.clone(),
+            g.dm_self_owner,
+            g.dm_outbox.clone(),
+            g.pending_outbound_introductions.clone(),
+        )
+    };
+    let (
+        Some(resolver),
+        Some(crdt_state),
+        Some(keytree),
+        Some(iroh_endpoint),
+        Some(self_owner),
+        Some(dm_outbox),
+    ) = (
+        resolver,
+        crdt_state,
+        owner_keytree,
+        iroh_endpoint,
+        self_owner,
+        dm_outbox,
+    )
+    else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+
+    // The SELF device-#2 signing key + SELF EnrollmentCert live on the DmOutbox
+    // (same source `browse_friend_referrals` / `add_friend_by_key` use).
+    let (self_device2_key, self_enrollment) = {
+        let o = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&o.community_signing_key),
+            o.enrollment_cert.clone(),
+        )
+    };
+
+    // 2. Parse both hex owner ids → OwnerAddr (same inline pattern as unfriend /
+    //    browse_friend_referrals).
+    let via_owner_16: [u8; 16] = hex::decode(&via_owner_id_hex)
+        .map_err(|e| format!("invalid via_owner_id_hex hex: {e}"))?
+        .try_into()
+        .map_err(|_| "via_owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let via_owner = crate::owner_state_types::OwnerAddr(via_owner_16);
+    let target_owner_16: [u8; 16] = hex::decode(&target_owner_id_hex)
+        .map_err(|e| format!("invalid target_owner_id_hex hex: {e}"))?
+        .try_into()
+        .map_err(|_| "target_owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let target_owner = crate::owner_state_types::OwnerAddr(target_owner_16);
+
+    // 3. Require the VIA friend (F) is Active with a sealed rendezvous secret —
+    //    the same gate `browse_friend_referrals` applies before Case-D resolve.
+    let sealed_secret = {
+        let s = crdt_state.lock().await;
+        let Some(entry) = s.friend_graph.friends.get(&via_owner) else {
+            return Err("not an active friend".to_string());
+        };
+        if entry.status != crate::friend_graph::FriendStatus::Active {
+            return Err("not an active friend".to_string());
+        }
+        let Some(blob) = entry.sealed_secret.clone() else {
+            return Err("friend has no rendezvous secret".to_string());
+        };
+        blob
+    };
+
+    // 4. Build our OWN current reachability announce, device-#2-signed over the
+    //    CANONICAL introduction HLC. node_id / home relay / direct addrs come from
+    //    the live iroh endpoint (same accessors the reachability publisher uses).
+    let node_id_bytes: [u8; 32] = *iroh_endpoint.node_id().as_bytes();
+    let home_relay_url = iroh_endpoint
+        .home_relay()
+        .map(|r| r.to_string())
+        .unwrap_or_default();
+    // DELIBERATE: raw `direct_addresses()`, NOT the routable-filtered
+    // `gather_routable_direct_addrs_async` used by the pkarr publisher. Loopback
+    // MUST survive here so the hermetic 3-node introduction e2e can dial. This is
+    // safe because X (the introducee's acceptor) independently re-checks the
+    // relayed reachability's freshness and binds `complete_introduction`'s
+    // `expected_peer` to the named target — so the addresses are never trusted
+    // blindly. Do NOT "parity-fix" this to the filtered variant: it would silently
+    // break the e2e without improving production safety.
+    let direct_addrs = iroh_endpoint.direct_addresses();
+    let reachability = crate::friend_intro::build_self_reachability_announce(
+        node_id_bytes,
+        home_relay_url,
+        direct_addrs,
+        crate::iroh_friend_acceptor::wall_now_ms(),
+        &self_owner,
+        &self_device2_key,
+    )
+    .map_err(|e| format!("build self reachability: {e}"))?;
+
+    // 5. (Pre-authorization of X is deliberately DEFERRED to step 11, AFTER F
+    //    acks receipt of the IntroduceRequest — see there. Arming it here, before
+    //    the resolve/dial/send below, would leave a stale one-shot auto-accept
+    //    for X on ANY of those failures: an ordinary authenticated handshake from
+    //    X within the TTL could then bypass consent and be mislabeled as an
+    //    introduction, even though none was ever delivered.)
+
+    // 6. Build + device-#2-sign the IntroduceRequest (subject=us, broker=F,
+    //    target=X), folding in our fresh reachability + our enrollment cert.
+    let req = crate::friend_intro::sign_introduce_request(
+        &self_device2_key,
+        self_owner,
+        via_owner,
+        target_owner,
+        reachability,
+        self_enrollment,
+    );
+
+    // 7. Decrypt the per-friendship secret + Case-D resolve F's current
+    //    reachability — REUSING `browse_friend_referrals`' logic.
+    let secret =
+        crate::owner_state_crypto::decrypt_friend_secret(&keytree, &via_owner_16, &sealed_secret)
+            .map_err(|_| "friend unreachable".to_string())?;
+
+    let Some(blob) =
+        crate::pkarr_friend_publisher::resolve_friend_case_d(&resolver, &secret, &via_owner_16)
+            .await?
+    else {
+        return Err("friend unreachable".to_string());
+    };
+    if blob.is_empty() {
+        // Publisher emits an empty blob when iroh is down (un-dial-able).
+        return Err("friend unreachable".to_string());
+    }
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| format!("decode case-d routing blob: {e}"))?;
+
+    // Synthesize an EndpointAddr from the resolved routing record (same inline
+    // synthesis `browse_friend_referrals` does).
+    let friend_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode friend iroh_node_id: {e}"))?;
+    let mut friend_addr = iroh::EndpointAddr::new(friend_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => friend_addr = friend_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        friend_addr = friend_addr.with_ip_addr(*da);
+    }
+
+    // 8. Dial the friend-PEX ALPN + open a bi-stream, bounded by the same dial
+    //    config `browse_friend_referrals` uses.
+    let dial_config = HandshakeDialConfig::from_env();
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint.inner().connect(
+            friend_addr,
+            crate::iroh_endpoint::alpn::HARMONY_FRIEND_PEX_V1,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("friend unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "friend unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("friend unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "friend unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // 9. Encode the tagged IntroduceRequest frame + write [u32 LE len][body].
+    let wire = crate::friend_intro::encode_pex_frame(
+        &crate::friend_intro::PexFrame::IntroduceRequest(Box::new(req)),
+    )
+    .map_err(|e| format!("encode introduce request frame: {e:?}"))?;
+    let write_prefix = async {
+        // Caller-bounded packet; cap at the wire-representable max (u32::MAX) — the
+        // acceptor's inbound read enforces `PEX_MAX_PACKET_LEN`. Mirrors browse.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            u32::MAX as usize,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("friend unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err(
+                "friend unreachable: introduce request length-prefix write timeout".to_string(),
+            );
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write introduce request body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("friend unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("friend unreachable: introduce request body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("friend unreachable: send.finish failed: {e}"));
+    }
+
+    // 10. Read F's benign ack [u32 LE length-prefix][body]. Content is ignored —
+    //     the ack only confirms F received (and will relay) our IntroduceRequest.
+    //     A decode error / timeout surfaces as Err (delivery unconfirmed).
+    let read_ack = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read ack length-prefix: {e}"))?;
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            crate::referral_catalog::PEX_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("ack length out of bounds: len={} max={}", e.len, e.max))?;
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read ack body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    match tokio::time::timeout(dial_config.response_read_timeout, read_ack).await {
+        Ok(Ok(_ack)) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"ack-read-failed");
+            return Err(format!("friend unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"ack-read-timeout");
+            return Err("friend unreachable: introduce request ack timeout".to_string());
+        }
+    }
+
+    // 11. F acked — it received the IntroduceRequest and will relay the
+    //     Introduction, so X will dial us back. ONLY NOW arm the one-shot
+    //     pre-authorization so X's introduction-driven inbound link auto-accepts
+    //     (Task 8's `AcceptInlineIntroduced`). Deferring to here — vs. before the
+    //     resolve/dial/send — means a failed or undelivered request leaves NO
+    //     stale auto-accept for X (closes the consent-bypass-on-failure raised in
+    //     review). No race: X can only dial after the full F→X relay, many
+    //     round-trips after this returns.
+    pending_outbound.record(target_owner, crate::iroh_friend_acceptor::wall_now_ms());
+
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"introduce-request-complete");
+    drop(conn);
+    Ok(())
+}
+
+/// ZEB-376 (Friends Phase 2b, Task 9): F→X active-introduction delivery. Mirrors
+/// `browse_friend_referrals`' Case-D resolve + dial-`HARMONY_FRIEND_PEX_V1`
+/// pattern verbatim, but resolves the TARGET (X) from F's own sealed rendezvous
+/// secret for X (`target_sealed_secret`), writes a tagged
+/// `PexFrame::Introduction`, and reads a small ack (no catalog). The PEX
+/// acceptor's `IntroduceRequest` arm calls this inside a `tokio::spawn` so
+/// `serve()` stays single-shot and non-blocking. `intro` is F's already-signed
+/// vouch aimed at X.
+pub(crate) async fn deliver_introduction_to_target(
+    resolver: std::sync::Arc<harmony_pkarr::PkarrResolver>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    iroh_endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    target_owner: crate::owner_state_types::OwnerAddr,
+    target_sealed_secret: Vec<u8>,
+    intro: crate::friend_intro::Introduction,
+) -> Result<(), String> {
+    let target_owner_16 = target_owner.0;
+
+    // Decrypt the per-friendship secret + Case-D resolve X's current reachability
+    // — REUSING the same helpers `browse_friend_referrals` uses.
+    let secret = crate::owner_state_crypto::decrypt_friend_secret(
+        &keytree,
+        &target_owner_16,
+        &target_sealed_secret,
+    )
+    .map_err(|_| "target unreachable".to_string())?;
+
+    let Some(blob) =
+        crate::pkarr_friend_publisher::resolve_friend_case_d(&resolver, &secret, &target_owner_16)
+            .await?
+    else {
+        return Err("target unreachable".to_string());
+    };
+    if blob.is_empty() {
+        // Publisher emits an empty blob when iroh is down (un-dial-able).
+        return Err("target unreachable".to_string());
+    }
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| format!("decode case-d routing blob: {e}"))?;
+
+    // Synthesize an EndpointAddr from the verified routing record (same inline
+    // synthesis `browse_friend_referrals` does).
+    let target_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode target iroh_node_id: {e}"))?;
+    let mut target_addr = iroh::EndpointAddr::new(target_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => target_addr = target_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        target_addr = target_addr.with_ip_addr(*da);
+    }
+
+    // Dial the friend-PEX ALPN + open a bi-stream, bounded by the same dial config
+    // the browse path uses.
+    let dial_config = HandshakeDialConfig::from_env();
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint.inner().connect(
+            target_addr,
+            crate::iroh_endpoint::alpn::HARMONY_FRIEND_PEX_V1,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("target unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "target unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("target unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "target unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // Encode the tagged Introduction frame + write [u32 LE len][body].
+    let wire = crate::friend_intro::encode_pex_frame(&crate::friend_intro::PexFrame::Introduction(
+        Box::new(intro),
+    ))
+    .map_err(|e| format!("encode introduction frame: {e:?}"))?;
+    let write_prefix = async {
+        // Caller-bounded packet; cap at the wire-representable max (u32::MAX) — the
+        // acceptor's inbound read enforces `PEX_MAX_PACKET_LEN`. Mirrors browse.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            u32::MAX as usize,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"intro-write-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target unreachable: introduction length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write introduction body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"intro-write-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target unreachable: introduction body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("target unreachable: send.finish failed: {e}"));
+    }
+
+    // Read the small ack [u32 LE length-prefix][body] (no catalog). Content is
+    // ignored — the ack only confirms X received the relayed Introduction.
+    let read_ack = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read ack length-prefix: {e}"))?;
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            crate::referral_catalog::PEX_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("ack length out of bounds: len={} max={}", e.len, e.max))?;
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read ack body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    match tokio::time::timeout(dial_config.response_read_timeout, read_ack).await {
+        Ok(Ok(_ack)) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"ack-read-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"ack-read-timeout");
+            return Err("target unreachable: introduction ack timeout".to_string());
+        }
+    }
+
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"introduction-complete");
+    drop(conn);
+    Ok(())
+}
+
 // ── ZEB-371 Task 13: Path A user-facing friend IPCs ──────────────────
 //
 // Five commands surfacing the Path-A (mutual-key, no-token) friend flow + the
@@ -53921,12 +54512,18 @@ async fn browse_friend_referrals(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingFriendRequestDto {
-    /// The requester's 16-byte master `owner_id`, hex-encoded.
+    /// The requester's 16-byte master `owner_id`, hex-encoded. For an
+    /// introduction offer this is the INTRODUCEE (the subject X would dial).
     pub owner_id_hex: String,
     /// The requester's advertised display name (UX hint), if any.
     pub display: Option<String>,
     /// Epoch-ms the request was first recorded.
     pub received_at_ms: u64,
+    /// ZEB-376 Task 11 (AskMe): the voucher (F) owner hex when this row is an
+    /// AskMe-staged `IntroductionOffer` (X accepts by dialing the introducee via
+    /// `complete_introduction`); `None` for a plain Path-A `LinkRequest`. Lets the
+    /// UI badge the row as "introduced by …".
+    pub introduced_by: Option<String>,
 }
 
 /// Project the process-local pending-inbound store into the frontend DTO list.
@@ -53937,10 +54534,21 @@ pub fn list_pending_friend_requests_inner(
     store
         .list()
         .into_iter()
-        .map(|(addr, p)| PendingFriendRequestDto {
-            owner_id_hex: hex::encode(addr.0),
-            display: p.display,
-            received_at_ms: p.received_at_ms,
+        .map(|(addr, p)| {
+            // ZEB-376 Task 11: surface the voucher hex for an AskMe-staged
+            // introduction offer; a plain Path-A LinkRequest has no introducer.
+            let introduced_by = match &p.kind {
+                crate::friend_requests::PendingKind::IntroductionOffer(o) => {
+                    Some(hex::encode(o.voucher.0))
+                }
+                crate::friend_requests::PendingKind::LinkRequest => None,
+            };
+            PendingFriendRequestDto {
+                owner_id_hex: hex::encode(addr.0),
+                display: p.display,
+                received_at_ms: p.received_at_ms,
+                introduced_by,
+            }
         })
         .collect()
 }
@@ -53981,10 +54589,15 @@ pub(crate) async fn list_pending_friend_requests_impl(
     Ok(list_pending_friend_requests_inner(&store))
 }
 
-/// Accept a pending inbound friend request: mark the requester APPROVED so their
-/// NEXT dial is accepted inline by the acceptor's `prior_accept` consent gate.
-/// This does NOT dial out — the link completes on the requester's re-dial. Emits
-/// `friend-list-changed` so the UI refreshes its inbox/friend views.
+/// Accept a pending inbound friend request. Two shapes:
+///   * Path-A `LinkRequest` — mark the requester APPROVED so their NEXT dial is
+///     accepted inline by the acceptor's `prior_accept` consent gate. This does
+///     NOT dial out — the link completes on the requester's re-dial.
+///   * ZEB-376 AskMe `IntroductionOffer` — X actively dials the introducee via
+///     `complete_introduction` (the SAME action an auto-`Proceed` runs), forming
+///     the mutual link now (persisted + replicated + surfaced).
+/// Either way emits `friend-list-changed` so the UI refreshes its inbox/friend
+/// views.
 #[tauri::command]
 async fn accept_friend_request(
     app: tauri::AppHandle,
@@ -54002,16 +54615,140 @@ pub(crate) async fn accept_friend_request_impl(
     owner_id_hex: String,
 ) -> Result<(), String> {
     let addr = decode_owner_id_16(&owner_id_hex)?;
-    let store = {
-        state
+    // Snapshot the pending store + the self-dial/durability handles the AskMe
+    // accept path feeds to `complete_introduction` (the SAME handles
+    // `add_friend_by_key_impl` sources). Cloning them on the common LinkRequest
+    // path is a few cheap Arc bumps.
+    let (
+        store,
+        iroh_endpoint,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        sync_engine,
+        owner_keytree,
+        friend_publisher,
+        self_identity_pub_64,
+        self_dsa_pubkey,
+        self_kem_pubkey,
+    ) = {
+        let g = state
             .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?
-            .pending_friend_requests
-            .clone()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pending_friend_requests.clone(),
+            g.iroh_endpoint.clone(),
+            g.crdt_state.clone(),
+            g.hlc_tracker.clone(),
+            g.dm_device_id.clone(),
+            g.dm_self_owner,
+            g.dm_outbox.clone(),
+            g.sync_engine.clone(),
+            g.owner_keytree.clone(),
+            g.pkarr_friend_publisher.clone(),
+            g.dm_identity_pub_64,
+            g.dm_local_dsa_pubkey.clone(),
+            g.dm_local_kem_pubkey.clone(),
+        )
     };
     let Some(store) = store else {
         return Err(OWNER_NOT_LOADED_MSG.into());
     };
+
+    // ZEB-376 AskMe: an `IntroductionOffer` runs the introducee self-dial. A plain
+    // `LinkRequest` has no offer (`has_offer` is false) → the Path-A `approve`
+    // branch below, UNCHANGED.
+    //
+    // HARD-RULE (verify before an irreversible write): validate the self-dial
+    // handles BEFORE `take_offer` consumes the ONE-SHOT offer, so a missing handle
+    // leaves the offer row intact (recoverable) instead of destroying it. The
+    // non-consuming `has_offer` peek gates on the offer path ONLY — Path A never
+    // required these handles and still doesn't.
+    if store.has_offer(&addr) {
+        let (
+            Some(iroh_endpoint),
+            Some(crdt_state),
+            Some(hlc_tracker),
+            Some(device_id),
+            Some(self_owner),
+            Some(dm_outbox),
+            Some(owner_keytree),
+        ) = (
+            iroh_endpoint,
+            crdt_state,
+            hlc_tracker,
+            device_id,
+            self_owner,
+            dm_outbox,
+            owner_keytree,
+        )
+        else {
+            // Handles unavailable: the offer is NOT yet consumed, so leave the row
+            // intact (a later accept, once the node is fully loaded, can still
+            // complete it). Refresh the inbox and report we can't complete now.
+            crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+            return Err(OWNER_NOT_LOADED_MSG.into());
+        };
+
+        // Handles present — NOW irreversibly consume the one-shot offer.
+        // `has_offer` above confirmed an offer; only a concurrent accept racing
+        // between the peek and here could win first, in which case `take_offer`
+        // returns `None` and we simply refresh the inbox + report (no link, no
+        // double-consume).
+        let Some(offer) = store.take_offer(&addr) else {
+            crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+            return Err(OWNER_NOT_LOADED_MSG.into());
+        };
+
+        let (device2_key, enrollment_cert) = {
+            let o = dm_outbox.lock().await;
+            (
+                std::sync::Arc::clone(&o.community_signing_key),
+                o.enrollment_cert.clone(),
+            )
+        };
+        // Rebuild X's own dialer reachability fresh (same discipline as
+        // `add_friend_by_key_impl`) — the volatile home relay is read live.
+        let self_reachability = build_self_handshake_reachability(
+            self_identity_pub_64,
+            self_dsa_pubkey,
+            self_kem_pubkey,
+            Some(&iroh_endpoint),
+        );
+
+        // Run the SAME action Task 10's auto-`Proceed` uses. On a `Linked`
+        // outcome `complete_introduction` internally arms `notify_dirty()` +
+        // Case-D reconcile + emits `friend-list-changed`.
+        let result = complete_introduction(
+            offer.subject,
+            offer.reachability,
+            iroh_endpoint,
+            HandshakeDialConfig::from_env(),
+            self_owner,
+            None, // self_display — not persisted at this layer (see acceptor note).
+            enrollment_cert,
+            device2_key,
+            self_reachability,
+            owner_keytree,
+            crdt_state,
+            hlc_tracker,
+            device_id,
+            sync_engine,
+            friend_publisher,
+            Some(std::sync::Arc::clone(&sink)),
+        )
+        .await;
+
+        // Refresh the inbox regardless of outcome (the offer row was consumed by
+        // `take_offer`). `complete_introduction` already emitted this on a
+        // `Linked` outcome; a second emit is harmless (the frontend re-fetches).
+        crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
+        return result.map(|_outcome| ());
+    }
+
+    // Path A (unchanged): approve so the requester's next dial links inline.
     store.approve(addr);
     // Refresh the UI (friend list + pending inbox both re-fetch on this event).
     crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
@@ -54439,6 +55176,74 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
     )
 }
 
+/// Set the per-user introduction policy (ZEB-376) and persist it to
+/// `connectivity-settings.json`. Unlike the friend-acceptor's auto-accept toggle
+/// (which is captured by value at start_node), this applies LIVE: X's
+/// `Introduction` handler reads the policy fresh from the settings file per
+/// inbound introduction, so a change takes effect on the next introduction with
+/// no restart.
+#[tauri::command]
+async fn set_peer_intro_policy(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    policy: crate::friend_graph::PeerIntroPolicy,
+) -> Result<(), String> {
+    let path = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .connectivity_settings_path
+            .clone()
+    };
+    let Some(path) = path else {
+        return Err("connectivity_settings_path missing".into());
+    };
+
+    {
+        // ZEB-629: file RMW under the process-global settings write lock.
+        let _settings_guard = connectivity_settings_write_lock().lock().await;
+        let rmw_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut settings =
+                connectivity_settings::ConnectivitySettings::load_or_default(&rmw_path);
+            settings.peer_intro_policy = policy;
+            settings
+                .save(&rmw_path)
+                .map_err(|e| format!("save connectivity-settings: {e}"))
+        })
+        .await
+        .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    }
+
+    if let Err(e) = app.emit(
+        "connectivity-peer-intro-policy-changed",
+        serde_json::json!({ "policy": policy }),
+    ) {
+        tracing::warn!(error = %e, "set_peer_intro_policy: emit failed");
+    }
+    Ok(())
+}
+
+/// Read the current introduction policy from the persisted settings. Returns the
+/// spec default (`FriendsOfFriends`) when the settings path is not initialized.
+#[tauri::command]
+async fn get_peer_intro_policy(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<crate::friend_graph::PeerIntroPolicy, String> {
+    let path = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .connectivity_settings_path
+            .clone()
+    };
+    let Some(path) = path else {
+        // Node not running / pkarr not initialized — return the spec default.
+        return Ok(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
+    };
+    Ok(connectivity_settings::ConnectivitySettings::load_or_default(&path).peer_intro_policy)
+}
+
 /// ZEB-419: serializes the nickname-file read-modify-write so two concurrent
 /// `set_friend_nickname` calls can't lose an update (load A, load B, save A, save
 /// B → A's change is lost). Reads in `list_friends` don't need it —
@@ -54623,13 +55428,6 @@ pub async fn connectivity_add_friend_by_key_inner(
     // advertise in the request it signs. `None` ships the empty bundle.
     self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
 ) -> Result<AddFriendOutcome, String> {
-    use crate::iroh_friend_acceptor::{
-        decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
-        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
-        FRIEND_MAX_PACKET_LEN,
-    };
-    use ed25519_dalek::{Signature, Signer, VerifyingKey};
-
     // 1. Decode the target's 64-byte transport identity pub (the "key" held OOB).
     let identity_pub: [u8; 64] = hex::decode(&identity_pub_hex)
         .map_err(|e| format!("hex decode identity_pub: {e}"))?
@@ -54790,6 +55588,193 @@ pub async fn connectivity_add_friend_by_key_inner(
             last_err.unwrap_or_else(|| "target_unreachable: iroh connect failed".to_string())
         );
     };
+    link_over_connection(
+        conn,
+        dial_config,
+        crate::friend_graph::FriendOrigin::MutualKey,
+        None,
+        self_owner,
+        self_display,
+        self_enrollment,
+        self_device2_signing_key,
+        self_reachability,
+        keytree,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        identity_pub_hex,
+    )
+    .await
+}
+
+/// ZEB-376 Task 10: X's "dial the introducee and form the mutual link" action,
+/// shared by the friend-PEX `Introduction` arm (auto-`Proceed`) and the AskMe
+/// accept path (Task 11). The relayed `reachability` has ALREADY been verified
+/// self-authenticated + fresh by the caller; here X synthesizes the dial target
+/// from it, connects on the friend ALPN, and links — pinning `Some(subject)` as
+/// `expected_peer` so the authenticated accept MUST come from the introducee (an
+/// impostor squatting that iroh address is rejected inside `link_over_connection`
+/// at the accept-cert check, never written as a friend). Stamps `established_via:
+/// Introduction`.
+///
+/// On a successful `Linked`, mirrors `add_friend_by_key_impl`'s post-`Linked`
+/// block: arms the owner-state `SyncEngine` (`notify_dirty()`), reconciles the
+/// new friend's Case-D slot, and emits `friend-list-changed` — so the introduced
+/// friend is PERSISTED + REPLICATED + SURFACED (a local crdt mutation without
+/// `notify_dirty()` is never flushed on shutdown nor replicated). Each step is
+/// skipped (logged) when its handle is `None` (test path). `Pending`/`Unreachable`
+/// write nothing and emit nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn complete_introduction(
+    subject: crate::owner_state_types::OwnerAddr,
+    reachability: crate::reachability_record::ReachabilityAnnouncePayload,
+    iroh_endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    dial_config: HandshakeDialConfig,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_display: Option<String>,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    // ZEB-376 Task 10 (durability fix): the post-`Linked` handles this shared
+    // action needs so an introduced friend is PERSISTED + REPLICATED + SURFACED —
+    // mirroring `add_friend_by_key_impl`'s post-`Linked` block. A LOCAL crdt
+    // mutation (`link_over_connection` → `apply_handshaked_friend`) without
+    // `notify_dirty()` is NEVER persisted (shutdown flush is dirty-gated) NOR
+    // replicated — the introduced friend would evaporate on restart. All three are
+    // `Option` so the test path (no engine/publisher/sink wired) skips each step
+    // gracefully (logs) rather than panicking. Both callers (Task 10's auto-Proceed
+    // spawn AND Task 11's AskMe-accept path) get durability for free.
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    friend_publisher: Option<std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+    event_sink: Option<std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>>,
+) -> Result<AddFriendOutcome, String> {
+    let target_addr = endpoint_addr_from_routing(&reachability)
+        .map_err(|e| format!("synthesize introducee addr: {e}"))?;
+    let conn = tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint
+            .inner()
+            .connect(target_addr, crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1),
+    )
+    .await
+    .map_err(|_| "introducee unreachable: connect timeout".to_string())?
+    .map_err(|e| format!("introducee unreachable: connect failed: {e}"))?;
+
+    // Clone the reconcile handles BEFORE `link_over_connection` moves the
+    // originals — mirrors `add_friend_by_key_impl`.
+    let crdt_state_for_reconcile = std::sync::Arc::clone(&crdt_state);
+    let keytree_for_reconcile = std::sync::Arc::clone(&keytree);
+
+    let outcome = link_over_connection(
+        conn,
+        dial_config,
+        crate::friend_graph::FriendOrigin::Introduction,
+        Some(subject),
+        self_owner,
+        self_display,
+        self_enrollment,
+        self_device2_signing_key,
+        self_reachability,
+        keytree,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        hex::encode(subject.0),
+    )
+    .await?;
+
+    // Only a `Linked` outcome mutated owner-state → arm sync + reconcile Case-D +
+    // refresh the UI. `Pending`/`Unreachable` wrote nothing. This block is a
+    // deliberate mirror of `add_friend_by_key_impl`'s post-`Linked` steps (same
+    // functions, same event name) so BOTH friend-add paths behave identically.
+    if matches!(outcome, AddFriendOutcome::Linked { .. }) {
+        // (1) Arm the owner-state SyncEngine: persist-on-shutdown is dirty-gated
+        //     and replication is dirty-driven, so without this the introduced
+        //     friend is neither saved nor pushed to the user's other devices.
+        match sync_engine {
+            Some(engine) => engine.notify_dirty(),
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no owner-state SyncEngine wired \
+                 (test path); skipping notify_dirty — introduced friend will NOT \
+                 persist/replicate"
+            ),
+        }
+        // (2) Case-D reconcile: publish the just-added friend's reachability slot
+        //     now (no wait for the next reachability tick). Snapshot `friends` out
+        //     from under the owner-state lock BEFORE the network `.await`s.
+        match friend_publisher {
+            Some(friend_pub) => {
+                let friends_snapshot = {
+                    let s = crdt_state_for_reconcile.lock().await;
+                    s.friend_graph.friends.clone()
+                };
+                crate::pkarr_friend_publisher::sync_case_d_handles(
+                    &friend_pub,
+                    &friends_snapshot,
+                    &keytree_for_reconcile,
+                )
+                .await;
+            }
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no Case-D friend publisher wired \
+                 (test path); skipping reconcile"
+            ),
+        }
+        // (3) Surface the new friend to the UI.
+        match event_sink {
+            Some(sink) => {
+                crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &())
+            }
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no event sink wired (test path); \
+                 skipping friend-list-changed emit"
+            ),
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// ZEB-376: reusable Path-A friend-link tail. Given an already-connected iroh
+/// `conn` on the friend ALPN, opens a bi-stream, sends a token-less
+/// `FriendLinkRequest`, reads the `FriendLinkResponse`, verifies the accept
+/// cert+signature, derives the rendezvous secret, and applies the peer as a
+/// friend with `established_via = origin`. `expected_peer` (when `Some`) pins
+/// the owner the accept must come from (Path C introductions); `None` lets the
+/// caller learn the owner from the accept (Case-B `MutualKey`). `peer_label` is
+/// a hex label used only in log lines.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn link_over_connection(
+    conn: iroh::endpoint::Connection,
+    dial_config: HandshakeDialConfig,
+    origin: crate::friend_graph::FriendOrigin,
+    expected_peer: Option<crate::owner_state_types::OwnerAddr>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_display: Option<String>,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    peer_label: String,
+) -> Result<AddFriendOutcome, String> {
+    use crate::iroh_friend_acceptor::{
+        decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
+        friend_request_sig_preimage, verify_enrolled_device, FriendLinkRequest, FriendLinkResponse,
+        FRIEND_MAX_PACKET_LEN,
+    };
+    use ed25519_dalek::{Signature, Signer, VerifyingKey};
+
     let (mut send, mut recv) =
         match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
             Ok(Ok(s)) => s,
@@ -54942,7 +55927,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         FriendLinkResponse::Accepted(a) => *a,
         FriendLinkResponse::Pending => {
             tracing::info!(
-                target = %identity_pub_hex,
+                target = %peer_label,
                 "ZEB-371 Path A: target recorded request (Pending); no friend written, retry after accept"
             );
             return Ok(classify_pending_outcome());
@@ -54988,6 +55973,16 @@ pub async fn connectivity_add_friend_by_key_inner(
         )
         .map_err(|_| "friend accept signature invalid".to_string())?;
 
+    // ZEB-376: when the caller pinned an expected owner (Path C introductions),
+    // the authenticated accept MUST come from that owner — otherwise the peer we
+    // reached is not the subject the introducer vouched for. Case-B passes `None`
+    // (it learns the owner from the accept).
+    if let Some(exp) = expected_peer {
+        if accepted.from_addr != exp {
+            return Err("link: accept came from an unexpected owner".into());
+        }
+    }
+
     // 9. The target's master key came from the chokepoint verification in
     //    step 8; apply them as an Active/MutualKey friend (keyed on their
     //    authenticated master owner_id).
@@ -55018,7 +56013,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         master_ed25519,
         display: display.clone(),
         status: crate::friend_graph::FriendStatus::Active,
-        established_via: crate::friend_graph::FriendOrigin::MutualKey,
+        established_via: origin,
         referrable: false,
         learned_at: learned_at.clone(),
         sealed_secret: Some(sealed),
@@ -56233,6 +57228,48 @@ mod friend_ipc_tests {
             crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
                 .friend_auto_accept_known,
             "toggle back ON persists"
+        );
+    }
+
+    #[test]
+    fn set_peer_intro_policy_persists_round_trips() {
+        // Mirrors `set_friend_auto_accept_persists_round_trips`: the IPC's
+        // persistence half (independent of NodeState) — `set_peer_intro_policy`
+        // and `get_peer_intro_policy` both funnel through
+        // `ConnectivitySettings::load_or_default` / `::save`, so exercising that
+        // round trip directly covers the same logic without needing a live
+        // `tauri::AppHandle`/`State`.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // Default (no file) is FriendsOfFriends (ZEB-376 spec default) — what
+        // `get_peer_intro_policy` returns when the file is absent.
+        assert_eq!(
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::FriendsOfFriends
+        );
+
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.peer_intro_policy = crate::friend_graph::PeerIntroPolicy::AskMe;
+        settings.save(&path).expect("save");
+        assert_eq!(
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::AskMe,
+            "AskMe persists"
+        );
+
+        let mut settings =
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.peer_intro_policy = crate::friend_graph::PeerIntroPolicy::Closed;
+        settings.save(&path).expect("save");
+        assert_eq!(
+            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
+                .peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::Closed,
+            "Closed persists"
         );
     }
 
@@ -58405,6 +59442,9 @@ pub fn run() {
             connectivity_resolve_friend,
             // ZEB-375 Phase 2a Task 7: browse a friend's referral catalog.
             browse_friend_referrals,
+            // ZEB-376 Phase 2b Task 12: request an introduction to a friend's
+            // referrable friend (you→F, self-reachability + pending-outbound pre-auth).
+            request_introduction,
             // ZEB-371 Task 13: Path A user-facing friend IPCs.
             add_friend_by_key,
             list_pending_friend_requests,
@@ -58416,6 +59456,9 @@ pub fn run() {
             decline_dm_invite,
             set_friend_auto_accept,
             get_friend_auto_accept,
+            // ZEB-376 Phase 2b Task 5: per-user introduction policy IPCs.
+            set_peer_intro_policy,
+            get_peer_intro_policy,
             set_friend_nickname,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
@@ -63630,6 +64673,9 @@ mod start_node_race_tests {
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
             pending_friend_requests: None,
+            pending_outbound_introductions: std::sync::Arc::new(
+                crate::friend_requests::PendingOutboundIntroductions::new(),
+            ),
             pending_dm_invites: None,
             pkarr_resolver: None,
             pkarr_relay_client: None,

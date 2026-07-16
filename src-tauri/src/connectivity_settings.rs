@@ -36,11 +36,24 @@ pub struct ConnectivitySettings {
     /// their presence). Default OFF (visible) — presence is a product default.
     #[serde(default)]
     pub presence_invisible: bool,
+    /// ZEB-376 (Friends Phase 2b): per-user policy for inbound friend-vouched
+    /// introductions. Enforced on X's node when it receives an `Introduction`
+    /// (never the voucher's). Fresh-install default `FriendsOfFriends`; a
+    /// corrupt file fails closed to `Closed` (see `fail_closed_defaults`).
+    #[serde(default = "default_peer_intro_policy")]
+    pub peer_intro_policy: crate::friend_graph::PeerIntroPolicy,
 }
 
 /// Default for [`ConnectivitySettings::friend_auto_accept_known`]: ON (spec §7.1).
 fn default_friend_auto_accept_known() -> bool {
     true
+}
+
+/// Default for [`ConnectivitySettings::peer_intro_policy`]: `FriendsOfFriends`
+/// (arc §4.2 default — accept an introduction only when the voucher is an Active
+/// friend).
+fn default_peer_intro_policy() -> crate::friend_graph::PeerIntroPolicy {
+    crate::friend_graph::PeerIntroPolicy::FriendsOfFriends
 }
 
 /// Default for [`ConnectivitySettings::relays`]: the Zeblithic-operated
@@ -71,6 +84,7 @@ impl Default for ConnectivitySettings {
             // there is no first-run custom iroh pool.
             iroh_relays: Vec::new(),
             presence_invisible: false,
+            peer_intro_policy: default_peer_intro_policy(),
         }
     }
 }
@@ -313,6 +327,12 @@ impl ConnectivitySettings {
             // This is the INVERSE of identity_discoverable's closed value (false):
             // presence's restrictive value is "don't broadcast" = invisible = true.
             presence_invisible: true,
+            // ZEB-376: fail closed = Closed. A corrupt/unreadable file must never
+            // silently accept an introduction from a stranger; Closed rejects all
+            // inbound introductions until the file is fixed. (Distinct from the
+            // fresh-install default `FriendsOfFriends`, which trusts active-friend
+            // vouchers — the closed value is strictly the restrictive floor.)
+            peer_intro_policy: crate::friend_graph::PeerIntroPolicy::Closed,
         }
     }
 
@@ -590,6 +610,7 @@ mod tests {
             relays: vec!["https://relay.pkarr.org".to_string()],
             iroh_relays: Vec::new(),
             presence_invisible: false,
+            peer_intro_policy: crate::friend_graph::PeerIntroPolicy::FriendsOfFriends,
         };
         settings.save(&path).expect("save");
 
@@ -641,6 +662,7 @@ mod tests {
             relays: vec!["https://relay.pkarr.org".to_string()],
             iroh_relays: Vec::new(),
             presence_invisible: false,
+            peer_intro_policy: crate::friend_graph::PeerIntroPolicy::FriendsOfFriends,
         };
         settings.save(&path).expect("save");
         assert_eq!(
@@ -816,5 +838,39 @@ mod tests {
         };
         s.save(&path).expect("save");
         assert!(ConnectivitySettings::load_or_default(&path).presence_invisible);
+    }
+
+    // ---- ZEB-376: peer_intro_policy ----
+
+    #[test]
+    fn peer_intro_policy_defaults_to_fof_and_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("connectivity-settings.json");
+        // Fresh install default = FriendsOfFriends.
+        assert_eq!(
+            ConnectivitySettings::load_or_default(&path).peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::FriendsOfFriends,
+        );
+        let s = ConnectivitySettings {
+            peer_intro_policy: crate::friend_graph::PeerIntroPolicy::AskMe,
+            ..Default::default()
+        };
+        s.save(&path).unwrap();
+        assert_eq!(
+            ConnectivitySettings::load_or_default(&path).peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::AskMe,
+        );
+    }
+
+    #[test]
+    fn corrupt_settings_fails_closed_to_closed_policy() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("connectivity-settings.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        // A corrupt file must NOT silently widen the policy: fail closed to Closed.
+        assert_eq!(
+            ConnectivitySettings::load_or_default(&path).peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::Closed,
+        );
     }
 }
