@@ -113,8 +113,10 @@ pub revocations: Vec<RevocationAttestation>,
 - Deserialization is capped at `MAX_CARRIED_REVOCATIONS = 32`, and exceeding the cap is a
   **decode error that rejects the frame** — the established hostile-peer convention
   (`vec_devhash_capped` / `MAX_DEVICES_PER_OWNER` visitors error, they never truncate).
-  Serialization sends at most the same cap (smallest-N by byte order for determinism,
-  matching the ZEB-692 store-cap convention).
+  Serialization sends at most the same cap. *(Selection order superseded by ZEB-701,
+  2026-07-16: originally smallest-N by target byte order; now most-recently-issued N —
+  `issued_at` descending, target byte order as the deterministic tie-break. The ZEB-692
+  smallest-N convention still governs the persisted store's eviction, not the wire carry.)*
 - **Byte pins (execution amendment, T1 review):** `zeb370_fixtures` DOES byte-pin both
   friend-link frames — the pins stay valid because an empty `revocations` vec skips the
   `"v"` key entirely (`skip_serializing_if`), and fixture literals stay empty. Old-frame
