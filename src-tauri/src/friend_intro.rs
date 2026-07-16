@@ -42,7 +42,23 @@ pub enum IntroAuthError {
     /// The relayed reachability's inner identity signature / freshness failed.
     #[error("intro reachability record failed verification")]
     ReachabilityInvalid,
+    /// ZEB-376 (#4, defense-in-depth): the signed `at` envelope timestamp is
+    /// implausibly old (older than [`INTRODUCTION_MAX_ENVELOPE_AGE_MS`]) or set
+    /// too far in the future (beyond [`INTRODUCTION_MAX_FORWARD_SKEW_MS`]).
+    #[error("intro envelope timestamp outside the freshness window")]
+    Stale,
 }
+
+/// ZEB-376 (#4): max age of an [`Introduction`]'s signed `at` timestamp before X
+/// rejects the envelope as stale. Reuses the reachability record TTL (7 days) —
+/// an introduction older than the reachability it carries could never dial
+/// anyway, so the same generous ceiling is the natural bound.
+pub const INTRODUCTION_MAX_ENVELOPE_AGE_MS: u64 =
+    crate::reachability_record::REACHABILITY_RECORD_TTL_MS;
+/// ZEB-376 (#4): max forward clock skew tolerated on an [`Introduction`]'s `at`.
+/// A voucher whose clock runs slightly ahead of X's is fine; one set far in the
+/// future (a fabricated-freshness attempt) is rejected.
+pub const INTRODUCTION_MAX_FORWARD_SKEW_MS: u64 = 30 * 60 * 1000; // 30 min
 
 /// You → F: "introduce me to `target`; here is my device-#2 cert and my current
 /// reachability so `target` can dial me." `to_addr` binds the broker (re-aim
@@ -186,6 +202,15 @@ pub struct Introduction {
     pub voucher_enrollment: EnrollmentCert,
     #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
     pub signer_certs: Vec<EnrollmentCert>,
+    /// ZEB-376 (Q2): the SUBJECT's signer-cert bundle, forwarded from the
+    /// requester's `IntroduceRequest.signer_certs` so a quorum-issued
+    /// `subject_cert` can be verified on X (an empty bundle fails a quorum cert).
+    /// This is VERIFICATION CONTEXT, exactly like `signer_certs` for the voucher
+    /// cert — it is deliberately NOT part of `introduction_sig_preimage` (F does
+    /// not sign it; it is F relaying the subject's own Master-issued chain). Key
+    /// "g"; empty (the common master-issued-subject case) omits it from the wire.
+    #[serde(rename = "g", default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_signer_certs: Vec<EnrollmentCert>,
 }
 
 /// Bytes F's device-#2 key signs for an [`Introduction`]. `"hin1"` domain tag +
@@ -235,6 +260,7 @@ pub fn sign_introduction(
     reachability: ReachabilityAnnouncePayload,
     at: Hlc,
     voucher_enrollment: EnrollmentCert,
+    subject_signer_certs: Vec<EnrollmentCert>,
 ) -> Introduction {
     let preimage =
         introduction_sig_preimage(voucher, to_addr, subject, &subject_cert, &reachability, &at);
@@ -249,6 +275,7 @@ pub fn sign_introduction(
         sig,
         voucher_enrollment,
         signer_certs: Vec::new(),
+        subject_signer_certs,
     }
 }
 
@@ -268,6 +295,19 @@ pub fn verify_introduction(
     }
     if intro.voucher != expected_voucher {
         return Err(IntroAuthError::VoucherMismatch);
+    }
+    // ZEB-376 (#4, defense-in-depth): bound the signature-covered `at` envelope
+    // timestamp against X's own wall clock. Replay is already bounded (the pre-auth
+    // is one-shot + TTL, and the relayed reachability is freshness-checked by the
+    // caller), so this is a cheap extra guard, not the primary defense: reject an
+    // envelope stamped implausibly far in the past or future. `now_secs` is in
+    // seconds; `at.wall_ms` in epoch-ms — compare in ms. Checked before the sig
+    // spend (an out-of-window `at` is rejected regardless of its signature).
+    let now_ms = now_secs.saturating_mul(1000);
+    if now_ms.saturating_sub(intro.at.wall_ms) > INTRODUCTION_MAX_ENVELOPE_AGE_MS
+        || intro.at.wall_ms.saturating_sub(now_ms) > INTRODUCTION_MAX_FORWARD_SKEW_MS
+    {
+        return Err(IntroAuthError::Stale);
     }
     let vverified = verify_enrolled_device(
         &intro.voucher_enrollment,
@@ -289,8 +329,16 @@ pub fn verify_introduction(
     vk.verify_strict(&preimage, &Signature::from_bytes(&intro.sig))
         .map_err(|_| IntroAuthError::SignatureInvalid)?;
     // Bind the subject's cert → subject owner (X pins this into the FriendEntry).
-    verify_enrolled_device(&intro.subject_cert, &[], intro.subject, now_secs)
-        .map_err(|_| IntroAuthError::Auth)?;
+    // ZEB-376 (Q2): pass the FORWARDED subject signer bundle (not `&[]`) so a
+    // quorum-issued subject cert can recover its master anchor + verify its part
+    // signatures; a master-issued subject cert verifies with an empty bundle.
+    verify_enrolled_device(
+        &intro.subject_cert,
+        &intro.subject_signer_certs,
+        intro.subject,
+        now_secs,
+    )
+    .map_err(|_| IntroAuthError::Auth)?;
     Ok(())
 }
 
@@ -314,6 +362,14 @@ pub fn decode_introduction(bytes: &[u8]) -> Result<Introduction, ReferralCodecEr
 pub enum IntroBrokerError {
     #[error("introduce request authentication failed: {0}")]
     Auth(#[from] IntroAuthError),
+    /// ZEB-376 (Q1): the REQUESTER is not an Active friend of the broker. An
+    /// authenticated non-friend must not be able to make F sign/relay an
+    /// `Introduction` vouching for them — F relays nothing (mirrors the catalog
+    /// path's requester friend-gate in `serve_catalog_for_request`). Like
+    /// `NotReferrable`, this maps to the acceptor's benign-ack arm, so it is
+    /// network-indistinguishable from any other broker decline (no oracle).
+    #[error("requester is not an active friend")]
+    RequesterNotFriend,
     /// The requested target is not an Active + referrable friend of the broker —
     /// F relays nothing (no leak of a non-opted-in friend).
     #[error("target is not an active referrable friend")]
@@ -335,6 +391,18 @@ pub fn build_introduction_for_request(
     now_secs: u64,
 ) -> Result<Introduction, IntroBrokerError> {
     authenticate_introduce_request(req, self_owner, now_secs)?;
+    // ZEB-376 (Q1): friend-gate the REQUESTER. Authentication only proves the
+    // requester controls `from_addr`; it does NOT prove they are F's friend.
+    // Without this an authenticated non-friend could make F vouch for them.
+    // Mirror `serve_catalog_for_request`'s requester gate: require an Active
+    // friend entry keyed on `req.from_addr`.
+    let requester_is_friend = fg
+        .friends
+        .get(&req.from_addr)
+        .is_some_and(|e| e.status == crate::friend_graph::FriendStatus::Active);
+    if !requester_is_friend {
+        return Err(IntroBrokerError::RequesterNotFriend);
+    }
     let referrable = fg
         .friends
         .get(&req.target)
@@ -351,6 +419,10 @@ pub fn build_introduction_for_request(
         req.reachability.clone(),
         at,
         self_enrollment,
+        // ZEB-376 (Q2): forward the subject's (requester's) signer bundle so a
+        // quorum-issued subject cert verifies on X. F relays it as-is; F does not
+        // sign it (not in the preimage).
+        req.signer_certs.clone(),
     ))
 }
 
@@ -773,6 +845,7 @@ mod tests {
             reach(),
             hlc(5),
             voucher.cert.clone(),
+            Vec::new(),
         );
         // X verifies: voucher == who we think F is, target == us.
         verify_introduction(&intro, voucher.owner, target.owner, 0).expect("authentic");
@@ -822,6 +895,10 @@ mod tests {
         let mut fg = crate::friend_graph::FriendGraph::default();
         fg.friends
             .insert(target.owner, active_referrable_entry(0x33, true));
+        // ZEB-376 (Q1): the broker now friend-gates the REQUESTER too — seed the
+        // requester as an Active friend so the happy path still builds.
+        fg.friends
+            .insert(requester.owner, active_referrable_entry(0x11, true));
         let req = sign_introduce_request(
             &requester.device_key,
             requester.owner,
@@ -862,6 +939,157 @@ mod tests {
             ),
             Err(IntroBrokerError::NotReferrable),
         ));
+    }
+
+    /// ZEB-376 (Q1, HIGH auth bypass): an AUTHENTICATED requester who is NOT an
+    /// Active friend of F must not be able to make F vouch for them — even when
+    /// the target IS an active+referrable friend. The broker returns
+    /// `RequesterNotFriend` and builds no Introduction (mirrors the catalog path's
+    /// requester friend-gate). The request itself authenticates fine; only the
+    /// authorization (requester ∈ F's friends) fails.
+    #[test]
+    fn broker_rejects_non_friend_requester() {
+        let requester = mint_test_owner(0x11);
+        let broker = mint_test_owner(0x22);
+        let target = mint_test_owner(0x33);
+        let mut fg = crate::friend_graph::FriendGraph::default();
+        // Target IS an active+referrable friend; requester is NOT in the graph.
+        fg.friends
+            .insert(target.owner, active_referrable_entry(0x33, true));
+        let req = sign_introduce_request(
+            &requester.device_key,
+            requester.owner,
+            broker.owner,
+            target.owner,
+            reach(),
+            requester.cert.clone(),
+        );
+        // The request authenticates (correct broker, valid cert + sig)…
+        authenticate_introduce_request(&req, broker.owner, 0).expect("request authenticates");
+        // …but the broker refuses because the requester is not F's friend.
+        assert!(matches!(
+            build_introduction_for_request(
+                &req,
+                &fg,
+                broker.owner,
+                broker.cert.clone(),
+                &broker.device_key,
+                hlc(1),
+                0,
+            ),
+            Err(IntroBrokerError::RequesterNotFriend),
+        ));
+        // A merely-Pending requester is also rejected (only Active passes).
+        fg.friends.insert(requester.owner, {
+            let mut e = active_referrable_entry(0x11, true);
+            e.status = crate::friend_graph::FriendStatus::Pending;
+            e
+        });
+        assert!(matches!(
+            build_introduction_for_request(
+                &req,
+                &fg,
+                broker.owner,
+                broker.cert.clone(),
+                &broker.device_key,
+                hlc(1),
+                0,
+            ),
+            Err(IntroBrokerError::RequesterNotFriend),
+        ));
+    }
+
+    /// ZEB-376 (Q2, correctness): F forwards the subject's signer-cert bundle in
+    /// the `Introduction` so a QUORUM-issued subject cert verifies on X. With the
+    /// bundle present `verify_introduction` accepts; stripped, the subject-cert
+    /// verify fails closed (`Auth`). Proves the field round-trips through F's
+    /// broker into X's verifier.
+    #[test]
+    fn introduction_forwards_subject_signer_bundle_for_quorum_cert() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let voucher = mint_test_owner(0x22); // F
+        let target = mint_test_owner(0x33); // X (self)
+        let world = mint_quorum_world(0x80); // subject with a quorum-issued cert
+        let subject_owner = OwnerAddr(world.owner_id);
+        // Stamp `at` fresh relative to WORLD_NOW so the #4 envelope bound passes.
+        let at = hlc(WORLD_NOW.saturating_mul(1000));
+
+        let intro = sign_introduction(
+            &voucher.device_key,
+            voucher.owner,
+            target.owner,
+            subject_owner,
+            world.c_quorum_cert.clone(),
+            reach(),
+            at,
+            voucher.cert.clone(),
+            world.bundle.clone(),
+        );
+        assert_eq!(
+            intro.subject_signer_certs, world.bundle,
+            "F forwards the subject's signer bundle verbatim"
+        );
+
+        // WITH the forwarded bundle the quorum subject cert verifies through X.
+        verify_introduction(&intro, voucher.owner, target.owner, WORLD_NOW)
+            .expect("quorum subject cert verifies via the forwarded signer bundle");
+
+        // WITHOUT it, the subject-cert verify fails closed (the exact bug Q2 fixes:
+        // an empty bundle cannot verify a quorum cert).
+        let mut stripped = intro.clone();
+        stripped.subject_signer_certs.clear();
+        assert_eq!(
+            verify_introduction(&stripped, voucher.owner, target.owner, WORLD_NOW),
+            Err(IntroAuthError::Auth),
+            "a quorum subject cert with no signer bundle must fail closed",
+        );
+    }
+
+    /// ZEB-376 (#4, defense-in-depth): `verify_introduction` bounds the signed
+    /// `at` envelope timestamp against X's wall clock — an envelope stamped far in
+    /// the past or future is rejected `Stale` (the sig is valid over the stale
+    /// stamp; freshness is the axis under test). A fresh stamp still verifies.
+    #[test]
+    fn introduction_rejects_stale_envelope_timestamp() {
+        let voucher = mint_test_owner(0x22);
+        let subject = mint_test_owner(0x11);
+        let target = mint_test_owner(0x33);
+        let now_secs = 1_700_000_000u64;
+        let now_ms = now_secs * 1000;
+
+        let sign_at = |wall_ms: u64| {
+            sign_introduction(
+                &voucher.device_key,
+                voucher.owner,
+                target.owner,
+                subject.owner,
+                subject.cert.clone(),
+                reach(),
+                hlc(wall_ms),
+                voucher.cert.clone(),
+                Vec::new(),
+            )
+        };
+
+        // Fresh `at` (== now) verifies.
+        verify_introduction(&sign_at(now_ms), voucher.owner, target.owner, now_secs)
+            .expect("a fresh envelope verifies");
+
+        // Far in the past (> max age) → Stale.
+        let stale = sign_at(now_ms - INTRODUCTION_MAX_ENVELOPE_AGE_MS - 1);
+        assert_eq!(
+            verify_introduction(&stale, voucher.owner, target.owner, now_secs),
+            Err(IntroAuthError::Stale),
+            "an envelope older than the max age must be rejected",
+        );
+
+        // Far in the future (> forward skew) → Stale.
+        let future = sign_at(now_ms + INTRODUCTION_MAX_FORWARD_SKEW_MS + 1);
+        assert_eq!(
+            verify_introduction(&future, voucher.owner, target.owner, now_secs),
+            Err(IntroAuthError::Stale),
+            "an envelope beyond the forward-skew must be rejected",
+        );
     }
 
     #[test]
@@ -948,6 +1176,7 @@ mod tests {
             reachability,
             broker_at.clone(),
             voucher.cert.clone(),
+            Vec::new(),
         );
 
         // X derives the subject's device-#2 verifying key from the relayed cert.

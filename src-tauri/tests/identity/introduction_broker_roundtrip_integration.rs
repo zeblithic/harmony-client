@@ -929,6 +929,7 @@ async fn introduction_broker_roundtrip_askme_policy_stages_then_links_on_accept(
                 device_id: "f-dev".into(),
             },
             h.f.cert.clone(),
+            Vec::new(),
         );
         send_pex_frame(
             &h.client,

@@ -141,13 +141,14 @@ different broker; binding `target` blocks swapping whom you asked to meet.
 Introduction {
     voucher:    OwnerAddr,                 // F (introducer)            key "v"
     to_addr:    OwnerAddr,                 // X (target) — re-aim guard key "d"
-    subject:    OwnerAddr,                 // you (introducee)          key "s"
+    subject:    OwnerAddr,                 // you (introducee)          key "u"
     subject_cert: EnrollmentCert,          // your device-#2 cert       key "c"
     reachability: ReachabilityAnnouncePayload,  // your dial target     key "r"
     at:         Hlc,                       // freshness / dedupe        key "t"
-    sig:        [u8; 64],                  // F's device-#2 over preimage key "g"
+    sig:        [u8; 64],                  // F's device-#2 over preimage key "s"
     voucher_enrollment: EnrollmentCert,    // F's device-#2 cert        key "e"
-    signer_certs: Vec<EnrollmentCert>,     // ZEB-677 bundle (empty today) key "b"
+    signer_certs: Vec<EnrollmentCert>,     // F's ZEB-677 bundle (empty today) key "b"
+    subject_signer_certs: Vec<EnrollmentCert>, // Q2: subject's bundle, forwarded from req.signer_certs (empty omits it) key "g"
 }
 ```
 
@@ -172,9 +173,15 @@ identity (your cert is still your Master-issued cert; F only relays it).
 1. `intro.to_addr == self_owner` else `WrongTarget`.
 2. `verify_enrolled_device(&intro.voucher_enrollment, …, intro.voucher)` (binds
    F's cert→F).
-3. `verify_strict(intro.sig)` over the `"hin1"` preimage.
-4. `verify_enrolled_device(&intro.subject_cert, …, intro.subject)` (binds your
-   cert→you — X will pin this into the resulting `FriendEntry`).
+3. `verify_strict(intro.sig)` over the `"hin1"` preimage. Also bound `intro.at`
+   (#4, defense-in-depth): reject an envelope stamped older than the reachability
+   TTL (7 days) or more than ~30 min in the future.
+4. `verify_enrolled_device(&intro.subject_cert, &intro.subject_signer_certs,
+   intro.subject)` (binds your cert→you — X will pin this into the resulting
+   `FriendEntry`). Q2: the subject bundle is forwarded from
+   `IntroduceRequest.signer_certs` so a quorum-issued subject cert verifies (an
+   empty bundle can only verify a Master-issued cert). It is verification context,
+   NOT part of the `"hin1"` preimage (F relays it; F does not sign it).
 5. Reachability inner checks (§3): `verify_inner_sig` + `verify_identity_match` +
    `verify_freshness` on `intro.reachability`.
 6. `PeerIntroPolicy` enforcement (§6) — F being an Active friend is the
@@ -191,25 +198,29 @@ first decoded item a tagged **`PexFrame`**:
 
 ```
 enum PexFrame {
-    CatalogRequest(CatalogRequest),   // existing browse (2a)
-    IntroduceRequest(IntroduceRequest), // You → F (2b)
-    Introduction(Introduction),        // F → X (2b)
+    IntroduceRequest(IntroduceRequest), // You → F (2b), tag "ir"
+    Introduction(Introduction),        // F → X (2b),  tag "in"
 }
 ```
 
-The acceptor's `serve()` decodes a `PexFrame` and dispatches:
-- `CatalogRequest` → existing `serve_catalog_for_request` (unchanged behavior).
-- `IntroduceRequest` → validate + authorize (§4.3), then F **spawns** the F→X
-  delivery (resolve X via Case-D, dial, send `Introduction`) and acks the
+The catalog (2a browse) is **NOT** a `PexFrame` variant — it stays BARE on the
+wire, decoded via a fallback (see wire-compat below), which is what keeps the
+`zeb375_pex_fixtures` bytes byte-identical.
+
+The acceptor's `serve()` decodes the body and dispatches:
+- bare `CatalogRequest` (fallback decode) → existing `serve_catalog_for_request`
+  (unchanged behavior).
+- `PexFrame::IntroduceRequest` → validate + authorize (§4.3), then F **spawns** the
+  F→X delivery (resolve X via Case-D, dial, send `Introduction`) and acks the
   requester. The spawn keeps F's acceptor single-shot and non-blocking.
-- `Introduction` → validate (§4.3) + enforce policy (§6) + (on proceed) trigger
-  the introduction-driven link (§7).
+- `PexFrame::Introduction` → validate (§4.3) + enforce policy (§6) + (on proceed)
+  trigger the introduction-driven link (§7).
 
 **Wire-compat (no flag-day):** a ciborium externally-tagged enum encodes as a
-map (`{"CatalogRequest": …}`), which is **not** byte-identical to a bare 2a
-`CatalogRequest`. So the friend-PEX **decoder tries `PexFrame` first and falls
-back to decoding a bare `CatalogRequest`** — 2a peers (bare) and 2b peers
-(`PexFrame::CatalogRequest`) both serve correctly, no coordinated upgrade needed.
+single-key map (`{"ir": …}` / `{"in": …}`), which is **not** byte-identical to a
+bare 2a `CatalogRequest` (a multi-key map). So the friend-PEX **decoder tries
+`PexFrame` first and falls back to decoding a bare `CatalogRequest`** — 2a peers
+(bare) and 2b peers both serve correctly, no coordinated upgrade needed.
 The 2a `zeb375_pex_fixtures` bytes stay byte-pinned (unchanged); the fallback is
 what keeps them valid. A full flag-day (require `PexFrame` everywhere) is rejected
 for 2b — it would break every un-upgraded 2a peer. Both 2b message directions are

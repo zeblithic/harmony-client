@@ -110,10 +110,13 @@ impl PendingFriendRequests {
     }
 
     /// ZEB-376 Task 11: stage an AskMe introduction OFFER for `subject` in the
-    /// pending inbox. IDEMPOTENT (like [`record_inbound`](Self::record_inbound)):
-    /// a re-delivered introduction keeps the original entry rather than resetting
-    /// its timestamp. The offer carries the already-verified vouch + relayed
-    /// reachability the accept path consumes via [`take_offer`](Self::take_offer).
+    /// pending inbox. The offer SUPERSEDES any prior inbound entry for `subject`
+    /// (an unconditional `insert`, not an `or_insert`): a verified,
+    /// F-vouched + reachability-checked offer is strictly more actionable than a
+    /// bare Path-A `LinkRequest` staged earlier for the same owner — dropping it
+    /// (#6) would strand the user with a request they can't accept-as-introduction.
+    /// A re-delivered SAME offer just replaces itself (resetting `received_at_ms`
+    /// to `now_ms` — acceptable; it is the same verified offer).
     pub fn record_introduction_offer(
         &self,
         subject: OwnerAddr,
@@ -122,11 +125,14 @@ impl PendingFriendRequests {
         offer: StoredIntroductionOffer,
     ) {
         let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
-        inner.inbound.entry(subject).or_insert(PendingInbound {
-            display,
-            received_at_ms: now_ms,
-            kind: PendingKind::IntroductionOffer(Box::new(offer)),
-        });
+        inner.inbound.insert(
+            subject,
+            PendingInbound {
+                display,
+                received_at_ms: now_ms,
+                kind: PendingKind::IntroductionOffer(Box::new(offer)),
+            },
+        );
     }
 
     /// ZEB-376 Task 11: remove + return the staged introduction offer for
@@ -274,10 +280,16 @@ impl PendingOutboundIntroductions {
     /// Remove + return true iff `target` was recorded AND still within the TTL.
     /// A present-but-expired entry is removed and returns false. One-shot: even
     /// a fresh hit is consumed, so a single pre-auth accepts exactly one dial.
+    ///
+    /// #7 (security): fails CLOSED on a BACKWARD clock. `saturating_sub` returns
+    /// `0 < TTL` when `now_ms < rec` (the clock moved back after recording),
+    /// which would keep a stale pre-auth valid indefinitely. Require
+    /// `now_ms >= rec` explicitly so a backward-clock record is rejected — and it
+    /// is still consumed (the `remove` already ran), preserving one-shot.
     pub fn take(&self, target: &OwnerAddr, now_ms: u64) -> bool {
         let mut m = self.inner.lock().expect("outbound-intro mutex poisoned");
         match m.remove(target) {
-            Some(rec) => now_ms.saturating_sub(rec) < OUTBOUND_INTRO_TTL_MS,
+            Some(rec) => now_ms >= rec && now_ms - rec < OUTBOUND_INTRO_TTL_MS,
             None => false,
         }
     }
@@ -324,6 +336,35 @@ mod tests {
         assert!(store.take_offer(&addr(1)).is_some());
         assert!(store.take_offer(&addr(1)).is_none());
         assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn introduction_offer_supersedes_prior_link_request() {
+        // #6 regression: a bare Path-A LinkRequest staged first for owner O must
+        // NOT block a later verified IntroductionOffer for O — the offer supersedes
+        // the prior inbound entry (unconditional insert, not or_insert). Before the
+        // fix, `take_offer(O)` returned None because the LinkRequest still occupied
+        // the slot, stranding the user with an unacceptable-as-introduction row.
+        let store = PendingFriendRequests::new();
+        store.record_inbound(addr(1), Some("link".into()), 1_000);
+        assert!(matches!(&store.list()[0].1.kind, PendingKind::LinkRequest));
+        let offer = StoredIntroductionOffer {
+            voucher: addr(2),
+            subject: addr(1),
+            reachability: fixture_reach(),
+        };
+        store.record_introduction_offer(addr(1), Some("offer".into()), 2_000, offer);
+        // The offer now occupies the slot and is take-able.
+        let taken = store.take_offer(&addr(1));
+        assert!(
+            taken.is_some(),
+            "the verified offer must supersede the prior LinkRequest and be take-able"
+        );
+        assert_eq!(taken.unwrap().voucher, addr(2));
+        assert!(
+            store.list().is_empty(),
+            "take consumed the superseding offer"
+        );
     }
 
     #[test]
@@ -470,5 +511,24 @@ mod tests {
         assert!(!s.take(&addr(2), 1_000 + OUTBOUND_INTRO_TTL_MS + 1));
         // Unknown target → false.
         assert!(!s.take(&addr(3), 2_000));
+    }
+
+    #[test]
+    fn outbound_intro_take_fails_closed_on_backward_clock() {
+        // #7 (security): a record made at t=1000 must NOT authorize a `take` at
+        // t=500 (the wall clock moved backward after recording). `saturating_sub`
+        // would have returned 0 < TTL → true, keeping the pre-auth valid. The
+        // explicit `now_ms >= rec` guard rejects it — and still consumes the entry
+        // (one-shot preserved: a second take returns false regardless).
+        let s = PendingOutboundIntroductions::new();
+        s.record(addr(1), 1_000);
+        assert!(
+            !s.take(&addr(1), 500),
+            "a backward clock must not authorize a stale pre-auth"
+        );
+        assert!(
+            !s.take(&addr(1), 1_500),
+            "the backward-clock take still consumed the entry (one-shot)"
+        );
     }
 }
