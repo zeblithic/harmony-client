@@ -561,20 +561,26 @@ pub const INTRO_PER_VOUCHER_MAX: usize = 20; // per key per window
 /// A repeat `(key, subject)` seen within this TTL is shed as a duplicate.
 pub const INTRO_DEDUPE_TTL_MS: u64 = 5 * 60 * 1000; // 5 min
 
-/// Hard ceiling on tracked dedupe pairs. Bounds the limiter's OWN memory
-/// against an attacker spraying frames with rotating spoofed `(key, subject)`
-/// values — [`IntroRateLimiter::admit`] runs BEFORE frame authentication, so
-/// any peer on the friend-PEX ALPN can grow these maps. When `last_seen`
-/// exceeds this cap, `admit` first drops entries already past
-/// [`INTRO_DEDUPE_TTL_MS`] (they can no longer shed a duplicate, so removing
-/// them changes no decision) and then, if a genuine fresh flood keeps it over,
-/// evicts the oldest-timestamped entries down to a low-watermark below the cap.
-/// 8192 pairs is well under a MB and orders of magnitude above the volume of
-/// legitimate, rare, human-initiated introductions.
+/// ZEB-694: pre-auth per-connection-endpoint cap over the same 1h window.
+/// Generous vs the per-owner 20 because one iroh endpoint may legitimately
+/// host/relay for several owners; a genuine single-endpoint flood is still shed.
+pub const INTRO_PER_CONNECTION_MAX: usize = 40;
+
+/// Hard ceiling on tracked dedupe pairs — bounds each per-role dedupe map's OWN
+/// memory. The Tier-2 quota methods admit (and record) as soon as a frame's
+/// owner is AUTHENTICATED but before it is a known friend, so a flood of frames
+/// bearing rotating `(owner, owner)` pairs could otherwise grow these maps
+/// unbounded. When a map exceeds this cap, [`KeyedDedupe`] first drops entries
+/// already past [`INTRO_DEDUPE_TTL_MS`] (they can no longer shed a duplicate, so
+/// removing them changes no decision) and then, if a genuine fresh flood keeps
+/// it over, evicts the oldest-timestamped entries down to a low-watermark below
+/// the cap. 8192 pairs is well under a MB and orders of magnitude above the
+/// volume of legitimate, rare, human-initiated introductions.
 const MAX_DEDUPE_ENTRIES: usize = 8192;
-/// Hard ceiling on tracked window keys — the `windows` counterpart to
-/// [`MAX_DEDUPE_ENTRIES`], with the same pre-auth-flood rationale and the same
-/// stale-then-oldest eviction discipline.
+/// Hard ceiling on tracked window keys — the counterpart to
+/// [`MAX_DEDUPE_ENTRIES`] for every [`KeyedSlidingWindow`] (the pre-auth
+/// connection shield keyed on un-spoofable endpoint ids, plus the two per-role
+/// owner quotas), with the same stale-then-oldest eviction discipline.
 const MAX_WINDOW_KEYS: usize = 8192;
 
 /// A per-key sliding-window counter, bounded to `MAX_WINDOW_KEYS` distinct keys.
@@ -690,183 +696,141 @@ impl<K: Copy + Eq + Hash> KeyedDedupe<K> {
     }
 }
 
-/// Process-local DoS hygiene layered BEFORE the (primary) policy/authentication
-/// defenses on both friend-PEX introduction arms: a per-`key` sliding-window cap
-/// plus a `(key, subject)` dedupe, so a compromised/spammy voucher (F) or
-/// requester cannot flood a node with introductions. It is deliberately NOT an
-/// authorization decision — it only sheds volume; every shed is LOGGED by the
-/// caller ("no silent truncation") and answered with the same benign ack a
-/// normal outcome writes, so a shed is network-indistinguishable (no oracle).
+/// ZEB-694: two-tier introduction rate limiter.
+/// - Tier 1 (`admit_connection`): pre-auth flood shield keyed on the connecting
+///   iroh endpoint's authenticated `remote_id()` — un-spoofable, runs before any
+///   signature verification.
+/// - Tier 2 (`admit_requester` / `admit_voucher`): post-auth per-owner quotas +
+///   dedupe, keyed on the AUTHENTICATED owner, in DISJOINT per-role namespaces so
+///   requester traffic and voucher traffic never share a budget.
 ///
-/// Guarded by a `std::sync::Mutex`; [`admit`](Self::admit) never `.await`s, so
-/// the lock is never held across a suspension point.
-///
-/// Because `admit` runs BEFORE frame authentication, its own two maps are
-/// bounded by [`MAX_DEDUPE_ENTRIES`] / [`MAX_WINDOW_KEYS`] with amortized-O(1)
-/// eviction, so a peer spraying frames with rotating spoofed addresses cannot
-/// turn this DoS-hygiene layer into a remote pre-auth memory-DoS of its own.
+/// It is deliberately NOT an authorization decision — it only sheds volume;
+/// every shed is LOGGED by the caller ("no silent truncation") and answered with
+/// the same benign ack a normal outcome writes, so a shed is
+/// network-indistinguishable (no oracle). Guarded by a `std::sync::Mutex`; the
+/// admit methods never `.await`, so the lock is never held across a suspension
+/// point. Every tracked map is bounded by [`MAX_DEDUPE_ENTRIES`] /
+/// [`MAX_WINDOW_KEYS`] with amortized-O(1) eviction (see [`KeyedSlidingWindow`] /
+/// [`KeyedDedupe`]), so a flood of rotating keys cannot turn this DoS-hygiene
+/// layer into a memory-DoS of its own.
 pub struct IntroRateLimiter {
-    inner: Mutex<IntroRateLimiterInner>,
+    inner: Mutex<Inner>,
 }
 
-struct IntroRateLimiterInner {
-    /// Per-`key` admit timestamps (epoch-ms), pruned to
-    /// [`INTRO_PER_VOUCHER_WINDOW_MS`] on each `admit`; `len()` is the in-window
-    /// count checked against [`INTRO_PER_VOUCHER_MAX`].
-    windows: HashMap<OwnerAddr, VecDeque<u64>>,
-    /// Last time a `(key, subject)` pair was admitted, for TTL dedupe.
-    last_seen: HashMap<(OwnerAddr, OwnerAddr), u64>,
-}
-
-impl IntroRateLimiterInner {
-    /// Bound `last_seen` against a pre-auth flood of rotating spoofed
-    /// `(key, subject)` pairs. Runs only when the map is over its cap (an O(1)
-    /// `len()` guard), so legitimate load — always far below the cap — never
-    /// pays for it, while a flood pays O(1) amortized: each firing frees
-    /// ~`MAX_DEDUPE_ENTRIES / 4` slots, so the next firing is ~cap/4 admits away.
-    ///
-    /// The stale pass is the EXACT complement of the dedupe-shed predicate, so
-    /// it can never drop a pair that would still shed a duplicate. The
-    /// oldest-eviction fallback runs only for a genuine fresh flood (every
-    /// remaining pair is within the TTL), where dropping the oldest pairs merely
-    /// forgets long-idle dedupe state — it can never wrongly reject legitimate
-    /// traffic, which lives nowhere near the cap.
-    fn evict_last_seen(&mut self, now_ms: u64) {
-        if self.last_seen.len() <= MAX_DEDUPE_ENTRIES {
-            return;
-        }
-        // 1. Stale pass: drop pairs past the dedupe TTL.
-        self.last_seen
-            .retain(|_, &mut ts| now_ms.saturating_sub(ts) < INTRO_DEDUPE_TTL_MS);
-        if self.last_seen.len() <= MAX_DEDUPE_ENTRIES {
-            return;
-        }
-        // 2. Fresh-flood pass: evict the oldest-timestamped pairs down to a
-        //    low-watermark (3/4 cap) so the map never exceeds the cap yet the
-        //    next eviction is ~cap/4 admits away (→ O(1) amortized).
-        let target = MAX_DEDUPE_ENTRIES / 4 * 3;
-        let mut stamps: Vec<(u64, (OwnerAddr, OwnerAddr))> =
-            self.last_seen.iter().map(|(&k, &ts)| (ts, k)).collect();
-        let excess = stamps.len() - target;
-        stamps.select_nth_unstable_by_key(excess, |&(ts, _)| ts);
-        for &(_, k) in &stamps[..excess] {
-            self.last_seen.remove(&k);
-        }
-    }
-
-    /// Bound `windows` against the same pre-auth flood (rotating spoofed keys),
-    /// with the same over-cap guard and O(1)-amortized cost as
-    /// [`evict_last_seen`](Self::evict_last_seen). The stale pass prunes every
-    /// key's deque to the sliding window and drops keys that empty out (an empty
-    /// window counts zero admits, so removing it changes no cap decision); the
-    /// fresh-flood fallback evicts the keys with the oldest most-recent admit
-    /// (deque back) down to the low-watermark.
-    fn evict_windows(&mut self, now_ms: u64) {
-        if self.windows.len() <= MAX_WINDOW_KEYS {
-            return;
-        }
-        // 1. Stale pass: prune each deque to the window; drop now-empty keys.
-        let cutoff = now_ms.saturating_sub(INTRO_PER_VOUCHER_WINDOW_MS);
-        self.windows.retain(|_, dq| {
-            while dq.front().is_some_and(|&t| t < cutoff) {
-                dq.pop_front();
-            }
-            !dq.is_empty()
-        });
-        if self.windows.len() <= MAX_WINDOW_KEYS {
-            return;
-        }
-        // 2. Fresh-flood pass: evict keys with the oldest most-recent admit.
-        let target = MAX_WINDOW_KEYS / 4 * 3;
-        let mut recents: Vec<(u64, OwnerAddr)> = self
-            .windows
-            .iter()
-            .map(|(&k, dq)| {
-                (
-                    *dq.back().expect("deque is non-empty after the stale prune"),
-                    k,
-                )
-            })
-            .collect();
-        let excess = recents.len() - target;
-        recents.select_nth_unstable_by_key(excess, |&(ts, _)| ts);
-        for &(_, k) in &recents[..excess] {
-            self.windows.remove(&k);
-        }
-    }
+struct Inner {
+    /// Tier 1: pre-auth per-connection-endpoint window, keyed on the connecting
+    /// iroh endpoint's authenticated `remote_id` (un-spoofable).
+    conn: KeyedSlidingWindow<[u8; 32]>,
+    /// Tier 2 (requester role): per-authenticated-requester window + dedupe of a
+    /// repeated `(requester, target)`.
+    req_window: KeyedSlidingWindow<OwnerAddr>,
+    req_dedupe: KeyedDedupe<(OwnerAddr, OwnerAddr)>,
+    /// Tier 2 (voucher role): per-verified-voucher window + dedupe of a repeated
+    /// `(voucher, subject)`. Disjoint from the requester role's maps.
+    vouch_window: KeyedSlidingWindow<OwnerAddr>,
+    vouch_dedupe: KeyedDedupe<(OwnerAddr, OwnerAddr)>,
 }
 
 impl IntroRateLimiter {
     pub fn new() -> Self {
+        Self::with_caps(
+            INTRO_PER_CONNECTION_MAX,
+            INTRO_PER_VOUCHER_MAX,
+            INTRO_PER_VOUCHER_WINDOW_MS,
+            INTRO_DEDUPE_TTL_MS,
+        )
+    }
+
+    /// Test/tuning constructor — deterministic tiny caps in unit tests.
+    pub fn with_caps(
+        conn_max: usize,
+        per_owner_max: usize,
+        window_ms: u64,
+        dedupe_ttl_ms: u64,
+    ) -> Self {
         Self {
-            inner: Mutex::new(IntroRateLimiterInner {
-                windows: HashMap::new(),
-                last_seen: HashMap::new(),
+            inner: Mutex::new(Inner {
+                conn: KeyedSlidingWindow::new(conn_max, window_ms),
+                req_window: KeyedSlidingWindow::new(per_owner_max, window_ms),
+                req_dedupe: KeyedDedupe::new(dedupe_ttl_ms),
+                vouch_window: KeyedSlidingWindow::new(per_owner_max, window_ms),
+                vouch_dedupe: KeyedDedupe::new(dedupe_ttl_ms),
             }),
         }
     }
 
-    /// Returns `Ok(())` to admit (and RECORDS the event: bumps the `key`'s
-    /// window and the `(key, subject)` last-seen), or `Err(reason)` to shed
-    /// WITHOUT recording. Sheds `"duplicate"` when `(key, subject)` was admitted
-    /// within [`INTRO_DEDUPE_TTL_MS`], or `"per-voucher cap"` when `key` already
-    /// has [`INTRO_PER_VOUCHER_MAX`] admits inside
-    /// [`INTRO_PER_VOUCHER_WINDOW_MS`]. Pure over `now_ms`; the caller LOGS every
-    /// shed.
-    pub fn admit(
+    /// Poison-tolerant lock: a panic elsewhere must not wedge the acceptor — the
+    /// guarded state is plain counters, safe to keep using.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Tier 1 — pre-auth. Key = the connecting endpoint's authenticated
+    /// `remote_id`. `Ok(())` admits (and records); `Err("per-connection cap")`
+    /// sheds without recording. Runs BEFORE any signature verification.
+    pub fn admit_connection(&self, remote_id: [u8; 32], now_ms: u64) -> Result<(), &'static str> {
+        if self.lock().conn.admit(remote_id, now_ms) {
+            Ok(())
+        } else {
+            Err("per-connection cap")
+        }
+    }
+
+    /// Tier 2 — post-auth requester quota. Key = the AUTHENTICATED requester.
+    /// Sheds `"duplicate"` for a repeat `(requester, target)` within the TTL, or
+    /// `"per-requester cap"` at the per-owner window cap; a windowed shed does
+    /// NOT record the dedupe stamp.
+    pub fn admit_requester(
         &self,
-        key: OwnerAddr,
-        subject: OwnerAddr,
+        requester: OwnerAddr,
+        target: OwnerAddr,
         now_ms: u64,
     ) -> Result<(), &'static str> {
-        // Poison-tolerant: a panic elsewhere must not wedge the acceptor — the
-        // guarded state is plain counters, safe to keep using.
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // 1. Dedupe: a repeat of the SAME (key, subject) within the TTL is shed
-        //    (a shed does NOT refresh the last-seen stamp — only an admit does).
-        if let Some(&last) = inner.last_seen.get(&(key, subject)) {
-            if now_ms.saturating_sub(last) < INTRO_DEDUPE_TTL_MS {
-                return Err("duplicate");
-            }
+        let mut inner = self.lock();
+        if inner.req_dedupe.is_duplicate((requester, target), now_ms) {
+            return Err("duplicate");
         }
-
-        // 2. Per-`key` sliding window: drop entries older than the window, then
-        //    enforce the cap on what remains.
-        {
-            let window = inner.windows.entry(key).or_default();
-            let cutoff = now_ms.saturating_sub(INTRO_PER_VOUCHER_WINDOW_MS);
-            while window.front().is_some_and(|&t| t < cutoff) {
-                window.pop_front();
-            }
-            if window.len() >= INTRO_PER_VOUCHER_MAX {
-                return Err("per-voucher cap");
-            }
-            window.push_back(now_ms);
+        if !inner.req_window.admit(requester, now_ms) {
+            return Err("per-requester cap");
         }
-        // Bound `windows` (see `evict_windows`): a no-op O(1) `len()` check for
-        // legitimate load; only a pre-auth flood ever triggers the sweep.
-        inner.evict_windows(now_ms);
-
-        // 3. Record the admit for future dedupe, then bound `last_seen` (same
-        //    over-cap-only, O(1)-amortized eviction as `windows`).
-        inner.last_seen.insert((key, subject), now_ms);
-        inner.evict_last_seen(now_ms);
+        inner.req_dedupe.record((requester, target), now_ms);
         Ok(())
     }
 
-    /// Test-only view of the two tracked-map sizes `(last_seen, windows)`, so a
-    /// test can assert the pre-auth-flood memory bound holds.
+    /// Tier 2 — post-auth voucher quota. Key = the VERIFIED voucher. Sheds
+    /// `"duplicate"` for a repeat `(voucher, subject)` within the TTL, or
+    /// `"per-voucher cap"` at the per-owner window cap; a windowed shed does NOT
+    /// record the dedupe stamp.
+    pub fn admit_voucher(
+        &self,
+        voucher: OwnerAddr,
+        subject: OwnerAddr,
+        now_ms: u64,
+    ) -> Result<(), &'static str> {
+        let mut inner = self.lock();
+        if inner.vouch_dedupe.is_duplicate((voucher, subject), now_ms) {
+            return Err("duplicate");
+        }
+        if !inner.vouch_window.admit(voucher, now_ms) {
+            return Err("per-voucher cap");
+        }
+        inner.vouch_dedupe.record((voucher, subject), now_ms);
+        Ok(())
+    }
+
+    /// Test helper: (voucher-role dedupe entries, voucher-role window keys). The
+    /// migrated Task-13 flood tests exercise `admit_voucher`, so they assert on
+    /// the voucher role's maps. Same-module access to the primitives' private
+    /// fields.
     #[cfg(test)]
     pub(crate) fn tracked_len(&self) -> (usize, usize) {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (inner.last_seen.len(), inner.windows.len())
+        let inner = self.lock();
+        (
+            inner.vouch_dedupe.last_seen.len(),
+            inner.vouch_window.windows.len(),
+        )
     }
 }
 
@@ -1402,19 +1366,19 @@ mod tests {
         for i in 0..INTRO_PER_VOUCHER_MAX {
             let subject = OwnerAddr([i as u8; 16]);
             assert_eq!(
-                rl.admit(key, subject, 1_000),
+                rl.admit_voucher(key, subject, 1_000),
                 Ok(()),
                 "subject {i} is within the cap and must admit"
             );
         }
         // The (MAX + 1)-th distinct subject in the window sheds.
         assert_eq!(
-            rl.admit(key, OwnerAddr([0xFF; 16]), 1_000),
+            rl.admit_voucher(key, OwnerAddr([0xFF; 16]), 1_000),
             Err("per-voucher cap"),
         );
         // A DIFFERENT key has its own budget — unaffected by the first key's cap.
         assert_eq!(
-            rl.admit(OwnerAddr([0xBB; 16]), OwnerAddr([0xFF; 16]), 1_000),
+            rl.admit_voucher(OwnerAddr([0xBB; 16]), OwnerAddr([0xFF; 16]), 1_000),
             Ok(())
         );
     }
@@ -1427,15 +1391,19 @@ mod tests {
         let rl = IntroRateLimiter::new();
         let key = OwnerAddr([0x01; 16]);
         let subject = OwnerAddr([0x02; 16]);
-        assert_eq!(rl.admit(key, subject, 0), Ok(()), "first sighting admits");
+        assert_eq!(
+            rl.admit_voucher(key, subject, 0),
+            Ok(()),
+            "first sighting admits"
+        );
         // Same pair strictly within the TTL → duplicate.
         assert_eq!(
-            rl.admit(key, subject, INTRO_DEDUPE_TTL_MS - 1),
+            rl.admit_voucher(key, subject, INTRO_DEDUPE_TTL_MS - 1),
             Err("duplicate"),
         );
         // Same pair exactly at the TTL boundary (measured from the last ADMIT at
         // t=0, not the shed) → admits again.
-        assert_eq!(rl.admit(key, subject, INTRO_DEDUPE_TTL_MS), Ok(()));
+        assert_eq!(rl.admit_voucher(key, subject, INTRO_DEDUPE_TTL_MS), Ok(()));
     }
 
     /// Entries older than `INTRO_PER_VOUCHER_WINDOW_MS` are pruned and do NOT
@@ -1447,17 +1415,17 @@ mod tests {
         let key = OwnerAddr([0x03; 16]);
         // Fill the window to the cap at t=0 with distinct subjects.
         for i in 0..INTRO_PER_VOUCHER_MAX {
-            assert_eq!(rl.admit(key, OwnerAddr([i as u8; 16]), 0), Ok(()));
+            assert_eq!(rl.admit_voucher(key, OwnerAddr([i as u8; 16]), 0), Ok(()));
         }
         // At the cap now → a fresh subject at t=0 sheds.
         assert_eq!(
-            rl.admit(key, OwnerAddr([0xFE; 16]), 0),
+            rl.admit_voucher(key, OwnerAddr([0xFE; 16]), 0),
             Err("per-voucher cap"),
         );
         // Advance past the window: all cap-counted entries are now stale and must
         // not count → a fresh subject admits again.
         assert_eq!(
-            rl.admit(key, OwnerAddr([0xFD; 16]), INTRO_PER_VOUCHER_WINDOW_MS + 1),
+            rl.admit_voucher(key, OwnerAddr([0xFD; 16]), INTRO_PER_VOUCHER_WINDOW_MS + 1),
             Ok(()),
         );
     }
@@ -1478,7 +1446,7 @@ mod tests {
         let inserted = MAX_DEDUPE_ENTRIES.max(MAX_WINDOW_KEYS) * 2;
         for i in 0..inserted as u64 {
             assert_eq!(
-                rl.admit(addr16(2 * i), addr16(2 * i + 1), i + 1),
+                rl.admit_voucher(addr16(2 * i), addr16(2 * i + 1), i + 1),
                 Ok(()),
                 "fresh key+subject at t={i} must admit",
             );
@@ -1507,28 +1475,28 @@ mod tests {
         let rl = IntroRateLimiter::new();
         let flood = MAX_DEDUPE_ENTRIES.max(MAX_WINDOW_KEYS) * 2;
         for i in 0..flood as u64 {
-            let _ = rl.admit(addr16(2 * i), addr16(2 * i + 1), i + 1);
+            let _ = rl.admit_voucher(addr16(2 * i), addr16(2 * i + 1), i + 1);
         }
         // A fresh legit key, newest in the maps → survives any later eviction.
         let now = flood as u64 + 10;
         let key = OwnerAddr([0xC7; 16]);
         for j in 0..INTRO_PER_VOUCHER_MAX {
             assert_eq!(
-                rl.admit(key, OwnerAddr([0x80 | j as u8; 16]), now),
+                rl.admit_voucher(key, OwnerAddr([0x80 | j as u8; 16]), now),
                 Ok(()),
                 "legit subject {j} within the cap must still admit after a flood",
             );
         }
         // Cap still enforced for the legit key.
         assert_eq!(
-            rl.admit(key, OwnerAddr([0xFF; 16]), now),
+            rl.admit_voucher(key, OwnerAddr([0xFF; 16]), now),
             Err("per-voucher cap"),
         );
         // Dedupe still enforced for a repeated legit pair within the TTL.
         let key2 = OwnerAddr([0xC8; 16]);
         let subj = OwnerAddr([0xC9; 16]);
-        assert_eq!(rl.admit(key2, subj, now), Ok(()));
-        assert_eq!(rl.admit(key2, subj, now + 1), Err("duplicate"));
+        assert_eq!(rl.admit_voucher(key2, subj, now), Ok(()));
+        assert_eq!(rl.admit_voucher(key2, subj, now + 1), Err("duplicate"));
     }
 
     #[test]
@@ -1623,6 +1591,43 @@ mod tests {
         assert!(
             d.last_seen.len() <= MAX_DEDUPE_ENTRIES,
             "map bounded after record-time eviction"
+        );
+    }
+
+    // ── ZEB-694 Task A3: two-tier role-separated IntroRateLimiter. ───────────
+
+    #[test]
+    fn limiter_roles_have_independent_budgets() {
+        // Greptile regression: requester traffic must not starve an unrelated vouch.
+        let rl = IntroRateLimiter::with_caps(100, 1, 3_600_000, 300_000);
+        let o = OwnerAddr([1; 16]);
+        let t = OwnerAddr([2; 16]);
+        let t2 = OwnerAddr([3; 16]);
+        let s = OwnerAddr([4; 16]);
+        assert!(rl.admit_requester(o, t, 0).is_ok());
+        assert_eq!(
+            rl.admit_requester(o, t2, 1),
+            Err("per-requester cap"),
+            "requester at cap"
+        );
+        assert!(
+            rl.admit_voucher(o, s, 2).is_ok(),
+            "voucher role has its own budget"
+        );
+    }
+
+    #[test]
+    fn limiter_connection_shield_sheds_one_endpoint_only() {
+        let rl = IntroRateLimiter::with_caps(1, 100, 3_600_000, 300_000);
+        assert!(rl.admit_connection([1; 32], 0).is_ok());
+        assert_eq!(
+            rl.admit_connection([1; 32], 1),
+            Err("per-connection cap"),
+            "same endpoint shed at cap"
+        );
+        assert!(
+            rl.admit_connection([2; 32], 2).is_ok(),
+            "a different endpoint still admits"
         );
     }
 }
