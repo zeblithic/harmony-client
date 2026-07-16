@@ -5,6 +5,7 @@
 //! `PEX_MAX_PACKET_LEN`) so their framing can never diverge.
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::Mutex;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -575,6 +576,74 @@ const MAX_DEDUPE_ENTRIES: usize = 8192;
 /// [`MAX_DEDUPE_ENTRIES`], with the same pre-auth-flood rationale and the same
 /// stale-then-oldest eviction discipline.
 const MAX_WINDOW_KEYS: usize = 8192;
+
+/// A per-key sliding-window counter, bounded to `MAX_WINDOW_KEYS` distinct keys.
+/// Extracted from the ZEB-376 `IntroRateLimiter` so both the pre-auth connection
+/// shield and the post-auth owner quotas share one audited implementation.
+struct KeyedSlidingWindow<K> {
+    max: usize,
+    window_ms: u64,
+    windows: HashMap<K, VecDeque<u64>>,
+}
+
+impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
+    fn new(max: usize, window_ms: u64) -> Self {
+        Self {
+            max,
+            window_ms,
+            windows: HashMap::new(),
+        }
+    }
+
+    /// `true` if admitted (recorded), `false` if the key is at its in-window cap.
+    fn admit(&mut self, key: K, now_ms: u64) -> bool {
+        {
+            let window = self.windows.entry(key).or_default();
+            let cutoff = now_ms.saturating_sub(self.window_ms);
+            while window.front().is_some_and(|&t| t < cutoff) {
+                window.pop_front();
+            }
+            if window.len() >= self.max {
+                return false;
+            }
+            window.push_back(now_ms);
+        }
+        self.evict(now_ms);
+        true
+    }
+
+    fn evict(&mut self, now_ms: u64) {
+        if self.windows.len() <= MAX_WINDOW_KEYS {
+            return;
+        }
+        let cutoff = now_ms.saturating_sub(self.window_ms);
+        self.windows.retain(|_, dq| {
+            while dq.front().is_some_and(|&t| t < cutoff) {
+                dq.pop_front();
+            }
+            !dq.is_empty()
+        });
+        if self.windows.len() <= MAX_WINDOW_KEYS {
+            return;
+        }
+        let target = MAX_WINDOW_KEYS / 4 * 3;
+        let mut recents: Vec<(u64, K)> = self
+            .windows
+            .iter()
+            .map(|(&k, dq)| {
+                (
+                    *dq.back().expect("deque is non-empty after the stale prune"),
+                    k,
+                )
+            })
+            .collect();
+        let excess = recents.len() - target;
+        recents.select_nth_unstable_by_key(excess, |&(ts, _)| ts);
+        for &(_, k) in &recents[..excess] {
+            self.windows.remove(&k);
+        }
+    }
+}
 
 /// Process-local DoS hygiene layered BEFORE the (primary) policy/authentication
 /// defenses on both friend-PEX introduction arms: a per-`key` sliding-window cap
@@ -1438,5 +1507,44 @@ mod tests {
         // Closed: always reject.
         assert_eq!(decide_introduction(Closed, true), IntroDecision::Reject);
         assert_eq!(decide_introduction(Closed, false), IntroDecision::Reject);
+    }
+
+    // ── ZEB-694 Task A1: KeyedSlidingWindow<K> primitive. ───────────────────
+
+    #[test]
+    fn keyed_window_enforces_cap_within_window() {
+        let mut w = KeyedSlidingWindow::new(2, 1000);
+        assert!(w.admit(7u64, 0));
+        assert!(w.admit(7u64, 10));
+        assert!(
+            !w.admit(7u64, 20),
+            "third within the window is over the cap"
+        );
+        // a different key has its own budget
+        assert!(w.admit(9u64, 20));
+    }
+
+    #[test]
+    fn keyed_window_prunes_stale_timestamps() {
+        let mut w = KeyedSlidingWindow::new(1, 1000);
+        assert!(w.admit(7u64, 0));
+        assert!(!w.admit(7u64, 500), "still within the 1000ms window");
+        assert!(
+            w.admit(7u64, 1001),
+            "t=0 pruned (cutoff=1), window empty again"
+        );
+    }
+
+    #[test]
+    fn keyed_window_evicts_over_cap_keys() {
+        let mut w = KeyedSlidingWindow::new(1, 1_000_000);
+        for k in 0u64..(MAX_WINDOW_KEYS as u64 + 100) {
+            w.admit(k, k); // distinct keys, distinct timestamps
+        }
+        w.evict(MAX_WINDOW_KEYS as u64 + 100);
+        assert!(
+            w.windows.len() <= MAX_WINDOW_KEYS,
+            "map bounded after eviction"
+        );
     }
 }
