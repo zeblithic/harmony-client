@@ -1399,33 +1399,15 @@ pub fn process_friend_request(
         crate::owner_state_crypto::encrypt_friend_secret(keytree, &req.from_addr.0, &secret)
             .map_err(|_| FriendHandshakeError::ApplyRejected("friend-secret seal failed".into()))?;
 
-    // 4-5. Apply the new friend entry to the CRDT. apply_friend_update re-checks
-    // the key↔master-key invariant; a Rejected is a hard error here.
-    // established_via is Token when the requester supplied a token_sig (the
-    // normal token-invite path); MutualKey for the future Path-A (no-token)
-    // reuse path where no token is present.
-    let entry = FriendEntry {
-        master_ed25519,
-        display: req.display.clone(),
-        status: FriendStatus::Active,
-        established_via: origin_override.unwrap_or_else(|| {
-            if req.token_sig.is_some() {
-                FriendOrigin::Token
-            } else {
-                FriendOrigin::MutualKey
-            }
-        }),
-        referrable: false,
-        learned_at: learned_at.clone(),
-        sealed_secret: Some(sealed),
-    };
-    match state.apply_friend_update(req.from_addr, entry) {
-        ApplyOutcome::Inserted | ApplyOutcome::Merged { .. } => {}
-        ApplyOutcome::Rejected(reason) => {
-            return Err(FriendHandshakeError::ApplyRejected(format!("{reason:?}")));
-        }
-    }
-
+    // ORDERING (ZEB-680 review — CodeRabbit + Greptile): every FALLIBLE
+    // owner-state update runs BEFORE the friendship + revocation commits, and the
+    // friendship write and the revocation apply are ADJACENT (nothing fallible
+    // between them). This makes the pair effectively atomic: a device-cache
+    // rejection aborts here, having committed NOTHING that would leave an active
+    // friend WITHOUT its carried revocations (Greptile) — and because the commits
+    // are followed only by infallible work + a pre-write notify (below), a
+    // committed pair is always flushed, never applied-but-unpersisted (CodeRabbit).
+    //
     // ZEB-580 S1: cache the requester's cert-attested #2 DM identity (the
     // combined pub keyed by the #2 DM hash), derived from the EnrollmentCert
     // already verified in step 1 above (`verify_enrolled_device`). This is what
@@ -1434,10 +1416,13 @@ pub fn process_friend_request(
     // `req.device_identity_pubs`), which is now discarded for DM signing. Degrade
     // to the legacy #3 bundle ONLY when the cert carries no usable X25519
     // (synthetic / pre-ZEB-372 zeroed cert), then to empty if that bundle is
-    // empty too. `learned_at` is this node's local HLC (the value stamped on the
-    // friend entry just above) — never the peer's claimed time (anti-forgery
-    // rule). An empty result skips the write so a peer that advertised nothing
-    // never LWW-clobbers a previously-known-good cache entry.
+    // empty too. `learned_at` is this node's local HLC (the value also stamped on
+    // the friend entry below) — never the peer's claimed time (anti-forgery rule).
+    // An empty result skips the write so a peer that advertised nothing never
+    // LWW-clobbers a previously-known-good cache entry. A device-cache Rejected is
+    // a security-invariant signal (a peer advertising two different pubs for one
+    // device hash, a mismatched hash, or invalid key sizes), so it still aborts
+    // the whole handshake — but now BEFORE any friendship/revocation commit.
     //
     // ZEB-473 Task 5: the requester's iroh reachability + PQ keys ride along as a
     // SINGLE tunnel contact parallel to the (sole) cached device, so the DM
@@ -1470,7 +1455,7 @@ pub fn process_friend_request(
                 devices,
                 pubs,
                 device_tunnel_contacts,
-                learned_at,
+                learned_at.clone(),
             )
         {
             return Err(FriendHandshakeError::ApplyRejected(format!(
@@ -1479,18 +1464,42 @@ pub fn process_friend_request(
         }
     }
 
-    // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is established AND every
-    // fallible in-memory update above (friend-entry write + device-cache write)
-    // has succeeded, so now apply the requester's carried own-fleet revocations
-    // to the DM revoked-device store + live projection. Ordering matters: placing
-    // this AFTER the device-cache write means a device-cache rejection returns
-    // early WITHOUT stranding an applied-but-unreturned revocation (review: a
-    // post-mutation failure must not leave learned revocations locally applied but
-    // never flushed). The phase-1 verify already proved every pair valid +
-    // owner-bound (`req.from_addr`), so no partial apply is possible; everything
-    // after this point is infallible. `revocations_inserted` rides back to the
-    // dispatch, which arms the owner-state publish (same CRDT) BEFORE the
-    // accept-write.
+    // 4-5. Apply the new friend entry to the CRDT. apply_friend_update re-checks
+    // the key↔master-key invariant; a Rejected is a hard error here.
+    // established_via is Token when the requester supplied a token_sig (the
+    // normal token-invite path); MutualKey for the future Path-A (no-token)
+    // reuse path where no token is present.
+    let entry = FriendEntry {
+        master_ed25519,
+        display: req.display.clone(),
+        status: FriendStatus::Active,
+        established_via: origin_override.unwrap_or_else(|| {
+            if req.token_sig.is_some() {
+                FriendOrigin::Token
+            } else {
+                FriendOrigin::MutualKey
+            }
+        }),
+        referrable: false,
+        learned_at,
+        sealed_secret: Some(sealed),
+    };
+    match state.apply_friend_update(req.from_addr, entry) {
+        ApplyOutcome::Inserted | ApplyOutcome::Merged { .. } => {}
+        ApplyOutcome::Rejected(reason) => {
+            return Err(FriendHandshakeError::ApplyRejected(format!("{reason:?}")));
+        }
+    }
+
+    // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is established, so apply the
+    // requester's carried own-fleet revocations to the DM revoked-device store +
+    // live projection. This is ADJACENT to the friendship write above with no
+    // fallible step between (all fallible updates ran earlier), so an active
+    // friend can never be left without its carried revocations. The phase-1 verify
+    // already proved every pair valid + owner-bound (`req.from_addr`), so no
+    // partial apply is possible; `apply_carried_revocations` is infallible.
+    // `revocations_inserted` rides back to the dispatch, which arms the owner-state
+    // publish (same CRDT) BEFORE the accept-write.
     let revocations_inserted =
         apply_carried_revocations(state, req.from_addr, &req.revocations, revoked);
 
