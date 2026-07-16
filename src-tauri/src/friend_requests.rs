@@ -461,7 +461,7 @@ mod tests {
         let offer = StoredIntroductionOffer {
             voucher: OwnerAddr([2; 16]),
             subject: subj,
-            reachability: fixture_reach(), // existing helper in this test module (:308)
+            reachability: fixture_reach(), // existing helper in this test module (:383)
         };
         store.record_introduction_offer(subj, Some("x".into()), 4242, offer.clone());
         let (peeked, received_at) = store.peek_offer(&subj).expect("offer present");
@@ -662,7 +662,7 @@ mod tests {
         let mk = |s: OwnerAddr| StoredIntroductionOffer {
             voucher: OwnerAddr([9; 16]),
             subject: s,
-            reachability: fixture_reach(), // existing helper in this test module (friend_requests.rs:308)
+            reachability: fixture_reach(), // existing helper in this test module (friend_requests.rs:383)
         };
         let now = 10 * INTRODUCTION_OFFER_TTL_MS;
         store.record_introduction_offer(fresh, None, now, mk(fresh)); // received now → fresh

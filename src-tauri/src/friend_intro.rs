@@ -1617,6 +1617,23 @@ mod tests {
     }
 
     #[test]
+    fn limiter_requester_dedupes_repeat_within_ttl() {
+        let rl = IntroRateLimiter::with_caps(100, 100, 3_600_000, 300_000);
+        let r = OwnerAddr([1; 16]);
+        let t = OwnerAddr([2; 16]);
+        assert!(rl.admit_requester(r, t, 0).is_ok());
+        assert_eq!(
+            rl.admit_requester(r, t, 1),
+            Err("duplicate"),
+            "a repeat (requester, target) within the ttl is deduped"
+        );
+        assert!(
+            rl.admit_requester(r, OwnerAddr([9; 16]), 2).is_ok(),
+            "a different target is not a duplicate"
+        );
+    }
+
+    #[test]
     fn limiter_connection_shield_sheds_one_endpoint_only() {
         let rl = IntroRateLimiter::with_caps(1, 100, 3_600_000, 300_000);
         assert!(rl.admit_connection([1; 32], 0).is_ok());

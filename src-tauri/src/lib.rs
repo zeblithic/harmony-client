@@ -54758,7 +54758,7 @@ pub(crate) async fn accept_friend_request_impl(
             }
             IntroAcceptGate::Vanished => {
                 crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
-                return Err(OWNER_NOT_LOADED_MSG.into());
+                return Err("This introduction is no longer available.".into());
             }
         };
 
@@ -67949,7 +67949,7 @@ mod zeb694_accept_tests {
     use std::sync::Arc;
 
     // ReachabilityAnnouncePayload has no Default; build the 7-field zeroed payload
-    // (mirrors friend_requests.rs:308 fixture_reach — the store never inspects it).
+    // (mirrors friend_requests.rs:383 fixture_reach — the store never inspects it).
     fn fixture_reach() -> crate::reachability_record::ReachabilityAnnouncePayload {
         crate::reachability_record::ReachabilityAnnouncePayload {
             iroh_node_id: [7u8; 32],
