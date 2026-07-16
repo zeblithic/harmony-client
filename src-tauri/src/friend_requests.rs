@@ -168,6 +168,21 @@ impl PendingFriendRequests {
         )
     }
 
+    /// Non-consuming clone of a staged `IntroductionOffer` plus its `received_at_ms`.
+    /// Returns `None` if the entry is absent or a plain `LinkRequest`. The accept
+    /// path uses this (instead of `take_offer`) so a failed dial leaves the offer
+    /// staged for retry (ZEB-694).
+    pub fn peek_offer(&self, subject: &OwnerAddr) -> Option<(StoredIntroductionOffer, u64)> {
+        let inner = self.inner.lock().expect("pending inner mutex poisoned");
+        match inner.inbound.get(subject) {
+            Some(p) => match &p.kind {
+                PendingKind::IntroductionOffer(o) => Some(((**o).clone(), p.received_at_ms)),
+                PendingKind::LinkRequest => None,
+            },
+            None => None,
+        }
+    }
+
     /// Snapshot the currently-pending inbound requests (for the list IPC).
     pub fn list(&self) -> Vec<(OwnerAddr, PendingInbound)> {
         let inner = self.inner.lock().expect("pending inner mutex poisoned");
@@ -377,6 +392,29 @@ mod tests {
         assert!(store.take_offer(&addr(3)).is_none());
         assert_eq!(store.list().len(), 1, "LinkRequest row must remain");
         assert!(matches!(&store.list()[0].1.kind, PendingKind::LinkRequest));
+    }
+
+    #[test]
+    fn peek_offer_clones_without_consuming() {
+        let store = PendingFriendRequests::default();
+        let subj = OwnerAddr([1; 16]);
+        let offer = StoredIntroductionOffer {
+            voucher: OwnerAddr([2; 16]),
+            subject: subj,
+            reachability: fixture_reach(), // existing helper in this test module (:308)
+        };
+        store.record_introduction_offer(subj, Some("x".into()), 4242, offer.clone());
+        let (peeked, received_at) = store.peek_offer(&subj).expect("offer present");
+        assert_eq!(peeked, offer);
+        assert_eq!(received_at, 4242);
+        assert!(store.has_offer(&subj), "peek did NOT consume the offer");
+        // a plain LinkRequest yields None
+        let other = OwnerAddr([9; 16]);
+        store.record_inbound(other, None, 1);
+        assert!(
+            store.peek_offer(&other).is_none(),
+            "a LinkRequest is not an offer"
+        );
     }
 
     #[test]
