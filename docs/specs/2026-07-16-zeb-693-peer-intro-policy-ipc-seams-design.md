@@ -52,7 +52,11 @@ branch**:
   RMW under `connectivity_settings_write_lock()` via `spawn_blocking`
   (moved verbatim from the wrappers).
 * getters: `None` → spec default (`Ok(PeerIntroPolicy::FriendsOfFriends)` /
-  `Ok(true)`); `Some` → `load_or_default(&path).<field>`.
+  `Ok(true)`); `Some` → `load_or_default(&path).<field>`, offloaded via
+  `spawn_blocking` (matching `connectivity_get_identity_discoverable_impl`'s
+  documented rationale — the seam is reachable over the async headless API
+  surface; previously the wrappers did this sync read inline on the Tokio
+  worker). Same values and error strings; adds only the task-join error arm.
 
 The `#[tauri::command]` wrappers shrink to: lock `NodeState` → clone
 `connectivity_settings_path` → delegate to `_impl` → (setters only)

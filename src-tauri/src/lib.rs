@@ -55192,6 +55192,36 @@ pub(crate) async fn decline_dm_invite_impl(
 /// trait object in the iroh link-manager's dispatcher OnceCell, with no
 /// interior-mutability handle exposed), so a running acceptor keeps its prior
 /// value until restart. The persisted value is what the next `start_node` reads.
+/// Testable seam for `set_friend_auto_accept` (ZEB-693): everything after the
+/// NodeState lock. Takes the already-extracted settings path rather than
+/// `&Mutex<NodeState>` (unlike the `connectivity_set_identity_discoverable_impl`
+/// precedent, which needs two state fields and is untestable for it) so unit
+/// tests can drive it with a tempdir path.
+async fn set_friend_auto_accept_impl(
+    settings_path: Option<std::path::PathBuf>,
+    enabled: bool,
+) -> Result<(), String> {
+    let Some(path) = settings_path else {
+        return Err("connectivity_settings_path missing".into());
+    };
+
+    // ZEB-629: file RMW under the process-global settings write lock.
+    // CodeRabbit PR #397 R1: offload the sync load+save to spawn_blocking
+    // (mirrors connectivity_set_identity_discoverable_impl) so a Tokio
+    // worker isn't parked on disk I/O while the lock is held.
+    let _settings_guard = connectivity_settings_write_lock().lock().await;
+    tokio::task::spawn_blocking(move || {
+        let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.friend_auto_accept_known = enabled;
+        settings
+            .save(&path)
+            .map_err(|e| format!("save connectivity-settings: {e}"))
+    })
+    .await
+    .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    Ok(())
+}
+
 #[tauri::command]
 async fn set_friend_auto_accept(
     app: tauri::AppHandle,
@@ -55205,28 +55235,7 @@ async fn set_friend_auto_accept(
             .connectivity_settings_path
             .clone()
     };
-    let Some(path) = path else {
-        return Err("connectivity_settings_path missing".into());
-    };
-
-    {
-        // ZEB-629: file RMW under the process-global settings write lock.
-        // CodeRabbit PR #397 R1: offload the sync load+save to spawn_blocking
-        // (mirrors connectivity_set_identity_discoverable_impl) so a Tokio
-        // worker isn't parked on disk I/O while the lock is held.
-        let _settings_guard = connectivity_settings_write_lock().lock().await;
-        let rmw_path = path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut settings =
-                connectivity_settings::ConnectivitySettings::load_or_default(&rmw_path);
-            settings.friend_auto_accept_known = enabled;
-            settings
-                .save(&rmw_path)
-                .map_err(|e| format!("save connectivity-settings: {e}"))
-        })
-        .await
-        .map_err(|e| format!("save connectivity-settings task: {e}"))??;
-    }
+    set_friend_auto_accept_impl(path, enabled).await?;
 
     // Emit so the UI reflects the toggle (and can surface the "applies on next
     // start" hint).
@@ -55237,6 +55246,25 @@ async fn set_friend_auto_accept(
         tracing::warn!(error = %e, "set_friend_auto_accept: emit failed");
     }
     Ok(())
+}
+
+/// Testable seam for `get_friend_auto_accept` (ZEB-693); see
+/// `set_friend_auto_accept_impl` for why it takes the path, not the state.
+/// The sync fs read moves off the Tokio worker via spawn_blocking, matching
+/// `connectivity_get_identity_discoverable_impl` (this seam is reachable over
+/// the async headless API surface).
+async fn get_friend_auto_accept_impl(
+    settings_path: Option<std::path::PathBuf>,
+) -> Result<bool, String> {
+    let Some(path) = settings_path else {
+        // Node not running / pkarr not initialized — return the spec default (ON).
+        return Ok(true);
+    };
+    tokio::task::spawn_blocking(move || {
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).friend_auto_accept_known
+    })
+    .await
+    .map_err(|e| format!("load connectivity-settings task: {e}"))
 }
 
 /// Read the current "auto-accept known requesters" toggle from the persisted
@@ -55251,14 +55279,7 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
             .connectivity_settings_path
             .clone()
     };
-    let Some(path) = path else {
-        // Node not running / pkarr not initialized — return the spec default (ON).
-        return Ok(true);
-    };
-    Ok(
-        connectivity_settings::ConnectivitySettings::load_or_default(&path)
-            .friend_auto_accept_known,
-    )
+    get_friend_auto_accept_impl(path).await
 }
 
 /// Set the per-user introduction policy (ZEB-376) and persist it to
@@ -55267,6 +55288,30 @@ async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Re
 /// `Introduction` handler reads the policy fresh from the settings file per
 /// inbound introduction, so a change takes effect on the next introduction with
 /// no restart.
+/// Testable seam for `set_peer_intro_policy` (ZEB-693); see
+/// `set_friend_auto_accept_impl` for why it takes the path, not the state.
+async fn set_peer_intro_policy_impl(
+    settings_path: Option<std::path::PathBuf>,
+    policy: crate::friend_graph::PeerIntroPolicy,
+) -> Result<(), String> {
+    let Some(path) = settings_path else {
+        return Err("connectivity_settings_path missing".into());
+    };
+
+    // ZEB-629: file RMW under the process-global settings write lock.
+    let _settings_guard = connectivity_settings_write_lock().lock().await;
+    tokio::task::spawn_blocking(move || {
+        let mut settings = connectivity_settings::ConnectivitySettings::load_or_default(&path);
+        settings.peer_intro_policy = policy;
+        settings
+            .save(&path)
+            .map_err(|e| format!("save connectivity-settings: {e}"))
+    })
+    .await
+    .map_err(|e| format!("save connectivity-settings task: {e}"))??;
+    Ok(())
+}
+
 #[tauri::command]
 async fn set_peer_intro_policy(
     app: tauri::AppHandle,
@@ -55280,25 +55325,7 @@ async fn set_peer_intro_policy(
             .connectivity_settings_path
             .clone()
     };
-    let Some(path) = path else {
-        return Err("connectivity_settings_path missing".into());
-    };
-
-    {
-        // ZEB-629: file RMW under the process-global settings write lock.
-        let _settings_guard = connectivity_settings_write_lock().lock().await;
-        let rmw_path = path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut settings =
-                connectivity_settings::ConnectivitySettings::load_or_default(&rmw_path);
-            settings.peer_intro_policy = policy;
-            settings
-                .save(&rmw_path)
-                .map_err(|e| format!("save connectivity-settings: {e}"))
-        })
-        .await
-        .map_err(|e| format!("save connectivity-settings task: {e}"))??;
-    }
+    set_peer_intro_policy_impl(path, policy).await?;
 
     if let Err(e) = app.emit(
         "connectivity-peer-intro-policy-changed",
@@ -55307,6 +55334,23 @@ async fn set_peer_intro_policy(
         tracing::warn!(error = %e, "set_peer_intro_policy: emit failed");
     }
     Ok(())
+}
+
+/// Testable seam for `get_peer_intro_policy` (ZEB-693); see
+/// `get_friend_auto_accept_impl` for the path-not-state and spawn_blocking
+/// rationale.
+async fn get_peer_intro_policy_impl(
+    settings_path: Option<std::path::PathBuf>,
+) -> Result<crate::friend_graph::PeerIntroPolicy, String> {
+    let Some(path) = settings_path else {
+        // Node not running / pkarr not initialized — return the spec default.
+        return Ok(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
+    };
+    tokio::task::spawn_blocking(move || {
+        connectivity_settings::ConnectivitySettings::load_or_default(&path).peer_intro_policy
+    })
+    .await
+    .map_err(|e| format!("load connectivity-settings task: {e}"))
 }
 
 /// Read the current introduction policy from the persisted settings. Returns the
@@ -55322,11 +55366,7 @@ async fn get_peer_intro_policy(
             .connectivity_settings_path
             .clone()
     };
-    let Some(path) = path else {
-        // Node not running / pkarr not initialized — return the spec default.
-        return Ok(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
-    };
-    Ok(connectivity_settings::ConnectivitySettings::load_or_default(&path).peer_intro_policy)
+    get_peer_intro_policy_impl(path).await
 }
 
 /// ZEB-419: serializes the nickname-file read-modify-write so two concurrent
@@ -57280,82 +57320,136 @@ mod friend_ipc_tests {
         assert!(!super::resolve_error_is_transient_unreachable(""));
     }
 
-    #[test]
-    fn set_friend_auto_accept_persists_round_trips() {
-        // The IPC's persistence half (independent of NodeState): flipping the
-        // toggle writes through `ConnectivitySettings::save` and reads back via
-        // `load_or_default`, exactly as `set_/get_friend_auto_accept` do.
+    #[tokio::test]
+    async fn friend_auto_accept_impl_round_trips() {
+        // ZEB-693: drives the real IPC seam (`set_/get_friend_auto_accept_impl`)
+        // rather than re-implementing its load/save inline, so the command's own
+        // persistence logic is what's under test.
         let td = tempfile::TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
 
-        // Default (no file) is ON (spec §7.1) — what `get_friend_auto_accept`
-        // returns when the file is absent.
-        assert!(
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
-                .friend_auto_accept_known
-        );
+        // Default (no file) is ON (spec §7.1).
+        assert!(super::get_friend_auto_accept_impl(Some(path.clone()))
+            .await
+            .expect("get default"));
 
-        let mut settings =
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
-        settings.friend_auto_accept_known = false;
-        settings.save(&path).expect("save");
+        super::set_friend_auto_accept_impl(Some(path.clone()), false)
+            .await
+            .expect("set OFF");
         assert!(
-            !crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
-                .friend_auto_accept_known,
+            !super::get_friend_auto_accept_impl(Some(path.clone()))
+                .await
+                .expect("get OFF"),
             "toggle OFF persists"
         );
 
-        let mut settings =
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
-        settings.friend_auto_accept_known = true;
-        settings.save(&path).expect("save");
+        super::set_friend_auto_accept_impl(Some(path.clone()), true)
+            .await
+            .expect("set ON");
         assert!(
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
-                .friend_auto_accept_known,
+            super::get_friend_auto_accept_impl(Some(path))
+                .await
+                .expect("get ON"),
             "toggle back ON persists"
         );
     }
 
-    #[test]
-    fn set_peer_intro_policy_persists_round_trips() {
-        // Mirrors `set_friend_auto_accept_persists_round_trips`: the IPC's
-        // persistence half (independent of NodeState) — `set_peer_intro_policy`
-        // and `get_peer_intro_policy` both funnel through
-        // `ConnectivitySettings::load_or_default` / `::save`, so exercising that
-        // round trip directly covers the same logic without needing a live
-        // `tauri::AppHandle`/`State`.
+    #[tokio::test]
+    async fn friend_auto_accept_impl_none_path() {
+        // No settings path (node not running / pkarr not initialized): the
+        // setter must error and the getter must return the spec default (ON) —
+        // the branches the old inline round-trip never covered.
+        let err = super::set_friend_auto_accept_impl(None, true)
+            .await
+            .expect_err("set without a settings path must fail");
+        assert!(
+            err.contains("connectivity_settings_path missing"),
+            "unexpected error: {err}"
+        );
+        assert!(super::get_friend_auto_accept_impl(None)
+            .await
+            .expect("get default"));
+    }
+
+    #[tokio::test]
+    async fn peer_intro_policy_impl_round_trips() {
+        // ZEB-693: mirrors `friend_auto_accept_impl_round_trips` — the seam
+        // itself, every variant.
+        use crate::friend_graph::PeerIntroPolicy;
+
         let td = tempfile::TempDir::new().expect("tempdir");
         let path = td.path().join("connectivity-settings.json");
 
-        // Default (no file) is FriendsOfFriends (ZEB-376 spec default) — what
-        // `get_peer_intro_policy` returns when the file is absent.
+        // Default (no file) is FriendsOfFriends (ZEB-376 spec default).
         assert_eq!(
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
-                .peer_intro_policy,
+            super::get_peer_intro_policy_impl(Some(path.clone()))
+                .await
+                .expect("get default"),
+            PeerIntroPolicy::FriendsOfFriends
+        );
+
+        for policy in [
+            PeerIntroPolicy::Open,
+            PeerIntroPolicy::AskMe,
+            PeerIntroPolicy::Closed,
+            PeerIntroPolicy::FriendsOfFriends,
+        ] {
+            super::set_peer_intro_policy_impl(Some(path.clone()), policy)
+                .await
+                .expect("set");
+            assert_eq!(
+                super::get_peer_intro_policy_impl(Some(path.clone()))
+                    .await
+                    .expect("get"),
+                policy,
+                "{policy:?} persists"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_intro_policy_impl_none_path() {
+        let err =
+            super::set_peer_intro_policy_impl(None, crate::friend_graph::PeerIntroPolicy::AskMe)
+                .await
+                .expect_err("set without a settings path must fail");
+        assert!(
+            err.contains("connectivity_settings_path missing"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            super::get_peer_intro_policy_impl(None)
+                .await
+                .expect("get default"),
             crate::friend_graph::PeerIntroPolicy::FriendsOfFriends
         );
+    }
 
-        let mut settings =
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
-        settings.peer_intro_policy = crate::friend_graph::PeerIntroPolicy::AskMe;
-        settings.save(&path).expect("save");
-        assert_eq!(
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
-                .peer_intro_policy,
-            crate::friend_graph::PeerIntroPolicy::AskMe,
-            "AskMe persists"
-        );
+    #[test]
+    fn peer_intro_policy_serde_tokens_pinned() {
+        // ZEB-693: the Tauri IPC macro (de)serializes the `policy` parameter
+        // with exactly this serde representation — these tokens ARE the JS
+        // contract (`friend-service.ts` sends/receives them). A variant rename
+        // that would silently break the frontend fails here.
+        use crate::friend_graph::PeerIntroPolicy;
 
-        let mut settings =
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path);
-        settings.peer_intro_policy = crate::friend_graph::PeerIntroPolicy::Closed;
-        settings.save(&path).expect("save");
-        assert_eq!(
-            crate::connectivity_settings::ConnectivitySettings::load_or_default(&path)
-                .peer_intro_policy,
-            crate::friend_graph::PeerIntroPolicy::Closed,
-            "Closed persists"
-        );
+        for (policy, token) in [
+            (PeerIntroPolicy::Open, "\"open\""),
+            (PeerIntroPolicy::FriendsOfFriends, "\"fof\""),
+            (PeerIntroPolicy::AskMe, "\"ask\""),
+            (PeerIntroPolicy::Closed, "\"closed\""),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&policy).expect("serialize"),
+                token,
+                "{policy:?} serialize token drifted"
+            );
+            assert_eq!(
+                serde_json::from_str::<PeerIntroPolicy>(token).expect("deserialize"),
+                policy,
+                "{token} deserialize target drifted"
+            );
+        }
     }
 
     #[test]
