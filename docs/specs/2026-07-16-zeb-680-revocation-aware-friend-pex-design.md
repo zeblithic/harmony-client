@@ -115,7 +115,9 @@ pub revocations: Vec<RevocationAttestation>,
   (`vec_devhash_capped` / `MAX_DEVICES_PER_OWNER` visitors error, they never truncate).
   Serialization sends at most the same cap (smallest-N by byte order for determinism,
   matching the ZEB-692 store-cap convention).
-- **No byte-pinned fixtures exist for the friend-link frames** (verified) — old-frame
+- **Byte pins (execution amendment, T1 review):** `zeb370_fixtures` DOES byte-pin both
+  friend-link frames — the pins stay valid because an empty `revocations` vec skips the
+  `"v"` key entirely (`skip_serializing_if`), and fixture literals stay empty. Old-frame
   decoding is covered by `serde(default)`; the intro/PEX frames (`IntroduceRequest`,
   `Introduction`, catalog) are **untouched**, so the zeb375/zeb376 hex pins stay byte-identical.
 

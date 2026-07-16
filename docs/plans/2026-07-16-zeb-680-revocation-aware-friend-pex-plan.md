@@ -20,7 +20,9 @@ Svelte 5 + vitest frontend.
 
 - zeb375/zeb376 wire fixtures stay **byte-identical** — `IntroduceRequest`, `Introduction`,
   `PexFrame`, catalog frames gain NO fields. Only `FriendLinkRequest`/`FriendLinkAccepted`
-  change (no byte pins exist on those; back-compat via `#[serde(default)]`).
+  change. **zeb370_fixtures byte-pins BOTH friend-link frames** (T1 review finding): the pins
+  hold because empty `revocations` skips the `"v"` key — fixture struct literals must stay
+  `Vec::new()`; back-compat via `#[serde(default)]`.
 - `enrollment_verify::verify_enrollment_any_issuer` stays pure and untouched; no async added
   to any verifier.
 - Every local `OwnerState` mutation pairs with the owner-state dirty notification
