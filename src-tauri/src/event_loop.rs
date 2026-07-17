@@ -28,6 +28,11 @@ pub struct SyncEngineHandles {
     pub outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     /// Bytes received from Zenoh, forwarded into the SyncEngine.
     pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// ZEB-707: sender for owner-state root-serve requests. The state-root
+    /// queryable task forwards each inbound zenoh root query over this to the
+    /// engine, which replies the current root wire so a butler that missed the
+    /// live push can PULL it. Obtained from `SyncEngine::root_serve_tx()`.
+    pub root_serve_tx: tokio::sync::mpsc::Sender<crate::fleet_sync::RootServeReq>,
 }
 
 /// Mint sync Zenoh adapter handles. Mirrors `SyncEngineHandles` — constructed
@@ -1558,6 +1563,176 @@ pub async fn run(
                         }
                     }
                 });
+
+                // ZEB-707 (server side of the pull): a queryable on the
+                // state-root topic. A butler that missed the live push GETs this
+                // key; we forward each query to the engine over `root_serve_tx`
+                // and reply the current root wire, which the butler runs through
+                // its normal inbound decrypt/merge path. Mirrors the community
+                // state-root queryable (`spawn_community_state_zenoh_adapter`).
+                let session_qbl = session.clone();
+                let key_qbl = key_expr.clone();
+                let topic_qbl = topic.clone();
+                let closing_qbl = Arc::clone(&closing);
+                let root_serve_tx_qbl = handles.root_serve_tx;
+                tokio::spawn(async move {
+                    let qbl = match session_qbl.declare_queryable(&key_qbl).await {
+                        Ok(q) => q,
+                        Err(e) => {
+                            if !closing_qbl.load(Ordering::SeqCst) {
+                                tracing::error!(topic = %topic_qbl, error = %e,
+                                    "failed to declare owner-state root queryable");
+                            }
+                            return;
+                        }
+                    };
+                    loop {
+                        tokio::select! {
+                            biased;
+                            res = qbl.recv_async() => {
+                                let Ok(query) = res else { break; };
+                                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                                if root_serve_tx_qbl.send(reply_tx).await.is_err() {
+                                    break; // engine gone
+                                }
+                                // Only Ok(Ok(_)) is servable; an encode error is
+                                // logged engine-side and simply not answered.
+                                if let Ok(Ok(wire)) = reply_rx.await {
+                                    if let Err(e) = query.reply(query.key_expr(), wire).await {
+                                        tracing::warn!(topic = %topic_qbl, error = %e,
+                                            "owner-state root queryable reply failed");
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                                if closing_qbl.load(Ordering::SeqCst) { break; }
+                            }
+                        }
+                    }
+                });
+
+                // ZEB-707 (receiver side of the pull): a GET-driver task fed by
+                // a `run_root_fetch_driver`. The driver re-arms on transport-epoch
+                // bumps (a fleet peer (re)connecting), the presence kick, and an
+                // ~hourly anti-entropy floor; each arm sends one request, and this
+                // task runs the zenoh GET and pipes every reply into the engine's
+                // inbound path — so a butler PULLs the primary's root when the
+                // live push never fired (D3 Mode B). Mirrors the community
+                // `rf_handle` GET driver + the mail-root driver spawn. The fetch
+                // request/report channel is local: both ends live in this scope.
+                let (fetch_request_tx, mut fetch_request_rx) =
+                    tokio::sync::mpsc::channel::<CommunityRootFetchRequest>(8);
+                let session_rf = session.clone();
+                let key_rf = topic.clone();
+                // Clone BEFORE the subscriber task below moves `handles.inbound_tx`.
+                let subscriber_tx_rf = handles.inbound_tx.clone();
+                let closing_rf = Arc::clone(&closing);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            maybe = fetch_request_rx.recv() => {
+                                let Some(req) = maybe else { break; };
+                                let receiver = match session_rf
+                                    .get(&key_rf)
+                                    .consolidation(zenoh::query::ConsolidationMode::None)
+                                    .timeout(Duration::from_secs(10))
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        if !closing_rf.load(Ordering::SeqCst) {
+                                            tracing::warn!(key = %key_rf, error = %e,
+                                                "owner-state root fetch query failed");
+                                        }
+                                        continue; // report drops → driver maps to NoReply
+                                    }
+                                };
+                                let mut replies: usize = 0;
+                                let drained_clean: bool = loop {
+                                    tokio::select! {
+                                        biased;
+                                        res = receiver.recv_async() => {
+                                            let Ok(reply) = res else { break true; };
+                                            if let Ok(sample) = reply.into_result() {
+                                                let bytes: Vec<u8> =
+                                                    sample.payload().to_bytes().to_vec();
+                                                if subscriber_tx_rf.send(bytes).await.is_err() {
+                                                    return; // engine teardown
+                                                }
+                                                replies = replies.saturating_add(1);
+                                            }
+                                        }
+                                        _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                                            if closing_rf.load(Ordering::SeqCst) { break false; }
+                                        }
+                                    }
+                                };
+                                if drained_clean {
+                                    let _ = req.report.send(replies);
+                                }
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                                if closing_rf.load(Ordering::SeqCst) { break; }
+                            }
+                        }
+                    }
+                });
+
+                // Shutdown bridge: flip the driver's watch when `closing` flips
+                // (1s poll — mirrors the mail-root driver and the adapter tasks).
+                let (owner_root_shutdown_tx, owner_root_shutdown_rx) =
+                    tokio::sync::watch::channel(false);
+                {
+                    let closing_drv = Arc::clone(&closing);
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            if closing_drv.load(Ordering::SeqCst) {
+                                let _ = owner_root_shutdown_tx.send(true);
+                                return;
+                            }
+                        }
+                    });
+                }
+                let request_root = move || {
+                    let fetch_tx = fetch_request_tx.clone();
+                    async move {
+                        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+                        if fetch_tx
+                            .send(CommunityRootFetchRequest { report: report_tx })
+                            .await
+                            .is_err()
+                        {
+                            return crate::channel_backfill::RootFetch::EngineGone;
+                        }
+                        match report_rx.await {
+                            Ok(n) if n > 0 => crate::channel_backfill::RootFetch::Answered,
+                            Ok(_) | Err(_) => crate::channel_backfill::RootFetch::NoReply,
+                        }
+                    }
+                };
+                tokio::spawn(crate::channel_backfill::run_root_fetch_driver(
+                    crate::channel_backfill::RootFetchLatch::new(),
+                    request_root,
+                    owner_root_shutdown_rx,
+                    // event_loop holds the epoch/presence SENDERS; derive receivers.
+                    // `.subscribe()` is legal here — this precedes the presence
+                    // sender's move into the presence task.
+                    Some(transport_epoch_tx.subscribe()),
+                    Some(presence_resync_tx.subscribe()),
+                    // ZEB-425 anti-entropy floor: re-arm ~hourly (jittered) even
+                    // with no epoch bump. Not restart-aware — the epoch + presence
+                    // kicks cover reconnect; a persisted floor is a future add.
+                    Some(crate::channel_backfill::periodic_resync_interval_ms()),
+                    || {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0)
+                    },
+                    None,
+                ));
 
                 // Inbound: Zenoh subscriber → SyncEngine subscriber_rx.
                 match session.declare_subscriber(&key_expr).await {

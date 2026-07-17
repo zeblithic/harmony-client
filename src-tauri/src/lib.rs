@@ -4909,6 +4909,9 @@ pub async fn start_node_inner(
                         addr_hex: owner_addr_hex.clone(),
                         outbound_rx: out_rx,
                         inbound_tx: in_tx,
+                        // ZEB-707: route the engine's root-serve channel to the
+                        // state-root queryable so a butler can PULL our root.
+                        root_serve_tx: engine.root_serve_tx(),
                     });
 
                     tracing::info!("BOOT-PROBE 02: iroh/pkarr/profile sections done, entering mint sync engine");
