@@ -1574,6 +1574,7 @@ pub async fn run(
                 let key_qbl = key_expr.clone();
                 let topic_qbl = topic.clone();
                 let closing_qbl = Arc::clone(&closing);
+                let app_qbl = app.clone();
                 let root_serve_tx_qbl = handles.root_serve_tx;
                 tokio::spawn(async move {
                     let qbl = match session_qbl.declare_queryable(&key_qbl).await {
@@ -1582,6 +1583,21 @@ pub async fn run(
                             if !closing_qbl.load(Ordering::SeqCst) {
                                 tracing::error!(topic = %topic_qbl, error = %e,
                                     "failed to declare owner-state root queryable");
+                                // Surface the serving failure to the GUI like the
+                                // subscriber path, so a dead pull-serve side is
+                                // visible rather than silent (CodeRabbit). This
+                                // queryable structure mirrors the production-proven
+                                // community state-root queryable; adding
+                                // re-declaration recovery to both is a codebase-wide
+                                // follow-up, not owner-state-specific.
+                                crate::node_event_sink::emit_ser(
+                                    app_qbl.as_ref(),
+                                    "state-root-sync-degraded",
+                                    &serde_json::json!({
+                                        "reason": "declare_queryable_failed",
+                                        "topic": &topic_qbl,
+                                    }),
+                                );
                             }
                             return;
                         }
@@ -1633,6 +1649,21 @@ pub async fn run(
                             biased;
                             maybe = fetch_request_rx.recv() => {
                                 let Some(req) = maybe else { break; };
+                                // NB: this GET intentionally uses the default
+                                // `Locality::Any`, NOT `Remote`. A paired butler
+                                // is often co-located with its primary (same home
+                                // LAN — the D3 topology), and `Locality::Remote`
+                                // was observed live to exclude the co-located
+                                // primary's queryable, not just this node's own
+                                // self-reply — breaking the pull entirely (D3 red).
+                                // The self-reply that `Remote` would suppress is
+                                // benign: a reachable primary answers the SAME GET
+                                // (the pull's purpose), so the latch is satisfied by
+                                // a real root; the only case a lone self-reply
+                                // satisfies it early is when the primary didn't
+                                // answer — where no pull could have succeeded anyway,
+                                // and the epoch/floor re-arm retries. Its own root
+                                // is echo-suppressed on the inbound side regardless.
                                 let receiver = match session_rf
                                     .get(&key_rf)
                                     .consolidation(zenoh::query::ConsolidationMode::None)
