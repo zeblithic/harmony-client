@@ -58,6 +58,15 @@ pub struct NetworkHealthSnapshot {
     /// `#[serde(default)]` keeps a pre-field snapshot forward-compatible.
     #[serde(default)]
     pub transport_disabled_reason: Option<String>,
+    /// ZEB-702 (Component D): butler-deposit accept/reject decision counts.
+    /// `None` when this node runs no butler-deposit acceptor (no owner
+    /// identity loaded — headless / owner-less), serialized as `null` per the
+    /// `Option` convention above. Lets an always-rejecting butler (a sibling
+    /// whose `friend_graph` never converged) be told apart from transport
+    /// failure at the panel / e2e layer. `#[serde(default)]` keeps a pre-field
+    /// snapshot forward-compatible.
+    #[serde(default)]
+    pub butler_deposits: Option<ButlerDepositHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -218,6 +227,19 @@ pub struct DialHealthSummary {
     #[serde(default)]
     pub connected: u32,
     pub recent: Vec<DynamicDialHit>,
+}
+
+/// ZEB-702 (Component D): process-lifetime butler-deposit decision counts,
+/// mirrored from the acceptor's `ButlerDepositStats`
+/// (`iroh_butler_acceptor.rs`). Serde camelCase — the e2e assertions read the
+/// exact `accepted` / `rejectedUnauthorized` / `rejectedOther` keys. Field
+/// order matches the acceptor's `ButlerDepositCounts`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ButlerDepositHealth {
+    pub accepted: u64,
+    pub rejected_unauthorized: u64,
+    pub rejected_other: u64,
 }
 
 /// ZEB-620: live per-peer-state tally derived from a supervisor
@@ -464,6 +486,8 @@ impl NetworkHealthSnapshot {
             // path. The reason (if transport is disabled this session) is
             // stamped on by the IPC from NodeState; default None here.
             transport_disabled_reason: None,
+            // ZEB-702: no service ⇒ no acceptor to read counts from.
+            butler_deposits: None,
         }
     }
 }
@@ -871,6 +895,13 @@ pub struct NetworkHealthService {
     /// no self-row filtering happens (additive like the other `set_*`
     /// sources). Consumed by `snapshot` to drop the self row from `peers[]`.
     self_owner: Option<[u8; 16]>,
+    /// ZEB-702 (Component D): butler-deposit decision-counter source — the SAME
+    /// `Arc` the acceptor shell increments (`iroh_butler_acceptor.rs`). `None`
+    /// on nodes with no acceptor installed (no owner identity); then
+    /// `snapshot().butler_deposits` is `None`. Installed at boot via
+    /// [`set_butler_deposit_source`](Self::set_butler_deposit_source),
+    /// additive like the other `set_*` sources.
+    butler_deposits: Option<std::sync::Arc<crate::iroh_butler_acceptor::ButlerDepositStats>>,
 }
 
 impl NetworkHealthService {
@@ -898,6 +929,7 @@ impl NetworkHealthService {
             last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             notify_tx: None,
             self_owner: None,
+            butler_deposits: None,
         }
     }
 
@@ -939,6 +971,17 @@ impl NetworkHealthService {
     /// happens — additive like the other `set_*` sources.
     pub fn set_self_owner(&mut self, owner: [u8; 16]) {
         self.self_owner = Some(owner);
+    }
+
+    /// ZEB-702 (Component D): install the butler-deposit stats source — the
+    /// SAME `Arc` the acceptor shell increments. Called once at boot alongside
+    /// the acceptor install; when unset (no acceptor — no owner), `snapshot`'s
+    /// `butler_deposits` stays `None`, matching the other additive sources.
+    pub fn set_butler_deposit_source(
+        &mut self,
+        src: std::sync::Arc<crate::iroh_butler_acceptor::ButlerDepositStats>,
+    ) {
+        self.butler_deposits = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -1174,6 +1217,17 @@ impl NetworkHealthService {
             // The disabled case has no service and goes through the IPC's
             // empty()-path stamp instead.
             transport_disabled_reason: None,
+            // ZEB-702 (Component D): butler-deposit decision counts, read from
+            // the acceptor's shared stats. `None` (absent section) when no
+            // acceptor is installed on this node (no owner identity).
+            butler_deposits: self.butler_deposits.as_ref().map(|s| {
+                let c = s.snapshot();
+                ButlerDepositHealth {
+                    accepted: c.accepted,
+                    rejected_unauthorized: c.rejected_unauthorized,
+                    rejected_other: c.rejected_other,
+                }
+            }),
         }
     }
 
@@ -2812,6 +2866,7 @@ mod tests {
             },
             dial_status: DialHealthSummary::default(),
             transport_disabled_reason: None,
+            butler_deposits: None,
         }
     }
 
@@ -3053,6 +3108,68 @@ mod tests {
         assert!(snap.my_network.is_none());
         assert!(snap.peers.is_empty());
         assert_eq!(snap.schema_version, 4);
+    }
+
+    // ── ZEB-702 Task 5: butler-deposit counters in the snapshot ────
+    #[tokio::test]
+    async fn snapshot_butler_deposits_section_serializes_camelcase() {
+        use crate::iroh_butler_acceptor::{ButlerDepositStats, DepositReject};
+        let stats = std::sync::Arc::new(ButlerDepositStats::new());
+        stats.record_accepted(); // accepted = 1
+        stats.record_rejected(&DepositReject::NotAuthorized); // rejected_unauthorized = 1
+        stats.record_rejected(&DepositReject::NotAuthorized); // = 2
+        stats.record_rejected(&DepositReject::WrongRecipient); // rejected_other = 1
+        stats.record_rejected(&DepositReject::WrongRecipient); // = 2
+        stats.record_rejected(&DepositReject::WrongRecipient); // = 3
+
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_butler_deposit_source(std::sync::Arc::clone(&stats));
+
+        let snap = svc.snapshot().await;
+        // Also assert the typed field, so the test pins BOTH the wire keys and
+        // the Rust-side mapping.
+        assert_eq!(
+            snap.butler_deposits,
+            Some(ButlerDepositHealth {
+                accepted: 1,
+                rejected_unauthorized: 2,
+                rejected_other: 3,
+            })
+        );
+        let v = serde_json::to_value(&snap).expect("snapshot serializes");
+        let bd = &v["butlerDeposits"];
+        assert_eq!(bd["accepted"], serde_json::json!(1));
+        assert_eq!(bd["rejectedUnauthorized"], serde_json::json!(2));
+        assert_eq!(bd["rejectedOther"], serde_json::json!(3));
+        // No snake_case key leakage past the camelCase rename.
+        assert!(bd.get("rejected_unauthorized").is_none());
+        assert!(bd.get("rejected_other").is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_without_acceptor_omits_butler_deposits() {
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        let snap = svc.snapshot().await;
+        assert!(snap.butler_deposits.is_none());
+        let v = serde_json::to_value(&snap).expect("snapshot serializes");
+        // Present-as-null per the DTO's `Option` convention (the `myNetwork`
+        // pattern) — the no-acceptor case is a null section, not a fabricated
+        // zeroed one.
+        assert!(v["butlerDeposits"].is_null());
     }
 
     #[tokio::test]

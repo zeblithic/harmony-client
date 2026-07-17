@@ -4108,6 +4108,16 @@ pub async fn start_node_inner(
         let mut butler_deposit_client_for_state: Option<
             std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>,
         > = None;
+        // ZEB-702 T5 (Component D): lifted alongside `butler_deposit_client_for_state`
+        // so the acceptor's decision counters (built below only when iroh binds
+        // AND an owner is loaded) reach the `NetworkHealthService` construction
+        // further down — the same outer-scope hand-out the other acceptor handles
+        // use, since the acceptor block is nested and closes before that point.
+        // Stays `None` on an owner-less node (no acceptor built) → the snapshot's
+        // `butlerDeposits` section is then absent.
+        let mut butler_deposit_stats_for_state: Option<
+            std::sync::Arc<crate::iroh_butler_acceptor::ButlerDepositStats>,
+        > = None;
         // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
         // adapter requests handed to the event loop. Both stay None /
         // empty when no owner identity is loaded (registry depends on
@@ -9719,6 +9729,15 @@ pub async fn start_node_inner(
                                 deposit_ctx,
                             ),
                         );
+                        // ZEB-702 T5 (Component D): capture the decision-counter
+                        // handle before the acceptor moves into the link manager,
+                        // but hand it to the outer scope (for the NH build — this
+                        // block closes first) only on SUCCESSFUL install. In the
+                        // OnceLock-refusal branch the link manager keeps the PRIOR
+                        // acceptor, whose stats handle is unreachable here —
+                        // surfacing this orphan's zeroed counters would misreport,
+                        // so the snapshot section honestly stays absent.
+                        let butler_deposit_stats = butler_acceptor.deposit_stats();
                         if link_mgr
                             .install_butler_deposit_acceptor(butler_acceptor)
                             .is_err()
@@ -9732,6 +9751,8 @@ pub async fn start_node_inner(
                                  installed on iroh link manager — keeping \
                                  the prior instance"
                             );
+                        } else {
+                            butler_deposit_stats_for_state = Some(butler_deposit_stats);
                         }
 
                         // ── ZEB-473 (DM-over-iroh, Move 1a) Task 6/7: build the
@@ -10851,6 +10872,65 @@ pub async fn start_node_inner(
                 // ZEB-621: hand the address-change fan-out to event_loop::run so
                 // the supervisor sweep hook is installed where the handle is minted.
                 let addr_fanout_for_loop = addr_fanout_opt.clone();
+                // ZEB-702 T3 (Component B): bundle every owner-scoped dataset
+                // engine as an `Arc<dyn RepublishDirty>` for the transport-epoch
+                // republish listener in event_loop::run. On a transport up-edge
+                // each is nudged to re-offer its current root, closing the
+                // late-joiner hole (the D3 300s roster stall where a cert-only
+                // butler's owner-state `friend_graph` never converges). Built
+                // from CLONES so the originals below still install on NodeState;
+                // `push` coerces each `Arc<Concrete>` to `Arc<dyn RepublishDirty>`
+                // at the argument site. owner-state (`sync_engine_arc`) is the
+                // `friend_graph` carrier — the whole point of ZEB-702. Datasets
+                // match the spec §"Component B" list — all 12 owner-scoped
+                // engines, including relay-hold/relay-optin (added by T3b when
+                // the original 10-dataset enumeration was found incomplete).
+                let republish_on_epoch_for_loop: Vec<
+                    std::sync::Arc<dyn crate::fleet_sync::RepublishDirty>,
+                > = {
+                    let mut v: Vec<std::sync::Arc<dyn crate::fleet_sync::RepublishDirty>> =
+                        Vec::new();
+                    if let Some(e) = sync_engine_arc.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = fleet_net_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = dm_inbox_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = dm_outhold_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = owner_trust_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = fleet_keys_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = owner_quorum_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = community_device_intro_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = mint_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = notes_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    // ZEB-702: relay-hold/relay-optin are owner-scoped datasets
+                    // too (harmony/owner/{addr}/ds/relay-*-v1) — a late-linking
+                    // sibling needs their current state like any other.
+                    if let Some(e) = relay_hold_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = relay_optin_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    v
+                };
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -10951,6 +11031,10 @@ pub async fn start_node_inner(
                                 // 5s peer-refresh arm bumps it on every
                                 // never-before-seen zenoh session id.
                                 transport_epoch_tx,
+                                // ZEB-702 T3 (Component B): owner-dataset engines
+                                // the epoch listener nudges to re-offer on a
+                                // transport up-edge.
+                                republish_on_epoch_for_loop,
                                 // ZEB-599 Direction 1: presence-driven
                                 // full-reconcile sender — handed to each
                                 // community presence subscriber, bumped when a
@@ -11479,6 +11563,17 @@ pub async fn start_node_inner(
                             nh.set_protocol_compat_source(std::sync::Arc::clone(
                                 &guard.protocol_compat,
                             ));
+                            // ZEB-702 T5 (Component D): butler-deposit decision
+                            // counts. Same `Arc` the acceptor shell increments
+                            // (stashed at the acceptor install, before the move
+                            // into the link manager) — the panel / e2e can tell an
+                            // always-rejecting butler from a transport failure.
+                            // `None` on an owner-less node (no acceptor was built,
+                            // even though iroh bound and this block runs), so the
+                            // snapshot's `butlerDeposits` section stays absent.
+                            if let Some(stats) = butler_deposit_stats_for_state.as_ref() {
+                                nh.set_butler_deposit_source(std::sync::Arc::clone(stats));
+                            }
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks

@@ -87,6 +87,16 @@ pub enum DepositReject {
     /// counters/tests. (Formerly `NotFriend`.)
     #[error("sender is not authorized to deposit (not an active friend or co-member)")]
     NotAuthorized,
+    /// The sender WAS admitted (active friend or live group-DM co-member) but
+    /// failed a narrower post-admission scope check: a co-member deposit
+    /// bound to a space they don't live-share (message/invite paths), or a
+    /// co-member attempting a friend-scoped revocation deposit. Split from
+    /// [`NotAuthorized`] (ZEB-702, PR #481 review): only a ROSTER miss is the
+    /// roster-sync signal — counting these as `rejected_unauthorized` would
+    /// fire the ZEB-702 WARN for senders the roster already admitted. The
+    /// wire close is uniform with every other reject (no oracle).
+    #[error("sender is not authorized for this deposit's scope")]
+    NotAuthorizedForScope,
     /// The embedded `EnrollmentCert` failed to decode, failed verification,
     /// is not Master-issued, has `owner_id != frame.sender_owner`, or its
     /// issuing master fails the admission-path master binding: the friend
@@ -712,7 +722,7 @@ pub async fn handle_deposit_core(
                     .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
                     .await
             {
-                return Err(DepositReject::NotAuthorized);
+                return Err(DepositReject::NotAuthorizedForScope);
             }
             let key = DmInboxDoc::key(&signed.space_id.0, &signed.message_cid.to_bytes());
             (
@@ -745,7 +755,7 @@ pub async fn handle_deposit_core(
                 // revocation: doing so would let a mere co-member write
                 // into another owner's friend-scoped revocation set.
                 if !matches!(admission, Admission::Friend(_)) {
-                    return Err(DepositReject::NotAuthorized);
+                    return Err(DepositReject::NotAuthorizedForScope);
                 }
                 if rp_bytes.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
                     return Err(DepositReject::BadPayload);
@@ -864,7 +874,7 @@ pub async fn handle_deposit_core(
                         .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
                         .await
                 {
-                    return Err(DepositReject::NotAuthorized);
+                    return Err(DepositReject::NotAuthorizedForScope);
                 }
                 let key = DmInboxDoc::invite_key(&signed.space_id.0);
                 (
@@ -906,6 +916,169 @@ pub async fn handle_deposit_core(
         space_id: deposit_space_id,
         message_cid: ack_message_cid,
     })
+}
+
+// =====================================================================
+// ZEB-702: local-only butler-deposit decision observability
+// =====================================================================
+
+/// ZEB-702: minimum interval between unauthorized-reject WARN emissions. A
+/// butler that fail-closed rejects EVERY deposit (its `friend_graph` never
+/// replicated — the ZEB-702 roster-sync failure) is otherwise indistinguishable
+/// from transport failure at default log level; one WARN per window surfaces it
+/// while keeping probing traffic from spamming the log.
+const BUTLER_REJECT_WARN_MIN_INTERVAL_MS: u64 = 60_000;
+
+/// Default clock for [`ButlerDepositStats`]: MONOTONIC milliseconds since
+/// process start (Greptile, PR #481: a wall clock would let a forward system
+/// clock step re-open the WARN window early — `Instant` is immune to clock
+/// corrections, which is the right source for a process-local rate gate).
+/// `.max(1)` because `last_warn_ms == 0` encodes "never warned": the first
+/// millisecond of process life must not alias it (this also retires the
+/// injected-clock-of-0 edge recorded in the T4 review). Injectable via
+/// [`ButlerDepositStats::with_clock`] in tests so the rate-limit window is
+/// deterministic (the WARN gate reads THIS clock, not tokio's, so paused
+/// tokio time would not control it).
+fn butler_stats_default_clock() -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    Arc::new(move || (start.elapsed().as_millis() as u64).max(1))
+}
+
+/// Process-lifetime butler-deposit decision counts. Snapshot of
+/// [`ButlerDepositStats`]; Task 5 serializes it into `network_health_snapshot`
+/// (serde camelCase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ButlerDepositCounts {
+    pub accepted: u64,
+    pub rejected_unauthorized: u64,
+    pub rejected_other: u64,
+}
+
+/// ZEB-702 (Component D): process-lifetime accept/reject counters for the
+/// butler-deposit acceptor, plus the rate-limited unauthorized-reject WARN.
+/// `Arc`-shared between the acceptor shell (writer) and
+/// `network_health_snapshot` (reader), mirroring the dial-outcome counters
+/// (`network_health.rs` `DialTelemetry`). LOCAL-ONLY: nothing here touches the
+/// wire — the reject stays byte-identical, close-without-detail (spec §4, no
+/// oracle).
+pub struct ButlerDepositStats {
+    accepted: AtomicU64,
+    rejected_unauthorized: AtomicU64,
+    rejected_other: AtomicU64,
+    /// Unix-epoch ms of the last unauthorized-reject WARN; `0` = never warned
+    /// (production wall-clock ms is never 0, so the first reject always warns).
+    /// Gates the WARN to ≤1 per [`BUTLER_REJECT_WARN_MIN_INTERVAL_MS`] via
+    /// compare-exchange.
+    last_warn_ms: AtomicU64,
+    /// Count of WARNs actually emitted (observability + test hook for the
+    /// rate-limit assertions). Distinct from `rejected_unauthorized`, which
+    /// counts every reject regardless of whether it warned.
+    warns_emitted: AtomicU64,
+    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl ButlerDepositStats {
+    pub fn new() -> Self {
+        Self {
+            accepted: AtomicU64::new(0),
+            rejected_unauthorized: AtomicU64::new(0),
+            rejected_other: AtomicU64::new(0),
+            last_warn_ms: AtomicU64::new(0),
+            warns_emitted: AtomicU64::new(0),
+            now_ms: butler_stats_default_clock(),
+        }
+    }
+
+    /// Test seam: inject a controllable wall clock (Unix-epoch ms) so the
+    /// rate-limit window is deterministic.
+    #[cfg(test)]
+    fn with_clock(now_ms: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        Self {
+            now_ms,
+            ..Self::new()
+        }
+    }
+
+    /// Current decision counts.
+    pub fn snapshot(&self) -> ButlerDepositCounts {
+        ButlerDepositCounts {
+            accepted: self.accepted.load(Ordering::Relaxed),
+            rejected_unauthorized: self.rejected_unauthorized.load(Ordering::Relaxed),
+            rejected_other: self.rejected_other.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Total WARNs emitted (rate-limited), for observability.
+    pub fn warn_emissions(&self) -> u64 {
+        self.warns_emitted.load(Ordering::Relaxed)
+    }
+
+    /// Count an accepted deposit (ack delivered).
+    pub fn record_accepted(&self) {
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a rejected deposit. A ROSTER-MISS reject (`NotAuthorized`) also
+    /// fires a rate-limited WARN (≤1 per [`BUTLER_REJECT_WARN_MIN_INTERVAL_MS`])
+    /// naming ZEB-702 and the remedy hint. Every other reject reason (bad
+    /// cert/sig, cap, malformed payload, inner-verify, persist, and the
+    /// post-admission `NotAuthorizedForScope` class — an admitted sender
+    /// failing a space/operation binding) is a `rejected_other` — already
+    /// covered by the shell's per-reject `debug!` and never warned (only a
+    /// persistently-rejecting roster is the ZEB-702 signal).
+    pub fn record_rejected(&self, reject: &DepositReject) {
+        match reject {
+            DepositReject::NotAuthorized => {
+                let n = self.rejected_unauthorized.fetch_add(1, Ordering::Relaxed) + 1;
+                if self.arm_warn((self.now_ms)()) {
+                    self.warns_emitted.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        rejected_unauthorized = n,
+                        "ZEB-702: butler deposit rejected — sender not in this butler's \
+                         roster; if persistent, owner-state sync to this sibling is not \
+                         converging"
+                    );
+                }
+            }
+            _ => {
+                self.rejected_other.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// ≤1-per-window WARN gate. Returns `true` (and arms the window at `now_ms`)
+    /// iff the caller should emit now. The compare-exchange makes concurrent
+    /// unauthorized rejects emit at most one WARN per window (the losers see the
+    /// updated `last_warn_ms` and back off).
+    fn arm_warn(&self, now_ms: u64) -> bool {
+        let last = self.last_warn_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < BUTLER_REJECT_WARN_MIN_INTERVAL_MS {
+            return false;
+        }
+        self.last_warn_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+}
+
+impl Default for ButlerDepositStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ButlerDepositStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let c = self.snapshot();
+        f.debug_struct("ButlerDepositStats")
+            .field("accepted", &c.accepted)
+            .field("rejected_unauthorized", &c.rejected_unauthorized)
+            .field("rejected_other", &c.rejected_other)
+            .field("warns_emitted", &self.warn_emissions())
+            .finish_non_exhaustive()
+    }
 }
 
 // =====================================================================
@@ -968,6 +1141,11 @@ pub struct IrohButlerDepositAcceptor {
     /// that counter (rejects additionally surface at `debug!`, never `warn!`,
     /// so probing traffic can't spam production logs).
     rejected_deposits: AtomicU64,
+    /// ZEB-702 (Component D): accept/reject decision counters + the
+    /// rate-limited unauthorized-reject WARN. `Arc`-shared so the install site
+    /// can hand a clone to `network_health_snapshot` (Task 5). Defaults fresh,
+    /// so existing callers are unchanged.
+    stats: Arc<ButlerDepositStats>,
 }
 
 impl IrohButlerDepositAcceptor {
@@ -980,7 +1158,22 @@ impl IrohButlerDepositAcceptor {
             ctx,
             config,
             rejected_deposits: AtomicU64::new(0),
+            stats: Arc::new(ButlerDepositStats::new()),
         }
+    }
+
+    /// ZEB-702: install a shared [`ButlerDepositStats`] handle (default is a
+    /// fresh one). Fluent so the install site can construct the stats first,
+    /// keep a clone for `network_health_snapshot`, and pass it in here.
+    pub fn with_deposit_stats(mut self, stats: Arc<ButlerDepositStats>) -> Self {
+        self.stats = stats;
+        self
+    }
+
+    /// ZEB-702: shared handle to the accept/reject decision counters (an
+    /// `Arc` clone; the install site threads it into `network_health_snapshot`).
+    pub fn deposit_stats(&self) -> Arc<ButlerDepositStats> {
+        Arc::clone(&self.stats)
     }
 
     /// Total rejected deposits since construction (spec §4 counter).
@@ -996,6 +1189,7 @@ impl IrohButlerDepositAcceptor {
     pub async fn handle_connection(&self, conn: Connection) {
         match self.handle_deposit_inbound(&conn).await {
             Ok(()) => {
+                self.stats.record_accepted();
                 tracing::info!(
                     remote_id = ?conn.remote_id(),
                     "ZEB-418: butler deposit accepted (ack delivered)"
@@ -1007,6 +1201,11 @@ impl IrohButlerDepositAcceptor {
             }
             Err(DepositConnError::Reject(reject)) => {
                 self.rejected_deposits.fetch_add(1, Ordering::Relaxed);
+                // ZEB-702: classify the reject into the decision counters and,
+                // for an unauthorized reject, fire the rate-limited WARN. Both
+                // are local-only (atomics + an occasional local log) — the wire
+                // reject below stays byte-identical: same close-without-detail.
+                self.stats.record_rejected(&reject);
                 tracing::debug!(
                     reject = %reject,
                     remote_id = ?conn.remote_id(),
@@ -1623,7 +1822,9 @@ mod tests {
 
     /// ZEB-424 D28.1 security follow-up: a sender who shares SOME live group
     /// DM (so step-1 admission passes) but whose deposit names a space they
-    /// are NOT a live member of is rejected `NotAuthorized` AFTER decrypt but
+    /// are NOT a live member of is rejected `NotAuthorizedForScope` (an
+    /// ADMITTED sender failing the space bind — deliberately NOT the ZEB-702
+    /// roster-miss signal) AFTER decrypt but
     /// BEFORE persist/ack — closing the "deposit for an unrelated space"
     /// inbox-slot-pinning / lying-ack vector. The bind is on the inner
     /// packet's own space_id, not merely "shares any group".
@@ -1639,7 +1840,10 @@ mod tests {
         let err = handle_deposit_core(&f.frame, &ctx)
             .await
             .expect_err("co-member depositing into a non-member space is rejected");
-        assert!(matches!(err, DepositReject::NotAuthorized), "got {err:?}");
+        assert!(
+            matches!(err, DepositReject::NotAuthorizedForScope),
+            "got {err:?}"
+        );
         let ev = ctx.events();
         // The reject is POST-decrypt (the space_id is sealed until then)…
         assert!(
@@ -2544,7 +2748,8 @@ mod tests {
     /// to ACTIVE friends, and this persists into the friend-scoped
     /// `revoked_dm_devices` CRDT. A well-formed, sender-owned revocation
     /// admitted only as a live group-DM `CoMember` (NOT an Active friend)
-    /// must be rejected `NotAuthorized`, and nothing persisted — mirrors
+    /// must be rejected `NotAuthorizedForScope` (admitted sender, friend-scoped
+    /// operation — not the ZEB-702 roster-miss signal), and nothing persisted — mirrors
     /// `deposit_from_non_friend_group_co_member_is_accepted`'s admission
     /// setup, but for the revocation arm where co-member admission must NOT
     /// be sufficient.
@@ -2559,7 +2764,7 @@ mod tests {
         let err = handle_deposit_core(&f.frame, &ctx)
             .await
             .expect_err("a co-member (non-friend) must not be able to deposit a revocation");
-        assert_eq!(err, DepositReject::NotAuthorized);
+        assert_eq!(err, DepositReject::NotAuthorizedForScope);
         assert!(
             ctx.store.lock().unwrap().is_empty(),
             "nothing persisted for a co-member-admitted revocation"
@@ -2584,5 +2789,129 @@ mod tests {
             ctx.store.lock().unwrap().is_empty(),
             "nothing persisted on an oversized revocation"
         );
+    }
+
+    // ==================================================================
+    // ZEB-702 Task 4: butler-deposit decision counters + rate-limited WARN
+    //
+    // The shell (`IrohButlerDepositAcceptor::handle_connection`) classifies a
+    // `handle_deposit_core` outcome into `ButlerDepositStats`. The shell needs
+    // a live iroh `Connection` (not unit-testable here), so these tests drive
+    // the SAME classification the shell performs: run the real pipeline to get
+    // the outcome, then feed it to the stats recorder.
+    // ==================================================================
+
+    /// (a)+(b): an unauthorized deposit increments `rejected_unauthorized` and
+    /// fires exactly one WARN; a second unauthorized reject inside the window
+    /// bumps the counter to 2 but emits NO second WARN; once the window elapses
+    /// the next unauthorized reject warns again. The clock is injected (mirrors
+    /// `reachability_resolver`'s swappable clock) so the window is deterministic.
+    #[tokio::test]
+    async fn unauthorized_deposit_counts_and_warns_rate_limited() {
+        // A real unauthorized outcome from the pipeline: the fixture's sender is
+        // neither an Active friend nor a live group-DM co-member.
+        let f = valid_fixture();
+        let mut ctx = TestCtx::for_fixture(&f);
+        ctx.friends.clear();
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("unauthorized rejected");
+        assert!(matches!(err, DepositReject::NotAuthorized), "got {err:?}");
+
+        const T0: u64 = 1_700_000_000_000;
+        let clock = Arc::new(AtomicU64::new(T0));
+        let c2 = Arc::clone(&clock);
+        let stats = ButlerDepositStats::with_clock(Arc::new(move || c2.load(Ordering::SeqCst)));
+
+        // (a) first unauthorized reject → counter 1, one WARN.
+        stats.record_rejected(&err);
+        assert_eq!(stats.snapshot().rejected_unauthorized, 1);
+        assert_eq!(stats.warn_emissions(), 1, "first unauthorized reject warns");
+
+        // (b) second within the window (Δ = 30 s < 60 s) → counter 2, no 2nd WARN.
+        clock.store(T0 + 30_000, Ordering::SeqCst);
+        stats.record_rejected(&err);
+        assert_eq!(stats.snapshot().rejected_unauthorized, 2);
+        assert_eq!(
+            stats.warn_emissions(),
+            1,
+            "no second WARN inside the window"
+        );
+
+        // window elapsed (Δ = 61 s > 60 s) → warns again.
+        clock.store(T0 + 61_000, Ordering::SeqCst);
+        stats.record_rejected(&err);
+        assert_eq!(stats.snapshot().rejected_unauthorized, 3);
+        assert_eq!(stats.warn_emissions(), 2, "window reopened → WARN again");
+
+        // The reject-only path never touched accepted / rejected_other.
+        let s = stats.snapshot();
+        assert_eq!(s.accepted, 0);
+        assert_eq!(s.rejected_other, 0);
+    }
+
+    /// ZEB-702 (PR #481 review): a post-admission scope reject — an ADMITTED
+    /// co-member failing the space bind — counts as `rejected_other` and never
+    /// fires the roster-divergence WARN. Splitting this class out of
+    /// `rejected_unauthorized` keeps the ZEB-702 signal meaningful: only true
+    /// roster misses indicate owner-state sync failure.
+    #[tokio::test]
+    async fn scope_reject_counts_other_never_warns() {
+        // A real scope outcome from the pipeline: admitted via a shared live
+        // group, but the deposit's own space is not live-shared.
+        let f = valid_fixture();
+        let mut ctx = TestCtx::for_fixture(&f);
+        ctx.friends.clear();
+        ctx.group_co_members.insert(f.sender_owner);
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("scope-bound reject");
+        assert!(
+            matches!(err, DepositReject::NotAuthorizedForScope),
+            "got {err:?}"
+        );
+
+        let stats = ButlerDepositStats::new();
+        stats.record_rejected(&err);
+        let s = stats.snapshot();
+        assert_eq!(s.rejected_other, 1, "scope reject is rejected_other");
+        assert_eq!(
+            s.rejected_unauthorized, 0,
+            "scope reject is NOT the roster signal"
+        );
+        assert_eq!(stats.warn_emissions(), 0, "scope reject never warns");
+    }
+
+    /// (c): an accepted deposit increments `accepted` only — no reject counter,
+    /// no WARN.
+    #[tokio::test]
+    async fn accepted_deposit_counts_accepted_only() {
+        let f = valid_fixture();
+        let ctx = TestCtx::for_fixture(&f);
+        handle_deposit_core(&f.frame, &ctx).await.expect("accepted");
+
+        let stats = ButlerDepositStats::new();
+        stats.record_accepted();
+
+        let s = stats.snapshot();
+        assert_eq!(s.accepted, 1);
+        assert_eq!(s.rejected_unauthorized, 0);
+        assert_eq!(s.rejected_other, 0);
+        assert_eq!(stats.warn_emissions(), 0, "the accept path never warns");
+    }
+
+    /// A non-authorization reject (bad cert, cap, malformed, …) lands in
+    /// `rejected_other` and never warns — the WARN is reserved for the
+    /// roster-sync signal (`NotAuthorized`).
+    #[test]
+    fn other_reject_counts_rejected_other_no_warn() {
+        let stats = ButlerDepositStats::new();
+        stats.record_rejected(&DepositReject::BadCert);
+        stats.record_rejected(&DepositReject::CapExceeded);
+        let s = stats.snapshot();
+        assert_eq!(s.rejected_other, 2);
+        assert_eq!(s.rejected_unauthorized, 0);
+        assert_eq!(s.accepted, 0);
+        assert_eq!(stats.warn_emissions(), 0);
     }
 }

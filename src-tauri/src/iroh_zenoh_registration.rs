@@ -80,8 +80,9 @@ pub fn ensure_iroh_factory_registered() {
 
 /// ZEB-620: recency-ordered node-ids for boot-time reconnect seeding. Every
 /// distinct peer the resolver knows (minus self), newest routing record first
-/// (by `announced_at_ms`, ties broken by node-id for determinism). Same-node-id
-/// records under different owners collapse to one entry keyed on the freshest.
+/// (by `effective_announced_at_ms`, ties broken by node-id for determinism).
+/// Same-node-id records under different owners collapse to one entry keyed on
+/// the freshest.
 ///
 /// This replaces ZEB-368's `iroh_connect_locators` (which injected `iroh/<hex>`
 /// strings into zenoh's static `connect/endpoints`): boot peers now enter the
@@ -93,18 +94,25 @@ pub fn boot_seed_node_ids_by_recency(
     self_node_id: &[u8; 32],
 ) -> Vec<[u8; 32]> {
     use std::collections::HashMap;
-    // Keep the freshest announced_at_ms per node-id (a peer may be announced
-    // under multiple owners; recency is per-device, not per-owner).
+    // Keep the freshest effective_announced_at_ms per node-id (a peer may be
+    // announced under multiple owners; recency is per-device, not per-owner).
+    // ZEB-702: enumerate the DIAL view (`list_dialable_peers`, freshest across
+    // durable/pkarr/fleet) rather than `list_active_peers` (durable/pkarr only)
+    // so a fleet-slot-only sibling — a SAS-paired cert-only butler — is
+    // re-dialed at every boot. The runtime kick gate already dials off the
+    // freshest view; this aligns the boot seed with it. Recency uses the
+    // future-skew-clamped `effective_announced_at_ms` so a bogus future-dated
+    // record cannot permanently dominate the seed order.
     let mut newest: HashMap<[u8; 32], u64> = HashMap::new();
-    for (_owner, payload) in resolver.list_active_peers() {
-        let nid = payload.iroh_node_id;
+    for (_owner, entry) in resolver.list_dialable_peers() {
+        let nid = entry.payload.iroh_node_id;
         if &nid == self_node_id {
             continue;
         }
         newest
             .entry(nid)
-            .and_modify(|at| *at = (*at).max(payload.announced_at_ms))
-            .or_insert(payload.announced_at_ms);
+            .and_modify(|at| *at = (*at).max(entry.effective_announced_at_ms))
+            .or_insert(entry.effective_announced_at_ms);
     }
     let mut ordered: Vec<([u8; 32], u64)> = newest.into_iter().collect();
     // Newest first; deterministic tie-break on node-id so the seed order is
@@ -248,5 +256,74 @@ mod tests {
             );
             assert!(merged.contains(&loc), "fallback adds iroh: {merged}");
         }
+    }
+
+    // ZEB-702: the boot-seed enumeration must include fleet-slot-only siblings so
+    // a SAS-paired cert-only butler is re-dialed at every boot. Before the fix it
+    // enumerated `list_active_peers()` (durable_preferred → durable/pkarr only),
+    // dropping FleetSibling entries; now it enumerates `list_dialable_peers()`
+    // (freshest across all three slots). Recency ordering + self-exclusion
+    // preserved.
+    #[test]
+    fn boot_seed_includes_fleet_only_recency_ordered_self_excluded() {
+        use crate::owner_state_types::{Hlc, OwnerAddr};
+        use crate::reachability_record::ReachabilityAnnouncePayload;
+        use crate::reachability_resolver::{ReachabilityResolver, ReachabilitySource};
+
+        fn payload(node: u8, announced_at_ms: u64) -> ReachabilityAnnouncePayload {
+            ReachabilityAnnouncePayload {
+                iroh_node_id: [node; 32],
+                home_relay_url: "https://derp.example/".into(),
+                direct_addresses: vec![],
+                announced_at_ms,
+                identity_signature: [0; 64],
+                butler_set: Vec::new(),
+                bs_at: 0,
+            }
+        }
+        fn hlc(wall_ms: u64) -> Hlc {
+            Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: String::new(),
+            }
+        }
+
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0x51; 16]);
+        let self_node = [0xEE; 32];
+
+        // Two fleet-slot-only siblings (older then fresher). durable_preferred
+        // would drop both, so the pre-ZEB-702 boot seed never re-dialed them.
+        r.update_with_source(
+            owner,
+            payload(0xB2, 3_000),
+            hlc(3_000),
+            ReachabilitySource::FleetSibling,
+        );
+        r.update_with_source(
+            owner,
+            payload(0xC3, 5_000),
+            hlc(5_000),
+            ReachabilitySource::FleetSibling,
+        );
+        // A self-node fleet entry — must be filtered out of the seed.
+        let mut self_payload = payload(0, 9_000);
+        self_payload.iroh_node_id = self_node;
+        r.update_with_source(
+            owner,
+            self_payload,
+            hlc(9_000),
+            ReachabilitySource::FleetSibling,
+        );
+
+        let seeded = boot_seed_node_ids_by_recency(&r, &self_node);
+
+        assert!(!seeded.contains(&self_node), "self-node excluded from seed");
+        assert_eq!(
+            seeded,
+            vec![[0xC3; 32], [0xB2; 32]],
+            "fleet-only siblings seeded, newest effective_announced_at_ms first"
+        );
     }
 }

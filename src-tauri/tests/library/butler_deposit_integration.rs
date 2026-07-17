@@ -1128,7 +1128,9 @@ async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
 /// ZEB-424 D28.1 security follow-up: a sender who shares SOME live group DM
 /// with the recipient (so step-1 admission passes) but deposits a packet whose
 /// inner `space_id` names a space they are NOT a live member of is rejected
-/// `NotAuthorized` and nothing is persisted. This is the integration-level
+/// `NotAuthorizedForScope` (ZEB-702 split: an ADMITTED sender failing the
+/// space bind — deliberately not the roster-miss signal) and nothing is
+/// persisted. This is the integration-level
 /// proof that co-member admission is bound to the DEPOSITED space, not merely
 /// to "shares any group" — closing the un-ingestible-entry inbox-slot-pinning
 /// vector. Same construction as the co-member happy-path, with one delta:
@@ -1196,7 +1198,7 @@ async fn co_member_deposit_for_unrelated_space_is_rejected_and_not_persisted() {
     let err = handle_deposit_core(&frame, &a_butler_ctx)
         .await
         .expect_err("co-member depositing into a non-member space must be rejected");
-    assert_eq!(err, DepositReject::NotAuthorized);
+    assert_eq!(err, DepositReject::NotAuthorizedForScope);
 
     // Nothing was persisted, even though step-1 admission passed: the reject
     // landed at the post-decrypt space bind, before persist/ack.
