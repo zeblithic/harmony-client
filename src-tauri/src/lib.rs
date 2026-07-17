@@ -4108,6 +4108,16 @@ pub async fn start_node_inner(
         let mut butler_deposit_client_for_state: Option<
             std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>,
         > = None;
+        // ZEB-702 T5 (Component D): lifted alongside `butler_deposit_client_for_state`
+        // so the acceptor's decision counters (built below only when iroh binds
+        // AND an owner is loaded) reach the `NetworkHealthService` construction
+        // further down — the same outer-scope hand-out the other acceptor handles
+        // use, since the acceptor block is nested and closes before that point.
+        // Stays `None` on an owner-less node (no acceptor built) → the snapshot's
+        // `butlerDeposits` section is then absent.
+        let mut butler_deposit_stats_for_state: Option<
+            std::sync::Arc<crate::iroh_butler_acceptor::ButlerDepositStats>,
+        > = None;
         // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
         // adapter requests handed to the event loop. Both stay None /
         // empty when no owner identity is loaded (registry depends on
@@ -9719,6 +9729,13 @@ pub async fn start_node_inner(
                                 deposit_ctx,
                             ),
                         );
+                        // ZEB-702 T5 (Component D): stash the acceptor's
+                        // decision-counter handle BEFORE it is moved into the
+                        // link manager, so `network_health_snapshot` can surface
+                        // the butler-deposit accept/reject counts. Same `Arc` the
+                        // shell increments; hand it to the outer scope (this block
+                        // is nested and closes before the NH build).
+                        butler_deposit_stats_for_state = Some(butler_acceptor.deposit_stats());
                         if link_mgr
                             .install_butler_deposit_acceptor(butler_acceptor)
                             .is_err()
@@ -11541,6 +11558,17 @@ pub async fn start_node_inner(
                             nh.set_protocol_compat_source(std::sync::Arc::clone(
                                 &guard.protocol_compat,
                             ));
+                            // ZEB-702 T5 (Component D): butler-deposit decision
+                            // counts. Same `Arc` the acceptor shell increments
+                            // (stashed at the acceptor install, before the move
+                            // into the link manager) — the panel / e2e can tell an
+                            // always-rejecting butler from a transport failure.
+                            // `None` on an owner-less node (no acceptor was built,
+                            // even though iroh bound and this block runs), so the
+                            // snapshot's `butlerDeposits` section stays absent.
+                            if let Some(stats) = butler_deposit_stats_for_state.as_ref() {
+                                nh.set_butler_deposit_source(std::sync::Arc::clone(stats));
+                            }
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
