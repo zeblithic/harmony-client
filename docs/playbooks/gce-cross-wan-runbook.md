@@ -95,10 +95,14 @@ second non-cloud network).
   2026-07-16 lesson — dial fine, frame delivered, roster missing, ZEB-702).
   RECV/CLEARED timeouts mean the recover half broke on a real WAN. Local
   profiles `xwan-d3-p`/`xwan-d3-b2` are wiped fresh each run (disposable
-  identities). Run via `--test d3` in both firewall modes. **Known-red until
-  ZEB-702 lands:** HELD fails because a cert-only paired butler never
-  receives the owner's friend graph and fail-closed rejects every deposit —
-  this scenario is the standing gate that flips green with the fix.
+  identities). Run via `--test d3` in both firewall modes. **ZEB-702 status:**
+  the fix (fleet-sibling owner-state sync: boot-seed dial view + transport
+  up-edge republish, branch `zeb-702-butler-roster-replication`) landed
+  2026-07-17 — D3 HELD is expected to flip green on the next live run, which
+  is the authoritative re-validation. If HELD still fails, check the butler's
+  `network_health_snapshot` → `butlerDeposits.rejectedUnauthorized` (new in
+  ZEB-702) before any transport-side diagnosis: a climbing reject counter =
+  roster still not converging; zero rejects + no HELD = transport-side.
 
 Node snapshots and logs land in `~/.cache/gce-xwan-logs/<timestamp>/`.
 

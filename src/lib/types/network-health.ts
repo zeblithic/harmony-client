@@ -138,6 +138,22 @@ export interface NetworkHealthSnapshot {
    * for forward-compat with pre-field snapshots (Rust `#[serde(default)]`).
    */
   transportDisabledReason?: string | null;
+  /**
+   * ZEB-702: butler-deposit accept/reject decision counts from this node's
+   * deposit acceptor. `null`/absent on nodes running no acceptor (no owner
+   * identity loaded) and on pre-field snapshots (Rust `#[serde(default)]`).
+   * Lets an always-rejecting butler (sibling whose roster never converged)
+   * be told apart from transport failure without a debug-level log session.
+   */
+  butlerDeposits?: ButlerDepositHealth | null;
+}
+
+/** ZEB-702: process-lifetime butler-deposit decision counters (camelCase
+ * mirror of Rust `ButlerDepositHealth`, network_health.rs). */
+export interface ButlerDepositHealth {
+  accepted: number;
+  rejectedUnauthorized: number;
+  rejectedOther: number;
 }
 
 export type StepOutcome =
