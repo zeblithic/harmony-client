@@ -680,6 +680,23 @@ d3_butler_deposit() {
     || { echo "FAIL D3 (mode=$MODE_WANT): A never received P's post-pin ReachabilityAnnounce (B2 butler-set never replicated cross-WAN)"; return 1; }
   log "D3: A holds P's post-pin announce — B2-bearing butler-set replicated cross-WAN"
 
+  # -- Phase 7.5 (ZEB-705): B2's roster must converge BEFORE P departs — the
+  #    acceptor admits by OwnerState.friend_graph, which reaches B2 only from
+  #    P (same-owner sync; A cannot serve another owner's state). Without
+  #    this barrier HELD conflates "roster sync lost a boot-window race"
+  #    with "deposit dial/authorization failed" — the 2026-07-17 lesson:
+  #    both roster publishes arrived ~2 s after B2's relaunch boot, died on
+  #    a content-fetch race, and P was SIGKILLed 3 s later, making the loss
+  #    unrecoverable. The barrier keeps the two claims separable: this poll
+  #    proves bounded-time roster convergence while P is alive; HELD then
+  #    proves the deposit dial + authorization alone.
+  if ! poll 120 5 "D3 ROSTER: B2 converged P's friend graph" friends_active_d3 b2 "$REMOTE_OWNER"; then
+    d3_api b2 network_health_snapshot > "$ARTIFACTS/d3-roster-timeout-b2-snapshot-$MODE_WANT.json" 2>&1 || true
+    echo "FAIL D3 (mode=$MODE_WANT): B2 never converged P's friend graph while P was alive (same-owner sync to the butler failed — ZEB-705 class; check butlerDeposits + fleet_sync warns in the b2 log/snapshot artifacts)"
+    return 1
+  fi
+  log "D3: B2 roster carries A — owner-state synced to the butler"
+
   # -- Phase 8: P goes OFFLINE (real SIGKILL — mirror s7's crash semantics).
   kill_d3 p
   log "D3: P is offline (SIGKILL)"
@@ -704,7 +721,11 @@ d3_butler_deposit() {
   }
   if ! poll 300 10 "D3 HELD: B2 holds A's deposit" held_for_a; then
     d3_api b2 get_butler_held > "$ARTIFACTS/d3-held-timeout-$MODE_WANT.json" 2>&1 || true
-    echo "FAIL D3 (mode=$MODE_WANT): B2 never RETAINED A's deposit — transport failure vs acceptor reject is indistinguishable from the sender; rerun B2 with RUST_LOG=harmony_app=debug to classify (ZEB-702 class: dial delivered, authorization rejected)"
+    # ZEB-705: counter-first triage — butlerDeposits.rejectedUnauthorized
+    # climbing = roster/authorization; zero rejects = transport-side (the
+    # debug log remains the classifier of record).
+    d3_api b2 network_health_snapshot > "$ARTIFACTS/d3-held-timeout-b2-snapshot-$MODE_WANT.json" 2>&1 || true
+    echo "FAIL D3 (mode=$MODE_WANT): B2 never RETAINED A's deposit — check butlerDeposits counters in the snapshot artifact first (ZEB-702 observability), then B2's debug log to classify"
     return 1
   fi
   d3_api b2 get_butler_held > "$ARTIFACTS/d3-held-$MODE_WANT.json" 2>&1 || true
