@@ -56,6 +56,9 @@ so the loop must stay live during the backoff.
   --context task`; `shellcheck scripts/gce-xwan/run-tests.sh`; final full sweep
   `cargo nextest run --locked --workspace --all-targets --features test-fixtures`
   pre-PR.
+- `test-select` selection (for audit): `round=73 k=4 bucket=2/4
+  always-run=[test(fleet_sync)]` — the always-run set plus the rotating
+  `hash:2/4` partition; 1201 tests, all passed.
 - **Live validation (post-merge): D3 re-run** — the standing gate; expected
   green with the barrier making the window deterministic.
 

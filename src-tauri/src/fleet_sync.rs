@@ -1007,12 +1007,15 @@ where
             // consistency).
             tracing::warn!(
                 cid = ?payload.root_cid,
-                "incoming publish dropped: missing root blob (fetch timeout or admit-rejected)"
+                "incoming publish fetch miss: missing root blob (fetch timeout or admit-rejected) — will retry if budget remains"
             );
             return Inbound::FetchMiss(wire);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "incoming publish dropped: content_store.get error");
+            tracing::warn!(
+                error = %e,
+                "incoming publish fetch error: content_store.get error — will retry if budget remains"
+            );
             return Inbound::FetchMiss(wire);
         }
     };
