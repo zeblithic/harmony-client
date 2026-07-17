@@ -722,8 +722,19 @@ where
     )
     .map_err(|e| SyncError::Crypto(format!("ContentId::for_book: {e}")))?;
 
-    // 4. Put into the content store.
-    ctx.content_store.put(root_cid, blob_ciphertext).await?;
+    // 4. Put into the content store as SERVEABLE (ZEB-706). A plain `put`
+    //    stores the root locally but never registers the CID in the shared
+    //    CommunityServeAllowlist, so the content-serve queryable
+    //    (`harmony/content/*/**`) refuses every peer GET for it — the fetch
+    //    returns `no successful reply` and cross-device sync silently stalls
+    //    (the live D3 butler-roster failure; owner-state analog of ZEB-398's
+    //    community-root serve bug). The root is a single self-contained
+    //    ciphertext blob and, like community state-roots, is safe to serve to
+    //    any requester who can name the CID: it is fleet-net-symmetric
+    //    ciphertext, so serving it leaks only ciphertext.
+    ctx.content_store
+        .put_serveable(root_cid, blob_ciphertext)
+        .await?;
 
     // 5. Mint a strictly-newer HLC and assemble the publish envelope.
     let at = mint_next_hlc(&ctx.replay_tracker, &ctx.device_id).await;
@@ -1501,6 +1512,96 @@ mod engine_tests {
         );
 
         engine.shutdown().await.ok();
+    }
+
+    /// ZEB-706: the owner-state publish must make its root blob SERVEABLE
+    /// (`put_serveable`), not plain `put`. A plain `put` stores the blob
+    /// locally but never adds the CID to the shared `CommunityServeAllowlist`,
+    /// so the content-serve queryable (`harmony/content/*/**`) refuses every
+    /// peer GET for the root — the fetch returns `no successful reply` and
+    /// cross-device sync silently stalls (the live D3 roster-barrier failure;
+    /// the owner-state analog of ZEB-398's community-root serve bug). This
+    /// recording ContentStore pins which method the publish path calls for the
+    /// root CID: before the fix it is plain `put` (test red), after it is
+    /// `put_serveable` (test green).
+    #[derive(Default)]
+    struct RecordingCas {
+        inner: InMemoryStub,
+        put_cids: std::sync::Mutex<Vec<ContentId>>,
+        put_serveable_cids: std::sync::Mutex<Vec<ContentId>>,
+    }
+    #[async_trait]
+    impl ContentStore for RecordingCas {
+        async fn put(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+            self.put_cids.lock().expect("put_cids mutex").push(cid);
+            self.inner.put(cid, blob).await
+        }
+        async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            self.inner.get(cid).await
+        }
+        async fn put_serveable(
+            &self,
+            cid: ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), ContentStoreError> {
+            self.put_serveable_cids
+                .lock()
+                .expect("put_serveable_cids mutex")
+                .push(cid);
+            self.inner.put(cid, blob).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_makes_root_serveable_zeb706() {
+        let rec = Arc::new(RecordingCas::default());
+        let cas: Arc<dyn ContentStore> = rec.clone();
+        let Built {
+            engine,
+            mut out_rx,
+            in_tx,
+            ..
+        } = build_engine("dev-706", Arc::clone(&cas), false);
+        let _in_tx = in_tx;
+
+        // Trigger a real publish through the debounced-publish seam and KEEP
+        // the outbound frame: `publish_root_now` stores the root before it
+        // sends the frame, so the frame lets us recover the EXACT root CID
+        // that was published and assert THAT specific CID was made serveable
+        // (rather than merely "some CID"). Scoping the assertions to the
+        // published root also keeps them robust to any unrelated CAS writes a
+        // future publish step might add.
+        let engine = Arc::new(engine);
+        let handle: Arc<dyn RepublishDirty> = engine.clone();
+        handle.republish_dirty();
+        let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("publish must land within 5s")
+            .expect("publisher channel closed before a frame arrived");
+        engine.shutdown().await.ok();
+
+        // Recover the published root CID via the same decode path as
+        // `handle_incoming_publish`; `make_kt()` is deterministic so it opens
+        // the frame the engine encrypted.
+        let kt = make_kt();
+        let payload_bytes = decrypt_root_publish(&kt, &frame).expect("decrypt published frame");
+        let published: FleetRootPublish =
+            canonical_cbor_decode(&payload_bytes).expect("decode published envelope");
+        let root_cid = published.root_cid;
+
+        let served = rec
+            .put_serveable_cids
+            .lock()
+            .expect("put_serveable_cids mutex");
+        let plain = rec.put_cids.lock().expect("put_cids mutex");
+        assert!(
+            served.contains(&root_cid),
+            "ZEB-706: the published root {root_cid:?} must be stored via put_serveable so peers can fetch it (served={served:?})"
+        );
+        assert!(
+            !plain.contains(&root_cid),
+            "ZEB-706: the published root {root_cid:?} must NOT be stored via plain put — that never allowlists the CID for the content-serve queryable, silently stalling cross-device sync (owner-state analog of ZEB-398) (plain={plain:?})"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
