@@ -95,18 +95,23 @@ second non-cloud network).
   2026-07-16 lesson — dial fine, frame delivered, roster missing, ZEB-702).
   RECV/CLEARED timeouts mean the recover half broke on a real WAN. Local
   profiles `xwan-d3-p`/`xwan-d3-b2` are wiped fresh each run (disposable
-  identities). Run via `--test d3` in both firewall modes. **ZEB-702 status:**
-  the fix (fleet-sibling owner-state sync: boot-seed dial view + transport
-  up-edge republish, branch `zeb-702-butler-roster-replication`) landed
-  2026-07-17 — D3 HELD is expected to flip green on the next live run, which
-  is the authoritative re-validation. If HELD still fails, check the butler's
-  `network_health_snapshot` → `butlerDeposits.rejectedUnauthorized` (new in
-  ZEB-702; counts ONLY roster misses — admitted-sender scope failures land in
-  `rejectedOther`) before any transport-side diagnosis. A climbing counter is
-  strong evidence the roster still isn't converging (confirm via the butler's
-  debug log — a genuinely unknown sender also lands here); zero rejects + no
-  HELD points transport-side (no rejection decision was recorded), but is not
-  by itself proof — the debug log remains the classifier of record.
+  identities). Run via `--test d3` in both firewall modes. **ZEB-702/705
+  status:** the ZEB-702 fix (boot-seed dial view + transport up-edge
+  republish) merged 2026-07-17 and its mechanisms were PROVEN on the same
+  day's live re-run — but HELD stayed red: both roster publishes reached B2
+  ~2 s after its relaunch boot and were dropped on an un-retried content-blob
+  fetch (queryable-declaration race on the ~1 s-old link); P, the only blob
+  holder, was SIGKILLed 3 s later → ZEB-705. That fix adds a bounded fetch
+  retry (3×2 s re-injection) plus a **D3 ROSTER barrier** (B2's friend list
+  must carry A before P is killed — separates "roster converges while P is
+  alive" from "deposit dial + authorization work"). On a HELD or ROSTER
+  timeout the script now snapshots B2's `network_health_snapshot` into the
+  artifacts: read `butlerDeposits.rejectedUnauthorized` FIRST (counts ONLY
+  roster misses — admitted-sender scope failures land in `rejectedOther`). A
+  climbing counter means the roster still isn't converging (confirm via the
+  butler's debug log — a genuinely unknown sender also lands here); zero
+  rejects + no HELD points transport-side, but is not by itself proof — the
+  debug log remains the classifier of record.
 
 Node snapshots and logs land in `~/.cache/gce-xwan-logs/<timestamp>/`.
 
@@ -155,6 +160,19 @@ friend or co-member)" — a cert-only paired butler never receives
 community-less sibling; measured: 300 s bilateral-alive, roster still empty).
 Filed as **ZEB-702** (High). Also found: `dm_outbox` pending entries do not
 survive a graceful restart. Session cost ≈$0.50 (VM up ~1.5 h).
+
+**2026-07-17 D3 post-ZEB-702 re-run — open mode** (`999c5f3d`, warm disk,
+provision 12m incremental): every setup barrier again passed (friend attempt
+1, community attempt 2, post-pin announce replicated in ~3 s). **HELD FAIL,
+counter-classified in one log line**: the ZEB-702 epoch-republish DELIVERED
+P's roster roots to B2 twice at +2 s after B2's relaunch boot, and the
+acceptor's new WARN fired with `rejected_unauthorized=1` — but both publishes
+were dropped at the content fetch (`no successful reply` with zero
+reply-error warns = the get() raced P's queryable-declaration propagation on
+the ~1 s-old LAN link), and P was SIGKILLed 3 s later, leaving no holder of
+the blob. Filed as **ZEB-705**; its fix (bounded fetch retry + ROSTER
+barrier) makes this window deterministic. Session cost ≈$0.15 (VM up ~30 min,
+stop-not-delete). Artifacts: `~/.cache/gce-xwan-logs/20260717-101952/`.
 
 The 2026-07-04 session is the **first proven cross-WAN direct-path NAT traversal**
 for Harmony: `connectionMode: "direct"` on both a home-NAT node and the GCE node,

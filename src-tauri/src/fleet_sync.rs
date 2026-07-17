@@ -39,10 +39,10 @@ use crate::owner_state_types::Hlc;
 use harmony_content::cid::ContentId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 /// Default debounce window between a `notify_dirty` and the resulting
@@ -50,6 +50,31 @@ use tokio::task::JoinHandle;
 /// — small enough to feel near-instant to a human, large enough to
 /// collapse keystroke-rate mutations.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
+
+/// ZEB-705: bounded retry budget for an inbound state-root publish whose
+/// content-blob fetch failed. A fresh zenoh link delivers the root put before
+/// the publisher's content queryable declaration has propagated back (~1 s),
+/// so the first fetch can complete with zero replies; without a retry the
+/// publish is dropped permanently — fatal for a paired butler whose primary
+/// (the only blob holder) departs seconds later. Retries re-inject the
+/// original wire frame through the FULL inbound pipeline, so the replay check
+/// naturally kills a retry that a newer root has since superseded.
+const FETCH_RETRY_ATTEMPTS: u8 = 3;
+
+/// Delay between fetch retries. Comfortably above declaration-propagation
+/// latency on a fresh link; small enough that all retries land inside the
+/// "publisher still alive" window the D3 scenario measures in seconds.
+const FETCH_RETRY_DELAY_MS: u64 = 2000;
+
+/// Max fetch-retry sleepers in flight per engine. Each pending retry is a
+/// detached task holding its wire frame for `FETCH_RETRY_DELAY_MS`; a burst
+/// of misses (or a hostile publish flood) must not pile those up unbounded.
+/// A permit is acquired BEFORE the sleeper is spawned and held for its whole
+/// lifetime, so concurrent retries — and thus retained wire buffers — are
+/// hard-capped. Excess misses are dropped (WARN); CRDT eventual consistency +
+/// the transport-epoch re-offer recover them. Sized to the re-injection
+/// channel capacity so a full permit set never overflows the channel.
+const FETCH_RETRY_MAX_INFLIGHT: usize = 8;
 
 /// Engine-local root-publish envelope. Superset of legacy RootPublishPayload:
 /// `seen` is skip-if-empty so an empty-seen envelope encodes byte-identically.
@@ -176,6 +201,18 @@ pub struct FleetSyncEngine<S: Send + 'static> {
     sibling_acks: Arc<Mutex<BTreeMap<String, Hlc>>>,
     device_id: String,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// ZEB-705 observability. The task-side (`Ctx`) clones carry the live
+    /// increments; these handle-side clones exist only so the in-crate tests
+    /// can read the counters, hence the `cfg(test)` gate (production never
+    /// reads them off the handle).
+    #[cfg(test)]
+    fetch_retries_scheduled: Arc<AtomicU64>,
+    #[cfg(test)]
+    fetch_retries_run: Arc<AtomicU64>,
+    #[cfg(test)]
+    fetch_retries_dropped: Arc<AtomicU64>,
+    #[cfg(test)]
+    fetch_retry_inflight_peak: Arc<AtomicU64>,
     _s: std::marker::PhantomData<fn() -> S>,
 }
 
@@ -225,6 +262,14 @@ where
         let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
         let (persist_now_tx, persist_now_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        // ZEB-705: bounded fetch-retry re-injection. Capacity matches the
+        // in-flight permit cap so a full sleeper set never overflows it.
+        let (fetch_retry_tx, fetch_retry_rx) = mpsc::channel(FETCH_RETRY_MAX_INFLIGHT);
+        let fetch_retry_sem = Arc::new(Semaphore::new(FETCH_RETRY_MAX_INFLIGHT));
+        let fetch_retries_scheduled = Arc::new(AtomicU64::new(0));
+        let fetch_retries_run = Arc::new(AtomicU64::new(0));
+        let fetch_retries_dropped = Arc::new(AtomicU64::new(0));
+        let fetch_retry_inflight_peak = Arc::new(AtomicU64::new(0));
 
         let replay_tracker = Arc::clone(&config.replay_tracker);
         let sibling_acks = Arc::clone(&config.sibling_acks);
@@ -250,6 +295,13 @@ where
             flush_now_rx,
             persist_now_rx,
             shutdown_rx,
+            fetch_retry_tx,
+            fetch_retry_rx,
+            fetch_retry_sem,
+            fetch_retries_scheduled: Arc::clone(&fetch_retries_scheduled),
+            fetch_retries_run: Arc::clone(&fetch_retries_run),
+            fetch_retries_dropped: Arc::clone(&fetch_retries_dropped),
+            fetch_retry_inflight_peak: Arc::clone(&fetch_retry_inflight_peak),
         }));
 
         FleetSyncEngine {
@@ -262,8 +314,40 @@ where
             sibling_acks,
             device_id,
             task: Mutex::new(Some(task)),
+            #[cfg(test)]
+            fetch_retries_scheduled,
+            #[cfg(test)]
+            fetch_retries_run,
+            #[cfg(test)]
+            fetch_retries_dropped,
+            #[cfg(test)]
+            fetch_retry_inflight_peak,
             _s: std::marker::PhantomData,
         }
+    }
+
+    /// ZEB-705 test observability: fetch retries scheduled so far.
+    #[cfg(test)]
+    fn fetch_retries_scheduled(&self) -> u64 {
+        self.fetch_retries_scheduled.load(Ordering::Relaxed)
+    }
+
+    /// ZEB-705 test observability: retry frames dequeued and re-processed.
+    #[cfg(test)]
+    fn fetch_retries_run(&self) -> u64 {
+        self.fetch_retries_run.load(Ordering::Relaxed)
+    }
+
+    /// ZEB-705 test observability: retries dropped at the in-flight cap.
+    #[cfg(test)]
+    fn fetch_retries_dropped(&self) -> u64 {
+        self.fetch_retries_dropped.load(Ordering::Relaxed)
+    }
+
+    /// ZEB-705 test observability: peak concurrent retry sleepers observed.
+    #[cfg(test)]
+    fn fetch_retry_inflight_peak(&self) -> u64 {
+        self.fetch_retry_inflight_peak.load(Ordering::Relaxed)
     }
 
     /// Hint that local state has mutated and a debounced publish should
@@ -420,6 +504,22 @@ struct Ctx<S> {
     flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     persist_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
+    /// ZEB-705: re-injection channel for bounded fetch retries. The sender
+    /// clone lives in short-lived sleep tasks; keeping one clone here means
+    /// `fetch_retry_rx` can never observe a closed channel while the engine
+    /// task runs (the select arm's `Some(..)` pattern stays armed).
+    fetch_retry_tx: mpsc::Sender<(Vec<u8>, u8)>,
+    fetch_retry_rx: mpsc::Receiver<(Vec<u8>, u8)>,
+    /// ZEB-705: caps concurrent retry sleepers (see `FETCH_RETRY_MAX_INFLIGHT`).
+    /// A permit is acquired before spawning and released when the sleeper ends.
+    fetch_retry_sem: Arc<Semaphore>,
+    /// ZEB-705 observability: retries scheduled / retry frames processed /
+    /// retries dropped because the in-flight cap was saturated / peak
+    /// concurrent sleepers observed.
+    fetch_retries_scheduled: Arc<AtomicU64>,
+    fetch_retries_run: Arc<AtomicU64>,
+    fetch_retries_dropped: Arc<AtomicU64>,
+    fetch_retry_inflight_peak: Arc<AtomicU64>,
 }
 
 async fn internal_task<S>(mut ctx: Ctx<S>)
@@ -542,20 +642,14 @@ where
                     inbound_closed = true;
                     continue;
                 };
-                match handle_incoming_publish(&mut ctx, bytes).await {
-                    Inbound::Applied(outcome) => {
-                        if let Err(e) = persist_now(&ctx).await {
-                            tracing::warn!(error = %e, "persist_now failed");
-                        }
-                        if outcome.changed {
-                            if let Some(cb) = ctx.on_applied.as_ref() {
-                                cb();
-                            }
-                        }
-                    }
-                    // Duplicate / Echo / Dropped: no persist, no callback.
-                    Inbound::Duplicate | Inbound::Echo | Inbound::Dropped => {}
-                }
+                process_inbound(&mut ctx, bytes, FETCH_RETRY_ATTEMPTS).await;
+            }
+            Some((wire, attempts_left)) = ctx.fetch_retry_rx.recv() => {
+                // ZEB-705: re-injected retry of a fetch-missed publish. The
+                // frame re-enters the FULL pipeline, so a root that a newer
+                // publish has since superseded dies at the replay check.
+                ctx.fetch_retries_run.fetch_add(1, Ordering::Relaxed);
+                process_inbound(&mut ctx, wire, attempts_left).await;
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
                 // Flush only if there is genuinely unpublished dirty state.
@@ -744,12 +838,94 @@ enum Inbound {
     Duplicate,
     /// Our own publish echoed back. No change.
     Echo,
-    /// Dropped before applying (decrypt/decode/fetch-miss/blob-decrypt
-    /// failure). No change; tracker NOT advanced — the peer's next
-    /// publish is retried.
+    /// Dropped before applying on a DETERMINISTIC failure (decrypt/decode/
+    /// blob-decrypt). No change; tracker NOT advanced — the peer's next
+    /// publish is retried. Not re-attempted locally: the same bytes would
+    /// fail the same way.
     Dropped,
+    /// ZEB-705: the content-blob fetch behind the root pointer failed — a
+    /// TRANSIENT failure class (declaration-propagation race on a fresh
+    /// link, fetch timeout). Carries the original wire frame back so the
+    /// engine loop can schedule a bounded re-injection; tracker NOT
+    /// advanced, so the retry is idempotent.
+    FetchMiss(Vec<u8>),
     /// Merge applied AND tracker advanced. Persist + maybe-callback.
     Applied(MergeOutcome),
+}
+
+/// Drive one inbound wire frame through `handle_incoming_publish` and act on
+/// the outcome: persist + callback on Applied; on a FetchMiss (ZEB-705,
+/// transient blob-fetch failure) schedule a bounded re-injection with
+/// `attempts_left - 1`. The sleep lives in a spawned task — NEVER inline —
+/// because this runs on the engine's select loop, whose other arms include
+/// `flush_now` (awaited by the shutdown flush fence).
+async fn process_inbound<S>(ctx: &mut Ctx<S>, wire: Vec<u8>, attempts_left: u8)
+where
+    S: CanonicalPayload + serde::de::DeserializeOwned + Clone + Send + 'static,
+{
+    match handle_incoming_publish(ctx, wire).await {
+        Inbound::Applied(outcome) => {
+            if let Err(e) = persist_now(ctx).await {
+                tracing::warn!(error = %e, "persist_now failed");
+            }
+            if outcome.changed {
+                if let Some(cb) = ctx.on_applied.as_ref() {
+                    cb();
+                }
+            }
+        }
+        Inbound::FetchMiss(wire) => {
+            if attempts_left == 0 {
+                tracing::warn!(
+                    "ZEB-705: state-root blob fetch retries exhausted — publish dropped; \
+                     tracker un-advanced, the peer's next publish or re-offer recovers"
+                );
+                return;
+            }
+            // Acquire a permit BEFORE spawning so the count of detached
+            // sleepers — each retaining its wire buffer for the whole delay —
+            // is hard-capped, not just the re-injection channel. On
+            // saturation drop the retry (CRDT + epoch re-offer recover); this
+            // is the adversarial-flood backstop CodeRabbit/Qodo flagged.
+            let Ok(permit) = Arc::clone(&ctx.fetch_retry_sem).try_acquire_owned() else {
+                ctx.fetch_retries_dropped.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "ZEB-705: fetch-retry in-flight cap saturated — dropping retry; \
+                     CRDT re-offer / transport-epoch republish recover"
+                );
+                return;
+            };
+            ctx.fetch_retries_scheduled.fetch_add(1, Ordering::Relaxed);
+            // Record peak concurrent sleepers (permits taken = cap - available).
+            let inflight =
+                (FETCH_RETRY_MAX_INFLIGHT - ctx.fetch_retry_sem.available_permits()) as u64;
+            ctx.fetch_retry_inflight_peak
+                .fetch_max(inflight, Ordering::Relaxed);
+            tracing::info!(
+                attempts_left,
+                delay_ms = FETCH_RETRY_DELAY_MS,
+                "ZEB-705: state-root blob fetch failed — retry scheduled"
+            );
+            let tx = ctx.fetch_retry_tx.clone();
+            tokio::spawn(async move {
+                // Hold the permit for the sleeper's whole lifetime; released
+                // on task end (after enqueue), bounding concurrent retries.
+                let _permit = permit;
+                tokio::time::sleep(Duration::from_millis(FETCH_RETRY_DELAY_MS)).await;
+                // `try_send`, never a blocking `send().await`: a full channel
+                // means the engine is already saturated — drop, don't pile up.
+                // A closed channel means the engine shut down — also moot.
+                if tx.try_send((wire, attempts_left - 1)).is_err() {
+                    tracing::warn!(
+                        "ZEB-705: fetch-retry re-injection channel unavailable — retry dropped"
+                    );
+                }
+            });
+        }
+        // Duplicate / Echo / deterministic Dropped: no persist, no callback,
+        // no retry (the same bytes would fail the same way).
+        Inbound::Duplicate | Inbound::Echo | Inbound::Dropped => {}
+    }
 }
 
 /// Process an incoming publish using MINT ordering (apply-before-advance):
@@ -819,23 +995,28 @@ where
         }
     }
 
-    // 5. Fetch the encrypted root blob from CAS.
+    // 5. Fetch the encrypted root blob from CAS. Failures here are the
+    //    TRANSIENT class (ZEB-705): return the wire frame so the engine
+    //    loop can schedule a bounded retry (tracker un-advanced either way).
     let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
         Ok(Some(b)) => b,
         Ok(None) => {
             // A missing blob means a fetch timeout or a corrupted-admit
-            // drop. Both collapse onto the same recovery path: drop the
-            // publish (tracker un-advanced) and rely on the next
-            // state-root from any peer (CRDT eventual consistency).
+            // drop. Both collapse onto the same recovery path: retry, then
+            // rely on the next state-root from any peer (CRDT eventual
+            // consistency).
             tracing::warn!(
                 cid = ?payload.root_cid,
-                "incoming publish dropped: missing root blob (fetch timeout or admit-rejected)"
+                "incoming publish fetch miss: missing root blob (fetch timeout or admit-rejected) — will retry if budget remains"
             );
-            return Inbound::Dropped;
+            return Inbound::FetchMiss(wire);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "incoming publish dropped: content_store.get error");
-            return Inbound::Dropped;
+            tracing::warn!(
+                error = %e,
+                "incoming publish fetch error: content_store.get error — will retry if budget remains"
+            );
+            return Inbound::FetchMiss(wire);
         }
     };
 
@@ -1851,6 +2032,423 @@ mod engine_tests {
         );
 
         let _ = a.engine.shutdown().await;
+        let _ = b.engine.shutdown().await;
+    }
+
+    /// ZEB-705 headline: a publish whose blob fetch misses is retried from
+    /// the receiver side and converges once the blob becomes fetchable —
+    /// WITHOUT any republish from the sender. This is the D3 failure mode:
+    /// the fetch raced queryable-declaration propagation on a ~1s-old link,
+    /// then the publisher (only blob holder) departed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_miss_is_retried_until_blob_appears() {
+        let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let get_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(GateGetCas {
+            inner: Arc::clone(&inner),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            get_attempts: Arc::clone(&get_attempts),
+        });
+        let mut a = build_engine("dev-A", Arc::clone(&inner), false);
+        let b = build_engine("dev-B", Arc::clone(&gate) as Arc<dyn ContentStore>, false);
+
+        // Capture exactly ONE frame from A and inject it — no forwarder, so
+        // convergence can only come from B's own retry of this frame.
+        {
+            let mut doc = a.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "v1".into(),
+                },
+            );
+        }
+        a.engine.flush_now().await.expect("flush A");
+        let frame = tokio::time::timeout(Duration::from_secs(2), a.out_rx.recv())
+            .await
+            .expect("A produced a publish frame")
+            .expect("frame not None");
+        b.in_tx.send(frame).await.expect("inject frame");
+
+        // Positive signal: the initial fetch failed (gate unarmed).
+        let reached_fetch = wait_until(
+            || {
+                let get_attempts = Arc::clone(&get_attempts);
+                async move { get_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(reached_fetch, "B never reached the CAS fetch step");
+        assert!(
+            !b.state.lock().await.entries.contains_key("k1"),
+            "B converged before the blob was fetchable"
+        );
+
+        // Blob becomes fetchable (declarations propagated). The RETRY of the
+        // same frame must now converge B — the sender never republishes.
+        gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let converged = wait_until(
+            || {
+                let b_state = Arc::clone(&b.state);
+                async move {
+                    let doc = b_state.lock().await;
+                    doc.entries.get("k1").is_some_and(|e| e.val == "v1")
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            converged,
+            "B did not converge from the fetch retry (no republish was sent)"
+        );
+        assert!(
+            b.engine.fetch_retries_scheduled() >= 1,
+            "no retry was scheduled for the fetch miss"
+        );
+        assert!(
+            b.engine.fetch_retries_run() >= 1,
+            "no retry frame was re-processed"
+        );
+
+        let _ = a.engine.shutdown().await;
+        let _ = b.engine.shutdown().await;
+    }
+
+    /// ZEB-705: retries are BOUNDED. After exhaustion the tracker stays
+    /// un-advanced, so re-sending the very same frame later (the peer's
+    /// next re-offer) still applies cleanly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_retries_exhaust_then_same_frame_reapplies() {
+        let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let get_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(GateGetCas {
+            inner: Arc::clone(&inner),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            get_attempts: Arc::clone(&get_attempts),
+        });
+        let mut a = build_engine("dev-A", Arc::clone(&inner), false);
+        let b = build_engine("dev-B", Arc::clone(&gate) as Arc<dyn ContentStore>, false);
+
+        {
+            let mut doc = a.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "v1".into(),
+                },
+            );
+        }
+        a.engine.flush_now().await.expect("flush A");
+        let frame = tokio::time::timeout(Duration::from_secs(2), a.out_rx.recv())
+            .await
+            .expect("A produced a publish frame")
+            .expect("frame not None");
+        b.in_tx.send(frame.clone()).await.expect("inject frame");
+
+        // Initial attempt + FETCH_RETRY_ATTEMPTS retries, all missing.
+        let total_attempts = 1 + FETCH_RETRY_ATTEMPTS as usize;
+        let exhausted =
+            wait_until(
+                || {
+                    let get_attempts = Arc::clone(&get_attempts);
+                    async move {
+                        get_attempts.load(std::sync::atomic::Ordering::SeqCst) >= total_attempts
+                    }
+                },
+                Duration::from_secs(20),
+            )
+            .await;
+        assert!(
+            exhausted,
+            "expected {total_attempts} total fetch attempts (initial + retries)"
+        );
+        assert_eq!(
+            b.engine.fetch_retries_scheduled(),
+            FETCH_RETRY_ATTEMPTS as u64,
+            "retry scheduling must stop at the bound"
+        );
+        assert!(
+            !b.tracker.lock().await.contains_key("dev-A"),
+            "tracker advanced despite every fetch failing"
+        );
+        assert!(!b.state.lock().await.entries.contains_key("k1"));
+
+        // Recovery: blob fetchable now; the SAME frame re-offered applies.
+        gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        b.in_tx.send(frame).await.expect("re-inject frame");
+        let converged = wait_until(
+            || {
+                let b_state = Arc::clone(&b.state);
+                async move {
+                    let doc = b_state.lock().await;
+                    doc.entries.get("k1").is_some_and(|e| e.val == "v1")
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(converged, "re-offered frame did not apply after recovery");
+        assert!(
+            b.tracker.lock().await.contains_key("dev-A"),
+            "tracker must advance on the successful re-offer"
+        );
+
+        let _ = a.engine.shutdown().await;
+        let _ = b.engine.shutdown().await;
+    }
+
+    /// ZEB-705: a retry that a NEWER root has superseded dies at the replay
+    /// check — it must not fetch again, let alone regress state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newer_root_supersedes_pending_retry() {
+        let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let get_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(GateGetCas {
+            inner: Arc::clone(&inner),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            get_attempts: Arc::clone(&get_attempts),
+        });
+        let mut a = build_engine("dev-A", Arc::clone(&inner), false);
+        let b = build_engine("dev-B", Arc::clone(&gate) as Arc<dyn ContentStore>, false);
+
+        // Two frames from A: v1 then v2 (strictly newer HLC, same device).
+        {
+            let mut doc = a.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "v1".into(),
+                },
+            );
+        }
+        a.engine.flush_now().await.expect("flush A v1");
+        let frame_v1 = tokio::time::timeout(Duration::from_secs(2), a.out_rx.recv())
+            .await
+            .expect("frame v1")
+            .expect("frame v1 not None");
+        {
+            let mut doc = a.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 2,
+                    val: "v2".into(),
+                },
+            );
+        }
+        a.engine.flush_now().await.expect("flush A v2");
+        let frame_v2 = tokio::time::timeout(Duration::from_secs(2), a.out_rx.recv())
+            .await
+            .expect("frame v2")
+            .expect("frame v2 not None");
+
+        // v1 misses (gate unarmed) → retry scheduled.
+        b.in_tx.send(frame_v1).await.expect("inject v1");
+        let missed = wait_until(
+            || {
+                let get_attempts = Arc::clone(&get_attempts);
+                async move { get_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(missed, "v1 never reached the CAS fetch");
+
+        // v2 arrives with the store healthy → applies, tracker advances.
+        gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        b.in_tx.send(frame_v2).await.expect("inject v2");
+        let converged = wait_until(
+            || {
+                let b_state = Arc::clone(&b.state);
+                async move {
+                    let doc = b_state.lock().await;
+                    doc.entries.get("k1").is_some_and(|e| e.val == "v2")
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(converged, "v2 did not apply");
+        let attempts_after_v2 = get_attempts.load(std::sync::atomic::Ordering::SeqCst);
+
+        // The pending v1 retry fires… and must die at the replay check:
+        // no additional CAS fetch, no state regression.
+        let retry_ran = wait_until(
+            || {
+                let engine_runs = b.engine.fetch_retries_run.clone();
+                async move { engine_runs.load(std::sync::atomic::Ordering::Relaxed) >= 1 }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(retry_ran, "the pending v1 retry never re-processed");
+        assert_eq!(
+            get_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts_after_v2,
+            "superseded retry must be replay-rejected BEFORE the CAS fetch"
+        );
+        let doc = b.state.lock().await;
+        assert_eq!(
+            doc.entries.get("k1").map(|e| e.val.as_str()),
+            Some("v2"),
+            "superseded retry regressed state"
+        );
+        drop(doc);
+
+        let _ = a.engine.shutdown().await;
+        let _ = b.engine.shutdown().await;
+    }
+
+    /// ZEB-705: deterministic failures (garbage that fails decrypt/decode)
+    /// schedule NO retry — the same bytes would fail the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deterministic_decode_failure_is_not_retried() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let mut a = build_engine("dev-A", Arc::clone(&cas), false);
+        let b = build_engine("dev-B", Arc::clone(&cas), false);
+
+        // Garbage first; a valid frame behind it is the positive signal that
+        // the garbage was fully processed (the inbound channel is FIFO).
+        b.in_tx.send(vec![0u8; 48]).await.expect("inject garbage");
+        {
+            let mut doc = a.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "v1".into(),
+                },
+            );
+        }
+        a.engine.flush_now().await.expect("flush A");
+        let frame = tokio::time::timeout(Duration::from_secs(2), a.out_rx.recv())
+            .await
+            .expect("A produced a publish frame")
+            .expect("frame not None");
+        b.in_tx.send(frame).await.expect("inject valid frame");
+
+        let converged = wait_until(
+            || {
+                let b_state = Arc::clone(&b.state);
+                async move {
+                    let doc = b_state.lock().await;
+                    doc.entries.get("k1").is_some_and(|e| e.val == "v1")
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(converged, "valid frame behind the garbage did not apply");
+        assert_eq!(
+            b.engine.fetch_retries_scheduled(),
+            0,
+            "a deterministic decode failure must not schedule fetch retries"
+        );
+
+        let _ = a.engine.shutdown().await;
+        let _ = b.engine.shutdown().await;
+    }
+
+    /// ZEB-705 (CodeRabbit/Qodo): a burst of fetch misses larger than the
+    /// in-flight cap must NOT pile up detached retry sleepers. Concurrent
+    /// sleepers (each retaining its wire buffer) stay ≤ FETCH_RETRY_MAX_INFLIGHT;
+    /// the excess is dropped rather than blocked; liveness survives (the
+    /// permitted retries still converge once the store heals).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_retry_sleepers_are_bounded_under_a_miss_flood() {
+        let flood = FETCH_RETRY_MAX_INFLIGHT + 4; // 12 distinct publishers
+        let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let get_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(GateGetCas {
+            inner: Arc::clone(&inner),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            get_attempts: Arc::clone(&get_attempts),
+        });
+        let b = build_engine("dev-B", Arc::clone(&gate) as Arc<dyn ContentStore>, false);
+
+        // Capture one publish frame from each of `flood` distinct publishers
+        // (shared inner CAS, so every blob is fetchable once B's gate arms).
+        let mut frames = Vec::with_capacity(flood);
+        for i in 0..flood {
+            let mut a = build_engine(&format!("dev-A{i}"), Arc::clone(&inner), false);
+            {
+                let mut doc = a.state.lock().await;
+                doc.entries.insert(
+                    format!("k{i}"),
+                    ToyEntry {
+                        ctr: 1,
+                        val: format!("v{i}"),
+                    },
+                );
+            }
+            a.engine.flush_now().await.expect("flush publisher");
+            let frame = tokio::time::timeout(Duration::from_secs(2), a.out_rx.recv())
+                .await
+                .expect("publisher produced a frame")
+                .expect("frame not None");
+            frames.push(frame);
+            let _ = a.engine.shutdown().await;
+        }
+
+        // Flood all frames near-simultaneously; B's gate is unarmed so every
+        // fetch misses. Frames process in ms; sleepers hold permits for the
+        // whole retry delay, so the excess misses can't get permits.
+        for frame in frames {
+            b.in_tx.send(frame).await.expect("inject flood frame");
+        }
+
+        // THE BOUND, proven off the monotonic drop counter (robust to
+        // scheduling jitter — no wall-clock race). `fetch_retries_dropped`
+        // counts ONLY permit-saturation drops, so reaching `flood - cap`
+        // proves the in-flight cap actually engaged: every miss beyond the
+        // cap was dropped rather than spawning an unbounded sleeper.
+        let excess = (flood - FETCH_RETRY_MAX_INFLIGHT) as u64;
+        let capped = wait_until(
+            || {
+                let dropped = b.engine.fetch_retries_dropped();
+                async move { dropped >= excess }
+            },
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            capped,
+            "in-flight cap never engaged under the flood: dropped={} (want ≥{excess}) scheduled={} peak={}",
+            b.engine.fetch_retries_dropped(),
+            b.engine.fetch_retries_scheduled(),
+            b.engine.fetch_retry_inflight_peak(),
+        );
+        // Structural guard: the semaphore hard-caps concurrent sleepers. This
+        // can only hold while the permit gate exists (removing it would leave
+        // `dropped` at 0 and fail the assertion above).
+        assert!(
+            b.engine.fetch_retry_inflight_peak() <= FETCH_RETRY_MAX_INFLIGHT as u64,
+            "peak concurrent retry sleepers {} exceeded the cap {}",
+            b.engine.fetch_retry_inflight_peak(),
+            FETCH_RETRY_MAX_INFLIGHT
+        );
+
+        // Liveness: heal the store; the permitted (non-dropped) retries still
+        // converge, so the cap throttles without deadlocking delivery.
+        gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let some_converged = wait_until(
+            || {
+                let b_state = Arc::clone(&b.state);
+                async move { !b_state.lock().await.entries.is_empty() }
+            },
+            Duration::from_secs(15),
+        )
+        .await;
+        assert!(
+            some_converged,
+            "no flooded key converged after the store healed — the cap deadlocked delivery"
+        );
+
         let _ = b.engine.shutdown().await;
     }
 
