@@ -53,8 +53,9 @@ so the loop must stay live during the backoff.
   (Duplicate); decode failures schedule no retry (cfg(test) retry counter).
 - Gates: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets
   --features test-fixtures --no-deps -- -D warnings`; `scripts/test-select
-  --context task`; `shellcheck scripts/gce-xwan/run-tests.sh`; full
-  `--workspace --all-targets` sweep pre-PR.
+  --context task`; `shellcheck scripts/gce-xwan/run-tests.sh`; final full sweep
+  `cargo nextest run --locked --workspace --all-targets --features test-fixtures`
+  pre-PR.
 - **Live validation (post-merge): D3 re-run** — the standing gate; expected
   green with the barrier making the window deterministic.
 
