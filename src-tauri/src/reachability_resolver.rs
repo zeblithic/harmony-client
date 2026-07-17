@@ -485,6 +485,28 @@ impl ReachabilityResolver {
             .collect()
     }
 
+    /// ZEB-702: the DIAL view — the freshest [`ResolverEntry`] per
+    /// `(owner, node_id)` across ALL three slots (durable / pkarr / fleet), one
+    /// row per (owner, device). Unlike [`list_active_peers`](Self::list_active_peers)
+    /// / [`list_active_peers_with_source`](Self::list_active_peers_with_source)
+    /// (both backed by [`durable_preferred`](ResolverSlots::durable_preferred),
+    /// which EXCLUDES the fleet slot), this uses
+    /// [`freshest`](ResolverSlots::freshest), so a fleet-slot-only sibling — e.g.
+    /// a SAS-paired cert-only butler known only from pairing — appears here.
+    ///
+    /// The boot-seed reconnect enumeration
+    /// ([`crate::iroh_zenoh_registration::boot_seed_node_ids_by_recency`]) reads
+    /// THIS view so such siblings are re-dialed at every boot. `durable_preferred`
+    /// is deliberately NOT widened: it backs [`resolve`](Self::resolve) /
+    /// `list_active_peers` whose callers (dial-by-owner, diagnostics, e2e
+    /// barriers) depend on durable/pkarr semantics. This view is additive.
+    pub fn list_dialable_peers(&self) -> Vec<(OwnerAddr, ResolverEntry)> {
+        let map = self.inner.read().expect("resolver read lock");
+        map.iter()
+            .filter_map(|((owner, _node_id), v)| v.freshest().map(|e| (*owner, e.clone())))
+            .collect()
+    }
+
     /// Reverse lookup: given an iroh `EndpointId` byte representation,
     /// find the matching `(OwnerAddr, payload)` entry.
     ///
@@ -2149,6 +2171,71 @@ mod fallback_tests {
         let diag = r.resolve(&owner);
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].announced_at_ms, 100);
+    }
+
+    // ZEB-702: the dial view (`list_dialable_peers`) INCLUDES the fleet slot,
+    // unlike the butler/diagnostics view (`list_active_peers`, backed by
+    // `durable_preferred`). This asymmetry is the keystone: a SAS-paired
+    // cert-only butler is known only via its fleet slot, so it must be dialable
+    // (re-dialed at boot) even though it never surfaces in butler/diag views.
+    #[test]
+    fn list_dialable_peers_includes_fleet_only_that_list_active_excludes() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0x51; 16]);
+        let payload = make_payload(0xB2, 5000);
+        r.update_with_source(
+            owner,
+            payload.clone(),
+            make_hlc(5000, 0, ""),
+            ReachabilitySource::FleetSibling,
+        );
+
+        // Dial view returns the fleet-slot-only sibling, full entry + source.
+        let dialable = r.list_dialable_peers();
+        assert_eq!(dialable.len(), 1, "one row per (owner, device)");
+        assert_eq!(dialable[0].0, owner);
+        assert_eq!(dialable[0].1.payload.iroh_node_id, payload.iroh_node_id);
+        assert_eq!(dialable[0].1.source, ReachabilitySource::FleetSibling);
+
+        // Butler/diagnostics view still excludes it (deliberate asymmetry).
+        assert!(
+            r.list_active_peers().is_empty(),
+            "fleet-only entry must NOT surface via list_active_peers()"
+        );
+    }
+
+    // ZEB-702: when a peer has entries in more than one slot, the dial view
+    // returns the FRESHEST (by `effective_announced_at_ms`, ties → durable),
+    // matching the freshest-wins dial semantics the runtime kick gate uses.
+    #[test]
+    fn list_dialable_peers_returns_freshest_across_slots() {
+        let r = ReachabilityResolver::new();
+        let owner = OwnerAddr([0x77; 16]);
+        let node = 0xAB;
+        let durable = make_payload(node, 100);
+        let fleet = make_payload(node, 200); // fresher announce
+        assert_eq!(durable.iroh_node_id, fleet.iroh_node_id, "same key");
+
+        r.update_with_source(
+            owner,
+            durable.clone(),
+            make_hlc(100, 0, "d"),
+            ReachabilitySource::DurableCrdt,
+        );
+        r.update_with_source(
+            owner,
+            fleet.clone(),
+            make_hlc(200, 0, ""),
+            ReachabilitySource::FleetSibling,
+        );
+
+        let dialable = r.list_dialable_peers();
+        assert_eq!(dialable.len(), 1, "distinct slots collapse to one dial row");
+        assert_eq!(
+            dialable[0].1.payload.announced_at_ms, 200,
+            "the fresher fleet record wins the dial view"
+        );
+        assert_eq!(dialable[0].1.source, ReachabilitySource::FleetSibling);
     }
 
     // Reuses the `CountingFallback` defined above (`payloads: Vec::new()` — this
