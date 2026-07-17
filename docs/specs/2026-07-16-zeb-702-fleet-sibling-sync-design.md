@@ -73,7 +73,9 @@ In `event_loop::run`, subscribe `transport_epoch_tx` (`watch::Sender<u64>`,
 pattern precedent: mail driver `event_loop.rs:3169`). On each epoch change, call
 `notify_dirty()` on every owner-scoped dataset engine (owner-state, fleet-net,
 dm-inbox, dm-outhold, owner-trust, fleet-keys, owner-quorum-req,
-community-device-intro, mint, notes).
+community-device-intro, mint, notes, relay-hold, relay-optin — the last two
+added during T3: they are owner-scoped `ds/*` datasets the original
+enumeration missed).
 
 - `notify_dirty` (not `flush_now`): synchronous, non-blocking, no oneshot await in
   the event loop, and the engines' existing debounce coalesces bursts of up-edges.

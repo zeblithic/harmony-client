@@ -10898,6 +10898,15 @@ pub async fn start_node_inner(
                     if let Some(e) = notes_sync_engine_opt.clone() {
                         v.push(e);
                     }
+                    // ZEB-702: relay-hold/relay-optin are owner-scoped datasets
+                    // too (harmony/owner/{addr}/ds/relay-*-v1) — a late-linking
+                    // sibling needs their current state like any other.
+                    if let Some(e) = relay_hold_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = relay_optin_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
                     v
                 };
                 let thread_result = thread::Builder::new()
