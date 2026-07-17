@@ -15,7 +15,7 @@
 - No butler-acceptor authorization change; the wire-silent reject (no oracle) stays wire-silent. New WARN/counters are local-only.
 - e2e/s7 asserts untouched (do not weaken or harden the co-located HELD boundary).
 - DTO fields serialize camelCase (serde) — e2e assertions read camelCase keys.
-- Gates per task: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, `scripts/test-select --context task` (from repo root). Commit BEFORE gates; 10-minute wall-clock budget on gate runs; report DONE_WITH_CONCERNS rather than looping.
+- Gates per task: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, `scripts/test-select --context task` (from repo root; paste the printed `round=… bucket=…` summary line into the task report so the selection is auditable). Commit BEFORE gates; 10-minute wall-clock budget on gate runs; report DONE_WITH_CONCERNS rather than looping.
 - Commits end with:
   `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>` and
   `Claude-Session: https://claude.ai/code/session_01MsT6ZD7kqbpbKoeenyQPtc`
@@ -49,7 +49,7 @@
 - Produces: `pub trait RepublishDirty: Send + Sync { fn republish_dirty(&self); }` implemented for `FleetSyncEngine<S>` by delegating to `notify_dirty()`. Also implemented for `mint_sync`'s engine ONLY IF it shares `FleetSyncEngine` (check: `mint_sync.rs` — if it is a distinct engine type, add the same one-line impl there; notes likewise). Task 3 consumes `Arc<dyn RepublishDirty>`.
 
 - [ ] **Step 1: Failing test.** With an engine built via the existing `new_for_test*` constructor and a large debounce, call `republish_dirty()` via the trait object → engine publishes on the debounce path exactly as a `notify_dirty()` would (assert via the existing test publisher channel; model on the existing notify_dirty debounce test).
-- [ ] **Step 2: Verify fail** (trait doesn't exist yet → compile fail is the failure mode; `cargo nextest list` catches it fast).
+- [ ] **Step 2: Verify fail** (trait doesn't exist yet → compile fail is the failure mode; `cargo nextest list --locked` catches it fast).
 - [ ] **Step 3: Implement** trait + impls (delegation only, no behavior).
 - [ ] **Step 4: Tests green.**
 - [ ] **Step 5: Commit** (`ZEB-702 T2: RepublishDirty seam on sync engines`), gates.
@@ -58,7 +58,7 @@
 
 **Files:**
 - Modify: `src-tauri/src/event_loop.rs` (listener task near the epoch machinery; handles struct(s) that `start_node` passes in)
-- Modify: `src-tauri/src/lib.rs` (collect `Arc<dyn RepublishDirty>` clones of ALL owner dataset engines — owner-state `:4868`, fleet-net `:5627`, dm-inbox `:5160`, dm-outhold, owner-trust `:5863`, fleet-keys, owner-quorum-req, community-device-intro `:5255-5350`, mint `:5040`, notes — into a `Vec` threaded through the event-loop handles)
+- Modify: `src-tauri/src/lib.rs` (collect `Arc<dyn RepublishDirty>` clones of ALL owner dataset engines — owner-state `:4868`, fleet-net `:5627`, dm-inbox `:5160`, dm-outhold, owner-trust `:5863`, fleet-keys, owner-quorum-req, community-device-intro `:5255-5350`, mint `:5040`, notes, relay-hold, relay-optin — into a `Vec` threaded through the event-loop handles; the relay pair are owner-scoped `ds/*` engines like the rest)
 - Tests: inline in `event_loop.rs` (fake `RepublishDirty` impl counting calls)
 
 **Interfaces:**

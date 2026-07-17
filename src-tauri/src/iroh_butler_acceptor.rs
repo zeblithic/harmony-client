@@ -87,6 +87,16 @@ pub enum DepositReject {
     /// counters/tests. (Formerly `NotFriend`.)
     #[error("sender is not authorized to deposit (not an active friend or co-member)")]
     NotAuthorized,
+    /// The sender WAS admitted (active friend or live group-DM co-member) but
+    /// failed a narrower post-admission scope check: a co-member deposit
+    /// bound to a space they don't live-share (message/invite paths), or a
+    /// co-member attempting a friend-scoped revocation deposit. Split from
+    /// [`NotAuthorized`] (ZEB-702, PR #481 review): only a ROSTER miss is the
+    /// roster-sync signal — counting these as `rejected_unauthorized` would
+    /// fire the ZEB-702 WARN for senders the roster already admitted. The
+    /// wire close is uniform with every other reject (no oracle).
+    #[error("sender is not authorized for this deposit's scope")]
+    NotAuthorizedForScope,
     /// The embedded `EnrollmentCert` failed to decode, failed verification,
     /// is not Master-issued, has `owner_id != frame.sender_owner`, or its
     /// issuing master fails the admission-path master binding: the friend
@@ -712,7 +722,7 @@ pub async fn handle_deposit_core(
                     .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
                     .await
             {
-                return Err(DepositReject::NotAuthorized);
+                return Err(DepositReject::NotAuthorizedForScope);
             }
             let key = DmInboxDoc::key(&signed.space_id.0, &signed.message_cid.to_bytes());
             (
@@ -745,7 +755,7 @@ pub async fn handle_deposit_core(
                 // revocation: doing so would let a mere co-member write
                 // into another owner's friend-scoped revocation set.
                 if !matches!(admission, Admission::Friend(_)) {
-                    return Err(DepositReject::NotAuthorized);
+                    return Err(DepositReject::NotAuthorizedForScope);
                 }
                 if rp_bytes.len() > crate::butler_deposit::MAX_DEPOSIT_INVITE_BYTES {
                     return Err(DepositReject::BadPayload);
@@ -864,7 +874,7 @@ pub async fn handle_deposit_core(
                         .space_live_group_dm_co_member(&signed.space_id.0, &frame.sender_owner)
                         .await
                 {
-                    return Err(DepositReject::NotAuthorized);
+                    return Err(DepositReject::NotAuthorizedForScope);
                 }
                 let key = DmInboxDoc::invite_key(&signed.space_id.0);
                 (
@@ -1007,12 +1017,14 @@ impl ButlerDepositStats {
         self.accepted.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a rejected deposit. An unauthorized reject also fires a
-    /// rate-limited WARN (≤1 per [`BUTLER_REJECT_WARN_MIN_INTERVAL_MS`]) naming
-    /// ZEB-702 and the remedy hint. Every other reject reason (bad cert/sig,
-    /// cap, malformed payload, inner-verify, persist) is a `rejected_other` —
-    /// already covered by the shell's per-reject `debug!` and never warned
-    /// (only a persistently-rejecting roster is the ZEB-702 signal).
+    /// Count a rejected deposit. A ROSTER-MISS reject (`NotAuthorized`) also
+    /// fires a rate-limited WARN (≤1 per [`BUTLER_REJECT_WARN_MIN_INTERVAL_MS`])
+    /// naming ZEB-702 and the remedy hint. Every other reject reason (bad
+    /// cert/sig, cap, malformed payload, inner-verify, persist, and the
+    /// post-admission `NotAuthorizedForScope` class — an admitted sender
+    /// failing a space/operation binding) is a `rejected_other` — already
+    /// covered by the shell's per-reject `debug!` and never warned (only a
+    /// persistently-rejecting roster is the ZEB-702 signal).
     pub fn record_rejected(&self, reject: &DepositReject) {
         match reject {
             DepositReject::NotAuthorized => {
@@ -1807,7 +1819,9 @@ mod tests {
 
     /// ZEB-424 D28.1 security follow-up: a sender who shares SOME live group
     /// DM (so step-1 admission passes) but whose deposit names a space they
-    /// are NOT a live member of is rejected `NotAuthorized` AFTER decrypt but
+    /// are NOT a live member of is rejected `NotAuthorizedForScope` (an
+    /// ADMITTED sender failing the space bind — deliberately NOT the ZEB-702
+    /// roster-miss signal) AFTER decrypt but
     /// BEFORE persist/ack — closing the "deposit for an unrelated space"
     /// inbox-slot-pinning / lying-ack vector. The bind is on the inner
     /// packet's own space_id, not merely "shares any group".
@@ -1823,7 +1837,10 @@ mod tests {
         let err = handle_deposit_core(&f.frame, &ctx)
             .await
             .expect_err("co-member depositing into a non-member space is rejected");
-        assert!(matches!(err, DepositReject::NotAuthorized), "got {err:?}");
+        assert!(
+            matches!(err, DepositReject::NotAuthorizedForScope),
+            "got {err:?}"
+        );
         let ev = ctx.events();
         // The reject is POST-decrypt (the space_id is sealed until then)…
         assert!(
@@ -2728,7 +2745,8 @@ mod tests {
     /// to ACTIVE friends, and this persists into the friend-scoped
     /// `revoked_dm_devices` CRDT. A well-formed, sender-owned revocation
     /// admitted only as a live group-DM `CoMember` (NOT an Active friend)
-    /// must be rejected `NotAuthorized`, and nothing persisted — mirrors
+    /// must be rejected `NotAuthorizedForScope` (admitted sender, friend-scoped
+    /// operation — not the ZEB-702 roster-miss signal), and nothing persisted — mirrors
     /// `deposit_from_non_friend_group_co_member_is_accepted`'s admission
     /// setup, but for the revocation arm where co-member admission must NOT
     /// be sufficient.
@@ -2743,7 +2761,7 @@ mod tests {
         let err = handle_deposit_core(&f.frame, &ctx)
             .await
             .expect_err("a co-member (non-friend) must not be able to deposit a revocation");
-        assert_eq!(err, DepositReject::NotAuthorized);
+        assert_eq!(err, DepositReject::NotAuthorizedForScope);
         assert!(
             ctx.store.lock().unwrap().is_empty(),
             "nothing persisted for a co-member-admitted revocation"
@@ -2827,6 +2845,38 @@ mod tests {
         let s = stats.snapshot();
         assert_eq!(s.accepted, 0);
         assert_eq!(s.rejected_other, 0);
+    }
+
+    /// ZEB-702 (PR #481 review): a post-admission scope reject — an ADMITTED
+    /// co-member failing the space bind — counts as `rejected_other` and never
+    /// fires the roster-divergence WARN. Splitting this class out of
+    /// `rejected_unauthorized` keeps the ZEB-702 signal meaningful: only true
+    /// roster misses indicate owner-state sync failure.
+    #[tokio::test]
+    async fn scope_reject_counts_other_never_warns() {
+        // A real scope outcome from the pipeline: admitted via a shared live
+        // group, but the deposit's own space is not live-shared.
+        let f = valid_fixture();
+        let mut ctx = TestCtx::for_fixture(&f);
+        ctx.friends.clear();
+        ctx.group_co_members.insert(f.sender_owner);
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("scope-bound reject");
+        assert!(
+            matches!(err, DepositReject::NotAuthorizedForScope),
+            "got {err:?}"
+        );
+
+        let stats = ButlerDepositStats::new();
+        stats.record_rejected(&err);
+        let s = stats.snapshot();
+        assert_eq!(s.rejected_other, 1, "scope reject is rejected_other");
+        assert_eq!(
+            s.rejected_unauthorized, 0,
+            "scope reject is NOT the roster signal"
+        );
+        assert_eq!(stats.warn_emissions(), 0, "scope reject never warns");
     }
 
     /// (c): an accepted deposit increments `accepted` only — no reject counter,

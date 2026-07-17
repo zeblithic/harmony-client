@@ -101,8 +101,12 @@ second non-cloud network).
   2026-07-17 — D3 HELD is expected to flip green on the next live run, which
   is the authoritative re-validation. If HELD still fails, check the butler's
   `network_health_snapshot` → `butlerDeposits.rejectedUnauthorized` (new in
-  ZEB-702) before any transport-side diagnosis: a climbing reject counter =
-  roster still not converging; zero rejects + no HELD = transport-side.
+  ZEB-702; counts ONLY roster misses — admitted-sender scope failures land in
+  `rejectedOther`) before any transport-side diagnosis. A climbing counter is
+  strong evidence the roster still isn't converging (confirm via the butler's
+  debug log — a genuinely unknown sender also lands here); zero rejects + no
+  HELD points transport-side (no rejection decision was recorded), but is not
+  by itself proof — the debug log remains the classifier of record.
 
 Node snapshots and logs land in `~/.cache/gce-xwan-logs/<timestamp>/`.
 

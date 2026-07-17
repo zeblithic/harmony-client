@@ -135,9 +135,9 @@ The reject is DEBUG-only and wire-silent by design (`iroh_butler_acceptor.rs:101
   where timing matters (wall-clock budget rule).
 - **D:** counter increments per decision path; WARN rate-limiting (CountingEmitter
   precedent); snapshot DTO carries camelCase fields.
-- **Gates:** `cargo fmt`, `clippy --locked --all-targets --features test-fixtures
-  -D warnings`, `scripts/test-select --context task` per task, full
-  `--workspace --all-targets` sweep at the end.
+- **Gates:** `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets
+  --features test-fixtures --no-deps -- -D warnings`, `scripts/test-select
+  --context task` per task, full `--workspace --all-targets` sweep at the end.
 - **Live validation (post-merge):** `scripts/gce-xwan/run-tests.sh --mode open
   --test d3` — the standing ZEB-689 gate; HELD flips green when this works. The s7
   co-located HELD boundary stays as-is (do not weaken/harden in this PR).
