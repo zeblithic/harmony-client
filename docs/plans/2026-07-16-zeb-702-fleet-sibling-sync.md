@@ -65,6 +65,17 @@
 - Consumes: `RepublishDirty` (Task 2), `transport_epoch_tx: watch::Sender<u64>` (`event_loop.rs:1086`, bumped at `:3830`; subscribe precedent `:3169`).
 - Produces: a spawned listener: `let mut rx = transport_epoch_tx.subscribe(); loop { rx.changed().await?; for e in &engines { e.republish_dirty(); } }` — plus the handles-struct field carrying `Vec<Arc<dyn RepublishDirty>>` from `start_node`.
 
+**Additional requirement (T1 review ⚠️, controller-adjudicated):** the zenoh
+transport-events listener's zid→node-id reverse cache (`event_loop.rs:~1428`)
+is built from `list_active_peers()`, so a fleet-only sibling's transport drop
+never fires the secondary `Dropped` reconnect kick / liveness down-edge (the
+registry drop-watchers remain the primary). Switch that ONE enumeration to
+`list_dialable_peers()` (map `entry.payload` where the payload is needed) so
+fleet siblings get the same drop-resilience as community peers. Add/extend a
+test if the surrounding module has a harness for the reverse-cache mapping;
+otherwise document the switch in the task report and rely on T1's view tests
+(the mapping is a straight enumeration swap).
+
 - [ ] **Step 1: Failing test.** Extract the listener body into a testable `pub(crate) async fn run_epoch_republish(rx: watch::Receiver<u64>, engines: Vec<Arc<dyn RepublishDirty>>)`. Test with fake engines + a real watch channel: (a) one `send_modify` bump → every fake sees exactly 1 call; (b) no bump → 0 calls; (c) two rapid bumps → calls ≥1 and ≤2 per fake (watch coalescing is allowed — assert the bound, not an exact count); (d) sender dropped → task exits (no hang; use `tokio::time::timeout` with paused time).
 - [ ] **Step 2: Verify fail.**
 - [ ] **Step 3: Implement** fn + spawn site + `lib.rs` collection/threading. The listener must NOT fire on the initial subscribe value (use `rx.changed().await` semantics — it only wakes on post-subscribe changes; add a comment pinning this).
