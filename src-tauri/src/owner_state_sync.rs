@@ -211,6 +211,20 @@ impl SyncEngine {
     }
 }
 
+/// ZEB-702 T3 (Component B): owner-state is the `friend_graph` carrier — the
+/// dataset whose non-convergence is the root of ZEB-702 — so the transport-epoch
+/// republish listener must nudge it too. This thin wrapper isn't a
+/// `FleetSyncEngine<S>` (it owns one privately), so the generic
+/// `RepublishDirty` impl doesn't reach it; delegate through the public
+/// `notify_dirty`, exactly as `flush_now`/`persist_now` above delegate. No
+/// behavior change — `republish_dirty` schedules the same debounced re-publish
+/// of the current root a local mutation would.
+impl crate::fleet_sync::RepublishDirty for SyncEngine {
+    fn republish_dirty(&self) {
+        self.notify_dirty();
+    }
+}
+
 /// Merge each entry from a decoded remote `OwnerState` snapshot into
 /// `local`, in the load-bearing order documented inside (see the
 /// "outbox_tombstones → spaces → outbox → inbox → markers →

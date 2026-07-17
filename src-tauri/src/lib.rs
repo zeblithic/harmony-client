@@ -10851,6 +10851,55 @@ pub async fn start_node_inner(
                 // ZEB-621: hand the address-change fan-out to event_loop::run so
                 // the supervisor sweep hook is installed where the handle is minted.
                 let addr_fanout_for_loop = addr_fanout_opt.clone();
+                // ZEB-702 T3 (Component B): bundle every owner-scoped dataset
+                // engine as an `Arc<dyn RepublishDirty>` for the transport-epoch
+                // republish listener in event_loop::run. On a transport up-edge
+                // each is nudged to re-offer its current root, closing the
+                // late-joiner hole (the D3 300s roster stall where a cert-only
+                // butler's owner-state `friend_graph` never converges). Built
+                // from CLONES so the originals below still install on NodeState;
+                // `push` coerces each `Arc<Concrete>` to `Arc<dyn RepublishDirty>`
+                // at the argument site. owner-state (`sync_engine_arc`) is the
+                // `friend_graph` carrier — the whole point of ZEB-702. Datasets
+                // match the spec §"Component B" list; relay-hold/relay-optin are
+                // outside that list and deliberately excluded here.
+                let republish_on_epoch_for_loop: Vec<
+                    std::sync::Arc<dyn crate::fleet_sync::RepublishDirty>,
+                > = {
+                    let mut v: Vec<std::sync::Arc<dyn crate::fleet_sync::RepublishDirty>> =
+                        Vec::new();
+                    if let Some(e) = sync_engine_arc.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = fleet_net_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = dm_inbox_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = dm_outhold_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = owner_trust_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = fleet_keys_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = owner_quorum_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = community_device_intro_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = mint_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = notes_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    v
+                };
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -10951,6 +11000,10 @@ pub async fn start_node_inner(
                                 // 5s peer-refresh arm bumps it on every
                                 // never-before-seen zenoh session id.
                                 transport_epoch_tx,
+                                // ZEB-702 T3 (Component B): owner-dataset engines
+                                // the epoch listener nudges to re-offer on a
+                                // transport up-edge.
+                                republish_on_epoch_for_loop,
                                 // ZEB-599 Direction 1: presence-driven
                                 // full-reconcile sender — handed to each
                                 // community presence subscriber, bumped when a

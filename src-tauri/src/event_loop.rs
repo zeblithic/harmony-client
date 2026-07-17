@@ -1084,6 +1084,15 @@ pub async fn run(
     // catch-up path pass `tokio::sync::watch::channel(0u64).0` (a
     // sender with no receivers — send_modify is then a no-op).
     transport_epoch_tx: tokio::sync::watch::Sender<u64>,
+    // ZEB-702 T3 (Component B): `Arc<dyn RepublishDirty>` over every
+    // owner-scoped dataset engine (owner-state, fleet-net, dm-inbox,
+    // dm-outhold, owner-trust, fleet-keys, owner-quorum-req,
+    // community-device-intro, mint, notes). The listener spawned below
+    // subscribes to `transport_epoch_tx` and nudges each on the transport
+    // up-edge so a link that forms after the last publish still receives the
+    // current root. Empty in test callers that bypass `start_node` and when no
+    // owner identity is loaded — the listener is then not spawned.
+    republish_on_epoch: Vec<Arc<dyn crate::fleet_sync::RepublishDirty>>,
     // ZEB-599 Direction 1: presence-driven full-reconcile sender. Cloned into
     // each community presence subscriber; bumped when a new roster device
     // (potential holder) appears so channel-log backfill drivers re-arm with a
@@ -1424,13 +1433,21 @@ pub async fn run(
                     let zid = event.transport().zid().to_string();
                     let current_gen = listener_resolver.generation();
                     let node_id = zid_cache.lookup(&zid, current_gen, || {
+                        // ZEB-702 T3: enumerate the DIAL view (`list_dialable_peers`),
+                        // which INCLUDES the fleet slot, not the butler/diagnostics
+                        // view (`list_active_peers`, backed by `durable_preferred`,
+                        // which excludes it). A fleet-only sibling's transport Delete
+                        // now maps back to its node-id so the secondary Dropped
+                        // reconnect kick / liveness down-edge fires for it too — the
+                        // registry drop-watchers remain the primary source.
                         listener_resolver
-                            .list_active_peers()
+                            .list_dialable_peers()
                             .into_iter()
-                            .map(|(_owner, p)| {
+                            .map(|(_owner, entry)| {
+                                let node_id = entry.payload.iroh_node_id;
                                 (
-                                    crate::iroh_dial_driver::deterministic_zid_hex(&p.iroh_node_id),
-                                    p.iroh_node_id,
+                                    crate::iroh_dial_driver::deterministic_zid_hex(&node_id),
+                                    node_id,
                                 )
                             })
                             .collect()
@@ -3148,6 +3165,20 @@ pub async fn run(
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
     // session open, all queryables and subscribers declared.
     let _ = ready_tx.send(Ok(()));
+
+    // ZEB-702 T3 (Component B): spawn the transport-epoch republish listener.
+    // The SENDER (`transport_epoch_tx`) lives for run()'s whole lifetime, so
+    // this subscriber only exits when the event loop does (sender drop → the
+    // loop's `changed()` returns Err). Subscribing HERE — before the select
+    // loop that bumps the epoch (~5s peer-refresh arm) — guarantees no up-edge
+    // is missed. Skipped when there are no engines (test callers / no owner
+    // identity) so we don't spawn an idle task.
+    if !republish_on_epoch.is_empty() {
+        tokio::spawn(run_epoch_republish(
+            transport_epoch_tx.subscribe(),
+            republish_on_epoch,
+        ));
+    }
 
     // Phase 2: cold-start root query. Pulls current root via Zenoh `get` in
     // case the gateway last published before this client subscribed. ZEB-434
@@ -7539,6 +7570,32 @@ fn detect_up_edges(prev: &mut std::collections::HashSet<String>, current: Vec<St
     any_new
 }
 
+/// ZEB-702 T3 (Component B): re-offer every owner-scoped dataset root on a
+/// transport up-edge. Zenoh `put`s are fire-and-forget and the sync engines
+/// publish only on local dirty (debounced) or explicit flush — so a link that
+/// forms AFTER the last publish carries nothing until the next local mutation
+/// (the D3 300 s roster stall: a cert-only butler's `friend_graph` never
+/// converges). This listener nudges each engine's `notify_dirty` when the
+/// transport epoch advances, re-offering the CURRENT root — byte-identical
+/// content, idempotent on receivers (LWW/HLC merge), coalesced by the engines'
+/// own debounce.
+///
+/// `rx.changed()` wakes ONLY on values written after `rx` was created — the
+/// initial subscribe value is NOT a change, so we never re-offer on a spurious
+/// boot edge (the boot flushes already cover the first publish). It returns
+/// `Err` exactly when every `Sender` has dropped (the event loop exiting), which
+/// ends the task cleanly — no separate shutdown signal needed.
+pub(crate) async fn run_epoch_republish(
+    mut rx: watch::Receiver<u64>,
+    engines: Vec<Arc<dyn crate::fleet_sync::RepublishDirty>>,
+) {
+    while rx.changed().await.is_ok() {
+        for engine in &engines {
+            engine.republish_dirty();
+        }
+    }
+}
+
 /// ZEB-434 D9: classify a mail-root query result for the retry latch.
 /// An empty-payload reply is a VALID answer (the "no mail yet" sentinel —
 /// see [`query_mail_root`]); only zero-responders / query failure retries.
@@ -7626,6 +7683,136 @@ mod transport_epoch_tests {
         let mut prev: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
         assert!(detect_up_edges(&mut prev, vec!["b".to_string()]));
         assert!(!detect_up_edges(&mut prev, vec!["b".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod epoch_republish_tests {
+    //! ZEB-702 T3 (Component B): the transport-epoch republish listener
+    //! (`run_epoch_republish`) re-offers every owner-scoped dataset root on a
+    //! transport up-edge. These tests drive the extracted loop body with fake
+    //! engines + a real watch channel — the exact shape production wires.
+    use super::run_epoch_republish;
+    use crate::fleet_sync::RepublishDirty;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Fake dataset engine: counts `republish_dirty` calls. The real engines'
+    /// `republish_dirty` is exactly `notify_dirty` — a synchronous, non-blocking
+    /// schedule — so a call-count fake faithfully models the seam the listener
+    /// drives (the debounced publish itself is covered by the T2 engine tests).
+    #[derive(Default)]
+    struct CountingEngine {
+        calls: AtomicUsize,
+    }
+    impl RepublishDirty for CountingEngine {
+        fn republish_dirty(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Build N counting engines; return the concrete handles (to read counters)
+    /// and the `Arc<dyn RepublishDirty>` bundle the listener consumes.
+    fn engines(n: usize) -> (Vec<Arc<CountingEngine>>, Vec<Arc<dyn RepublishDirty>>) {
+        let concrete: Vec<Arc<CountingEngine>> = (0..n)
+            .map(|_| Arc::new(CountingEngine::default()))
+            .collect();
+        let dyn_engines: Vec<Arc<dyn RepublishDirty>> = concrete
+            .iter()
+            .map(|e| e.clone() as Arc<dyn RepublishDirty>)
+            .collect();
+        (concrete, dyn_engines)
+    }
+
+    /// (a) One post-subscribe bump nudges every engine exactly once. The
+    /// `send_modify` then `drop(tx)` sequence is deterministic: the receiver's
+    /// first `changed()` sees the version advance (Ok → one fan-out), the second
+    /// sees the sender gone with no further change (Err → clean exit), so each
+    /// engine is nudged exactly once regardless of scheduler timing.
+    #[tokio::test(start_paused = true)]
+    async fn one_bump_nudges_each_engine_once() {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let (concrete, dyn_engines) = engines(3);
+        let task = tokio::spawn(run_epoch_republish(rx, dyn_engines));
+        tx.send_modify(|e| *e = e.wrapping_add(1));
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("listener must exit when the sender drops")
+            .expect("listener task must not panic");
+        for e in &concrete {
+            assert_eq!(e.calls.load(Ordering::SeqCst), 1, "one bump = one nudge");
+        }
+    }
+
+    /// (b) No bump → zero nudges. The initial subscribe value is NOT a change
+    /// (`changed()` only wakes on post-subscribe writes), so a listener that
+    /// starts and then sees the sender drop must never have fired — this pins
+    /// the "don't re-offer on the initial value" contract.
+    #[tokio::test(start_paused = true)]
+    async fn no_bump_no_nudge() {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let (concrete, dyn_engines) = engines(2);
+        let task = tokio::spawn(run_epoch_republish(rx, dyn_engines));
+        // Drop the sender WITHOUT any send_modify — the current value 0 is the
+        // subscribe baseline, not a change.
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("listener must exit when the sender drops")
+            .expect("listener task must not panic");
+        for e in &concrete {
+            assert_eq!(
+                e.calls.load(Ordering::SeqCst),
+                0,
+                "no bump must produce no nudge (initial value is not a change)"
+            );
+        }
+    }
+
+    /// (c) Two rapid bumps → each engine nudged at least once and at most twice.
+    /// watch coalescing is allowed: if the listener observes both versions in one
+    /// `changed()` wake it fires once; if it wakes between them it fires twice.
+    /// We assert the BOUND, not an exact count.
+    #[tokio::test(start_paused = true)]
+    async fn two_rapid_bumps_bounded() {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let (concrete, dyn_engines) = engines(2);
+        let task = tokio::spawn(run_epoch_republish(rx, dyn_engines));
+        tx.send_modify(|e| *e = e.wrapping_add(1));
+        // Give the listener a chance (but no guarantee) to observe the first bump
+        // before the second lands — exercises both the coalesced and the
+        // observed-separately paths across runs.
+        tokio::task::yield_now().await;
+        tx.send_modify(|e| *e = e.wrapping_add(1));
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("listener must exit when the sender drops")
+            .expect("listener task must not panic");
+        for e in &concrete {
+            let calls = e.calls.load(Ordering::SeqCst);
+            assert!(
+                (1..=2).contains(&calls),
+                "two bumps must nudge 1..=2 times (coalescing), got {calls}"
+            );
+        }
+    }
+
+    /// (d) Sender dropped → the task exits (no hang). Paused time makes the
+    /// timeout deterministic: if the loop failed to exit on sender-drop the
+    /// virtual clock would auto-advance to the deadline and this would Err.
+    #[tokio::test(start_paused = true)]
+    async fn sender_drop_exits_task() {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let (_concrete, dyn_engines) = engines(1);
+        let task = tokio::spawn(run_epoch_republish(rx, dyn_engines));
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("listener must exit promptly when the sender drops")
+            .expect("listener task must not panic");
     }
 }
 
