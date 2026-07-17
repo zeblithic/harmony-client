@@ -1085,9 +1085,10 @@ pub async fn run(
     // sender with no receivers — send_modify is then a no-op).
     transport_epoch_tx: tokio::sync::watch::Sender<u64>,
     // ZEB-702 T3 (Component B): `Arc<dyn RepublishDirty>` over every
-    // owner-scoped dataset engine (owner-state, fleet-net, dm-inbox,
+    // owner-scoped dataset engine — all 12: owner-state, fleet-net, dm-inbox,
     // dm-outhold, owner-trust, fleet-keys, owner-quorum-req,
-    // community-device-intro, mint, notes). The listener spawned below
+    // community-device-intro, mint, notes, relay-hold, relay-optin (the last
+    // two added by T3b). The listener spawned below
     // subscribes to `transport_epoch_tx` and nudges each on the transport
     // up-edge so a link that forms after the last publish still receives the
     // current root. Empty in test callers that bypass `start_node` and when no

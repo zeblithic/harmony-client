@@ -203,10 +203,11 @@ impl<S: Send + 'static> Drop for FleetSyncEngine<S> {
 /// nudges each on the transport up-edge, closing the late-joiner hole where a
 /// link that forms after the last publish would otherwise carry nothing until
 /// the next local mutation. Implemented here for the generic
-/// `FleetSyncEngine<S>` (covers owner-state, fleet-net, dm-inbox, dm-outhold,
-/// owner-trust, fleet-keys, owner-quorum-req, community-device-intro, notes,
-/// relay datasets); the distinct `MintSyncEngine` carries its own one-line
-/// impl in `mint_sync.rs`.
+/// `FleetSyncEngine<S>` (covers fleet-net, dm-inbox, dm-outhold, owner-trust,
+/// fleet-keys, owner-quorum-req, community-device-intro, notes, and the relay
+/// datasets); owner-state's `owner_state_sync::SyncEngine` WRAPPER carries its
+/// own delegating impl (the generic one cannot reach its private inner
+/// engine), and the distinct `MintSyncEngine` likewise in `mint_sync.rs`.
 pub trait RepublishDirty: Send + Sync {
     /// Schedule a debounced re-publish of the current dataset root.
     /// Non-blocking; coalesces with any pending dirty state.

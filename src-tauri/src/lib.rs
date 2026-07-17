@@ -10882,8 +10882,9 @@ pub async fn start_node_inner(
                 // `push` coerces each `Arc<Concrete>` to `Arc<dyn RepublishDirty>`
                 // at the argument site. owner-state (`sync_engine_arc`) is the
                 // `friend_graph` carrier — the whole point of ZEB-702. Datasets
-                // match the spec §"Component B" list; relay-hold/relay-optin are
-                // outside that list and deliberately excluded here.
+                // match the spec §"Component B" list — all 12 owner-scoped
+                // engines, including relay-hold/relay-optin (added by T3b when
+                // the original 10-dataset enumeration was found incomplete).
                 let republish_on_epoch_for_loop: Vec<
                     std::sync::Arc<dyn crate::fleet_sync::RepublishDirty>,
                 > = {
