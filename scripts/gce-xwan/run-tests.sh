@@ -562,9 +562,28 @@ d3_butler_deposit() {
   [ "$cstatus" = "joined" ] || { echo "FAIL D3 (mode=$MODE_WANT): P never joined A's community"; return 1; }
   log "D3: A<->P co-members of $cid"
 
+  # -- Phase 3.5: P must observe A's durable announce BEFORE the relaunch.
+  #    Found live (first D3 run, 2026-07-17): P relaunched seconds after the
+  #    join boots with an EMPTY reachability resolver — nothing persisted to
+  #    replay, so nothing seeds a cross-WAN re-dial of A, and P sits isolated
+  #    forever (co-located, Zenoh LAN multicast masks this by rediscovering
+  #    automatically). Observing A's announce over the still-live join session
+  #    persists it, so the post-relaunch boot replay re-seeds the dial policy —
+  #    the exact restart machinery T3 proves cross-WAN.
+  p_observes_a() {
+    d3_api p connectivity_list_peer_reachability | grep -E '^\[' | tail -1 | \
+      jq -e --arg owner "$REMOTE_OWNER" \
+        '.[] | select(.ownerAddress == $owner) | select(.source == "durableCrdt")' > /dev/null
+  }
+  poll 180 5 "D3: P observes A's durable announce (pre-relaunch persist)" p_observes_a \
+    || { echo "FAIL D3 (mode=$MODE_WANT): P never observed A's durable announce over the live join session"; return 1; }
+  log "D3: P observed A's durable announce — persisted; relaunch replay can re-seed the dial"
+
   # -- Phase 4: relaunch P (start_node rebuilds the boot-time enrolled-set
   #    snapshot from PERSISTED enrollments — the set_butler_pin precondition),
-  #    then read B2's deviceVkHex from P's own persisted view.
+  #    then read B2's deviceVkHex from P's own persisted view. The relaunch
+  #    startup also republishes P's announce into the community CRDT
+  #    (publisher trigger 1) — P is a member at THIS boot, unlike its first.
   relaunch_d3 p
   local devices peer_vk
   devices="$(d3_api p get_owner_state | jq '[.devices[]? | select(.isThisDevice == false)]')"
@@ -576,6 +595,20 @@ d3_butler_deposit() {
   [ -n "$peer_vk" ] || { echo "FAIL D3: peer device row missing deviceVkHex"; return 1; }
   [ "$peer_vk" = "$joiner_vk" ] || { echo "FAIL D3: persisted peer vk ($peer_vk) != pairing-captured joiner vk ($joiner_vk)"; return 1; }
 
+  # -- Phase 4.5: prove the relaunched P re-established the cross-WAN session —
+  #    A observes P's durable announce again (any freshness; the post-pin
+  #    freshness gate is Phase 7's job). Isolates a re-dial failure from a
+  #    pin-propagation failure. The replayed A-announce (Phase 3.5) seeds P's
+  #    dial policy; P's relaunch-startup publish provides the announce to sync.
+  a_observes_p() {
+    remote_api connectivity_list_peer_reachability | grep -E '^\[' | tail -1 | \
+      jq -e --arg owner "$p_owner" \
+        '.[] | select(.ownerAddress == $owner) | select(.source == "durableCrdt")' > /dev/null
+  }
+  poll 300 10 "D3: A observes relaunched P (session re-established)" a_observes_p \
+    || { echo "FAIL D3 (mode=$MODE_WANT): A never observed relaunched P's announce — cross-WAN re-dial after restart did not re-establish"; return 1; }
+  log "D3: A observed relaunched P — cross-WAN session re-established"
+
   # -- Phase 5: relaunch B2 (ZEB-492: boots its dm-inbox/butler engines from
   #    the persisted fleet KeyTree), then hard-assert butler readiness.
   relaunch_d3 b2
@@ -584,33 +617,34 @@ d3_butler_deposit() {
   [ "$held0" = 0 ] || { echo "FAIL D3: B2 get_butler_held not a clean empty array post-relaunch (got: $held0) — ZEB-492 KeyTree/engine regression"; return 1; }
   log "D3: B2 butler engine live (held=[])"
 
-  # -- Phase 6: pin B2 as P's butler + readback.
+  # -- Phase 6: pin B2 as P's butler + readback. Capture the pin floor FIRST:
+  #    set_butler_pin_impl fires force_reachability_republish, so the very
+  #    next announce P authors carries the B2 butler-set and an
+  #    announced_at_ms >= this floor (authored on the same local clock).
+  local pin_floor_ms
+  pin_floor_ms=$(( $(date +%s) * 1000 ))
   d3_api p set_butler_pin "{\"deviceId\": \"$peer_vk\"}" > /dev/null
   local pin
   pin="$(d3_api p get_butler_pin | jq -r '.pinnedDeviceId // empty')"
   [ "$pin" = "$peer_vk" ] || { echo "FAIL D3: get_butler_pin ($pin) does not reflect pinned B2 ($peer_vk)"; return 1; }
-  log "D3: P pinned B2 as butler"
+  log "D3: P pinned B2 as butler (pin floor $pin_floor_ms)"
 
-  # -- Phase 7: reachability barrier — A (the SENDER, cross-WAN) must observe
-  #    P's DURABLE-CRDT ReachabilityAnnounce (which carries the B2 butler-set)
-  #    BEFORE P goes offline, or the deposit can't resolve seal targets
-  #    (ZEB-488; source == "durableCrdt" — a pkarrLive cache-back is not
+  # -- Phase 7: post-pin reachability barrier — A (the SENDER, cross-WAN)
+  #    must hold P's DURABLE-CRDT ReachabilityAnnounce authored AT/AFTER the
+  #    pin, i.e. the one whose butler-set carries B2 (ZEB-488; the DTO does
+  #    not expose the set itself, but announcedAtMs >= pin floor identifies
+  #    the post-pin announce exactly — no staleness proxy, no settle sleeps;
+  #    source == "durableCrdt" because a pkarrLive cache-back is not
   #    replication and does not count).
-  reachability_observed() {
+  post_pin_observed() {
     remote_api connectivity_list_peer_reachability | grep -E '^\[' | tail -1 | \
-      jq -e --arg owner "$p_owner" \
-        '.[] | select(.ownerAddress == $owner) | select(.source == "durableCrdt")' > /dev/null
+      jq -e --arg owner "$p_owner" --argjson floor "$pin_floor_ms" \
+        '.[] | select(.ownerAddress == $owner) | select(.source == "durableCrdt")
+             | select((.record.announcedAtMs // 0) >= $floor)' > /dev/null
   }
-  poll 300 10 "D3 reachability: A observes P's durable announce" reachability_observed \
-    || { echo "FAIL D3 (mode=$MODE_WANT): A never observed P's durable ReachabilityAnnounce (butler-set never replicated cross-WAN)"; return 1; }
-  # PROXY STALENESS WINDOW: the barrier proves A observed *a* durable announce
-  # from P, but the DTO doesn't expose the butler-set, and A may have latched
-  # a pre-pin announce (LWW) that lacks B2. The post-pin re-announce rides the
-  # same path; give it a settle margin before killing P so the deposit
-  # resolves seal targets against the B2-bearing set (same proxy the s7
-  # co-located sibling accepts — this settle is the cross-WAN latency hedge).
-  log "D3: A observed P's durable announce — 45s settle for the post-pin re-announce…"
-  sleep 45
+  poll 300 10 "D3 reachability: A holds P's POST-PIN announce" post_pin_observed \
+    || { echo "FAIL D3 (mode=$MODE_WANT): A never received P's post-pin ReachabilityAnnounce (B2 butler-set never replicated cross-WAN)"; return 1; }
+  log "D3: A holds P's post-pin announce — B2-bearing butler-set replicated cross-WAN"
 
   # -- Phase 8: P goes OFFLINE (real SIGKILL — mirror s7's crash semantics).
   kill_d3 p

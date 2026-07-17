@@ -79,8 +79,10 @@ second non-cloud network).
   nodes — **P** (recipient primary) and **B2** (butler, SAS-paired into P's
   fleet; pairing rides Zenoh `harmony/pairing/v2/lan/**` so the fleet half is
   LAN-local by necessity). Flow: pair → friend A↔P → shared community
-  (announce replication path) → relaunch both locals → pin B2 → A observes
-  P's durable `ReachabilityAnnounce` → SIGKILL P → A sends a DM → **HELD**
+  (announce replication path) → P persists A's announce (the
+  relaunch-replay dial seed) → relaunch both locals → pin B2 → A holds P's
+  POST-PIN announce (`announcedAtMs` >= pin floor — the B2-bearing set) →
+  SIGKILL P → A sends a DM → **HELD**
   (B2 receives the `harmony/butler-deposit/v1` dial from GCE — the headline)
   → restart P → **RECV** (P recovers the deposit) → **CLEARED** (B2 records
   the ingest). Every boundary hard-fails (no characterize fallbacks — this
