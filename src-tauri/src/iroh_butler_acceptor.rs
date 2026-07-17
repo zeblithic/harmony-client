@@ -929,18 +929,21 @@ pub async fn handle_deposit_core(
 /// while keeping probing traffic from spamming the log.
 const BUTLER_REJECT_WARN_MIN_INTERVAL_MS: u64 = 60_000;
 
-/// Default wall clock for [`ButlerDepositStats`]: milliseconds since the Unix
-/// epoch. Injectable via [`ButlerDepositStats::with_clock`] in tests so the
-/// rate-limit window is deterministic (mirrors `reachability_resolver`'s
-/// swappable clock — the WARN gate reads THIS clock, not tokio's, so paused
+/// Default clock for [`ButlerDepositStats`]: MONOTONIC milliseconds since
+/// process start (Greptile, PR #481: a wall clock would let a forward system
+/// clock step re-open the WARN window early — `Instant` is immune to clock
+/// corrections, which is the right source for a process-local rate gate).
+/// `.max(1)` because `last_warn_ms == 0` encodes "never warned": the first
+/// millisecond of process life must not alias it (this also retires the
+/// injected-clock-of-0 edge recorded in the T4 review). Injectable via
+/// [`ButlerDepositStats::with_clock`] in tests so the rate-limit window is
+/// deterministic (the WARN gate reads THIS clock, not tokio's, so paused
 /// tokio time would not control it).
 fn butler_stats_default_clock() -> Arc<dyn Fn() -> u64 + Send + Sync> {
-    Arc::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    })
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    Arc::new(move || (start.elapsed().as_millis() as u64).max(1))
 }
 
 /// Process-lifetime butler-deposit decision counts. Snapshot of
