@@ -191,8 +191,13 @@ pub struct FleetSyncEngine<S: Send + 'static> {
     sibling_acks: Arc<Mutex<BTreeMap<String, Hlc>>>,
     device_id: String,
     task: Mutex<Option<JoinHandle<()>>>,
-    /// ZEB-705 observability (see the Ctx twins).
+    /// ZEB-705 observability. The task-side (`Ctx`) clones carry the live
+    /// increments; these handle-side clones exist only so the in-crate tests
+    /// can read the counters, hence the `cfg(test)` gate (production never
+    /// reads them off the handle).
+    #[cfg(test)]
     fetch_retries_scheduled: Arc<AtomicU64>,
+    #[cfg(test)]
     fetch_retries_run: Arc<AtomicU64>,
     _s: std::marker::PhantomData<fn() -> S>,
 }
@@ -289,7 +294,9 @@ where
             sibling_acks,
             device_id,
             task: Mutex::new(Some(task)),
+            #[cfg(test)]
             fetch_retries_scheduled,
+            #[cfg(test)]
             fetch_retries_run,
             _s: std::marker::PhantomData,
         }
@@ -2071,12 +2078,12 @@ mod engine_tests {
         b.in_tx.send(frame.clone()).await.expect("inject frame");
 
         // Initial attempt + FETCH_RETRY_ATTEMPTS retries, all missing.
+        let total_attempts = 1 + FETCH_RETRY_ATTEMPTS as usize;
         let exhausted = wait_until(
             || {
                 let get_attempts = Arc::clone(&get_attempts);
                 async move {
-                    get_attempts.load(std::sync::atomic::Ordering::SeqCst)
-                        >= 1 + FETCH_RETRY_ATTEMPTS as usize
+                    get_attempts.load(std::sync::atomic::Ordering::SeqCst) >= total_attempts
                 }
             },
             Duration::from_secs(20),
@@ -2084,8 +2091,7 @@ mod engine_tests {
         .await;
         assert!(
             exhausted,
-            "expected {} total fetch attempts (initial + retries)",
-            1 + FETCH_RETRY_ATTEMPTS as usize
+            "expected {total_attempts} total fetch attempts (initial + retries)"
         );
         assert_eq!(
             b.engine.fetch_retries_scheduled(),
