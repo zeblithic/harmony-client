@@ -32,6 +32,7 @@ scripts/gce-xwan/mode.sh open     # firewall mode 1: public-host easy case
 scripts/gce-xwan/run-tests.sh --mode open --test all       # T1 + T2
 scripts/gce-xwan/mode.sh filtered # firewall mode 2: hole-punch must actually work
 scripts/gce-xwan/run-tests.sh --mode filtered --test t2
+scripts/gce-xwan/run-tests.sh --mode open --test d3     # butler deposit→recover (ZEB-689)
 scripts/gce-xwan/down.sh          # stop (disk survives); --delete when the wave ends
 ```
 
@@ -72,6 +73,22 @@ second non-cloud network).
   messages while the GCE node is down → restart → catch-up assert (cross-WAN
   anti-entropy on a real WAN). Run via `--test t3` (re-runs T1 first for a fresh
   community).
+- **D3 — butler deposit→recover** (ZEB-477 Scenario D3 / ZEB-689): the
+  authoritative proof of the butler-rung deposit dial, which the co-located
+  s7 harness cannot establish. Three nodes: GCE **A** (sender) + two LOCAL
+  nodes — **P** (recipient primary) and **B2** (butler, SAS-paired into P's
+  fleet; pairing rides Zenoh `harmony/pairing/v2/lan/**` so the fleet half is
+  LAN-local by necessity). Flow: pair → friend A↔P → shared community
+  (announce replication path) → relaunch both locals → pin B2 → A observes
+  P's durable `ReachabilityAnnounce` → SIGKILL P → A sends a DM → **HELD**
+  (B2 receives the `harmony/butler-deposit/v1` dial from GCE — the headline)
+  → restart P → **RECV** (P recovers the deposit) → **CLEARED** (B2 records
+  the ingest). Every boundary hard-fails (no characterize fallbacks — this
+  scenario IS the verdict): a HELD timeout means the deposit dial itself
+  failed cross-WAN → escalate as a product bug; RECV/CLEARED timeouts mean
+  the recover half broke on a real WAN. Local profiles `xwan-d3-p`/`xwan-d3-b2`
+  are wiped fresh each run (disposable identities). Run via `--test d3` in
+  both firewall modes.
 
 Node snapshots and logs land in `~/.cache/gce-xwan-logs/<timestamp>/`.
 
