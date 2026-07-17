@@ -1564,16 +1564,30 @@ mod engine_tests {
         } = build_engine("dev-706", Arc::clone(&cas), false);
         let _in_tx = in_tx;
 
-        // Trigger a real publish through the debounced-publish seam and wait
-        // for the frame so `publish_root_now` (which stores the root) has run.
+        // Trigger a real publish through the debounced-publish seam and KEEP
+        // the outbound frame: `publish_root_now` stores the root before it
+        // sends the frame, so the frame lets us recover the EXACT root CID
+        // that was published and assert THAT specific CID was made serveable
+        // (rather than merely "some CID"). Scoping the assertions to the
+        // published root also keeps them robust to any unrelated CAS writes a
+        // future publish step might add.
         let engine = Arc::new(engine);
         let handle: Arc<dyn RepublishDirty> = engine.clone();
         handle.republish_dirty();
-        tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
             .await
             .expect("publish must land within 5s")
             .expect("publisher channel closed before a frame arrived");
         engine.shutdown().await.ok();
+
+        // Recover the published root CID via the same decode path as
+        // `handle_incoming_publish`; `make_kt()` is deterministic so it opens
+        // the frame the engine encrypted.
+        let kt = make_kt();
+        let payload_bytes = decrypt_root_publish(&kt, &frame).expect("decrypt published frame");
+        let published: FleetRootPublish =
+            canonical_cbor_decode(&payload_bytes).expect("decode published envelope");
+        let root_cid = published.root_cid;
 
         let served = rec
             .put_serveable_cids
@@ -1581,12 +1595,12 @@ mod engine_tests {
             .expect("put_serveable_cids mutex");
         let plain = rec.put_cids.lock().expect("put_cids mutex");
         assert!(
-            !served.is_empty(),
-            "ZEB-706: publish must make the root serveable via put_serveable — got none (plain puts={plain:?})"
+            served.contains(&root_cid),
+            "ZEB-706: the published root {root_cid:?} must be stored via put_serveable so peers can fetch it (served={served:?})"
         );
         assert!(
-            plain.is_empty(),
-            "ZEB-706: publish must NOT use plain put for the root — plain put never allowlists the CID for the content-serve queryable, silently stalling cross-device sync (owner-state analog of ZEB-398); got plain puts={plain:?}"
+            !plain.contains(&root_cid),
+            "ZEB-706: the published root {root_cid:?} must NOT be stored via plain put — that never allowlists the CID for the content-serve queryable, silently stalling cross-device sync (owner-state analog of ZEB-398) (plain={plain:?})"
         );
     }
 
