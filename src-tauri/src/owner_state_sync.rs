@@ -176,7 +176,9 @@ impl SyncEngine {
     /// query-side zenoh adapter can answer a peer's root PULL (a butler that
     /// missed the live push). The wrapper isn't a `FleetSyncEngine`, so it
     /// delegates like the methods around it. See `FleetSyncEngine::root_serve_tx`.
-    pub fn root_serve_tx(&self) -> tokio::sync::mpsc::Sender<crate::fleet_sync::RootServeReq> {
+    pub(crate) fn root_serve_tx(
+        &self,
+    ) -> tokio::sync::mpsc::Sender<crate::fleet_sync::RootServeReq> {
         self.inner.root_serve_tx()
     }
 

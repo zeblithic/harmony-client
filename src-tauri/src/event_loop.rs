@@ -1686,6 +1686,22 @@ pub async fn run(
                                         res = receiver.recv_async() => {
                                             let Ok(reply) = res else { break true; };
                                             if let Ok(sample) = reply.into_result() {
+                                                // ZEB-707: bound the reply before
+                                                // materializing it — a matching peer
+                                                // controls this payload, and the
+                                                // engine only validates it after the
+                                                // copy (CodeRabbit). A real root wire
+                                                // is a few KB; skip anything wildly
+                                                // larger without allocating or
+                                                // counting it.
+                                                if sample.payload().len()
+                                                    > crate::fleet_sync::MAX_ROOT_WIRE_BYTES
+                                                {
+                                                    tracing::warn!(key = %key_rf,
+                                                        len = sample.payload().len(),
+                                                        "owner-state root reply exceeds wire cap; skipping");
+                                                    continue;
+                                                }
                                                 let bytes: Vec<u8> =
                                                     sample.payload().to_bytes().to_vec();
                                                 if subscriber_tx_rf.send(bytes).await.is_err() {

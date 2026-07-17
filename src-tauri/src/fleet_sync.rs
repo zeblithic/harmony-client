@@ -99,6 +99,14 @@ impl CanonicalPayload for FleetRootPublish {}
 
 pub const MAX_DEVICES_PER_OWNER: usize = 32;
 
+/// ZEB-707: upper bound on a served/pulled root wire frame. A `FleetRootPublish`
+/// envelope is a single root CID + HLC + a `seen` digest capped at
+/// `MAX_DEVICES_PER_OWNER` — a few KB at most. The query-side pull materializes
+/// a peer's GET reply into a `Vec<u8>` before the engine validates it, so reject
+/// anything wildly larger up front to bound an oversized attacker-controlled
+/// reply (CodeRabbit). Generous vs. the real size.
+pub(crate) const MAX_ROOT_WIRE_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MergeOutcome {
     pub changed: bool,
@@ -371,7 +379,10 @@ where
     /// send carries a oneshot the serve arm replies the encoded root frame on.
     /// Engines with no queryable simply never call this — the serve arm stays
     /// idle. Wrappers (e.g. `owner_state_sync::SyncEngine`) delegate to it.
-    pub fn root_serve_tx(&self) -> mpsc::Sender<RootServeReq> {
+    /// `pub(crate)`: callers are all in-crate (the wrapper + the event-loop
+    /// adapter), and returning the `pub(crate)` `RootServeReq` from a `pub` fn
+    /// would leak a crate-private type (CodeRabbit; `private_interfaces`).
+    pub(crate) fn root_serve_tx(&self) -> mpsc::Sender<RootServeReq> {
         self.root_serve_tx.clone()
     }
 
