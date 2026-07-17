@@ -22,7 +22,11 @@
 #       (harmony/butler-deposit/v1) GCE→home-NAT. The co-located s7 sibling
 #       (e2e_two_node.rs) can't prove this dial; this scenario is the
 #       authoritative proof either way (works → co-located-harness-specific
-#       confirmed; fails → real product bug on the deposit ALPN).
+#       confirmed; HELD timeout → deposit not RETAINED by the butler — from
+#       the sender that is indistinguishable between a transport failure and
+#       an acceptor reject (wire-silent by design); check the butler at
+#       RUST_LOG=harmony_app=debug before classifying. 2026-07-17 verdict:
+#       dial delivered, authorization rejected → ZEB-702).
 #
 # Local node: fresh binary, profile xwan-local, keychain disabled + passphrase
 # (per CLAUDE.md keychain-isolation rules). The standing fleet-koya node (iroh
@@ -139,8 +143,10 @@ kill_d3() { # p|b2 — SIGKILL, mirroring the harness NodeHandle::kill (s7's
   [ -n "$pid" ] || return 0
   kill -KILL "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  rm -f "$HOME/Library/Application Support/net.zeblith.harmony/profiles/$profile/api/port" \
-        "$HOME/Library/Application Support/net.zeblith.harmony/profiles/$profile/api/token"
+  local dir
+  while IFS= read -r dir; do
+    rm -f "$dir/api/port" "$dir/api/token"
+  done < <(d3_data_dirs "$profile")
   if [ "$side" = p ]; then D3_P_PID=""; else D3_B2_PID=""; fi
 }
 
@@ -428,19 +434,34 @@ t3_restart_backfill() {
 #
 # Every boundary is a HARD FAIL here (unlike s7's characterize fallbacks):
 # this scenario IS the authoritative proof, so a silent skip would waste the
-# session. A HELD timeout = the deposit dial itself — the ZEB-689 verdict
-# signal (escalate as a product bug). RECV/CLEARED timeouts = the recover
-# half broke cross-WAN (a real finding; ZEB-509's co-located topology gap
-# does not apply here).
+# session. A HELD timeout = the deposit was NOT RETAINED by B2 — from the
+# sender that is indistinguishable between a transport failure and an
+# acceptor reject (the acceptor is wire-silent by design, no oracle); rerun
+# B2 with RUST_LOG=harmony_app=debug to classify before escalating
+# (2026-07-17: dial delivered, authorization rejected → ZEB-702).
+# RECV/CLEARED timeouts = the recover half broke cross-WAN (a real finding;
+# ZEB-509's co-located topology gap does not apply here).
+
+# Harmony's profile data dir follows dirs::data_dir(): macOS
+# `~/Library/Application Support`, Linux XDG `~/.local/share` (the path
+# stop_remote already uses on the VM). Emit BOTH candidates — literal
+# per-profile paths, safe no-ops where absent — so wipe/cleanup work
+# whichever OS the operator machine runs (Qodo PR #480).
+d3_data_dirs() { # profile → per-profile data-dir candidates, one per line
+  echo "$HOME/Library/Application Support/net.zeblith.harmony/profiles/$1"
+  echo "$HOME/.local/share/net.zeblith.harmony/profiles/$1"
+}
 
 d3_fresh_profiles() {
   # Disposable by design (stale-ghost-key lesson): wipe BOTH the profile data
   # dir and the ZEB-449 file vault so every run mints fresh identities.
   # Literal profile names only — never glob near the standing fleet-koya node.
-  local name
+  local name dir
   for name in "$D3_P_PROFILE" "$D3_B2_PROFILE"; do
-    rm -rf "$HOME/Library/Application Support/net.zeblith.harmony/profiles/$name" \
-           "$HOME/.harmony/profiles/$name"
+    while IFS= read -r dir; do
+      rm -rf "$dir"
+    done < <(d3_data_dirs "$name")
+    rm -rf "$HOME/.harmony/profiles/$name"
   done
 }
 
@@ -459,7 +480,7 @@ d3_butler_deposit() {
   d3_fresh_profiles
   start_d3 p
   start_d3 b2
-  d3_api p mint_owner_identity > /dev/null
+  d3_api p mint_owner_identity > /dev/null || { echo "FAIL D3: mint P owner identity"; return 1; }
   p_owner="$(d3_api p get_owner_state | jq -r '.ownerId // empty')"
   [ -n "$p_owner" ] || die "D3: P mint/read owner identity failed"
   log "D3: P ownerId: $p_owner (B2 stays unminted — it enrolls via pairing)"
@@ -486,8 +507,8 @@ d3_butler_deposit() {
   }
   poll 180 3 "D3 pairing: P discovers B2"  discovered_joiner  || { echo "FAIL D3 (mode=$MODE_WANT): P never discovered joiner B2"; return 1; }
   poll 60  3 "D3 pairing: B2 discovers P"  discovered_inviter || { echo "FAIL D3 (mode=$MODE_WANT): B2 never discovered inviter P"; return 1; }
-  d3_api p  select_pairing_peer "{\"peerSessionId\": \"$joiner_session\"}"  > /dev/null
-  d3_api b2 select_pairing_peer "{\"peerSessionId\": \"$inviter_session\"}" > /dev/null
+  d3_api p  select_pairing_peer "{\"peerSessionId\": \"$joiner_session\"}"  > /dev/null || { echo "FAIL D3: P select_pairing_peer"; return 1; }
+  d3_api b2 select_pairing_peer "{\"peerSessionId\": \"$inviter_session\"}" > /dev/null || { echo "FAIL D3: B2 select_pairing_peer"; return 1; }
 
   sas_of() { # p|b2 → echoes sasDigits when handshaking
     d3_pairing_state "$1" | jq -re 'select(.kind == "handshaking") | .sasDigits'
@@ -498,8 +519,8 @@ d3_butler_deposit() {
   sas_p="$(sas_of p)"; sas_b2="$(sas_of b2)"
   [ -n "$sas_p" ] && [ "$sas_p" = "$sas_b2" ] || { echo "FAIL D3: SAS mismatch (P=$sas_p B2=$sas_b2) — MITM-check property violated"; return 1; }
   log "D3: SAS match ($sas_p) — confirming both sides"
-  d3_api p  confirm_pairing_sas > /dev/null
-  d3_api b2 confirm_pairing_sas > /dev/null
+  d3_api p  confirm_pairing_sas > /dev/null || { echo "FAIL D3: P confirm_pairing_sas"; return 1; }
+  d3_api b2 confirm_pairing_sas > /dev/null || { echo "FAIL D3: B2 confirm_pairing_sas"; return 1; }
   pairing_complete() { [ "$(d3_pairing_state "$1" | jq -r '.kind // empty')" = complete ]; }
   poll 120 3 "D3 pairing: P complete"  pairing_complete p  || { echo "FAIL D3: P pairing never completed"; return 1; }
   poll 60  3 "D3 pairing: B2 complete" pairing_complete b2 || { echo "FAIL D3: B2 pairing never completed"; return 1; }
@@ -584,6 +605,16 @@ d3_butler_deposit() {
   #    then read B2's deviceVkHex from P's own persisted view. The relaunch
   #    startup also republishes P's announce into the community CRDT
   #    (publisher trigger 1) — P is a member at THIS boot, unlike its first.
+  #    Capture A's newest announcedAtMs for P BEFORE the relaunch: A retains
+  #    P's pre-relaunch durable record, so Phase 4.5 must demand a STRICTLY
+  #    newer announce or it can pass on the stale record without proving the
+  #    re-dial (CodeRabbit PR #480).
+  local pre_relaunch_announced_ms
+  pre_relaunch_announced_ms="$(
+    remote_api connectivity_list_peer_reachability | grep -E '^\[' | tail -1 | \
+      jq -r --arg owner "$p_owner" \
+        '[.[] | select(.ownerAddress == $owner) | (.record.announcedAtMs // 0)] | max // 0'
+  )"
   relaunch_d3 p
   local devices peer_vk
   devices="$(d3_api p get_owner_state | jq '[.devices[]? | select(.isThisDevice == false)]')"
@@ -596,18 +627,21 @@ d3_butler_deposit() {
   [ "$peer_vk" = "$joiner_vk" ] || { echo "FAIL D3: persisted peer vk ($peer_vk) != pairing-captured joiner vk ($joiner_vk)"; return 1; }
 
   # -- Phase 4.5: prove the relaunched P re-established the cross-WAN session —
-  #    A observes P's durable announce again (any freshness; the post-pin
-  #    freshness gate is Phase 7's job). Isolates a re-dial failure from a
-  #    pin-propagation failure. The replayed A-announce (Phase 3.5) seeds P's
-  #    dial policy; P's relaunch-startup publish provides the announce to sync.
+  #    A observes a durable announce from P authored STRICTLY AFTER the
+  #    pre-relaunch max (the stale pre-relaunch record would otherwise satisfy
+  #    an existence check instantly and prove nothing). Isolates a re-dial
+  #    failure from a pin-propagation failure. The replayed A-announce
+  #    (Phase 3.5) seeds P's dial policy; P's relaunch-startup publish
+  #    provides the fresh announce to sync.
   a_observes_p() {
     remote_api connectivity_list_peer_reachability | grep -E '^\[' | tail -1 | \
-      jq -e --arg owner "$p_owner" \
-        '.[] | select(.ownerAddress == $owner) | select(.source == "durableCrdt")' > /dev/null
+      jq -e --arg owner "$p_owner" --argjson before "$pre_relaunch_announced_ms" \
+        '.[] | select(.ownerAddress == $owner) | select(.source == "durableCrdt")
+             | select((.record.announcedAtMs // 0) > $before)' > /dev/null
   }
-  poll 300 10 "D3: A observes relaunched P (session re-established)" a_observes_p \
-    || { echo "FAIL D3 (mode=$MODE_WANT): A never observed relaunched P's announce — cross-WAN re-dial after restart did not re-establish"; return 1; }
-  log "D3: A observed relaunched P — cross-WAN session re-established"
+  poll 300 10 "D3: A observes relaunched P (post-relaunch announce)" a_observes_p \
+    || { echo "FAIL D3 (mode=$MODE_WANT): A never observed a POST-relaunch announce from P — cross-WAN re-dial after restart did not re-establish"; return 1; }
+  log "D3: A observed relaunched P's fresh announce — cross-WAN session re-established"
 
   # -- Phase 5: relaunch B2 (ZEB-492: boots its dm-inbox/butler engines from
   #    the persisted fleet KeyTree), then hard-assert butler readiness.
@@ -623,7 +657,7 @@ d3_butler_deposit() {
   #    announced_at_ms >= this floor (authored on the same local clock).
   local pin_floor_ms
   pin_floor_ms=$(( $(date +%s) * 1000 ))
-  d3_api p set_butler_pin "{\"deviceId\": \"$peer_vk\"}" > /dev/null
+  d3_api p set_butler_pin "{\"deviceId\": \"$peer_vk\"}" > /dev/null || { echo "FAIL D3: set_butler_pin"; return 1; }
   local pin
   pin="$(d3_api p get_butler_pin | jq -r '.pinnedDeviceId // empty')"
   [ "$pin" = "$peer_vk" ] || { echo "FAIL D3: get_butler_pin ($pin) does not reflect pinned B2 ($peer_vk)"; return 1; }
@@ -655,20 +689,22 @@ d3_butler_deposit() {
   space="$(remote_api add_space "{\"kind\": \"dm\", \"name\": \"xwan-d3-dm\", \"members\": [\"$p_owner\"]}" | id_of)"
   [ -n "$space" ] || die "D3: add_space returned no spaceId"
   msg="d3-butler-durable-$ts"
-  remote_api send_dm "$(payload_json spaceId "$space" "$msg")" > /dev/null
+  remote_api send_dm "$(payload_json spaceId "$space" "$msg")" > /dev/null || { echo "FAIL D3: A send_dm"; return 1; }
   log "D3: A sent DM to offline P (space $space) — deposit fans out after DEPOSIT_NOACK_WINDOWS=2"
 
   # -- Phase 10: HELD — THE HEADLINE. B2 must receive A's deposit over the
   #    harmony/butler-deposit/v1 dial that crosses the real WAN (GCE →
   #    home-NAT B2). This is the exact dial the co-located harness cannot
   #    establish (ZEB-689); its outcome here is the ticket's verdict signal.
+  #    NB a timeout proves only "not retained" — transport vs authorization
+  #    reject is decided by B2's debug log, not by this poll.
   held_for_a() {
     d3_api b2 get_butler_held | \
       jq -e --arg a "$REMOTE_OWNER" '.held[] | select(.senderOwnerHex == $a)' > /dev/null
   }
   if ! poll 300 10 "D3 HELD: B2 holds A's deposit" held_for_a; then
     d3_api b2 get_butler_held > "$ARTIFACTS/d3-held-timeout-$MODE_WANT.json" 2>&1 || true
-    echo "FAIL D3 (mode=$MODE_WANT): B2 never held A's deposit — the cross-WAN butler-deposit dial did not land (ZEB-689: escalate as product bug on harmony/butler-deposit/v1)"
+    echo "FAIL D3 (mode=$MODE_WANT): B2 never RETAINED A's deposit — transport failure vs acceptor reject is indistinguishable from the sender; rerun B2 with RUST_LOG=harmony_app=debug to classify (ZEB-702 class: dial delivered, authorization rejected)"
     return 1
   fi
   d3_api b2 get_butler_held > "$ARTIFACTS/d3-held-$MODE_WANT.json" 2>&1 || true

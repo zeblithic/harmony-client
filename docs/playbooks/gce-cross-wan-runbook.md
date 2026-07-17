@@ -32,6 +32,7 @@ scripts/gce-xwan/mode.sh open     # firewall mode 1: public-host easy case
 scripts/gce-xwan/run-tests.sh --mode open --test all       # T1 + T2
 scripts/gce-xwan/mode.sh filtered # firewall mode 2: hole-punch must actually work
 scripts/gce-xwan/run-tests.sh --mode filtered --test t2
+scripts/gce-xwan/mode.sh open     # restore: run-tests.sh asserts the live mode matches --mode
 scripts/gce-xwan/run-tests.sh --mode open --test d3     # butler deposit→recover (ZEB-689)
 scripts/gce-xwan/down.sh          # stop (disk survives); --delete when the wave ends
 ```
@@ -85,13 +86,13 @@ second non-cloud network).
   SIGKILL P → A sends a DM → **HELD**
   (B2 receives the `harmony/butler-deposit/v1` dial from GCE — the headline)
   → restart P → **RECV** (P recovers the deposit) → **CLEARED** (B2 records
-  the ingest). Every boundary hard-fails (no characterize fallbacks — this
-  scenario IS the verdict): a HELD timeout means the deposit never landed —
-  but before blaming the transport, rerun the butler with
-  `RUST_LOG=harmony_app=debug` and check its acceptor log: the acceptor
-  **rejects without wire detail by design** (no oracle), so an
-  authorization reject is indistinguishable from a transport failure at
-  INFO (the 2026-07-16 lesson — dial fine, roster missing, ZEB-702).
+  the ingest). Every boundary hard-fails (no characterization fallbacks — this
+  scenario IS the verdict): a HELD timeout means only that **no HELD record
+  was observed** — transport failure vs authorization reject is
+  indistinguishable at INFO, because the acceptor **rejects without wire
+  detail by design** (no oracle). Rerun the butler with
+  `RUST_LOG=harmony_app=debug` to classify before escalating (the
+  2026-07-16 lesson — dial fine, frame delivered, roster missing, ZEB-702).
   RECV/CLEARED timeouts mean the recover half broke on a real WAN. Local
   profiles `xwan-d3-p`/`xwan-d3-b2` are wiped fresh each run (disposable
   identities). Run via `--test d3` in both firewall modes. **Known-red until
@@ -127,20 +128,25 @@ _Filled from live sessions; each row names the commit driven and the firewall mo
 |---|---|---|---|---|---|---|---|
 | 2026-07-04 | `9d12a9a4` (main) | **24m20s** (e2-standard-4, peak RSS 7.1 GB) | **PASS** both modes, attempt 1 each | **PASS + `direct` both sides** | **PASS + `direct` both sides** | **PASS** (catch-up ≈60s post-restart) | ≈$0.40 (VM up ~2.5 h) |
 
-**2026-07-17 D3 session** (`e1bcb92e` + this branch, VM recreated from scratch,
-provision 28m55s): every setup barrier PASSED first-attempt cross-WAN — friend
-redeem attempt 1, community join attempt 1, post-SIGKILL relaunch re-dial
-re-established in **3 s** (announce-replay dial seeding), post-pin announce
-replicated GCE-ward in 38 s. **HELD FAIL, root-caused live**: the deposit dial
-A→B2 (GCE → home-NAT, dial-by-`{endpoint_id, home_relay}`) **established and
-delivered the frame** — the ZEB-689 `MultipathNotNegotiated` transport theory
-is refuted (that noise came from deposit dials to the killed P's own
-butler-set entry). B2's acceptor rejected every deposit: "sender is not
-authorized (not an active friend or co-member)" — a cert-only paired butler
-never receives `OwnerState.friend_graph` (no same-owner CRDT channel exists
-for a community-less sibling; measured: 300 s bilateral-alive, roster still
-empty). Filed as **ZEB-702** (High). Also found: `dm_outbox` pending entries
-do not survive a graceful restart. Session cost ≈$0.50 (VM up ~1.5 h).
+**2026-07-17 D3 session — open mode only** (`e1bcb92e` + this branch, VM
+recreated from scratch, provision 28m55s; filtered mode deliberately not run —
+known-red until ZEB-702, so a filtered result would not be attributable to the
+mode): every setup barrier PASSED first-attempt cross-WAN — friend redeem
+attempt 1, community join attempt 1, post-pin announce replicated GCE-ward in
+38 s (the honest session-re-establishment signal; the earlier existence-only
+Phase 4.5 pass could have been satisfied by A's stale pre-relaunch record —
+the barrier now requires a strictly-newer `announcedAtMs`). **HELD FAIL,
+root-caused live**: the deposit dial A→B2 (GCE → home-NAT,
+dial-by-`{endpoint_id, home_relay}`) **established and delivered the frame** —
+so `MultipathNotNegotiated` was not the cause of THIS session's failure (that
+noise came from deposit dials to the killed P's own butler-set entry; the
+co-located establishment gap remains a co-located-only observation). B2's
+acceptor rejected every deposit: "sender is not authorized (not an active
+friend or co-member)" — a cert-only paired butler never receives
+`OwnerState.friend_graph` (no same-owner CRDT channel exists for a
+community-less sibling; measured: 300 s bilateral-alive, roster still empty).
+Filed as **ZEB-702** (High). Also found: `dm_outbox` pending entries do not
+survive a graceful restart. Session cost ≈$0.50 (VM up ~1.5 h).
 
 The 2026-07-04 session is the **first proven cross-WAN direct-path NAT traversal**
 for Harmony: `connectionMode: "direct"` on both a home-NAT node and the GCE node,
