@@ -16,7 +16,9 @@ DELETE=0
 [ "${1:-}" = "--delete" ] && DELETE=1
 
 if [ "$(firewall_mode)" = "open" ]; then
-  log "removing open-mode firewall rule $FIREWALL_RULE…"
+  # ${FIREWALL_RULE} braced: bash 5.3 parses a bare $VAR adjacent to a
+  # multibyte char as one variable name → unbound-variable at runtime.
+  log "removing open-mode firewall rule ${FIREWALL_RULE}…"
   gcloud compute firewall-rules delete "$FIREWALL_RULE" --project "$GCP_PROJECT" --quiet
 fi
 
