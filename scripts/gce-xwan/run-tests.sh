@@ -119,7 +119,9 @@ start_local() {
 D3_P_PID="" ; D3_B2_PID=""
 start_d3() { # p|b2 [logsuffix]
   local side="$1" suffix="${2:-}"
-  log "starting d3 node $side…"
+  # NB: ${side} braced — bash 5.3 parses a bare `$side…` (multibyte char
+  # adjacent to the name) as one variable name → "unbound variable" at runtime.
+  log "starting d3 node ${side}…"
   d3_env "$side" "$LOCAL_BIN" serve --api-port 0 \
     >> "$ARTIFACTS/d3-$side-serve$suffix.log" 2>&1 &
   if [ "$side" = p ]; then D3_P_PID=$!; else D3_B2_PID=$!; fi
