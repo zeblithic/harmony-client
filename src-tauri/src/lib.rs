@@ -9729,13 +9729,15 @@ pub async fn start_node_inner(
                                 deposit_ctx,
                             ),
                         );
-                        // ZEB-702 T5 (Component D): stash the acceptor's
-                        // decision-counter handle BEFORE it is moved into the
-                        // link manager, so `network_health_snapshot` can surface
-                        // the butler-deposit accept/reject counts. Same `Arc` the
-                        // shell increments; hand it to the outer scope (this block
-                        // is nested and closes before the NH build).
-                        butler_deposit_stats_for_state = Some(butler_acceptor.deposit_stats());
+                        // ZEB-702 T5 (Component D): capture the decision-counter
+                        // handle before the acceptor moves into the link manager,
+                        // but hand it to the outer scope (for the NH build — this
+                        // block closes first) only on SUCCESSFUL install. In the
+                        // OnceLock-refusal branch the link manager keeps the PRIOR
+                        // acceptor, whose stats handle is unreachable here —
+                        // surfacing this orphan's zeroed counters would misreport,
+                        // so the snapshot section honestly stays absent.
+                        let butler_deposit_stats = butler_acceptor.deposit_stats();
                         if link_mgr
                             .install_butler_deposit_acceptor(butler_acceptor)
                             .is_err()
@@ -9749,6 +9751,8 @@ pub async fn start_node_inner(
                                  installed on iroh link manager — keeping \
                                  the prior instance"
                             );
+                        } else {
+                            butler_deposit_stats_for_state = Some(butler_deposit_stats);
                         }
 
                         // ── ZEB-473 (DM-over-iroh, Move 1a) Task 6/7: build the
