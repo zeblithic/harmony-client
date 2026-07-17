@@ -317,6 +317,17 @@ impl std::future::Future for MintSyncEngineHandle {
     }
 }
 
+/// ZEB-702 T2: `MintSyncEngine` is a distinct engine type (not the generic
+/// `FleetSyncEngine<S>`), so it carries its own delegation-only
+/// `RepublishDirty` impl. `republish_dirty` is exactly `notify_dirty`, so the
+/// transport-up-edge re-offer reuses the existing debounced publish path with
+/// no behavior change.
+impl crate::fleet_sync::RepublishDirty for MintSyncEngine {
+    fn republish_dirty(&self) {
+        self.notify_dirty();
+    }
+}
+
 impl MintSyncEngine {
     /// Test constructor that schedules a one-shot boot-hook flush.
     /// The "real" `new` (Task 11) will use this same boot-hook pattern with
@@ -1442,6 +1453,38 @@ mod tests {
         .await;
 
         engine.notify_dirty();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(cs_stub.debug_count().await, 1);
+
+        engine.shutdown().await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// ZEB-702 T2: `MintSyncEngine` is a distinct engine type (not
+    /// `FleetSyncEngine`), so it carries its own one-line `RepublishDirty`
+    /// impl delegating to `notify_dirty()`. Driving the seam through the
+    /// trait object schedules the same debounced publish. Models
+    /// `notify_dirty_triggers_debounced_publish`.
+    #[tokio::test]
+    async fn republish_dirty_triggers_debounced_publish() {
+        let mut conn = fresh_db();
+        seed_account(&mut conn, "a1", "Chase", "2026-05-01T00:00:00Z");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let cs_stub = Arc::new(crate::content_store::InMemoryStub::default());
+        let cs: Arc<dyn crate::content_store::ContentStore> = cs_stub.clone();
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+
+        let (engine, handle) = MintSyncEngine::new_for_test_with_debounce(
+            conn,
+            cs,
+            sync_state,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        // Drive the seam through the trait object (the shape Task 3 consumes).
+        let seam: &dyn crate::fleet_sync::RepublishDirty = &engine;
+        seam.republish_dirty();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert_eq!(cs_stub.debug_count().await, 1);
 

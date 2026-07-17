@@ -194,6 +194,25 @@ impl<S: Send + 'static> Drop for FleetSyncEngine<S> {
     }
 }
 
+/// ZEB-702 (Component B): object-safe seam for re-offering the current
+/// dataset root when a transport link forms. `republish_dirty` delegates to
+/// the engine's own `notify_dirty()`, so the re-offer rides the existing
+/// debounce + publish path — byte-identical content, idempotent on receivers
+/// (LWW/HLC merge). Task 3's transport-epoch listener holds a
+/// `Vec<Arc<dyn RepublishDirty>>` over every owner-scoped dataset engine and
+/// nudges each on the transport up-edge, closing the late-joiner hole where a
+/// link that forms after the last publish would otherwise carry nothing until
+/// the next local mutation. Implemented here for the generic
+/// `FleetSyncEngine<S>` (covers owner-state, fleet-net, dm-inbox, dm-outhold,
+/// owner-trust, fleet-keys, owner-quorum-req, community-device-intro, notes,
+/// relay datasets); the distinct `MintSyncEngine` carries its own one-line
+/// impl in `mint_sync.rs`.
+pub trait RepublishDirty: Send + Sync {
+    /// Schedule a debounced re-publish of the current dataset root.
+    /// Non-blocking; coalesces with any pending dirty state.
+    fn republish_dirty(&self);
+}
+
 impl<S> FleetSyncEngine<S>
 where
     S: CanonicalPayload + serde::de::DeserializeOwned + Clone + Send + 'static,
@@ -362,6 +381,18 @@ where
         acks.values()
             .filter(|seen_of_me| !my_latest.is_strictly_newer_than(seen_of_me))
             .count()
+    }
+}
+
+/// ZEB-702 T2: delegation-only — `republish_dirty` is exactly `notify_dirty`,
+/// so the transport-up-edge re-offer reuses the engine's existing debounced
+/// publish path with no behavior change.
+impl<S> RepublishDirty for FleetSyncEngine<S>
+where
+    S: CanonicalPayload + serde::de::DeserializeOwned + Clone + Send + 'static,
+{
+    fn republish_dirty(&self) {
+        self.notify_dirty();
     }
 }
 
@@ -1251,6 +1282,43 @@ mod engine_tests {
             }
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
+    }
+
+    /// ZEB-702 T2: the `RepublishDirty` seam must delegate to the engine's
+    /// debounced-publish path. Driving it through an `Arc<dyn RepublishDirty>`
+    /// (the exact shape Task 3's transport-epoch listener consumes) schedules
+    /// the same debounced publish a `notify_dirty()` would — observed as a
+    /// frame on the outbound publisher channel. Models
+    /// `mint_sync::notify_dirty_triggers_debounced_publish`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn republish_dirty_schedules_debounced_publish() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let Built {
+            engine,
+            mut out_rx,
+            in_tx,
+            ..
+        } = build_engine("dev-republish", Arc::clone(&cas), false);
+        // Keep the inbound sender alive so the engine task doesn't log a
+        // spurious "inbound subscriber channel closed" error mid-test.
+        let _in_tx = in_tx;
+
+        // Drive the seam through the trait object, exactly as Task 3 will.
+        let engine = Arc::new(engine);
+        let handle: Arc<dyn RepublishDirty> = engine.clone();
+        handle.republish_dirty();
+
+        // A debounced publish (50 ms window) must land on the outbound channel.
+        let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("republish_dirty must trigger a debounced publish within 5s")
+            .expect("publisher channel closed before a frame arrived");
+        assert!(
+            !frame.is_empty(),
+            "republish_dirty debounced publish produced an empty frame"
+        );
+
+        engine.shutdown().await.ok();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
