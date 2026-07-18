@@ -39729,12 +39729,16 @@ mod zeb268_leave_detach_fence_tests {
     /// be inserted into a detached engine, reporting success while the event
     /// never persists or publishes.
     ///
-    /// The interleaving is deterministic on the current-thread test runtime:
-    /// holding the `dm_outbox` tokio lock parks the impl at the mint (AFTER its
-    /// NodeState snapshot, BEFORE the re-lock fence); we then clear the
-    /// registry with generation untouched — exactly the stop_inner shape —
-    /// release the lock, and the fence must fire.
-    #[tokio::test]
+    /// The interleaving is deterministic: holding the `dm_outbox` tokio lock
+    /// parks the impl at the mint (AFTER its NodeState snapshot, BEFORE the
+    /// re-lock fence), and the HLC-tracker entry — written by
+    /// `reserve_next_hlc_for_device` between the snapshot and the outbox-lock
+    /// attempt — is the observable barrier proving the snapshot already
+    /// happened (Qodo, PR #491 R1: a fixed yield count + `is_finished()` only
+    /// suggested progress, it didn't prove it). Once the barrier trips we
+    /// clear the registry with generation untouched — exactly the stop_inner
+    /// shape — release the lock, and the fence must fire.
+    #[tokio::test(flavor = "current_thread")]
     async fn leave_errs_detached_when_registry_cleared_mid_flight() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (cas_op_tx, _cas_op_rx) = tokio::sync::mpsc::channel(8);
@@ -39782,12 +39786,13 @@ mod zeb268_leave_detach_fence_tests {
             ),
         ));
 
+        let hlc_tracker = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
         let node = Arc::new(std::sync::Mutex::new(NodeState {
             dm_outbox: Some(Arc::clone(&dm_outbox)),
             crdt_state: Some(Arc::new(tokio::sync::Mutex::new(
                 crate::owner_state_crdt::OwnerState::default(),
             ))),
-            hlc_tracker: Some(Arc::new(tokio::sync::Mutex::new(BTreeMap::new()))),
+            hlc_tracker: Some(Arc::clone(&hlc_tracker)),
             dm_device_id: Some("leaver-dev".into()),
             dm_self_owner: Some(self_owner),
             community_registry: Some(registry),
@@ -39804,14 +39809,24 @@ mod zeb268_leave_detach_fence_tests {
             leave_community_impl(&node_task, sink, hex::encode([0x77u8; 16])).await
         });
 
-        // Current-thread runtime: yielding drives the spawned task to its only
-        // possible park point (the held outbox lock) — no wall-clock waits.
-        for _ in 0..100 {
+        // Deterministic barrier (no wall-clock waits): the impl writes the
+        // device's HLC into the tracker via `reserve_next_hlc_for_device`
+        // strictly AFTER its NodeState snapshot and strictly BEFORE its
+        // `dm_outbox.lock().await`. Seeing the key therefore proves the
+        // snapshot captured the still-attached registry; the held outbox
+        // gate guarantees the impl cannot get past the mint.
+        let mut reserved = false;
+        for _ in 0..10_000 {
             tokio::task::yield_now().await;
+            if hlc_tracker.lock().await.contains_key("leaver-dev") {
+                reserved = true;
+                break;
+            }
         }
+        assert!(reserved, "impl must have passed the HLC reservation");
         assert!(
             !task.is_finished(),
-            "impl must be parked at the outbox lock"
+            "impl must be parked at the held outbox lock"
         );
 
         // stop_inner shape: registry cleared, generation NOT bumped.

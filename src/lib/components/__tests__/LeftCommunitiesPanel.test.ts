@@ -78,4 +78,69 @@ describe('LeftCommunitiesPanel (ZEB-435)', () => {
     await findByText(/has not been left/i);
     await findByText('Old Crew');
   });
+
+  it('defers the first load until the tab is activated', async () => {
+    const service = makeService([[]]);
+    const { findByText, rerender } = render(LeftCommunitiesPanel, {
+      props: { service, active: false },
+    });
+    // Mounted hidden (SettingsPanel keeps all tabs mounted): no IPC yet.
+    await Promise.resolve();
+    expect(service.listLeftCommunities).not.toHaveBeenCalled();
+
+    await rerender({ active: true });
+    await findByText(/No left communities/i);
+    expect(service.listLeftCommunities).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops the deleted row locally even when the refresh fails', async () => {
+    let call = 0;
+    const service = {
+      listLeftCommunities: vi.fn(async () => {
+        call += 1;
+        if (call === 1) return [ROW];
+        throw new Error('adapter went away');
+      }),
+      removeSpace: vi.fn(async () => {}),
+    };
+    const { findByText, getByText, getByPlaceholderText, queryByText } = render(
+      LeftCommunitiesPanel,
+      { props: { service } },
+    );
+    await findByText('Old Crew');
+    await fireEvent.click(getByText('Delete forever…'));
+    const input = getByPlaceholderText('Type community name exactly...') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: 'Old Crew' } });
+    await fireEvent.click(getByText('Delete forever').closest('button') as HTMLButtonElement);
+
+    // The tombstoned community must not linger looking undeleted just
+    // because the reconciling re-fetch failed.
+    await waitFor(() => {
+      expect(service.removeSpace).toHaveBeenCalledWith(ROW.spaceId);
+      expect(queryByText('Old Crew')).toBeNull();
+    });
+    await findByText(/adapter went away/i);
+  });
+
+  it('retries a failed load when the tab is re-activated', async () => {
+    let call = 0;
+    const service = {
+      listLeftCommunities: vi.fn(async () => {
+        call += 1;
+        if (call === 1) throw new Error('adapter not connected');
+        return [];
+      }),
+      removeSpace: vi.fn(async () => {}),
+    };
+    const { findByText, rerender } = render(LeftCommunitiesPanel, {
+      props: { service, active: true },
+    });
+    await findByText(/adapter not connected/i);
+
+    // Leaving and re-entering the tab is the retry edge.
+    await rerender({ active: false });
+    await rerender({ active: true });
+    await findByText(/No left communities/i);
+    expect(service.listLeftCommunities).toHaveBeenCalledTimes(2);
+  });
 });

@@ -136,7 +136,7 @@
   // SettingsPanel) so the app can route to a specific section — see
   // handleExportRequested, which opens Settings → Account for the backup wizard.
   let settingsTab = $state<
-    'profile' | 'appearance' | 'account' | 'notifications' | 'network' | 'friends'
+    'profile' | 'appearance' | 'account' | 'notifications' | 'network' | 'communities' | 'friends'
   >('profile');
   let appMode = $state<AppMode>('messages');
 

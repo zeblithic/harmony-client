@@ -45,9 +45,10 @@ with `hlc_tracker` + `dm_device_id` + `dm_self_owner` + real `CommunitySyncRegis
 `node.community_registry = None` (same-crate field access; generation untouched — exactly the
 stop_inner shape) → releases lock → asserts `Err` contains `"community_registry detached"`.
 **Deterministically red pre-fix:** without the fence the impl proceeds to `engine_arc()` on the
-snapshot clone and fails with the WRONG error (`"no engine for community"`). Fallback if fixture
-cost balloons (>~1 task): drop to the two cheap err-path assertions via a small extracted recheck
-helper, and say so in the PR.
+snapshot clone and fails with the WRONG error (`"no engine for community"`). *(Outcome: the
+interleave test shipped exactly as specified and went red pre-fix — no fallback was needed. Any
+future rework must keep the integration-level interleave through `leave_community_impl`; a
+helper-only test could pass with the production fence missing or unreachable.)*
 
 ### D2 — `list_left_communities` (backend, new)
 
@@ -91,11 +92,17 @@ left-list (pull-on-open is sufficient).
 - R2 (rust): `left_communities_for_nav` unit tests (live filtered out, left included w/ correct
   `left_at_ms`, sort desc + tiebreak, non-community kinds excluded) → red (fn absent) → D2 → green.
 - R3 (rust): RPC pin test updated (expected-methods list) — red until registration.
-- F1 (vitest): `listLeftCommunities` wrapper invokes `'list_left_communities'` and maps DTO.
+- F1 (vitest): `listLeftCommunities` wrapper invokes `'list_left_communities'` and returns the
+  DTO rows verbatim (no normalization layer).
 - F2 (vitest): `LeftCommunitiesPanel` — renders rows + empty state; Delete forever opens typed
   modal with the community name; confirm calls `removeSpace(spaceId)` and re-fetches; error shown.
-- Gates per task: fmt, clippy `--all-targets`, `npx tsc --noEmit`, `npx vitest run`,
-  `scripts/test-select --context task`. Final: full sweep + all frontend gates.
+- Gates per task (iterative): `cargo fmt --all -- --check`,
+  `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`,
+  `npx tsc --noEmit`, `npx vitest run`, and `scripts/test-select --context task` — paste the
+  emitted `round=… bucket=…` summary line into the task report so the selection is auditable.
+- Final (pre-PR, CI-parity):
+  `cargo nextest run --locked --workspace --all-targets --features test-fixtures` (full sweep —
+  test-select is for iterative gates only), plus the same fmt/clippy/tsc/vitest set.
 
 ## Task order
 

@@ -373,11 +373,16 @@ First boot is **pre-mint** — `serve` starts the node but does not create an
 identity. `GET /v1/status` reports `"ownerId": null` until you `POST
 /v1/rpc/mint_owner_identity` (once per profile; subsequent boots load it).
 
-### The v1 RPC surface (35 commands)
+### The v1 RPC surface (common commands)
 
 All commands are `POST /v1/rpc/{command}` with a JSON object body
 (camelCase keys, exactly the args the GUI sends). No-arg commands accept
 `{}` or an empty body.
+
+The table below is a curated subset of the most commonly used commands —
+the registry has grown well past it. The authoritative, always-current
+list is the `registry_has_exactly_the_curated_v1_surface` pin test in
+`src-tauri/src/api/rpc.rs`.
 
 | Capability | Commands |
 |---|---|

@@ -9,7 +9,6 @@
    * from resurrecting the community. Leaving stays reversible and is NEVER
    * cascaded into deletion — only this explicit gesture tombstones.
    */
-  import { onMount } from 'svelte';
   import type { LeftCommunityNavDto } from '../community-service';
   import TypedConfirmationModal from './TypedConfirmationModal.svelte';
 
@@ -20,16 +19,18 @@
     removeSpace(spaceId: string): Promise<void>;
   }
 
-  let { service }: { service: LeftCommunitiesService } = $props();
+  let { service, active = true }: { service: LeftCommunitiesService; active?: boolean } = $props();
 
   let rows: LeftCommunityNavDto[] = $state([]);
   let loaded = $state(false);
+  let loading = $state(false);
   let loadError: string | null = $state(null);
   let target: LeftCommunityNavDto | null = $state(null);
   let removeError: string | null = $state(null);
   let removing = $state(false);
 
   async function load(): Promise<void> {
+    loading = true;
     try {
       rows = await service.listLeftCommunities();
       loadError = null;
@@ -37,15 +38,27 @@
       loadError = e instanceof Error ? e.message : String(e);
     } finally {
       loaded = true;
+      loading = false;
     }
   }
 
-  // The panel remounts each time Settings opens (SettingsPanel keeps tabs
-  // mounted only while Settings itself is open), so pull-on-mount is fresh
-  // per open; each successful delete re-fetches. No push events exist for
-  // left spaces — they were already gone from the nav stream.
-  onMount(() => {
-    void load();
+  // SettingsPanel keeps every tab mounted (visibility via `hidden`), so an
+  // unconditional on-mount fetch would fire on every Settings open even when
+  // this tab is never visited — and a failure at that moment would persist
+  // with no retry path (Qodo, PR #491 R1). Instead the first fetch is
+  // deferred until the tab is actually activated, and a failed load retries
+  // on the next activation EDGE (not continuously — a persistent backend
+  // error must not become a hot retry loop). Each successful delete still
+  // re-fetches. No push events exist for left spaces — they were already
+  // gone from the nav stream.
+  let prevActive = false;
+  $effect(() => {
+    const becameActive = active && !prevActive;
+    prevActive = active;
+    if (!active || loading) return;
+    if (!loaded || (becameActive && loadError !== null)) {
+      void load();
+    }
   });
 
   async function confirmRemove(): Promise<void> {
@@ -56,6 +69,10 @@
       await service.removeSpace(t.spaceId);
       removeError = null;
       target = null;
+      // Drop the row locally BEFORE the fallible re-fetch: if load() fails
+      // here, the tombstoned community must not linger looking undeleted
+      // (CodeRabbit, PR #491 R1). The re-fetch then reconciles fully.
+      rows = rows.filter((row) => row.spaceId !== t.spaceId);
       await load();
     } catch (e) {
       // Surface the backend guard verbatim (e.g. leave-first / still-active

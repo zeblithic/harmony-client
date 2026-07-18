@@ -214,7 +214,7 @@
     hidden={activeTab !== 'communities'}
   >
     {#if communityService}
-      <LeftCommunitiesPanel service={communityService} />
+      <LeftCommunitiesPanel service={communityService} active={activeTab === 'communities'} />
     {/if}
   </div>
   <div
