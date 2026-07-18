@@ -51606,6 +51606,15 @@ pub(crate) async fn fence_owner_state_flush(
     context: &'static str,
     community_id: &str,
 ) {
+    // Notify BEFORE the persist (PR #493 R1, Qodo): arms the debounced
+    // publish (best-effort propagation of the owner-state root to sibling
+    // devices — what the old synchronous `flush_now` did; never blocks
+    // durability) AND accounts the fenced mutation for the ZEB-710
+    // dirty-window tripwire, so callers that mutate-then-fence without
+    // their own notify (e.g. fork_community) don't trip it. `persist_now`
+    // never consumes `has_pending_dirty`, so the debounce stays armed
+    // across every arm below — including error/timeout.
+    engine.notify_dirty();
     match tokio::time::timeout(timeout, engine.persist_now()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -51623,11 +51632,6 @@ pub(crate) async fn fence_owner_state_flush(
             );
         }
     }
-    // Best-effort propagation of the owner-state root to sibling devices — the
-    // publish `flush_now` used to do synchronously. Fires on the next debounce;
-    // never blocks durability. Also serves as the re-arm on the error/timeout
-    // arms above.
-    engine.notify_dirty();
 }
 
 /// ZEB-462 B: durable-on-commit fence for the COMMUNITY MEMBERSHIP CRDT,

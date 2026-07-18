@@ -94,5 +94,13 @@ a named surviving equivalent. Integration files in scope:
 ## Gates
 
 Red-first for D1/D2/D4 counters; D3 is deletion+port (ports red-first where a property
-lacks live coverage). fmt, clippy `--all-targets`, `scripts/test-select --context task`
-per task, `--context round` + full sweep before PR. PR body: "Closes ZEB-710."
+lacks live coverage). Iterative: `scripts/test-select --context task` per task,
+`--context round` per converge round. Final (CI-shaped, reproducible — R1 CodeRabbit):
+
+```
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+scripts/test-select --full   # = cargo nextest run --locked --workspace --all-targets --features test-fixtures
+```
+
+PR body: "Closes ZEB-710."
