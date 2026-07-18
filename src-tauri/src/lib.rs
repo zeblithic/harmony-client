@@ -2685,16 +2685,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // stop_inner is sync (blocking_lock would panic from async contexts);
     // contention here means a drain tick holds the lock for its brief
     // Phase A window — treat as no-fence (WARN) rather than spinning.
-    let dm_drain_fence = dm_outbox.as_ref().and_then(|o| match o.try_lock() {
-        Ok(g) => Some(g.shutdown_fence_handles()),
-        Err(_) => {
-            tracing::warn!(
-                "ZEB-703: dm_outbox contended at stop; skipping drain-path fence \
-                 (a Phase C mutation may race the final persist)"
-            );
-            None
-        }
-    });
+    // ZEB-710: the contended degrade (WARN + no-fence) now also increments
+    // DM_FENCE_STATS inside the helper, so the wedge is metric-visible.
+    let dm_drain_fence = dm_outbox
+        .as_ref()
+        .and_then(crate::dm_outbox::DmOutbox::snapshot_shutdown_fence_at_stop);
     // ZEB-225 Sub-B Phase 2: drop DM outbox handles after the channel
     // drops. send_dm IPC and the event-loop drain tick both clone these
     // Arcs into local scope before await, so dropping our Arc here just
@@ -11734,6 +11729,13 @@ pub async fn start_node_inner(
                             if let Some(stats) = butler_deposit_stats_for_state.as_ref() {
                                 nh.set_butler_deposit_source(std::sync::Arc::clone(stats));
                             }
+                            // ZEB-710: drain-fence degraded-mode counters —
+                            // the process-global (survives node restarts
+                            // within the process, so a stop-time no-fence
+                            // degrade is visible in the NEXT boot's panel).
+                            nh.set_dm_fence_source(std::sync::Arc::clone(
+                                &crate::dm_outbox::DM_FENCE_STATS,
+                            ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks

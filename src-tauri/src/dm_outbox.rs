@@ -514,6 +514,66 @@ pub const EXPIRATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000; // 30 days
 /// `acquire_many`s this many to await drain-path quiescence.
 pub(crate) const DRAIN_PHASE_C_FENCE_CAPACITY: usize = 64;
 
+/// ZEB-710: process-lived counters for the ZEB-703 fence's two documented
+/// degraded modes, which were previously WARN-log-only:
+///
+/// 1. Phase-C fence exhaustion — `DRAIN_PHASE_C_FENCE_CAPACITY` detached
+///    Phase C tasks wedged means a drain tick skips Phase C entirely
+///    (safe direction, but pathological wedging deserves a metric).
+/// 2. `stop_inner` finding the outbox lock contended and degrading to
+///    no-fence (a Phase C mutation may race the final persist).
+///
+/// Process-global (not outbox-lived) deliberately: the stop arm fires while
+/// the node is tearing down, so an outbox-lived counter would die before
+/// any snapshot could read it — a restart within the same process surfaces
+/// the previous stop's skip in the next boot's network-health snapshot.
+/// Registered with `NetworkHealthService` at boot via
+/// `set_dm_fence_source`.
+pub(crate) struct DmFenceStats {
+    phase_c_saturated_skips: std::sync::atomic::AtomicU64,
+    stop_fence_skipped_contended: std::sync::atomic::AtomicU64,
+}
+
+impl DmFenceStats {
+    /// Test-only: a private instance so snapshot-mapping tests can assert
+    /// exact values instead of deltas against the process-global.
+    #[cfg(test)]
+    pub(crate) fn new_for_source() -> Self {
+        Self {
+            phase_c_saturated_skips: std::sync::atomic::AtomicU64::new(0),
+            stop_fence_skipped_contended: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn record_phase_c_saturated_skip(&self) {
+        self.phase_c_saturated_skips
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn record_stop_fence_skipped_contended(&self) {
+        self.stop_fence_skipped_contended
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn phase_c_saturated_skips(&self) -> u64 {
+        self.phase_c_saturated_skips
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn stop_fence_skipped_contended(&self) -> u64 {
+        self.stop_fence_skipped_contended
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// ZEB-710: the process-global instance (see [`DmFenceStats`] for why it is
+/// not outbox-lived). `Arc` so the network-health registry can hold the
+/// same allocation via its additive `set_*_source` pattern.
+pub(crate) static DM_FENCE_STATS: std::sync::LazyLock<Arc<DmFenceStats>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(DmFenceStats {
+            phase_c_saturated_skips: std::sync::atomic::AtomicU64::new(0),
+            stop_fence_skipped_contended: std::sync::atomic::AtomicU64::new(0),
+        })
+    });
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
     /// `(space_id, message_cid, recipient_owner_addr)` triples whose
@@ -761,6 +821,33 @@ impl DmOutbox {
             Arc::clone(&self.shutdown_gate),
             Arc::clone(&self.phase_c_inflight),
         )
+    }
+
+    /// ZEB-703/710: snapshot the drain-path fence handles at stop. `try_lock`
+    /// because `stop_inner` is fully synchronous (`blocking_lock` would panic
+    /// from async contexts); contention means a drain tick holds the lock for
+    /// its brief Phase A window — degrade to no-fence with a WARN rather than
+    /// spinning. ZEB-710: the degraded mode also increments
+    /// [`DM_FENCE_STATS`] so wedge visibility is not log-only.
+    pub(crate) fn snapshot_shutdown_fence_at_stop(
+        outbox: &Arc<tokio::sync::Mutex<DmOutbox>>,
+    ) -> Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<tokio::sync::Semaphore>,
+    )> {
+        match outbox.try_lock() {
+            Ok(g) => Some(g.shutdown_fence_handles()),
+            Err(_) => {
+                // ZEB-710: count the degrade — wedge visibility must not be
+                // log-only.
+                DM_FENCE_STATS.record_stop_fence_skipped_contended();
+                tracing::warn!(
+                    "ZEB-703: dm_outbox contended at stop; skipping drain-path fence \
+                     (a Phase C mutation may race the final persist)"
+                );
+                None
+            }
+        }
     }
 
     /// Test-only constructor that bypasses the ZEB-339 `assert!`
@@ -3116,6 +3203,9 @@ pub async fn drain_lifted(
     let phase_c_permit = match phase_c_sem.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            // ZEB-710: count the degrade — wedge visibility must not be
+            // log-only.
+            DM_FENCE_STATS.record_phase_c_saturated_skip();
             tracing::warn!(
                 "drain_lifted: Phase C fence exhausted ({} in flight); skipping this \
                  tick's Phase C (ZEB-703)",
@@ -5941,6 +6031,84 @@ mod tests {
             transport.sends().len(),
             1,
             "ungated tick with a due entry must send (fixture sanity)"
+        );
+    }
+
+    /// ZEB-710: Phase-C fence exhaustion (all `DRAIN_PHASE_C_FENCE_CAPACITY`
+    /// permits held by wedged tasks) skips the tick's Phase C with a WARN —
+    /// the skip must also increment the process-lived
+    /// `DM_FENCE_STATS.phase_c_saturated_skips` counter so wedge visibility
+    /// is not log-only. Delta-asserted: the counter is process-global.
+    #[tokio::test]
+    async fn drain_lifted_phase_c_saturation_increments_fence_counter_zeb710() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        install_outbox_entry(&mut state, entry);
+
+        let outbox_arc = Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic("dev", alice)));
+        let state_arc = Arc::new(tokio::sync::Mutex::new(state));
+        let transport = StubTransport::new();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+
+        // Wedge simulation: hold EVERY fence permit for the whole tick.
+        let (_gate, phase_c_sem) = outbox_arc.lock().await.shutdown_fence_handles();
+        let held = Arc::clone(&phase_c_sem)
+            .acquire_many_owned(DRAIN_PHASE_C_FENCE_CAPACITY as u32)
+            .await
+            .expect("acquire all fence permits");
+
+        let before = DM_FENCE_STATS.phase_c_saturated_skips();
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            2_000,
+            app,
+            None,
+        )
+        .await;
+        assert_eq!(
+            DM_FENCE_STATS.phase_c_saturated_skips(),
+            before + 1,
+            "a saturated-fence Phase C skip must increment the counter"
+        );
+        drop(held);
+    }
+
+    /// ZEB-710: `stop_inner`'s fence snapshot degrading to no-fence on a
+    /// contended outbox lock must increment
+    /// `DM_FENCE_STATS.stop_fence_skipped_contended`; the uncontended path
+    /// must not count.
+    #[tokio::test]
+    async fn stop_fence_snapshot_contended_increments_counter_zeb710() {
+        let alice = OwnerAddr([0xaa; 16]);
+        let outbox_arc = Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic("dev", alice)));
+
+        let before = DM_FENCE_STATS.stop_fence_skipped_contended();
+        {
+            let _held = outbox_arc.try_lock().expect("hold for contention");
+            assert!(
+                DmOutbox::snapshot_shutdown_fence_at_stop(&outbox_arc).is_none(),
+                "contended snapshot must degrade to no-fence"
+            );
+        }
+        assert_eq!(
+            DM_FENCE_STATS.stop_fence_skipped_contended(),
+            before + 1,
+            "the contended no-fence degrade must increment the counter"
+        );
+
+        assert!(
+            DmOutbox::snapshot_shutdown_fence_at_stop(&outbox_arc).is_some(),
+            "uncontended snapshot must return the fence handles"
+        );
+        assert_eq!(
+            DM_FENCE_STATS.stop_fence_skipped_contended(),
+            before + 1,
+            "the uncontended path must not count"
         );
     }
 

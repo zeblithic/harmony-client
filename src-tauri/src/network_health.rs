@@ -67,6 +67,11 @@ pub struct NetworkHealthSnapshot {
     /// snapshot forward-compatible.
     #[serde(default)]
     pub butler_deposits: Option<ButlerDepositHealth>,
+    /// ZEB-710: drain-fence degraded-mode counters. `None` until the boot
+    /// wiring installs the source (`#[serde(default)]` keeps a pre-field
+    /// snapshot forward-compatible, matching `butler_deposits`).
+    #[serde(default)]
+    pub dm_fence: Option<DmFenceHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -240,6 +245,18 @@ pub struct ButlerDepositHealth {
     pub accepted: u64,
     pub rejected_unauthorized: u64,
     pub rejected_other: u64,
+}
+
+/// ZEB-710: the ZEB-703 drain-fence's two degraded modes, mirrored from the
+/// process-lived `dm_outbox::DM_FENCE_STATS`. Both were WARN-log-only; a
+/// non-zero value here means either Phase C wedging (saturated fence made a
+/// drain tick skip Phase C) or a stop that ran without the drain-path fence
+/// (contended outbox lock). Serde camelCase like the sibling sections.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DmFenceHealth {
+    pub phase_c_saturated_skips: u64,
+    pub stop_fence_skipped_contended: u64,
 }
 
 /// ZEB-620: live per-peer-state tally derived from a supervisor
@@ -488,6 +505,8 @@ impl NetworkHealthSnapshot {
             transport_disabled_reason: None,
             // ZEB-702: no service ⇒ no acceptor to read counts from.
             butler_deposits: None,
+            // ZEB-710: no service ⇒ no fence source installed.
+            dm_fence: None,
         }
     }
 }
@@ -902,6 +921,11 @@ pub struct NetworkHealthService {
     /// [`set_butler_deposit_source`](Self::set_butler_deposit_source),
     /// additive like the other `set_*` sources.
     butler_deposits: Option<std::sync::Arc<crate::iroh_butler_acceptor::ButlerDepositStats>>,
+    /// ZEB-710: drain-fence degraded-mode counter source — the process-lived
+    /// `dm_outbox::DM_FENCE_STATS` Arc. Installed at boot via
+    /// [`set_dm_fence_source`](Self::set_dm_fence_source), additive like the
+    /// other `set_*` sources.
+    dm_fence: Option<std::sync::Arc<crate::dm_outbox::DmFenceStats>>,
 }
 
 impl NetworkHealthService {
@@ -930,6 +954,7 @@ impl NetworkHealthService {
             notify_tx: None,
             self_owner: None,
             butler_deposits: None,
+            dm_fence: None,
         }
     }
 
@@ -982,6 +1007,18 @@ impl NetworkHealthService {
         src: std::sync::Arc<crate::iroh_butler_acceptor::ButlerDepositStats>,
     ) {
         self.butler_deposits = Some(src);
+    }
+
+    /// ZEB-710: install the drain-fence degraded-mode counter source — the
+    /// process-lived `dm_outbox::DM_FENCE_STATS` Arc. Called once at boot;
+    /// when unset, `snapshot`'s `dm_fence` stays `None`. `pub(crate)`
+    /// because `DmFenceStats` is crate-private (a `pub fn` would leak it —
+    /// same `private_interfaces` rationale as `root_serve_tx`).
+    pub(crate) fn set_dm_fence_source(
+        &mut self,
+        src: std::sync::Arc<crate::dm_outbox::DmFenceStats>,
+    ) {
+        self.dm_fence = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -1227,6 +1264,10 @@ impl NetworkHealthService {
                     rejected_unauthorized: c.rejected_unauthorized,
                     rejected_other: c.rejected_other,
                 }
+            }),
+            dm_fence: self.dm_fence.as_ref().map(|s| DmFenceHealth {
+                phase_c_saturated_skips: s.phase_c_saturated_skips(),
+                stop_fence_skipped_contended: s.stop_fence_skipped_contended(),
             }),
         }
     }
@@ -2867,6 +2908,7 @@ mod tests {
             dial_status: DialHealthSummary::default(),
             transport_disabled_reason: None,
             butler_deposits: None,
+            dm_fence: None,
         }
     }
 
@@ -3151,6 +3193,53 @@ mod tests {
         // No snake_case key leakage past the camelCase rename.
         assert!(bd.get("rejected_unauthorized").is_none());
         assert!(bd.get("rejected_other").is_none());
+    }
+
+    // ── ZEB-710: drain-fence degraded-mode counters in the snapshot ────
+    #[tokio::test]
+    async fn snapshot_dm_fence_section_serializes_camelcase() {
+        // A private local instance (not the process-global) so the assertions
+        // are exact, not delta-based.
+        let stats = std::sync::Arc::new(crate::dm_outbox::DmFenceStats::new_for_source());
+        stats.record_phase_c_saturated_skip();
+        stats.record_stop_fence_skipped_contended();
+        stats.record_stop_fence_skipped_contended();
+
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_dm_fence_source(std::sync::Arc::clone(&stats));
+
+        let snap = svc.snapshot().await;
+        assert_eq!(
+            snap.dm_fence,
+            Some(DmFenceHealth {
+                phase_c_saturated_skips: 1,
+                stop_fence_skipped_contended: 2,
+            })
+        );
+        let v = serde_json::to_value(&snap).expect("snapshot serializes");
+        let df = &v["dmFence"];
+        assert_eq!(df["phaseCSaturatedSkips"], serde_json::json!(1));
+        assert_eq!(df["stopFenceSkippedContended"], serde_json::json!(2));
+        assert!(df.get("phase_c_saturated_skips").is_none());
+
+        // Unset source ⇒ null section (the butlerDeposits convention).
+        let svc2 = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        let snap2 = svc2.snapshot().await;
+        assert!(snap2.dm_fence.is_none());
     }
 
     #[tokio::test]
