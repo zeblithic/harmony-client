@@ -1877,17 +1877,17 @@ impl DmOutbox {
                 )
                 .await
             }
-            // ZEB-241: CidNotify is dispatched via `handle_cidnotify_lifted`
-            // (spawned from event_loop pre-decode) so the 500ms CAS fetch
-            // doesn't hold outbox + state locks. event_loop pre-decodes
-            // and short-circuits before reaching handle_unicast for
-            // CidNotify packets, so this arm should be unreachable in
-            // production. If a CidNotify ever arrives here (e.g., a future
-            // caller that bypasses the pre-decode), drop+warn rather than
+            // ZEB-241 (historical): CidNotify was dispatched via
+            // `handle_cidnotify_lifted` (spawned from the now-retired
+            // event_loop pre-decode) so the 500ms CAS fetch didn't hold
+            // outbox + state locks. ZEB-709: that dispatch no longer exists
+            // and this whole method is production-orphaned — the live
+            // CidNotify path is `dm_inbox_ingest::ingest_dm_packet`. The
+            // drop+warn arm stays so no caller (today: tests) can
             // re-introduce a locked CAS-fetch path.
             crate::dm_envelope::DmPacket::CidNotify { .. } => {
                 tracing::warn!(
-                    "handle_unicast received CidNotify; expected event_loop pre-decode to spawn handle_cidnotify_lifted instead. Dropping packet."
+                    "handle_unicast received CidNotify; the live path is dm_inbox_ingest::ingest_dm_packet. Dropping packet."
                 );
                 Ok(DrainOutcome::default())
             }
@@ -2010,10 +2010,11 @@ impl DmOutbox {
         }
     }
 
-    /// ZEB-241: lock-lifted CidNotify handler. Manages its
+    /// ZEB-241 (historical): lock-lifted CidNotify handler. Manages its
     /// own lock cycles internally so the slow CAS fetch in Phase B
-    /// happens with NO locks held. Designed to be called from a
-    /// `tokio::spawn`'d task (event_loop fires-and-forgets).
+    /// happens with NO locks held. Was designed to be called from a
+    /// `tokio::spawn`'d task by the now-retired event_loop pre-decode
+    /// dispatch; today only tests call it.
     ///
     /// ZEB-709 audit (2026-07-18): PRODUCTION-ORPHANED — see
     /// `handle_unicast`'s doc note. No live transport routes CidNotify here
