@@ -2320,8 +2320,9 @@ mod revoke_tests {
         device_sk: &ed25519_dalek::SigningKey,
     ) -> String {
         let n = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
-        let rec = crate::feed_authority::build_active_authority(&n, device_sk, device_cert, 1_000)
-            .expect("build active authority");
+        let rec =
+            crate::feed_authority::build_active_authority(&n, device_sk, device_cert, &[], 1_000)
+                .expect("build active authority");
         let feed_id = rec.feed_id.clone();
         let json = serde_json::to_string(&rec).unwrap();
         doc.devices.insert(
