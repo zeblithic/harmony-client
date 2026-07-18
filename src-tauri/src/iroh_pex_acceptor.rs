@@ -603,7 +603,9 @@ impl IrohFriendPexAcceptor {
                 // and still write the SAME benign ack a normal outcome writes — a
                 // shed is network-indistinguishable (no oracle) and never reaches
                 // `build_introduction_for_request` or the dial.
-                let now = wall_now_ms();
+                // ZEB-711: limiter timeline = the limiter's own monotonic
+                // clock, never wall time (a wall step distorts the window).
+                let now = self.intro_rate_limiter.monotonic_now_ms();
                 if let Err(reason) = self
                     .intro_rate_limiter
                     .admit_connection(*conn.remote_id().as_bytes(), now)
@@ -743,7 +745,9 @@ impl IrohFriendPexAcceptor {
                 // benign ack a normal outcome writes — a shed is
                 // network-indistinguishable (no oracle) and never reaches
                 // `verify_introduction` or the dial.
-                let now = wall_now_ms();
+                // ZEB-711: limiter timeline = the limiter's own monotonic
+                // clock, never wall time (a wall step distorts the window).
+                let now = self.intro_rate_limiter.monotonic_now_ms();
                 if let Err(reason) = self
                     .intro_rate_limiter
                     .admit_connection(*conn.remote_id().as_bytes(), now)

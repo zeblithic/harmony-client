@@ -648,6 +648,18 @@ pub enum LocalInsertError {
     /// Display text is the user-facing IPC message.
     #[error("a channel named '{display}' already exists in this community")]
     DuplicateChannelName { display: String },
+    /// ZEB-712: the engine's internal task has begun (or completed) shutdown —
+    /// its final flush is the last persist/publish this engine will ever run.
+    /// Accepting the event would sign it into engine memory that no task will
+    /// persist or publish while the IPC reports success — the silent-loss
+    /// window behind the lib.rs registry-detach fences (a lifecycle IPC that
+    /// passed its re-lock fence can still reach a snapshot Arc of an engine
+    /// `stop_inner` has since flushed). Checked under the same `state` lock
+    /// the shutdown arm sets the flag under, so an insert either lands before
+    /// the flag (and is included in the final flush — durable) or gets this
+    /// error; there is no silent third outcome.
+    #[error("community engine is shutting down (node stopped?)")]
+    EngineShuttingDown,
 }
 
 /// ZEB-583: an optional check run under the SAME `state` lock guard as the
@@ -933,6 +945,15 @@ pub struct CommunitySyncEngine {
     /// the `Notify` permit was left over from before the most-recent
     /// actual publish.
     has_pending_dirty: Arc<AtomicBool>,
+    /// ZEB-712 closing guard. Set under the `state` lock by the internal
+    /// task's shutdown arm BEFORE the final publish/persist (and
+    /// belt-and-suspenders by `shutdown()` itself for paths where the arm
+    /// never runs). The local-insert entry points check it under the same
+    /// lock before appending, so every insert racing a shutdown resolves
+    /// to exactly one of: landed before the flag → included in the final
+    /// flush (durable), or landed after → `EngineShuttingDown`. Mirrors
+    /// the ZEB-248 channel-log `closing` guard.
+    closing: Arc<AtomicBool>,
     flush_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     /// ZEB-462 B: publish-INDEPENDENT durable persist. Routes a `persist_now`
     /// request through the single-writer task (same discipline as `flush_now`)
@@ -1040,6 +1061,7 @@ impl CommunitySyncEngine {
     pub fn new(cfg: CommunitySyncEngineConfig) -> Self {
         let notify_dirty = Arc::new(Notify::new());
         let has_pending_dirty = Arc::new(AtomicBool::new(false));
+        let closing = Arc::new(AtomicBool::new(false));
         let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
         // ZEB-462 B: publish-independent persist channel (join-commit fence).
         let (persist_now_tx, persist_now_rx) = mpsc::channel(8);
@@ -1101,6 +1123,7 @@ impl CommunitySyncEngine {
             debounce: std::time::Duration::from_millis(cfg.debounce_ms),
             notify_dirty: Arc::clone(&notify_dirty),
             has_pending_dirty: Arc::clone(&has_pending_dirty),
+            closing: Arc::clone(&closing),
             flush_now_rx,
             persist_now_rx,
             shutdown_rx,
@@ -1116,6 +1139,7 @@ impl CommunitySyncEngine {
         Self {
             notify_dirty,
             has_pending_dirty,
+            closing,
             flush_now_tx,
             persist_now_tx,
             shutdown_tx,
@@ -1228,6 +1252,9 @@ impl CommunitySyncEngine {
         let is_invite_only = self.is_invite_only;
         let notify_dirty = Arc::clone(&self.notify_dirty);
         let has_pending_dirty = Arc::clone(&self.has_pending_dirty);
+        // ZEB-712 (CodeRabbit #492 R1): the spawned task mutates state
+        // directly, so it carries the closing fence too.
+        let closing = Arc::clone(&self.closing);
         // R3 (C4): plumb the delta channel so the auto-counter-sign task
         // can emit CommunityMembershipDelta on Inserted.
         let delta_tx = self.delta_tx.clone();
@@ -1244,6 +1271,7 @@ impl CommunitySyncEngine {
             is_invite_only,
             notify_dirty,
             has_pending_dirty,
+            closing,
             delta_tx,
         ));
     }
@@ -1416,6 +1444,12 @@ impl CommunitySyncEngine {
 
         let outcome = {
             let mut state_g = self.state.lock().await;
+            // ZEB-712: closing guard — checked under the same lock the
+            // shutdown arm sets the flag under. See the field docs on
+            // `CommunitySyncEngine::closing` for the race semantics.
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(LocalInsertError::EngineShuttingDown);
+            }
             // ZEB-583: run the optional precheck under the SAME lock guard,
             // immediately before the append, so the check + commit are atomic
             // (closes the create_channel TOCTOU where two concurrent local IPC
@@ -1425,7 +1459,21 @@ impl CommunitySyncEngine {
             if let Some(check) = &precheck {
                 check.run(&state_g, self.admin_addr)?;
             }
-            state_g.insert_event(event.clone(), &ctx)
+            let outcome = state_g.insert_event(event.clone(), &ctx);
+            // ZEB-712 (CodeRabbit #492 R1): latch the dirty flag under the
+            // SAME lock as the mutation. The `notify_dirty()` in the
+            // post-insert hooks runs after this lock is released — a
+            // shutdown winning that gap would read `has_pending_dirty ==
+            // false`, skip the final publish, and leave the (persisted)
+            // event unreplicated until a peer pulls it. The in-lock latch
+            // makes "state mutated" and "publish owed" atomic.
+            if matches!(
+                outcome,
+                crate::community_state_crdt::InsertOutcome::Inserted
+            ) {
+                self.has_pending_dirty.store(true, Ordering::Relaxed);
+            }
+            outcome
         };
 
         // C1 restart-recovery: when a PendingJoin returns AlreadyKnown
@@ -1589,6 +1637,12 @@ impl CommunitySyncEngine {
         let (first_outcome, second_outcome) = {
             let mut state_g = self.state.lock().await;
 
+            // ZEB-712: closing guard — same placement as the single-insert
+            // path: under the state lock, before any validation or mutation.
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(LocalInsertError::EngineShuttingDown);
+            }
+
             // Pre-validate first: compute prior state from current log.
             let first_log: Vec<crate::community_membership::SignedMembershipEvent> =
                 state_g.events.values().cloned().collect();
@@ -1631,6 +1685,11 @@ impl CommunitySyncEngine {
             } else {
                 InsertOutcome::AlreadyKnown // sentinel: pair rejected at first (should not happen after pre-validation)
             };
+            // ZEB-712 (CodeRabbit #492 R1): latch dirty under the mutation
+            // lock — same rationale as the single-insert path.
+            if matches!(o1, InsertOutcome::Inserted) || matches!(o2, InsertOutcome::Inserted) {
+                self.has_pending_dirty.store(true, Ordering::Relaxed);
+            }
             (o1, o2)
         };
 
@@ -1721,11 +1780,26 @@ impl CommunitySyncEngine {
     /// releases; the `resp_rx.await` already gives the flush-complete
     /// guarantee.
     pub async fn shutdown(&self) -> Result<(), CommunitySyncError> {
+        // ZEB-712 (CodeRabbit #492 R1): set `closing` BEFORE attempting the
+        // shutdown send. If the internal task already exited (double
+        // shutdown, task death), the send fails — and a store placed after
+        // it would leave a gap where a concurrent insert observes
+        // `closing == false` and appends to state no task will ever
+        // persist. Setting first, under the state lock, fail-closes every
+        // insert from this point on. Inserts that already hold (or win)
+        // the lock land before the flag and are covered by the arm's
+        // final flush; the arm's own store before that flush remains as
+        // defense-in-depth for the ordering guarantee.
+        {
+            let _state_g = self.state.lock().await;
+            self.closing.store(true, Ordering::SeqCst);
+        }
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let result = if self.shutdown_tx.send(resp_tx).await.is_ok() {
-            resp_rx
-                .await
-                .map_err(|_| CommunitySyncError::TransportClosed)?
+            match resp_rx.await {
+                Ok(inner) => inner,
+                Err(_) => Err(CommunitySyncError::TransportClosed),
+            }
         } else {
             Ok(())
         };
@@ -1755,6 +1829,9 @@ struct InternalCtx {
     debounce: std::time::Duration,
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
+    /// ZEB-712: see `CommunitySyncEngine::closing`. The shutdown arm sets
+    /// it under the `state` lock before the final flush.
+    closing: Arc<AtomicBool>,
     flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     /// ZEB-462 B: publish-independent persist request channel (join-commit fence).
     persist_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
@@ -1809,6 +1886,13 @@ async fn spawn_auto_counter_sign_task(
     is_invite_only: bool,
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
+    // ZEB-712 (CodeRabbit #492 R1): this task deliberately bypasses
+    // `insert_local_event` (no engine back-reference → no Arc cycle), so
+    // it must carry the closing fence itself — otherwise it can acquire
+    // the state lock after the shutdown arm's final flush and append a
+    // JoinCountersign nothing will ever persist or publish. Skipping is
+    // safe: eligibility idempotently re-derives on next boot (C1).
+    closing: Arc<AtomicBool>,
     // ZEB-254 R3 (C4): plumb the membership-delta channel so the locally-
     // emitted JoinCountersign drives the same `community-members-changed`
     // Tauri event that any other Inserted membership event would. Without
@@ -1905,6 +1989,18 @@ async fn spawn_auto_counter_sign_task(
     let outcome = {
         let mut state_g = state.lock().await;
 
+        // ZEB-712 (CodeRabbit #492 R1): same closing fence as the
+        // `insert_local_event` funnel, under the same lock. See the
+        // `closing` parameter docs.
+        if closing.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::debug!(
+                community_id = ?community_id,
+                target = ?pending_id,
+                "ZEB-254 auto-counter-sign: engine shutting down; skipping (re-derived on next boot)"
+            );
+            return;
+        }
+
         // Re-check idempotency inside the lock so a race between two
         // concurrent triggers (e.g. two PendingJoin deliveries) doesn't
         // produce a duplicate JoinCountersign.
@@ -1920,7 +2016,13 @@ async fn spawn_auto_counter_sign_task(
             return; // already inserted by a concurrent spawn
         }
 
-        state_g.insert_event(signed_cs, &ctx_v)
+        let outcome = state_g.insert_event(signed_cs, &ctx_v);
+        // ZEB-712 (CodeRabbit #492 R1): latch dirty under the mutation
+        // lock — same rationale as the insert_local_event paths.
+        if matches!(outcome, InsertOutcome::Inserted) {
+            has_pending_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        outcome
     };
 
     match outcome {
@@ -1942,7 +2044,8 @@ async fn spawn_auto_counter_sign_task(
                     event: signed_cs_for_delta,
                 });
             }
-            has_pending_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Dirty flag already latched under the insertion lock above
+            // (ZEB-712 R1); only the task wake-up remains post-lock.
             notify_dirty.notify_one();
         }
         InsertOutcome::AlreadyKnown => {
@@ -1990,6 +2093,8 @@ fn maybe_spawn_auto_counter_sign_for_ctx(
     let is_invite_only = ctx.is_invite_only;
     let notify_dirty = Arc::clone(&ctx.notify_dirty);
     let has_pending_dirty = Arc::clone(&ctx.has_pending_dirty);
+    // ZEB-712 (CodeRabbit #492 R1): receive-path spawns carry the fence too.
+    let closing = Arc::clone(&ctx.closing);
     // R3 (C4): receive-path delta channel for the auto-counter-sign emission.
     let delta_tx = ctx.delta_tx.clone();
 
@@ -2005,6 +2110,7 @@ fn maybe_spawn_auto_counter_sign_for_ctx(
         is_invite_only,
         notify_dirty,
         has_pending_dirty,
+        closing,
         delta_tx,
     ));
 }
@@ -2522,10 +2628,25 @@ async fn internal_task(mut ctx: InternalCtx) {
                 }
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
+                // ZEB-712: mark closing under the `state` lock BEFORE the
+                // final flush. Inserts append under this same lock and
+                // check the flag first, so every insert racing this
+                // shutdown either landed already (its event is in `state`
+                // and the flush below persists it) or will observe the
+                // flag and return `EngineShuttingDown`. Without this, an
+                // insert arriving after the flush is signed into memory
+                // no task will ever persist or publish — while the IPC
+                // reports success.
+                {
+                    let _state_g = ctx.state.lock().await;
+                    ctx.closing.store(true, Ordering::SeqCst);
+                }
                 // Final-flush only if the in-memory pending-dirty flag
                 // says we owe peers a publish. Lock-relaxed is fine
                 // because there's no concurrent mutator past this
-                // point — we're in the shutdown branch.
+                // point — we're in the shutdown branch. (Mutating IPC
+                // entry points are fenced by `closing` above; the
+                // flag-set is why "no concurrent mutator" now holds.)
                 let was_dirty = ctx.has_pending_dirty.load(Ordering::Relaxed);
                 let pub_result = if was_dirty {
                     publish_root_now(&ctx).await
@@ -7295,6 +7416,314 @@ mod tests {
             .get(&ch_id)
             .expect("channel still present after idempotent re-fetch");
         assert_eq!(info.name, "created-while-offline");
+    }
+
+    // ── ZEB-712: engine closing guard ────────────────────────────────────
+    //
+    // The registry-detach fences in lib.rs shrink but cannot close the
+    // TOCTOU: a lifecycle IPC that passed its re-lock fence can still call
+    // `insert_local_event` on a snapshot Arc AFTER `stop_inner` →
+    // `shutdown_all()` ran the engine's final flush — the event is signed
+    // and accepted into engine memory that no task will ever persist or
+    // publish, while the IPC reports success. These tests pin the closure:
+    // an insert either lands BEFORE the closing flag (and is included in
+    // the shutdown arm's final flush — durable) or errors. The silent
+    // third outcome is what ZEB-712 removes.
+
+    /// Minimal single-engine fixture for the closing-guard tests: direct
+    /// `CommunitySyncEngine::new` (same shape as the query-serve fixture
+    /// above), publisher_rx drained so debounced publishes never latch
+    /// transport_closed, NopResolver (signer resolution uses the carried
+    /// EnrollmentCert / materialized membership). Returns the subscriber
+    /// sender alongside the engine — callers bind it (`_sub_tx`) so the
+    /// channel stays open for the test's duration; dropping it would make
+    /// the engine latch "subscriber channel closed; sync inbound disabled"
+    /// error noise (Qodo, PR #492 — same class as the PR #307 precedent).
+    fn closing_guard_engine(
+        dir: &tempfile::TempDir,
+        community_id: SpaceId,
+        alice: &crate::community_membership::TestOwner,
+    ) -> (CommunitySyncEngine, mpsc::Sender<Vec<u8>>) {
+        let (pub_tx, mut pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while pub_rx.recv().await.is_some() {} });
+        let cas_op_tx = spawn_shared_cas();
+        let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+        let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key: EpochKey::new([0x55; 32]),
+            admin_addr: alice.owner,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice.owner,
+            signing_key: Arc::new(alice.device_key.clone()),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            content_store: cs,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            paths: PersistPaths {
+                crdt: dir.path().join("crdt.cbor"),
+                replay: dir.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::new(NopResolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+        (engine, sub_tx)
+    }
+
+    /// Alice's EnrollmentCert-bearing bootstrap Join (the same construction
+    /// every fixture in this module uses for the admin bootstrap).
+    fn closing_guard_bootstrap_join(
+        community_id: SpaceId,
+        alice: &crate::community_membership::TestOwner,
+        event_id: [u8; 16],
+        logical: u32,
+    ) -> crate::community_membership::SignedMembershipEvent {
+        use crate::community_membership::{
+            sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        };
+        let payload = EventPayload {
+            id: event_id,
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice.owner,
+            at: Hlc {
+                wall_ms: 100_000,
+                logical,
+                device_id: "alice-dev".into(),
+            },
+        };
+        SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&payload, &alice.device_key).expect("sign join")
+        }
+    }
+
+    /// Alice's steady-state ChannelCreate (verifies via her materialized
+    /// enrolled key from the bootstrap Join — no cert carried).
+    fn closing_guard_channel_create(
+        community_id: SpaceId,
+        alice: &crate::community_membership::TestOwner,
+        event_id: [u8; 16],
+        channel_byte: u8,
+        logical: u32,
+    ) -> crate::community_membership::SignedMembershipEvent {
+        use crate::community_membership::{
+            sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+        };
+        let payload = EventPayload {
+            id: event_id,
+            community_id,
+            kind: MembershipEventKind::ChannelCreate {
+                channel_id: ChannelId([channel_byte; 16]),
+                name: format!("chan-{channel_byte:02x}"),
+                write_power: 0,
+                kind: ChannelKind::Text,
+            },
+            actor: alice.owner,
+            at: Hlc {
+                wall_ms: 100_000,
+                logical,
+                device_id: "alice-dev".into(),
+            },
+        };
+        sign_event(&payload, &alice.device_key).expect("sign channel create")
+    }
+
+    /// R1: an insert AFTER `shutdown()` must surface an error — pre-fix it
+    /// returns `Ok(Inserted)` into engine memory nothing will ever persist
+    /// or publish (the exact ZEB-712 silent-loss bug).
+    #[tokio::test]
+    async fn insert_after_shutdown_errs_engine_shutting_down() {
+        use crate::community_membership::mint_test_owner;
+        use crate::community_state_crdt::InsertOutcome;
+
+        let alice = mint_test_owner(0xAA);
+        let community_id = SpaceId([0x71; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+
+        // Prove the fixture: the same construction inserts fine pre-shutdown.
+        let join = closing_guard_bootstrap_join(community_id, &alice, [0x10; 16], 0);
+        let outcome = engine
+            .insert_local_event(join)
+            .await
+            .expect("pre-shutdown bootstrap insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        engine.shutdown().await.expect("shutdown");
+
+        // Post-shutdown: the SAME kind of construction that succeeded above
+        // must now be refused, not silently accepted.
+        let create = closing_guard_channel_create(community_id, &alice, [0x11; 16], 0x42, 1);
+        let err = engine
+            .insert_local_event(create)
+            .await
+            .expect_err("insert after shutdown must error — Ok here means the event was signed into memory that will never persist or publish");
+        assert!(
+            err.to_string().contains("shutting down"),
+            "expected the engine-shutting-down error, got: {err}"
+        );
+    }
+
+    /// R1 companion: `insert_local_event_pair` (the second local-insert
+    /// entry point, its own C5-atomic lock block) gets the same guard.
+    #[tokio::test]
+    async fn insert_pair_after_shutdown_errs_engine_shutting_down() {
+        use crate::community_membership::mint_test_owner;
+        use crate::community_state_crdt::InsertOutcome;
+
+        let alice = mint_test_owner(0xAB);
+        let community_id = SpaceId([0x72; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+
+        let join = closing_guard_bootstrap_join(community_id, &alice, [0x10; 16], 0);
+        let outcome = engine
+            .insert_local_event(join)
+            .await
+            .expect("pre-shutdown bootstrap insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        engine.shutdown().await.expect("shutdown");
+
+        let first = closing_guard_channel_create(community_id, &alice, [0x11; 16], 0x42, 1);
+        let second = closing_guard_channel_create(community_id, &alice, [0x12; 16], 0x43, 2);
+        let err = engine
+            .insert_local_event_pair(first, second)
+            .await
+            .expect_err("pair insert after shutdown must error");
+        assert!(
+            err.to_string().contains("shutting down"),
+            "expected the engine-shutting-down error, got: {err}"
+        );
+    }
+
+    /// R2 (pin): an insert that lands BEFORE shutdown is included in the
+    /// shutdown arm's final flush — the durable half of the closing-guard
+    /// semantics. Guards against a future "fix" that rejects instead of
+    /// flushing the already-accepted side of the race.
+    #[tokio::test]
+    async fn insert_before_shutdown_included_in_final_flush() {
+        use crate::community_membership::mint_test_owner;
+        use crate::community_state_crdt::InsertOutcome;
+
+        let alice = mint_test_owner(0xAC);
+        let community_id = SpaceId([0x73; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("crdt.cbor");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+
+        let join = closing_guard_bootstrap_join(community_id, &alice, [0x10; 16], 0);
+        let join_id = join.id;
+        let outcome = engine
+            .insert_local_event(join)
+            .await
+            .expect("pre-shutdown bootstrap insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        engine.shutdown().await.expect("shutdown");
+
+        let loaded = load_crdt(&crdt_path, community_id).expect("load persisted crdt");
+        assert!(
+            loaded.events.contains_key(&join_id),
+            "pre-shutdown insert must reach disk via the shutdown arm's final flush"
+        );
+    }
+
+    /// CR-1 (#492): the auto-counter-sign task bypasses `insert_local_event`
+    /// (deliberate direct state mutation to avoid an engine back-reference),
+    /// so it needs the SAME closing fence — without it, a task spawned or
+    /// scheduled around shutdown can acquire the state lock after the final
+    /// flush and append a JoinCountersign nothing will ever persist or
+    /// publish. Dropping it is safe: countersign eligibility idempotently
+    /// re-derives on next boot (C1 restart-recovery).
+    ///
+    /// The fixture stages alice's bootstrap Join + bob's PendingJoin by
+    /// direct log insertion (NOT `insert_local_event`) so no competing
+    /// auto-counter-sign spawn fires before the shutdown — the only
+    /// countersign attempt is the explicit post-shutdown one under test.
+    #[tokio::test]
+    async fn auto_counter_sign_after_shutdown_inserts_nothing() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        };
+
+        let alice = mint_test_owner(0xAD);
+        let bob = mint_test_owner(0xBE);
+        let community_id = SpaceId([0x74; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+
+        let alice_join = closing_guard_bootstrap_join(community_id, &alice, [0x10; 16], 0);
+        let bob_pending_payload = EventPayload {
+            id: [0x20; 16],
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: crate::community_invite::InviteToken {
+                    inviter: alice.owner,
+                    invitee_hint: None,
+                    minted_at: Hlc {
+                        wall_ms: 99_000,
+                        logical: 0,
+                        device_id: "alice-dev".into(),
+                    },
+                    expires_at: None,
+                    sig: [0u8; 64],
+                },
+            },
+            actor: bob.owner,
+            at: Hlc {
+                wall_ms: 100_500,
+                logical: 0,
+                device_id: "bob-dev".into(),
+            },
+        };
+        let bob_pending = SignedMembershipEvent {
+            enrollment: Some(bob.cert.clone()),
+            ..sign_event(&bob_pending_payload, &bob.device_key).expect("sign pending join")
+        };
+        let pending_id = bob_pending.id;
+        let state = engine.state();
+        {
+            let mut g = state.lock().await;
+            g.events.insert(alice_join.id, alice_join);
+            g.events.insert(bob_pending.id, bob_pending.clone());
+        }
+
+        engine.shutdown().await.expect("shutdown");
+
+        engine.maybe_spawn_auto_counter_sign(&bob_pending);
+        // Let the spawned task run to completion (its awaits are all
+        // uncontended lock acquisitions; a bounded yield budget is ample).
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        let g = state.lock().await;
+        let countersigned = g.events.values().any(|e| {
+            matches!(
+                &e.kind,
+                MembershipEventKind::JoinCountersign { target_event_id }
+                if *target_event_id == pending_id
+            )
+        });
+        assert!(
+            !countersigned,
+            "auto-counter-sign must not insert after shutdown — a JoinCountersign \
+             here was signed into engine memory nothing will ever persist or publish"
+        );
     }
 }
 

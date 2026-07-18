@@ -2066,7 +2066,11 @@ where
         // recorded, no token consumed, no friend written. An honest peer that
         // somehow trips the cap self-heals by re-dialing after the window (a
         // live token stays live and redeemable).
-        let limiter_now_ms = wall_now_ms();
+        // ZEB-711: the limiter timeline is the limiter's own monotonic
+        // clock, never wall time — a wall step would distort the window
+        // (forward jump: flood gets a fresh budget; backward jump: honest
+        // shed peer stays shed).
+        let limiter_now_ms = self.rate_limiter.monotonic_now_ms();
         if let Err(reason) = self
             .rate_limiter
             .admit_connection(*conn.remote_id().as_bytes(), limiter_now_ms)
