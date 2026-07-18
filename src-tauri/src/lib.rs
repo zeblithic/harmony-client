@@ -51678,13 +51678,17 @@ pub(crate) async fn fence_community_crdt_persist(
 mod zeb427_fence_tests {
     use super::*;
 
-    /// Qodo (PR #226 R1): the fence must return within its bound even when
-    /// the engine's internal task is wedged. The fence is now persist-only
-    /// (ZEB-509), so a saturated publisher no longer stalls it directly; to
-    /// wedge the task we make its debounce-wakeup arm block on a full
-    /// publisher channel. With the single-writer task stuck inside
-    /// `publish_root_now`, it can never service the `persist_now` oneshot,
-    /// so only the fence's `timeout` can return control.
+    /// Qodo (PR #226 R1), upgraded by ZEB-710: the fence must stay useful
+    /// even when the engine's internal task is wedged. The fence is
+    /// persist-only (ZEB-509), and since ZEB-710 `persist_now` runs
+    /// DIRECTLY on the caller's stack instead of routing through the
+    /// task's `select!` loop — so a task stuck inside `publish_root_now`
+    /// no longer starves it. This test wedges the task deterministically
+    /// (a flush blocked on a full publisher channel) and pins the upgraded
+    /// contract: the fence returns promptly AND the mutation made while
+    /// the task was wedged is durably on disk. (Pre-ZEB-710 this test
+    /// pinned the old degraded mode — the fence could ONLY return via its
+    /// timeout, persisting nothing.)
     #[tokio::test]
     async fn fence_owner_state_flush_returns_on_stalled_engine() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -51699,17 +51703,18 @@ mod zeb427_fence_tests {
         // drained — the first publish fills it, the second blocks forever.
         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
         let engine = crate::owner_state_sync::SyncEngine::new(
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "fence-test-dev".into(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::owner_state_crdt::OwnerState::default(),
-            )),
+            std::sync::Arc::clone(&state),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
             std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
             pub_tx,
             sub_rx,
-            paths,
+            paths.clone(),
             // Large debounce: only the explicit flush_now calls drive
             // publishes; the wedge below is established deterministically, not
             // via the debounce-wakeup arm.
@@ -51740,6 +51745,13 @@ mod zeb427_fence_tests {
              engine task; it returned ({wedge:?}) — the stall rig is broken"
         );
 
+        // Mutate owner-state WHILE the task is provably wedged. ZEB-710: the
+        // fence's direct persist must still make this durable — the exact
+        // scenario the old channel-routed persist_now could not serve.
+        let tombstoned = crate::owner_state_types::SpaceId([0x77; 16]);
+        state.lock().await.tombstones.insert(tombstoned);
+        engine.notify_dirty();
+
         let started = std::time::Instant::now();
         fence_owner_state_flush(
             &engine,
@@ -51753,14 +51765,16 @@ mod zeb427_fence_tests {
             "bounded fence must return promptly on a stalled engine; took {:?}",
             started.elapsed()
         );
-        // The task is provably wedged inside publish (proven above), so the
-        // persist_now oneshot reply never arrives — only the timeout branch can
-        // return, and elapsed must reflect the bound actually firing.
+        // The discriminating assertion: the mutation made while the task was
+        // wedged reached disk. Pre-ZEB-710 the fence could only return via
+        // its timeout here, persisting nothing — this load would miss the
+        // tombstone.
+        let persisted = crate::owner_state_persist::load_crdt(&paths.crdt)
+            .expect("crdt file must load after the fence");
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(100),
-            "fence returned before its bound on a stalled engine ({:?}) — \
-             the stall rig is broken and this test is vacuous",
-            started.elapsed()
+            persisted.tombstones.contains(&tombstoned),
+            "the fence on a wedged engine must persist the mutation directly \
+             (ZEB-710 direct-persist seam)"
         );
         drop(pub_rx);
     }
