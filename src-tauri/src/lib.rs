@@ -886,6 +886,16 @@ pub struct NodeState {
     /// transport epoch, so a persisted gate would leave a new session with no
     /// re-offer trigger until a peer churns (PR #488 review, Qodo).
     vine_authority_gates: std::sync::Arc<std::sync::Mutex<VineAuthorityGates>>,
+    /// ZEB-679 R1 (CodeRabbit): last-known-good validated `#2` material for
+    /// the SYNC storage publish paths. Refreshed on every uncontended
+    /// snapshot (sync sites + the hosting task's per-tick refresh); read as
+    /// the fallback when the outbox/trust-doc `try_lock` is contended, so
+    /// transient contention never downgrades a migrated publisher to a
+    /// legacy record that pinned receivers would reject. RESET on
+    /// stop_inner / stale-cleanup — a restart may load a different owner,
+    /// and stale material must never cross that boundary.
+    storage_v2_cache:
+        std::sync::Arc<std::sync::Mutex<Option<storage_signing::StorageSignerMaterial>>>,
     /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
     /// start_node alongside the SyncEngine; shared with the IPC handler
     /// (send_dm) and the event-loop drain tick.
@@ -1822,6 +1832,7 @@ impl Default for NodeState {
             vine_authority_gates: std::sync::Arc::new(std::sync::Mutex::new(
                 VineAuthorityGates::default(),
             )),
+            storage_v2_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
             dm_outbox: None,
             dm_transport: None,
             butler_deposit_client: None,
@@ -2405,6 +2416,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // with no re-offer trigger until a peer churns.
         if let Ok(mut g) = guard.vine_authority_gates.lock() {
             *g = VineAuthorityGates::default();
+        }
+        // ZEB-679 R1: drop the cached storage `#2` material — a restart may
+        // load a different owner; stale material must never cross that
+        // boundary (the cache re-warms from the fresh outbox).
+        if let Ok(mut c) = guard.storage_v2_cache.lock() {
+            *c = None;
         }
         // ZEB-352: drop the voice-signal relay sender. The event_loop's
         // matching receiver gets None on next recv(); the relay arm goes
@@ -3616,6 +3633,10 @@ pub async fn start_node_inner(
         // the fresh run — see the matching stop_inner reset.
         if let Ok(mut g) = guard.vine_authority_gates.lock() {
             *g = VineAuthorityGates::default();
+        }
+        // ZEB-679 R1: matching storage-material cache reset — see stop_inner.
+        if let Ok(mut c) = guard.storage_v2_cache.lock() {
+            *c = None;
         }
         // ZEB-352: clear the previous voice-signal relay sender so it
         // doesn't outlive the previous event loop. A fresh channel pair is
@@ -10641,6 +10662,9 @@ pub async fn start_node_inner(
         let node_addr_for_state = node_addr.clone();
         // ZEB-669 S2: the engine tick's planner `me`.
         let own_owner_addr_for_loop = node_addr.clone();
+        // ZEB-679: storage-record v2 admission consults the same revoked-
+        // device projection the DM/friend/PEX cutoffs use.
+        let revoked_projection_for_loop = revoked_device_projection.clone();
         // ZEB-331: second clone for the StartNodeResponse returned to the
         // frontend — node_addr moves into NodeConfig and node_addr_for_state
         // moves into guard.node_addr, so we carry this out via the tuple.
@@ -11174,6 +11198,7 @@ pub async fn start_node_inner(
                                 storage_ledger_for_loop,
                                 storage_settings_for_loop,
                                 own_owner_addr_for_loop,
+                                revoked_projection_for_loop,
                             )
                             .await;
                         });
@@ -12284,6 +12309,9 @@ pub async fn start_node_inner(
                             path,
                             tx,
                             floor,
+                            guard.dm_outbox.clone(),
+                            guard.owner_trust_doc.clone(),
+                            guard.storage_v2_cache.clone(),
                         );
                     }
                     // ZEB-671: seed the Discover graph inputs (consumes
@@ -16680,6 +16708,86 @@ fn storage_signer<'a>(
     Ok(identity)
 }
 
+/// ZEB-679: publisher-side self-check + assembly of the `#2` material
+/// for storage-record dual-signing. `None` ⇒ legacy-only publish (which
+/// every receiver accepts). The self-check is the #488 lesson: never
+/// attach v2 material receivers would drop — an expired own cert or a
+/// short quorum bundle publishes honestly-legacy instead.
+fn validated_storage_material(
+    sk: std::sync::Arc<ed25519_dalek::SigningKey>,
+    cert: harmony_owner::certs::EnrollmentCert,
+    signer_certs: Vec<harmony_owner::certs::EnrollmentCert>,
+) -> Option<storage_signing::StorageSignerMaterial> {
+    // R1 (CodeRabbit + Qodo converged): cert validity alone does not prove
+    // the SIGNING key is the enrolled key — a mismatched (sk, cert) pair
+    // would sign v2 records every receiver rejects, with no legacy
+    // fallback (v2-present-but-invalid is reject by design).
+    if sk.verifying_key().to_bytes() != cert.device_pubkeys.classical.ed25519_verify {
+        tracing::warn!(
+            "storage v2 signing key does not match the enrollment; publishing legacy-only"
+        );
+        return None;
+    }
+    let now_secs = wall_clock_ms() / 1000;
+    if let Err(e) =
+        enrollment_verify::verify_enrollment_any_issuer(&cert, &signer_certs, None, now_secs)
+    {
+        tracing::warn!("storage v2 material does not self-verify, publishing legacy-only: {e}");
+        return None;
+    }
+    Some(storage_signing::StorageSignerMaterial {
+        sk,
+        cert,
+        signer_certs,
+    })
+}
+
+/// ZEB-679: `#2` material for the SYNC storage publish paths (pledge /
+/// backup-set, which hold the NodeState lock and cannot `.await`).
+/// Follow-list `try_lock` posture with an R1 (CodeRabbit) upgrade: a
+/// contended outbox or trust doc falls back to the LAST-KNOWN-GOOD
+/// cached material instead of `#3`-only — a pinned receiver rejects
+/// legacy records (anti-downgrade ratchet), so a transient contention
+/// must not produce a publish that migrated receivers drop. The cache is
+/// warmed by every uncontended snapshot here and by the hosting task's
+/// per-tick refresh; a genuine validation failure does NOT fall back
+/// (fresh material is authoritative — a truly expired cert should
+/// publish honestly-legacy, not a stale-cached v2).
+fn storage_v2_material(guard: &NodeState) -> Option<storage_signing::StorageSignerMaterial> {
+    let outbox = guard.dm_outbox.as_ref()?;
+    let cached = || guard.storage_v2_cache.lock().ok().and_then(|c| c.clone());
+    let Ok(og) = outbox.try_lock() else {
+        return cached();
+    };
+    let sk = std::sync::Arc::clone(&og.community_signing_key);
+    let cert = og.enrollment_cert.clone();
+    drop(og);
+    let signer_certs = match &cert.issuer {
+        harmony_owner::certs::EnrollmentIssuer::Master { .. } => Vec::new(),
+        harmony_owner::certs::EnrollmentIssuer::Quorum { .. } => {
+            match guard.owner_trust_doc.as_ref() {
+                // No trust doc at all: the self-check below refuses the
+                // short bundle — honest legacy, not a cache case.
+                None => Vec::new(),
+                Some(doc) => match doc.try_lock() {
+                    Ok(dg) => enrollment_verify::own_cert_bundle(&dg, &cert),
+                    Err(_) => return cached(),
+                },
+            }
+        }
+    };
+    let material = validated_storage_material(sk, cert, signer_certs);
+    // R2 (Greptile P1): a COMPLETED fresh validation updates the cache in
+    // BOTH directions — success refreshes it, failure CLEARS it. Leaving
+    // stale material behind a failed validation would let a later
+    // contended publish emit present-but-invalid v2 records receivers
+    // reject, instead of the intended honest legacy.
+    if let Ok(mut c) = guard.storage_v2_cache.lock() {
+        *c = material.clone();
+    }
+    material
+}
+
 /// Persist `settings` (floor updates included) — floor-then-publish
 /// ordering, matching the follow-list clock (a crash between the two
 /// re-publishes with a HIGHER timestamp, never a replayed one).
@@ -16717,8 +16825,20 @@ fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), Stri
         updated_at,
         identity_pub: None,
         sig: None,
+        v2: Default::default(),
     };
-    storage_signing::sign_pledge_list(identity, &mut payload);
+    // ZEB-679: dual-sign when the enrolled `#2` material is available and
+    // self-verifies; legacy-only otherwise (every receiver accepts it).
+    match storage_v2_material(guard) {
+        Some(material) => {
+            if let Err(e) = storage_signing::sign_pledge_list_v2(identity, &material, &mut payload)
+            {
+                tracing::warn!("pledge list v2 sign failed, publishing legacy-only: {e}");
+                payload.v2 = Default::default();
+            }
+        }
+        None => storage_signing::sign_pledge_list(identity, &mut payload),
+    }
     let topic = format!("{}{}/pledges", STORAGE_RECORD_PREFIX, payload.owner_address);
     let bytes =
         serde_json::to_vec(&payload).map_err(|e| format!("pledge list serialize failed: {e}"))?;
@@ -16770,6 +16890,9 @@ fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), Strin
     // oldest flagged entries always survive). Each shrink re-signs — the
     // signature covers the final entry list.
     let mut entries = entries;
+    // ZEB-679: fetch the `#2` material ONCE (not per shrink round — the
+    // material is round-invariant; only the entry list changes).
+    let v2_material = storage_v2_material(guard);
     let (topic, bytes) = loop {
         let mut payload = storage_signing::BackupSetPayload {
             owner_address: guard.node_addr.clone(),
@@ -16777,8 +16900,19 @@ fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), Strin
             updated_at,
             identity_pub: None,
             sig: None,
+            v2: Default::default(),
         };
-        storage_signing::sign_backup_set(identity, &mut payload);
+        match v2_material.as_ref() {
+            Some(material) => {
+                if let Err(e) =
+                    storage_signing::sign_backup_set_v2(identity, material, &mut payload)
+                {
+                    tracing::warn!("backup set v2 sign failed, publishing legacy-only: {e}");
+                    payload.v2 = Default::default();
+                }
+            }
+            None => storage_signing::sign_backup_set(identity, &mut payload),
+        }
         let bytes = serde_json::to_vec(&payload)
             .map_err(|e| format!("backup set serialize failed: {e}"))?;
         if bytes.len() <= storage_records::MAX_BACKUP_SET_WIRE_BYTES {
@@ -16842,6 +16976,9 @@ fn build_signed_hosting_report_with(
     settings: &std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
     settings_path: &std::path::Path,
     clock: &std::sync::atomic::AtomicU64,
+    // ZEB-679: pre-validated `#2` material (the async publisher task
+    // snapshots + self-checks it per tick); `None` ⇒ legacy-only.
+    v2_material: Option<&storage_signing::StorageSignerMaterial>,
 ) -> Result<(String, Vec<u8>), String> {
     let signer = vine_signing::signer_address(identity);
     if node_addr != signer {
@@ -16863,8 +17000,19 @@ fn build_signed_hosting_report_with(
         updated_at,
         identity_pub: None,
         sig: None,
+        v2: Default::default(),
     };
-    storage_signing::sign_hosting_report(identity, &mut payload);
+    match v2_material {
+        Some(material) => {
+            if let Err(e) =
+                storage_signing::sign_hosting_report_v2(identity, material, &mut payload)
+            {
+                tracing::warn!("hosting report v2 sign failed, publishing legacy-only: {e}");
+                payload.v2 = Default::default();
+            }
+        }
+        None => storage_signing::sign_hosting_report(identity, &mut payload),
+    }
     let topic = format!("{}{}/hosting", STORAGE_RECORD_PREFIX, payload.owner_address);
     let bytes = serde_json::to_vec(&payload)
         .map_err(|e| format!("hosting report serialize failed: {e}"))?;
@@ -16921,6 +17069,9 @@ pub(crate) fn publish_backup_set_update(guard: &NodeState) {
 /// `HOSTING_REFRESH_INTERVAL_MS` elapsed (receivers prune at 3× the
 /// refresh interval). Exits when the event loop drops `publish_rx`
 /// (node stopped) — no generation plumbing needed.
+// Owned-handle posture (headless-serve, no `app.state()`): each dependency
+// arrives as its own argument by design.
+#[allow(clippy::too_many_arguments)]
 fn spawn_hosting_report_publisher(
     identity: std::sync::Arc<harmony_identity::PrivateIdentity>,
     node_addr: String,
@@ -16929,6 +17080,15 @@ fn spawn_hosting_report_publisher(
     settings_path: std::path::PathBuf,
     publish_tx: tokio::sync::mpsc::Sender<event_loop::PublishRequest>,
     hosting_floor: u64,
+    // ZEB-679: `#2` material sources, owned outright like every other
+    // handle here (headless-serve posture — no `app.state()`), snapshotted
+    // per tick so a cert renewal is picked up without a restart.
+    dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
+    owner_trust_doc: Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+    // ZEB-679 R1: shared last-known-good material cell (NodeState.
+    // storage_v2_cache). This task's per-tick refresh warms it with async
+    // locks so the SYNC pledge/backup paths have a contention fallback.
+    v2_cache: std::sync::Arc<Mutex<Option<storage_signing::StorageSignerMaterial>>>,
 ) {
     tokio::spawn(async move {
         let clock = std::sync::atomic::AtomicU64::new(hosting_floor);
@@ -16943,6 +17103,33 @@ fn spawn_hosting_report_publisher(
                 tracing::debug!("hosting-report publisher exiting (node stopped)");
                 return;
             }
+            // ZEB-679: snapshot + self-check the `#2` material EVERY tick
+            // (async locks are fine here, unlike the sync sites) and warm
+            // the shared cache — this is what gives the sync pledge/backup
+            // paths a last-known-good fallback under lock contention (R1),
+            // and it picks up a cert renewal without a restart.
+            let v2_material = match dm_outbox.as_ref() {
+                Some(outbox) => {
+                    let (sk, cert) = {
+                        let og = outbox.lock().await;
+                        (
+                            std::sync::Arc::clone(&og.community_signing_key),
+                            og.enrollment_cert.clone(),
+                        )
+                    };
+                    let bundle = signer_bundle_from_doc(&owner_trust_doc, &cert).await;
+                    let material = validated_storage_material(sk, cert, bundle);
+                    // R2 (Greptile P1): fresh validation updates the shared
+                    // cache in BOTH directions — see storage_v2_material.
+                    let mut c = v2_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *c = material.clone();
+                    drop(c);
+                    material
+                }
+                None => None,
+            };
             let lines = hosting_report_lines(&ledger);
             let changed = published.as_deref() != Some(&lines[..]);
             let refresh_due = last_publish.elapsed().as_millis() as u64
@@ -16958,6 +17145,7 @@ fn spawn_hosting_report_publisher(
                 &settings,
                 &settings_path,
                 &clock,
+                v2_material.as_ref(),
             ) {
                 Ok((topic, bytes)) => {
                     let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
@@ -17401,15 +17589,17 @@ mod storage_buddy_ipc_tests {
             updated_at,
             identity_pub: None,
             sig: None,
+            v2: Default::default(),
         };
         storage_signing::sign_pledge_list(&id, &mut pl);
         let topic = format!("{STORAGE_RECORD_PREFIX}{owner}/pledges");
         let guard = state.lock().unwrap();
-        let outcome = guard
-            .storage_records
-            .lock()
-            .unwrap()
-            .on_pledge_list_sample(&topic, &serde_json::to_vec(&pl).unwrap());
+        let outcome = guard.storage_records.lock().unwrap().on_pledge_list_sample(
+            &topic,
+            &serde_json::to_vec(&pl).unwrap(),
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            9_000,
+        );
         assert!(outcome.changed(), "seed ingest must land: {outcome:?}");
         owner
     }
@@ -17781,7 +17971,9 @@ mod storage_publish_tests {
     #[test]
     fn backup_set_build_never_exceeds_wire_cap_and_keeps_priority_prefix() {
         use harmony_content::cid::{ContentFlags, ContentId};
-        let (state, _) = signed_state();
+        // ZEB-679: with the outbox present, every shrink round re-signs
+        // BOTH layers — the final payload must carry a valid v2 block too.
+        let (state, _) = signed_state_with_outbox();
         let mut first_cid = None;
         {
             let mut idx = state.content_index.lock().unwrap();
@@ -17816,6 +18008,9 @@ mod storage_publish_tests {
         );
         let payload: storage_signing::BackupSetPayload = serde_json::from_slice(&bytes).unwrap();
         storage_signing::verify_backup_set(&payload).expect("re-signed after truncation");
+        assert!(payload.v2.is_present(), "shrink loop keeps the v2 block");
+        storage_signing::verify_backup_set_v2(&payload, wall_clock_ms() / 1000)
+            .expect("v2 re-signed after truncation");
         assert!(
             payload.entries.len() < storage_records::MAX_BACKUP_ENTRIES,
             "this fixture must actually trigger truncation"
@@ -17847,6 +18042,7 @@ mod storage_publish_tests {
             &state.storage_settings,
             &settings_path,
             &clock,
+            None,
         )
         .expect("build");
         assert_eq!(topic, format!("{STORAGE_RECORD_PREFIX}{addr}/hosting"));
@@ -17872,6 +18068,245 @@ mod storage_publish_tests {
         );
         let on_disk = storage_settings::load_or_default(&settings_path);
         assert_eq!(on_disk.hosting_floor, payload.updated_at, "floor persisted");
+    }
+
+    // ── ZEB-679: publish-side dual-signing ───────────────────────────
+
+    /// `signed_state` + a synthetic DmOutbox carrying the `#2` material
+    /// (master-issued cert, expires: never — real-clock safe).
+    fn signed_state_with_outbox() -> (NodeState, String) {
+        let (mut state, addr) = signed_state();
+        let outbox = crate::zeb703_outbox_runtime_durability_tests::make_outbox_synthetic(
+            "storage-test-device",
+            crate::owner_state_types::OwnerAddr([0xCD; 16]),
+        );
+        state.dm_outbox = Some(std::sync::Arc::new(tokio::sync::Mutex::new(outbox)));
+        (state, addr)
+    }
+
+    #[test]
+    fn pledge_and_backup_builds_dual_sign_with_outbox_zeb679() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, _addr) = signed_state_with_outbox();
+        state.storage_settings_path = Some(storage_settings::settings_path(dir.path()));
+        state
+            .storage_settings
+            .lock()
+            .unwrap()
+            .my_pledges
+            .insert("buddy".into(), 1_000);
+        let now_secs = wall_clock_ms() / 1000;
+
+        let (_, bytes) = build_signed_pledge_list(&state).expect("build pledge");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(p.v2.is_present(), "pledge list carries v2 material");
+        storage_signing::verify_pledge_list(&p).expect("legacy verifies");
+        storage_signing::verify_pledge_list_v2(&p, now_secs).expect("v2 verifies");
+
+        {
+            let mut idx = state.content_index.lock().unwrap();
+            let cid = harmony_content::cid::ContentId::for_book(
+                b"zeb679 backup fixture",
+                harmony_content::cid::ContentFlags::default(),
+            )
+            .expect("cid");
+            idx.insert(content_index::ContentIndexEntry {
+                sidecar_id: content_index::SidecarId::new(),
+                cid: cid.to_bytes(),
+                file_name: "f".into(),
+                size_bytes: 3,
+                stored_at_ms: 100,
+                sensitivity: content_index::Sensitivity::Public,
+                replication_tier: content_index::ReplicationTier::Default,
+                licensed: false,
+                archived: false,
+                pinned: false,
+                backup: true,
+                kind: content_index::ContentKind::Leaf,
+                origin: None,
+            });
+        }
+        let (_, bytes) = build_signed_backup_set(&state).expect("build backup");
+        let b: storage_signing::BackupSetPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(b.v2.is_present(), "backup set carries v2 material");
+        storage_signing::verify_backup_set(&b).expect("legacy verifies");
+        storage_signing::verify_backup_set_v2(&b, now_secs).expect("v2 verifies");
+    }
+
+    #[test]
+    fn builds_stay_legacy_without_outbox_zeb679() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, _addr) = signed_state();
+        state.storage_settings_path = Some(storage_settings::settings_path(dir.path()));
+        let (_, bytes) = build_signed_pledge_list(&state).expect("build");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(!p.v2.is_present(), "no outbox ⇒ legacy-only wire");
+        storage_signing::verify_pledge_list(&p).expect("legacy verifies");
+    }
+
+    #[test]
+    fn hosting_build_dual_signs_with_material_zeb679() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, addr) = signed_state_with_outbox();
+        {
+            let mut ledger = state.storage_ledger.lock().unwrap();
+            ledger.record_pin("alice", "cid1", 100, 1);
+        }
+        // Snapshot the material exactly as the publisher task does.
+        let outbox = state.dm_outbox.as_ref().unwrap();
+        let og = outbox.try_lock().unwrap();
+        let material = validated_storage_material(
+            std::sync::Arc::clone(&og.community_signing_key),
+            og.enrollment_cert.clone(),
+            Vec::new(),
+        )
+        .expect("master material self-verifies");
+        drop(og);
+        let lines = hosting_report_lines(&state.storage_ledger);
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let settings_path = storage_settings::settings_path(dir.path());
+        let (_, bytes) = build_signed_hosting_report_with(
+            state.owner_private_identity.as_ref().unwrap(),
+            &addr,
+            lines,
+            &state.storage_settings,
+            &settings_path,
+            &clock,
+            Some(&material),
+        )
+        .expect("build");
+        let h: storage_signing::HostingReportPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(h.v2.is_present(), "hosting report carries v2 material");
+        storage_signing::verify_hosting_report(&h).expect("legacy verifies");
+        storage_signing::verify_hosting_report_v2(&h, wall_clock_ms() / 1000).expect("v2 verifies");
+    }
+
+    #[test]
+    fn quorum_material_without_bundle_fails_self_check_zeb679() {
+        use crate::enrollment_verify::quorum_fixtures::mint_quorum_world;
+        let world = mint_quorum_world(0x2C);
+        // Quorum cert with an EMPTY bundle: receivers would reject it, so
+        // the publisher self-check must refuse (⇒ legacy-only publish).
+        assert!(validated_storage_material(
+            std::sync::Arc::new(world.c_sk.clone()),
+            world.c_quorum_cert.clone(),
+            Vec::new(),
+        )
+        .is_none());
+        // With the bundle it validates.
+        assert!(validated_storage_material(
+            std::sync::Arc::new(world.c_sk),
+            world.c_quorum_cert,
+            world.bundle,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn mismatched_key_material_fails_self_check_zeb679_r1() {
+        use crate::enrollment_verify::quorum_fixtures::mint_quorum_world;
+        let world = mint_quorum_world(0x2C);
+        // A's valid cert with B's signing key: the cert verifies, but a
+        // deviceSig minted with this pair fails at every receiver — the
+        // self-check must refuse (R1, CodeRabbit + Qodo converged).
+        assert!(validated_storage_material(
+            std::sync::Arc::new(world.b_sk.clone()),
+            world.a_cert.clone(),
+            Vec::new(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn contended_outbox_falls_back_to_cached_material_zeb679_r1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, _addr) = signed_state_with_outbox();
+        state.storage_settings_path = Some(storage_settings::settings_path(dir.path()));
+        state
+            .storage_settings
+            .lock()
+            .unwrap()
+            .my_pledges
+            .insert("buddy".into(), 1_000);
+
+        // Cold cache + contention: honest legacy (pre-cache posture).
+        let outbox = state.dm_outbox.as_ref().unwrap().clone();
+        {
+            let _held = outbox.try_lock().expect("acquire for contention");
+            let (_, bytes) = build_signed_pledge_list(&state).expect("build under contention");
+            let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                !p.v2.is_present(),
+                "cold cache + contention ⇒ legacy-only (documented residual)"
+            );
+        }
+        // Uncontended build warms the cache…
+        let (_, bytes) = build_signed_pledge_list(&state).expect("uncontended build");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(p.v2.is_present());
+        // …after which contention no longer downgrades the publisher (R1:
+        // pinned receivers reject legacy, so this fallback is load-bearing).
+        {
+            let _held = outbox.try_lock().expect("acquire for contention");
+            let (_, bytes) = build_signed_pledge_list(&state).expect("build under contention");
+            let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+            assert!(p.v2.is_present(), "cached material used under contention");
+            storage_signing::verify_pledge_list_v2(&p, wall_clock_ms() / 1000)
+                .expect("cached-material v2 verifies");
+        }
+    }
+
+    #[test]
+    fn failed_fresh_validation_clears_cache_zeb679_r2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, _addr) = signed_state_with_outbox();
+        state.storage_settings_path = Some(storage_settings::settings_path(dir.path()));
+        // Warm the cache with a valid uncontended build.
+        let (_, bytes) = build_signed_pledge_list(&state).expect("warm build");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(p.v2.is_present(), "cache warmed");
+
+        // Swap in an outbox whose (sk, cert) pair is MISMATCHED (cert of
+        // owner 0xAB, signing key of owner 0xB4): fresh validation fails.
+        let outbox = {
+            let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x56; 32]);
+            let priv_bytes = private_identity.to_private_bytes();
+            let mut ed_seed = [0u8; 32];
+            ed_seed.copy_from_slice(&priv_bytes[32..64]);
+            let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+            let device_hash = crate::owner_state_types::DeviceIdentityHash(
+                private_identity.identity.address_hash,
+            );
+            let cert_owner = crate::community_membership::mint_test_owner(0xAB);
+            let other_owner = crate::community_membership::mint_test_owner(0xB4);
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                "mismatched-device".into(),
+                crate::owner_state_types::OwnerAddr([0xCE; 16]),
+                device_hash,
+                signing_key,
+                std::sync::Arc::new(private_identity),
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+                    &other_owner.device_key.to_bytes(),
+                )),
+                cert_owner.cert,
+            )
+        };
+        state.dm_outbox = Some(std::sync::Arc::new(tokio::sync::Mutex::new(outbox)));
+
+        // Uncontended build: fresh validation fails ⇒ honest legacy AND the
+        // stale cache is CLEARED (R2, Greptile P1)…
+        let (_, bytes) = build_signed_pledge_list(&state).expect("mismatched build");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(!p.v2.is_present(), "failed validation ⇒ legacy");
+        // …so a CONTENDED build must not resurrect the old material.
+        let outbox = state.dm_outbox.as_ref().unwrap().clone();
+        let _held = outbox.try_lock().expect("acquire for contention");
+        let (_, bytes) = build_signed_pledge_list(&state).expect("contended build");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            !p.v2.is_present(),
+            "stale material must not survive a failed fresh validation"
+        );
     }
 }
 
@@ -67475,6 +67910,7 @@ mod start_node_race_tests {
             vine_authority_gates: std::sync::Arc::new(std::sync::Mutex::new(
                 VineAuthorityGates::default(),
             )),
+            storage_v2_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
             dm_outbox: None,
             dm_transport: None,
             butler_deposit_client: None,

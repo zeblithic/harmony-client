@@ -1151,6 +1151,10 @@ pub async fn run(
     // loaded; the engine tick no-ops then. Distinct from `own_zid`,
     // which is the transport-session id (announces stay anonymous).
     own_owner_addr: String,
+    // ZEB-679: shared revoked-device projection consulted by storage-
+    // record v2 admission (same handle the DM/friend/PEX cutoffs use).
+    // Test callers pass `RevokedDeviceProjection::new()`.
+    revoked_projection: crate::revoked_device_projection::RevokedDeviceProjection,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -4188,6 +4192,7 @@ pub async fn run(
                                 &storage_records,
                                 &key_expr,
                                 &payload,
+                                &revoked_projection,
                                 crate::wall_clock_ms,
                             ) {
                                 crate::node_event_sink::emit_ser(
@@ -6253,11 +6258,19 @@ pub async fn run(
                     }
                 }
                 // (2) Hosting-report staleness sweep (wall clock — receipt
-                // stamps are wall ms, see note_storage_record_sample).
-                storage_records
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .sweep_hosting(crate::wall_clock_ms());
+                // stamps are wall ms, see note_storage_record_sample) +
+                // ZEB-679 R1 retroactive revocation purge: records admitted
+                // before the projection learned their signer's revocation
+                // must stop driving the planner.
+                {
+                    let mut records = storage_records
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    records.sweep_hosting(crate::wall_clock_ms());
+                    if records.purge_revoked(&revoked_projection) {
+                        tracing::info!("storage records purged for revoked signer(s)");
+                    }
+                }
                 // (3) Plan under short locks (guards dropped before any
                 // await; the plan is applied mechanically below).
                 let plan = {
@@ -7076,6 +7089,7 @@ fn note_storage_record_sample(
     storage_records: &Arc<std::sync::Mutex<crate::storage_records::StorageRecordStore>>,
     key_expr: &str,
     payload: &[u8],
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
     now_ms: impl FnOnce() -> u64,
 ) -> bool {
     use crate::storage_records::RecordOutcome;
@@ -7085,13 +7099,21 @@ fn note_storage_record_sample(
     let Some((_owner, kind)) = rest.split_once('/') else {
         return false;
     };
+    if !matches!(kind, "pledges" | "backup-set" | "hosting") {
+        return false;
+    }
     let mut store = storage_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Wall clock evaluated once we KNOW this is a storage record (the
+    // lazy closure keeps non-storage keys clock-free); all three
+    // families need it now — cert expiry + pin stamping (ZEB-679), and
+    // the hosting receipt clock.
+    let now = now_ms();
     let outcome = match kind {
-        "pledges" => store.on_pledge_list_sample(key_expr, payload),
-        "backup-set" => store.on_backup_set_sample(key_expr, payload),
-        "hosting" => store.on_hosting_report_sample(key_expr, payload, now_ms()),
+        "pledges" => store.on_pledge_list_sample(key_expr, payload, revoked, now),
+        "backup-set" => store.on_backup_set_sample(key_expr, payload, revoked, now),
+        "hosting" => store.on_hosting_report_sample(key_expr, payload, revoked, now),
         _ => return false,
     };
     if let RecordOutcome::Rejected(reason) = &outcome {
@@ -12001,6 +12023,7 @@ mod note_storage_record_sample_tests {
             updated_at,
             identity_pub: None,
             sig: None,
+            v2: Default::default(),
         };
         storage_signing::sign_pledge_list(id, &mut p);
         (
@@ -12009,12 +12032,62 @@ mod note_storage_record_sample_tests {
         )
     }
 
+    /// Empty revocation projection (ZEB-679) — most routing tests don't
+    /// exercise the revocation path.
+    fn rvk() -> crate::revoked_device_projection::RevokedDeviceProjection {
+        crate::revoked_device_projection::RevokedDeviceProjection::new()
+    }
+
+    /// ZEB-679 end-to-end: the projection handle threaded through the
+    /// router actually gates a revoked signer's dual-signed record.
+    #[test]
+    fn revoked_signer_sample_dropped_through_router_zeb679() {
+        use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, WORLD_NOW};
+        let world = mint_quorum_world(0x30);
+        let s = store();
+        let id = signer();
+        let owner = hex::encode(id.public_identity().address_hash);
+        let mut p = crate::storage_signing::PledgeListPayload {
+            owner_address: owner.clone(),
+            pledges: vec![],
+            updated_at: 5,
+            identity_pub: None,
+            sig: None,
+            v2: Default::default(),
+        };
+        let material = crate::storage_signing::StorageSignerMaterial {
+            sk: std::sync::Arc::new(world.a_sk.clone()),
+            cert: world.a_cert.clone(),
+            signer_certs: Vec::new(),
+        };
+        crate::storage_signing::sign_pledge_list_v2(&id, &material, &mut p).expect("dual-sign");
+        let key = format!("{}{owner}/pledges", crate::STORAGE_RECORD_PREFIX);
+        let bytes = serde_json::to_vec(&p).unwrap();
+
+        let revoked = rvk();
+        let dead_key = world.a_cert.device_pubkeys.classical.ed25519_verify;
+        let keys: std::collections::BTreeSet<[u8; 32]> = std::iter::once(dead_key).collect();
+        revoked.union_from_members(std::iter::once((
+            crate::owner_state_types::OwnerAddr(world.owner_id),
+            &keys,
+        )));
+        assert!(
+            !note_storage_record_sample(&s, &key, &bytes, &revoked, || WORLD_NOW * 1000),
+            "revoked signer's record must not land"
+        );
+        assert!(s.lock().unwrap().pledge_list(&owner).is_none());
+        // Same record through an EMPTY projection lands (control).
+        assert!(note_storage_record_sample(&s, &key, &bytes, &rvk(), || {
+            WORLD_NOW * 1000
+        }));
+    }
+
     #[test]
     fn signed_pledge_sample_routes_and_reports_change() {
         let s = store();
         let id = signer();
         let (key, payload) = signed_pledges(&id, 5);
-        assert!(note_storage_record_sample(&s, &key, &payload, || 1));
+        assert!(note_storage_record_sample(&s, &key, &payload, &rvk(), || 1));
         let owner = hex::encode(id.public_identity().address_hash);
         assert!(s.lock().unwrap().pledge_list(&owner).is_some());
     }
@@ -12024,11 +12097,23 @@ mod note_storage_record_sample_tests {
         let s = store();
         let id = signer();
         let (key, payload) = signed_pledges(&id, 5);
-        assert!(note_storage_record_sample(&s, &key, &payload, || 1));
+        assert!(note_storage_record_sample(&s, &key, &payload, &rvk(), || 1));
         // LWW replay: same updated_at ⇒ IgnoredOlder ⇒ no change.
-        assert!(!note_storage_record_sample(&s, &key, &payload, || 1));
+        assert!(!note_storage_record_sample(
+            &s,
+            &key,
+            &payload,
+            &rvk(),
+            || 1
+        ));
         // Garbage payload ⇒ Rejected ⇒ no change.
-        assert!(!note_storage_record_sample(&s, &key, b"not json", || 1));
+        assert!(!note_storage_record_sample(
+            &s,
+            &key,
+            b"not json",
+            &rvk(),
+            || 1
+        ));
     }
 
     #[test]
@@ -12046,6 +12131,7 @@ mod note_storage_record_sample_tests {
             updated_at: 5,
             identity_pub: None,
             sig: None,
+            v2: Default::default(),
         };
         storage_signing::sign_hosting_report(&id, &mut h);
         let key = format!("{}{owner}/hosting", crate::STORAGE_RECORD_PREFIX);
@@ -12053,6 +12139,7 @@ mod note_storage_record_sample_tests {
             &s,
             &key,
             &serde_json::to_vec(&h).unwrap(),
+            &rvk(),
             || 777,
         ));
         assert_eq!(
@@ -12072,18 +12159,21 @@ mod note_storage_record_sample_tests {
             &s,
             "harmony/announce/aabb",
             b"",
+            &rvk(),
             || 1
         ));
         assert!(!note_storage_record_sample(
             &s,
             "harmony/storage/owner/unknown-kind",
             b"",
+            &rvk(),
             || 1
         ));
         assert!(!note_storage_record_sample(
             &s,
             "harmony/storage/owner",
             b"",
+            &rvk(),
             || 1
         ));
     }

@@ -223,11 +223,17 @@ mod tests {
                 updated_at: 1,
                 identity_pub: None,
                 sig: None,
+                v2: Default::default(),
             };
             storage_signing::sign_pledge_list(&id, &mut pl);
             let topic = format!("harmony/storage/{owner}/pledges");
             assert!(store
-                .on_pledge_list_sample(&topic, &serde_json::to_vec(&pl).unwrap())
+                .on_pledge_list_sample(
+                    &topic,
+                    &serde_json::to_vec(&pl).unwrap(),
+                    &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+                    9_000,
+                )
                 .changed());
             let mut bs = BackupSetPayload {
                 owner_address: owner.clone(),
@@ -235,11 +241,17 @@ mod tests {
                 updated_at: 1,
                 identity_pub: None,
                 sig: None,
+                v2: Default::default(),
             };
             storage_signing::sign_backup_set(&id, &mut bs);
             let topic = format!("harmony/storage/{owner}/backup-set");
             assert!(store
-                .on_backup_set_sample(&topic, &serde_json::to_vec(&bs).unwrap())
+                .on_backup_set_sample(
+                    &topic,
+                    &serde_json::to_vec(&bs).unwrap(),
+                    &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+                    9_000,
+                )
                 .changed());
             let _ = name; // labels are for the test author; owners map by index
             owners.push(owner);

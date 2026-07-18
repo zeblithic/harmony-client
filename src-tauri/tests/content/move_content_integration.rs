@@ -221,6 +221,7 @@ async fn spawn_test_runtime() -> TestHarness {
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
                     String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
+                    harmony_app::revoked_device_projection::RevokedDeviceProjection::new(), // ZEB-679: revocation not exercised
                 )
                 .await;
             });
