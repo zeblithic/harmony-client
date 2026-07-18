@@ -175,34 +175,60 @@ async fn shutdown_handler(
     }
     // Snapshot the handles out of the sync-mutex guard (guard must not
     // live across an await); a poisoned lock degrades to no pre-flush.
-    let (engine, stopping, inflight) = match ctx.state.node_state().lock() {
+    let (engine, stopping, inflight, dm_outbox) = match ctx.state.node_state().lock() {
         Ok(guard) => guard.pre_shutdown_flush_handles(),
         Err(e) => {
             tracing::warn!(error = %e, "ZEB-703: NodeState poisoned at shutdown; skipping pre-ack flush");
-            (None, None, None)
+            (None, None, None, None)
         }
     };
-    // Barrier (PR #485 round 1, CodeRabbit): without it, a send_dm/delete
-    // landing WHILE persist_now snapshots could miss the persist and be
-    // lost to a kill-on-200 supervisor. Sequence mirrors stop_inner's
-    // ZEB-234 teardown (idempotent when stop_inner repeats it later):
+    // Barrier (PR #485 round 1, CodeRabbit + Greptile P1): without it, a
+    // DM mutation landing WHILE persist_now snapshots could miss the
+    // persist and be lost to a kill-on-200 supervisor. Sequence mirrors
+    // stop_inner's ZEB-234 teardown (idempotent when stop_inner repeats
+    // it later):
     //   1. stopping=true — new fenced IPC mutations reject ("node
     //      stopping"), same Ordering::Release as stop_inner;
-    //   2. drain the fence permits — every in-flight fenced mutation
-    //      completes BEFORE the snapshot;
-    //   3. persist_now — the snapshot now contains everything accepted
+    //   2. drain-path gate — new drain ticks skip entirely, so no new
+    //      detached Phase C task can spawn;
+    //   3. drain the ZEB-234 send-fence permits — every in-flight fenced
+    //      IPC mutation completes BEFORE the snapshot;
+    //   4. drain the Phase C fence — every in-flight detached Phase C
+    //      task (drain outcomes + deposit-rung acks) completes BEFORE
+    //      the snapshot;
+    //   5. persist_now — the snapshot now contains everything accepted
     //      before the shutdown call.
-    // Drain-tick (Phase C) mutations remain outside the fence — known
-    // residue, tracked in ZEB-709. One 5s budget bounds the whole
-    // sequence; on timeout/error we warn + proceed (the process is going
-    // down either way; a wedged engine task starves stop_inner's backstop
-    // persist equally — the ZEB-509 fence accepts the same degraded mode,
-    // see fence_owner_state_flush_returns_on_stalled_engine).
+    // One 5s budget bounds the whole sequence; on timeout/error we warn +
+    // proceed (the process is going down either way; a wedged engine task
+    // starves stop_inner's backstop persist equally — the ZEB-509 fence
+    // accepts the same degraded mode, see
+    // fence_owner_state_flush_returns_on_stalled_engine).
     let barrier_and_persist = async {
         if let Some(flag) = stopping.as_ref() {
             flag.store(true, std::sync::atomic::Ordering::Release);
         }
-        if let Some(sem) = inflight {
+        if let Some(outbox) = dm_outbox {
+            let (gate, phase_c_sem) = {
+                let guard = outbox.lock().await;
+                guard.shutdown_fence_handles()
+            };
+            gate.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(sem) = inflight {
+                crate::drain_dm_send_fence(sem).await;
+            }
+            // Wait for every in-flight detached Phase C task; permits are
+            // dropped immediately — only the blocking effect is needed
+            // (the gate prevents new spawns).
+            match Arc::clone(&phase_c_sem)
+                .acquire_many_owned(crate::dm_outbox::DRAIN_PHASE_C_FENCE_CAPACITY as u32)
+                .await
+            {
+                Ok(permits) => drop(permits),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ZEB-703: Phase C fence closed; proceeding");
+                }
+            }
+        } else if let Some(sem) = inflight {
             crate::drain_dm_send_fence(sem).await;
         }
         match engine {

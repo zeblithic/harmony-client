@@ -506,6 +506,13 @@ const BACKOFF_MULTIPLIER: u64 = 2;
 const BACKOFF_CAP_MS: u64 = 5 * 60 * 1_000; // 5 min
 const BACKOFF_MAX_EXPONENT: u32 = 8; // 5s * 2^8 = 1280s -> capped at 5min
 pub const EXPIRATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000; // 30 days
+/// ZEB-703 (PR #485 Greptile P1): cap on concurrent detached Phase C tasks
+/// (one permit each, held for the task's lifetime incl. deposit rungs).
+/// Drain ticks fire every ~250ms and Phase C is usually sub-second, so 64
+/// outstanding means pathological wedging — the tick then skips its Phase C
+/// with a WARN rather than spawning unfenced. The shutdown barrier
+/// `acquire_many`s this many to await drain-path quiescence.
+pub(crate) const DRAIN_PHASE_C_FENCE_CAPACITY: usize = 64;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
@@ -643,6 +650,21 @@ pub struct DmOutbox {
     pub(crate) our_device2_signing_hash: Option<DeviceIdentityHash>,
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
+    /// ZEB-703 (PR #485 Greptile P1): shutdown gate for the drain path.
+    /// Once set, `drain_lifted` skips the whole tick (no sends, no Phase C
+    /// spawn) — mirroring the ZEB-234 `dm_send_stopping` flag's role for
+    /// the IPC paths. Set by `/v1/shutdown`'s pre-ack barrier and by
+    /// `stop_inner`; never cleared (the outbox dies with the node).
+    shutdown_gate: Arc<std::sync::atomic::AtomicBool>,
+    /// ZEB-703 (PR #485 Greptile P1): Phase C in-flight fence. Every
+    /// detached Phase C task (drain outcomes + deposit rungs — all the
+    /// drain-path CRDT mutation sites) holds one permit for its lifetime;
+    /// the shutdown barrier `acquire_many(DRAIN_PHASE_C_FENCE_CAPACITY)`s
+    /// to wait for them BEFORE the pre-ack owner-state snapshot, so a
+    /// mid-flight delivery/expiry/ack transition can't land after the
+    /// persist and be lost to a kill-on-200 supervisor. Same pattern as
+    /// the ZEB-234 send fence, scoped to the drain path.
+    phase_c_inflight: Arc<tokio::sync::Semaphore>,
     /// ZEB-418 SP2 P1 Task 8: sender-side butler deposit client. `None`
     /// (default) disables the deposit rung entirely — drain behaves exactly
     /// as before. Production injects `IrohButlerDepositClient` via
@@ -714,11 +736,31 @@ impl DmOutbox {
             our_device2_signing_hash,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
+            shutdown_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            phase_c_inflight: Arc::new(tokio::sync::Semaphore::new(DRAIN_PHASE_C_FENCE_CAPACITY)),
             butler_deposit_client: None,
             community_relay_deposit_client: None,
             outhold_doc: None,
             outhold_notify: None,
         }
+    }
+
+    /// ZEB-703 (PR #485 Greptile P1): the drain-path shutdown fence
+    /// handles, cloned out for the `/v1/shutdown` pre-ack barrier and
+    /// `stop_inner`. Callers set the gate (stops new drain ticks), then
+    /// `acquire_many(DRAIN_PHASE_C_FENCE_CAPACITY)` on the semaphore to
+    /// await every in-flight detached Phase C task before snapshotting
+    /// owner-state.
+    pub(crate) fn shutdown_fence_handles(
+        &self,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<tokio::sync::Semaphore>,
+    ) {
+        (
+            Arc::clone(&self.shutdown_gate),
+            Arc::clone(&self.phase_c_inflight),
+        )
     }
 
     /// Test-only constructor that bypasses the ZEB-339 `assert!`
@@ -752,6 +794,8 @@ impl DmOutbox {
             our_device2_signing_hash,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
+            shutdown_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            phase_c_inflight: Arc::new(tokio::sync::Semaphore::new(DRAIN_PHASE_C_FENCE_CAPACITY)),
             butler_deposit_client: None,
             community_relay_deposit_client: None,
             outhold_doc: None,
@@ -2941,8 +2985,21 @@ pub async fn drain_lifted(
     // skip this tick. (Same deadlock-avoidance rationale as the
     // original event_loop drain caller — see event_loop.rs timer arm
     // comment.)
-    let work = match (outbox.try_lock(), state.try_lock()) {
-        (Ok(mut o_g), Ok(s_g)) => o_g.drain_phase_a(&s_g, wall_now_ms),
+    let (work, phase_c_sem) = match (outbox.try_lock(), state.try_lock()) {
+        (Ok(mut o_g), Ok(s_g)) => {
+            // ZEB-703 (PR #485 Greptile P1): once the shutdown barrier has
+            // gated the drain path, skip the whole tick — no sends, no
+            // Phase C spawn — so no drain-path CRDT mutation can land
+            // after the pre-ack owner-state snapshot.
+            if o_g.shutdown_gate.load(std::sync::atomic::Ordering::Acquire) {
+                tracing::debug!("drain_lifted: shutdown gate set; skipping tick");
+                return;
+            }
+            (
+                o_g.drain_phase_a(&s_g, wall_now_ms),
+                Arc::clone(&o_g.phase_c_inflight),
+            )
+        }
         _ => {
             tracing::debug!("drain_lifted Phase A: outbox/state lock contended; skipping tick");
             return;
@@ -3032,12 +3089,34 @@ pub async fn drain_lifted(
         });
     }
 
+    // ZEB-703 (PR #485 Greptile P1): fence the detached Phase C task. One
+    // permit, held for the task's whole lifetime (Phase C lock-block AND
+    // the deposit rungs — every drain-path CRDT mutation site), so the
+    // shutdown barrier's acquire_many awaits it before snapshotting
+    // owner-state. Exhaustion (64 outstanding tasks) means pathological
+    // wedging: skip this tick's Phase C with a WARN rather than spawning
+    // unfenced — the next tick re-derives everything from state.
+    let phase_c_permit = match phase_c_sem.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::warn!(
+                "drain_lifted: Phase C fence exhausted ({} in flight); skipping this \
+                 tick's Phase C (ZEB-703)",
+                DRAIN_PHASE_C_FENCE_CAPACITY
+            );
+            return;
+        }
+    };
+
     // Phase C: spawn so the event_loop's timer arm returns to select!
     // immediately. The spawned task runs detached and uses .lock().await
     // (not try_lock) — by the time it awakens after .lock().await
     // returns, the event_loop is free to pump cas_op_rx, so any holder
     // of outbox/state can release.
     tokio::spawn(async move {
+        // ZEB-703: hold the fence permit until every mutation in this task
+        // (Phase C outcomes + deposit-rung acks) has completed.
+        let _phase_c_permit = phase_c_permit;
         let (outcome, deposit_candidates, deposit_client, relay_client) = {
             let mut o_g = outbox.lock().await;
             let mut s_g = state.lock().await;
@@ -5781,6 +5860,70 @@ mod tests {
             state_try_lock_succeeded.load(Ordering::SeqCst),
             "ZEB-233 regression: state lock must be RELEASED during Phase B's transport.send. \
              The try_lock from inside send() failed, meaning Phase A's guard is still held."
+        );
+    }
+
+    /// ZEB-703 (PR #485 Greptile P1): once the shutdown gate is set, a
+    /// drain tick must be a complete no-op — no Phase B sends, no Phase C
+    /// spawn — so no drain-path CRDT mutation can land after the pre-ack
+    /// owner-state snapshot.
+    #[tokio::test]
+    async fn drain_lifted_shutdown_gate_skips_tick_zeb703() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        // Entry due for send at wall=2_000 (mirrors the lock-lift test's
+        // fixture) — WITHOUT the gate this tick would produce a send.
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        install_outbox_entry(&mut state, entry);
+
+        let outbox_arc = Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic("dev", alice)));
+        let state_arc = Arc::new(tokio::sync::Mutex::new(state));
+        let transport = StubTransport::new();
+        let app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+
+        let (gate, phase_c_sem) = outbox_arc.lock().await.shutdown_fence_handles();
+        gate.store(true, std::sync::atomic::Ordering::Release);
+
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            2_000,
+            app,
+            None, // gate short-circuits before any mutation; engine irrelevant
+        )
+        .await;
+
+        assert!(
+            transport.sends().is_empty(),
+            "gated tick must not send (Phase B skipped)"
+        );
+        // No Phase C task spawned: all fence permits are immediately
+        // available (a spawned task would hold one until it completed).
+        assert_eq!(
+            phase_c_sem.available_permits(),
+            DRAIN_PHASE_C_FENCE_CAPACITY,
+            "gated tick must not spawn a fenced Phase C task"
+        );
+        // And the sanity inverse: without the gate the same fixture sends.
+        gate.store(false, std::sync::atomic::Ordering::Release);
+        let app2: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            2_000,
+            app2,
+            None,
+        )
+        .await;
+        assert_eq!(
+            transport.sends().len(),
+            1,
+            "ungated tick with a due entry must send (fixture sanity)"
         );
     }
 

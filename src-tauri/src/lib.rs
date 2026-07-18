@@ -1635,10 +1635,11 @@ impl NodeState {
     /// ZEB-703: handles for `/v1/shutdown`'s pre-ack barrier + flush. The
     /// 200 is the signal supervisors act on; the handler fences new DM
     /// mutations (ZEB-234 stopping flag), drains in-flight fenced sends,
-    /// and persists owner-state BEFORE responding — so a
-    /// kill-or-relaunch-on-200 supervisor can't race the process's final
-    /// save point NOR miss a mutation that was mid-flight when the
-    /// shutdown was requested (PR #485 CodeRabbit barrier finding).
+    /// gates + drains the drain-path's detached Phase C tasks (PR #485
+    /// Greptile P1 — via the returned `dm_outbox` handle), and persists
+    /// owner-state BEFORE responding — so a kill-or-relaunch-on-200
+    /// supervisor can't race the process's final save point NOR miss a
+    /// mutation that was mid-flight when the shutdown was requested.
     /// All `None` when no owner is loaded (nothing to fence or flush).
     #[allow(clippy::type_complexity)]
     pub(crate) fn pre_shutdown_flush_handles(
@@ -1647,11 +1648,13 @@ impl NodeState {
         Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
         Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
     ) {
         (
             self.sync_engine.clone(),
             self.dm_send_stopping.clone(),
             self.dm_send_inflight.clone(),
+            self.dm_outbox.clone(),
         )
     }
 
@@ -2653,6 +2656,23 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     drop(follow_tx);
     drop(voice_tx);
     drop(voice_channel_tx);
+    // ZEB-703 (PR #485 Greptile P1): snapshot the drain-path fence handles
+    // BEFORE releasing our outbox Arc — the gate+drain below (after the
+    // ZEB-234 send-fence drain) waits for detached Phase C tasks so their
+    // CRDT mutations land before the SyncEngine final persist. try_lock:
+    // stop_inner is sync (blocking_lock would panic from async contexts);
+    // contention here means a drain tick holds the lock for its brief
+    // Phase A window — treat as no-fence (WARN) rather than spinning.
+    let dm_drain_fence = dm_outbox.as_ref().and_then(|o| match o.try_lock() {
+        Ok(g) => Some(g.shutdown_fence_handles()),
+        Err(_) => {
+            tracing::warn!(
+                "ZEB-703: dm_outbox contended at stop; skipping drain-path fence \
+                 (a Phase C mutation may race the final persist)"
+            );
+            None
+        }
+    });
     // ZEB-225 Sub-B Phase 2: drop DM outbox handles after the channel
     // drops. send_dm IPC and the event-loop drain tick both clone these
     // Arcs into local scope before await, so dropping our Arc here just
@@ -2802,6 +2822,47 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                             "ZEB-234: failed to build drain runtime; \
                              proceeding with shutdown (in-flight \
                              send_dm may produce duplicates)"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-703 (PR #485 Greptile P1): gate the drain path and wait for
+    // every in-flight detached Phase C task (drain outcomes + deposit-rung
+    // acks) BEFORE the SyncEngine final persist below, so a mid-flight
+    // drain-path CRDT mutation can't land after the persist snapshot and
+    // be lost. Same ephemeral-runtime pattern as the ZEB-234 drain above.
+    // (The /v1/shutdown pre-ack barrier runs the same sequence earlier on
+    // the serve path — this is the stop_node/restart-path parity.)
+    if let Some((gate, phase_c_sem)) = dm_drain_fence {
+        gate.store(true, std::sync::atomic::Ordering::Release);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(async {
+                        match std::sync::Arc::clone(&phase_c_sem)
+                            .acquire_many_owned(
+                                crate::dm_outbox::DRAIN_PHASE_C_FENCE_CAPACITY as u32,
+                            )
+                            .await
+                        {
+                            Ok(permits) => drop(permits),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "ZEB-703: Phase C fence closed during stop; proceeding"
+                            ),
+                        }
+                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ZEB-703: failed to build Phase C drain runtime; \
+                             proceeding (a drain-path mutation may race the \
+                             final persist)"
                         );
                     }
                 }
@@ -65911,6 +65972,171 @@ mod zeb703_outbox_runtime_durability_tests {
         assert!(
             err.contains("node stopping"),
             "rejection must be the ZEB-234 fence, got: {err}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("server task must join after /v1/shutdown")
+            .expect("server task must not panic")
+            .expect("graceful shutdown must end the server cleanly");
+    }
+
+    /// ZEB-703 (PR #485 Greptile P1): the pre-ack barrier must WAIT for
+    /// in-flight detached Phase C drain tasks before snapshotting — a
+    /// mutation those tasks make while the barrier is blocked must be
+    /// inside the persisted snapshot when the 200 arrives. Simulated by
+    /// holding one Phase C fence permit (exactly what a live Phase C task
+    /// holds), asserting the shutdown response stays pending, landing a
+    /// "late" outbox mutation, then releasing the permit.
+    #[tokio::test]
+    async fn shutdown_barrier_awaits_inflight_phase_c_zeb703() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt =
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"));
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        let alice = crate::owner_state_types::OwnerAddr([0x01; 16]);
+        let bob = crate::owner_state_types::OwnerAddr([0x02; 16]);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let outbox_arc = Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+            "zeb703-dev",
+            alice,
+        )));
+        let cas = crate::content_store::InMemoryStub::default();
+        let space_id = {
+            let mut g = crdt_state.lock().await;
+            let sp = make_dm_space(17, vec![alice, bob]);
+            let id = sp.id;
+            let outcome = g.apply_space_with_canonicalization(sp);
+            assert!(
+                matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Inserted),
+                "fixture install must succeed, got {outcome:?}"
+            );
+            id
+        };
+        // 10-min debounce: only the handler's barrier persist can write.
+        let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
+            crate::owner_state_crypto::FleetKeySet::new(kt),
+            "zeb703-dev".into(),
+            Arc::clone(&crdt_state),
+            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(crate::content_store::InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            600_000,
+        ));
+
+        let stopping_flag = Arc::new(AtomicBool::new(false));
+        let inflight_sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
+        let api_dir = tempfile::tempdir().expect("api tempdir");
+        let state: Arc<std::sync::Mutex<NodeState>> = Arc::new(std::sync::Mutex::new(NodeState {
+            crdt_state: Some(Arc::clone(&crdt_state)),
+            sync_engine: Some(Arc::clone(&engine)),
+            dm_send_stopping: Some(Arc::clone(&stopping_flag)),
+            dm_send_inflight: Some(Arc::clone(&inflight_sem)),
+            dm_outbox: Some(Arc::clone(&outbox_arc)),
+            ..NodeState::default()
+        }));
+        let events = crate::api::events::ApiEventSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(crate::node_event_sink::FanoutSink(vec![]));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (handle, task) = crate::api::start_server(
+            api_dir.path(),
+            0,
+            state,
+            sink,
+            events,
+            shutdown_tx,
+            shutdown_rx,
+        )
+        .await
+        .expect("start_server");
+        let token = std::fs::read_to_string(handle.api_dir.join("token")).expect("token file");
+
+        // Simulate an in-flight detached Phase C task: hold one fence
+        // permit, exactly as the spawned task does for its lifetime.
+        let (_gate, phase_c_sem) = outbox_arc.lock().await.shutdown_fence_handles();
+        let inflight_phase_c = phase_c_sem
+            .clone()
+            .try_acquire_owned()
+            .expect("fence permit");
+
+        // Fire /v1/shutdown concurrently; it must BLOCK on the barrier.
+        let port = handle.bound_port;
+        let req_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            stream
+                .write_all(
+                    format!(
+                        "POST /v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                         Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        // The barrier can NOT complete while the permit is held (it
+        // acquire_many's the full fence). 400ms is a wide margin over the
+        // handler's ~ms path — a missing barrier fails this immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !req_task.is_finished(),
+            "shutdown must not ack while a Phase C fence permit is in flight"
+        );
+
+        // The "late" Phase C mutation: lands while the barrier is blocked,
+        // so it must be inside the pre-ack snapshot.
+        let entry_id = {
+            let mut o_g = outbox_arc.lock().await;
+            let mut s_g = crdt_state.lock().await;
+            let (id, _cid) = o_g
+                .send_dm(
+                    &mut s_g,
+                    &cas,
+                    space_id,
+                    b"late phase-c write".to_vec(),
+                    "text/plain".into(),
+                    1_000,
+                    None,
+                )
+                .await
+                .expect("send_dm must succeed");
+            id
+        };
+
+        // Release the "Phase C task" — the barrier unblocks, persists,
+        // then acks.
+        drop(inflight_phase_c);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), req_task)
+            .await
+            .expect("shutdown must ack after the fence clears")
+            .expect("request task must not panic");
+        assert!(resp.contains("200"), "shutdown must ack 200, got: {resp}");
+
+        let loaded = crate::owner_state_persist::load_crdt(&crdt_path)
+            .expect("owner_state_crdt.cbor must exist by ack time");
+        assert!(
+            loaded.outbox.contains_key(&entry_id),
+            "ZEB-703: a mutation landed while the barrier awaited Phase C \
+             must be inside the pre-ack snapshot"
         );
 
         tokio::time::timeout(std::time::Duration::from_secs(5), task)
