@@ -2151,6 +2151,11 @@ fn maybe_spawn_pending_join_clear(
         updated.updated_at = new_hlc;
 
         let space_name = existing.name.clone();
+        // ZEB-709 audit (C1): deliberately NOT owner-state notify_dirty'd —
+        // this fn receives no engine handle. The pending_join clear is
+        // re-derived by the next-restart C3 healing pass (see the fallback
+        // note below), so a crash costs one restart's worth of staleness,
+        // never the join itself.
         let outcome = owner_g.apply_space_with_canonicalization(updated);
         drop(owner_g);
 

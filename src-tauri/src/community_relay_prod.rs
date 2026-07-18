@@ -390,6 +390,14 @@ pub struct ProdRelayIngestCtx {
     /// cutoff (bare Arc-backed handle, matches `MembershipProjection`'s
     /// by-value-clone style).
     pub revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    /// ZEB-709: arms the OWNER-STATE `SyncEngine` flush after this ctx writes
+    /// into `crdt_state` (inbox insert / invite auto-accept). Without it the
+    /// relay ack persists+replicates (relay coverage-GC destroys the held
+    /// blob) while the payload sits un-notified in memory — a crash in that
+    /// window loses the message permanently. Mirrors
+    /// `ProdDmInboxIngestCtx::notify_owner_state_dirty`. `None` only in unit
+    /// tests.
+    pub notify_owner_state_dirty: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[async_trait]
@@ -464,6 +472,12 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     );
                 }
                 crate::dm_outbox::ApplyInviteOutcome::Accepted => {
+                    // ZEB-709: the auto-accept wrote the DM Space into
+                    // owner-state — arm the owner-state flush (Staged/Ignored
+                    // return before any owner-state write).
+                    if let Some(mark) = &self.notify_owner_state_dirty {
+                        mark();
+                    }
                     // ZEB-640 (1): a friend-tier auto-accept makes any EARLIER
                     // staged (pre-befriend) entry for this space stale — the
                     // Space now exists in nav, so purge the pending row.
@@ -572,6 +586,15 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                     // accept / space exists) → flag the post-lock purge.
                     None => {
                         purge_stale_staged = true;
+                        // ZEB-709: the friend-tier accept may have written the
+                        // DM Space into owner-state inside this lock — arm the
+                        // flush HERE so even the unacked-Err exits below keep
+                        // it durable (mirrors the dm_inbox_ingest co-deposit
+                        // arm; a spurious arm on the space-exists no-op is a
+                        // harmless debounced persist).
+                        if let Some(mark) = &self.notify_owner_state_dirty {
+                            mark();
+                        }
                         None
                     }
                 }
@@ -659,6 +682,16 @@ impl RelayIngestCtx for ProdRelayIngestCtx {
                 signed.message_cid,
             )
         };
+
+        // ZEB-709: arm the OWNER-STATE flush for the payload write (lock
+        // dropped above; notify-on-insert only). The relay ack that follows a
+        // successful ingest lets coverage-GC destroy the held blob — the
+        // payload must not be the only un-persisted copy at that point.
+        if newly_inserted {
+            if let Some(mark) = &self.notify_owner_state_dirty {
+                mark();
+            }
+        }
 
         // ZEB-640 (1): the co-deposited invite auto-accepted (or the Space
         // already existed) — the lock is dropped now, so purge any stale
@@ -3118,6 +3151,8 @@ mod tests {
         bob: OwnerAddr,
         created_at: Hlc,
         content_key: crate::owner_state_types::DmContentKey,
+        /// ZEB-709: counts `notify_owner_state_dirty` invocations from the ctx.
+        dirty: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl RelayRecoverInviteFixture {
@@ -3339,6 +3374,7 @@ mod tests {
         let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
             Arc::new(Arc::clone(&sink_handle));
 
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let prod_ctx = ProdRelayIngestCtx {
             device_id: "bob-device-64hex".into(),
             device_x25519_privs: vec![],
@@ -3348,6 +3384,13 @@ mod tests {
             sink,
             pending_dm_invites: None,
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            // ZEB-709: count the owner-state dirty arms so tests can pin them.
+            notify_owner_state_dirty: {
+                let d = std::sync::Arc::clone(&dirty);
+                Some(Arc::new(move || {
+                    d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }) as Arc<dyn Fn() + Send + Sync>)
+            },
         };
 
         RelayRecoverInviteFixture {
@@ -3359,6 +3402,7 @@ mod tests {
             bob,
             created_at,
             content_key,
+            dirty,
         }
     }
 
@@ -3394,6 +3438,41 @@ mod tests {
             fx.emitted_dm_received(),
             1,
             "dm-received emitted exactly once"
+        );
+    }
+
+    /// ZEB-709: relay recover writes owner-state (Space bootstrap + inbox
+    /// insert) and the relay's ack lets coverage-GC destroy the held blob —
+    /// both writes must arm the owner-state flush or a crash after the ack
+    /// loses the message permanently.
+    #[tokio::test]
+    async fn ingest_recovered_marks_owner_state_dirty_zeb709() {
+        use std::sync::atomic::Ordering;
+        let fx = relay_ingest_fixture_without_space_with_invite(true);
+
+        fx.prod_ctx
+            .ingest_recovered([0xA1; 16], fx.payload.clone())
+            .await
+            .expect("invite bootstraps space, notify admits, blob delivers");
+        assert_eq!(
+            fx.dirty.load(Ordering::SeqCst),
+            2,
+            "first recover arms owner-state twice: the co-deposit friend-tier \
+             accept (Space write) and the inbox insert"
+        );
+
+        // Re-recover the same payload: the Space now exists (the co-deposit
+        // arm fires its documented harmless spurious arm) and apply_inbox
+        // dedupes (Merged → NO insert arm).
+        fx.prod_ctx
+            .ingest_recovered([0xA1; 16], fx.payload.clone())
+            .await
+            .expect("re-recover dedupes cleanly");
+        assert_eq!(
+            fx.dirty.load(Ordering::SeqCst),
+            3,
+            "re-recover adds only the co-deposit consumed-invite arm (space \
+             exists), never a second insert arm"
         );
     }
 

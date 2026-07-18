@@ -10162,6 +10162,18 @@ pub async fn start_node_inner(
                                             // ZEB-580 S2: shared-community
                                             // revocation cutoff handle.
                                             revoked: revoked_device_projection.clone(),
+                                            // ZEB-709: relay-recovered writes
+                                            // into owner-state must arm ITS
+                                            // engine's flush (the relay ack +
+                                            // coverage-GC otherwise outrun the
+                                            // un-persisted payload).
+                                            notify_owner_state_dirty: {
+                                                let e = std::sync::Arc::clone(
+                                                    &owner_state_engine_for_dirty,
+                                                );
+                                                Some(std::sync::Arc::new(move || e.notify_dirty())
+                                                    as std::sync::Arc<dyn Fn() + Send + Sync>)
+                                            },
                                         },
                                     );
                                     let relay_pull_transport: std::sync::Arc<
@@ -14319,6 +14331,7 @@ pub(crate) async fn add_space_impl(
         hlc_tracker,
         device_id,
         self_owner,
+        sync_engine,
         tunnel_manager,
         snapshot_generation,
     ) = {
@@ -14331,6 +14344,11 @@ pub(crate) async fn add_space_impl(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            // ZEB-709 (audit A2): the owner-state engine — the Space + invite
+            // outbox writes below must arm/fence its flush or the just-created
+            // conversation evaporates on a crash. Kept Option (not ok_or):
+            // engineless test states must not fail creation.
+            g.sync_engine.clone(),
             // ZEB-580 S1 Task 6: the invite's bootstrap `inviter_identity_pub` is
             // no longer sourced from NodeState here — it now comes (with the #2
             // signing identity + cert) from `outbox_g.dm_invite_material()` below,
@@ -14490,6 +14508,21 @@ pub(crate) async fn add_space_impl(
             )
             .await;
         }
+    }
+
+    // ZEB-709 (audit A2): durable-on-commit — the Space + invite OutboxEntry
+    // must survive a crash the moment this IPC returns (the UI shows the
+    // conversation; the drain owns the invite's delivery). Same bounded fence
+    // as create_community/redeem_invite (ZEB-393 class: their un-fenced twins
+    // had exactly this loss window).
+    if let Some(engine) = sync_engine.as_ref() {
+        fence_owner_state_flush(
+            engine,
+            OWNER_STATE_FENCE_TIMEOUT,
+            "add_space",
+            &hex::encode(space_id.0),
+        )
+        .await;
     }
 
     Ok(hex::encode(space_id.0))
@@ -36790,7 +36823,7 @@ async fn add_library(
     // R3 F3: snapshot `generation` paired-atomically with the Arcs so
     // the post-await fence below can detect a stop_node / start_node
     // racing through this command (mirrors add_space, send_dm).
-    let (crdt_state, library_directory, hlc_tracker, device_id, snapshot_generation) = {
+    let (crdt_state, library_directory, hlc_tracker, device_id, sync_engine, snapshot_generation) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -36799,6 +36832,9 @@ async fn add_library(
             g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            // ZEB-709 (audit A3): the owner-state engine — the libraries
+            // write below must arm its flush. Option, not ok_or.
+            g.sync_engine.clone(),
             g.generation,
         )
     };
@@ -36836,8 +36872,13 @@ async fn add_library(
         // it's unit-testable without a tauri::State harness.
         let new_entry = merge_add_library(crdt_g.libraries.get(&addr), addr, &now_hlc)?;
         crdt_g.libraries.insert(addr, new_entry);
-        // Persistence writeback: owner-state SyncEngine debounces its
-        // own checkpoint on the same crdt_state Arc (see add_space).
+    }
+    // ZEB-709 (audit A3): arm the owner-state flush. The previous comment
+    // here claimed the engine "debounces its own checkpoint" — no such
+    // autonomous mechanism exists; the engine persists ONLY when notified
+    // (or at the shutdown backstop, which a crash skips).
+    if let Some(engine) = sync_engine.as_ref() {
+        engine.notify_dirty();
     }
     let _ = library_directory
         .request_tx
@@ -36858,7 +36899,7 @@ async fn remove_library(
     // R3 F3: snapshot `generation` paired-atomically with the Arcs so
     // the post-await fence below can detect a stop_node / start_node
     // racing through this command (mirrors add_library, add_space).
-    let (crdt_state, library_directory, hlc_tracker, device_id, snapshot_generation) = {
+    let (crdt_state, library_directory, hlc_tracker, device_id, sync_engine, snapshot_generation) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -36867,6 +36908,9 @@ async fn remove_library(
             g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            // ZEB-709 (audit A4): the owner-state engine — the tombstone
+            // write below must arm its flush. Option, not ok_or.
+            g.sync_engine.clone(),
             g.generation,
         )
     };
@@ -36876,6 +36920,7 @@ async fn remove_library(
         .as_millis() as u64;
     let now_hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let mut tombstoned = false;
     {
         let mut crdt_g = crdt_state.lock().await;
         // R3 F3: post-await restart fence (same rationale as add_library).
@@ -36901,6 +36946,15 @@ async fn remove_library(
         merge_remove_library(crdt_g.libraries.get(&addr), &now_hlc)?;
         if let Some(lib) = crdt_g.libraries.get_mut(&addr) {
             lib.removed_at = Some(now_hlc);
+            tombstoned = true;
+        }
+    }
+    // ZEB-709 (audit A4): arm the owner-state flush for the tombstone — an
+    // un-persisted removal lets a de-authorized library reappear on restart.
+    // Gated on the actual write (row-absent is a documented no-op).
+    if tombstoned {
+        if let Some(engine) = sync_engine.as_ref() {
+            engine.notify_dirty();
         }
     }
     let _ = library_directory
@@ -39962,6 +40016,11 @@ pub(crate) async fn kick_from_community_impl(
                     g.crdt_state.clone()
                 } {
                     let mut state_g = crdt_state.lock().await;
+                    // ZEB-709 audit (B1): deliberately NOT notify_dirty'd —
+                    // this eager epoch write is a CACHE of the community
+                    // engine's authoritative epoch state, re-projected at
+                    // next boot (and re-derivable by the delta-consumer). A
+                    // crash loses only the eager copy, never the rotation.
                     if let Some(space) = state_g.spaces.get_mut(&space_id) {
                         let target_epoch = prior_epoch + 1;
                         if space.current_epoch.unwrap_or(0) < target_epoch {
@@ -42077,6 +42136,13 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR, FE, FutE
 /// called while the community-state mutex is already held (community-state
 /// mutations happen in `self_heal_community_observer`, which is always called
 /// AFTER this function returns).
+///
+/// ZEB-709 audit (B2): the epoch/key writes here are deliberately NOT
+/// owner-state `notify_dirty`'d — they cache the community engine's
+/// authoritative epoch state into the owner-state Space row and are
+/// re-projected at next boot (self-heal). This is NOT the remote-merge
+/// exemption (that covers only the owner-state root merger); it is a
+/// re-derivable-cache exemption. A crash loses only the cached copy.
 pub async fn apply_remote_epoch_event(
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -65830,6 +65896,143 @@ mod zeb703_outbox_runtime_durability_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// ZEB-709 (audit finding A2): creating a DM/GroupDM writes the Space AND
+    /// the invite OutboxEntry into owner-state — both must be durable at
+    /// runtime. On unfixed code `add_space_impl`'s handle snapshot omits the
+    /// SyncEngine entirely, so neither write ever arms the flush and a crash
+    /// (or pre-ZEB-703 graceful restart) silently forgets the just-created
+    /// conversation plus the invite the drain was supposed to deliver.
+    #[tokio::test]
+    async fn add_space_persists_space_and_invite_outbox_at_runtime_zeb709() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt =
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"));
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        let alice = crate::owner_state_types::OwnerAddr([0x01; 16]);
+        let bob = crate::owner_state_types::OwnerAddr([0x02; 16]);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
+            crate::owner_state_crypto::FleetKeySet::new(kt),
+            "zeb709-dev".into(),
+            Arc::clone(&crdt_state),
+            Arc::clone(&tracker),
+            Arc::new(crate::content_store::InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            250,
+        ));
+
+        let node = Mutex::new(NodeState {
+            dm_outbox: Some(Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+                "zeb709-dev",
+                alice,
+            )))),
+            dm_transport: Some(Arc::new(crate::dm_outbox::StubTransport::new())),
+            crdt_state: Some(Arc::clone(&crdt_state)),
+            hlc_tracker: Some(Arc::clone(&tracker)),
+            dm_device_id: Some("zeb709-dev".into()),
+            dm_self_owner: Some(alice),
+            content_store: Some(Arc::new(crate::content_store::InMemoryStub::default())),
+            dm_send_inflight: Some(Arc::new(tokio::sync::Semaphore::new(
+                DM_SEND_FENCE_CAPACITY,
+            ))),
+            dm_send_stopping: Some(Arc::new(AtomicBool::new(false))),
+            sync_engine: Some(Arc::clone(&engine)),
+            ..NodeState::default()
+        });
+
+        let space_hex = add_space_impl(
+            &node,
+            "dm".into(),
+            "Bob".into(),
+            Some(vec![hex::encode(bob.0)]),
+        )
+        .await
+        .expect("add_space_impl must succeed");
+        let sid: [u8; 16] = hex::decode(&space_hex)
+            .expect("space id hex")
+            .as_slice()
+            .try_into()
+            .expect("space id 16 bytes");
+        let space_id = crate::owner_state_types::SpaceId(sid);
+
+        poll_crdt_until(&crdt_path, "created DM Space + invite outbox entry", |s| {
+            s.spaces.contains_key(&space_id) && s.outbox.values().any(|e| e.space_id == space_id)
+        })
+        .await;
+    }
+
+    /// ZEB-709 (audit A3): adding a trusted library must persist at runtime.
+    /// The old in-code comment claimed the engine "debounces its own
+    /// checkpoint" — no such autonomous mechanism exists (the engine persists
+    /// only when notified), so on unfixed code the entry never reaches disk
+    /// and this test times out red.
+    #[tokio::test]
+    async fn add_library_persists_at_runtime_zeb709() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt =
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"));
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
+            crate::owner_state_crypto::FleetKeySet::new(kt),
+            "zeb709-dev".into(),
+            Arc::clone(&crdt_state),
+            Arc::clone(&tracker),
+            Arc::new(crate::content_store::InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            250,
+        ));
+        // Keep the receiver alive so the Subscribe request send isn't racing
+        // a closed channel (the command ignores the send result either way).
+        let (library_directory, _lib_rx) = crate::library_directory::LibraryDirectory::new();
+
+        let app = tauri::test::mock_builder()
+            .manage(Mutex::new(NodeState {
+                crdt_state: Some(Arc::clone(&crdt_state)),
+                hlc_tracker: Some(Arc::clone(&tracker)),
+                dm_device_id: Some("zeb709-dev".into()),
+                library_directory: Some(library_directory),
+                sync_engine: Some(Arc::clone(&engine)),
+                ..NodeState::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        use tauri::Manager as _;
+
+        let lib_owner = crate::owner_state_types::OwnerAddr([0x0C; 16]);
+        add_library(app.state::<Mutex<NodeState>>(), hex::encode(lib_owner.0))
+            .await
+            .expect("add_library must succeed");
+
+        poll_crdt_until(&crdt_path, "trusted-library entry", |s| {
+            s.libraries.contains_key(&lib_owner)
+        })
+        .await;
     }
 
     /// ZEB-703 delete path: a real delete must persist BOTH the entry
