@@ -3826,6 +3826,7 @@
       {friendService}
       {friendCardService}
       {dmInviteService}
+      {communityService}
       onOpenCard={openMemberCard}
       bind:activeTab={settingsTab}
     />

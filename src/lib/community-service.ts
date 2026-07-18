@@ -67,6 +67,19 @@ export interface CommunityNavDto {
 }
 
 /**
+ * ZEB-435: a left (but not yet deleted-forever) community for the
+ * left-communities management surface. Mirrors `LeftCommunityNavDto` in
+ * src-tauri/src/lib.rs (`#[serde(rename_all = "camelCase")]`). `leftAtMs` is
+ * the leave's HLC wall-clock for display. Returned from
+ * `list_left_communities`; rows disappear once `removeSpace` tombstones them.
+ */
+export interface LeftCommunityNavDto {
+  spaceId: string;
+  name: string;
+  leftAtMs: number;
+}
+
+/**
  * ZEB-393 Bug B: CommunityNavDto → an 'added' community nav payload for
  * `navService.addOrUpdateNavSpace`. `pending: undefined` when not pending so
  * the nav tree leaves the greyed state off (addOrUpdateNavSpace reads
@@ -304,6 +317,15 @@ export class CommunityService {
 
   async leaveCommunity(communityId: string): Promise<void> {
     await this.invoke<void>('leave_community', { communityId });
+  }
+
+  /**
+   * ZEB-435: enumerate left-but-not-deleted communities for the management
+   * surface (they're hidden from nav, so this list is the only way to reach
+   * them). Pull-on-open; no push events — re-fetch after each removeSpace.
+   */
+  async listLeftCommunities(): Promise<LeftCommunityNavDto[]> {
+    return this.invoke<LeftCommunityNavDto[]>('list_left_communities', {});
   }
 
   /**

@@ -383,7 +383,7 @@ All commands are `POST /v1/rpc/{command}` with a JSON object body
 |---|---|
 | Node lifecycle (2) | `start_node`, `stop_node` (serve auto-starts the node at boot) |
 | Identity (2) | `get_owner_state`, `mint_owner_identity` |
-| Communities (7) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, `redeem_invite`, `join_open_community`, `leave_community` |
+| Communities (9) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, `redeem_invite`, `join_open_community`, `leave_community`, `list_left_communities`, `remove_space` |
 | Channels (4) | `create_channel`, `list_channels`, `list_channel_messages`, `post_channel_message` |
 | Friends (7) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request` |
 | Spaces / DMs (3) | `add_space`, `send_dm`, `read_dm_thread` |

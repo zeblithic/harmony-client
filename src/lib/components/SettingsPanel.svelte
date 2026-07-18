@@ -18,6 +18,7 @@
   import type { FriendService } from '../friend-service';
   import type { DmInviteService } from '../dm-invite-service';
   import type { MemberCardService } from '../member-card-service';
+  import type { CommunityService } from '../community-service';
   import type { OpenCardPayload } from './MemberRow.svelte';
 
   import ProfileEditor from './ProfileEditor.svelte';
@@ -27,9 +28,17 @@
   import NotificationSettingsPanel from './NotificationSettingsPanel.svelte';
   import NetworkDiscoverabilitySettings from './NetworkDiscoverabilitySettings.svelte';
   import IrohRelaySettings from './IrohRelaySettings.svelte';
+  import LeftCommunitiesPanel from './LeftCommunitiesPanel.svelte';
   import FriendsPanel from './FriendsPanel.svelte';
 
-  type SettingsTab = 'profile' | 'appearance' | 'account' | 'notifications' | 'network' | 'friends';
+  type SettingsTab =
+    | 'profile'
+    | 'appearance'
+    | 'account'
+    | 'notifications'
+    | 'network'
+    | 'communities'
+    | 'friends';
 
   let {
     profile,
@@ -44,6 +53,7 @@
     friendService,
     friendCardService,
     dmInviteService,
+    communityService,
     onOpenCard,
     activeTab = $bindable('profile'),
   }: {
@@ -62,6 +72,9 @@
     /** ZEB-236 T7: shared DM-invite service, forwarded straight to FriendsPanel
      *  for its "DM invites" pending section. Optional (existing mounts/tests). */
     dmInviteService?: DmInviteService;
+    /** ZEB-435: shared community service for the left-communities management
+     *  tab. Optional (existing mounts/tests); the tab renders empty without it. */
+    communityService?: CommunityService;
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
     /**
      * Active tab. Bindable so the app can route to a specific section — e.g. the
@@ -77,6 +90,7 @@
     { id: 'account', label: 'Account' },
     { id: 'notifications', label: 'Notifications' },
     { id: 'network', label: 'Network' },
+    { id: 'communities', label: 'Communities' },
     { id: 'friends', label: 'Friends' },
   ];
 
@@ -191,6 +205,17 @@
   >
     <NetworkDiscoverabilitySettings />
     <IrohRelaySettings />
+  </div>
+  <div
+    class="tab-content"
+    role="tabpanel"
+    id="settings-tabpanel-communities"
+    aria-labelledby="settings-tab-communities"
+    hidden={activeTab !== 'communities'}
+  >
+    {#if communityService}
+      <LeftCommunitiesPanel service={communityService} />
+    {/if}
   </div>
   <div
     class="tab-content"
