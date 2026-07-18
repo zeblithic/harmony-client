@@ -154,6 +154,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     None,       // dm_outbox — DM outbox not exercised in this test
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
+                    None,       // ZEB-703: owner_sync_engine — DM outbox not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         // Phase 3 Task 9: on-demand adapter request channel; tx
@@ -483,6 +484,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     None,       // dm_outbox — DM outbox not exercised in this test
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
+                    None,       // ZEB-703: owner_sync_engine — DM outbox not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         // Phase 3 Task 9: on-demand adapter request channel; tx
@@ -921,6 +923,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     None,       // dm_outbox — DM outbox not exercised in this test
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
+                    None,       // ZEB-703: owner_sync_engine — DM outbox not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         // Phase 3 Task 9: on-demand adapter request channel; tx
@@ -1218,6 +1221,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     None,
                     None,
                     None,
+                    None, // ZEB-703: owner_sync_engine — DM outbox not exercised in this test
                     Vec::new(),
                     {
                         let (_tx, rx) = tokio::sync::mpsc::channel::<
@@ -1577,6 +1581,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     None,
                     None,
                     None,
+                    None, // ZEB-703: owner_sync_engine — DM outbox not exercised in this test
                     Vec::new(),
                     {
                         let (_tx, rx) = tokio::sync::mpsc::channel::<

@@ -175,6 +175,7 @@ async fn spawn_test_runtime() -> TestHarness {
                     None,
                     None,
                     None,
+                    None, // ZEB-703: owner_sync_engine — DM outbox not exercised in this test
                     Vec::new(),
                     {
                         let (_tx, rx) = tokio::sync::mpsc::channel::<

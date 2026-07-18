@@ -183,8 +183,7 @@ async fn shutdown_handler(
         }
     };
     if let Some(engine) = engine {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), engine.persist_now()).await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), engine.persist_now()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(
                 error = %e,

@@ -13694,7 +13694,15 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
     // Snapshot handles under the sync mutex; release before any .await.
     // Same pattern as send_dm — NodeState's sync mutex must not span
     // .await boundaries.
-    let (dm_outbox, crdt_state, hlc_tracker, device_id, dm_send_inflight, dm_send_stopping, sync_engine) = {
+    let (
+        dm_outbox,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        dm_send_inflight,
+        dm_send_stopping,
+        sync_engine,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -65348,9 +65356,8 @@ mod zeb703_outbox_runtime_durability_tests {
             crdt: crdt_path.clone(),
             replay: dir.path().join("state_root_replay.cbor"),
         };
-        let kt = Arc::new(
-            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
-        );
+        let kt =
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"));
         // Healthy publish rig: roomy channel, receiver held alive so the
         // debounce arm's publish leg can't error and mask the persist leg.
         let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -65484,9 +65491,8 @@ mod zeb703_outbox_runtime_durability_tests {
             crdt: crdt_path.clone(),
             replay: dir.path().join("state_root_replay.cbor"),
         };
-        let kt = Arc::new(
-            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
-        );
+        let kt =
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"));
         let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
 
@@ -65548,10 +65554,9 @@ mod zeb703_outbox_runtime_durability_tests {
             }))
             .build(mock_context_with_full_acl(&["delete_outbox_entry"]))
             .expect("mock app");
-        let webview =
-            tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
-                .build()
-                .expect("webview build");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("webview build");
 
         // Enqueue through the production path; wait for the runtime persist
         // (the send-path test above pins this leg — here it's the baseline).
@@ -65613,9 +65618,8 @@ mod zeb703_outbox_runtime_durability_tests {
             crdt: crdt_path.clone(),
             replay: dir.path().join("state_root_replay.cbor"),
         };
-        let kt = Arc::new(
-            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
-        );
+        let kt =
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"));
         let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
 
@@ -65715,9 +65719,8 @@ mod zeb703_outbox_runtime_durability_tests {
             crdt: crdt_path.clone(),
             replay: dir.path().join("state_root_replay.cbor"),
         };
-        let kt = Arc::new(
-            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
-        );
+        let kt =
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"));
         let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
 
