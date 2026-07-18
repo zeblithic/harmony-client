@@ -153,12 +153,98 @@ async fn status_handler(
 /// of the GUI's explicit quit). The send wakes `axum::serve`'s
 /// graceful-shutdown future; serve_cli's select observes the server task
 /// ending and runs the node teardown.
+///
+/// ZEB-703: owner-state is persisted BEFORE the 200 is sent. The ack is
+/// the signal supervisors act on (`curl …/v1/shutdown; sleep N; relaunch`
+/// — our own cross-WAN harness recipe), while `stop_inner`'s flush only
+/// runs AFTER axum drains — i.e. after the caller already has its 200. A
+/// supervisor that kills or relaunches on the ack would race the
+/// process's final save point and silently lose any un-flushed owner-state
+/// mutation (queued DMs — the observed ZEB-703 data loss). The pre-ack
+/// `persist_now` closes that window: everything enqueued before the call
+/// is durable by ack time. Bounded + best-effort: on timeout/error we
+/// warn and proceed (the process is going down either way, and
+/// `stop_inner`'s unconditional persist remains the backstop for the
+/// well-behaved-supervisor path).
 async fn shutdown_handler(
     State(ctx): State<ApiCtx>,
     headers: axum::http::HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if !authed(&ctx, &headers) {
         return unauthorized();
+    }
+    // Snapshot the handles out of the sync-mutex guard (guard must not
+    // live across an await); a poisoned lock degrades to no pre-flush.
+    let (engine, stopping, inflight, dm_outbox) = match ctx.state.node_state().lock() {
+        Ok(guard) => guard.pre_shutdown_flush_handles(),
+        Err(e) => {
+            tracing::warn!(error = %e, "ZEB-703: NodeState poisoned at shutdown; skipping pre-ack flush");
+            (None, None, None, None)
+        }
+    };
+    // Barrier (PR #485 round 1, CodeRabbit + Greptile P1): without it, a
+    // DM mutation landing WHILE persist_now snapshots could miss the
+    // persist and be lost to a kill-on-200 supervisor. Sequence mirrors
+    // stop_inner's ZEB-234 teardown (idempotent when stop_inner repeats
+    // it later):
+    //   1. stopping=true — new fenced IPC mutations reject ("node
+    //      stopping"), same Ordering::Release as stop_inner;
+    //   2. drain-path gate — new drain ticks skip entirely, so no new
+    //      detached Phase C task can spawn;
+    //   3. drain the ZEB-234 send-fence permits — every in-flight fenced
+    //      IPC mutation completes BEFORE the snapshot;
+    //   4. drain the Phase C fence — every in-flight detached Phase C
+    //      task (drain outcomes + deposit-rung acks) completes BEFORE
+    //      the snapshot;
+    //   5. persist_now — the snapshot now contains everything accepted
+    //      before the shutdown call.
+    // One 5s budget bounds the whole sequence; on timeout/error we warn +
+    // proceed (the process is going down either way; a wedged engine task
+    // starves stop_inner's backstop persist equally — the ZEB-509 fence
+    // accepts the same degraded mode, see
+    // fence_owner_state_flush_returns_on_stalled_engine).
+    let barrier_and_persist = async {
+        if let Some(flag) = stopping.as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(outbox) = dm_outbox {
+            let (gate, phase_c_sem) = {
+                let guard = outbox.lock().await;
+                guard.shutdown_fence_handles()
+            };
+            gate.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(sem) = inflight {
+                crate::drain_dm_send_fence(sem).await;
+            }
+            // Wait for every in-flight detached Phase C task; permits are
+            // dropped immediately — only the blocking effect is needed
+            // (the gate prevents new spawns).
+            match Arc::clone(&phase_c_sem)
+                .acquire_many_owned(crate::dm_outbox::DRAIN_PHASE_C_FENCE_CAPACITY as u32)
+                .await
+            {
+                Ok(permits) => drop(permits),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ZEB-703: Phase C fence closed; proceeding");
+                }
+            }
+        } else if let Some(sem) = inflight {
+            crate::drain_dm_send_fence(sem).await;
+        }
+        match engine {
+            Some(engine) => engine.persist_now().await.map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), barrier_and_persist).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "ZEB-703: pre-ack owner-state persist failed; proceeding with shutdown"
+        ),
+        Err(_) => tracing::warn!(
+            "ZEB-703: pre-ack barrier/persist timed out (5s); proceeding with shutdown"
+        ),
     }
     // Err = shutdown already requested (channel full or receiver consumed) —
     // still report success; the process is going down either way.

@@ -267,6 +267,7 @@ async fn spawn_test_runtime() -> TestHarness {
                     None,       // dm_outbox — DM outbox not exercised in this test
                     None,       // dm_transport — DM outbox not exercised in this test
                     None,       // crdt_state — DM outbox not exercised in this test
+                    None,       // ZEB-703: owner_sync_engine — DM outbox not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                     {
                         // Phase 3 Task 9: on-demand adapter request channel; not
