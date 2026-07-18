@@ -878,19 +878,15 @@ pub struct NodeState {
     /// observe that the feed wiring actually runs; production reads go
     /// through the receive-path handles, not this field.
     revoked_device_projection: Option<crate::revoked_device_projection::RevokedDeviceProjection>,
+    /// ZEB-678 S2 / ZEB-683: the feed-authority publish + stamp gates, keyed by
+    /// publisher-material fingerprint (see [`VineAuthorityGates`]). Shared as an
+    /// `Arc` so the transport-epoch re-offer task can hold them without holding
+    /// `NodeState`. Always present (fresh `Default` per `NodeState`
+    /// construction); contents persist across in-process stop/start, which is
+    /// benign — the record is LWW and the re-offer task re-asserts it on peer
+    /// up-edges.
+    vine_authority_gates: std::sync::Arc<std::sync::Mutex<VineAuthorityGates>>,
     /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
-    /// ZEB-678 S2: set true after this device publishes its feed
-    /// `FeedAuthorityRecord` (the Zenoh authority sample) for the first time this
-    /// boot. Once-per-boot gate for `publish_feed_authority_if_needed` (the record
-    /// is LWW; re-publishing every vine would be wasteful — steady state converges
-    /// on the first publish).
-    vine_authority_published: bool,
-    /// ZEB-678 S2 (review-fix): set true once the active binding is stamped into
-    /// this device's fleet-net `feed_binding`. GATED SEPARATELY from the Zenoh
-    /// publish so a stamp that no-ops (fleet-net not yet wired / self-row absent)
-    /// is retried on later vine publishes WITHOUT re-publishing the authority
-    /// record — the stamp is the material a seed-holder needs to master-revoke.
-    vine_feed_binding_stamped: bool,
     /// start_node alongside the SyncEngine; shared with the IPC handler
     /// (send_dm) and the event-loop drain tick.
     dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
@@ -1823,8 +1819,9 @@ impl Default for NodeState {
             community_registry: None,
             community_delta_tx: None,
             revoked_device_projection: None,
-            vine_authority_published: false,
-            vine_feed_binding_stamped: false,
+            vine_authority_gates: std::sync::Arc::new(std::sync::Mutex::new(
+                VineAuthorityGates::default(),
+            )),
             dm_outbox: None,
             dm_transport: None,
             butler_deposit_client: None,
@@ -11190,6 +11187,9 @@ pub async fn start_node_inner(
                         guard.generation += 1;
                         guard.thread = Some(thread);
                         guard.shutdown_tx = Some(shutdown_tx);
+                        // ZEB-683: keep a clone for the vine-authority re-offer
+                        // task spawned below (the original moves into the guard).
+                        let publish_tx_for_vine_reoffer = publish_tx.clone();
                         guard.publish_tx = Some(publish_tx);
                         guard.fetch_tx = Some(fetch_tx);
                         guard.ingest_tx = Some(ingest_tx);
@@ -11310,7 +11310,24 @@ pub async fn start_node_inner(
                         // redeem / fork_community IPC paths can clone it
                         // into their engine spawns. The matching sender
                         // was moved into event_loop::run above.
-                        guard.transport_epoch_rx = Some(transport_epoch_rx);
+                        guard.transport_epoch_rx = Some(transport_epoch_rx.clone());
+                        // ZEB-683: re-offer the feed authority record on
+                        // transport up-edges. Spawned (never inlined — see the
+                        // start_node inline-await hazard) with individual Arc
+                        // captures, per the no-NodeState-in-tasks pattern; the
+                        // loop exits when the epoch sender drops at node stop.
+                        // Gated on the outbox (enrolled devices only — the only
+                        // ones that can migrate a feed).
+                        if let Some(outbox_for_reoffer) = dm_outbox_arc.clone() {
+                            tokio::spawn(run_vine_authority_reoffer(
+                                transport_epoch_rx.clone(),
+                                guard.vine_authority_gates.clone(),
+                                outbox_for_reoffer,
+                                owner_trust_doc_opt.clone(),
+                                publish_tx_for_vine_reoffer,
+                                std::sync::Arc::clone(&private_identity_arc),
+                            ));
+                        }
                         // ZEB-298+ZEB-312 PR 1: store the voting-log adapter-
                         // request sender so `ensure_voting_engine_for` can
                         // dispatch `VotingLogAdapterRequest`s into the event
@@ -14939,16 +14956,86 @@ async fn vine_publisher_material(
     Some((g.community_signing_key.clone(), g.enrollment_cert.clone()))
 }
 
-/// ZEB-678 S2: on this device's first migrated vine publish, build + publish its
-/// feed `FeedAuthorityRecord` (active binding, no revocation) to
+/// ZEB-682: the signer-cert bundle this device must attach wherever it presents
+/// its own enrollment cert on the vine wire (authority record, reaction v2). A
+/// Master-issued cert needs none (fast path, no locks); a Quorum-issued cert
+/// pulls its signers' Master certs from the trust doc via `own_cert_bundle`.
+/// A missing trust doc yields an empty bundle — the authority publish path's
+/// self-check then keeps the feed on the legacy path (honest degraded mode)
+/// rather than publishing a record every receiver drops.
+async fn own_signer_bundle(
+    state: &Mutex<NodeState>,
+    cert: &harmony_owner::certs::EnrollmentCert,
+) -> Vec<harmony_owner::certs::EnrollmentCert> {
+    let doc = match state.lock() {
+        Ok(g) => g.owner_trust_doc.clone(),
+        Err(_) => None,
+    };
+    signer_bundle_from_doc(&doc, cert).await
+}
+
+/// ZEB-682/683: `own_signer_bundle` core over an already-extracted trust-doc
+/// handle — the shape the transport-epoch re-offer task holds (it never touches
+/// `NodeState`).
+async fn signer_bundle_from_doc(
+    doc: &Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+    cert: &harmony_owner::certs::EnrollmentCert,
+) -> Vec<harmony_owner::certs::EnrollmentCert> {
+    if matches!(
+        cert.issuer,
+        harmony_owner::certs::EnrollmentIssuer::Master { .. }
+    ) {
+        return Vec::new();
+    }
+    match doc {
+        Some(doc) => {
+            let g = doc.lock().await;
+            crate::enrollment_verify::own_cert_bundle(&g, cert)
+        }
+        None => {
+            tracing::warn!("vine signer bundle: trust doc unavailable; quorum bundle empty");
+            Vec::new()
+        }
+    }
+}
+
+/// ZEB-683: the feed-authority publish/stamp gates, keyed by publisher-material
+/// fingerprint `{publisher_key_hex}:{cert_issued_at}` — so the first publish,
+/// a cert renewal, and a `#2` rotation each re-arm, while agreeing re-publishes
+/// stay suppressed (the record is LWW; steady state is one publish per material
+/// generation). The stamp gate is tracked separately so a stamp that no-ops
+/// (fleet-net not yet wired) retries without re-publishing the record.
+#[derive(Debug, Default)]
+pub(crate) struct VineAuthorityGates {
+    /// Fingerprint of the material last published to the Zenoh authority topic.
+    published_fp: Option<String>,
+    /// Fingerprint of the material last stamped into the fleet-net
+    /// `feed_binding` row.
+    stamped_fp: Option<String>,
+}
+
+/// The publish/stamp gate fingerprint for the current publisher material.
+fn vine_material_fingerprint(
+    sk: &ed25519_dalek::SigningKey,
+    cert: &harmony_owner::certs::EnrollmentCert,
+) -> String {
+    format!(
+        "{}:{}",
+        hex::encode(sk.verifying_key().to_bytes()),
+        cert.issued_at
+    )
+}
+
+/// ZEB-678 S2 / ZEB-683: on a migrated vine publish, build + publish this
+/// device's feed `FeedAuthorityRecord` (active binding, no revocation) to
 /// `harmony/vines/{N}/authority`, and self-stamp the record into its fleet-net
-/// row so a seed-holder can master-revoke it later (§3.5). The Zenoh publish and
-/// the fleet-net stamp are gated INDEPENDENTLY (`vine_authority_published` /
-/// `vine_feed_binding_stamped`) so a stamp that no-ops (fleet-net not yet wired)
-/// retries on a later vine publish without re-publishing the LWW record. The
-/// publish is reserved atomically to avoid concurrent duplicates. Best-effort —
-/// a failure is logged, does NOT fail the content publish, and leaves the
-/// relevant gate unset so the next vine publish retries.
+/// row so a seed-holder can master-revoke it later (§3.5). Both actions are
+/// gated INDEPENDENTLY on the material fingerprint (ZEB-683 — first publish,
+/// cert renewal, and `#2` rotation each re-arm; a stamp that no-ops retries on
+/// a later vine publish without re-publishing the LWW record). The publish is
+/// reserved atomically to avoid concurrent duplicates. Best-effort — a failure
+/// is logged, does NOT fail the content publish, and restores the gate so the
+/// next vine publish retries.
 async fn publish_feed_authority_if_needed(
     state: &Mutex<NodeState>,
     publish_tx: &tokio::sync::mpsc::Sender<event_loop::PublishRequest>,
@@ -14956,31 +15043,37 @@ async fn publish_feed_authority_if_needed(
     sk: &ed25519_dalek::SigningKey,
     cert: &harmony_owner::certs::EnrollmentCert,
 ) {
+    let gates = match state.lock() {
+        Ok(g) => g.vine_authority_gates.clone(),
+        Err(_) => return,
+    };
+    let current_fp = vine_material_fingerprint(sk, cert);
     // Decide what still needs doing and ATOMICALLY reserve the Zenoh publish, so
     // two concurrent vine publishes can't emit duplicate authority records
     // (CodeRabbit). The fleet-net stamp is gated separately (Qodo/CodeRabbit): a
     // stamp that no-ops (fleet-net not yet wired) must retry on a later vine
     // publish WITHOUT re-publishing the authority record.
-    let (do_publish, do_stamp) = match state.lock() {
+    let (do_publish, do_stamp, prev_published_fp) = match gates.lock() {
         Ok(mut g) => {
-            let do_publish = !g.vine_authority_published;
-            let do_stamp = !g.vine_feed_binding_stamped;
+            let do_publish = g.published_fp.as_deref() != Some(current_fp.as_str());
+            let do_stamp = g.stamped_fp.as_deref() != Some(current_fp.as_str());
             if !do_publish && !do_stamp {
                 return;
             }
+            let prev = g.published_fp.clone();
             if do_publish {
-                g.vine_authority_published = true; // reserve
+                g.published_fp = Some(current_fp.clone()); // reserve
             }
-            (do_publish, do_stamp)
+            (do_publish, do_stamp, prev)
         }
         Err(_) => return,
     };
-    // Release the reservation so a later vine publish retries, on any failure
-    // before the Zenoh publish actually lands.
+    // Restore the previous fingerprint so a later vine publish retries, on any
+    // failure before the Zenoh publish actually lands.
     let release_publish = || {
         if do_publish {
-            if let Ok(mut g) = state.lock() {
-                g.vine_authority_published = false;
+            if let Ok(mut g) = gates.lock() {
+                g.published_fp = prev_published_fp.clone();
             }
         }
     };
@@ -14988,7 +15081,10 @@ async fn publish_feed_authority_if_needed(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let rec = match feed_authority::build_active_authority(identity, sk, cert, now_ms) {
+    // ZEB-682: thread the quorum signer bundle so a quorum-issued device's
+    // record verifies at receivers (empty for master-issued).
+    let bundle = own_signer_bundle(state, cert).await;
+    let rec = match feed_authority::build_active_authority(identity, sk, cert, &bundle, now_ms) {
         Ok(r) => r,
         Err(e) => {
             release_publish();
@@ -14996,6 +15092,14 @@ async fn publish_feed_authority_if_needed(
             return;
         }
     };
+    // ZEB-682: self-check — never publish a record receivers will drop (short
+    // or missing quorum bundle, expired own cert). The gate is released so a
+    // later vine publish retries once the material heals.
+    if let Err(e) = feed_authority::verify_authority(&rec, now_ms / 1000) {
+        release_publish();
+        tracing::warn!(error = %e, "vine authority: self-check failed; feed stays on legacy path");
+        return;
+    }
     let rec_json = match serde_json::to_string(&rec) {
         Ok(j) => j,
         Err(e) => {
@@ -15038,8 +15142,98 @@ async fn publish_feed_authority_if_needed(
     // master-revoke). Latch the stamp gate ONLY when it actually applied, so a
     // no-op retries on the next vine publish without re-publishing the record.
     if do_stamp && stamp_feed_binding(state, &rec_json).await {
-        if let Ok(mut g) = state.lock() {
-            g.vine_feed_binding_stamped = true;
+        if let Ok(mut g) = gates.lock() {
+            g.stamped_fp = Some(current_fp.clone());
+        }
+    }
+}
+
+/// ZEB-683: transport-epoch re-offer loop for the feed authority record. The
+/// record is a bare Zenoh PUT — a follower that subscribes after the publish
+/// never sees it (and follower caches are in-memory, so a restarted follower
+/// forgets it). Peer up-edges bump the transport epoch (event_loop ~5s poll,
+/// the same trigger `run_epoch_republish` uses for the dataset engines); each
+/// bump re-offers the CURRENT record with a fresh `updated_at` (receivers pin
+/// or benign-refresh) — but only if this device has already migrated this boot
+/// (`published_fp` set): a feed that never vine-published is never
+/// force-migrated. Material is re-read per firing, so a mid-session cert
+/// renewal or `#2` rotation re-offers the NEW record and re-arms the gate.
+/// Exits when the transport-epoch sender drops at node stop.
+async fn run_vine_authority_reoffer(
+    mut epoch_rx: tokio::sync::watch::Receiver<u64>,
+    gates: std::sync::Arc<std::sync::Mutex<VineAuthorityGates>>,
+    dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    owner_trust_doc: Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+    publish_tx: tokio::sync::mpsc::Sender<event_loop::PublishRequest>,
+    identity: std::sync::Arc<harmony_identity::PrivateIdentity>,
+) {
+    while epoch_rx.changed().await.is_ok() {
+        let migrated = gates
+            .lock()
+            .map(|g| g.published_fp.is_some())
+            .unwrap_or(false);
+        if !migrated {
+            continue;
+        }
+        let (sk, cert) = {
+            let g = dm_outbox.lock().await;
+            (g.community_signing_key.clone(), g.enrollment_cert.clone())
+        };
+        let bundle = signer_bundle_from_doc(&owner_trust_doc, &cert).await;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let rec =
+            match feed_authority::build_active_authority(&identity, &sk, &cert, &bundle, now_ms) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "vine authority re-offer: build failed; skipping");
+                    continue;
+                }
+            };
+        // Same self-check as the gated publish path: never put a record
+        // receivers will drop.
+        if let Err(e) = feed_authority::verify_authority(&rec, now_ms / 1000) {
+            tracing::warn!(error = %e, "vine authority re-offer: self-check failed; skipping");
+            continue;
+        }
+        let payload = match serde_json::to_vec(&rec) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "vine authority re-offer: serialize failed");
+                continue;
+            }
+        };
+        let key_expr = format!("harmony/vines/{}/authority", rec.feed_id);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if publish_tx
+            .send(event_loop::PublishRequest {
+                key_expr,
+                payload,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            // Event loop gone — the node is stopping; the loop exits on the
+            // dropped watch sender next iteration.
+            continue;
+        }
+        match reply_rx.await {
+            Ok(Ok(())) => {
+                // Re-arm the gate to the material just offered, so a
+                // mid-session rotation that re-published here doesn't
+                // re-publish again on the next vine publish.
+                if let Ok(mut g) = gates.lock() {
+                    g.published_fp = Some(vine_material_fingerprint(&sk, &cert));
+                }
+                tracing::debug!("vine authority re-offer: published on transport up-edge");
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "vine authority re-offer: publish rejected");
+            }
+            Err(_) => {}
         }
     }
 }
@@ -15482,7 +15676,11 @@ pub(crate) async fn publish_vine_reaction_impl(
         Some((sk, cert)) => {
             wire.owner_id = Some(hex::encode(cert.owner_id));
             wire.enrollment_cbor_hex = Some(feed_authority::encode_cert(&cert)?);
-            wire.signer_certs_cbor_hex = String::new();
+            // ZEB-682: a quorum-issued device must attach its signer bundle —
+            // receivers hard-reject a v2 reaction whose carried enrollment
+            // cannot verify (empty bundle ⇒ every quorum reaction dropped).
+            wire.signer_certs_cbor_hex =
+                feed_authority::encode_certs(&own_signer_bundle(state, &cert).await)?;
             vine_signing::sign_reaction(&identity, &mut wire);
             vine_signing::sign_reaction_v2(&sk, &mut wire);
             publish_feed_authority_if_needed(state, &publish_tx, &identity, &sk, &cert).await;
@@ -66850,6 +67048,277 @@ mod zeb708_gui_exit_flush_tests {
     }
 }
 
+// ── ZEB-682/683: feed-authority quorum bundle + fingerprint gates + re-offer ──
+#[cfg(test)]
+mod zeb682_683_feed_authority_tests {
+    use super::*;
+    use crate::enrollment_verify::quorum_fixtures::{
+        mint_quorum_world, QUORUM_ISSUED_AT, SIGNER_ISSUED_AT, WORLD_NOW,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// Answer every `PublishRequest` on `rx` with `reply(result)`, recording
+    /// key_exprs. Returns the recorder.
+    fn spawn_publish_responder(
+        mut rx: tokio::sync::mpsc::Receiver<event_loop::PublishRequest>,
+        result: fn() -> Result<(), String>,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = seen.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                seen_task
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(req.key_expr.clone());
+                let _ = req.reply.send(result());
+            }
+        });
+        seen
+    }
+
+    fn published_count(seen: &Arc<Mutex<Vec<String>>>) -> usize {
+        seen.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Master-issue a RENEWED cert for the same device: same keys (device_id
+    /// is `hash(device_pubkeys)`, so the keys cannot change), strictly newer
+    /// `issued_at`. This is the one material change ZEB-683's fingerprint gate
+    /// must react to — see the `PinnedAuthority` doc for why a key rotation is
+    /// unrepresentable.
+    fn renewed_cert(
+        world: &crate::enrollment_verify::quorum_fixtures::QuorumWorld,
+        cert: &harmony_owner::certs::EnrollmentCert,
+        issued_at: u64,
+    ) -> harmony_owner::certs::EnrollmentCert {
+        harmony_owner::certs::EnrollmentCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            cert.device_id,
+            cert.device_pubkeys.clone(),
+            issued_at,
+            None,
+        )
+        .expect("sign renewed cert")
+    }
+
+    #[tokio::test]
+    async fn publish_feed_authority_gates_on_material_fingerprint_zeb683() {
+        let world = mint_quorum_world(0x40);
+        let state = Mutex::new(NodeState::default());
+        let (tx, rx) = tokio::sync::mpsc::channel::<event_loop::PublishRequest>(8);
+        let seen = spawn_publish_responder(rx, || Ok(()));
+        let identity = harmony_identity::PrivateIdentity::from_seed(&[0x71; 32]);
+
+        // First publish for this material.
+        publish_feed_authority_if_needed(&state, &tx, &identity, &world.a_sk, &world.a_cert).await;
+        assert_eq!(published_count(&seen), 1, "first material publishes");
+        assert!(
+            seen.lock().unwrap_or_else(|p| p.into_inner())[0].ends_with("/authority"),
+            "authority topic"
+        );
+
+        // Same material again: suppressed (LWW record already out).
+        publish_feed_authority_if_needed(&state, &tx, &identity, &world.a_sk, &world.a_cert).await;
+        assert_eq!(published_count(&seen), 1, "agreeing material suppressed");
+
+        // Cert renewal (same keys, newer issued_at): the fingerprint moves and
+        // the record re-publishes with the fresh embedded cert — the ZEB-683
+        // staleness fix (late followers must never ingest an expired cert).
+        let renewed = renewed_cert(&world, &world.a_cert, SIGNER_ISSUED_AT + 100);
+        publish_feed_authority_if_needed(&state, &tx, &identity, &world.a_sk, &renewed).await;
+        assert_eq!(published_count(&seen), 2, "renewed material re-publishes");
+    }
+
+    #[tokio::test]
+    async fn publish_feed_authority_releases_gate_on_rejected_publish_zeb683() {
+        let world = mint_quorum_world(0x44);
+        let state = Mutex::new(NodeState::default());
+        let identity = harmony_identity::PrivateIdentity::from_seed(&[0x72; 32]);
+
+        // A rejected publish must restore the previous fingerprint…
+        let (tx_err, rx_err) = tokio::sync::mpsc::channel::<event_loop::PublishRequest>(8);
+        let seen_err = spawn_publish_responder(rx_err, || Err("zenoh down".to_string()));
+        publish_feed_authority_if_needed(&state, &tx_err, &identity, &world.a_sk, &world.a_cert)
+            .await;
+        assert_eq!(published_count(&seen_err), 1, "attempt reached the loop");
+
+        // …so the next vine publish retries the same material.
+        let (tx_ok, rx_ok) = tokio::sync::mpsc::channel::<event_loop::PublishRequest>(8);
+        let seen_ok = spawn_publish_responder(rx_ok, || Ok(()));
+        publish_feed_authority_if_needed(&state, &tx_ok, &identity, &world.a_sk, &world.a_cert)
+            .await;
+        assert_eq!(published_count(&seen_ok), 1, "released gate retries");
+    }
+
+    #[tokio::test]
+    async fn publish_feed_authority_self_check_blocks_unverifiable_record_zeb682() {
+        // Quorum-issued cert with NO trust doc wired (empty bundle): the built
+        // record can never verify at receivers — the self-check must keep it
+        // off the wire and leave the gate released for a later retry.
+        let world = mint_quorum_world(0x48);
+        let state = Mutex::new(NodeState::default());
+        let (tx, rx) = tokio::sync::mpsc::channel::<event_loop::PublishRequest>(8);
+        let seen = spawn_publish_responder(rx, || Ok(()));
+        let identity = harmony_identity::PrivateIdentity::from_seed(&[0x73; 32]);
+
+        publish_feed_authority_if_needed(&state, &tx, &identity, &world.c_sk, &world.c_quorum_cert)
+            .await;
+        assert_eq!(
+            published_count(&seen),
+            0,
+            "unverifiable record never published"
+        );
+        let gates = state.lock().unwrap().vine_authority_gates.clone();
+        assert!(
+            gates.lock().unwrap().published_fp.is_none(),
+            "gate released for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_feed_authority_quorum_with_trust_doc_publishes_zeb682() {
+        // With the trust doc wired, the quorum device's bundle is sourced via
+        // own_cert_bundle and the record passes the self-check end-to-end.
+        let world = mint_quorum_world(0x4C);
+        let mut trust = harmony_owner::state::OwnerState::new(world.owner_id);
+        trust
+            .add_enrollment(
+                world.a_cert.clone(),
+                WORLD_NOW,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .expect("enroll A");
+        trust
+            .add_enrollment(
+                world.b_cert.clone(),
+                WORLD_NOW,
+                harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .expect("enroll B");
+        let state = Mutex::new(NodeState::default());
+        state.lock().unwrap().owner_trust_doc = Some(Arc::new(tokio::sync::Mutex::new(trust)));
+        let (tx, rx) = tokio::sync::mpsc::channel::<event_loop::PublishRequest>(8);
+        let seen = spawn_publish_responder(rx, || Ok(()));
+        let identity = harmony_identity::PrivateIdentity::from_seed(&[0x74; 32]);
+
+        publish_feed_authority_if_needed(&state, &tx, &identity, &world.c_sk, &world.c_quorum_cert)
+            .await;
+        assert_eq!(published_count(&seen), 1, "quorum record published");
+        let gates = state.lock().unwrap().vine_authority_gates.clone();
+        assert_eq!(
+            gates.lock().unwrap().published_fp.as_deref(),
+            Some(vine_material_fingerprint(&world.c_sk, &world.c_quorum_cert).as_str()),
+            "gate latched to the quorum material"
+        );
+        assert_eq!(
+            world.c_quorum_cert.issued_at, QUORUM_ISSUED_AT,
+            "fixture sanity: quorum cert carries its signed issued_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn signer_bundle_from_doc_sources_quorum_bundle_zeb682() {
+        let world = mint_quorum_world(0x50);
+        // Master cert: empty without touching any doc.
+        assert!(signer_bundle_from_doc(&None, &world.a_cert)
+            .await
+            .is_empty());
+        // Quorum cert without a doc: empty (degraded — self-check keeps it
+        // off the wire).
+        assert!(signer_bundle_from_doc(&None, &world.c_quorum_cert)
+            .await
+            .is_empty());
+        // Quorum cert with a stocked doc: the signers' Master certs.
+        let mut trust = harmony_owner::state::OwnerState::new(world.owner_id);
+        for c in [&world.a_cert, &world.b_cert] {
+            trust
+                .add_enrollment(
+                    c.clone(),
+                    WORLD_NOW,
+                    harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                )
+                .expect("enroll signer");
+        }
+        let doc = Some(Arc::new(tokio::sync::Mutex::new(trust)));
+        let bundle = signer_bundle_from_doc(&doc, &world.c_quorum_cert).await;
+        assert_eq!(bundle, vec![world.a_cert.clone(), world.b_cert.clone()]);
+    }
+
+    #[tokio::test]
+    async fn run_vine_authority_reoffer_republishes_on_up_edge_zeb683() {
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let gates = Arc::new(Mutex::new(VineAuthorityGates::default()));
+        let outbox = Arc::new(tokio::sync::Mutex::new(
+            super::zeb703_outbox_runtime_durability_tests::make_outbox_synthetic(
+                "reoffer-dev",
+                crate::owner_state_types::OwnerAddr([0x0A; 16]),
+            ),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<event_loop::PublishRequest>(8);
+        let identity = Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x75; 32]));
+
+        tokio::spawn(run_vine_authority_reoffer(
+            epoch_rx,
+            gates.clone(),
+            outbox.clone(),
+            None,
+            tx,
+            identity,
+        ));
+
+        // Not migrated yet (fp None): an up-edge must NOT publish.
+        epoch_tx.send(1).expect("bump");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "un-migrated feed is never force-migrated"
+        );
+
+        // Migrated: the next up-edge re-offers the current record.
+        gates.lock().unwrap_or_else(|p| p.into_inner()).published_fp = Some("stale-fp".to_string());
+        epoch_tx.send(2).expect("bump");
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("re-offer within bound")
+            .expect("channel open");
+        assert!(req.key_expr.ends_with("/authority"), "authority topic");
+        let rec: feed_authority::FeedAuthorityRecord =
+            serde_json::from_slice(&req.payload).expect("record json");
+        feed_authority::verify_authority(
+            &rec,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+        .expect("re-offered record verifies");
+        let _ = req.reply.send(Ok(()));
+
+        // The gate re-arms to the material actually offered (a mid-session
+        // rotation re-published here must not re-publish again on the next
+        // vine publish).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let fp = gates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .published_fp
+                .clone();
+            if fp.as_deref() != Some("stale-fp") {
+                assert!(fp.is_some(), "gate stays armed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gate must re-arm to the offered material"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod start_node_race_tests {
     use super::*;
@@ -66904,8 +67373,9 @@ mod start_node_race_tests {
             community_registry: None,
             community_delta_tx: None,
             revoked_device_projection: None,
-            vine_authority_published: false,
-            vine_feed_binding_stamped: false,
+            vine_authority_gates: std::sync::Arc::new(std::sync::Mutex::new(
+                VineAuthorityGates::default(),
+            )),
             dm_outbox: None,
             dm_transport: None,
             butler_deposit_client: None,

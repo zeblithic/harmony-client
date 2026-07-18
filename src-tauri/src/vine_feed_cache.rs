@@ -3852,6 +3852,7 @@ mod tests {
             &n,
             &world.a_sk,
             &world.a_cert,
+            &[],
             updated_at_ms,
         )
         .expect("build authority record");

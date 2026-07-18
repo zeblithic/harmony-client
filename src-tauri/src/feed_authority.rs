@@ -110,15 +110,16 @@ pub fn sign_authority_binding(
 /// ZEB-678 S2: build a device's own *active* `FeedAuthorityRecord` for its
 /// feed `N` (no revocation). `node_identity` is the feed's `#3` key (hashes to
 /// `N` and produces `n_sig`); `sk` is the enrolled `#2` device key; `cert` is
-/// this device's own enrollment. Master-issued self-publish uses an empty
-/// signer bundle (a quorum-enrolled device whose own cert is quorum-issued
-/// would need its signer bundle threaded — see the §11 follow-up). Errors if
-/// the `#2` signing key does not match the enrolled `publisher_key`, so a
-/// record that could not verify is never published.
+/// this device's own enrollment. `signer_certs` is the quorum signer bundle a
+/// quorum-issued `cert` needs to verify (`own_cert_bundle`); master-issued
+/// self-publish passes an empty slice, which serde omits from the wire
+/// (ZEB-682). Errors if the `#2` signing key does not match the enrolled
+/// `publisher_key`, so a record that could not verify is never published.
 pub fn build_active_authority(
     node_identity: &harmony_identity::PrivateIdentity,
     sk: &ed25519_dalek::SigningKey,
     cert: &EnrollmentCert,
+    signer_certs: &[EnrollmentCert],
     updated_at_ms: u64,
 ) -> Result<FeedAuthorityRecord, String> {
     let publisher_key = sk.verifying_key().to_bytes();
@@ -132,7 +133,7 @@ pub fn build_active_authority(
         publisher_key: hex::encode(publisher_key),
         n_identity_pub: String::new(), // set by sign_authority_binding
         enrollment_cbor_hex: encode_cert(cert)?,
-        signer_certs_cbor_hex: String::new(),
+        signer_certs_cbor_hex: encode_certs(signer_certs)?,
         revocation_cbor_hex: None,
         updated_at: updated_at_ms,
         n_sig: String::new(), // set by sign_authority_binding
@@ -343,6 +344,19 @@ pub fn verify_authority(
 
 /// The pinned per-feed state a follower keeps. The binding is set once
 /// (first-write-wins); `revoked` is monotonic-true.
+///
+/// ZEB-683 investigated an authenticated "supersession" path for a same-device
+/// `#2` rotation and found it UNREPRESENTABLE: `EnrollmentCert::verify`
+/// enforces `device_id == hash(device_pubkeys)`, so a record pairing the
+/// pinned `device_id` with a different `#2` key can never pass
+/// [`verify_authority`]. A `#2` key change therefore mints a NEW device
+/// identity — which is device replacement, and a replaced device's feed does
+/// not survive by design (spec §2; feed continuity across devices is the §11
+/// "canonical owner feed" follow-up). What CAN change for the same device is
+/// cert metadata only (renewal `issued_at`/`expires_at`, Master↔Quorum
+/// re-issue over the same keys) — same binding, so it lands as
+/// [`IngestOutcome::BenignRefresh`] and each record re-verifies its own
+/// embedded cert. First-write-wins stays absolute.
 #[derive(Debug, Clone)]
 pub struct PinnedAuthority {
     pub device_id: [u8; 16],
@@ -378,7 +392,10 @@ impl FeedAuthorityCache {
     }
 
     /// Verify and merge a record. The active binding is first-write-wins; a
-    /// verified revocation sets `revoked` true forever (never cleared).
+    /// verified revocation sets `revoked` true forever (never cleared). There
+    /// is deliberately NO repin path — see the [`PinnedAuthority`] doc for the
+    /// ZEB-683 finding (a same-device `#2` change is unrepresentable; cert
+    /// renewals keep the binding and land as `BenignRefresh`).
     ///
     /// `now_secs` is the verifier-controlled wall clock forwarded to
     /// [`verify_authority`] for the enrollment-validity check — never derived
@@ -466,7 +483,7 @@ mod tests {
         rec
     }
     use crate::enrollment_verify::quorum_fixtures::{
-        mint_quorum_revocation, mint_quorum_world, WORLD_NOW,
+        mint_quorum_revocation, mint_quorum_world, QUORUM_ISSUED_AT, SIGNER_ISSUED_AT, WORLD_NOW,
     };
 
     #[test]
@@ -926,7 +943,7 @@ mod tests {
         let world = mint_quorum_world(0xD2);
         let n = gen_identity();
         // world.a_sk is the enrolled #2 key matching world.a_cert (master-issued).
-        let rec = build_active_authority(&n, &world.a_sk, &world.a_cert, WORLD_NOW * 1000)
+        let rec = build_active_authority(&n, &world.a_sk, &world.a_cert, &[], WORLD_NOW * 1000)
             .expect("builds");
         assert_eq!(rec.feed_id, hex::encode(n.public_identity().address_hash));
         assert!(
@@ -944,8 +961,136 @@ mod tests {
         // A #2 signing key that is not the enrolled key is rejected at build.
         let wrong = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
         assert!(
-            build_active_authority(&n, &wrong, &world.a_cert, WORLD_NOW * 1000).is_err(),
+            build_active_authority(&n, &wrong, &world.a_cert, &[], WORLD_NOW * 1000).is_err(),
             "mismatched publisher key rejected"
         );
+    }
+
+    // ── ZEB-682: quorum self-publish ─────────────────────────────────────
+
+    #[test]
+    fn build_active_authority_quorum_bundle_verifies_zeb682() {
+        let world = mint_quorum_world(0xC0);
+        let n = gen_identity();
+        // With the signer bundle threaded, a quorum-issued device's own record
+        // verifies end-to-end — this is the ZEB-682 migration gap.
+        let rec = build_active_authority(
+            &n,
+            &world.c_sk,
+            &world.c_quorum_cert,
+            &world.bundle,
+            WORLD_NOW * 1000,
+        )
+        .expect("quorum self-publish builds");
+        assert!(!rec.signer_certs_cbor_hex.is_empty(), "bundle on the wire");
+        let v = verify_authority(&rec, WORLD_NOW).expect("quorum record verifies");
+        assert_eq!(v.publisher_key, world.c_sk.verifying_key().to_bytes());
+
+        // The pre-ZEB-682 shape — quorum cert, empty bundle — builds but can
+        // NEVER verify; the publish path's self-check keeps it off the wire.
+        let bare =
+            build_active_authority(&n, &world.c_sk, &world.c_quorum_cert, &[], WORLD_NOW * 1000)
+                .expect("builds without bundle");
+        assert!(
+            verify_authority(&bare, WORLD_NOW).is_err(),
+            "quorum cert with empty bundle must not verify"
+        );
+    }
+
+    // ── ZEB-683: rotation/renewal cache semantics ────────────────────────
+    //
+    // ZEB-683 investigated an authenticated repin ("supersession") for a
+    // same-device #2 rotation. Finding: `EnrollmentCert::verify` enforces
+    // `device_id == hash(device_pubkeys)`, so "same device_id, new #2 key"
+    // is unrepresentable — a key change is a NEW device (= replacement, new
+    // feed per spec §2). The two tests below pin both halves: the key-change
+    // record can never verify, and a cert RENEWAL (same keys, newer
+    // issued_at) keeps the binding and lands as a benign refresh.
+
+    /// Master-sign a cert pairing `device_id` with a DIFFERENT `#2` key —
+    /// structurally forgeable at sign time, but `verify` rejects it
+    /// (`device_id != hash(device_pubkeys)`).
+    fn same_device_new_key_cert(
+        world: &crate::enrollment_verify::quorum_fixtures::QuorumWorld,
+        device_id: [u8; 16],
+        fill: u8,
+        issued_at: u64,
+    ) -> EnrollmentCert {
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[fill; 32]);
+        let bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        EnrollmentCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            device_id,
+            bundle,
+            issued_at,
+            None,
+        )
+        .expect("sign_master does not enforce the hash; verify does")
+    }
+
+    #[test]
+    fn cache_rejects_same_device_key_change_record_zeb683() {
+        let world = mint_quorum_world(0xC4);
+        let n = gen_identity();
+        let mut cache = FeedAuthorityCache::default();
+        let old = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        assert_eq!(cache.ingest(&old, WORLD_NOW), IngestOutcome::Pinned);
+
+        // A record pairing the pinned device_id with a fresh #2 key under a
+        // strictly newer master-issued cert: verification kills it BEFORE any
+        // binding comparison — the repin path ZEB-683 asked for cannot exist.
+        let cert =
+            same_device_new_key_cert(&world, world.a_cert.device_id, 0x20, SIGNER_ISSUED_AT + 100);
+        let rebind = record_for(&world, &cert, Vec::new(), None, WORLD_NOW + 5, &n);
+        assert!(matches!(
+            cache.ingest(&rebind, WORLD_NOW),
+            IngestOutcome::Dropped(ref m) if m.contains("invalid")
+        ));
+        let pin = cache.get(&old.feed_id).expect("pin untouched");
+        assert_eq!(
+            pin.publisher_key,
+            world.a_cert.device_pubkeys.classical.ed25519_verify
+        );
+    }
+
+    #[test]
+    fn cache_cert_renewal_same_binding_is_benign_refresh_zeb683() {
+        let world = mint_quorum_world(0xC8);
+        let n = gen_identity();
+        let mut cache = FeedAuthorityCache::default();
+        let old = record_for(&world, &world.a_cert, Vec::new(), None, WORLD_NOW, &n);
+        assert_eq!(cache.ingest(&old, WORLD_NOW), IngestOutcome::Pinned);
+
+        // Renewal: same keys (same device_id), newer issued_at. The binding is
+        // unchanged, so the record verifies and refreshes the clock — this is
+        // how a long-lived feed keeps a fresh embedded cert on the wire.
+        let renewed = EnrollmentCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.a_cert.device_id,
+            world.a_cert.device_pubkeys.clone(),
+            SIGNER_ISSUED_AT + 100,
+            None,
+        )
+        .expect("renewed cert");
+        let refresh = record_for(&world, &renewed, Vec::new(), None, WORLD_NOW + 5, &n);
+        assert_eq!(
+            cache.ingest(&refresh, WORLD_NOW),
+            IngestOutcome::BenignRefresh
+        );
+        let pin = cache.get(&old.feed_id).expect("pinned");
+        assert_eq!(
+            pin.publisher_key, world.a_cert.device_pubkeys.classical.ed25519_verify,
+            "binding unchanged"
+        );
+        assert_eq!(pin.updated_at, (WORLD_NOW + 5) * 1000, "clock advanced");
     }
 }
