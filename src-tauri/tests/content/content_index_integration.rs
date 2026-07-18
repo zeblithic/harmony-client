@@ -229,6 +229,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
                     String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
+                    harmony_app::revoked_device_projection::RevokedDeviceProjection::new(), // ZEB-679: revocation not exercised
                 )
                 .await;
             });
@@ -559,6 +560,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
                     String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
+                    harmony_app::revoked_device_projection::RevokedDeviceProjection::new(), // ZEB-679: revocation not exercised
                 )
                 .await;
             });
@@ -998,6 +1000,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
                     String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
+                    harmony_app::revoked_device_projection::RevokedDeviceProjection::new(), // ZEB-679: revocation not exercised
                 )
                 .await;
             });
@@ -1291,6 +1294,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
                     String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
+                    harmony_app::revoked_device_projection::RevokedDeviceProjection::new(), // ZEB-679: revocation not exercised
                 )
                 .await;
             });
@@ -1651,6 +1655,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                         harmony_app::storage_settings::StorageSettings::default(),
                     )),
                     String::new(), // ZEB-669 S2: no owner ⇒ engine tick no-ops
+                    harmony_app::revoked_device_projection::RevokedDeviceProjection::new(), // ZEB-679: revocation not exercised
                 )
                 .await;
             });

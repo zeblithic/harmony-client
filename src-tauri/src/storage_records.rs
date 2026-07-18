@@ -11,15 +11,24 @@
 //! `TombstoneOnDisk` posture). Hosting reports are deliberately
 //! in-memory only: they are staleness-pruned freshness signals, and a
 //! stale report surviving a restart would claim liveness we cannot show.
+//!
+//! ZEB-679: ingest is additionally revocation-aware. A record carrying
+//! `#2` v2 material self-anchors (enrollment + `#3` binding
+//! countersignature), is checked against [`RevokedDeviceProjection`],
+//! and pins its `(owner_id, device key)` binding first-write-wins per
+//! owner address ([`StorageSignerPin`], persisted). Pinned owners'
+//! legacy records are rejected (anti-downgrade ratchet).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::owner_state_types::OwnerAddr;
+use crate::revoked_device_projection::RevokedDeviceProjection;
 use crate::storage_signing::{
     self, BackupEntry, BackupSetPayload, HostingReportEntry, HostingReportPayload, PledgeEntry,
-    PledgeListPayload,
+    PledgeListPayload, StorageSignerV2, VerifiedStorageSigner,
 };
 
 /// Spec §3 cap: pledges per list.
@@ -36,6 +45,11 @@ pub const MAX_HOSTING_REPORTS: usize = 64;
 pub const MAX_HOSTING_REPORT_WIRE_BYTES: usize = 16 * 1024;
 /// Bounded-store cap per record family; stalest owner evicted beyond it.
 pub const MAX_TRACKED_OWNERS: usize = 1024;
+/// Cap on first-write-wins signer pins (ZEB-679). Strictly above the
+/// worst-case live-owner union (3 families × [`MAX_TRACKED_OWNERS`]), so
+/// a pin backing a live record is never forced out — only pins whose
+/// owner has no current record compete for eviction.
+pub const MAX_SIGNER_PINS: usize = 4096;
 /// Cadence at which the local node republishes its hosting report.
 pub const HOSTING_REFRESH_INTERVAL_MS: u64 = 300_000;
 /// Receiver-side staleness bound for hosting reports (spec §3: ≥ 3
@@ -101,12 +115,43 @@ struct BackupSetOnDisk {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SignerPinOnDisk {
+    owner: String,
+    /// 16-byte master owner id, hex (32 chars).
+    owner_id: String,
+    /// 32-byte enrolled `#2` verify key, hex (64 chars).
+    device_ed25519: String,
+    pinned_at_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StorageRecordsDiskV1 {
     version: u32,
     #[serde(default)]
     pledge_lists: Vec<PledgeListOnDisk>,
     #[serde(default)]
     backup_sets: Vec<BackupSetOnDisk>,
+    /// ZEB-679, additive (old files load with no pins; version unbumped).
+    #[serde(default)]
+    signer_pins: Vec<SignerPinOnDisk>,
+}
+
+/// ZEB-679: the first-verified `(owner_id, #2 key)` binding for an
+/// owner address — first-write-wins, exactly the vine authority-cache
+/// posture. PERSISTED (unlike the vine cache) because storage has no
+/// wire-durable revoked-authority record to re-arm revocation after a
+/// restart: a revoked device holds its `#3` address key forever and
+/// would otherwise publish accepted legacy records after every receiver
+/// restart. A pinned binding can never legitimately change — same-device
+/// `#2` rotation is unrepresentable (`device_id == hash(device_pubkeys)`,
+/// ZEB-683 finding), so a mismatch is always a rebind attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageSignerPin {
+    pub owner_id: [u8; 16],
+    pub device_ed25519: [u8; 32],
+    /// Local pin clock (ms) — eviction ordering only, no trust meaning.
+    pub pinned_at_ms: u64,
 }
 
 /// Bounded store of verified remote records, keyed by owner address.
@@ -115,6 +160,7 @@ pub struct StorageRecordStore {
     pledge_lists: HashMap<String, PledgeListRecord>,
     backup_sets: HashMap<String, BackupSetRecord>,
     hosting_reports: HashMap<String, HostingReportRecord>,
+    signer_pins: HashMap<String, StorageSignerPin>,
     path: Option<PathBuf>,
 }
 
@@ -127,6 +173,7 @@ impl StorageRecordStore {
             pledge_lists: HashMap::new(),
             backup_sets: HashMap::new(),
             hosting_reports: HashMap::new(),
+            signer_pins: HashMap::new(),
             path,
         };
         let Some(p) = store.path.clone() else {
@@ -177,8 +224,34 @@ impl StorageRecordStore {
                 },
             );
         }
+        for row in disk.signer_pins {
+            let mut owner_id = [0u8; 16];
+            let mut device = [0u8; 32];
+            if row.owner_id.len() != 32
+                || row.device_ed25519.len() != 64
+                || hex::decode_to_slice(&row.owner_id, &mut owner_id).is_err()
+                || hex::decode_to_slice(&row.device_ed25519, &mut device).is_err()
+            {
+                tracing::warn!(owner = %row.owner, "storage_records reload: dropping malformed signer pin");
+                continue;
+            }
+            store.signer_pins.insert(
+                row.owner,
+                StorageSignerPin {
+                    owner_id,
+                    device_ed25519: device,
+                    pinned_at_ms: row.pinned_at_ms,
+                },
+            );
+        }
         evict_stalest(&mut store.pledge_lists, |r| r.updated_at);
         evict_stalest(&mut store.backup_sets, |r| r.updated_at);
+        evict_pins(
+            &mut store.signer_pins,
+            &store.pledge_lists,
+            &store.backup_sets,
+            &store.hosting_reports,
+        );
         store
     }
 
@@ -206,10 +279,22 @@ impl StorageRecordStore {
             })
             .collect();
         backup_sets.sort_by(|a, b| a.owner.cmp(&b.owner));
+        let mut signer_pins: Vec<SignerPinOnDisk> = self
+            .signer_pins
+            .iter()
+            .map(|(owner, pin)| SignerPinOnDisk {
+                owner: owner.clone(),
+                owner_id: hex::encode(pin.owner_id),
+                device_ed25519: hex::encode(pin.device_ed25519),
+                pinned_at_ms: pin.pinned_at_ms,
+            })
+            .collect();
+        signer_pins.sort_by(|a, b| a.owner.cmp(&b.owner));
         let disk = StorageRecordsDiskV1 {
             version: RECORDS_FILE_VERSION,
             pledge_lists,
             backup_sets,
+            signer_pins,
         };
         match serde_json::to_vec_pretty(&disk) {
             Ok(bytes) => {
@@ -221,8 +306,79 @@ impl StorageRecordStore {
         }
     }
 
+    /// ZEB-679 dual-path admission, shared by all three families. Runs
+    /// AFTER the legacy `#3` verify + topic + caps (so its errors never
+    /// mask a plain signature failure) and BEFORE any state effect:
+    ///
+    /// * v2 material present → it must fully verify (present-but-invalid
+    ///   is reject, never fallback), the signer must not be revoked
+    ///   ([`RevokedDeviceProjection`], the same store the DM/friend/PEX
+    ///   cutoffs consult), and the binding must match the pin
+    ///   (first-write-wins; mismatch = rebind attempt).
+    /// * v2 absent → rejected iff this address has a pin (anti-downgrade
+    ///   ratchet: a migrated owner's legacy records are no longer
+    ///   trusted); unpinned legacy records keep working (bootstrap).
+    ///
+    /// Returns whether a new pin was written (callers persist + bound it
+    /// after the record itself lands, so a fresh pin counts as live for
+    /// eviction).
+    fn v2_admission(
+        &mut self,
+        owner_address: &str,
+        v2: &StorageSignerV2,
+        revoked: &RevokedDeviceProjection,
+        now_ms: u64,
+        verify: impl FnOnce() -> Result<VerifiedStorageSigner, String>,
+    ) -> Result<bool, String> {
+        if !v2.is_present() {
+            if self.signer_pins.contains_key(owner_address) {
+                return Err(format!(
+                    "legacy record from migrated owner {owner_address} rejected (signer pin present)"
+                ));
+            }
+            return Ok(false);
+        }
+        let signer = verify()?;
+        if revoked.is_revoked(&OwnerAddr(signer.owner_id), &signer.device_ed25519) {
+            return Err(format!(
+                "record signer device revoked for owner {}",
+                hex::encode(signer.owner_id)
+            ));
+        }
+        match self.signer_pins.get(owner_address) {
+            None => {
+                self.signer_pins.insert(
+                    owner_address.to_string(),
+                    StorageSignerPin {
+                        owner_id: signer.owner_id,
+                        device_ed25519: signer.device_ed25519,
+                        pinned_at_ms: now_ms,
+                    },
+                );
+                Ok(true)
+            }
+            Some(pin)
+                if pin.owner_id == signer.owner_id
+                    && pin.device_ed25519 == signer.device_ed25519 =>
+            {
+                Ok(false)
+            }
+            Some(_) => Err(format!(
+                "v2 binding for {owner_address} does not match pinned signer (rebind rejected)"
+            )),
+        }
+    }
+
     /// Verify-first ingest of a `harmony/storage/{owner}/pledges` sample.
-    pub fn on_pledge_list_sample(&mut self, key_expr: &str, payload: &[u8]) -> RecordOutcome {
+    /// `now_ms` is the verifier-controlled ingest clock (cert expiry +
+    /// pin stamping); `revoked` is the shared revocation projection.
+    pub fn on_pledge_list_sample(
+        &mut self,
+        key_expr: &str,
+        payload: &[u8],
+        revoked: &RevokedDeviceProjection,
+        now_ms: u64,
+    ) -> RecordOutcome {
         if payload.len() > MAX_PLEDGE_LIST_WIRE_BYTES {
             return RecordOutcome::Rejected(format!(
                 "pledge list {} bytes exceeds wire cap {MAX_PLEDGE_LIST_WIRE_BYTES}",
@@ -245,6 +401,13 @@ impl StorageRecordStore {
                 list.pledges.len()
             ));
         }
+        let pin_changed =
+            match self.v2_admission(&list.owner_address, &list.v2, revoked, now_ms, || {
+                storage_signing::verify_pledge_list_v2(&list, now_ms / 1000)
+            }) {
+                Ok(changed) => changed,
+                Err(e) => return RecordOutcome::Rejected(e),
+            };
         let outcome = lww_insert(
             &mut self.pledge_lists,
             list.owner_address,
@@ -256,6 +419,16 @@ impl StorageRecordStore {
         );
         if outcome.changed() {
             evict_stalest(&mut self.pledge_lists, |r| r.updated_at);
+        }
+        if pin_changed {
+            evict_pins(
+                &mut self.signer_pins,
+                &self.pledge_lists,
+                &self.backup_sets,
+                &self.hosting_reports,
+            );
+        }
+        if outcome.changed() || pin_changed {
             self.save();
         }
         outcome
@@ -267,7 +440,13 @@ impl StorageRecordStore {
     /// not policy compliance — a hostile record listing encrypted or
     /// ephemeral CIDs must never induce fetches of never-announced
     /// content classes.
-    pub fn on_backup_set_sample(&mut self, key_expr: &str, payload: &[u8]) -> RecordOutcome {
+    pub fn on_backup_set_sample(
+        &mut self,
+        key_expr: &str,
+        payload: &[u8],
+        revoked: &RevokedDeviceProjection,
+        now_ms: u64,
+    ) -> RecordOutcome {
         if payload.len() > MAX_BACKUP_SET_WIRE_BYTES {
             return RecordOutcome::Rejected(format!(
                 "backup set {} bytes exceeds wire cap {MAX_BACKUP_SET_WIRE_BYTES}",
@@ -293,6 +472,13 @@ impl StorageRecordStore {
         if let Err(reason) = validate_backup_entries(&set.entries) {
             return RecordOutcome::Rejected(reason);
         }
+        let pin_changed =
+            match self.v2_admission(&set.owner_address, &set.v2, revoked, now_ms, || {
+                storage_signing::verify_backup_set_v2(&set, now_ms / 1000)
+            }) {
+                Ok(changed) => changed,
+                Err(e) => return RecordOutcome::Rejected(e),
+            };
         let outcome = lww_insert(
             &mut self.backup_sets,
             set.owner_address,
@@ -304,6 +490,16 @@ impl StorageRecordStore {
         );
         if outcome.changed() {
             evict_stalest(&mut self.backup_sets, |r| r.updated_at);
+        }
+        if pin_changed {
+            evict_pins(
+                &mut self.signer_pins,
+                &self.pledge_lists,
+                &self.backup_sets,
+                &self.hosting_reports,
+            );
+        }
+        if outcome.changed() || pin_changed {
             self.save();
         }
         outcome
@@ -315,6 +511,7 @@ impl StorageRecordStore {
         &mut self,
         key_expr: &str,
         payload: &[u8],
+        revoked: &RevokedDeviceProjection,
         now_ms: u64,
     ) -> RecordOutcome {
         if payload.len() > MAX_HOSTING_REPORT_WIRE_BYTES {
@@ -341,6 +538,13 @@ impl StorageRecordStore {
                 report.reports.len()
             ));
         }
+        let pin_changed =
+            match self.v2_admission(&report.owner_address, &report.v2, revoked, now_ms, || {
+                storage_signing::verify_hosting_report_v2(&report, now_ms / 1000)
+            }) {
+                Ok(changed) => changed,
+                Err(e) => return RecordOutcome::Rejected(e),
+            };
         let outcome = lww_insert(
             &mut self.hosting_reports,
             report.owner_address,
@@ -353,7 +557,17 @@ impl StorageRecordStore {
         );
         if outcome.changed() {
             evict_stalest(&mut self.hosting_reports, |r| r.updated_at);
-            // Hosting reports are in-memory only — no save().
+            // Hosting reports are in-memory only — no save() for them…
+        }
+        if pin_changed {
+            evict_pins(
+                &mut self.signer_pins,
+                &self.pledge_lists,
+                &self.backup_sets,
+                &self.hosting_reports,
+            );
+            // …but a pin minted from one IS durable revocation state.
+            self.save();
         }
         outcome
     }
@@ -368,6 +582,11 @@ impl StorageRecordStore {
 
     pub fn hosting_report(&self, owner: &str) -> Option<&HostingReportRecord> {
         self.hosting_reports.get(owner)
+    }
+
+    /// The first-write-wins signer pin for `owner`, if it has migrated.
+    pub fn signer_pin(&self, owner: &str) -> Option<&StorageSignerPin> {
+        self.signer_pins.get(owner)
     }
 
     /// Owners whose pledge list names `me`, with the pledged bytes —
@@ -484,6 +703,39 @@ fn lww_insert<R>(
     }
 }
 
+/// Pin-cap overflow: evict pins whose owner has NO live record first
+/// (dead weight — an attacker minting throwaway addresses lands here),
+/// then oldest `pinned_at_ms`, owner tiebreak. Because
+/// [`MAX_SIGNER_PINS`] strictly exceeds the worst-case live-owner union
+/// (3 × [`MAX_TRACKED_OWNERS`]), a pin backing a live record is never
+/// forced out — evicting one would re-open the legacy-downgrade window
+/// for that owner.
+fn evict_pins(
+    pins: &mut HashMap<String, StorageSignerPin>,
+    pledges: &HashMap<String, PledgeListRecord>,
+    backups: &HashMap<String, BackupSetRecord>,
+    hosting: &HashMap<String, HostingReportRecord>,
+) {
+    while pins.len() > MAX_SIGNER_PINS {
+        let victim = pins
+            .iter()
+            .map(|(owner, pin)| {
+                let live = pledges.contains_key(owner)
+                    || backups.contains_key(owner)
+                    || hosting.contains_key(owner);
+                (live, pin.pinned_at_ms, owner.clone())
+            })
+            .min()
+            .map(|(_, _, owner)| owner);
+        match victim {
+            Some(owner) => {
+                pins.remove(&owner);
+            }
+            None => break,
+        }
+    }
+}
+
 /// Bounded-store overflow: evict the stalest record (min `updated_at`,
 /// ties broken by owner) until within [`MAX_TRACKED_OWNERS`].
 fn evict_stalest<R>(map: &mut HashMap<String, R>, updated_at: impl Fn(&R) -> u64) {
@@ -511,6 +763,12 @@ mod tests {
         harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
     }
 
+    /// Empty revocation projection — the default for tests that don't
+    /// exercise the ZEB-679 revocation path.
+    fn rvk() -> RevokedDeviceProjection {
+        RevokedDeviceProjection::new()
+    }
+
     fn addr_of(private: &harmony_identity::PrivateIdentity) -> String {
         hex::encode(private.public_identity().address_hash)
     }
@@ -531,6 +789,7 @@ mod tests {
             updated_at,
             identity_pub: None,
             sig: None,
+            v2: Default::default(),
         };
         storage_signing::sign_pledge_list(signer, &mut p);
         let topic = format!("harmony/storage/{}/pledges", p.owner_address);
@@ -548,6 +807,7 @@ mod tests {
             updated_at,
             identity_pub: None,
             sig: None,
+            v2: Default::default(),
         };
         storage_signing::sign_backup_set(signer, &mut p);
         let topic = format!("harmony/storage/{}/backup-set", p.owner_address);
@@ -565,6 +825,7 @@ mod tests {
             updated_at,
             identity_pub: None,
             sig: None,
+            v2: Default::default(),
         };
         storage_signing::sign_hosting_report(signer, &mut p);
         let topic = format!("harmony/storage/{}/hosting", p.owner_address);
@@ -586,7 +847,7 @@ mod tests {
 
         let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 5)], 10);
         assert_eq!(
-            store.on_pledge_list_sample(&topic, &bytes),
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000),
             RecordOutcome::Inserted
         );
         assert_eq!(store.pledge_list(&owner).unwrap().pledges[0].bytes, 5);
@@ -601,7 +862,7 @@ mod tests {
             10,
         );
         assert_eq!(
-            store.on_backup_set_sample(&topic, &bytes),
+            store.on_backup_set_sample(&topic, &bytes, &rvk(), 9_000),
             RecordOutcome::Inserted
         );
         assert_eq!(store.backup_set(&owner).unwrap().entries[0].cid, cid);
@@ -616,7 +877,7 @@ mod tests {
             10,
         );
         assert_eq!(
-            store.on_hosting_report_sample(&topic, &bytes, 999),
+            store.on_hosting_report_sample(&topic, &bytes, &rvk(), 999),
             RecordOutcome::Inserted
         );
         assert_eq!(store.hosting_report(&owner).unwrap().received_at_ms, 999);
@@ -634,15 +895,26 @@ mod tests {
             updated_at: 1,
             identity_pub: None,
             sig: None,
+            v2: Default::default(),
         };
         let topic = format!("harmony/storage/{owner}/pledges");
-        let outcome = store.on_pledge_list_sample(&topic, &serde_json::to_vec(&unsigned).unwrap());
+        let outcome = store.on_pledge_list_sample(
+            &topic,
+            &serde_json::to_vec(&unsigned).unwrap(),
+            &rvk(),
+            9_000,
+        );
         assert!(matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("unsigned")));
 
         let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("x", 1)], 2);
         let mut tampered: PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
         tampered.pledges[0].bytes = 999;
-        let outcome = store.on_pledge_list_sample(&topic, &serde_json::to_vec(&tampered).unwrap());
+        let outcome = store.on_pledge_list_sample(
+            &topic,
+            &serde_json::to_vec(&tampered).unwrap(),
+            &rvk(),
+            9_000,
+        );
         assert!(
             matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("signature invalid"))
         );
@@ -664,7 +936,7 @@ mod tests {
             format!("harmony/storage/{}/backup-set", addr_of(&id)),
             format!("harmony/vines/{}/pledges", addr_of(&id)),
         ] {
-            let outcome = store.on_pledge_list_sample(&bad_topic, &bytes);
+            let outcome = store.on_pledge_list_sample(&bad_topic, &bytes, &rvk(), 9_000);
             assert!(
                 matches!(outcome, RecordOutcome::Rejected(_)),
                 "topic {bad_topic} should reject"
@@ -680,26 +952,26 @@ mod tests {
 
         let (topic, v2) = signed_pledge_bytes(&id, vec![pledge("a", 2)], 20);
         assert_eq!(
-            store.on_pledge_list_sample(&topic, &v2),
+            store.on_pledge_list_sample(&topic, &v2, &rvk(), 9_000),
             RecordOutcome::Inserted
         );
 
         let (_, v1) = signed_pledge_bytes(&id, vec![pledge("a", 1)], 10);
         assert_eq!(
-            store.on_pledge_list_sample(&topic, &v1),
+            store.on_pledge_list_sample(&topic, &v1, &rvk(), 9_000),
             RecordOutcome::IgnoredOlder
         );
 
         let (_, v2_replay) = signed_pledge_bytes(&id, vec![pledge("a", 9)], 20);
         assert_eq!(
-            store.on_pledge_list_sample(&topic, &v2_replay),
+            store.on_pledge_list_sample(&topic, &v2_replay, &rvk(), 9_000),
             RecordOutcome::IgnoredOlder
         );
         assert_eq!(store.pledge_list(&owner).unwrap().pledges[0].bytes, 2);
 
         let (_, v3) = signed_pledge_bytes(&id, vec![pledge("a", 3)], 30);
         assert_eq!(
-            store.on_pledge_list_sample(&topic, &v3),
+            store.on_pledge_list_sample(&topic, &v3, &rvk(), 9_000),
             RecordOutcome::UpdatedNewer
         );
         assert_eq!(store.pledge_list(&owner).unwrap().pledges[0].bytes, 3);
@@ -716,14 +988,14 @@ mod tests {
             .collect();
         let (topic, bytes) = signed_pledge_bytes(&id, too_many, 1);
         assert!(matches!(
-            store.on_pledge_list_sample(&topic, &bytes),
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000),
             RecordOutcome::Rejected(ref e) if e.contains("cap")
         ));
 
         // Wire-byte cap, checked before parse (payload is not even JSON).
         let huge = vec![b'x'; MAX_PLEDGE_LIST_WIRE_BYTES + 1];
         assert!(matches!(
-            store.on_pledge_list_sample(&topic, &huge),
+            store.on_pledge_list_sample(&topic, &huge, &rvk(), 9_000),
             RecordOutcome::Rejected(ref e) if e.contains("wire cap")
         ));
     }
@@ -759,7 +1031,7 @@ mod tests {
                 }],
                 1,
             );
-            let outcome = store.on_backup_set_sample(&topic, &bytes);
+            let outcome = store.on_backup_set_sample(&topic, &bytes, &rvk(), 9_000);
             assert!(
                 matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("public durable")),
                 "class {:?} must reject",
@@ -783,7 +1055,7 @@ mod tests {
             1,
         );
         assert!(matches!(
-            store.on_backup_set_sample(&topic, &bytes),
+            store.on_backup_set_sample(&topic, &bytes, &rvk(), 9_000),
             RecordOutcome::Rejected(ref e) if e.contains("not hex")
         ));
 
@@ -796,7 +1068,7 @@ mod tests {
             1,
         );
         assert!(matches!(
-            store.on_backup_set_sample(&topic, &bytes),
+            store.on_backup_set_sample(&topic, &bytes, &rvk(), 9_000),
             RecordOutcome::Rejected(ref e) if e.contains("32 bytes")
         ));
 
@@ -813,7 +1085,7 @@ mod tests {
             1,
         );
         assert!(matches!(
-            store.on_backup_set_sample(&topic, &bytes),
+            store.on_backup_set_sample(&topic, &bytes, &rvk(), 9_000),
             RecordOutcome::Rejected(ref e) if e.contains("checksum")
         ));
 
@@ -830,7 +1102,7 @@ mod tests {
             1,
         );
         assert!(matches!(
-            store.on_backup_set_sample(&topic, &bytes),
+            store.on_backup_set_sample(&topic, &bytes, &rvk(), 9_000),
             RecordOutcome::Rejected(ref e) if e.contains("duplicate")
         ));
     }
@@ -845,10 +1117,14 @@ mod tests {
         {
             let mut store = StorageRecordStore::new(Some(path.clone()));
             let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 5);
-            assert!(store.on_pledge_list_sample(&topic, &bytes).changed());
+            assert!(store
+                .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
+                .changed());
             let cid = public_durable_cid_hex(b"keep");
             let (topic, bytes) = signed_backup_bytes(&id, vec![BackupEntry { cid, size: 4 }], 5);
-            assert!(store.on_backup_set_sample(&topic, &bytes).changed());
+            assert!(store
+                .on_backup_set_sample(&topic, &bytes, &rvk(), 9_000)
+                .changed());
             let (topic, bytes) = signed_hosting_bytes(
                 &id,
                 vec![HostingReportEntry {
@@ -859,7 +1135,7 @@ mod tests {
                 5,
             );
             assert!(store
-                .on_hosting_report_sample(&topic, &bytes, 100)
+                .on_hosting_report_sample(&topic, &bytes, &rvk(), 100)
                 .changed());
         }
 
@@ -947,7 +1223,7 @@ mod tests {
         let owner = addr_of(&id);
         let (topic, bytes) = signed_hosting_bytes(&id, vec![], 1);
         assert!(store
-            .on_hosting_report_sample(&topic, &bytes, 1_000)
+            .on_hosting_report_sample(&topic, &bytes, &rvk(), 1_000)
             .changed());
 
         store.sweep_hosting(1_000 + HOSTING_REPORT_STALE_MS - 1);
@@ -968,9 +1244,13 @@ mod tests {
         let me = "me-address";
 
         let (topic, bytes) = signed_pledge_bytes(&alice, vec![pledge(me, 100)], 1);
-        assert!(store.on_pledge_list_sample(&topic, &bytes).changed());
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
+            .changed());
         let (topic, bytes) = signed_pledge_bytes(&bob, vec![pledge("other", 50)], 1);
-        assert!(store.on_pledge_list_sample(&topic, &bytes).changed());
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
+            .changed());
 
         let pledgers = store.owners_pledging_to(me);
         assert_eq!(pledgers, vec![(addr_of(&alice), 100)]);
@@ -979,6 +1259,274 @@ mod tests {
             store.hosting_reported_for(&addr_of(&alice), me),
             None,
             "no hosting report yet"
+        );
+    }
+
+    // ── ZEB-679: v2 admission (revocation + signer pin + ratchet) ────
+
+    use crate::enrollment_verify::quorum_fixtures::{mint_quorum_world, QuorumWorld, WORLD_NOW};
+    use crate::storage_signing::StorageSignerMaterial;
+
+    /// Ingest clock (ms) at which every fixture world's certs are valid.
+    const NOW_MS: u64 = WORLD_NOW * 1000;
+
+    fn master_material(world: &QuorumWorld) -> StorageSignerMaterial {
+        StorageSignerMaterial {
+            sk: std::sync::Arc::new(world.a_sk.clone()),
+            cert: world.a_cert.clone(),
+            signer_certs: Vec::new(),
+        }
+    }
+
+    fn dual_signed_pledge_bytes(
+        signer: &harmony_identity::PrivateIdentity,
+        material: &StorageSignerMaterial,
+        pledges: Vec<PledgeEntry>,
+        updated_at: u64,
+    ) -> (String, Vec<u8>) {
+        let mut p = PledgeListPayload {
+            owner_address: addr_of(signer),
+            pledges,
+            updated_at,
+            identity_pub: None,
+            sig: None,
+            v2: Default::default(),
+        };
+        storage_signing::sign_pledge_list_v2(signer, material, &mut p).expect("dual-sign");
+        let topic = format!("harmony/storage/{}/pledges", p.owner_address);
+        (topic, serde_json::to_vec(&p).unwrap())
+    }
+
+    fn dual_signed_hosting_bytes(
+        signer: &harmony_identity::PrivateIdentity,
+        material: &StorageSignerMaterial,
+        updated_at: u64,
+    ) -> (String, Vec<u8>) {
+        let mut p = HostingReportPayload {
+            owner_address: addr_of(signer),
+            reports: vec![HostingReportEntry {
+                beneficiary: "b".into(),
+                bytes: 1,
+                cids: 1,
+            }],
+            updated_at,
+            identity_pub: None,
+            sig: None,
+            v2: Default::default(),
+        };
+        storage_signing::sign_hosting_report_v2(signer, material, &mut p).expect("dual-sign");
+        let topic = format!("harmony/storage/{}/hosting", p.owner_address);
+        (topic, serde_json::to_vec(&p).unwrap())
+    }
+
+    #[test]
+    fn v2_record_pins_and_accepts_zeb679() {
+        let world = mint_quorum_world(0x20);
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        let (topic, bytes) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 1);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), NOW_MS)
+            .changed());
+        let pin = store.signer_pin(&addr_of(&id)).expect("pinned");
+        assert_eq!(pin.owner_id, world.owner_id);
+        assert_eq!(
+            pin.device_ed25519,
+            world.a_cert.device_pubkeys.classical.ed25519_verify
+        );
+    }
+
+    #[test]
+    fn revoked_signer_rejected_zero_state_zeb679() {
+        let world = mint_quorum_world(0x28);
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        let revoked = rvk();
+        let key = world.a_cert.device_pubkeys.classical.ed25519_verify;
+        let keys: std::collections::BTreeSet<[u8; 32]> = std::iter::once(key).collect();
+        revoked.union_from_members(std::iter::once((OwnerAddr(world.owner_id), &keys)));
+
+        let (topic, bytes) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 1);
+        let outcome = store.on_pledge_list_sample(&topic, &bytes, &revoked, NOW_MS);
+        assert!(
+            matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("revoked")),
+            "{outcome:?}"
+        );
+        assert!(store.pledge_list(&addr_of(&id)).is_none(), "zero state");
+        assert!(store.signer_pin(&addr_of(&id)).is_none(), "no pin");
+    }
+
+    #[test]
+    fn legacy_after_pin_rejected_cross_family_zeb679() {
+        let world = mint_quorum_world(0x20);
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        let (topic, bytes) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 1);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), NOW_MS)
+            .changed());
+
+        // Legacy pledge from the (now migrated) owner: ratchet rejects,
+        // even at a NEWER updated_at.
+        let (topic, legacy) = signed_pledge_bytes(&id, vec![], 9);
+        let outcome = store.on_pledge_list_sample(&topic, &legacy, &rvk(), NOW_MS);
+        assert!(
+            matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("signer pin")),
+            "{outcome:?}"
+        );
+        // The ratchet is per-ADDRESS, so it spans record families: a
+        // legacy hosting report from the same address is also rejected.
+        let (topic, legacy_hosting) = signed_hosting_bytes(&id, vec![], 9);
+        let outcome = store.on_hosting_report_sample(&topic, &legacy_hosting, &rvk(), NOW_MS);
+        assert!(
+            matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("signer pin")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn rebind_to_different_owner_rejected_zeb679() {
+        let world = mint_quorum_world(0x20);
+        let other = mint_quorum_world(0x24);
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        let (topic, bytes) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 1);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), NOW_MS)
+            .changed());
+
+        // Same #3 address re-anchoring to a DIFFERENT owner (the
+        // throwaway-owner laundering move): first-write-wins refuses.
+        let (topic, rebind) = dual_signed_pledge_bytes(&id, &master_material(&other), vec![], 9);
+        let outcome = store.on_pledge_list_sample(&topic, &rebind, &rvk(), NOW_MS);
+        assert!(
+            matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("rebind")),
+            "{outcome:?}"
+        );
+        let pin = store.signer_pin(&addr_of(&id)).expect("pin kept");
+        assert_eq!(pin.owner_id, world.owner_id, "original binding kept");
+    }
+
+    #[test]
+    fn pin_survives_disk_reload_and_keeps_ratchet_zeb679() {
+        let world = mint_quorum_world(0x20);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_records.json");
+        let id = test_identity();
+        {
+            let mut store = StorageRecordStore::new(Some(path.clone()));
+            // Pin via a HOSTING report — the record itself is in-memory
+            // only, so this also pins the "pin persists even when its
+            // record doesn't" property.
+            let (topic, bytes) = dual_signed_hosting_bytes(&id, &master_material(&world), 1);
+            assert!(store
+                .on_hosting_report_sample(&topic, &bytes, &rvk(), NOW_MS)
+                .changed());
+        }
+        let mut reloaded = StorageRecordStore::new(Some(path));
+        assert!(
+            reloaded.hosting_report(&addr_of(&id)).is_none(),
+            "hosting record itself is not persisted"
+        );
+        let pin = reloaded.signer_pin(&addr_of(&id)).expect("pin reloaded");
+        assert_eq!(pin.owner_id, world.owner_id);
+        // The revoked device's post-restart legacy publish is still dead.
+        let (topic, legacy) = signed_pledge_bytes(&id, vec![], 9);
+        let outcome = reloaded.on_pledge_list_sample(&topic, &legacy, &rvk(), NOW_MS);
+        assert!(
+            matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("signer pin")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_v2_material_rejected_zero_state_zeb679() {
+        let world = mint_quorum_world(0x20);
+        let mut store = StorageRecordStore::new(None);
+        let victim = test_identity();
+        let attacker = test_identity();
+        // Swap attack at the ingest boundary: victim's legacy record with
+        // the attacker's (genuinely valid) v2 material attached.
+        let mut p = PledgeListPayload {
+            owner_address: addr_of(&victim),
+            pledges: vec![],
+            updated_at: 1,
+            identity_pub: None,
+            sig: None,
+            v2: Default::default(),
+        };
+        storage_signing::sign_pledge_list(&victim, &mut p);
+        let mut hijacked = p.clone();
+        storage_signing::sign_pledge_list_v2(&attacker, &master_material(&world), &mut hijacked)
+            .expect("attacker dual-sign");
+        // Graft the attacker's v2 block onto the victim's record (the
+        // legacy fields stay the victim's).
+        p.v2 = hijacked.v2;
+        let topic = format!("harmony/storage/{}/pledges", p.owner_address);
+        let outcome =
+            store.on_pledge_list_sample(&topic, &serde_json::to_vec(&p).unwrap(), &rvk(), NOW_MS);
+        assert!(
+            matches!(outcome, RecordOutcome::Rejected(ref e) if e.contains("binding")),
+            "{outcome:?}"
+        );
+        assert!(store.pledge_list(&addr_of(&victim)).is_none(), "zero state");
+        assert!(store.signer_pin(&addr_of(&victim)).is_none(), "no pin");
+    }
+
+    #[test]
+    fn older_v2_replay_still_pins_zeb679() {
+        let world = mint_quorum_world(0x20);
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        // Legacy record lands first (unpinned bootstrap), newer clock.
+        let (topic, legacy) = signed_pledge_bytes(&id, vec![], 10);
+        assert!(store
+            .on_pledge_list_sample(&topic, &legacy, &rvk(), NOW_MS)
+            .changed());
+        // An OLDER v2 record is LWW-ignored but its verified binding
+        // still pins — the binding is time-invariant.
+        let (topic, v2_bytes) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 5);
+        let outcome = store.on_pledge_list_sample(&topic, &v2_bytes, &rvk(), NOW_MS);
+        assert_eq!(outcome, RecordOutcome::IgnoredOlder);
+        assert!(store.signer_pin(&addr_of(&id)).is_some(), "pin set anyway");
+        // …and the ratchet is live from that point on.
+        let (topic, legacy2) = signed_pledge_bytes(&id, vec![], 20);
+        let outcome = store.on_pledge_list_sample(&topic, &legacy2, &rvk(), NOW_MS);
+        assert!(matches!(outcome, RecordOutcome::Rejected(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn evict_pins_prefers_dead_then_oldest_zeb679() {
+        let mut pins: HashMap<String, StorageSignerPin> = HashMap::new();
+        let mut pledges: HashMap<String, PledgeListRecord> = HashMap::new();
+        let backups: HashMap<String, BackupSetRecord> = HashMap::new();
+        let hosting: HashMap<String, HostingReportRecord> = HashMap::new();
+        let pin = |t| StorageSignerPin {
+            owner_id: [1; 16],
+            device_ed25519: [2; 32],
+            pinned_at_ms: t,
+        };
+        // One live-backed pin (oldest of all) + dead pins over the cap.
+        pins.insert("live".into(), pin(0));
+        pledges.insert(
+            "live".into(),
+            PledgeListRecord {
+                pledges: vec![],
+                updated_at: 1,
+            },
+        );
+        for i in 0..MAX_SIGNER_PINS {
+            pins.insert(format!("dead-{i:05}"), pin(10 + i as u64));
+        }
+        evict_pins(&mut pins, &pledges, &backups, &hosting);
+        assert_eq!(pins.len(), MAX_SIGNER_PINS);
+        assert!(
+            pins.contains_key("live"),
+            "live-backed pin survives even as the globally oldest"
+        );
+        assert!(
+            !pins.contains_key("dead-00000"),
+            "oldest dead pin evicted first"
         );
     }
 }
