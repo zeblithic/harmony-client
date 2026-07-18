@@ -73,6 +73,13 @@ zero per-site changes (the existing `is_none()` fences remain as fast-fail diagn
   second dial, `tokio::time::advance(W+1)`, third dial admitted. **Red pre-fix:** wall clock
   ignores `advance`, third dial still shed. Plus one unit-level pin per limiter:
   `monotonic_now_ms()` advances with `tokio::time::advance` under `start_paused`.
+  *(Outcome: the serve-level variant is NOT viable — the V4 harness drives real iroh
+  endpoints on `multi_thread`, incompatible with `start_paused`. Shipped the unit-level
+  paused-clock pins per limiter instead (timeline advances exactly with `tokio::time::advance`
+  + shed→advance→re-admit through the limiter's own clock — a property a `SystemTime`-backed
+  source cannot satisfy); the 3 feed-site migrations are review-verified, with all other
+  `wall_now_ms` sites audited as wall-domain: HLC stamping, token/cert expiry, consent
+  recorded-at, reachability freshness.)*
 - Gates per task (iterative): `cargo fmt --all -- --check`,
   `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`,
   `scripts/test-select --context task` — paste the emitted `round=… bucket=…` line into the

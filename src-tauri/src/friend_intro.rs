@@ -736,6 +736,14 @@ impl<K: Copy + Eq + Hash> KeyedDedupe<K> {
 /// layer into a memory-DoS of its own.
 pub struct IntroRateLimiter {
     inner: Mutex<Inner>,
+    /// ZEB-711: monotonic epoch for the production `now_ms` feed. The admit
+    /// methods keep taking an explicit `now_ms` (the unit-test seam), but
+    /// acceptors derive it from [`Self::monotonic_now_ms`] instead of wall
+    /// clock — a wall step would otherwise distort enforcement (forward
+    /// jump: a flood gets a fresh budget; backward jump: an honest shed
+    /// peer stays shed longer). `tokio::time::Instant` also honors the
+    /// paused test clock, keeping window mechanics deterministic in tests.
+    epoch: tokio::time::Instant,
 }
 
 struct Inner {
@@ -777,7 +785,18 @@ impl IntroRateLimiter {
                 vouch_window: KeyedSlidingWindow::new(per_owner_max, window_ms),
                 vouch_dedupe: KeyedDedupe::new(dedupe_ttl_ms),
             }),
+            epoch: tokio::time::Instant::now(),
         }
+    }
+
+    /// ZEB-711: the production timeline for every admit call on this
+    /// limiter — milliseconds since this limiter was constructed, from the
+    /// monotonic (and test-pausable) tokio clock. Window state and epoch
+    /// live and die together with the limiter instance, so the timeline is
+    /// internally consistent by construction. Wall time stays for wall
+    /// domains only (HLC stamping, token/cert expiry, recorded-at).
+    pub fn monotonic_now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
     }
 
     /// Poison-tolerant lock: a panic elsewhere must not wedge the acceptor — the
@@ -898,6 +917,10 @@ pub const FRIEND_HANDSHAKE_WINDOW_MS: u64 = 60 * 60 * 1000; // 1h
 /// audited [`KeyedSlidingWindow`] eviction.
 pub struct FriendRateLimiter {
     inner: Mutex<FriendLimiterInner>,
+    /// ZEB-711: monotonic epoch — see [`IntroRateLimiter::epoch`]. Both
+    /// ALPN limiters migrate in one move so their audited posture stays
+    /// uniform.
+    epoch: tokio::time::Instant,
 }
 
 struct FriendLimiterInner {
@@ -923,7 +946,14 @@ impl FriendRateLimiter {
                 conn: KeyedSlidingWindow::new(conn_max, window_ms),
                 owner: KeyedSlidingWindow::new(owner_max, window_ms),
             }),
+            epoch: tokio::time::Instant::now(),
         }
+    }
+
+    /// ZEB-711: production timeline for this limiter's admit calls — see
+    /// [`IntroRateLimiter::monotonic_now_ms`].
+    pub fn monotonic_now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
     }
 
     /// Poison-tolerant lock, as [`IntroRateLimiter::lock`]: plain counters,
@@ -2023,5 +2053,70 @@ mod tests {
         let rl = FriendRateLimiter::with_caps(0, 0, 3_600_000);
         assert_eq!(rl.admit_connection([1; 32], 0), Err("per-connection cap"));
         assert_eq!(rl.admit_owner(OwnerAddr([7; 16]), 0), Err("per-owner cap"));
+    }
+
+    // ---- ZEB-711: monotonic limiter timeline --------------------------------
+    //
+    // The production `now_ms` feed comes from the limiter's own
+    // `monotonic_now_ms()` (tokio monotonic clock), not `wall_now_ms()`
+    // (`SystemTime`). These tests pin the property that makes that
+    // distinguishable: under tokio's paused test clock the timeline
+    // advances ONLY via `tokio::time::advance` — impossible for a
+    // SystemTime-backed source, which ignores the paused clock (and can
+    // step arbitrarily in production, distorting the windows: a forward
+    // jump grants a flood a fresh budget, a backward jump keeps an honest
+    // shed peer shed).
+
+    #[tokio::test(start_paused = true)]
+    async fn friend_limiter_timeline_is_the_paused_tokio_clock_zeb711() {
+        let rl = FriendRateLimiter::with_caps(1, 1, 1_000);
+        let t0 = rl.monotonic_now_ms();
+        tokio::time::advance(std::time::Duration::from_millis(5_000)).await;
+        assert_eq!(
+            rl.monotonic_now_ms(),
+            t0 + 5_000,
+            "the limiter timeline must advance exactly with the tokio clock"
+        );
+
+        // Window mechanics driven entirely through the limiter's own clock:
+        // cap 1 → second admit in-window sheds; advancing the tokio clock
+        // past the window re-admits. No wall clock involved anywhere.
+        let id = [9u8; 32];
+        assert_eq!(rl.admit_connection(id, rl.monotonic_now_ms()), Ok(()));
+        assert_eq!(
+            rl.admit_connection(id, rl.monotonic_now_ms()),
+            Err("per-connection cap")
+        );
+        tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+        assert_eq!(
+            rl.admit_connection(id, rl.monotonic_now_ms()),
+            Ok(()),
+            "advancing the paused clock past the window must re-admit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn intro_limiter_timeline_is_the_paused_tokio_clock_zeb711() {
+        let rl = IntroRateLimiter::with_caps(1, 1, 1_000, 500);
+        let t0 = rl.monotonic_now_ms();
+        tokio::time::advance(std::time::Duration::from_millis(2_500)).await;
+        assert_eq!(
+            rl.monotonic_now_ms(),
+            t0 + 2_500,
+            "the limiter timeline must advance exactly with the tokio clock"
+        );
+
+        let id = [3u8; 32];
+        assert_eq!(rl.admit_connection(id, rl.monotonic_now_ms()), Ok(()));
+        assert_eq!(
+            rl.admit_connection(id, rl.monotonic_now_ms()),
+            Err("per-connection cap")
+        );
+        tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+        assert_eq!(
+            rl.admit_connection(id, rl.monotonic_now_ms()),
+            Ok(()),
+            "advancing the paused clock past the window must re-admit"
+        );
     }
 }
