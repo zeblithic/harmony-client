@@ -483,7 +483,7 @@ mod tests {
         rec
     }
     use crate::enrollment_verify::quorum_fixtures::{
-        mint_quorum_revocation, mint_quorum_world, QUORUM_ISSUED_AT, SIGNER_ISSUED_AT, WORLD_NOW,
+        mint_quorum_revocation, mint_quorum_world, SIGNER_ISSUED_AT, WORLD_NOW,
     };
 
     #[test]

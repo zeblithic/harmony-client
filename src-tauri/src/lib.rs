@@ -881,10 +881,10 @@ pub struct NodeState {
     /// ZEB-678 S2 / ZEB-683: the feed-authority publish + stamp gates, keyed by
     /// publisher-material fingerprint (see [`VineAuthorityGates`]). Shared as an
     /// `Arc` so the transport-epoch re-offer task can hold them without holding
-    /// `NodeState`. Always present (fresh `Default` per `NodeState`
-    /// construction); contents persist across in-process stop/start, which is
-    /// benign — the record is LWW and the re-offer task re-asserts it on peer
-    /// up-edges.
+    /// `NodeState`. Always present; RESET on stop_inner / stale-cleanup so a
+    /// fresh in-process run republishes once — boot-time peers don't bump the
+    /// transport epoch, so a persisted gate would leave a new session with no
+    /// re-offer trigger until a peer churns (PR #488 review, Qodo).
     vine_authority_gates: std::sync::Arc<std::sync::Mutex<VineAuthorityGates>>,
     /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
     /// start_node alongside the SyncEngine; shared with the IPC handler
@@ -2398,6 +2398,14 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // outlive the event loop's sender; a restart wires a fresh
         // watch pair.
         let _ = guard.transport_epoch_rx.take();
+        // ZEB-683 (PR #488 review, Qodo): reset the feed-authority gates so a
+        // fresh in-process run republishes/restamps once. Boot-time peers do
+        // NOT bump the transport epoch (event_loop seeds transport_prev_zids
+        // without a bump), so a persisted gate would leave the new session
+        // with no re-offer trigger until a peer churns.
+        if let Ok(mut g) = guard.vine_authority_gates.lock() {
+            *g = VineAuthorityGates::default();
+        }
         // ZEB-352: drop the voice-signal relay sender. The event_loop's
         // matching receiver gets None on next recv(); the relay arm goes
         // dormant. Cleared even when unused so a restart's fresh Sender
@@ -3604,6 +3612,11 @@ pub async fn start_node_inner(
         // doesn't outlive the previous event loop's sender. A fresh
         // watch pair is constructed below.
         let _ = guard.transport_epoch_rx.take();
+        // ZEB-683 (PR #488 review, Qodo): reset the feed-authority gates for
+        // the fresh run — see the matching stop_inner reset.
+        if let Ok(mut g) = guard.vine_authority_gates.lock() {
+            *g = VineAuthorityGates::default();
+        }
         // ZEB-352: clear the previous voice-signal relay sender so it
         // doesn't outlive the previous event loop. A fresh channel pair is
         // constructed below.
@@ -14993,7 +15006,11 @@ async fn signer_bundle_from_doc(
             crate::enrollment_verify::own_cert_bundle(&g, cert)
         }
         None => {
-            tracing::warn!("vine signer bundle: trust doc unavailable; quorum bundle empty");
+            // debug, not warn: the reaction path hits this per user action in
+            // the degraded quorum-without-trust-doc state (PR #488 review,
+            // Qodo); the publish paths surface their own single higher-signal
+            // WARN where publishing is actually affected.
+            tracing::debug!("vine signer bundle: trust doc unavailable; quorum bundle empty");
             Vec::new()
         }
     }
@@ -15015,15 +15032,27 @@ pub(crate) struct VineAuthorityGates {
 }
 
 /// The publish/stamp gate fingerprint for the current publisher material.
+/// Covers the FULL published material — the publisher key plus a blake3 over
+/// the cert's and signer bundle's canonical CBOR — so a same-second cert
+/// re-issue with different content AND a bundle-only change (a signer's cert
+/// renewed in the trust doc) each re-arm the gate (PR #488 review,
+/// CodeRabbit + Qodo).
 fn vine_material_fingerprint(
     sk: &ed25519_dalek::SigningKey,
     cert: &harmony_owner::certs::EnrollmentCert,
-) -> String {
-    format!(
+    bundle: &[harmony_owner::certs::EnrollmentCert],
+) -> Result<String, String> {
+    let cert_hex = feed_authority::encode_cert(cert)?;
+    let bundle_hex = feed_authority::encode_certs(bundle)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(cert_hex.as_bytes());
+    hasher.update(b"|");
+    hasher.update(bundle_hex.as_bytes());
+    Ok(format!(
         "{}:{}",
         hex::encode(sk.verifying_key().to_bytes()),
-        cert.issued_at
-    )
+        hasher.finalize().to_hex()
+    ))
 }
 
 /// ZEB-678 S2 / ZEB-683: on a migrated vine publish, build + publish this
@@ -15047,7 +15076,17 @@ async fn publish_feed_authority_if_needed(
         Ok(g) => g.vine_authority_gates.clone(),
         Err(_) => return,
     };
-    let current_fp = vine_material_fingerprint(sk, cert);
+    // ZEB-682: the quorum signer bundle, fetched BEFORE the gate — the
+    // fingerprint covers it, so a bundle-only change re-arms (PR #488 review).
+    // Master-issued certs skip the trust-doc lock entirely.
+    let bundle = own_signer_bundle(state, cert).await;
+    let current_fp = match vine_material_fingerprint(sk, cert, &bundle) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "vine authority: material fingerprint failed");
+            return;
+        }
+    };
     // Decide what still needs doing and ATOMICALLY reserve the Zenoh publish, so
     // two concurrent vine publishes can't emit duplicate authority records
     // (CodeRabbit). The fleet-net stamp is gated separately (Qodo/CodeRabbit): a
@@ -15081,9 +15120,6 @@ async fn publish_feed_authority_if_needed(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    // ZEB-682: thread the quorum signer bundle so a quorum-issued device's
-    // record verifies at receivers (empty for master-issued).
-    let bundle = own_signer_bundle(state, cert).await;
     let rec = match feed_authority::build_active_authority(identity, sk, cert, &bundle, now_ms) {
         Ok(r) => r,
         Err(e) => {
@@ -15168,13 +15204,10 @@ async fn run_vine_authority_reoffer(
     identity: std::sync::Arc<harmony_identity::PrivateIdentity>,
 ) {
     while epoch_rx.changed().await.is_ok() {
-        let migrated = gates
-            .lock()
-            .map(|g| g.published_fp.is_some())
-            .unwrap_or(false);
-        if !migrated {
-            continue;
-        }
+        let observed_fp = match gates.lock().map(|g| g.published_fp.clone()) {
+            Ok(Some(fp)) => fp,
+            _ => continue, // not migrated this boot (or poisoned): never force-migrate
+        };
         let (sk, cert) = {
             let g = dm_outbox.lock().await;
             (g.community_signing_key.clone(), g.enrollment_cert.clone())
@@ -15222,11 +15255,17 @@ async fn run_vine_authority_reoffer(
         }
         match reply_rx.await {
             Ok(Ok(())) => {
-                // Re-arm the gate to the material just offered, so a
-                // mid-session rotation that re-published here doesn't
-                // re-publish again on the next vine publish.
+                // Re-arm the gate to the material just offered — but only if
+                // no newer reservation landed while this offer was in flight
+                // (compare-and-set against the fingerprint observed at tick
+                // start; PR #488 review, CodeRabbit). A lost CAS is benign:
+                // the newer material's own publish path owns the gate.
                 if let Ok(mut g) = gates.lock() {
-                    g.published_fp = Some(vine_material_fingerprint(&sk, &cert));
+                    if g.published_fp.as_deref() == Some(observed_fp.as_str()) {
+                        if let Ok(fp) = vine_material_fingerprint(&sk, &cert, &bundle) {
+                            g.published_fp = Some(fp);
+                        }
+                    }
                 }
                 tracing::debug!("vine authority re-offer: published on transport up-edge");
             }
@@ -15674,16 +15713,42 @@ pub(crate) async fn publish_vine_reaction_impl(
     // the `#3`-bound reactor_address.
     match vine_publisher_material(&dm_outbox).await {
         Some((sk, cert)) => {
-            wire.owner_id = Some(hex::encode(cert.owner_id));
-            wire.enrollment_cbor_hex = Some(feed_authority::encode_cert(&cert)?);
-            // ZEB-682: a quorum-issued device must attach its signer bundle —
-            // receivers hard-reject a v2 reaction whose carried enrollment
-            // cannot verify (empty bundle ⇒ every quorum reaction dropped).
-            wire.signer_certs_cbor_hex =
-                feed_authority::encode_certs(&own_signer_bundle(state, &cert).await)?;
-            vine_signing::sign_reaction(&identity, &mut wire);
-            vine_signing::sign_reaction_v2(&sk, &mut wire);
-            publish_feed_authority_if_needed(state, &publish_tx, &identity, &sk, &cert).await;
+            // ZEB-682: a quorum-issued device must attach a VERIFIABLE signer
+            // bundle — receivers hard-reject a v2 reaction whose carried
+            // enrollment cannot verify. Validate publisher-side (PR #488
+            // review, CodeRabbit): a device that cannot present a verifying
+            // bundle (trust doc not wired, short bundle, expired cert) falls
+            // back to the LEGACY #3-only reaction, which every receiver still
+            // accepts (§3.3 dual-path) — a delivered legacy reaction beats a
+            // silently-dropped v2 one.
+            let bundle = own_signer_bundle(state, &cert).await;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            match crate::enrollment_verify::verify_enrollment_any_issuer(
+                &cert,
+                &bundle,
+                Some(&cert.owner_id),
+                now_secs,
+            ) {
+                Ok(_) => {
+                    wire.owner_id = Some(hex::encode(cert.owner_id));
+                    wire.enrollment_cbor_hex = Some(feed_authority::encode_cert(&cert)?);
+                    wire.signer_certs_cbor_hex = feed_authority::encode_certs(&bundle)?;
+                    vine_signing::sign_reaction(&identity, &mut wire);
+                    vine_signing::sign_reaction_v2(&sk, &mut wire);
+                    publish_feed_authority_if_needed(state, &publish_tx, &identity, &sk, &cert)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "vine reaction: own enrollment not verifiable; publishing legacy #3-only"
+                    );
+                    vine_signing::sign_reaction(&identity, &mut wire);
+                }
+            }
         }
         None => {
             tracing::warn!("vine reaction: enrolled #2 key unavailable; signing legacy #3");
@@ -67206,15 +67271,49 @@ mod zeb682_683_feed_authority_tests {
             .await;
         assert_eq!(published_count(&seen), 1, "quorum record published");
         let gates = state.lock().unwrap().vine_authority_gates.clone();
+        let expected_fp =
+            vine_material_fingerprint(&world.c_sk, &world.c_quorum_cert, &world.bundle)
+                .expect("fingerprint");
         assert_eq!(
             gates.lock().unwrap().published_fp.as_deref(),
-            Some(vine_material_fingerprint(&world.c_sk, &world.c_quorum_cert).as_str()),
+            Some(expected_fp.as_str()),
             "gate latched to the quorum material"
         );
         assert_eq!(
             world.c_quorum_cert.issued_at, QUORUM_ISSUED_AT,
             "fixture sanity: quorum cert carries its signed issued_at"
         );
+
+        // R1 (CodeRabbit/Qodo): a bundle-only change re-arms — swap the trust
+        // doc for one where signer B's cert was re-issued (same keys, same
+        // issued_at second, different expiry). The published record's signer
+        // bundle changes, so the full-material fingerprint moves and the
+        // record re-publishes even though key + issued_at are unchanged.
+        let renewed_b = harmony_owner::certs::EnrollmentCert::sign_master(
+            &world.master_sk,
+            world.master_bundle.clone(),
+            world.b_cert.device_id,
+            world.b_cert.device_pubkeys.clone(),
+            world.b_cert.issued_at,
+            // Far-future in REAL time — the publish self-check runs against
+            // the wall clock, so a WORLD_NOW-relative expiry is already past.
+            Some(4_000_000_000),
+        )
+        .expect("renew B");
+        let mut trust2 = harmony_owner::state::OwnerState::new(world.owner_id);
+        for c in [&world.a_cert, &renewed_b] {
+            trust2
+                .add_enrollment(
+                    c.clone(),
+                    WORLD_NOW,
+                    harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                )
+                .expect("enroll signer");
+        }
+        state.lock().unwrap().owner_trust_doc = Some(Arc::new(tokio::sync::Mutex::new(trust2)));
+        publish_feed_authority_if_needed(&state, &tx, &identity, &world.c_sk, &world.c_quorum_cert)
+            .await;
+        assert_eq!(published_count(&seen), 2, "bundle-only change re-publishes");
     }
 
     #[tokio::test]

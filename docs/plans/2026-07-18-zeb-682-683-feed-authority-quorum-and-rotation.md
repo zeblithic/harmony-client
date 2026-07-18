@@ -28,18 +28,19 @@ So the **real** ZEB-683 staleness triggers are: (a) cert renewal (same binding, 
 1. `build_active_authority` gains a `signer_certs: &[EnrollmentCert]` parameter; sets `signer_certs_cbor_hex = encode_certs(signer_certs)?` (empty slice ⇒ `""` ⇒ serde-omitted, wire-compatible).
 2. New `lib.rs` helper `own_signer_bundle(state, cert) -> Vec<EnrollmentCert>`: Master-issued → `vec![]` without locking; Quorum-issued → async-lock `owner_trust_doc` and call `own_cert_bundle`. Missing trust doc ⇒ empty bundle (the self-check below then keeps the feed on legacy, honestly).
 3. `publish_feed_authority_if_needed` builds with the bundle, then **self-verifies** `verify_authority(&rec, now_ms/1000)` before publishing; on `Err` → warn + release the gate (never publish a record receivers will drop — also catches an expired own cert and a short bundle).
-4. Reaction path: fill `wire.signer_certs_cbor_hex` from the same bundle (fixes V2).
+4. Reaction path: fill `wire.signer_certs_cbor_hex` from the same bundle (fixes V2), and validate the enrollment + bundle publisher-side first (R1, CodeRabbit): a quorum device that cannot present a verifying bundle publishes the LEGACY `#3`-only reaction (which every receiver accepts, §3.3 dual-path) instead of a v2 reaction receivers silently drop.
 
 Out of scope: the friend-handshake self-bundle (`iroh_friend_acceptor.rs:1568`) — separate documented S4 deferral, different seam.
 
 ### B. ZEB-683 — publish-side maintenance: fingerprint gates
 
-Replace the two boot-bools with fingerprints:
+Replace the two boot-bools with fingerprints in a shared `VineAuthorityGates` cell:
 
-- `vine_authority_published_fp: Option<String>`, `vine_feed_binding_stamped_fp: Option<String>`; `fp = format!("{publisher_key_hex}:{cert.issued_at}")`.
-- Gate = `stored != Some(current_fp)`. The atomic reserve/release pattern is preserved (release restores the *previous* value, not `None`).
+- `published_fp` / `stamped_fp: Option<String>`; `fp = {publisher_key_hex}:{blake3(cert_cbor ‖ bundle_cbor)}` — the FULL published material (R1, CodeRabbit + Qodo): a same-second cert re-issue with different content and a bundle-only change (a signer's cert renewed in the trust doc) each re-arm; `issued_at` alone was collision-prone.
+- Gate = `stored != Some(current_fp)`. The atomic reserve/release pattern is preserved (release restores the *previous* value, not `None`). The re-offer task's completion re-arm is a compare-and-set against the fingerprint it observed at tick start, so a stale offer never overwrites a newer reservation (R1); a lost CAS is benign — the newer material's publish path owns the gate.
+- Gates are RESET in `stop_inner` / the start-path stale-cleanup (R1, Qodo): boot-time peers don't bump the transport epoch, so a gate persisted across an in-process restart would leave the fresh session with no publish and no re-offer trigger until a peer churns.
 
-This re-publishes exactly when the material changes: first publish (None) and cert renewal / re-issue (`issued_at` moves; keys cannot move for a given `device_id` — §C) — and stays once-per-boot in the steady state. If the node ever re-enrolls as a new device (new `device_id` + keys, same `#3`), the fingerprint also moves and the new binding publishes; followers holding the old pin drop it (first-write-wins, §C), fresh followers pin it.
+This re-publishes exactly when the material changes: first publish (None), cert renewal / re-issue, bundle change — and stays once-per-boot in the steady state. If the node ever re-enrolls as a new device (new `device_id` + keys, same `#3`), the fingerprint also moves and the new binding publishes; followers holding the old pin drop it (first-write-wins, §C), fresh followers pin it.
 
 ### C. ZEB-683 — follower-side repin: **FINDING — unrepresentable; no cache change ships**
 
