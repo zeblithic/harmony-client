@@ -153,12 +153,47 @@ async fn status_handler(
 /// of the GUI's explicit quit). The send wakes `axum::serve`'s
 /// graceful-shutdown future; serve_cli's select observes the server task
 /// ending and runs the node teardown.
+///
+/// ZEB-703: owner-state is persisted BEFORE the 200 is sent. The ack is
+/// the signal supervisors act on (`curl …/v1/shutdown; sleep N; relaunch`
+/// — our own cross-WAN harness recipe), while `stop_inner`'s flush only
+/// runs AFTER axum drains — i.e. after the caller already has its 200. A
+/// supervisor that kills or relaunches on the ack would race the
+/// process's final save point and silently lose any un-flushed owner-state
+/// mutation (queued DMs — the observed ZEB-703 data loss). The pre-ack
+/// `persist_now` closes that window: everything enqueued before the call
+/// is durable by ack time. Bounded + best-effort: on timeout/error we
+/// warn and proceed (the process is going down either way, and
+/// `stop_inner`'s unconditional persist remains the backstop for the
+/// well-behaved-supervisor path).
 async fn shutdown_handler(
     State(ctx): State<ApiCtx>,
     headers: axum::http::HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if !authed(&ctx, &headers) {
         return unauthorized();
+    }
+    // Snapshot the engine handle out of the sync-mutex guard (guard must
+    // not live across an await); a poisoned lock degrades to no pre-flush.
+    let engine = match ctx.state.node_state().lock() {
+        Ok(guard) => guard.sync_engine_for_shutdown_flush(),
+        Err(e) => {
+            tracing::warn!(error = %e, "ZEB-703: NodeState poisoned at shutdown; skipping pre-ack flush");
+            None
+        }
+    };
+    if let Some(engine) = engine {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), engine.persist_now()).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                "ZEB-703: pre-ack owner-state persist failed; proceeding with shutdown"
+            ),
+            Err(_) => tracing::warn!(
+                "ZEB-703: pre-ack owner-state persist timed out (5s); proceeding with shutdown"
+            ),
+        }
     }
     // Err = shutdown already requested (channel full or receiver consumed) —
     // still report success; the process is going down either way.

@@ -1632,6 +1632,17 @@ impl NodeState {
         self.dm_self_owner.map(|o| hex::encode(o.0))
     }
 
+    /// ZEB-703: owner-state engine handle for `/v1/shutdown`'s pre-ack
+    /// flush. The 200 is the signal supervisors act on; the handler
+    /// persists owner-state BEFORE responding so a kill-or-relaunch-on-200
+    /// supervisor can't race the process's final save point. `None` when no
+    /// owner is loaded (nothing to flush).
+    pub(crate) fn sync_engine_for_shutdown_flush(
+        &self,
+    ) -> Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> {
+        self.sync_engine.clone()
+    }
+
     /// ZEB-321 Phase 1 PR #157 round 2 (CodeRabbit): abort the iroh
     /// background tasks and drop all iroh-related Arcs in one place.
     /// Called from both `stop_inner` and the identity-rebuild path
@@ -65685,6 +65696,147 @@ mod zeb703_outbox_runtime_durability_tests {
             })
         })
         .await;
+    }
+
+    /// ZEB-703 shutdown-ordering leg: `/v1/shutdown` must complete an
+    /// owner-state persist BEFORE acking 200. The 200 is the signal
+    /// supervisors act on (our own harness does `curl …; sleep 3; relaunch`)
+    /// — if the flush trails the ack, a kill-or-relaunch-on-200 supervisor
+    /// races the process's ONLY save point for any un-notified mutation.
+    /// The entry here is minted via the raw `DmOutbox::send_dm` primitive
+    /// (no notify_dirty — deliberately simulating an un-notified window),
+    /// so the handler's pre-ack flush is the only thing that can persist it
+    /// by ack time.
+    #[tokio::test]
+    async fn shutdown_acks_only_after_owner_state_persist_zeb703() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt = Arc::new(
+            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
+        );
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        let alice = crate::owner_state_types::OwnerAddr([0x01; 16]);
+        let bob = crate::owner_state_types::OwnerAddr([0x02; 16]);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let outbox_arc = Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+            "zeb703-dev",
+            alice,
+        )));
+        let cas = crate::content_store::InMemoryStub::default();
+        let space_id = {
+            let mut g = crdt_state.lock().await;
+            let sp = make_dm_space(13, vec![alice, bob]);
+            let id = sp.id;
+            let outcome = g.apply_space_with_canonicalization(sp);
+            assert!(
+                matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Inserted),
+                "fixture install must succeed, got {outcome:?}"
+            );
+            id
+        };
+        // Long debounce (10 min): even if something DID notify, the
+        // debounced flush can't fire within this test — only the handler's
+        // explicit pre-ack persist can write the file.
+        let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
+            crate::owner_state_crypto::FleetKeySet::new(kt),
+            "zeb703-dev".into(),
+            Arc::clone(&crdt_state),
+            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(crate::content_store::InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            600_000,
+        ));
+        // Mint the entry via the raw primitive — NO notify_dirty anywhere.
+        let entry_id = {
+            let mut o_g = outbox_arc.lock().await;
+            let mut s_g = crdt_state.lock().await;
+            let (id, _cid) = o_g
+                .send_dm(
+                    &mut s_g,
+                    &cas,
+                    space_id,
+                    b"zeb703 pre-ack flush".to_vec(),
+                    "text/plain".into(),
+                    1_000,
+                    None,
+                )
+                .await
+                .expect("send_dm must succeed");
+            id
+        };
+
+        // Real API server over a NodeState carrying the engine.
+        let api_dir = tempfile::tempdir().expect("api tempdir");
+        let state: Arc<std::sync::Mutex<NodeState>> = Arc::new(std::sync::Mutex::new(NodeState {
+            crdt_state: Some(Arc::clone(&crdt_state)),
+            sync_engine: Some(Arc::clone(&engine)),
+            ..NodeState::default()
+        }));
+        let events = crate::api::events::ApiEventSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(crate::node_event_sink::FanoutSink(vec![]));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (handle, task) = crate::api::start_server(
+            api_dir.path(),
+            0,
+            state,
+            sink,
+            events,
+            shutdown_tx,
+            shutdown_rx,
+        )
+        .await
+        .expect("start_server");
+        let token = std::fs::read_to_string(handle.api_dir.join("token")).expect("token file");
+
+        // POST /v1/shutdown and read the full response (Connection: close).
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", handle.bound_port))
+            .await
+            .expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "POST /v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                     Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write request");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read response");
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.contains("200"), "shutdown must ack 200, got: {resp}");
+
+        // ORDERING ASSERTION — no polling: the moment the 200 arrived, the
+        // un-notified mutation must ALREADY be on disk. A trailing flush
+        // (the pre-fix behavior: ack first, stop_inner later) fails here
+        // because this harness never runs stop_inner at all — exactly the
+        // supervisor's view after kill-on-200.
+        let loaded = crate::owner_state_persist::load_crdt(&crdt_path)
+            .expect("owner_state_crdt.cbor must exist by ack time (pre-ack flush)");
+        assert!(
+            loaded.outbox.contains_key(&entry_id),
+            "ZEB-703: /v1/shutdown acked 200 before persisting owner-state — \
+             a kill-on-200 supervisor would lose the queued DM"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("server task must join after /v1/shutdown")
+            .expect("server task must not panic")
+            .expect("graceful shutdown must end the server cleanly");
     }
 }
 
