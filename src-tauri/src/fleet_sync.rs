@@ -199,6 +199,33 @@ pub struct FleetSyncConfig<S> {
 
 /// Generic per-owner sync engine. Construction spawns the internal task;
 /// `shutdown().await` stops it cleanly with one final flush.
+/// ZEB-710: generic dirty-window tripwire — recurrence prevention for the
+/// ZEB-703 bug class, where a mutation site forgets `notify_dirty()` and
+/// silently relies on some LATER persist (typically the shutdown flush) to
+/// save its write, so the publish leg never replicates it. The persist path
+/// compares the canonical hash of the state snapshot against the previous
+/// persist's hash: a changed hash with no dirty signal (and no in-engine
+/// merge) observed since the previous persist is an un-notified mutation
+/// window.
+///
+/// The CHECK compiles only under `cfg(any(test, feature = "test-fixtures"))`
+/// — i.e. the entire test suite — and fires `tracing::error!` +
+/// `debug_assert!`. Production carries only the (never-read) bookkeeping
+/// stores. The per-site dirty-count pins from ZEB-709/PR #487 guard the
+/// CURRENT mutation surface; this guards FUTURE sites generically.
+struct PersistTripwire {
+    /// Set by `notify_dirty()` and by the engine's own inbound-merge path
+    /// (remote merges are exempt from the notify discipline — the engine
+    /// task persists them right where they apply). Consumed by the persist
+    /// check ONLY when the hash actually changed, so an early or spurious
+    /// signal cannot mask a later un-notified mutation.
+    dirty_seen: AtomicBool,
+    /// Canonical-CBOR hash of the last persisted state snapshot. `None`
+    /// until the first persist (the baseline never fires).
+    #[cfg_attr(not(any(test, feature = "test-fixtures")), allow(dead_code))]
+    last_hash: std::sync::Mutex<Option<u64>>,
+}
+
 pub struct FleetSyncEngine<S: Send + 'static> {
     notify_dirty: Arc<Notify>,
     /// Set to `true` by `notify_dirty()`; cleared by the task after each
@@ -207,11 +234,23 @@ pub struct FleetSyncEngine<S: Send + 'static> {
     /// most-recent actual publish.
     has_pending_dirty: Arc<AtomicBool>,
     flush_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
-    persist_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     /// Carries `Result<(), SyncError>` so the final publish + persist
     /// errors propagate to the caller rather than being silently
     /// swallowed by `()`.
     shutdown_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
+    /// ZEB-710: the handle holds the state + persist Arcs directly so
+    /// `persist_now` can run WITHOUT routing through the task's `select!`
+    /// loop — a task wedged inside a publish send (publisher-channel
+    /// backpressure, the ZEB-509 stall shape) must never starve a
+    /// durability fence. `persist_sink` serializes handle-side persists
+    /// against the task's own (snapshot taken UNDER the sink lock, so a
+    /// later acquirer always snapshots later state — no older-clobbers-
+    /// newer write).
+    state: Arc<Mutex<S>>,
+    persist: Arc<dyn FleetPersist<S>>,
+    persist_sink: Arc<tokio::sync::Mutex<()>>,
+    /// ZEB-710: dirty-window tripwire bookkeeping (see [`PersistTripwire`]).
+    tripwire: Arc<PersistTripwire>,
     replay_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
     sibling_acks: Arc<Mutex<BTreeMap<String, Hlc>>>,
     device_id: String,
@@ -279,8 +318,14 @@ where
         let notify_dirty = Arc::new(Notify::new());
         let has_pending_dirty = Arc::new(AtomicBool::new(false));
         let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
-        let (persist_now_tx, persist_now_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        // ZEB-710: serializes every persist (task-side and handle-side
+        // direct) — see the field doc on the handle.
+        let persist_sink = Arc::new(tokio::sync::Mutex::new(()));
+        let tripwire = Arc::new(PersistTripwire {
+            dirty_seen: AtomicBool::new(false),
+            last_hash: std::sync::Mutex::new(None),
+        });
         // ZEB-705: bounded fetch-retry re-injection. Capacity matches the
         // in-flight permit cap so a full sleeper set never overflows it.
         let (fetch_retry_tx, fetch_retry_rx) = mpsc::channel(FETCH_RETRY_MAX_INFLIGHT);
@@ -296,6 +341,9 @@ where
         let replay_tracker = Arc::clone(&config.replay_tracker);
         let sibling_acks = Arc::clone(&config.sibling_acks);
         let device_id = config.device_id.clone();
+        // ZEB-710: handle-side clones for the direct persist path.
+        let state = Arc::clone(&config.state);
+        let persist = Arc::clone(&config.persist);
 
         let task = tokio::spawn(internal_task(Ctx {
             keys: config.keys,
@@ -314,8 +362,9 @@ where
             sibling_acks: config.sibling_acks,
             notify_dirty: Arc::clone(&notify_dirty),
             has_pending_dirty: Arc::clone(&has_pending_dirty),
+            persist_sink: Arc::clone(&persist_sink),
+            tripwire: Arc::clone(&tripwire),
             flush_now_rx,
-            persist_now_rx,
             shutdown_rx,
             fetch_retry_tx,
             fetch_retry_rx,
@@ -331,8 +380,11 @@ where
             notify_dirty,
             has_pending_dirty,
             flush_now_tx,
-            persist_now_tx,
             shutdown_tx,
+            state,
+            persist,
+            persist_sink,
+            tripwire,
             replay_tracker,
             sibling_acks,
             device_id,
@@ -389,6 +441,9 @@ where
     /// Hint that local state has mutated and a debounced publish should
     /// fire after `debounce_ms`. Non-blocking.
     pub fn notify_dirty(&self) {
+        // ZEB-710: record the signal for the dirty-window tripwire before
+        // arming the publish debounce.
+        self.tripwire.dirty_seen.store(true, Ordering::SeqCst);
         self.has_pending_dirty.store(true, Ordering::Release);
         self.notify_dirty.notify_one();
     }
@@ -421,13 +476,21 @@ where
     /// only requirement is that local state reach disk; any pending state-root
     /// publish still fires on the next debounce. Mirrors
     /// `community_state_sync::CommunitySyncEngine::persist_now`.
+    ///
+    /// ZEB-710: runs DIRECTLY on the caller's stack — it does NOT route
+    /// through the engine task's `select!` loop. A task wedged inside a
+    /// publish send (publisher-channel backpressure, the ZEB-509 stall
+    /// shape) therefore cannot starve this call; `persist_sink` serializes
+    /// it against the task's own persists.
     pub async fn persist_now(&self) -> Result<(), SyncError> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        self.persist_now_tx
-            .send(resp_tx)
-            .await
-            .map_err(|_| SyncError::TransportClosed)?;
-        resp_rx.await.map_err(|_| SyncError::TransportClosed)?
+        persist_direct(
+            &self.state,
+            &self.replay_tracker,
+            &self.persist,
+            &self.persist_sink,
+            &self.tripwire,
+        )
+        .await
     }
 
     /// Stop the internal task, flushing any pending writes first. Must be
@@ -537,8 +600,12 @@ struct Ctx<S> {
     sibling_acks: Arc<Mutex<BTreeMap<String, Hlc>>>,
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
+    /// ZEB-710: shared with the handle — every persist (task-side or
+    /// handle-direct) serializes through this. See the handle field doc.
+    persist_sink: Arc<tokio::sync::Mutex<()>>,
+    /// ZEB-710: dirty-window tripwire bookkeeping (see [`PersistTripwire`]).
+    tripwire: Arc<PersistTripwire>,
     flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
-    persist_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     /// ZEB-705: re-injection channel for bounded fetch retries. The sender
     /// clone lives in short-lived sleep tasks; keeping one clone here means
@@ -658,20 +725,16 @@ where
                         ctx.has_pending_dirty.store(true, Ordering::Release);
                     }
                 }
+                // ZEB-710: an EXPLICIT flush accounts the caller's mutation
+                // for the dirty-window tripwire — the state was just
+                // published above, so the ZEB-703 harm (persisted but never
+                // replicated) cannot occur through this arm. Enforcement
+                // stays on the IMPLICIT saves: the debounce persist and the
+                // shutdown flush.
+                ctx.tripwire.dirty_seen.store(true, Ordering::SeqCst);
                 let persist_result = persist_now(&ctx).await;
                 let result = pub_result.and(persist_result);
                 let _ = resp_tx.send(result);
-            }
-            Some(resp_tx) = ctx.persist_now_rx.recv() => {
-                // Publish-INDEPENDENT durable persist (durable-on-commit fence).
-                // Persists state + tracker to disk without the publish leg, so a
-                // stalled publish (no zenoh responder) can never starve durability
-                // — the ZEB-509 bug this path fixes. Deliberately does NOT touch
-                // `has_pending_dirty`: any pending state-root publish still fires
-                // on the next debounce / flush_now. Mirrors the community engine's
-                // persist_now arm.
-                let persist_result = persist_now(&ctx).await;
-                let _ = resp_tx.send(persist_result);
             }
             maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
                 let Some(bytes) = maybe_bytes else {
@@ -732,11 +795,73 @@ where
 /// the tokio worker is not stalled.
 async fn persist_now<S>(ctx: &Ctx<S>) -> Result<(), SyncError>
 where
-    S: Clone + Send + 'static,
+    S: CanonicalPayload + Clone + Send + 'static,
 {
-    let state_snap = ctx.state.lock().await.clone();
-    let tracker_snap = ctx.replay_tracker.lock().await.clone();
-    let persist = Arc::clone(&ctx.persist);
+    persist_direct(
+        &ctx.state,
+        &ctx.replay_tracker,
+        &ctx.persist,
+        &ctx.persist_sink,
+        &ctx.tripwire,
+    )
+    .await
+}
+
+/// ZEB-710: the one durability write path, shared by the engine task's
+/// persists (debounce / flush / shutdown arms, inbound-merge persist) and
+/// the handle's direct `persist_now`. The sink lock is held from BEFORE the
+/// state snapshot until the blocking write completes: concurrent persists
+/// are strictly ordered, and because each acquirer snapshots under the
+/// lock, a later write always carries same-or-newer state — an unlocked
+/// direct path could otherwise interleave an older snapshot over a newer
+/// on-disk image.
+async fn persist_direct<S>(
+    state: &Arc<Mutex<S>>,
+    replay_tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
+    persist: &Arc<dyn FleetPersist<S>>,
+    persist_sink: &Arc<tokio::sync::Mutex<()>>,
+    tripwire: &Arc<PersistTripwire>,
+) -> Result<(), SyncError>
+where
+    S: CanonicalPayload + Clone + Send + 'static,
+{
+    let _sink_g = persist_sink.lock().await;
+    let state_snap = state.lock().await.clone();
+
+    // ZEB-710 dirty-window tripwire (test builds only; see [`PersistTripwire`]).
+    // Runs under the sink lock so hash bookkeeping is serialized with the
+    // persists themselves.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    {
+        use std::hash::{Hash, Hasher};
+        if let Ok(bytes) = canonical_cbor_encode(&state_snap) {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            let hash = hasher.finish();
+            let mut last_g = tripwire.last_hash.lock().expect("tripwire hash mutex");
+            let changed = last_g.is_some_and(|prev| prev != hash);
+            // Short-circuit keeps the flag UNCONSUMED when the hash did not
+            // change — an early signal must stay armed for the mutation it
+            // announced.
+            if changed && !tripwire.dirty_seen.swap(false, Ordering::SeqCst) {
+                tracing::error!(
+                    "ZEB-710 dirty-window tripwire: state hash changed since the last \
+                     persist with NO notify_dirty() observed — an un-notified mutation \
+                     window (the ZEB-703 bug class). Find the mutation site and arm its \
+                     notify hook."
+                );
+                debug_assert!(
+                    false,
+                    "un-notified owner-state mutation window (ZEB-710 tripwire): state \
+                     hash changed since the last persist without notify_dirty()"
+                );
+            }
+            *last_g = Some(hash);
+        }
+    }
+
+    let tracker_snap = replay_tracker.lock().await.clone();
+    let persist = Arc::clone(persist);
     tokio::task::spawn_blocking(move || persist.persist(&state_snap, &tracker_snap))
         .await
         .map_err(|e| SyncError::Persist(format!("spawn_blocking join: {e}")))?
@@ -950,6 +1075,15 @@ where
 {
     match handle_incoming_publish(ctx, wire).await {
         Inbound::Applied(outcome) => {
+            // ZEB-710: remote merges are exempt from the notify_dirty
+            // discipline ([[reference_owner_state_crdt_notify_dirty]]) —
+            // mark the mutation accounted so the tripwire below doesn't
+            // misread the in-engine merge as an un-notified window. Gated
+            // on `changed` so a no-op merge can't mask a genuinely
+            // un-notified external mutation.
+            if outcome.changed {
+                ctx.tripwire.dirty_seen.store(true, Ordering::SeqCst);
+            }
             if let Err(e) = persist_now(ctx).await {
                 tracing::warn!(error = %e, "persist_now failed");
             }
@@ -1381,6 +1515,17 @@ mod engine_tests {
         cas: Arc<dyn ContentStore>,
         publisher_capacity: usize,
     ) -> BuiltInspectable {
+        // Effectively disable the debounce wakeup — these tests drive
+        // persistence explicitly and must never race a background publish.
+        build_engine_inspectable_debounce(device_id, cas, publisher_capacity, 3_600_000)
+    }
+
+    fn build_engine_inspectable_debounce(
+        device_id: &str,
+        cas: Arc<dyn ContentStore>,
+        publisher_capacity: usize,
+        debounce_ms: u64,
+    ) -> BuiltInspectable {
         let (out_tx, out_rx) = mpsc::channel(publisher_capacity);
         // Keep the inbound sender alive (stored in BuiltInspectable below) so
         // the engine task doesn't immediately observe a closed subscriber
@@ -1400,7 +1545,7 @@ mod engine_tests {
             subscriber_rx: in_rx,
             persist: Arc::new(persist.clone()),
             lookup_key_tag: TOY_TAG,
-            debounce_ms: 3_600_000, // effectively disable the debounce wakeup
+            debounce_ms,
             publish_seen: false,
             on_applied: None,
             sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1530,6 +1675,172 @@ mod engine_tests {
         );
 
         // Drain so shutdown's final flush isn't itself starved by the saturation.
+        built.engine.shutdown().await.ok();
+    }
+
+    /// ZEB-710: the scenario `persist_now_persists_without_publishing_under_
+    /// saturated_publisher` does NOT cover — there the engine task is idle and
+    /// still services the persist request. Here the task ITSELF is wedged
+    /// inside `publisher_tx.send().await` (dirty debounce fired against a
+    /// saturated publisher, the ZEB-509 stall shape), so a channel-routed
+    /// persist starves: the task never returns to `select!` to poll the
+    /// request. `persist_now` must service the caller directly, without
+    /// routing through the task loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_now_completes_while_task_wedged_in_publish_send_zeb710() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        // Short debounce so the dirty signal below drives the task into the
+        // publish leg promptly.
+        let built =
+            build_engine_inspectable_debounce("dev-persist-wedged", Arc::clone(&cas), 1, 30);
+
+        // Saturate the publisher channel (rx held, never drained), so the
+        // task's publish send back-pressures indefinitely.
+        built
+            .out_tx
+            .send(vec![0xab; 4])
+            .await
+            .expect("prime saturated publisher channel");
+        assert!(
+            built.out_tx.try_send(vec![0xcd; 4]).is_err(),
+            "publisher channel must be provably full for this test to be meaningful"
+        );
+
+        // Mutate, then arm the debounce. When it fires, the task swaps the
+        // dirty flag off and commits to publish_root_now — which wedges in the
+        // saturated send and never returns to select!.
+        {
+            let mut doc = built.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "durable-while-task-wedged".into(),
+                },
+            );
+        }
+        built.engine.notify_dirty();
+
+        // The dirty-flag swap (wakeup arm, before the publish) is the
+        // observable that the task has left select! and committed to the
+        // wedged publish path.
+        let dirty = Arc::clone(&built.engine.has_pending_dirty);
+        assert!(
+            wait_until(
+                || {
+                    let dirty = Arc::clone(&dirty);
+                    async move { !dirty.load(Ordering::Acquire) }
+                },
+                Duration::from_secs(5)
+            )
+            .await,
+            "engine task must consume the dirty flag (enter the publish leg) within 5s"
+        );
+
+        // The core assertion: persist_now completes promptly even though the
+        // task cannot service any channel arm.
+        let result = tokio::time::timeout(Duration::from_secs(2), built.engine.persist_now()).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "persist_now must complete while the engine task is wedged in a publish send; \
+             got {result:?}"
+        );
+
+        // State reached the persist backend.
+        let persisted = built
+            .persist
+            .persisted
+            .lock()
+            .expect("persist mutex")
+            .clone();
+        assert!(
+            persisted
+                .iter()
+                .any(|doc| doc
+                    .entries
+                    .get("k1")
+                    .is_some_and(|e| e.val == "durable-while-task-wedged")),
+            "persist_now must persist mutated state while the task is wedged"
+        );
+
+        // Unwedge the task (closing the channel fails the pending send, which
+        // the task handles as a publish error) so shutdown can run cleanly.
+        drop(built.out_rx);
+        built.engine.shutdown().await.ok();
+    }
+
+    /// ZEB-710 D2: the dirty-window tripwire must fire when state mutates
+    /// between two persists with NO `notify_dirty()` — the ZEB-703 bug class
+    /// (an un-notified mutation silently riding a later flush). The first
+    /// persist records the baseline hash; the un-notified mutation is caught
+    /// at the second.
+    #[tokio::test]
+    #[should_panic(expected = "un-notified owner-state mutation window")]
+    async fn tripwire_unnotified_mutation_fires_on_persist_zeb710() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let built = build_engine_inspectable("dev-tripwire-red", Arc::clone(&cas), 8);
+
+        // Baseline: first persist records the hash (never fires).
+        built.engine.persist_now().await.expect("baseline persist");
+
+        // Mutate WITHOUT notify_dirty — the discipline violation.
+        {
+            let mut doc = built.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "un-notified".into(),
+                },
+            );
+        }
+
+        // The tripwire fires here (debug_assert in test builds).
+        let _ = built.engine.persist_now().await;
+    }
+
+    /// ZEB-710 D2 positive twin: disciplined mutations (mutate → notify)
+    /// persist clean, and an idle re-persist (unchanged hash) never fires —
+    /// including when a notify signal is still pending from before the
+    /// baseline (the flag is consumed only on an actual hash change).
+    #[tokio::test]
+    async fn tripwire_notified_mutations_persist_clean_zeb710() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let built = build_engine_inspectable("dev-tripwire-green", Arc::clone(&cas), 8);
+
+        built.engine.persist_now().await.expect("baseline persist");
+
+        // Disciplined mutation: mutate, then notify.
+        {
+            let mut doc = built.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "notified".into(),
+                },
+            );
+        }
+        built.engine.notify_dirty();
+        built.engine.persist_now().await.expect("notified persist");
+
+        // Idle re-persist: unchanged hash never fires.
+        built.engine.persist_now().await.expect("idle persist");
+
+        // Second disciplined round-trip proves the consumed flag re-arms.
+        {
+            let mut doc = built.state.lock().await;
+            doc.entries.insert(
+                "k2".into(),
+                ToyEntry {
+                    ctr: 2,
+                    val: "notified-again".into(),
+                },
+            );
+        }
+        built.engine.notify_dirty();
+        built.engine.persist_now().await.expect("second notified persist");
+
         built.engine.shutdown().await.ok();
     }
 
