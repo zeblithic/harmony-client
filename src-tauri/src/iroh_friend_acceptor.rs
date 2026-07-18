@@ -1667,6 +1667,12 @@ where
     /// `intro_rate_limiter` precedent. Clone shares the inner `Arc<RwLock<..>>`,
     /// so this sees the live feed's writes.
     revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    /// ZEB-700: two-tier rate limiter for this ALPN (the ZEB-694 pattern
+    /// extended to friend/v1) — Tier 1 pre-auth connection shield + Tier 2
+    /// post-auth per-owner window, budgets disjoint from the PEX acceptor's
+    /// `intro_rate_limiter`. `with_config` seeds the production caps; tests
+    /// override tiny/zero caps via [`Self::with_rate_limiter`].
+    rate_limiter: Arc<crate::friend_intro::FriendRateLimiter>,
     config: FriendAcceptorConfig,
 }
 
@@ -1747,8 +1753,22 @@ where
             // production overrides via `with_revoked` with the real NodeState
             // handle. Tests keep the empty default.
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            // ZEB-700: production caps by default; tests shrink them via
+            // `with_rate_limiter`. Honest single-handshake peers never hit them.
+            rate_limiter: Arc::new(crate::friend_intro::FriendRateLimiter::new()),
             config,
         }
+    }
+
+    /// ZEB-700: override the friend-handshake rate limiter (tests use
+    /// tiny/zero caps to force deterministic sheds; production keeps the
+    /// `with_config` default).
+    pub fn with_rate_limiter(
+        mut self,
+        rate_limiter: Arc<crate::friend_intro::FriendRateLimiter>,
+    ) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     /// ZEB-680 §1: wire in the live `RevokedDeviceProjection` so the inbound
@@ -2051,6 +2071,33 @@ where
             .map_err(|_| FriendAcceptError::IoTimeout { step: "read body" })?
             .map_err(|e| FriendAcceptError::ReadBody(e.to_string()))?;
 
+        // ZEB-700 Tier 1 (pre-auth connection shield): shed a flooding endpoint
+        // BEFORE decode and all crypto (cert chain + handshake sig + up to 32
+        // carried revocation attestations), keyed on the connecting endpoint's
+        // authenticated iroh id — un-spoofable. Sits pre-decode (cheaper than
+        // the PEX precedent's post-decode placement, which only exists to
+        // select an arm; friend/v1 has one arm). On a shed we LOG ("no silent
+        // truncation") and write the SAME benign `Pending` reply the Path-A
+        // outcome writes — network-indistinguishable (no oracle) and it leaks
+        // nothing about consent state — with ZERO state effect: nothing is
+        // recorded, no token consumed, no friend written. An honest peer that
+        // somehow trips the cap self-heals by re-dialing after the window (a
+        // live token stays live and redeemable).
+        let limiter_now_ms = wall_now_ms();
+        if let Err(reason) = self
+            .rate_limiter
+            .admit_connection(*conn.remote_id().as_bytes(), limiter_now_ms)
+        {
+            tracing::warn!(
+                reason,
+                "ZEB-700: friend handshake shed by connection shield"
+            );
+            let resp = encode_friend_response(&FriendLinkResponse::Pending)
+                .map_err(FriendAcceptError::Handshake)?;
+            self.write_friend_response(&mut send, &resp).await?;
+            return Ok(());
+        }
+
         let req = decode_friend_request(&body).map_err(FriendAcceptError::Handshake)?;
 
         // ZEB-371 Task 12 (spec §7.1): AUTHENTICATE ALWAYS, then decide consent.
@@ -2066,6 +2113,27 @@ where
         let now_secs = wall_now_secs();
         authenticate_friend_request(&req, &self.revoked, now_secs)
             .map_err(FriendAcceptError::Handshake)?;
+
+        // ZEB-700 Tier 2 (post-auth per-owner quota): `req.from_addr` is now
+        // AUTHENTICATED, so the window keys on a real owner. Deliberately
+        // AFTER auth — an unauthenticated request is still refused above, so a
+        // shed never masks an auth failure — and BEFORE any lock/consent work.
+        // Same benign `Pending` shed as Tier 1 (zero state effect); the legit
+        // re-dial flows (`Pending` → approve → re-dial, `Pending` → token →
+        // re-dial) stay far under the cap — see `FriendRateLimiter` for why
+        // this tier has no dedupe. Reuses Tier 1's `now` sample so the two
+        // tiers can't straddle a window boundary within one handshake.
+        if let Err(reason) = self.rate_limiter.admit_owner(req.from_addr, limiter_now_ms) {
+            tracing::warn!(
+                reason,
+                key = %hex::encode(req.from_addr.0),
+                "ZEB-700: friend handshake shed by per-owner quota"
+            );
+            let resp = encode_friend_response(&FriendLinkResponse::Pending)
+                .map_err(FriendAcceptError::Handshake)?;
+            self.write_friend_response(&mut send, &resp).await?;
+            return Ok(());
+        }
 
         // Compute `known` under the CRDT lock: is the requester already an
         // Active|Pending friend? Snapshot the boolean and DROP the guard before
@@ -5362,5 +5430,117 @@ mod tests {
         })
         .await
         .expect("serve_accepts_pre_zeb680_frame_unchanged completes within 30s");
+    }
+
+    /// ZEB-700 Tier 1: a connection-tier shed answers the SAME benign `Pending`
+    /// a Path-A outcome writes (server-side `Ok`, no error) with ZERO state
+    /// effect — nothing recorded in the pending-request store (the observable
+    /// difference from a REAL Pending outcome), no friend written. Zero conn
+    /// cap forces the shed on the first handshake; the sliding-window
+    /// mechanics are pinned by the `FriendRateLimiter` unit tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_connection_shed_writes_benign_pending_zeb700() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let req = signed_request_no_token(0x77);
+
+            let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+            let projection = crate::revoked_device_projection::RevokedDeviceProjection::new();
+            let pending = Arc::new(crate::friend_requests::PendingFriendRequests::new());
+
+            let acceptor = Arc::new(
+                t7_build_acceptor(0x76, Arc::clone(&crdt_state), projection)
+                    .with_pending_requests(Some(Arc::clone(&pending)))
+                    .with_rate_limiter(Arc::new(
+                        crate::friend_intro::FriendRateLimiter::with_caps(0, 100, 3_600_000),
+                    )),
+            );
+            let (result, resp) = t7_drive_handshake(acceptor, req).await;
+
+            assert!(
+                result.is_ok(),
+                "a shed is a benign outcome, not a handler error, got {result:?}"
+            );
+            assert!(
+                matches!(resp, Ok(FriendLinkResponse::Pending)),
+                "the dialer must read the SAME benign Pending reply, got {resp:?}"
+            );
+            assert!(
+                pending.list().is_empty(),
+                "a shed records NOTHING (unlike a real Pending outcome)"
+            );
+            assert!(
+                crdt_state.lock().await.friend_graph.friends.is_empty(),
+                "a shed writes no friend entry"
+            );
+        })
+        .await
+        .expect("serve_connection_shed_writes_benign_pending_zeb700 completes within 30s");
+    }
+
+    /// ZEB-700 Tier 2: the per-owner quota sits POST-auth. (a) A pre-approved
+    /// requester that would inline-accept is shed to the benign `Pending`
+    /// instead — no friend written, nothing recorded. (b) A request with a
+    /// tampered handshake sig is still REFUSED (no response frame) even with a
+    /// zero owner cap — the shed never masks an auth failure, so unauthenticated
+    /// traffic cannot buy the benign ack.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_owner_quota_sheds_post_auth_only_zeb700() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            // (a) authenticated + pre-approved, owner cap 0 → shed to Pending.
+            let req = signed_request_no_token(0x79);
+            let requester_owner = req.from_addr;
+            let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+            let pending = Arc::new(crate::friend_requests::PendingFriendRequests::new());
+            pending.mark_approved(requester_owner);
+            let acceptor = Arc::new(
+                t7_build_acceptor(
+                    0x78,
+                    Arc::clone(&crdt_state),
+                    crate::revoked_device_projection::RevokedDeviceProjection::new(),
+                )
+                .with_pending_requests(Some(Arc::clone(&pending)))
+                .with_rate_limiter(Arc::new(
+                    crate::friend_intro::FriendRateLimiter::with_caps(100, 0, 3_600_000),
+                )),
+            );
+            let (result, resp) = t7_drive_handshake(acceptor, req).await;
+            assert!(result.is_ok(), "owner-quota shed is benign, got {result:?}");
+            assert!(
+                matches!(resp, Ok(FriendLinkResponse::Pending)),
+                "shed pre-empts the inline accept with the benign Pending, got {resp:?}"
+            );
+            assert!(
+                crdt_state.lock().await.friend_graph.friends.is_empty(),
+                "the shed handshake writes no friend"
+            );
+
+            // (b) tampered sig, owner cap 0 → refused (no response), not shed.
+            let mut bad = signed_request_no_token(0x7B);
+            bad.sig[0] ^= 0xFF;
+            let crdt_state_b = Arc::new(TokioMutex::new(OwnerState::default()));
+            let acceptor_b = Arc::new(
+                t7_build_acceptor(
+                    0x7A,
+                    Arc::clone(&crdt_state_b),
+                    crate::revoked_device_projection::RevokedDeviceProjection::new(),
+                )
+                .with_rate_limiter(Arc::new(
+                    crate::friend_intro::FriendRateLimiter::with_caps(100, 0, 3_600_000),
+                )),
+            );
+            let (result_b, resp_b) = t7_drive_handshake(acceptor_b, bad).await;
+            assert!(
+                matches!(result_b, Err(FriendAcceptError::Handshake(_))),
+                "unauthenticated traffic is refused BEFORE the owner quota, got {result_b:?}"
+            );
+            assert!(
+                resp_b.is_err(),
+                "a refused handshake writes no response frame, got {resp_b:?}"
+            );
+        })
+        .await
+        .expect("serve_owner_quota_sheds_post_auth_only_zeb700 completes within 60s");
     }
 }

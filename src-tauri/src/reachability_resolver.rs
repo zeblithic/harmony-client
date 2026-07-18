@@ -166,13 +166,6 @@ impl ResolverSlots {
     /// empty triple (never stored — `update_with_source` writes at least one
     /// slot before any entry lands in the map).
     fn freshest(&self) -> Option<&ResolverEntry> {
-        fn rank(s: ReachabilitySource) -> u8 {
-            match s {
-                ReachabilitySource::DurableCrdt => 2,
-                ReachabilitySource::PkarrLive => 1,
-                ReachabilitySource::FleetSibling => 0,
-            }
-        }
         [
             self.durable.as_ref(),
             self.pkarr.as_ref(),
@@ -183,7 +176,7 @@ impl ResolverSlots {
         .max_by(|a, b| {
             a.effective_announced_at_ms
                 .cmp(&b.effective_announced_at_ms)
-                .then_with(|| rank(a.source).cmp(&rank(b.source)))
+                .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
         })
     }
 
@@ -196,6 +189,50 @@ impl ResolverSlots {
     fn durable_preferred(&self) -> Option<&ResolverEntry> {
         self.durable.as_ref().or(self.pkarr.as_ref())
     }
+}
+
+/// Source authority for freshness ties: durable > pkarr > fleet — a verified
+/// community record beats an unsigned fleet-sibling one at equal announce
+/// time. Shared by the within-entry slot pick ([`ResolverSlots::freshest`])
+/// and the ZEB-704 cross-owner reverse lookups ([`freshest_across_owners`]) so
+/// both views break ties the same way.
+fn source_rank(s: ReachabilitySource) -> u8 {
+    match s {
+        ReachabilitySource::DurableCrdt => 2,
+        ReachabilitySource::PkarrLive => 1,
+        ReachabilitySource::FleetSibling => 0,
+    }
+}
+
+/// ZEB-704: the globally freshest entry matching `node_id_bytes` ACROSS
+/// owners. The reverse lookups previously stopped at the FIRST
+/// `(owner, node_id)` key in owner-address order and only ran the slot pick
+/// within that entry — so when the same iroh node-id existed under multiple
+/// owners, the dial route could diverge from the boot-seed recency ranking
+/// (`boot_seed_node_ids_by_recency`, keep-freshest-across-owners).
+/// Ordering: `effective_announced_at_ms`, ties → [`source_rank`] (mirrors the
+/// slot pick), remaining ties → the first owner in BTreeMap order (replace
+/// only on strictly-greater), keeping the degenerate all-tie case
+/// deterministic and identical to the old behavior.
+fn freshest_across_owners<'a>(
+    map: &'a BTreeMap<ResolverKey, ResolverSlots>,
+    node_id_bytes: &[u8; 32],
+) -> Option<(OwnerAddr, &'a ResolverEntry)> {
+    map.iter()
+        .filter(|((_, key_node_id), _)| key_node_id == node_id_bytes)
+        .filter_map(|((owner, _), v)| v.freshest().map(|e| (*owner, e)))
+        .reduce(|best, cand| {
+            let ord = cand
+                .1
+                .effective_announced_at_ms
+                .cmp(&best.1.effective_announced_at_ms)
+                .then_with(|| source_rank(cand.1.source).cmp(&source_rank(best.1.source)));
+            if ord == std::cmp::Ordering::Greater {
+                cand
+            } else {
+                best
+            }
+        })
 }
 
 pub struct ReachabilityResolver {
@@ -519,14 +556,15 @@ impl ReachabilityResolver {
     /// `N` (joined community member count × device count) is expected to
     /// stay under ~10⁴ in Phase 1. Phase 2 should profile and add a
     /// `BTreeMap<[u8; 32], OwnerAddr>` secondary index if hot.
+    /// ZEB-704: when the same node-id exists under multiple owners, the
+    /// globally freshest matching entry wins (see [`freshest_across_owners`]) —
+    /// keeping this dial view consistent with the boot-seed recency ranking.
     pub fn resolve_by_node_id(
         &self,
         node_id_bytes: &[u8; 32],
     ) -> Option<(OwnerAddr, ReachabilityAnnouncePayload)> {
         let map = self.inner.read().expect("resolver read lock");
-        map.iter()
-            .find(|((_, key_node_id), _)| key_node_id == node_id_bytes)
-            .and_then(|((owner, _), v)| v.freshest().map(|e| (*owner, e.payload.clone())))
+        freshest_across_owners(&map, node_id_bytes).map(|(owner, e)| (owner, e.payload.clone()))
     }
 
     /// Freshest-view reverse lookup for the DIAL path (ZEB-621; consumed by
@@ -543,9 +581,7 @@ impl ReachabilityResolver {
         node_id_bytes: &[u8; 32],
     ) -> Option<(OwnerAddr, ResolverEntry)> {
         let map = self.inner.read().expect("resolver read lock");
-        map.iter()
-            .find(|((_, key_node_id), _)| key_node_id == node_id_bytes)
-            .and_then(|((owner, _), v)| v.freshest().map(|e| (*owner, e.clone())))
+        freshest_across_owners(&map, node_id_bytes).map(|(owner, e)| (owner, e.clone()))
     }
 
     /// ZEB-621: heal a stale dial route by kicking off an async pkarr
@@ -1607,6 +1643,108 @@ mod tests {
         assert!(
             r.refresh_cooldowns.lock().unwrap().is_empty(),
             "remove_owner evicts the owner's refresh cooldown"
+        );
+    }
+
+    // ---- ZEB-704: reverse lookup is globally-freshest ACROSS owners ------
+
+    /// ZEB-704: when the SAME node-id exists under two owners, the reverse
+    /// lookups must return the owner whose record is globally freshest — not
+    /// the first `(owner, node_id)` key in owner-address order. Here the
+    /// LATER owner holds the fresher record, so a first-key scan gets it wrong.
+    #[test]
+    fn reverse_lookup_prefers_fresher_record_across_owners_zeb704() {
+        let r = ReachabilityResolver::new();
+        let owner_a = OwnerAddr([1u8; 16]); // first in BTreeMap order, stale
+        let owner_b = OwnerAddr([2u8; 16]); // later in order, FRESHER
+        r.update(owner_a, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        r.update(
+            owner_b,
+            make_payload(7, 50_000),
+            make_hlc(50_000, 0, "dev-b"),
+        );
+
+        let (o, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(o, owner_b, "dial route must follow the freshest record");
+        assert_eq!(p.announced_at_ms, 50_000);
+
+        let (o2, e2) = r
+            .resolve_entry_by_node_id(&node_id_bytes(7))
+            .expect("entry");
+        assert_eq!(o2, owner_b);
+        assert_eq!(e2.effective_announced_at_ms, 50_000);
+    }
+
+    /// ZEB-704 mirror: the EARLIER owner holds the fresher record — guards an
+    /// accidental "last matching key wins" implementation.
+    #[test]
+    fn reverse_lookup_keeps_fresher_first_owner_zeb704() {
+        let r = ReachabilityResolver::new();
+        let owner_a = OwnerAddr([1u8; 16]); // first in order AND fresher
+        let owner_b = OwnerAddr([2u8; 16]);
+        r.update(
+            owner_a,
+            make_payload(7, 50_000),
+            make_hlc(50_000, 0, "dev-a"),
+        );
+        r.update(owner_b, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-b"));
+
+        let (o, p) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(o, owner_a);
+        assert_eq!(p.announced_at_ms, 50_000);
+    }
+
+    /// ZEB-704 determinism pin: a FULL tie (equal effective time, equal source
+    /// rank) keeps the first owner in BTreeMap order — today's behavior for the
+    /// degenerate case, now pinned so the selection stays deterministic.
+    #[test]
+    fn reverse_lookup_full_tie_keeps_first_owner_zeb704() {
+        let r = ReachabilityResolver::new();
+        let owner_a = OwnerAddr([1u8; 16]);
+        let owner_b = OwnerAddr([2u8; 16]);
+        r.update(owner_a, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        r.update(owner_b, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-b"));
+
+        let (o, _) = r.resolve_by_node_id(&node_id_bytes(7)).expect("record");
+        assert_eq!(o, owner_a, "full tie is deterministic: first owner wins");
+    }
+
+    /// ZEB-704: the boot-seed recency ranking
+    /// (`boot_seed_node_ids_by_recency`, keep-freshest-across-owners) and the
+    /// dial-route resolution must AGREE — the seed ranks node 7 by owner B's
+    /// fresh record, so resolving node 7 must yield that same record, not
+    /// owner A's stale one.
+    #[test]
+    fn boot_seed_ranking_and_dial_route_agree_zeb704() {
+        let r = ReachabilityResolver::new();
+        let owner_a = OwnerAddr([1u8; 16]);
+        let owner_b = OwnerAddr([2u8; 16]);
+        // node 7: stale under A (1_000), fresh under B (50_000).
+        r.update(owner_a, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+        r.update(
+            owner_b,
+            make_payload(7, 50_000),
+            make_hlc(50_000, 0, "dev-b"),
+        );
+        // node 9: single-owner, freshness between the two (10_000).
+        r.update(
+            owner_a,
+            make_payload(9, 10_000),
+            make_hlc(10_000, 0, "dev-a"),
+        );
+
+        let seed = crate::iroh_zenoh_registration::boot_seed_node_ids_by_recency(&r, &[0xFF; 32]);
+        assert_eq!(
+            seed,
+            vec![node_id_bytes(7), node_id_bytes(9)],
+            "seed ranks node 7 first via owner B's 50_000 record"
+        );
+        let (_, e) = r
+            .resolve_entry_by_node_id(&node_id_bytes(7))
+            .expect("entry");
+        assert_eq!(
+            e.effective_announced_at_ms, 50_000,
+            "dial route resolves the same record the seed ranked by"
         );
     }
 }
