@@ -173,26 +173,52 @@ async fn shutdown_handler(
     if !authed(&ctx, &headers) {
         return unauthorized();
     }
-    // Snapshot the engine handle out of the sync-mutex guard (guard must
-    // not live across an await); a poisoned lock degrades to no pre-flush.
-    let engine = match ctx.state.node_state().lock() {
-        Ok(guard) => guard.sync_engine_for_shutdown_flush(),
+    // Snapshot the handles out of the sync-mutex guard (guard must not
+    // live across an await); a poisoned lock degrades to no pre-flush.
+    let (engine, stopping, inflight) = match ctx.state.node_state().lock() {
+        Ok(guard) => guard.pre_shutdown_flush_handles(),
         Err(e) => {
             tracing::warn!(error = %e, "ZEB-703: NodeState poisoned at shutdown; skipping pre-ack flush");
-            None
+            (None, None, None)
         }
     };
-    if let Some(engine) = engine {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), engine.persist_now()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(
-                error = %e,
-                "ZEB-703: pre-ack owner-state persist failed; proceeding with shutdown"
-            ),
-            Err(_) => tracing::warn!(
-                "ZEB-703: pre-ack owner-state persist timed out (5s); proceeding with shutdown"
-            ),
+    // Barrier (PR #485 round 1, CodeRabbit): without it, a send_dm/delete
+    // landing WHILE persist_now snapshots could miss the persist and be
+    // lost to a kill-on-200 supervisor. Sequence mirrors stop_inner's
+    // ZEB-234 teardown (idempotent when stop_inner repeats it later):
+    //   1. stopping=true — new fenced IPC mutations reject ("node
+    //      stopping"), same Ordering::Release as stop_inner;
+    //   2. drain the fence permits — every in-flight fenced mutation
+    //      completes BEFORE the snapshot;
+    //   3. persist_now — the snapshot now contains everything accepted
+    //      before the shutdown call.
+    // Drain-tick (Phase C) mutations remain outside the fence — known
+    // residue, tracked in ZEB-709. One 5s budget bounds the whole
+    // sequence; on timeout/error we warn + proceed (the process is going
+    // down either way; a wedged engine task starves stop_inner's backstop
+    // persist equally — the ZEB-509 fence accepts the same degraded mode,
+    // see fence_owner_state_flush_returns_on_stalled_engine).
+    let barrier_and_persist = async {
+        if let Some(flag) = stopping.as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
         }
+        if let Some(sem) = inflight {
+            crate::drain_dm_send_fence(sem).await;
+        }
+        match engine {
+            Some(engine) => engine.persist_now().await.map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), barrier_and_persist).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "ZEB-703: pre-ack owner-state persist failed; proceeding with shutdown"
+        ),
+        Err(_) => tracing::warn!(
+            "ZEB-703: pre-ack barrier/persist timed out (5s); proceeding with shutdown"
+        ),
     }
     // Err = shutdown already requested (channel full or receiver consumed) —
     // still report success; the process is going down either way.

@@ -1632,15 +1632,27 @@ impl NodeState {
         self.dm_self_owner.map(|o| hex::encode(o.0))
     }
 
-    /// ZEB-703: owner-state engine handle for `/v1/shutdown`'s pre-ack
-    /// flush. The 200 is the signal supervisors act on; the handler
-    /// persists owner-state BEFORE responding so a kill-or-relaunch-on-200
-    /// supervisor can't race the process's final save point. `None` when no
-    /// owner is loaded (nothing to flush).
-    pub(crate) fn sync_engine_for_shutdown_flush(
+    /// ZEB-703: handles for `/v1/shutdown`'s pre-ack barrier + flush. The
+    /// 200 is the signal supervisors act on; the handler fences new DM
+    /// mutations (ZEB-234 stopping flag), drains in-flight fenced sends,
+    /// and persists owner-state BEFORE responding — so a
+    /// kill-or-relaunch-on-200 supervisor can't race the process's final
+    /// save point NOR miss a mutation that was mid-flight when the
+    /// shutdown was requested (PR #485 CodeRabbit barrier finding).
+    /// All `None` when no owner is loaded (nothing to fence or flush).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn pre_shutdown_flush_handles(
         &self,
-    ) -> Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> {
-        self.sync_engine.clone()
+    ) -> (
+        Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+        Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    ) {
+        (
+            self.sync_engine.clone(),
+            self.dm_send_stopping.clone(),
+            self.dm_send_inflight.clone(),
+        )
     }
 
     /// ZEB-321 Phase 1 PR #157 round 2 (CodeRabbit): abort the iroh
@@ -65778,11 +65790,16 @@ mod zeb703_outbox_runtime_durability_tests {
             id
         };
 
-        // Real API server over a NodeState carrying the engine.
+        // Real API server over a NodeState carrying the engine AND the
+        // ZEB-234 fence handles (the handler's barrier flips/drains them).
+        let stopping_flag = Arc::new(AtomicBool::new(false));
+        let inflight_sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
         let api_dir = tempfile::tempdir().expect("api tempdir");
         let state: Arc<std::sync::Mutex<NodeState>> = Arc::new(std::sync::Mutex::new(NodeState {
             crdt_state: Some(Arc::clone(&crdt_state)),
             sync_engine: Some(Arc::clone(&engine)),
+            dm_send_stopping: Some(Arc::clone(&stopping_flag)),
+            dm_send_inflight: Some(Arc::clone(&inflight_sem)),
             ..NodeState::default()
         }));
         let events = crate::api::events::ApiEventSink::new();
@@ -65802,7 +65819,12 @@ mod zeb703_outbox_runtime_durability_tests {
         .expect("start_server");
         let token = std::fs::read_to_string(handle.api_dir.join("token")).expect("token file");
 
-        // POST /v1/shutdown and read the full response (Connection: close).
+        // POST /v1/shutdown and read INCREMENTALLY until the response BODY
+        // is framed (PR #485 round 1, CodeRabbit): read_to_end waits for
+        // EOF ≥ connection close, which would also pass an implementation
+        // that persisted between respond and close. Asserting the moment
+        // the body is observable pins the real ordering a kill-on-200
+        // supervisor sees.
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", handle.bound_port))
             .await
@@ -65818,21 +65840,77 @@ mod zeb703_outbox_runtime_durability_tests {
             .await
             .expect("write request");
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.expect("read response");
-        let resp = String::from_utf8_lossy(&buf);
+        let mut chunk = [0u8; 1024];
+        let resp = loop {
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut chunk))
+                    .await
+                    .expect("response read timed out")
+                    .expect("read response");
+            assert!(n > 0, "connection closed before response body was framed");
+            buf.extend_from_slice(&chunk[..n]);
+            let so_far = String::from_utf8_lossy(&buf).into_owned();
+            // The JSON body is the last framed element; seeing it means
+            // status line + headers + body have all arrived.
+            if so_far.contains("shuttingDown") {
+                break so_far;
+            }
+        };
         assert!(resp.contains("200"), "shutdown must ack 200, got: {resp}");
 
-        // ORDERING ASSERTION — no polling: the moment the 200 arrived, the
-        // un-notified mutation must ALREADY be on disk. A trailing flush
-        // (the pre-fix behavior: ack first, stop_inner later) fails here
-        // because this harness never runs stop_inner at all — exactly the
-        // supervisor's view after kill-on-200.
+        // ORDERING ASSERTION — no polling: the moment the response body is
+        // observable, the un-notified mutation must ALREADY be on disk. A
+        // trailing flush (the pre-fix behavior: ack first, stop_inner
+        // later) fails here because this harness never runs stop_inner at
+        // all — exactly the supervisor's view after kill-on-200.
         let loaded = crate::owner_state_persist::load_crdt(&crdt_path)
             .expect("owner_state_crdt.cbor must exist by ack time (pre-ack flush)");
         assert!(
             loaded.outbox.contains_key(&entry_id),
             "ZEB-703: /v1/shutdown acked 200 before persisting owner-state — \
              a kill-on-200 supervisor would lose the queued DM"
+        );
+
+        // Barrier (round 1, CodeRabbit): the handler set the ZEB-234
+        // stopping flag BEFORE the persist (and drained the fence), so a
+        // DM mutation arriving after the shutdown call deterministically
+        // rejects instead of landing in an unpersistable window.
+        assert!(
+            stopping_flag.load(std::sync::atomic::Ordering::Acquire),
+            "handler must set the ZEB-234 stopping flag before persisting"
+        );
+        // End-to-end shape of that rejection: a post-shutdown send through
+        // the production IPC path (sharing the SAME fence handles the
+        // handler flipped) errors with the fence message.
+        let post_shutdown_node = std::sync::Mutex::new(NodeState {
+            dm_outbox: Some(Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+                "zeb703-dev",
+                alice,
+            )))),
+            dm_transport: Some(Arc::new(crate::dm_outbox::StubTransport::new())),
+            crdt_state: Some(Arc::clone(&crdt_state)),
+            hlc_tracker: Some(Arc::new(tokio::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            ))),
+            dm_device_id: Some("zeb703-dev".into()),
+            dm_self_owner: Some(alice),
+            content_store: Some(Arc::new(crate::content_store::InMemoryStub::default())),
+            dm_send_inflight: Some(Arc::clone(&inflight_sem)),
+            dm_send_stopping: Some(Arc::clone(&stopping_flag)),
+            sync_engine: Some(Arc::clone(&engine)),
+            ..NodeState::default()
+        });
+        let err = send_dm_impl(
+            &post_shutdown_node,
+            hex::encode(space_id.0),
+            b"post-shutdown send".to_vec(),
+            "text/plain".into(),
+        )
+        .await
+        .expect_err("send after /v1/shutdown must reject (stopping fence set by handler)");
+        assert!(
+            err.contains("node stopping"),
+            "rejection must be the ZEB-234 fence, got: {err}"
         );
 
         tokio::time::timeout(std::time::Duration::from_secs(5), task)
