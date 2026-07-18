@@ -36,9 +36,9 @@ On `PledgeListPayload` / `BackupSetPayload` / `HostingReportPayload` (all `#[ser
 ### B. Sign side (all three sites dual-sign; legacy path untouched)
 
 1. Legacy `#3` sign exactly as today (golden pins intact; old receivers unaffected).
-2. `#2` material: Sites A/B — `dm_outbox.try_lock()` (follow-list posture: contended → legacy-only, self-heals). Site C — thread the `dm_outbox` Arc through `spawn_hosting_report_publisher`; the task snapshots `(sk, cert, bundle)` per tick with a real async lock, passes `Option<material>` into the sync builder.
-3. Bundle: Master-issued → `[]` (no lock); Quorum-issued → trust-doc bundle (Sites A/B `try_lock` best-effort → legacy-only on contention; Site C async lock).
-4. **Publisher-side self-check (#488 lesson):** before attaching v2 fields, run `verify_enrollment_any_issuer(cert, bundle, Some(owner_id), now)`; failure → publish legacy-only (a delivered legacy record beats a v2 record every receiver drops).
+2. `#2` material: Sites A/B — `dm_outbox.try_lock()`; **contention falls back to the last-known-good cached material** (`NodeState.storage_v2_cache`, R1 CodeRabbit — a pinned receiver rejects legacy, so contention must not downgrade a migrated publisher; the cache is warmed by every uncontended snapshot and by Site C's per-tick refresh, and RESET on stop/stale-cleanup so material never crosses an owner switch). Cold-cache contention publishes honestly-legacy (documented residual; heals at the next publish/tick). Site C — thread the `dm_outbox` Arc through `spawn_hosting_report_publisher`; the task snapshots `(sk, cert, bundle)` EVERY tick with real async locks.
+3. Bundle: Master-issued → `[]` (no lock); Quorum-issued → trust-doc bundle (Sites A/B `try_lock` best-effort → cached-material fallback on contention; Site C async lock).
+4. **Publisher-side self-check (#488 lesson, + R1):** before attaching v2 fields, require the signing key's verifying key to EQUAL the enrollment's device key (cert validity alone doesn't prove the pair matches — R1, CodeRabbit + Qodo converged), then `verify_enrollment_any_issuer(cert, bundle, None, now)`; failure → publish legacy-only (a delivered legacy record beats a v2 record every receiver drops). A validation failure never falls back to cached material — fresh material is authoritative.
 5. Backup-set shrink loop re-signs BOTH signatures per round (v2 canonical covers entries).
 6. `binding_sig` minted with the same `#3` identity already at hand.
 
@@ -52,6 +52,10 @@ On `PledgeListPayload` / `BackupSetPayload` / `HostingReportPayload` (all `#[ser
 - **v2 absent:** pinned address → `Rejected("legacy record from migrated owner")` (anti-downgrade ratchet); unpinned → legacy accept (bootstrap/compat).
 
 **Pin persistence (deliberate divergence from the vine in-memory cache):** `signer_pins: HashMap<owner_address, {owner_id_hex, device_ed25519_hex}>` persisted in `storage_records.json` (additive, serde-default — old files load with no pins). Vines could stay in-memory because the wire-durable revoked-authority record re-arms after restart; storage has no authority record, so an in-memory pin would let a revoked device (which holds its `#3` forever and will never publish v2 again) publish accepted legacy records after every receiver restart — permanently. The persisted pin is the only durable revocation anchor.
+
+**Pin cap (`MAX_SIGNER_PINS = 4096` > 3-family live-owner union):** eviction takes dead pins (no live record) first, and among them the **NEWEST `pinned_at_ms` first** (R1, CodeRabbit — a flood of attacker-minted throwaway pins evicts its OWN just-minted pins; a long-established migrated address's ratchet pin is never the newest and survives; legit fresh pins are live-backed at mint time). A pin backing a live record is never forced out.
+
+**Retroactive revocation (R1, Qodo):** `purge_revoked(&RevokedDeviceProjection)` runs each auto-pin engine tick — records admitted BEFORE the projection learned their signer's revocation are dropped across all three families (the revoked device has no reason to republish), while their pins stay (sticky ratchet + revoked-at-ingest block any re-admission).
 
 **Threading:** `note_storage_record_sample` gains `&RevokedDeviceProjection` + `now_secs` params; the event loop receives a projection clone (same handle pattern as friend/PEX acceptors). `StorageRecordStore` itself stays dependency-free — the projection is passed per-call.
 

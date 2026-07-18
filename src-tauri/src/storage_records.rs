@@ -623,6 +623,33 @@ impl StorageRecordStore {
         self.hosting_reports
             .retain(|_, r| now_ms.saturating_sub(r.received_at_ms) < HOSTING_REPORT_STALE_MS);
     }
+
+    /// ZEB-679 R1 (Qodo): revocation is enforced RETROACTIVELY too.
+    /// Records admitted BEFORE the projection learned their signer's
+    /// revocation would otherwise keep driving buddy pin/fetch planning
+    /// indefinitely (the revoked device has no reason to republish).
+    /// Called from the auto-pin engine tick; drops the revoked owners'
+    /// records across all three families while KEEPING their pins — the
+    /// pin is the sticky ratchet that also blocks the legacy downgrade.
+    /// Returns true when anything was dropped (caller re-plans/emits).
+    pub fn purge_revoked(&mut self, revoked: &RevokedDeviceProjection) -> bool {
+        let dead: Vec<String> = self
+            .signer_pins
+            .iter()
+            .filter(|(_, pin)| revoked.is_revoked(&OwnerAddr(pin.owner_id), &pin.device_ed25519))
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        let mut changed = false;
+        for owner in &dead {
+            changed |= self.pledge_lists.remove(owner).is_some();
+            changed |= self.backup_sets.remove(owner).is_some();
+            changed |= self.hosting_reports.remove(owner).is_some();
+        }
+        if changed {
+            self.save();
+        }
+        changed
+    }
 }
 
 /// Per-entry BackupSet eligibility, shared by wire ingest AND disk
@@ -704,12 +731,16 @@ fn lww_insert<R>(
 }
 
 /// Pin-cap overflow: evict pins whose owner has NO live record first
-/// (dead weight — an attacker minting throwaway addresses lands here),
-/// then oldest `pinned_at_ms`, owner tiebreak. Because
-/// [`MAX_SIGNER_PINS`] strictly exceeds the worst-case live-owner union
-/// (3 × [`MAX_TRACKED_OWNERS`]), a pin backing a live record is never
-/// forced out — evicting one would re-open the legacy-downgrade window
-/// for that owner.
+/// (dead weight), and among those the NEWEST `pinned_at_ms` first
+/// (owner tiebreak). Newest-first makes a pin flood self-limiting (R1,
+/// CodeRabbit): an attacker minting throwaway addresses evicts their
+/// OWN just-minted pins, while a long-established migrated address's
+/// ratchet pin is never the newest and survives. Legit fresh pins are
+/// live-backed at mint time (created during record admission), so they
+/// don't compete in the dead pool. Because [`MAX_SIGNER_PINS`] strictly
+/// exceeds the worst-case live-owner union (3 × [`MAX_TRACKED_OWNERS`]),
+/// a pin backing a live record is never forced out — evicting one would
+/// re-open the legacy-downgrade window for that owner.
 fn evict_pins(
     pins: &mut HashMap<String, StorageSignerPin>,
     pledges: &HashMap<String, PledgeListRecord>,
@@ -723,7 +754,7 @@ fn evict_pins(
                 let live = pledges.contains_key(owner)
                     || backups.contains_key(owner)
                     || hosting.contains_key(owner);
-                (live, pin.pinned_at_ms, owner.clone())
+                (live, std::cmp::Reverse(pin.pinned_at_ms), owner.clone())
             })
             .min()
             .map(|(_, _, owner)| owner);
@@ -1496,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn evict_pins_prefers_dead_then_oldest_zeb679() {
+    fn evict_pins_prefers_dead_then_newest_zeb679() {
         let mut pins: HashMap<String, StorageSignerPin> = HashMap::new();
         let mut pledges: HashMap<String, PledgeListRecord> = HashMap::new();
         let backups: HashMap<String, BackupSetRecord> = HashMap::new();
@@ -1506,7 +1537,8 @@ mod tests {
             device_ed25519: [2; 32],
             pinned_at_ms: t,
         };
-        // One live-backed pin (oldest of all) + dead pins over the cap.
+        // One live-backed pin + an OLD established dead ratchet pin +
+        // a flood of fresh throwaway pins over the cap (the R1 attack).
         pins.insert("live".into(), pin(0));
         pledges.insert(
             "live".into(),
@@ -1515,8 +1547,9 @@ mod tests {
                 updated_at: 1,
             },
         );
+        pins.insert("established-ratchet".into(), pin(5));
         for i in 0..MAX_SIGNER_PINS {
-            pins.insert(format!("dead-{i:05}"), pin(10 + i as u64));
+            pins.insert(format!("flood-{i:05}"), pin(1_000 + i as u64));
         }
         evict_pins(&mut pins, &pledges, &backups, &hosting);
         assert_eq!(pins.len(), MAX_SIGNER_PINS);
@@ -1525,8 +1558,54 @@ mod tests {
             "live-backed pin survives even as the globally oldest"
         );
         assert!(
-            !pins.contains_key("dead-00000"),
-            "oldest dead pin evicted first"
+            pins.contains_key("established-ratchet"),
+            "old dead ratchet pin survives a fresh-pin flood (newest-dead evicted first)"
         );
+        assert!(
+            !pins.contains_key(&format!("flood-{:05}", MAX_SIGNER_PINS - 1)),
+            "the flood's newest pins are the ones evicted"
+        );
+    }
+
+    #[test]
+    fn purge_revoked_drops_records_keeps_ratchet_zeb679_r1() {
+        let world = mint_quorum_world(0x20);
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        let addr = addr_of(&id);
+        // Records land while the signer is in good standing.
+        let (topic, bytes) =
+            dual_signed_pledge_bytes(&id, &master_material(&world), vec![pledge("someone", 5)], 1);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), NOW_MS)
+            .changed());
+        let (topic, bytes) = dual_signed_hosting_bytes(&id, &master_material(&world), 1);
+        assert!(store
+            .on_hosting_report_sample(&topic, &bytes, &rvk(), NOW_MS)
+            .changed());
+
+        // The projection later learns the revocation (community feed,
+        // friend-link carry, …) — the already-admitted records must go.
+        let revoked = rvk();
+        let key = world.a_cert.device_pubkeys.classical.ed25519_verify;
+        let keys: std::collections::BTreeSet<[u8; 32]> = std::iter::once(key).collect();
+        revoked.union_from_members(std::iter::once((OwnerAddr(world.owner_id), &keys)));
+        assert!(store.purge_revoked(&revoked), "records dropped");
+        assert!(store.pledge_list(&addr).is_none());
+        assert!(store.hosting_report(&addr).is_none());
+        assert!(!store.purge_revoked(&revoked), "idempotent");
+        // The pin STAYS: the ratchet still blocks the legacy downgrade…
+        assert!(store.signer_pin(&addr).is_some(), "pin kept (sticky)");
+        let (topic, legacy) = signed_pledge_bytes(&id, vec![], 9);
+        assert!(matches!(
+            store.on_pledge_list_sample(&topic, &legacy, &revoked, NOW_MS),
+            RecordOutcome::Rejected(_)
+        ));
+        // …and re-admission of v2 records is blocked at ingest.
+        let (topic, again) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 20);
+        assert!(matches!(
+            store.on_pledge_list_sample(&topic, &again, &revoked, NOW_MS),
+            RecordOutcome::Rejected(ref e) if e.contains("revoked")
+        ));
     }
 }

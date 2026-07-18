@@ -6258,11 +6258,19 @@ pub async fn run(
                     }
                 }
                 // (2) Hosting-report staleness sweep (wall clock — receipt
-                // stamps are wall ms, see note_storage_record_sample).
-                storage_records
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .sweep_hosting(crate::wall_clock_ms());
+                // stamps are wall ms, see note_storage_record_sample) +
+                // ZEB-679 R1 retroactive revocation purge: records admitted
+                // before the projection learned their signer's revocation
+                // must stop driving the planner.
+                {
+                    let mut records = storage_records
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    records.sweep_hosting(crate::wall_clock_ms());
+                    if records.purge_revoked(&revoked_projection) {
+                        tracing::info!("storage records purged for revoked signer(s)");
+                    }
+                }
                 // (3) Plan under short locks (guards dropped before any
                 // await; the plan is applied mechanically below).
                 let plan = {
