@@ -2927,6 +2927,15 @@ pub async fn drain_lifted(
     transport: &dyn DmTransport,
     wall_now_ms: u64,
     app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    // ZEB-703: owner-state SyncEngine handle. Phase C's CRDT mutations
+    // (delivered_to/status transitions, the 30-day expiry sweep) and the
+    // deposit rungs' `mark_ack_delivered` writes must `notify_dirty()` or
+    // they are never persisted at runtime NOR replicated to paired devices
+    // (the owner-state CRDT persists + replicates ONLY via a notify_dirty
+    // flush — same discipline as the ZEB-685 revocation drain). `None` in
+    // tests that don't exercise durability; production always passes the
+    // live engine.
+    owner_sync: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
 ) {
     // Phase A: try_lock + collect work. If either lock is contended,
     // skip this tick. (Same deadlock-avoidance rationale as the
@@ -3055,6 +3064,16 @@ pub async fn drain_lifted(
             // and before the deposit rungs' network I/O below.
             (outcome, candidates, client, relay)
         };
+        // ZEB-703: Phase C mutated the owner-state CRDT iff it recorded a
+        // delivery or expired an entry — mark the engine dirty so the
+        // debounced flush persists + replicates the transition. Never
+        // notify on an idle tick (an unconditional notify would republish
+        // a byte-identical root every debounce window, forever).
+        if !outcome.newly_delivered.is_empty() || !outcome.newly_expired.is_empty() {
+            if let Some(engine) = owner_sync.as_ref() {
+                engine.notify_dirty();
+            }
+        }
         for (space_id, message_cid, recipient) in outcome.newly_delivered {
             let payload = serde_json::json!({
                 "spaceId": hex::encode(space_id.0),
@@ -3101,6 +3120,14 @@ pub async fn drain_lifted(
                             let mut s_g = state.lock().await;
                             o_g.mark_ack_delivered(&mut s_g, c.entry_id, c.recipient_owner)
                         };
+                        // ZEB-703: a fresh ack mutated delivered_to/status —
+                        // persist + replicate it (idempotent re-ack: no-op,
+                        // no notify).
+                        if newly {
+                            if let Some(engine) = owner_sync.as_ref() {
+                                engine.notify_dirty();
+                            }
+                        }
                         // ZEB-505: invite-only entries ack but emit no
                         // `dm-delivered` (no message to surface).
                         if newly {
@@ -3142,6 +3169,13 @@ pub async fn drain_lifted(
                             let mut s_g = state.lock().await;
                             o_g.mark_ack_delivered(&mut s_g, c.entry_id, c.recipient_owner)
                         };
+                        // ZEB-703: same as the butler Acked arm — a fresh
+                        // relay ack mutated the CRDT; persist + replicate.
+                        if newly {
+                            if let Some(engine) = owner_sync.as_ref() {
+                                engine.notify_dirty();
+                            }
+                        }
                         // ZEB-505: invite-only entries ack but emit no
                         // `dm-delivered` (no message to surface).
                         if newly {
@@ -5724,6 +5758,7 @@ mod tests {
             &transport,
             2_000,
             app,
+            None, // ZEB-703: durability not exercised here
         )
         .await;
 
@@ -5874,6 +5909,7 @@ mod tests {
             &transport,
             2_000,
             app,
+            None, // ZEB-703: durability not exercised here
         )
         .await;
 
@@ -10616,6 +10652,7 @@ mod tests {
             &transport,
             tick1_ms,
             Arc::clone(&app),
+            None, // ZEB-703: durability not exercised here
         )
         .await;
         // After Phase C settles, an AttemptState exists for (entry, bob).
@@ -10650,6 +10687,7 @@ mod tests {
             &transport,
             tick2_ms,
             Arc::clone(&app),
+            None, // ZEB-703: durability not exercised here
         )
         .await;
 

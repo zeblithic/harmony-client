@@ -930,6 +930,11 @@ pub async fn run(
     dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
     dm_transport: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>>,
     crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
+    // ZEB-703: owner-state SyncEngine handle for the drain tick. The drain's
+    // Phase C / deposit-rung CRDT mutations must notify_dirty this engine or
+    // they are never persisted at runtime nor replicated (same gating shape
+    // as `dm_outbox` / `crdt_state`: `None` until an owner is loaded).
+    owner_sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
     // ZEB-217 Sub-C Phase 2 Task 13: per-community state-CRDT Zenoh
     // adapter requests. `start_node` scans owner-state for joined
     // communities, spawns one engine per community via
@@ -4061,6 +4066,8 @@ pub async fn run(
                         transport.as_ref(),
                         wall_now_ms,
                         app.clone(),
+                        // ZEB-703: Phase C mutations persist via notify_dirty.
+                        owner_sync_engine.clone(),
                     )
                     .await;
                 }

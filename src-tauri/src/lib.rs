@@ -10775,6 +10775,10 @@ pub async fn start_node_inner(
                 let dm_outbox_for_loop = dm_outbox_arc.clone();
                 let dm_transport_for_loop = dm_transport_arc.clone();
                 let crdt_state_for_loop = crdt_state_for_state.clone();
+                // ZEB-703: owner-state engine handle for the drain tick's
+                // notify_dirty (Phase C / deposit-rung CRDT mutations must
+                // persist + replicate at runtime, not only at shutdown).
+                let owner_sync_engine_for_loop = sync_engine_arc.clone();
                 // ZEB-217 Sub-C Phase 2: per-community Zenoh adapter requests.
                 // Move (not clone) — the Vec carries Receiver halves the engines
                 // already own the matching Sender / other-half for; only the
@@ -11004,6 +11008,8 @@ pub async fn start_node_inner(
                                 dm_outbox_for_loop,
                                 dm_transport_for_loop,
                                 crdt_state_for_loop,
+                                // ZEB-703: drain-tick notify_dirty handle.
+                                owner_sync_engine_for_loop,
                                 community_adapter_requests_for_loop,
                                 community_adapter_request_rx,
                                 voting_log_adapter_request_rx,
@@ -13150,6 +13156,7 @@ pub(crate) async fn send_dm_impl(
         cas,
         dm_send_inflight,
         dm_send_stopping,
+        sync_engine,
     ) = {
         let g = state
             .lock()
@@ -13168,6 +13175,11 @@ pub(crate) async fn send_dm_impl(
             g.dm_send_stopping
                 .clone()
                 .ok_or("node not running (no fence)")?,
+            // ZEB-703: owner-state engine for the post-mutation
+            // notify_dirty. Kept Option (not ok_or): engineless states
+            // (some tests) must not fail the send — durability then rides
+            // the shutdown flush alone, as before.
+            g.sync_engine.clone(),
         )
     };
 
@@ -13237,6 +13249,19 @@ pub(crate) async fn send_dm_impl(
     drop(tracker_g);
     drop(state_g);
     drop(outbox_g);
+
+    // ZEB-703: the outbox entry (+ self-inbox row) just mutated the
+    // owner-state CRDT — mark the engine dirty so the debounced flush
+    // persists it at RUNTIME and replicates it to paired devices. Without
+    // this, the shutdown flush is the SOLE save point and any truncated
+    // shutdown (kill-on-200 supervisor, GUI quit, crash) silently loses
+    // the queued DM — the observed ZEB-703 data loss. Non-blocking; the
+    // ZEB-234 fence still guarantees shutdown can't outrun the mutation.
+    if let Some(engine) = sync_engine.as_ref() {
+        engine.notify_dirty();
+    } else {
+        tracing::debug!("send_dm: no owner-state SyncEngine; runtime persist skipped (ZEB-703)");
+    }
 
     Ok(SendDmResult {
         message_id: hex::encode(msg_id.0),
@@ -13658,7 +13683,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
     // Snapshot handles under the sync mutex; release before any .await.
     // Same pattern as send_dm — NodeState's sync mutex must not span
     // .await boundaries.
-    let (dm_outbox, crdt_state, hlc_tracker, device_id, dm_send_inflight, dm_send_stopping) = {
+    let (dm_outbox, crdt_state, hlc_tracker, device_id, dm_send_inflight, dm_send_stopping, sync_engine) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -13677,6 +13702,9 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
             g.dm_send_stopping
                 .clone()
                 .ok_or("node not running (no fence)")?,
+            // ZEB-703: owner-state engine for the post-mutation
+            // notify_dirty (see send_dm_impl's snapshot note).
+            g.sync_engine.clone(),
         )
     };
 
@@ -13752,6 +13780,19 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
     // guarantees stop_inner cannot complete SyncEngine::shutdown while this
     // permit is held, so the deletion above is always visible to the live
     // node. (ZEB-234)
+
+    // ZEB-703: a real delete removed the entry AND wrote a ZEB-243
+    // tombstone — mark the engine dirty so both persist at runtime and the
+    // tombstone REPLICATES (an unpublished tombstone can't suppress a
+    // paired-device resurrection). Gate on `deleted_outbox_id`, NOT the
+    // narrower (space_id, message_cid) pair below: invite-only entries
+    // (ZEB-505) delete with `message_cid: None` and still need the notify.
+    // Idempotent miss (all-None outcome) → no mutation → no notify.
+    if outcome.deleted_outbox_id.is_some() {
+        if let Some(engine) = sync_engine.as_ref() {
+            engine.notify_dirty();
+        }
+    }
 
     // Emit IPC event only if something actually changed (idempotent
     // missing-id is no-op).
@@ -65197,6 +65238,453 @@ mod dm_send_fence_tests {
             DM_SEND_FENCE_CAPACITY,
             "all permits should be returned after drain"
         );
+    }
+}
+
+/// ZEB-703: DM-outbox mutations must be durable at RUNTIME, not only via the
+/// shutdown flush. Every local outbox mutation (enqueue/ack/delete/drain) must
+/// `notify_dirty()` the owner-state SyncEngine so the debounced flush writes
+/// `owner_state_crdt.cbor` while the node is still running — the shutdown
+/// `persist_now` is a backstop, never the sole save point (a truncated
+/// shutdown, kill-on-200 supervisor, or GUI quit would otherwise silently
+/// lose queued DMs — the observed ZEB-703 data loss).
+#[cfg(test)]
+mod zeb703_outbox_runtime_durability_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    /// Synthetic DmOutbox mirroring dm_outbox::tests::make_outbox_synthetic
+    /// (private to that mod; the `_local` copy at dm_outbox.rs:11128 is the
+    /// same precedent). All identity-bound fields derive from one seed.
+    fn make_outbox_synthetic(
+        device_id: &str,
+        self_owner: crate::owner_state_types::OwnerAddr,
+    ) -> crate::dm_outbox::DmOutbox {
+        let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let priv_bytes = private_identity.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let device_hash =
+            crate::owner_state_types::DeviceIdentityHash(private_identity.identity.address_hash);
+        let private_identity = Arc::new(private_identity);
+        let test_owner = crate::community_membership::mint_test_owner(0xAB);
+        let community_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &test_owner.device_key.to_bytes(),
+        ));
+        crate::dm_outbox::DmOutbox::new_synthetic(
+            device_id.into(),
+            self_owner,
+            device_hash,
+            signing_key,
+            private_identity,
+            community_signing_key,
+            test_owner.cert,
+        )
+    }
+
+    /// DM Space fixture mirroring dm_outbox::tests::make_dm_space.
+    fn make_dm_space(
+        id_byte: u8,
+        members: Vec<crate::owner_state_types::OwnerAddr>,
+    ) -> crate::owner_state_types::Space {
+        use crate::owner_state_types::*;
+        Space {
+            id: SpaceId([id_byte; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Bob".into(),
+            transport: None,
+            members,
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: Some(DmContentKey::new([0x42u8; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    /// The ZEB-703 repro, distilled: send a DM through the production IPC
+    /// path (`send_dm_impl`) with a REAL SyncEngine persisting to a tempdir,
+    /// then — WITHOUT any shutdown/fence/flush call — the entry must appear
+    /// in `owner_state_crdt.cbor` within the debounced-flush window. On
+    /// unfixed code nothing ever marks the engine dirty, so the file never
+    /// gains the entry and this test times out red.
+    #[tokio::test]
+    async fn send_dm_persists_outbox_entry_at_runtime_without_shutdown_zeb703() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt = Arc::new(
+            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
+        );
+        // Healthy publish rig: roomy channel, receiver held alive so the
+        // debounce arm's publish leg can't error and mask the persist leg.
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        let alice = crate::owner_state_types::OwnerAddr([0x01; 16]);
+        let bob = crate::owner_state_types::OwnerAddr([0x02; 16]);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let space_id = {
+            let mut g = crdt_state.lock().await;
+            let sp = make_dm_space(7, vec![alice, bob]);
+            let id = sp.id;
+            let outcome = g.apply_space_with_canonicalization(sp);
+            assert!(
+                matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Inserted),
+                "fixture install must succeed, got {outcome:?}"
+            );
+            id
+        };
+
+        // Shared HLC tracker: production mirrors the SAME Arc between the
+        // engine and NodeState.hlc_tracker (see the field's doc comment).
+        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        // Short debounce keeps the green path fast; the red path is bounded
+        // by the poll deadline below, not the debounce.
+        let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
+            crate::owner_state_crypto::FleetKeySet::new(kt),
+            "zeb703-dev".into(),
+            Arc::clone(&crdt_state),
+            Arc::clone(&tracker),
+            Arc::new(crate::content_store::InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            250,
+        ));
+
+        let node = Mutex::new(NodeState {
+            dm_outbox: Some(Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+                "zeb703-dev",
+                alice,
+            )))),
+            dm_transport: Some(Arc::new(crate::dm_outbox::StubTransport::new())),
+            crdt_state: Some(Arc::clone(&crdt_state)),
+            hlc_tracker: Some(Arc::clone(&tracker)),
+            dm_device_id: Some("zeb703-dev".into()),
+            dm_self_owner: Some(alice),
+            content_store: Some(Arc::new(crate::content_store::InMemoryStub::default())),
+            dm_send_inflight: Some(Arc::new(tokio::sync::Semaphore::new(
+                DM_SEND_FENCE_CAPACITY,
+            ))),
+            dm_send_stopping: Some(Arc::new(AtomicBool::new(false))),
+            sync_engine: Some(Arc::clone(&engine)),
+            ..NodeState::default()
+        });
+
+        let res = send_dm_impl(
+            &node,
+            hex::encode(space_id.0),
+            b"zeb703 runtime durability".to_vec(),
+            "text/plain".into(),
+        )
+        .await
+        .expect("send_dm_impl must succeed");
+        let id_bytes: [u8; 16] = hex::decode(&res.message_id)
+            .expect("message_id hex")
+            .as_slice()
+            .try_into()
+            .expect("message_id 16 bytes");
+        let entry_id = crate::owner_state_types::OutboxEntryId(id_bytes);
+
+        // Poll the on-disk CRDT for the entry. 5 s budget vs a 250 ms
+        // debounce (wall-clock budget >> threshold per the timing-test
+        // rule). NO shutdown, NO flush_now, NO fence — runtime only.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if crdt_path.exists() {
+                if let Ok(loaded) = crate::owner_state_persist::load_crdt(&crdt_path) {
+                    if loaded.outbox.contains_key(&entry_id) {
+                        break; // durable at runtime — ZEB-703 fixed
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ZEB-703: outbox entry never reached owner_state_crdt.cbor at \
+                 runtime — the send path did not notify_dirty the owner-state \
+                 SyncEngine, so a truncated shutdown would silently lose the DM"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Poll `load_crdt(path)` until `pred` holds or the deadline passes.
+    async fn poll_crdt_until(
+        path: &std::path::Path,
+        what: &str,
+        pred: impl Fn(&crate::owner_state_crdt::OwnerState) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if path.exists() {
+                if let Ok(loaded) = crate::owner_state_persist::load_crdt(path) {
+                    if pred(&loaded) {
+                        return;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ZEB-703: {what} never reached owner_state_crdt.cbor at runtime"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// ZEB-703 delete path: a real delete must persist BOTH the entry
+    /// removal AND the ZEB-243 tombstone at runtime (an unpublished,
+    /// unpersisted tombstone cannot suppress a paired-device resurrection
+    /// after restart). Drives the REAL `delete_outbox_entry` tauri command
+    /// through the mock-IPC harness (the notify gate lives in the command
+    /// body, so an `_inner`-level test would miss it).
+    #[test]
+    fn delete_outbox_entry_persists_tombstone_at_runtime_zeb703() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt = Arc::new(
+            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
+        );
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        let alice = crate::owner_state_types::OwnerAddr([0x01; 16]);
+        let bob = crate::owner_state_types::OwnerAddr([0x02; 16]);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+        // SyncEngine::new spawns its task — needs a runtime context; scope
+        // the enter guard so `get_ipc_response` below (which block_ons on
+        // tauri's own executor) runs OUTSIDE any tokio context.
+        let (engine, space_id) = {
+            let _g = rt.enter();
+            let space_id = rt.block_on(async {
+                let mut g = crdt_state.lock().await;
+                let sp = make_dm_space(9, vec![alice, bob]);
+                let id = sp.id;
+                let outcome = g.apply_space_with_canonicalization(sp);
+                assert!(
+                    matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Inserted),
+                    "fixture install must succeed, got {outcome:?}"
+                );
+                id
+            });
+            let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
+                crate::owner_state_crypto::FleetKeySet::new(kt),
+                "zeb703-dev".into(),
+                Arc::clone(&crdt_state),
+                Arc::clone(&tracker),
+                Arc::new(crate::content_store::InMemoryStub::default()),
+                pub_tx,
+                sub_rx,
+                paths,
+                250,
+            ));
+            (engine, space_id)
+        };
+
+        let app = add_dm_ipc_handlers(tauri::test::mock_builder())
+            .manage(std::sync::Mutex::new(NodeState {
+                dm_outbox: Some(Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+                    "zeb703-dev",
+                    alice,
+                )))),
+                dm_transport: Some(Arc::new(crate::dm_outbox::StubTransport::new())),
+                crdt_state: Some(Arc::clone(&crdt_state)),
+                hlc_tracker: Some(Arc::clone(&tracker)),
+                dm_device_id: Some("zeb703-dev".into()),
+                dm_self_owner: Some(alice),
+                content_store: Some(Arc::new(crate::content_store::InMemoryStub::default())),
+                dm_send_inflight: Some(Arc::new(tokio::sync::Semaphore::new(
+                    DM_SEND_FENCE_CAPACITY,
+                ))),
+                dm_send_stopping: Some(Arc::new(AtomicBool::new(false))),
+                sync_engine: Some(Arc::clone(&engine)),
+                ..NodeState::default()
+            }))
+            .build(mock_context_with_full_acl(&["delete_outbox_entry"]))
+            .expect("mock app");
+        let webview =
+            tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("webview build");
+
+        // Enqueue through the production path; wait for the runtime persist
+        // (the send-path test above pins this leg — here it's the baseline).
+        use tauri::Manager as _;
+        let managed = app.state::<std::sync::Mutex<NodeState>>();
+        let message_id_hex = rt
+            .block_on(send_dm_impl(
+                managed.inner(),
+                hex::encode(space_id.0),
+                b"zeb703 delete durability".to_vec(),
+                "text/plain".into(),
+            ))
+            .expect("send_dm_impl must succeed")
+            .message_id;
+        let id_bytes: [u8; 16] = hex::decode(&message_id_hex)
+            .expect("message_id hex")
+            .as_slice()
+            .try_into()
+            .expect("message_id 16 bytes");
+        let entry_id = crate::owner_state_types::OutboxEntryId(id_bytes);
+        rt.block_on(poll_crdt_until(&crdt_path, "sent entry", |s| {
+            s.outbox.contains_key(&entry_id)
+        }));
+
+        // Drive the REAL delete command through the tauri IPC boundary.
+        let response = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "delete_outbox_entry".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: LOCAL_IPC_URL.parse().expect("url must parse"),
+                body: tauri::ipc::InvokeBody::Json(serde_json::json!({
+                    "messageId": message_id_hex,
+                })),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        );
+        assert!(response.is_ok(), "delete must succeed: {response:?}");
+
+        // The delete's mutations must persist at RUNTIME: entry gone AND
+        // ZEB-243 tombstone present — no shutdown/fence/flush involved.
+        rt.block_on(poll_crdt_until(&crdt_path, "delete tombstone", |s| {
+            !s.outbox.contains_key(&entry_id) && s.outbox_tombstones.contains_key(&entry_id)
+        }));
+    }
+
+    /// ZEB-703 drain path: Phase C's 30-day expiry sweep mutates
+    /// `delivery_status` in the owner-state CRDT — with the engine handle
+    /// threaded, the transition must persist at runtime. (Same wiring
+    /// covers the deposit rungs' `mark_ack_delivered` — all three notify
+    /// points share the `owner_sync` param this test pins.)
+    #[tokio::test]
+    async fn drain_expiry_transition_persists_at_runtime_zeb703() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt = Arc::new(
+            crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"),
+        );
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        let alice = crate::owner_state_types::OwnerAddr([0x01; 16]);
+        let bob = crate::owner_state_types::OwnerAddr([0x02; 16]);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let outbox_arc = Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+            "zeb703-dev",
+            alice,
+        )));
+        let cas = crate::content_store::InMemoryStub::default();
+
+        // Mint an entry at wall_ms=1_000 through the production primitive.
+        let space_id = {
+            let mut g = crdt_state.lock().await;
+            let sp = make_dm_space(11, vec![alice, bob]);
+            let id = sp.id;
+            let outcome = g.apply_space_with_canonicalization(sp);
+            assert!(
+                matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Inserted),
+                "fixture install must succeed, got {outcome:?}"
+            );
+            id
+        };
+        let entry_id = {
+            let mut o_g = outbox_arc.lock().await;
+            let mut s_g = crdt_state.lock().await;
+            let (id, _cid) = o_g
+                .send_dm(
+                    &mut s_g,
+                    &cas,
+                    space_id,
+                    b"zeb703 expiry".to_vec(),
+                    "text/plain".into(),
+                    1_000,
+                    None,
+                )
+                .await
+                .expect("send_dm must succeed");
+            id
+        };
+
+        let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
+            crate::owner_state_crypto::FleetKeySet::new(kt),
+            "zeb703-dev".into(),
+            Arc::clone(&crdt_state),
+            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(crate::content_store::InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            250,
+        ));
+
+        // One drain tick well past EXPIRATION_MS: Phase A filters the
+        // expired entry from send work; Phase C's sweep marks it Expired
+        // (newly_expired non-empty → notify_dirty → debounced persist).
+        let app: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(crate::node_event_sink::RecordingSink::new());
+        crate::dm_outbox::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&crdt_state),
+            &crate::dm_outbox::StubTransport::new(),
+            1_000 + crate::dm_outbox::EXPIRATION_MS + 1,
+            app,
+            Some(Arc::clone(&engine)),
+        )
+        .await;
+
+        poll_crdt_until(&crdt_path, "expired status transition", |s| {
+            s.outbox.get(&entry_id).is_some_and(|e| {
+                matches!(
+                    e.delivery_status,
+                    crate::owner_state_types::DeliveryStatus::Expired
+                )
+            })
+        })
+        .await;
     }
 }
 
