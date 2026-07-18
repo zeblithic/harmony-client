@@ -59009,11 +59009,136 @@ async fn network_health_export_payload(
     ))
 }
 
+/// ZEB-708: GUI quit-path shutdown flush. Every GUI exit route funnels into
+/// `RunEvent::ExitRequested` (quit_app, the tray/gui_host 3s fallback exits,
+/// the ZEB-433 last-window-closed auto-exit, and the macOS menu Quit once the
+/// setup swap routes it off muda's `terminate:`). The run() handler latches
+/// [`exit_gate`] once, prevents the exit, runs [`run_bounded_flush`]
+/// (`stop_inner` off the main thread under [`GUI_QUIT_FLUSH_MAX_MS`]), then
+/// re-issues the exit — the save point precedes the process disappearing
+/// (the ZEB-703 principle, GUI side).
+pub(crate) mod gui_exit_flush {
+    use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+
+    /// Wall-clock bound on the pre-exit flush. Matches the #485 pre-ack
+    /// barrier bound: generous next to a healthy teardown (well under 1 s),
+    /// tight enough that a wedged engine cannot hang quit indefinitely.
+    pub(crate) const GUI_QUIT_FLUSH_MAX_MS: u64 = 5_000;
+
+    pub(crate) const PHASE_NOT_STARTED: u8 = 0;
+    pub(crate) const PHASE_IN_FLIGHT: u8 = 1;
+    pub(crate) const PHASE_DONE: u8 = 2;
+
+    /// Phase latch for the one real app instance. Tests drive [`exit_gate`]
+    /// with their own atomics.
+    pub(crate) static EXIT_FLUSH_PHASE: AtomicU8 = AtomicU8::new(PHASE_NOT_STARTED);
+
+    /// Exit code the flush thread re-issues, last-wins across every request
+    /// the gate prevented (CodeRabbit #486: a quit that starts the flush must
+    /// not clobber a later request's code — e.g. `exit(1)` arriving while the
+    /// `exit(0)` flush runs must still exit 1). Restart codes never land here:
+    /// restart-coded requests take the synchronous path in the handler
+    /// (`prevent_exit` is a no-op for them, so they are never re-issued).
+    pub(crate) static PENDING_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ExitGateAction {
+        /// First exit request: prevent it and spawn the flush thread.
+        StartFlush,
+        /// Flush in flight: prevent — the flush thread owns the re-exit.
+        /// This is what stops the armed 3s fallback exits (tray/gui_host)
+        /// from cutting a slower flush short.
+        AwaitFlush,
+        /// Flush finished (or its bound expired): let the exit proceed.
+        Allow,
+    }
+
+    /// What the bounded flush worker actually did (Qodo #486: a worker that
+    /// responded in time but could NOT flush must not read as success).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FlushOutcome {
+        /// `stop_inner` ran to completion: every present engine's shutdown
+        /// flush (incl. the owner-state persist) executed. Its bool return
+        /// (`had_node` — was an event loop running) does not change
+        /// durability, so it is not distinguished here.
+        Flushed,
+        /// No managed NodeState — nothing to flush (unreachable in the real
+        /// app; it is managed before run()).
+        NoOp,
+        /// The NodeState lock is poisoned — `stop_inner` bails before
+        /// reaching any engine shutdown. Surfaced so the handler can WARN
+        /// instead of exiting silently.
+        LockPoisoned,
+    }
+
+    /// Once-only latch deciding what an `ExitRequested` event does. Exactly
+    /// one caller ever observes [`ExitGateAction::StartFlush`].
+    pub(crate) fn exit_gate(phase: &AtomicU8) -> ExitGateAction {
+        match phase.compare_exchange(
+            PHASE_NOT_STARTED,
+            PHASE_IN_FLIGHT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => ExitGateAction::StartFlush,
+            Err(PHASE_IN_FLIGHT) => ExitGateAction::AwaitFlush,
+            Err(_) => ExitGateAction::Allow,
+        }
+    }
+
+    /// Run `stop_inner` on a fresh thread and wait at most `bound` for it.
+    /// `Some(outcome)` = the worker finished inside the bound (see
+    /// [`FlushOutcome`] for what it managed to do); `None` = the bound
+    /// expired — the worker keeps running and dies with the process,
+    /// identical blast radius to the pre-ZEB-708 behavior, but only after
+    /// the bound, and `stop_inner` reaches the owner-state persist early in
+    /// its sequence. Must be called OUTSIDE any tokio context (`stop_inner`
+    /// builds its own ephemeral runtimes); the ExitRequested handler calls
+    /// it from a plain thread (or blocks the callback for restart codes,
+    /// where the exit cannot be deferred).
+    pub(crate) fn run_bounded_flush<R: tauri::Runtime>(
+        handle: tauri::AppHandle<R>,
+        bound: std::time::Duration,
+    ) -> Option<FlushOutcome> {
+        let (tx, rx) = std::sync::mpsc::channel::<FlushOutcome>();
+        std::thread::spawn(move || {
+            use tauri::Manager as _;
+            let outcome = match handle.try_state::<std::sync::Mutex<crate::NodeState>>() {
+                Some(state) => {
+                    // Poisoned = a panic happened while holding the node
+                    // lock; stop_inner bails without flushing. Report it
+                    // rather than letting the quit read as a clean flush.
+                    if state.is_poisoned() {
+                        FlushOutcome::LockPoisoned
+                    } else {
+                        let had_node = crate::stop_inner(&state, None);
+                        // A false return is benign (no event loop was
+                        // running; engine flushes still ran) UNLESS the lock
+                        // got poisoned between the check above and
+                        // stop_inner's own lock() — then it bailed without
+                        // flushing anything.
+                        if !had_node && state.is_poisoned() {
+                            FlushOutcome::LockPoisoned
+                        } else {
+                            FlushOutcome::Flushed
+                        }
+                    }
+                }
+                None => FlushOutcome::NoOp,
+            };
+            let _ = tx.send(outcome);
+        });
+        rx.recv_timeout(bound).ok()
+    }
+}
+
 /// ZEB-356: real application exit. A tray-resident app does NOT quit when its
 /// last window is hidden/destroyed (the tray keeps the process alive), so the
 /// FE Quit path runs its voice/call teardown and then invokes this to terminate
 /// the process. Distinct from the window-close path, which hides when the tray
 /// exists (ZEB-433: with no tray, close exits instead — see [`TrayActive`]).
+/// ZEB-708: the exit lands in run()'s `ExitRequested` handler, which defers it
+/// until the bounded [`gui_exit_flush`] teardown ran.
 #[tauri::command]
 fn quit_app(app_handle: tauri::AppHandle) {
     app_handle.exit(0);
@@ -59914,6 +60039,84 @@ pub fn run() {
                 app.manage(host);
             }
 
+            // ── ZEB-708: macOS menu Quit / ⌘Q must route through the ────────
+            // graceful quit path. The auto-installed default menu's Quit item
+            // is muda's `terminate:` selector — it kills the process without
+            // ever reaching the tao event loop (no ExitRequested, so no
+            // pre-exit flush; tao 0.35 has no applicationShouldTerminate
+            // hook). Swap it for a routed item that quits exactly the way
+            // tray Quit does. Best-effort (ZEB-433 tray precedent): failure
+            // degrades to the default menu — the pre-ZEB-708 ⌘Q behavior —
+            // instead of aborting setup.
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::menu::{Menu, MenuItem, MenuItemKind};
+                let swap_result = (|| -> Result<(), String> {
+                    let menu = Menu::default(app.handle()).map_err(|e| e.to_string())?;
+                    let items = menu.items().map_err(|e| e.to_string())?;
+                    let app_submenu = items
+                        .first()
+                        .and_then(|k| k.as_submenu())
+                        .ok_or("default menu has no app submenu")?;
+                    let sub_items = app_submenu.items().map_err(|e| e.to_string())?;
+                    // Menu::default pins Quit as the app submenu's last item
+                    // (tauri 2.11.2). Verify it IS the Quit item — kind AND
+                    // text (muda's non-Windows default is "&Quit"; Qodo #486:
+                    // matching any predefined item could remove the wrong
+                    // entry on structure drift and leave the terminate-based
+                    // Quit in place). Drift = bail, keep the default menu.
+                    let last_is_quit = match sub_items.last() {
+                        Some(MenuItemKind::Predefined(p)) => p
+                            .text()
+                            .map(|t| t.replace('&', "") == "Quit")
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if !last_is_quit {
+                        return Err("app submenu's last item is not the predefined Quit".into());
+                    }
+                    app_submenu
+                        .remove_at(sub_items.len() - 1)
+                        .map_err(|e| e.to_string())?;
+                    let quit = MenuItem::with_id(
+                        app,
+                        "harmony-quit",
+                        "Quit Harmony",
+                        true,
+                        Some("CmdOrCtrl+Q"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    app_submenu.append(&quit).map_err(|e| e.to_string())?;
+                    app.set_menu(menu).map_err(|e| e.to_string())?;
+                    Ok(())
+                })();
+                match swap_result {
+                    Ok(()) => {
+                        app.on_menu_event(|app, event| {
+                            if event.id().0 == "harmony-quit" {
+                                // Same body as the tray "quit" arm: emit for
+                                // graceful FE voice/call teardown, arm a
+                                // fallback exit so quit can't be lost if the
+                                // FE listener never initialized. Both exits
+                                // funnel into the ZEB-708 ExitRequested flush.
+                                let _ = app.emit("quit-requested", ());
+                                let app2 = app.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_secs(3));
+                                    app2.exit(0);
+                                });
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ZEB-708: menu Quit swap failed; ⌘Q keeps the flush-less terminate: path"
+                        );
+                    }
+                }
+            }
+
             Ok(())
         })
         .manage(Mutex::new(NodeState::default()))
@@ -60242,8 +60445,86 @@ pub fn run() {
             set_community_relay_opt_in,
             get_community_relay_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running harmony");
+        .build(tauri::generate_context!())
+        .expect("error while building harmony")
+        .run(|app_handle, event| {
+            // ZEB-708: every GUI exit route funnels into ExitRequested —
+            // quit_app, the tray/gui_host 3s fallback exits, the ZEB-433
+            // last-window-closed auto-exit, the swapped menu Quit, and
+            // restart requests. Latch once, defer the exit until the bounded
+            // stop_inner flush ran, then re-issue it. prevent_exit only
+            // counts when called synchronously inside this callback
+            // (runtime-wry try_recv's the verdict right after it returns) —
+            // and it is a documented NO-OP for RESTART_EXIT_CODE, so
+            // restart-coded requests block this callback on the flush
+            // instead (the exit cannot be deferred, only outwaited).
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                use gui_exit_flush::{ExitGateAction, FlushOutcome, EXIT_FLUSH_PHASE};
+                use std::sync::atomic::Ordering;
+                let bound =
+                    std::time::Duration::from_millis(gui_exit_flush::GUI_QUIT_FLUSH_MAX_MS);
+                let is_restart = code == Some(tauri::RESTART_EXIT_CODE);
+                let log_flush_outcome = |outcome: Option<FlushOutcome>| match outcome {
+                    None => tracing::warn!(
+                        bound_ms = gui_exit_flush::GUI_QUIT_FLUSH_MAX_MS,
+                        "ZEB-708: pre-exit flush exceeded its bound; exiting anyway"
+                    ),
+                    Some(FlushOutcome::LockPoisoned) => tracing::warn!(
+                        "ZEB-708: NodeState lock poisoned; pre-exit flush impossible"
+                    ),
+                    Some(FlushOutcome::Flushed) | Some(FlushOutcome::NoOp) => {}
+                };
+                match gui_exit_flush::exit_gate(&EXIT_FLUSH_PHASE) {
+                    ExitGateAction::StartFlush if is_restart => {
+                        // Restart cannot be prevented: flush synchronously
+                        // (the worker still runs off-thread; this callback
+                        // just waits, bounded) and let the exit proceed.
+                        log_flush_outcome(gui_exit_flush::run_bounded_flush(
+                            app_handle.clone(),
+                            bound,
+                        ));
+                        EXIT_FLUSH_PHASE.store(gui_exit_flush::PHASE_DONE, Ordering::Release);
+                    }
+                    ExitGateAction::StartFlush => {
+                        api.prevent_exit();
+                        gui_exit_flush::PENDING_EXIT_CODE
+                            .store(code.unwrap_or(0), Ordering::Release);
+                        let handle = app_handle.clone();
+                        std::thread::spawn(move || {
+                            log_flush_outcome(gui_exit_flush::run_bounded_flush(
+                                handle.clone(),
+                                bound,
+                            ));
+                            EXIT_FLUSH_PHASE.store(gui_exit_flush::PHASE_DONE, Ordering::Release);
+                            handle.exit(gui_exit_flush::PENDING_EXIT_CODE.load(Ordering::Acquire));
+                        });
+                    }
+                    ExitGateAction::AwaitFlush if is_restart => {
+                        // prevent_exit is a no-op for restarts: outwait the
+                        // in-flight flush here (bounded) so the restart's
+                        // immediate exit can't cut it short.
+                        let deadline = std::time::Instant::now() + bound;
+                        while EXIT_FLUSH_PHASE.load(Ordering::Acquire)
+                            != gui_exit_flush::PHASE_DONE
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                    }
+                    // Flush in flight: swallow (the armed fallback exits must
+                    // not cut it short) but keep the newest code — the flush
+                    // thread re-issues with last-wins.
+                    ExitGateAction::AwaitFlush => {
+                        api.prevent_exit();
+                        if let Some(c) = code {
+                            gui_exit_flush::PENDING_EXIT_CODE.store(c, Ordering::Release);
+                        }
+                    }
+                    // Done: the flush thread's own exit — let it through.
+                    ExitGateAction::Allow => {}
+                }
+            }
+        });
 }
 
 /// Test-only helper: adds the 4 DM IPC handlers (`send_dm`,
@@ -65349,7 +65630,8 @@ mod zeb703_outbox_runtime_durability_tests {
     /// Synthetic DmOutbox mirroring dm_outbox::tests::make_outbox_synthetic
     /// (private to that mod; the `_local` copy at dm_outbox.rs:11128 is the
     /// same precedent). All identity-bound fields derive from one seed.
-    fn make_outbox_synthetic(
+    /// `pub(super)` so the ZEB-708 sibling module reuses the same rig.
+    pub(super) fn make_outbox_synthetic(
         device_id: &str,
         self_owner: crate::owner_state_types::OwnerAddr,
     ) -> crate::dm_outbox::DmOutbox {
@@ -65377,7 +65659,8 @@ mod zeb703_outbox_runtime_durability_tests {
     }
 
     /// DM Space fixture mirroring dm_outbox::tests::make_dm_space.
-    fn make_dm_space(
+    /// `pub(super)` so the ZEB-708 sibling module reuses the same rig.
+    pub(super) fn make_dm_space(
         id_byte: u8,
         members: Vec<crate::owner_state_types::OwnerAddr>,
     ) -> crate::owner_state_types::Space {
@@ -66144,6 +66427,223 @@ mod zeb703_outbox_runtime_durability_tests {
             .expect("server task must join after /v1/shutdown")
             .expect("server task must not panic")
             .expect("graceful shutdown must end the server cleanly");
+    }
+}
+
+/// ZEB-708: GUI quit paths must run a bounded Rust-side shutdown flush before
+/// the process exits (quit_app, tray/gui_host 3s fallbacks, last-window-closed,
+/// macOS menu Quit). The `RunEvent::ExitRequested` handler wires
+/// `gui_exit_flush::exit_gate` (once-only latch; late fallback exits are
+/// swallowed while the flush runs) to `gui_exit_flush::run_bounded_flush`
+/// (`stop_inner` off-thread under a wall-clock bound). These tests pin the two
+/// seams; the RunEvent/menu wiring needs a live event loop and is review- and
+/// smoke-verified instead.
+#[cfg(test)]
+mod zeb708_gui_exit_flush_tests {
+    use super::zeb703_outbox_runtime_durability_tests::{make_dm_space, make_outbox_synthetic};
+    use super::*;
+    use crate::gui_exit_flush::{
+        exit_gate, run_bounded_flush, ExitGateAction, FlushOutcome, PHASE_DONE, PHASE_NOT_STARTED,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// The gate is a once-only latch: the first ExitRequested starts the
+    /// flush, every re-request while it runs is swallowed (the armed 3s
+    /// fallback exits must not cut the flush short), and once the flush
+    /// thread marks Done the re-issued exit passes through.
+    #[test]
+    fn exit_gate_latches_once_then_allows_zeb708() {
+        let phase = AtomicU8::new(PHASE_NOT_STARTED);
+        assert_eq!(exit_gate(&phase), ExitGateAction::StartFlush);
+        assert_eq!(exit_gate(&phase), ExitGateAction::AwaitFlush);
+        assert_eq!(exit_gate(&phase), ExitGateAction::AwaitFlush);
+        phase.store(PHASE_DONE, Ordering::Release);
+        assert_eq!(exit_gate(&phase), ExitGateAction::Allow);
+    }
+
+    /// Concurrent quit paths (FE quit_app racing an armed fallback) hit the
+    /// gate together — exactly ONE may win StartFlush, or two flush threads
+    /// would race `stop_inner` on the same NodeState.
+    #[test]
+    fn exit_gate_single_winner_under_race_zeb708() {
+        let phase = Arc::new(AtomicU8::new(PHASE_NOT_STARTED));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = Arc::clone(&phase);
+                std::thread::spawn(move || exit_gate(&p))
+            })
+            .collect();
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().expect("gate thread"))
+            .filter(|a| *a == ExitGateAction::StartFlush)
+            .count();
+        assert_eq!(wins, 1, "exactly one ExitRequested may start the flush");
+    }
+
+    /// THE ZEB-708 durability pin: a LOCAL owner-state mutation still inside
+    /// its debounce window (debounce set far past the test horizon — the
+    /// runtime flush can NOT fire) must reach `owner_state_crdt.cbor` via the
+    /// quit-path flush alone. This is exactly the "mutation inside the final
+    /// debounce window" that the flush-less GUI quit silently lost.
+    #[test]
+    fn gui_quit_flush_persists_unflushed_owner_state_zeb708() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crdt_path = dir.path().join("owner_state_crdt.cbor");
+        let paths = crate::owner_state_sync::PersistPaths {
+            crdt: crdt_path.clone(),
+            replay: dir.path().join("state_root_replay.cbor"),
+        };
+        let kt =
+            Arc::new(crate::owner_state_crypto::KeyTree::derive(&[0x42u8; 32]).expect("keytree"));
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        let alice = crate::owner_state_types::OwnerAddr([0x01; 16]);
+        let bob = crate::owner_state_types::OwnerAddr([0x02; 16]);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+        // SyncEngine::new spawns its select task — scope the enter guard so
+        // `run_bounded_flush` below runs OUTSIDE any tokio context (as the
+        // real ExitRequested handler thread does; `stop_inner` requires it).
+        let (engine, space_id) = {
+            let _g = rt.enter();
+            let space_id = rt.block_on(async {
+                let mut g = crdt_state.lock().await;
+                let sp = make_dm_space(11, vec![alice, bob]);
+                let id = sp.id;
+                let outcome = g.apply_space_with_canonicalization(sp);
+                assert!(
+                    matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Inserted),
+                    "fixture install must succeed, got {outcome:?}"
+                );
+                id
+            });
+            let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
+                crate::owner_state_crypto::FleetKeySet::new(kt),
+                "zeb708-dev".into(),
+                Arc::clone(&crdt_state),
+                Arc::clone(&tracker),
+                Arc::new(crate::content_store::InMemoryStub::default()),
+                pub_tx,
+                sub_rx,
+                paths,
+                // Debounce far beyond the test horizon: the runtime flush can
+                // never fire here, so ONLY the quit-path flush can save the
+                // mutation — the exposure window this test pins.
+                600_000,
+            ));
+            (engine, space_id)
+        };
+
+        let app = tauri::test::mock_builder()
+            .manage(Mutex::new(NodeState {
+                dm_outbox: Some(Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+                    "zeb708-dev",
+                    alice,
+                )))),
+                dm_transport: Some(Arc::new(crate::dm_outbox::StubTransport::new())),
+                crdt_state: Some(Arc::clone(&crdt_state)),
+                hlc_tracker: Some(Arc::clone(&tracker)),
+                dm_device_id: Some("zeb708-dev".into()),
+                dm_self_owner: Some(alice),
+                content_store: Some(Arc::new(crate::content_store::InMemoryStub::default())),
+                dm_send_inflight: Some(Arc::new(tokio::sync::Semaphore::new(
+                    DM_SEND_FENCE_CAPACITY,
+                ))),
+                dm_send_stopping: Some(Arc::new(AtomicBool::new(false))),
+                sync_engine: Some(Arc::clone(&engine)),
+                ..NodeState::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+
+        use tauri::Manager as _;
+        let managed = app.state::<Mutex<NodeState>>();
+        let message_id_hex = rt
+            .block_on(send_dm_impl(
+                managed.inner(),
+                hex::encode(space_id.0),
+                b"zeb708 gui quit durability".to_vec(),
+                "text/plain".into(),
+            ))
+            .expect("send_dm_impl must succeed")
+            .message_id;
+        let id_bytes: [u8; 16] = hex::decode(&message_id_hex)
+            .expect("message_id hex")
+            .as_slice()
+            .try_into()
+            .expect("message_id 16 bytes");
+        let entry_id = crate::owner_state_types::OutboxEntryId(id_bytes);
+
+        // Precondition: the entry is dirty-armed but NOT yet on disk (the
+        // 600s debounce is still pending). Otherwise the final assert would
+        // pass without the quit flush doing anything.
+        let already_persisted = crdt_path.exists()
+            && crate::owner_state_persist::load_crdt(&crdt_path)
+                .map(|s| s.outbox.contains_key(&entry_id))
+                .unwrap_or(false);
+        assert!(
+            !already_persisted,
+            "fixture: entry must NOT be persisted before the quit flush"
+        );
+
+        let outcome = run_bounded_flush(app.handle().clone(), std::time::Duration::from_secs(15));
+        assert_eq!(
+            outcome,
+            Some(FlushOutcome::Flushed),
+            "quit flush must complete within the bound AND report a real flush"
+        );
+
+        let loaded = crate::owner_state_persist::load_crdt(&crdt_path)
+            .expect("crdt file must exist after the quit flush");
+        assert!(
+            loaded.outbox.contains_key(&entry_id),
+            "ZEB-708: the un-debounced outbox entry must be persisted by the \
+             GUI quit flush — without it, quitting inside the debounce window \
+             silently loses the mutation"
+        );
+    }
+
+    /// The bound must actually cap the wait: with the NodeState lock held
+    /// (a wedged `stop_inner` blocks on exactly that lock), the flush must
+    /// report failure at the bound instead of hanging quit forever. 100 ms
+    /// bound vs a 3 s assert ceiling — budget well under the regression
+    /// threshold so timing noise can't flake it.
+    #[test]
+    fn gui_quit_flush_bound_respected_when_wedged_zeb708() {
+        let app = tauri::test::mock_builder()
+            .manage(Mutex::new(NodeState::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        use tauri::Manager as _;
+        let managed = app.state::<Mutex<NodeState>>();
+        let guard = managed.lock().expect("test holds the node lock");
+        let started = std::time::Instant::now();
+        let outcome =
+            run_bounded_flush(app.handle().clone(), std::time::Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        drop(guard);
+        assert_eq!(
+            outcome, None,
+            "a wedged stop_inner must NOT report completion"
+        );
+        // CodeRabbit #486: also pin the lower edge — an immediate None
+        // (never actually waiting out the bound) must fail too. 80 ms
+        // tolerance under the 100 ms bound absorbs clock granularity.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(80),
+            "flush returned before the 100 ms bound (took {elapsed:?})"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "bound must cap the wait (took {elapsed:?})"
+        );
     }
 }
 
