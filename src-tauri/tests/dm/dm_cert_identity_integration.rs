@@ -24,7 +24,7 @@
 //!      handshake-seeded cache — provably Alice's #2 (his cache holds exactly the
 //!      #2 device; the #3 hash is absent).
 //!   4. Bob receives + decrypts the message payload via the production
-//!      `handle_cidnotify_lifted` receive path fed the REAL drained CidNotify
+//!      `ingest_dm_packet` receive path fed the REAL drained CidNotify
 //!      bytes (delivery not regressed) and emits `dm-received` with the
 //!      round-tripped plaintext.
 //!   5. The invite the REAL deposit path rebuilds (`build_invite_packet_bytes →
@@ -38,7 +38,7 @@
 //!
 //! All five assertions are covered end-to-end against production code paths: the
 //! real iroh friend handshake (1, 2), the real send-side signing selection via
-//! `drain`/`dm_signing_material` (3), the real `handle_cidnotify_lifted` receive
+//! `drain`/`dm_signing_material` (3), the real `ingest_dm_packet` receive
 //! path (4), and the real `handle_invite → apply_invite` cert-anchored accept
 //! path (5). Both wire packets (CidNotify + invite) are pulled from the REAL
 //! deposit rung, so a regression leaving the sender on #3 surfaces here.
@@ -696,12 +696,12 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
         }
 
         // ── ASSERTION 4: Bob receives + decrypts via the PRODUCTION receive
-        //    path (`handle_cidnotify_lifted`), emitting `dm-received`. ──────
+        //    path (`ingest_dm_packet`), emitting `dm-received`. ─────────────
         let events = Arc::new(StdMutex::new(Vec::<(String, serde_json::Value)>::new()));
         let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(RecordingSink {
             events: Arc::clone(&events),
         });
-        // Bob's real DmOutbox (used only for its device_id in the receive path).
+        // Bob's real DmOutbox — used by the ASSERTION 5 accept path below.
         let bob_priv3 = Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x32; 32]));
         let bob_hash3 = DeviceIdentityHash(bob_priv3.public_identity().address_hash);
         let bob_priv3_bytes = bob_priv3.to_private_bytes();
@@ -719,18 +719,25 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
             bob.cert.clone(),
         )));
 
-        harmony_app::dm_outbox::DmOutbox::handle_cidnotify_lifted(
-            Arc::clone(&bob_outbox),
-            Arc::clone(&bob_crdt_state),
-            Arc::clone(&cas),
-            Arc::clone(&sink),
-            rx_signed,
-            rx_signature,
-            rx_signed_bytes,
-            now_ms(),
-            harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),
+        // The LIVE tunnel receive path takes the raw signed packet bytes (it
+        // decodes internally), so feed the drained `cidnotify_wire` directly.
+        // `bob_outbox` is not consumed here — the tunnel carrier owes no
+        // device-cache refresh + ack fan-out; it survives for ASSERTION 5.
+        let applied = harmony_app::dm_inbox_ingest::ingest_dm_packet(
+            &bob_crdt_state,
+            &cas,
+            &sink,
+            None,
+            bob.owner,
+            "bob-dev",
+            [0u8; 32],
+            &cidnotify_wire,
+            &harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
         )
-        .await;
+        .await
+        .expect("Bob ingests the drained CidNotify via the production receive path");
+        assert!(applied, "a newly-applied DM emits dm-received (Ok(true))");
 
         let dm_received: Vec<serde_json::Value> = events
             .lock()

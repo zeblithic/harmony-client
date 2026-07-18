@@ -234,10 +234,10 @@ fn derive_seal_key_with_info(shared_secret: &[u8; 32], info: &[u8]) -> Zeroizing
 /// Reticulum app+aspect for DM-protocol packets. The full destination
 /// name is `"harmony.dm"` (app `"harmony"`, single aspect `"dm"`); see
 /// `harmony_reticulum::destination::DestinationName::from_name` for the
-/// canonical naming scheme. Pinned here as a constant so both the
-/// drain-side `resolve_destinations` helper in `dm_outbox` and the
-/// ack-fan-out path in `handle_cidnotify_lifted` (Task 10) compute the same
-/// destination hash for any given device-identity hash.
+/// canonical naming scheme. Pinned here as a constant so every consumer
+/// (the drain-side `resolve_destinations` helper in `dm_outbox` and any
+/// future receive-side fan-out) computes the same destination hash for any
+/// given device-identity hash.
 const DM_DESTINATION_FULL_NAME: &[u8] = b"harmony.dm";
 
 /// Compute the Reticulum 16-byte destination hash for a DM packet

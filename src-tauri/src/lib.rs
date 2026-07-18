@@ -13542,8 +13542,8 @@ fn filter_sort_paginate_inbox(
 ///      truncated to `limit`.
 ///   4. Each surviving InboxEntry's `message_cid` is fetched from CAS and
 ///      decrypted via `dm_crypto::decrypt_dm_message` with the prior-keys
-///      fallback (matches `handle_cidnotify_lifted`'s receive path so post-key-
-///      rotation scrollback works).
+///      fallback (matches the receive path's `decrypt_and_bind_dm_blob` so
+///      post-key-rotation scrollback works).
 ///   5. Any per-entry CAS miss (`Ok(None)`) or fetch error (`Err(_)`) or
 ///      decrypt failure surfaces as a single `Err` with the failing
 ///      message_cid in the message — caller can retry. (Partial-result
@@ -13605,9 +13605,9 @@ pub async fn read_dm_thread_inner(
 ///   `received_at.wall_ms < before_hlc`. None = newest first page.
 ///
 /// Decryption uses `dm_crypto::decrypt_dm_message` with the prior-keys
-/// fallback (matches `handle_cidnotify_lifted`'s receive path), so scrollback
-/// after a content_key rotation still surfaces older messages encrypted
-/// under the previous key.
+/// fallback (matches the receive path's `decrypt_and_bind_dm_blob`), so
+/// scrollback after a content_key rotation still surfaces older messages
+/// encrypted under the previous key.
 ///
 /// Frontend uses this on first DM-channel switch to populate the
 /// TextFeed with history. To paginate: pass the oldest entry's

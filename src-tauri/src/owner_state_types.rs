@@ -2440,10 +2440,11 @@ impl InboxEntry {
 
 /// A received DM message bundle — Phase 4 IPC payload carrier.
 ///
-/// `handle_cidnotify_lifted` (receive path) decrypts the message, then emits this
-/// struct via `DrainOutcome.newly_received`. The event_loop tick consumes
-/// the vec and emits one `dm-received` IPC event per element with body +
-/// mime_type + sent_at fields the frontend needs to render the message.
+/// The receive path (`dm_inbox_ingest::ingest_dm_packet`, relay recover)
+/// decrypts the message, then emits this struct directly as the
+/// `dm-received` IPC event payload (via `dm_received_event_payload`) with
+/// body + mime_type + sent_at fields the frontend needs to render the
+/// message.
 ///
 /// This widens the previous `Vec<InboxEntry>` carrier so the decrypted
 /// body doesn't have to be re-fetched + re-decrypted on the IPC emit

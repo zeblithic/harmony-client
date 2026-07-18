@@ -1754,12 +1754,10 @@ mod engine_tests {
             .expect("persist mutex")
             .clone();
         assert!(
-            persisted
-                .iter()
-                .any(|doc| doc
-                    .entries
-                    .get("k1")
-                    .is_some_and(|e| e.val == "durable-while-task-wedged")),
+            persisted.iter().any(|doc| doc
+                .entries
+                .get("k1")
+                .is_some_and(|e| e.val == "durable-while-task-wedged")),
             "persist_now must persist mutated state while the task is wedged"
         );
 
@@ -1839,7 +1837,11 @@ mod engine_tests {
             );
         }
         built.engine.notify_dirty();
-        built.engine.persist_now().await.expect("second notified persist");
+        built
+            .engine
+            .persist_now()
+            .await
+            .expect("second notified persist");
 
         built.engine.shutdown().await.ok();
     }
