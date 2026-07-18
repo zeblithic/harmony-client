@@ -563,6 +563,12 @@ pub(crate) async fn ingest_dm_packet(
                     );
                 }
                 crate::dm_outbox::ApplyInviteOutcome::Accepted => {
+                    // ZEB-709: the auto-accept wrote the DM Space (+ cache
+                    // refresh) into owner-state — arm the owner-state flush.
+                    // Staged/Ignored return before any owner-state write.
+                    if let Some(mark_dirty) = notify_owner_state_dirty {
+                        mark_dirty();
+                    }
                     // ZEB-640 (1): a friend-tier auto-accept makes any EARLIER
                     // staged (pre-befriend) entry for this space stale — the
                     // Space now exists in nav, so purge the pending row.
@@ -809,6 +815,17 @@ pub(crate) async fn ingest_dm_packet(
         (payload, newly_inserted)
     };
 
+    // ZEB-709: arm the OWNER-STATE flush for the payload write (lock dropped
+    // above; notify-on-insert only). Without this, a live-tunnel DM's sender
+    // gets its Ack (sender stops re-sending) while the receiver's inbox entry
+    // sits un-notified in memory — a crash before an unrelated owner-state
+    // flush loses the message with no re-delivery path.
+    if newly_inserted {
+        if let Some(mark_dirty) = notify_owner_state_dirty {
+            mark_dirty();
+        }
+    }
+
     // 6. Emit the SAME dm-received event the direct/deposit paths emit, gated
     //    on Inserted so a deduped tunnel copy never re-emits.
     if newly_inserted {
@@ -976,6 +993,16 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                     // accept / space exists) → flag the post-lock purge.
                     None => {
                         purge_stale_staged = true;
+                        // ZEB-709: the friend-tier accept may have written the
+                        // DM Space into owner-state inside this lock — arm the
+                        // flush HERE so even the deferred-message error exits
+                        // below keep it durable (the entry stays pending, but
+                        // the in-memory Space write already happened). A
+                        // spurious arm on the space-already-exists no-op is a
+                        // harmless debounced persist of unchanged state.
+                        if let Some(mark) = &self.notify_owner_state_dirty {
+                            mark();
+                        }
                         None
                     }
                 }
@@ -1108,6 +1135,13 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
                 Ok(())
             }
             crate::dm_outbox::ApplyInviteOutcome::Accepted => {
+                // ZEB-709: the auto-accept wrote the DM Space into owner-state
+                // — arm the owner-state flush (Staged writes only the
+                // process-local pending store; IgnoredExistingSpace writes
+                // nothing; cache refresh is disabled on this path).
+                if let Some(mark) = &self.notify_owner_state_dirty {
+                    mark();
+                }
                 // ZEB-640 (1): a friend-tier auto-accept makes any EARLIER
                 // staged (pre-befriend) entry for this space stale — the Space
                 // now exists in nav, so purge the pending row.
@@ -1177,14 +1211,28 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
     }
 
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
-        let mut state = self.crdt_state.lock().await;
-        match state.apply_inbox(entry) {
-            crate::owner_state_crdt::ApplyOutcome::Inserted => Ok(true),
-            crate::owner_state_crdt::ApplyOutcome::Merged { .. } => Ok(false),
-            crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
-                Err(format!("apply_inbox rejected: {reason:?}"))
+        let inserted = {
+            let mut state = self.crdt_state.lock().await;
+            match state.apply_inbox(entry) {
+                crate::owner_state_crdt::ApplyOutcome::Inserted => true,
+                crate::owner_state_crdt::ApplyOutcome::Merged { .. } => false,
+                crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+                    return Err(format!("apply_inbox rejected: {reason:?}"));
+                }
+            }
+        };
+        // ZEB-709: the payload write must arm the OWNER-STATE flush — the
+        // `ingested_by` ack (dm-inbox DATASET engine, notified by the sweep)
+        // otherwise persists + replicates while this entry sits un-notified
+        // in memory, and a crash in that window loses the DM permanently
+        // (restart skips via `ingested_by`; coverage-GC destroys the
+        // deposit). Notify-on-insert only, mirroring `apply_revocation`.
+        if inserted {
+            if let Some(mark) = &self.notify_owner_state_dirty {
+                mark();
             }
         }
+        Ok(inserted)
     }
 
     fn emit_dm_received(&self, msg: &ReceivedMessage) {
@@ -2016,6 +2064,57 @@ mod tests {
         assert!(
             doc.entries[&key].ingested_by.contains(SELF_ID),
             "self added to the grow-only ig set"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_inbox_marks_owner_state_dirty_once_zeb709() {
+        // ZEB-709: the DM-message insert into owner-state MUST mark the
+        // OWNER-STATE engine dirty. Without it, the `ingested_by` ack (a
+        // dm-inbox DATASET write, notified by the sweep) persists and
+        // replicates within its debounce while the payload sits un-notified
+        // in memory — a crash in that window permanently loses the DM: the
+        // restarted sweeper skips the entry via `ingested_by`, coverage-GC
+        // destroys it, and the deposit clears. The notify does not make the
+        // two engines atomic; it flips the failure direction to safe (a
+        // persisted payload with a lost ack just re-ingests idempotently).
+        // Dirty-once discipline mirrors the revocation arm: fire on
+        // Inserted, never on the Merged re-apply.
+        let (ctx, crdt_state, dirty, _revoked) = prod_ctx_with_dirty();
+        let entry = crate::owner_state_types::InboxEntry {
+            space_id: crate::owner_state_types::SpaceId([0x07; 16]),
+            message_cid: ContentId::from_bytes([0x11; 32]),
+            from: OwnerAddr([0x02; 16]),
+            received_at: hlc(500),
+        };
+
+        let inserted = ctx
+            .apply_inbox(entry.clone())
+            .await
+            .expect("a fresh inbox entry applies");
+        assert!(inserted, "first apply is a genuine insert");
+        {
+            let state = crdt_state.lock().await;
+            assert!(
+                state.inbox.contains_key(&entry.key()),
+                "owner-state CRDT stored the inbox entry"
+            );
+        }
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "dirty fires exactly once on the genuine insert"
+        );
+
+        let again = ctx
+            .apply_inbox(entry)
+            .await
+            .expect("idempotent re-apply is not an error");
+        assert!(!again, "re-applying the same entry is not a new insert");
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "no spurious dirty on the idempotent re-apply"
         );
     }
 
@@ -2876,6 +2975,65 @@ mod tests {
                 .iter()
                 .any(|(n, _)| n == crate::dm_outbox::DM_RECEIVED_EVENT),
             "a CidNotifyWithBlob must emit dm-received"
+        );
+    }
+
+    /// ZEB-709: a live-tunnel DM insert must mark the OWNER-STATE engine dirty
+    /// exactly once (never on the deduped re-delivery). The tunnel sender gets
+    /// its Ack and stops re-sending, so an un-notified inbox write has no
+    /// re-delivery path — a crash before an unrelated owner-state flush would
+    /// lose the message permanently.
+    #[tokio::test]
+    async fn ingest_dm_packet_message_insert_marks_owner_state_dirty_once_zeb709() {
+        let fx = build_dm_ingest_fixture(b"dirty-pin-over-tunnel").await;
+        let dirty = std::sync::Arc::new(AtomicUsize::new(0));
+        let dirty_cb = {
+            let d = std::sync::Arc::clone(&dirty);
+            move || {
+                d.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        let applied = ingest_dm_packet(
+            &fx.crdt_state,
+            &fx.content_store,
+            &fx.sink,
+            None,
+            fx.bob,
+            &fx.bob_device_id,
+            [0u8; 32],
+            &fx.packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            Some(&dirty_cb),
+        )
+        .await
+        .expect("an admitted CidNotify must deliver");
+        assert!(applied, "first delivery is a genuine insert");
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "the inbox insert marks the owner-state engine dirty exactly once"
+        );
+
+        let re_applied = ingest_dm_packet(
+            &fx.crdt_state,
+            &fx.content_store,
+            &fx.sink,
+            None,
+            fx.bob,
+            &fx.bob_device_id,
+            [0u8; 32],
+            &fx.packet,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            Some(&dirty_cb),
+        )
+        .await
+        .expect("a re-delivered CidNotify dedupes cleanly");
+        assert!(!re_applied, "the dedup path is Merged, not a new insert");
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "no spurious dirty on the deduped re-delivery"
         );
     }
 

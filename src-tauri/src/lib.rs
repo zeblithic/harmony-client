@@ -10162,6 +10162,18 @@ pub async fn start_node_inner(
                                             // ZEB-580 S2: shared-community
                                             // revocation cutoff handle.
                                             revoked: revoked_device_projection.clone(),
+                                            // ZEB-709: relay-recovered writes
+                                            // into owner-state must arm ITS
+                                            // engine's flush (the relay ack +
+                                            // coverage-GC otherwise outrun the
+                                            // un-persisted payload).
+                                            notify_owner_state_dirty: {
+                                                let e = std::sync::Arc::clone(
+                                                    &owner_state_engine_for_dirty,
+                                                );
+                                                Some(std::sync::Arc::new(move || e.notify_dirty())
+                                                    as std::sync::Arc<dyn Fn() + Send + Sync>)
+                                            },
                                         },
                                     );
                                     let relay_pull_transport: std::sync::Arc<
