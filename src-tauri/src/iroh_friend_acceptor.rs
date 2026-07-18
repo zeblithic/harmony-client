@@ -2038,14 +2038,48 @@ where
     ///   * `TokenPath` → token gate + accept (reply `Accepted`),
     ///   * `AcceptInline` → accept with no token gate (reply `Accepted`),
     ///   * `Pending` → record the request + reply `Pending` (write NO friend).
+    ///
+    /// Returns WHICH benign outcome was delivered ([`FriendInboundOutcome`])
+    /// so the dispatcher's completion log reports the real result (ZEB-700
+    /// review: an `Ok` here is not necessarily a delivered accept).
     async fn handle_friend_handshake_inbound(
         &self,
         conn: &Connection,
-    ) -> Result<(), FriendAcceptError> {
+    ) -> Result<FriendInboundOutcome, FriendAcceptError> {
         let (mut send, mut recv) = tokio::time::timeout(self.config.io_deadline, conn.accept_bi())
             .await
             .map_err(|_| FriendAcceptError::IoTimeout { step: "accept_bi" })?
             .map_err(|e| FriendAcceptError::AcceptBi(e.to_string()))?;
+
+        // ZEB-700 Tier 1 (pre-auth connection shield): shed a flooding endpoint
+        // BEFORE any stream read — so a malformed or slow/trickled frame can't
+        // consume framing I/O without consuming the per-connection budget
+        // (CodeRabbit R1) — and before decode + all crypto (cert chain +
+        // handshake sig + up to 32 carried revocation attestations), keyed on
+        // the connecting endpoint's authenticated iroh id — un-spoofable.
+        // (Earlier than the PEX precedent's post-decode placement, which only
+        // exists to select an arm; friend/v1 has one arm, and the benign reply
+        // doesn't depend on the request.) On a shed we LOG ("no silent
+        // truncation") and write the SAME benign `Pending` reply the Path-A
+        // outcome writes — network-indistinguishable (no oracle) and it leaks
+        // nothing about consent state — with ZERO state effect: nothing is
+        // recorded, no token consumed, no friend written. An honest peer that
+        // somehow trips the cap self-heals by re-dialing after the window (a
+        // live token stays live and redeemable).
+        let limiter_now_ms = wall_now_ms();
+        if let Err(reason) = self
+            .rate_limiter
+            .admit_connection(*conn.remote_id().as_bytes(), limiter_now_ms)
+        {
+            tracing::warn!(
+                reason,
+                "ZEB-700: friend handshake shed by connection shield"
+            );
+            let resp = encode_friend_response(&FriendLinkResponse::Pending)
+                .map_err(FriendAcceptError::Handshake)?;
+            self.write_friend_response(&mut send, &resp).await?;
+            return Ok(FriendInboundOutcome::Shed);
+        }
 
         // Read [u32 LE length-prefix][body].
         let mut len_buf = [0u8; 4];
@@ -2070,33 +2104,6 @@ where
             .await
             .map_err(|_| FriendAcceptError::IoTimeout { step: "read body" })?
             .map_err(|e| FriendAcceptError::ReadBody(e.to_string()))?;
-
-        // ZEB-700 Tier 1 (pre-auth connection shield): shed a flooding endpoint
-        // BEFORE decode and all crypto (cert chain + handshake sig + up to 32
-        // carried revocation attestations), keyed on the connecting endpoint's
-        // authenticated iroh id — un-spoofable. Sits pre-decode (cheaper than
-        // the PEX precedent's post-decode placement, which only exists to
-        // select an arm; friend/v1 has one arm). On a shed we LOG ("no silent
-        // truncation") and write the SAME benign `Pending` reply the Path-A
-        // outcome writes — network-indistinguishable (no oracle) and it leaks
-        // nothing about consent state — with ZERO state effect: nothing is
-        // recorded, no token consumed, no friend written. An honest peer that
-        // somehow trips the cap self-heals by re-dialing after the window (a
-        // live token stays live and redeemable).
-        let limiter_now_ms = wall_now_ms();
-        if let Err(reason) = self
-            .rate_limiter
-            .admit_connection(*conn.remote_id().as_bytes(), limiter_now_ms)
-        {
-            tracing::warn!(
-                reason,
-                "ZEB-700: friend handshake shed by connection shield"
-            );
-            let resp = encode_friend_response(&FriendLinkResponse::Pending)
-                .map_err(FriendAcceptError::Handshake)?;
-            self.write_friend_response(&mut send, &resp).await?;
-            return Ok(());
-        }
 
         let req = decode_friend_request(&body).map_err(FriendAcceptError::Handshake)?;
 
@@ -2132,7 +2139,7 @@ where
             let resp = encode_friend_response(&FriendLinkResponse::Pending)
                 .map_err(FriendAcceptError::Handshake)?;
             self.write_friend_response(&mut send, &resp).await?;
-            return Ok(());
+            return Ok(FriendInboundOutcome::Shed);
         }
 
         // Compute `known` under the CRDT lock: is the requester already an
@@ -2310,7 +2317,7 @@ where
                 let resp = encode_friend_response(&FriendLinkResponse::Pending)
                     .map_err(FriendAcceptError::Handshake)?;
                 self.write_friend_response(&mut send, &resp).await?;
-                return Ok(());
+                return Ok(FriendInboundOutcome::Pending);
             }
         };
 
@@ -2352,7 +2359,7 @@ where
         // new friend can resolve us right away. No-op when pkarr isn't running.
         // Snapshots the friend graph under the lock, drops it, THEN does pkarr IO.
         self.reconcile_case_d_slots().await;
-        Ok(())
+        Ok(FriendInboundOutcome::Accepted)
     }
 }
 
@@ -2363,9 +2370,14 @@ where
 {
     async fn handle_connection(&self, conn: Connection) {
         match self.handle_friend_handshake_inbound(&conn).await {
-            Ok(()) => tracing::info!(
+            // ZEB-700 review (Qodo R1): log the ACTUAL outcome — `Ok` covers
+            // delivered accepts, consent-`Pending` replies, AND rate-limit
+            // sheds, so an unconditional "accept delivered" here would
+            // misreport the latter two (the Pending mislabel predated ZEB-700).
+            Ok(outcome) => tracing::info!(
                 remote_id = ?conn.remote_id(),
-                "ZEB-370: friend handshake completed (accept delivered)"
+                outcome = ?outcome,
+                "ZEB-370: friend handshake completed"
             ),
             Err(e) => tracing::warn!(
                 error = %e,
@@ -2377,6 +2389,21 @@ where
         // before `conn` drops (same race-avoidance as iroh_invite_acceptor).
         let _ = tokio::time::timeout(self.config.io_deadline, conn.closed()).await;
     }
+}
+
+/// ZEB-700 review (Qodo R1): which benign outcome the inbound handler actually
+/// delivered, so the dispatcher's completion log reports the real result
+/// instead of claiming "accept delivered" for every `Ok` (the `Pending`
+/// mislabel predated ZEB-700; the shed paths widened it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FriendInboundOutcome {
+    /// A `FriendLinkResponse::Accepted` was written — a friend was added.
+    Accepted,
+    /// The consent tree recorded the request and wrote `Pending`.
+    Pending,
+    /// A rate-limit tier shed the handshake with the benign `Pending` reply
+    /// (zero state effect); the tier already `warn!`-logged the shed reason.
+    Shed,
 }
 
 /// Errors that can short-circuit the inbound friend handshake. The crypto/codec
@@ -5193,7 +5220,7 @@ mod tests {
         acceptor: Arc<IrohFriendHandshakeAcceptor<()>>,
         req: FriendLinkRequest,
     ) -> (
-        Result<(), FriendAcceptError>,
+        Result<FriendInboundOutcome, FriendAcceptError>,
         Result<FriendLinkResponse, String>,
     ) {
         let server_ep = t7_loopback_endpoint().await;
@@ -5458,8 +5485,8 @@ mod tests {
             let (result, resp) = t7_drive_handshake(acceptor, req).await;
 
             assert!(
-                result.is_ok(),
-                "a shed is a benign outcome, not a handler error, got {result:?}"
+                matches!(result, Ok(FriendInboundOutcome::Shed)),
+                "a shed is a benign outcome reported as Shed (not a mislogged accept), got {result:?}"
             );
             assert!(
                 matches!(resp, Ok(FriendLinkResponse::Pending)),
@@ -5506,7 +5533,10 @@ mod tests {
                 )),
             );
             let (result, resp) = t7_drive_handshake(acceptor, req).await;
-            assert!(result.is_ok(), "owner-quota shed is benign, got {result:?}");
+            assert!(
+                matches!(result, Ok(FriendInboundOutcome::Shed)),
+                "owner-quota shed is benign and reported as Shed, got {result:?}"
+            );
             assert!(
                 matches!(resp, Ok(FriendLinkResponse::Pending)),
                 "shed pre-empts the inline accept with the benign Pending, got {resp:?}"

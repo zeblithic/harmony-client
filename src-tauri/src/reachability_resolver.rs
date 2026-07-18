@@ -1709,6 +1709,34 @@ mod tests {
         assert_eq!(o, owner_a, "full tie is deterministic: first owner wins");
     }
 
+    /// ZEB-704 (CodeRabbit R1): at EQUAL effective announce time, the
+    /// cross-owner pick falls to the source rank — a later owner's durable
+    /// (verified) record beats an earlier owner's unsigned fleet one, mirroring
+    /// the within-entry slot semantics.
+    #[test]
+    fn reverse_lookup_equal_time_prefers_higher_source_rank_zeb704() {
+        let r = ReachabilityResolver::new();
+        let owner_a = OwnerAddr([1u8; 16]); // first in order, FLEET (rank 0)
+        let owner_b = OwnerAddr([2u8; 16]); // later, DURABLE (rank 2)
+        r.update_with_source(
+            owner_a,
+            make_payload(7, 50_000),
+            make_hlc(50_000, 0, "dev-a"),
+            ReachabilitySource::FleetSibling,
+        );
+        r.update(
+            owner_b,
+            make_payload(7, 50_000),
+            make_hlc(50_000, 0, "dev-b"),
+        );
+
+        let (owner, entry) = r
+            .resolve_entry_by_node_id(&node_id_bytes(7))
+            .expect("entry");
+        assert_eq!(owner, owner_b, "equal time: higher source rank wins");
+        assert_eq!(entry.source, ReachabilitySource::DurableCrdt);
+    }
+
     /// ZEB-704: the boot-seed recency ranking
     /// (`boot_seed_node_ids_by_recency`, keep-freshest-across-owners) and the
     /// dial-route resolution must AGREE — the seed ranks node 7 by owner B's
