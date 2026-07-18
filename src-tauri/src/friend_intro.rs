@@ -861,6 +861,104 @@ impl Default for IntroRateLimiter {
     }
 }
 
+/// ZEB-700: friend/v1 handshake shield — per-connection-endpoint cap over
+/// [`FRIEND_HANDSHAKE_WINDOW_MS`]. Generous vs the per-owner cap for the same
+/// reason as [`INTRO_PER_CONNECTION_MAX`] (an endpoint legitimately retries;
+/// a genuine single-endpoint flood is still shed).
+pub const FRIEND_HANDSHAKE_PER_CONNECTION_MAX: usize = 40;
+/// ZEB-700: post-auth per-owner friend-handshake cap. Far above the legit
+/// re-dial flows (request → `Pending` → approve → re-dial; `Pending` → token →
+/// re-dial ≈ 2-3 dials/h) yet bounds an authenticated flood.
+pub const FRIEND_HANDSHAKE_PER_OWNER_MAX: usize = 20;
+/// ZEB-700: sliding window shared by both friend-handshake tiers.
+pub const FRIEND_HANDSHAKE_WINDOW_MS: u64 = 60 * 60 * 1000; // 1h
+
+/// ZEB-700: two-tier rate limiter for the `harmony/friend/v1` handshake ALPN —
+/// the [`IntroRateLimiter`] pattern extended to the friend-link acceptor, with
+/// DISJOINT budgets (friend handshakes and introductions never share a window).
+///
+/// - Tier 1 ([`admit_connection`](Self::admit_connection)): pre-auth flood
+///   shield keyed on the connecting endpoint's authenticated `remote_id()` —
+///   un-spoofable, runs before decode and all signature/cert verification
+///   (the unbounded pre-consent crypto ZEB-700 bounds).
+/// - Tier 2 ([`admit_owner`](Self::admit_owner)): post-auth per-owner window
+///   keyed on the AUTHENTICATED requester.
+///
+/// Deliberately NO dedupe tier (divergence from [`IntroRateLimiter`]): the
+/// legit friend flows re-dial the same `(requester, acceptor)` pair within
+/// minutes — request → `Pending` → user approves → re-dial inline-accepts, and
+/// `Pending` → token obtained → re-dial redeems it. A `(owner, owner)` dedupe
+/// TTL would shed exactly those; the per-owner window never does.
+///
+/// Same posture as the intro limiter: NOT an authorization decision — sheds
+/// volume only; the caller LOGS every shed ("no silent truncation") and writes
+/// the SAME benign `Pending` reply a normal Path-A outcome writes (no oracle).
+/// The admit methods never `.await`, so the mutex is never held across a
+/// suspension point; both maps are bounded by [`MAX_WINDOW_KEYS`] with the
+/// audited [`KeyedSlidingWindow`] eviction.
+pub struct FriendRateLimiter {
+    inner: Mutex<FriendLimiterInner>,
+}
+
+struct FriendLimiterInner {
+    /// Tier 1: pre-auth per-connection-endpoint window (un-spoofable iroh id).
+    conn: KeyedSlidingWindow<[u8; 32]>,
+    /// Tier 2: post-auth per-authenticated-owner window.
+    owner: KeyedSlidingWindow<OwnerAddr>,
+}
+
+impl FriendRateLimiter {
+    pub fn new() -> Self {
+        Self::with_caps(
+            FRIEND_HANDSHAKE_PER_CONNECTION_MAX,
+            FRIEND_HANDSHAKE_PER_OWNER_MAX,
+            FRIEND_HANDSHAKE_WINDOW_MS,
+        )
+    }
+
+    /// Test/tuning constructor — deterministic tiny caps in unit tests.
+    pub fn with_caps(conn_max: usize, owner_max: usize, window_ms: u64) -> Self {
+        Self {
+            inner: Mutex::new(FriendLimiterInner {
+                conn: KeyedSlidingWindow::new(conn_max, window_ms),
+                owner: KeyedSlidingWindow::new(owner_max, window_ms),
+            }),
+        }
+    }
+
+    /// Poison-tolerant lock, as [`IntroRateLimiter::lock`]: plain counters,
+    /// safe to keep using after a panic elsewhere.
+    fn lock(&self) -> std::sync::MutexGuard<'_, FriendLimiterInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Tier 1 — pre-auth. `Ok(())` admits (and records); `Err` sheds.
+    pub fn admit_connection(&self, remote_id: [u8; 32], now_ms: u64) -> Result<(), &'static str> {
+        if self.lock().conn.admit(remote_id, now_ms) {
+            Ok(())
+        } else {
+            Err("per-connection cap")
+        }
+    }
+
+    /// Tier 2 — post-auth per-owner quota. `Ok(())` admits; `Err` sheds.
+    pub fn admit_owner(&self, owner: OwnerAddr, now_ms: u64) -> Result<(), &'static str> {
+        if self.lock().owner.admit(owner, now_ms) {
+            Ok(())
+        } else {
+            Err("per-owner cap")
+        }
+    }
+}
+
+impl Default for FriendRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1845,5 +1943,85 @@ mod tests {
             rl.admit_connection([2; 32], 2).is_ok(),
             "a different endpoint still admits"
         );
+    }
+
+    // ---- ZEB-700: FriendRateLimiter (friend/v1 handshake tiers) ----------
+
+    #[test]
+    fn friend_limiter_connection_cap_sheds_over_max_zeb700() {
+        let rl = FriendRateLimiter::with_caps(2, 100, 3_600_000);
+        assert!(rl.admit_connection([1; 32], 0).is_ok());
+        assert!(rl.admit_connection([1; 32], 1).is_ok());
+        assert_eq!(
+            rl.admit_connection([1; 32], 2),
+            Err("per-connection cap"),
+            "third handshake from the same endpoint within the window is shed"
+        );
+        assert!(
+            rl.admit_connection([2; 32], 3).is_ok(),
+            "a different endpoint still admits"
+        );
+    }
+
+    #[test]
+    fn friend_limiter_owner_cap_sheds_over_max_zeb700() {
+        let rl = FriendRateLimiter::with_caps(100, 1, 3_600_000);
+        let owner = OwnerAddr([7; 16]);
+        assert!(rl.admit_owner(owner, 0).is_ok());
+        assert_eq!(
+            rl.admit_owner(owner, 1),
+            Err("per-owner cap"),
+            "second handshake from the same owner within the window is shed"
+        );
+        assert!(
+            rl.admit_owner(OwnerAddr([8; 16]), 2).is_ok(),
+            "a different owner still admits"
+        );
+    }
+
+    /// The window SLIDES: entries older than the window fall out, so a shed
+    /// endpoint/owner self-heals by waiting it out (the "honest peer that
+    /// somehow trips the cap re-dials later" story).
+    #[test]
+    fn friend_limiter_window_slides_and_readmits_zeb700() {
+        let window = 1_000;
+        let rl = FriendRateLimiter::with_caps(1, 1, window);
+        let owner = OwnerAddr([7; 16]);
+        assert!(rl.admit_connection([1; 32], 0).is_ok());
+        assert!(rl.admit_owner(owner, 0).is_ok());
+        assert_eq!(rl.admit_connection([1; 32], 500), Err("per-connection cap"));
+        assert_eq!(rl.admit_owner(owner, 500), Err("per-owner cap"));
+        assert!(
+            rl.admit_connection([1; 32], window + 1).is_ok(),
+            "past the window the endpoint re-admits"
+        );
+        assert!(
+            rl.admit_owner(owner, window + 1).is_ok(),
+            "past the window the owner re-admits"
+        );
+    }
+
+    /// Tier budgets are DISJOINT: exhausting the connection tier does not
+    /// consume the owner tier and vice versa (mirrors the intro limiter's
+    /// per-role separation).
+    #[test]
+    fn friend_limiter_tiers_have_independent_budgets_zeb700() {
+        let rl = FriendRateLimiter::with_caps(1, 1, 3_600_000);
+        assert!(rl.admit_connection([1; 32], 0).is_ok());
+        assert_eq!(rl.admit_connection([1; 32], 1), Err("per-connection cap"));
+        assert!(
+            rl.admit_owner(OwnerAddr([7; 16]), 2).is_ok(),
+            "owner tier unaffected by the exhausted connection tier"
+        );
+    }
+
+    /// Zero caps admit nothing (the acceptor-level shed tests rely on this to
+    /// force a shed on the first handshake) and, per the audited primitive,
+    /// record no unbounded empty entries.
+    #[test]
+    fn friend_limiter_zero_caps_admit_nothing_zeb700() {
+        let rl = FriendRateLimiter::with_caps(0, 0, 3_600_000);
+        assert_eq!(rl.admit_connection([1; 32], 0), Err("per-connection cap"));
+        assert_eq!(rl.admit_owner(OwnerAddr([7; 16]), 0), Err("per-owner cap"));
     }
 }
