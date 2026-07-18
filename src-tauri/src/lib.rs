@@ -25130,6 +25130,173 @@ pub(crate) async fn list_owner_dm_spaces_impl(
     Ok(dm_spaces_for_nav(&state))
 }
 
+/// ZEB-435 (scope #4): a left-but-not-deleted community Space shaped for the
+/// left-communities management surface. Mirrors `LeftCommunityNavDto` in
+/// `community-service.ts` (`#[serde(rename_all = "camelCase")]`). `left_at_ms`
+/// is the leave HLC's wall clock, for "Left <date>" display.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LeftCommunityNavDto {
+    pub space_id: String,
+    pub name: String,
+    pub left_at_ms: u64,
+}
+
+/// ZEB-435 (scope #4): enumerate left (but not deleted-forever) Community
+/// spaces for the management surface — the exact complement of
+/// `communities_for_nav`'s live filter. Tombstoned spaces are already removed
+/// from `spaces` by `tombstone_space`, so a deleted-forever community never
+/// reappears here. Most recently left first; space-id tiebreak keeps the
+/// order deterministic.
+pub fn left_communities_for_nav(
+    state: &crate::owner_state_crdt::OwnerState,
+) -> Vec<LeftCommunityNavDto> {
+    let mut rows: Vec<LeftCommunityNavDto> = state
+        .spaces
+        .values()
+        .filter_map(|s| {
+            if s.kind != crate::owner_state_types::SpaceKind::Community {
+                return None;
+            }
+            let left_at = s.left_at.as_ref()?;
+            Some(LeftCommunityNavDto {
+                space_id: hex::encode(s.id.0),
+                name: s.name.clone(),
+                left_at_ms: left_at.wall_ms,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.left_at_ms
+            .cmp(&a.left_at_ms)
+            .then_with(|| a.space_id.cmp(&b.space_id))
+    });
+    rows
+}
+
+/// ZEB-435 (scope #4): list left communities for the management surface — the
+/// only way to reach a left community once it's hidden from nav (ZEB-427 a′).
+/// Read-only over the in-memory owner-state CRDT.
+#[tauri::command]
+async fn list_left_communities(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<LeftCommunityNavDto>, String> {
+    list_left_communities_impl(state_lock.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_left_communities_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Vec<LeftCommunityNavDto>, String> {
+    let crdt_state = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let state = crdt_state.lock().await;
+    Ok(left_communities_for_nav(&state))
+}
+
+#[cfg(test)]
+mod zeb435_left_communities_for_nav_tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{Hlc, Space, SpaceId, SpaceKind};
+
+    fn hlc_at(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "t".into(),
+        }
+    }
+
+    fn space(id: u8, kind: SpaceKind, left_wall_ms: Option<u64>) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind,
+            parent: None,
+            community_id: None,
+            name: format!("community-{id}"),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: left_wall_ms.map(hlc_at),
+            created_at: hlc_at(1),
+            updated_at: hlc_at(1),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: Some(false),
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    fn state_with(spaces: Vec<Space>) -> OwnerState {
+        let mut st = OwnerState::default();
+        for s in spaces {
+            st.spaces.insert(s.id, s);
+        }
+        st
+    }
+
+    #[test]
+    fn lists_only_left_communities_with_wall_ms() {
+        let st = state_with(vec![
+            space(1, SpaceKind::Community, None),
+            space(2, SpaceKind::Community, Some(500)),
+            space(3, SpaceKind::Dm, Some(600)),
+        ]);
+        let rows = left_communities_for_nav(&st);
+        assert_eq!(rows.len(), 1, "only the LEFT community qualifies");
+        assert_eq!(rows[0].space_id, hex::encode([2u8; 16]));
+        assert_eq!(rows[0].name, "community-2");
+        assert_eq!(rows[0].left_at_ms, 500);
+        // Exact complement of the live nav list: between them every
+        // non-tombstoned community appears exactly once.
+        assert_eq!(communities_for_nav(&st).len(), 1);
+    }
+
+    #[test]
+    fn sorts_most_recent_first_with_space_id_tiebreak() {
+        let st = state_with(vec![
+            space(1, SpaceKind::Community, Some(100)),
+            space(2, SpaceKind::Community, Some(300)),
+            space(3, SpaceKind::Community, Some(100)),
+        ]);
+        let got: Vec<String> = left_communities_for_nav(&st)
+            .into_iter()
+            .map(|r| r.space_id)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                hex::encode([2u8; 16]),
+                hex::encode([1u8; 16]),
+                hex::encode([3u8; 16]),
+            ],
+            "most recently left first, space-id asc on ties"
+        );
+    }
+
+    #[test]
+    fn tombstoned_spaces_never_appear() {
+        let mut st = state_with(vec![space(4, SpaceKind::Community, Some(700))]);
+        assert_eq!(left_communities_for_nav(&st).len(), 1);
+        st.tombstone_space(SpaceId([4; 16]));
+        assert!(
+            left_communities_for_nav(&st).is_empty(),
+            "delete-forever (tombstone) removes the row from the surface"
+        );
+    }
+}
+
 #[cfg(test)]
 mod zeb393_communities_for_nav_tests {
     use super::*;
@@ -38721,7 +38888,7 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
 
 /// ZEB-427 Half B: durably mark a community Space as left in the
 /// owner-state CRDT. The row is RETAINED, not removed — the spec's
-/// `remove_space` (ZEB-435, unbuilt) is the separate irreversible
+/// `remove_space` (ZEB-435) is the separate irreversible
 /// cleanup. Setting `left_at` is what hides the community from nav
 /// rehydration (`communities_for_nav`), the boot engine sweep, and the
 /// profile-broadcast shared-set — all of which already filter on it;
@@ -38871,7 +39038,7 @@ async fn persist_community_left_at(
 /// commits to the membership CRDT, `mark_community_space_left` sets
 /// `Space.left_at` and the write is fenced to disk. The row is
 /// RETAINED (it holds chat-history keys and enables reversible
-/// rejoin); permanent local cleanup is the unbuilt `remove_space`
+/// rejoin); permanent local cleanup is the explicit `remove_space`
 /// (ZEB-435). Semantics per the nav-tree spec's "Tombstones vs
 /// leaves": leave sets `left_at` (reversible — a later redemption
 /// clears it via LWW), only an explicit tombstone is irreversible.
@@ -38974,6 +39141,17 @@ pub(crate) async fn leave_community_impl(
                 "node generation changed during leave_community (was {}, now {})",
                 snapshot_generation, g.generation
             ));
+        }
+        // ZEB-268: stop_inner clears the registry WITHOUT bumping generation,
+        // so the generation check alone can't catch a mid-flight stop — the
+        // Leave would land in a detached engine and silently never persist or
+        // publish while the IPC reports success. Same fence as create_channel /
+        // modify_channel / delete_channel / kick_from_community /
+        // set_power_level.
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during leave_community (node stopped?)".to_string(),
+            );
         }
     }
 
@@ -39521,6 +39699,147 @@ mod zeb427_leave_left_at_tests {
         assert!(
             communities_for_nav(&loaded).is_empty(),
             "rehydrated state must hide the left community"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeb268_leave_detach_fence_tests {
+    use super::*;
+    use crate::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use crate::content_store::{ContentStore, RuntimeContentStore};
+    use crate::owner_state_types::{DeviceIdentityHash, OwnerAddr};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct NopResolver;
+    #[async_trait::async_trait]
+    impl IdentityResolver for NopResolver {
+        async fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
+            None
+        }
+    }
+
+    /// ZEB-268: `stop_inner` clears `community_registry` WITHOUT bumping
+    /// `generation`, so the post-mint re-lock in `leave_community_impl` must
+    /// check registry presence too — the generation check alone lets the Leave
+    /// be inserted into a detached engine, reporting success while the event
+    /// never persists or publishes.
+    ///
+    /// The interleaving is deterministic: holding the `dm_outbox` tokio lock
+    /// parks the impl at the mint (AFTER its NodeState snapshot, BEFORE the
+    /// re-lock fence), and the HLC-tracker entry — written by
+    /// `reserve_next_hlc_for_device` between the snapshot and the outbox-lock
+    /// attempt — is the observable barrier proving the snapshot already
+    /// happened (Qodo, PR #491 R1: a fixed yield count + `is_finished()` only
+    /// suggested progress, it didn't prove it). Once the barrier trips we
+    /// clear the registry with generation untouched — exactly the stop_inner
+    /// shape — release the lock, and the fence must fire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn leave_errs_detached_when_registry_cleared_mid_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cas_op_tx, _cas_op_rx) = tokio::sync::mpsc::channel(8);
+        let content_store: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            Duration::from_millis(1000),
+        ));
+        let self_owner = OwnerAddr([0xAA; 16]);
+        let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_id: "leaver-dev".into(),
+            content_store,
+            identity_resolver: Arc::new(NopResolver),
+            identity_dir: dir.path().to_path_buf(),
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            error_tx: None,
+            delta_tx: None,
+            self_owner,
+            signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+            crdt_state: None,
+            nav_emitter: None,
+            presence_resync_rx: None,
+        }));
+
+        // DmOutbox fixture (same recipe as the add_space tunnel-routing
+        // tests): one PrivateIdentity drives signing key + device hash.
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let public = private.public_identity();
+        let self_device = DeviceIdentityHash(public.address_hash);
+        let private_bytes = private.to_private_bytes();
+        let ed_seed: [u8; 32] = private_bytes[32..64].try_into().expect("ed25519 seed");
+        let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let test_owner = crate::community_membership::mint_test_owner(0xC7);
+        let community_sk = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &test_owner.device_key.to_bytes(),
+        ));
+        let dm_outbox = Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                "leaver-dev".into(),
+                self_owner,
+                self_device,
+                Arc::clone(&signing_key),
+                Arc::new(private),
+                community_sk,
+                test_owner.cert,
+            ),
+        ));
+
+        let hlc_tracker = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let node = Arc::new(std::sync::Mutex::new(NodeState {
+            dm_outbox: Some(Arc::clone(&dm_outbox)),
+            crdt_state: Some(Arc::new(tokio::sync::Mutex::new(
+                crate::owner_state_crdt::OwnerState::default(),
+            ))),
+            hlc_tracker: Some(Arc::clone(&hlc_tracker)),
+            dm_device_id: Some("leaver-dev".into()),
+            dm_self_owner: Some(self_owner),
+            community_registry: Some(registry),
+            ..NodeState::default()
+        }));
+
+        // Park the impl at the mint's outbox lock.
+        let outbox_gate = dm_outbox.lock().await;
+
+        let node_task = Arc::clone(&node);
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            Arc::new(crate::node_event_sink::RecordingSink::new());
+        let task = tokio::spawn(async move {
+            leave_community_impl(&node_task, sink, hex::encode([0x77u8; 16])).await
+        });
+
+        // Deterministic barrier (no wall-clock waits): the impl writes the
+        // device's HLC into the tracker via `reserve_next_hlc_for_device`
+        // strictly AFTER its NodeState snapshot and strictly BEFORE its
+        // `dm_outbox.lock().await`. Seeing the key therefore proves the
+        // snapshot captured the still-attached registry; the held outbox
+        // gate guarantees the impl cannot get past the mint.
+        let mut reserved = false;
+        for _ in 0..10_000 {
+            tokio::task::yield_now().await;
+            if hlc_tracker.lock().await.contains_key("leaver-dev") {
+                reserved = true;
+                break;
+            }
+        }
+        assert!(reserved, "impl must have passed the HLC reservation");
+        assert!(
+            !task.is_finished(),
+            "impl must be parked at the held outbox lock"
+        );
+
+        // stop_inner shape: registry cleared, generation NOT bumped.
+        node.lock().expect("node lock").community_registry = None;
+        drop(outbox_gate);
+
+        let err = task
+            .await
+            .expect("join")
+            .expect_err("leave must fail once the registry is detached");
+        assert!(
+            err.contains("community_registry detached during leave_community"),
+            "expected the ZEB-268 detach-fence error, got: {err}"
         );
     }
 }
@@ -61035,6 +61354,7 @@ pub fn run() {
             join_open_community,
             leave_community,
             remove_space,
+            list_left_communities,
             kick_from_community,
             community_fork::fork_community,
             list_community_forks,

@@ -37,3 +37,25 @@ describe('CommunityService.getCachedChannelName (ZEB-662)', () => {
     expect(svc.getCachedChannelName('other-community', 'ch1')).toBeUndefined();
   });
 });
+
+describe('CommunityService.listLeftCommunities (ZEB-435)', () => {
+  it('invokes list_left_communities and returns the DTO rows verbatim', async () => {
+    const rows = [
+      { spaceId: 'aa'.repeat(16), name: 'Old Crew', leftAtMs: 1_700_000_000_000 },
+      { spaceId: 'bb'.repeat(16), name: 'Test Community', leftAtMs: 1_600_000_000_000 },
+    ];
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const adapter: TauriAdapter = {
+      invoke: async (cmd, args) => {
+        calls.push({ cmd, args });
+        return cmd === 'list_left_communities' ? rows : undefined;
+      },
+      listen: async () => () => {},
+    };
+    const svc = new CommunityService();
+    await svc.connectAdapter(adapter);
+    const got = await svc.listLeftCommunities();
+    expect(got).toEqual(rows);
+    expect(calls.some((c) => c.cmd === 'list_left_communities')).toBe(true);
+  });
+});

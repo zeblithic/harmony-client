@@ -373,17 +373,22 @@ First boot is **pre-mint** — `serve` starts the node but does not create an
 identity. `GET /v1/status` reports `"ownerId": null` until you `POST
 /v1/rpc/mint_owner_identity` (once per profile; subsequent boots load it).
 
-### The v1 RPC surface (35 commands)
+### The v1 RPC surface (common commands)
 
 All commands are `POST /v1/rpc/{command}` with a JSON object body
 (camelCase keys, exactly the args the GUI sends). No-arg commands accept
 `{}` or an empty body.
 
+The table below is a curated subset of the most commonly used commands —
+the registry has grown well past it. The authoritative, always-current
+list is the `registry_has_exactly_the_curated_v1_surface` pin test in
+`src-tauri/src/api/rpc.rs`.
+
 | Capability | Commands |
 |---|---|
 | Node lifecycle (2) | `start_node`, `stop_node` (serve auto-starts the node at boot) |
 | Identity (2) | `get_owner_state`, `mint_owner_identity` |
-| Communities (7) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, `redeem_invite`, `join_open_community`, `leave_community` |
+| Communities (9) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, `redeem_invite`, `join_open_community`, `leave_community`, `list_left_communities`, `remove_space` |
 | Channels (4) | `create_channel`, `list_channels`, `list_channel_messages`, `post_channel_message` |
 | Friends (7) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request` |
 | Spaces / DMs (3) | `add_space`, `send_dm`, `read_dm_thread` |

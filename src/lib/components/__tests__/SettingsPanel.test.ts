@@ -11,6 +11,7 @@ vi.mock('../IdentityPanel.svelte', () => import('./settings-panel-stub.svelte'))
 vi.mock('../DevicesPanel.svelte', () => import('./settings-panel-stub.svelte'));
 vi.mock('../NotificationSettingsPanel.svelte', () => import('./settings-panel-stub.svelte'));
 vi.mock('../NetworkDiscoverabilitySettings.svelte', () => import('./settings-panel-stub.svelte'));
+vi.mock('../LeftCommunitiesPanel.svelte', () => import('./settings-panel-stub.svelte'));
 vi.mock('../FriendsPanel.svelte', () => import('./settings-panel-stub.svelte'));
 
 import SettingsPanel from '../SettingsPanel.svelte';
@@ -28,7 +29,15 @@ const baseProps = {
   friendService: {} as unknown as FriendService,
 };
 
-const TAB_LABELS = ['Profile', 'Appearance', 'Account', 'Notifications', 'Network', 'Friends'];
+const TAB_LABELS = [
+  'Profile',
+  'Appearance',
+  'Account',
+  'Notifications',
+  'Network',
+  'Communities',
+  'Friends',
+];
 
 describe('SettingsPanel tab routing', () => {
   it('renders the tabs in order with Profile active by default', () => {

@@ -131,6 +131,14 @@ struct VineIdArgs {
     vine_id: String,
 }
 
+/// ZEB-435: `remove_space` takes a generic space id (community / dm /
+/// group-dm), not specifically a community id.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpaceIdArgs {
+    space_id: String,
+}
+
 /// ZEB-562: headless vine-follow verbs. `name` is the optional display label
 /// recorded alongside the followed address (mirrors the GUI command).
 #[derive(serde::Deserialize)]
@@ -534,6 +542,23 @@ pub fn build_registry() -> RpcRegistry {
         "leave_community",
         CommunityIdArgs,
         |state, sink, a| async move { crate::leave_community_impl(state, sink, a.community_id).await }
+    );
+    // ZEB-435: left-communities management verbs. `list_left_communities`
+    // enumerates left-but-not-deleted communities (they're hidden from nav);
+    // `remove_space` is the irreversible delete-forever (tombstone + local
+    // data cleanup; refuses communities that haven't been left). Headless
+    // parity also serves fleet test-community cleanup.
+    rpc!(
+        m,
+        "list_left_communities",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_left_communities_impl(state).await }
+    );
+    rpc!(
+        m,
+        "remove_space",
+        SpaceIdArgs,
+        |state, _sink, a| async move { crate::remove_space_impl(state, a.space_id).await }
     );
 
     // community moderation (ZEB-527)
@@ -1908,6 +1933,8 @@ mod tests {
             "redeem_invite",
             "join_open_community",
             "leave_community",
+            "list_left_communities",
+            "remove_space",
             // community moderation (ZEB-527)
             "list_pending_joins",
             "list_recent_counter_signs",
