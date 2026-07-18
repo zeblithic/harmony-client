@@ -1802,12 +1802,21 @@ impl DmOutbox {
 
     /// Inbound DM packet entry point. Decodes, dispatches by discriminant.
     ///
-    /// ZEB-241: production CidNotify dispatch happens via
-    /// `handle_cidnotify_lifted` (spawned by event_loop's pre-decode
-    /// branch), so the only discriminants this method actively handles
-    /// are Invite + Ack. CidNotify is kept as a defensive drop+warn arm
-    /// — a CidNotify reaching here means a future caller bypassed the
-    /// pre-decode contract and the packet is dropped rather than
+    /// ZEB-709 audit (2026-07-18): PRODUCTION-ORPHANED since the Reticulum
+    /// teardown (ZEB-474) — every caller is test code, and the event_loop
+    /// pre-decode dispatch the ZEB-241 note below described no longer
+    /// exists. The LIVE inbound DM path is `dm_inbox_ingest::ingest_dm_packet`
+    /// (tunnel/deposit/relay), which carries the owner-state notify_dirty
+    /// discipline this method's tail lacks. Kept as test-harness surface for
+    /// the verify/decrypt logic its tests exercise; deleting it (and the
+    /// ~15 tests + 2 integration files that drive real logic through it) is
+    /// tracked as follow-up cleanup on ZEB-709.
+    ///
+    /// ZEB-241 (historical): production CidNotify dispatch happened via
+    /// `handle_cidnotify_lifted`, so the only discriminants this method
+    /// actively handles are Invite + Ack. CidNotify is kept as a defensive
+    /// drop+warn arm — a CidNotify reaching here means a caller bypassed
+    /// the pre-decode contract and the packet is dropped rather than
     /// re-introducing the locked CAS-fetch path.
     ///
     /// The signature verification happens INSIDE each per-discriminant
@@ -2005,6 +2014,13 @@ impl DmOutbox {
     /// own lock cycles internally so the slow CAS fetch in Phase B
     /// happens with NO locks held. Designed to be called from a
     /// `tokio::spawn`'d task (event_loop fires-and-forgets).
+    ///
+    /// ZEB-709 audit (2026-07-18): PRODUCTION-ORPHANED — see
+    /// `handle_unicast`'s doc note. No live transport routes CidNotify here
+    /// (all producers feed `dm_inbox_ingest::ingest_dm_packet`); the
+    /// `apply_owner_device_update`/`apply_inbox` writes in Phase C therefore
+    /// have no owner-state notify_dirty and MUST NOT be wired to a live
+    /// dispatcher without adding one.
     ///
     /// Three phases:
     ///   - Phase A (locked): verify signature + resolve owner + check

@@ -40016,6 +40016,11 @@ pub(crate) async fn kick_from_community_impl(
                     g.crdt_state.clone()
                 } {
                     let mut state_g = crdt_state.lock().await;
+                    // ZEB-709 audit (B1): deliberately NOT notify_dirty'd —
+                    // this eager epoch write is a CACHE of the community
+                    // engine's authoritative epoch state, re-projected at
+                    // next boot (and re-derivable by the delta-consumer). A
+                    // crash loses only the eager copy, never the rotation.
                     if let Some(space) = state_g.spaces.get_mut(&space_id) {
                         let target_epoch = prior_epoch + 1;
                         if space.current_epoch.unwrap_or(0) < target_epoch {
@@ -42131,6 +42136,13 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR, FE, FutE
 /// called while the community-state mutex is already held (community-state
 /// mutations happen in `self_heal_community_observer`, which is always called
 /// AFTER this function returns).
+///
+/// ZEB-709 audit (B2): the epoch/key writes here are deliberately NOT
+/// owner-state `notify_dirty`'d — they cache the community engine's
+/// authoritative epoch state into the owner-state Space row and are
+/// re-projected at next boot (self-heal). This is NOT the remote-merge
+/// exemption (that covers only the owner-state root merger); it is a
+/// re-derivable-cache exemption. A crash loses only the cached copy.
 pub async fn apply_remote_epoch_event(
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
