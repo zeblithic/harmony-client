@@ -16777,10 +16777,13 @@ fn storage_v2_material(guard: &NodeState) -> Option<storage_signing::StorageSign
         }
     };
     let material = validated_storage_material(sk, cert, signer_certs);
-    if let Some(m) = material.as_ref() {
-        if let Ok(mut c) = guard.storage_v2_cache.lock() {
-            *c = Some(m.clone());
-        }
+    // R2 (Greptile P1): a COMPLETED fresh validation updates the cache in
+    // BOTH directions — success refreshes it, failure CLEARS it. Leaving
+    // stale material behind a failed validation would let a later
+    // contended publish emit present-but-invalid v2 records receivers
+    // reject, instead of the intended honest legacy.
+    if let Ok(mut c) = guard.storage_v2_cache.lock() {
+        *c = material.clone();
     }
     material
 }
@@ -17115,16 +17118,18 @@ fn spawn_hosting_report_publisher(
                         )
                     };
                     let bundle = signer_bundle_from_doc(&owner_trust_doc, &cert).await;
-                    validated_storage_material(sk, cert, bundle)
+                    let material = validated_storage_material(sk, cert, bundle);
+                    // R2 (Greptile P1): fresh validation updates the shared
+                    // cache in BOTH directions — see storage_v2_material.
+                    let mut c = v2_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *c = material.clone();
+                    drop(c);
+                    material
                 }
                 None => None,
             };
-            if let Some(m) = v2_material.as_ref() {
-                let mut c = v2_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *c = Some(m.clone());
-            }
             let lines = hosting_report_lines(&ledger);
             let changed = published.as_deref() != Some(&lines[..]);
             let refresh_due = last_publish.elapsed().as_millis() as u64
@@ -18249,6 +18254,59 @@ mod storage_publish_tests {
             storage_signing::verify_pledge_list_v2(&p, wall_clock_ms() / 1000)
                 .expect("cached-material v2 verifies");
         }
+    }
+
+    #[test]
+    fn failed_fresh_validation_clears_cache_zeb679_r2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, _addr) = signed_state_with_outbox();
+        state.storage_settings_path = Some(storage_settings::settings_path(dir.path()));
+        // Warm the cache with a valid uncontended build.
+        let (_, bytes) = build_signed_pledge_list(&state).expect("warm build");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(p.v2.is_present(), "cache warmed");
+
+        // Swap in an outbox whose (sk, cert) pair is MISMATCHED (cert of
+        // owner 0xAB, signing key of owner 0xB4): fresh validation fails.
+        let outbox = {
+            let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x56; 32]);
+            let priv_bytes = private_identity.to_private_bytes();
+            let mut ed_seed = [0u8; 32];
+            ed_seed.copy_from_slice(&priv_bytes[32..64]);
+            let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+            let device_hash = crate::owner_state_types::DeviceIdentityHash(
+                private_identity.identity.address_hash,
+            );
+            let cert_owner = crate::community_membership::mint_test_owner(0xAB);
+            let other_owner = crate::community_membership::mint_test_owner(0xB4);
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                "mismatched-device".into(),
+                crate::owner_state_types::OwnerAddr([0xCE; 16]),
+                device_hash,
+                signing_key,
+                std::sync::Arc::new(private_identity),
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+                    &other_owner.device_key.to_bytes(),
+                )),
+                cert_owner.cert,
+            )
+        };
+        state.dm_outbox = Some(std::sync::Arc::new(tokio::sync::Mutex::new(outbox)));
+
+        // Uncontended build: fresh validation fails ⇒ honest legacy AND the
+        // stale cache is CLEARED (R2, Greptile P1)…
+        let (_, bytes) = build_signed_pledge_list(&state).expect("mismatched build");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(!p.v2.is_present(), "failed validation ⇒ legacy");
+        // …so a CONTENDED build must not resurrect the old material.
+        let outbox = state.dm_outbox.as_ref().unwrap().clone();
+        let _held = outbox.try_lock().expect("acquire for contention");
+        let (_, bytes) = build_signed_pledge_list(&state).expect("contended build");
+        let p: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            !p.v2.is_present(),
+            "stale material must not survive a failed fresh validation"
+        );
     }
 }
 
