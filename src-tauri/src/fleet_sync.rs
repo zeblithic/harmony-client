@@ -99,6 +99,14 @@ impl CanonicalPayload for FleetRootPublish {}
 
 pub const MAX_DEVICES_PER_OWNER: usize = 32;
 
+/// ZEB-707: upper bound on a served/pulled root wire frame. A `FleetRootPublish`
+/// envelope is a single root CID + HLC + a `seen` digest capped at
+/// `MAX_DEVICES_PER_OWNER` — a few KB at most. The query-side pull materializes
+/// a peer's GET reply into a `Vec<u8>` before the engine validates it, so reject
+/// anything wildly larger up front to bound an oversized attacker-controlled
+/// reply (CodeRabbit). Generous vs. the real size.
+pub(crate) const MAX_ROOT_WIRE_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MergeOutcome {
     pub changed: bool,
@@ -142,6 +150,13 @@ pub trait FleetPersist<S>: Send + Sync {
 /// Construction-time configuration for a `FleetSyncEngine<S>`. Every
 /// collaborator (state, merger, durability sink, transport channels,
 /// CAS) is injected so the engine itself is consumer-agnostic.
+/// ZEB-707: a request to the engine to serve its CURRENT dataset root as a
+/// wire frame (the identical bytes a live publish carries). The query-side
+/// zenoh adapter sends one of these per inbound root query and awaits the
+/// oneshot, then `query.reply()`s the frame — so a receiver that missed the
+/// live push can PULL the root instead of waiting for the next push.
+pub(crate) type RootServeReq = tokio::sync::oneshot::Sender<Result<Vec<u8>, SyncError>>;
+
 pub struct FleetSyncConfig<S> {
     /// Installed fleet KeyTrees (ZEB-668 S5). Publishes use the newest
     /// epoch; inbound decrypts try every installed epoch (dual-epoch read
@@ -201,6 +216,10 @@ pub struct FleetSyncEngine<S: Send + 'static> {
     sibling_acks: Arc<Mutex<BTreeMap<String, Hlc>>>,
     device_id: String,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// ZEB-707: sender the query-side zenoh adapter clones (via `root_serve_tx()`)
+    /// to ask the engine for its current root wire when answering a peer's root
+    /// GET. Datasets with no queryable never send on it → the serve arm is idle.
+    root_serve_tx: mpsc::Sender<RootServeReq>,
     /// ZEB-705 observability. The task-side (`Ctx`) clones carry the live
     /// increments; these handle-side clones exist only so the in-crate tests
     /// can read the counters, hence the `cfg(test)` gate (production never
@@ -266,6 +285,9 @@ where
         // in-flight permit cap so a full sleeper set never overflows it.
         let (fetch_retry_tx, fetch_retry_rx) = mpsc::channel(FETCH_RETRY_MAX_INFLIGHT);
         let fetch_retry_sem = Arc::new(Semaphore::new(FETCH_RETRY_MAX_INFLIGHT));
+        // ZEB-707: root-serve request channel. Small cap — a receiver's fetch
+        // driver queries at most on epoch bumps + the hourly floor.
+        let (root_serve_tx, root_serve_rx) = mpsc::channel(8);
         let fetch_retries_scheduled = Arc::new(AtomicU64::new(0));
         let fetch_retries_run = Arc::new(AtomicU64::new(0));
         let fetch_retries_dropped = Arc::new(AtomicU64::new(0));
@@ -302,6 +324,7 @@ where
             fetch_retries_run: Arc::clone(&fetch_retries_run),
             fetch_retries_dropped: Arc::clone(&fetch_retries_dropped),
             fetch_retry_inflight_peak: Arc::clone(&fetch_retry_inflight_peak),
+            root_serve_rx,
         }));
 
         FleetSyncEngine {
@@ -314,6 +337,7 @@ where
             sibling_acks,
             device_id,
             task: Mutex::new(Some(task)),
+            root_serve_tx,
             #[cfg(test)]
             fetch_retries_scheduled,
             #[cfg(test)]
@@ -348,6 +372,18 @@ where
     #[cfg(test)]
     fn fetch_retry_inflight_peak(&self) -> u64 {
         self.fetch_retry_inflight_peak.load(Ordering::Relaxed)
+    }
+
+    /// ZEB-707: a sender the query-side zenoh adapter uses to ask the engine
+    /// for its current root wire (to answer a peer's root GET / pull). Each
+    /// send carries a oneshot the serve arm replies the encoded root frame on.
+    /// Engines with no queryable simply never call this — the serve arm stays
+    /// idle. Wrappers (e.g. `owner_state_sync::SyncEngine`) delegate to it.
+    /// `pub(crate)`: callers are all in-crate (the wrapper + the event-loop
+    /// adapter), and returning the `pub(crate)` `RootServeReq` from a `pub` fn
+    /// would leak a crate-private type (CodeRabbit; `private_interfaces`).
+    pub(crate) fn root_serve_tx(&self) -> mpsc::Sender<RootServeReq> {
+        self.root_serve_tx.clone()
     }
 
     /// Hint that local state has mutated and a debounced publish should
@@ -520,6 +556,14 @@ struct Ctx<S> {
     fetch_retries_run: Arc<AtomicU64>,
     fetch_retries_dropped: Arc<AtomicU64>,
     fetch_retry_inflight_peak: Arc<AtomicU64>,
+    /// ZEB-707: root-serve request channel. Yields a peer's pending root query;
+    /// the serve arm encodes the current root and replies its wire. The engine
+    /// HANDLE holds the matching `root_serve_tx` for the task's whole lifetime
+    /// (the task never outlives the handle — `shutdown`/`Drop` stop it), so
+    /// `recv()` never observes a closed channel and the `Some(..)` arm can't
+    /// busy-loop on `None` (no keep-open self-clone needed, unlike fetch-retry
+    /// whose senders live only in transient sleep tasks).
+    root_serve_rx: mpsc::Receiver<RootServeReq>,
 }
 
 async fn internal_task<S>(mut ctx: Ctx<S>)
@@ -651,6 +695,19 @@ where
                 ctx.fetch_retries_run.fetch_add(1, Ordering::Relaxed);
                 process_inbound(&mut ctx, wire, attempts_left).await;
             }
+            Some(resp_tx) = ctx.root_serve_rx.recv() => {
+                // ZEB-707: a peer PULLed our current root (it missed the live
+                // push). Encode the current root wire — the identical bytes a
+                // publish carries — and reply it; the query-side adapter
+                // forwards it to the peer, which runs it through the normal
+                // inbound decrypt/merge path. Idempotent: a pulled root the
+                // peer already applied dies at its replay check. Inline encode
+                // mirrors the publish arms (same brief state lock + put_serveable
+                // cas round-trip); queries arrive post-boot so the cas op is
+                // served promptly and the flush fence is not starved.
+                let wire = encode_root_wire(&ctx).await;
+                let _ = resp_tx.send(wire);
+            }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
                 // Flush only if there is genuinely unpublished dirty state.
                 let pub_result = if ctx.has_pending_dirty.load(Ordering::Relaxed) {
@@ -687,6 +744,29 @@ where
 
 /// Build, encrypt, store, and publish the current state root.
 async fn publish_root_now<S>(ctx: &Ctx<S>) -> Result<(), SyncError>
+where
+    S: CanonicalPayload + Clone + Send + 'static,
+{
+    let wire = encode_root_wire(ctx).await?;
+
+    // 7. Send onto the outbound channel.
+    ctx.publisher_tx
+        .send(wire)
+        .await
+        .map_err(|_| SyncError::TransportClosed)?;
+
+    Ok(())
+}
+
+/// ZEB-707: encode the CURRENT dataset root into the wire frame a publish
+/// carries — snapshot state, canonical-CBOR + encrypt the root blob, store it
+/// SERVEABLE (ZEB-706), mint a strictly-newer HLC, then build + encrypt the
+/// publish envelope. Shared by `publish_root_now` (which SENDs it on the
+/// publisher channel) and the ZEB-707 root-serve arm (which REPLIES it to a
+/// peer that PULLed the root via a zenoh query, so a missed live push is
+/// recoverable). The bytes are identical either way, so a pulled root re-enters
+/// the receiver's normal inbound decrypt/merge path with no special-casing.
+async fn encode_root_wire<S>(ctx: &Ctx<S>) -> Result<Vec<u8>, SyncError>
 where
     S: CanonicalPayload + Clone + Send + 'static,
 {
@@ -764,13 +844,7 @@ where
     let wire =
         encrypt_root_publish(&kt, &payload_bytes).map_err(|e| SyncError::Crypto(e.to_string()))?;
 
-    // 7. Send onto the outbound channel.
-    ctx.publisher_tx
-        .send(wire)
-        .await
-        .map_err(|_| SyncError::TransportClosed)?;
-
-    Ok(())
+    Ok(wire)
 }
 
 /// Build a strictly-newer HLC than the last one this device published.
@@ -1601,6 +1675,64 @@ mod engine_tests {
         assert!(
             !plain.contains(&root_cid),
             "ZEB-706: the published root {root_cid:?} must NOT be stored via plain put — that never allowlists the CID for the content-serve queryable, silently stalling cross-device sync (owner-state analog of ZEB-398) (plain={plain:?})"
+        );
+    }
+
+    /// ZEB-707: the engine must answer a root-serve request with its CURRENT
+    /// root as the identical wire a publish carries, and make that root's
+    /// content serveable — so a butler that missed the live push can PULL the
+    /// root via a zenoh query and fetch its content. Decodes the served frame
+    /// to the expected `FleetRootPublish` and asserts the root CID is
+    /// `put_serveable`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_serve_returns_current_root_wire_zeb707() {
+        let rec = Arc::new(RecordingCas::default());
+        let cas: Arc<dyn ContentStore> = rec.clone();
+        let Built {
+            engine,
+            state,
+            in_tx,
+            ..
+        } = build_engine("dev-707-serve", Arc::clone(&cas), false);
+        let _in_tx = in_tx;
+
+        // Put some state in so the served root reflects real content.
+        {
+            let mut doc = state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "served".into(),
+                },
+            );
+        }
+
+        // Ask the engine to serve its current root (the pull path's server side).
+        let serve_tx = engine.root_serve_tx();
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        serve_tx.send(resp_tx).await.expect("serve channel send");
+        let wire = tokio::time::timeout(Duration::from_secs(5), resp_rx)
+            .await
+            .expect("serve reply within 5s")
+            .expect("serve oneshot dropped")
+            .expect("encode_root_wire ok");
+        engine.shutdown().await.ok();
+
+        // The served frame decodes like any pushed publish, and its root CID is
+        // serveable so the puller's content fetch can succeed.
+        let kt = make_kt();
+        let payload_bytes = decrypt_root_publish(&kt, &wire).expect("decrypt served frame");
+        let published: FleetRootPublish =
+            canonical_cbor_decode(&payload_bytes).expect("decode served envelope");
+        let served = rec
+            .put_serveable_cids
+            .lock()
+            .expect("put_serveable_cids mutex");
+        assert!(
+            served.contains(&published.root_cid),
+            "ZEB-707: the served root {:?} must be put_serveable so a puller can fetch its content (served={served:?})",
+            published.root_cid
         );
     }
 
