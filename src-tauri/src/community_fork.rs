@@ -266,6 +266,7 @@ pub async fn fork_community(
         transport_epoch_rx,
         channel_log_registry,
         dm_outbox,
+        sync_engine,
         snapshot_generation,
     ) = {
         let g = state_lock
@@ -294,6 +295,12 @@ pub async fn fork_community(
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
+            // ZEB-709 (audit A1): the owner-state engine — the fork's Space
+            // commit below must fence its flush or the forked community's
+            // owner-state row evaporates on a crash (its twin
+            // create_community has fenced since ZEB-393). Option, not ok_or:
+            // engineless test states must not fail the fork.
+            g.sync_engine.clone(),
             g.generation,
         )
     }; // std lock released here.
@@ -770,6 +777,22 @@ pub async fn fork_community(
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
             return Err(format!("apply_space rejected fork community: {outcome:?}"));
         }
+    }
+
+    // ZEB-709 (audit A1): durable-on-commit for the fork's owner-state Space
+    // row — the community engine's snapshot is already fenced above, but
+    // without THIS fence the owner-state row (nav entry, members,
+    // content_key) rides an unarmed debounce and a crash forgets the fork
+    // from nav while its engine state exists on disk. Mirrors
+    // create_community's ZEB-393 fence exactly.
+    if let Some(engine) = sync_engine.as_ref() {
+        crate::fence_owner_state_flush(
+            engine,
+            crate::OWNER_STATE_FENCE_TIMEOUT,
+            "fork_community",
+            &fork_space_id_hex,
+        )
+        .await;
     }
 
     // Release RAII guards.
