@@ -59018,7 +59018,7 @@ async fn network_health_export_payload(
 /// re-issues the exit — the save point precedes the process disappearing
 /// (the ZEB-703 principle, GUI side).
 pub(crate) mod gui_exit_flush {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
     /// Wall-clock bound on the pre-exit flush. Matches the #485 pre-ack
     /// barrier bound: generous next to a healthy teardown (well under 1 s),
@@ -59033,6 +59033,14 @@ pub(crate) mod gui_exit_flush {
     /// with their own atomics.
     pub(crate) static EXIT_FLUSH_PHASE: AtomicU8 = AtomicU8::new(PHASE_NOT_STARTED);
 
+    /// Exit code the flush thread re-issues, last-wins across every request
+    /// the gate prevented (CodeRabbit #486: a quit that starts the flush must
+    /// not clobber a later request's code — e.g. `exit(1)` arriving while the
+    /// `exit(0)` flush runs must still exit 1). Restart codes never land here:
+    /// restart-coded requests take the synchronous path in the handler
+    /// (`prevent_exit` is a no-op for them, so they are never re-issued).
+    pub(crate) static PENDING_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum ExitGateAction {
         /// First exit request: prevent it and spawn the flush thread.
@@ -59043,6 +59051,24 @@ pub(crate) mod gui_exit_flush {
         AwaitFlush,
         /// Flush finished (or its bound expired): let the exit proceed.
         Allow,
+    }
+
+    /// What the bounded flush worker actually did (Qodo #486: a worker that
+    /// responded in time but could NOT flush must not read as success).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FlushOutcome {
+        /// `stop_inner` ran to completion: every present engine's shutdown
+        /// flush (incl. the owner-state persist) executed. Its bool return
+        /// (`had_node` — was an event loop running) does not change
+        /// durability, so it is not distinguished here.
+        Flushed,
+        /// No managed NodeState — nothing to flush (unreachable in the real
+        /// app; it is managed before run()).
+        NoOp,
+        /// The NodeState lock is poisoned — `stop_inner` bails before
+        /// reaching any engine shutdown. Surfaced so the handler can WARN
+        /// instead of exiting silently.
+        LockPoisoned,
     }
 
     /// Once-only latch deciding what an `ExitRequested` event does. Exactly
@@ -59061,28 +59087,48 @@ pub(crate) mod gui_exit_flush {
     }
 
     /// Run `stop_inner` on a fresh thread and wait at most `bound` for it.
-    /// Returns whether the flush completed inside the bound; on `false` the
-    /// worker keeps running and dies with the process — identical blast
-    /// radius to the pre-ZEB-708 behavior, but only after the bound, and
-    /// `stop_inner` reaches the owner-state persist early in its sequence.
-    /// Must be called OUTSIDE any tokio context (`stop_inner` builds its own
-    /// ephemeral runtimes); the ExitRequested handler spawns a plain thread.
+    /// `Some(outcome)` = the worker finished inside the bound (see
+    /// [`FlushOutcome`] for what it managed to do); `None` = the bound
+    /// expired — the worker keeps running and dies with the process,
+    /// identical blast radius to the pre-ZEB-708 behavior, but only after
+    /// the bound, and `stop_inner` reaches the owner-state persist early in
+    /// its sequence. Must be called OUTSIDE any tokio context (`stop_inner`
+    /// builds its own ephemeral runtimes); the ExitRequested handler calls
+    /// it from a plain thread (or blocks the callback for restart codes,
+    /// where the exit cannot be deferred).
     pub(crate) fn run_bounded_flush<R: tauri::Runtime>(
         handle: tauri::AppHandle<R>,
         bound: std::time::Duration,
-    ) -> bool {
-        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    ) -> Option<FlushOutcome> {
+        let (tx, rx) = std::sync::mpsc::channel::<FlushOutcome>();
         std::thread::spawn(move || {
             use tauri::Manager as _;
-            let stopped = match handle.try_state::<std::sync::Mutex<crate::NodeState>>() {
-                Some(state) => crate::stop_inner(&state, None),
-                // No managed NodeState (unreachable in the real app — it is
-                // managed before run()): nothing to flush.
-                None => false,
+            let outcome = match handle.try_state::<std::sync::Mutex<crate::NodeState>>() {
+                Some(state) => {
+                    // Poisoned = a panic happened while holding the node
+                    // lock; stop_inner bails without flushing. Report it
+                    // rather than letting the quit read as a clean flush.
+                    if state.is_poisoned() {
+                        FlushOutcome::LockPoisoned
+                    } else {
+                        let had_node = crate::stop_inner(&state, None);
+                        // A false return is benign (no event loop was
+                        // running; engine flushes still ran) UNLESS the lock
+                        // got poisoned between the check above and
+                        // stop_inner's own lock() — then it bailed without
+                        // flushing anything.
+                        if !had_node && state.is_poisoned() {
+                            FlushOutcome::LockPoisoned
+                        } else {
+                            FlushOutcome::Flushed
+                        }
+                    }
+                }
+                None => FlushOutcome::NoOp,
             };
-            let _ = tx.send(stopped);
+            let _ = tx.send(outcome);
         });
-        rx.recv_timeout(bound).is_ok()
+        rx.recv_timeout(bound).ok()
     }
 }
 
@@ -60014,8 +60060,19 @@ pub fn run() {
                         .ok_or("default menu has no app submenu")?;
                     let sub_items = app_submenu.items().map_err(|e| e.to_string())?;
                     // Menu::default pins Quit as the app submenu's last item
-                    // (tauri 2.11.2). Structure drift = bail, keep default.
-                    if !matches!(sub_items.last(), Some(MenuItemKind::Predefined(_))) {
+                    // (tauri 2.11.2). Verify it IS the Quit item — kind AND
+                    // text (muda's non-Windows default is "&Quit"; Qodo #486:
+                    // matching any predefined item could remove the wrong
+                    // entry on structure drift and leave the terminate-based
+                    // Quit in place). Drift = bail, keep the default menu.
+                    let last_is_quit = match sub_items.last() {
+                        Some(MenuItemKind::Predefined(p)) => p
+                            .text()
+                            .map(|t| t.replace('&', "") == "Quit")
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if !last_is_quit {
                         return Err("app submenu's last item is not the predefined Quit".into());
                     }
                     app_submenu
@@ -60393,43 +60450,76 @@ pub fn run() {
         .run(|app_handle, event| {
             // ZEB-708: every GUI exit route funnels into ExitRequested —
             // quit_app, the tray/gui_host 3s fallback exits, the ZEB-433
-            // last-window-closed auto-exit, the swapped menu Quit, and an
-            // off-main-thread restart() (its code is preserved so the
-            // restart-on-exit flag still applies, now flushed). Latch once,
-            // defer the exit until the bounded stop_inner flush ran, then
-            // re-issue it. prevent_exit only counts when called
-            // synchronously inside this callback (runtime-wry try_recv's
-            // the verdict right after it returns).
+            // last-window-closed auto-exit, the swapped menu Quit, and
+            // restart requests. Latch once, defer the exit until the bounded
+            // stop_inner flush ran, then re-issue it. prevent_exit only
+            // counts when called synchronously inside this callback
+            // (runtime-wry try_recv's the verdict right after it returns) —
+            // and it is a documented NO-OP for RESTART_EXIT_CODE, so
+            // restart-coded requests block this callback on the flush
+            // instead (the exit cannot be deferred, only outwaited).
             if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
-                use gui_exit_flush::{ExitGateAction, EXIT_FLUSH_PHASE};
+                use gui_exit_flush::{ExitGateAction, FlushOutcome, EXIT_FLUSH_PHASE};
+                use std::sync::atomic::Ordering;
+                let bound =
+                    std::time::Duration::from_millis(gui_exit_flush::GUI_QUIT_FLUSH_MAX_MS);
+                let is_restart = code == Some(tauri::RESTART_EXIT_CODE);
+                let log_flush_outcome = |outcome: Option<FlushOutcome>| match outcome {
+                    None => tracing::warn!(
+                        bound_ms = gui_exit_flush::GUI_QUIT_FLUSH_MAX_MS,
+                        "ZEB-708: pre-exit flush exceeded its bound; exiting anyway"
+                    ),
+                    Some(FlushOutcome::LockPoisoned) => tracing::warn!(
+                        "ZEB-708: NodeState lock poisoned; pre-exit flush impossible"
+                    ),
+                    Some(FlushOutcome::Flushed) | Some(FlushOutcome::NoOp) => {}
+                };
                 match gui_exit_flush::exit_gate(&EXIT_FLUSH_PHASE) {
+                    ExitGateAction::StartFlush if is_restart => {
+                        // Restart cannot be prevented: flush synchronously
+                        // (the worker still runs off-thread; this callback
+                        // just waits, bounded) and let the exit proceed.
+                        log_flush_outcome(gui_exit_flush::run_bounded_flush(
+                            app_handle.clone(),
+                            bound,
+                        ));
+                        EXIT_FLUSH_PHASE.store(gui_exit_flush::PHASE_DONE, Ordering::Release);
+                    }
                     ExitGateAction::StartFlush => {
                         api.prevent_exit();
-                        let code = code.unwrap_or(0);
+                        gui_exit_flush::PENDING_EXIT_CODE
+                            .store(code.unwrap_or(0), Ordering::Release);
                         let handle = app_handle.clone();
                         std::thread::spawn(move || {
-                            let completed = gui_exit_flush::run_bounded_flush(
+                            log_flush_outcome(gui_exit_flush::run_bounded_flush(
                                 handle.clone(),
-                                std::time::Duration::from_millis(
-                                    gui_exit_flush::GUI_QUIT_FLUSH_MAX_MS,
-                                ),
-                            );
-                            if !completed {
-                                tracing::warn!(
-                                    bound_ms = gui_exit_flush::GUI_QUIT_FLUSH_MAX_MS,
-                                    "ZEB-708: pre-exit flush exceeded its bound; exiting anyway"
-                                );
-                            }
-                            EXIT_FLUSH_PHASE.store(
-                                gui_exit_flush::PHASE_DONE,
-                                std::sync::atomic::Ordering::Release,
-                            );
-                            handle.exit(code);
+                                bound,
+                            ));
+                            EXIT_FLUSH_PHASE.store(gui_exit_flush::PHASE_DONE, Ordering::Release);
+                            handle.exit(gui_exit_flush::PENDING_EXIT_CODE.load(Ordering::Acquire));
                         });
                     }
+                    ExitGateAction::AwaitFlush if is_restart => {
+                        // prevent_exit is a no-op for restarts: outwait the
+                        // in-flight flush here (bounded) so the restart's
+                        // immediate exit can't cut it short.
+                        let deadline = std::time::Instant::now() + bound;
+                        while EXIT_FLUSH_PHASE.load(Ordering::Acquire)
+                            != gui_exit_flush::PHASE_DONE
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                    }
                     // Flush in flight: swallow (the armed fallback exits must
-                    // not cut it short); the flush thread owns the re-exit.
-                    ExitGateAction::AwaitFlush => api.prevent_exit(),
+                    // not cut it short) but keep the newest code — the flush
+                    // thread re-issues with last-wins.
+                    ExitGateAction::AwaitFlush => {
+                        api.prevent_exit();
+                        if let Some(c) = code {
+                            gui_exit_flush::PENDING_EXIT_CODE.store(c, Ordering::Release);
+                        }
+                    }
                     // Done: the flush thread's own exit — let it through.
                     ExitGateAction::Allow => {}
                 }
@@ -66353,7 +66443,7 @@ mod zeb708_gui_exit_flush_tests {
     use super::zeb703_outbox_runtime_durability_tests::{make_dm_space, make_outbox_synthetic};
     use super::*;
     use crate::gui_exit_flush::{
-        exit_gate, run_bounded_flush, ExitGateAction, PHASE_DONE, PHASE_NOT_STARTED,
+        exit_gate, run_bounded_flush, ExitGateAction, FlushOutcome, PHASE_DONE, PHASE_NOT_STARTED,
     };
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
@@ -66503,8 +66593,12 @@ mod zeb708_gui_exit_flush_tests {
             "fixture: entry must NOT be persisted before the quit flush"
         );
 
-        let completed = run_bounded_flush(app.handle().clone(), std::time::Duration::from_secs(15));
-        assert!(completed, "quit flush must complete within the bound");
+        let outcome = run_bounded_flush(app.handle().clone(), std::time::Duration::from_secs(15));
+        assert_eq!(
+            outcome,
+            Some(FlushOutcome::Flushed),
+            "quit flush must complete within the bound AND report a real flush"
+        );
 
         let loaded = crate::owner_state_persist::load_crdt(&crdt_path)
             .expect("crdt file must exist after the quit flush");
@@ -66531,11 +66625,21 @@ mod zeb708_gui_exit_flush_tests {
         let managed = app.state::<Mutex<NodeState>>();
         let guard = managed.lock().expect("test holds the node lock");
         let started = std::time::Instant::now();
-        let completed =
+        let outcome =
             run_bounded_flush(app.handle().clone(), std::time::Duration::from_millis(100));
         let elapsed = started.elapsed();
         drop(guard);
-        assert!(!completed, "a wedged stop_inner must NOT report completion");
+        assert_eq!(
+            outcome, None,
+            "a wedged stop_inner must NOT report completion"
+        );
+        // CodeRabbit #486: also pin the lower edge — an immediate None
+        // (never actually waiting out the bound) must fail too. 80 ms
+        // tolerance under the 100 ms bound absorbs clock granularity.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(80),
+            "flush returned before the 100 ms bound (took {elapsed:?})"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(3),
             "bound must cap the wait (took {elapsed:?})"
