@@ -1113,6 +1113,41 @@ pub async fn recovery_state_as_of(
     .await
 }
 
+/// Poll predicate for "the designate config has replicated here and this node
+/// is one of the designates". `Ok(None)` = not converged yet — which includes
+/// BOTH `config: null` (the SetRecoveryDesignates proposal hasn't landed) and
+/// the freshly-joined window where the community engine hasn't spawned (the
+/// RPC refuses with "no engine for community"). A MISSING `config` or
+/// `selfIsDesignate` key, or a mis-typed value, is a broken DTO contract,
+/// surfaced loudly per the ZEB-462 rule (Qodo, PR #499 R1) — `config` is an
+/// `Option` serialized as an always-present nullable key, and
+/// `selfIsDesignate` is an always-present bool.
+pub async fn recovery_configured_as_designate(
+    node: &NodeHandle,
+    community_id: &str,
+) -> anyhow::Result<Option<()>> {
+    let st = match recovery_state(node, community_id).await {
+        Ok(st) => st,
+        Err(e) if e.to_string().contains("no engine for community") => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let config_present = !st
+        .get("config")
+        .ok_or_else(|| {
+            anyhow::anyhow!("RecoveryStateDto missing `config` (DTO/schema mismatch?): {st}")
+        })?
+        .is_null();
+    let is_designate = st
+        .get("selfIsDesignate")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "RecoveryStateDto missing bool `selfIsDesignate` (DTO/schema mismatch?): {st}"
+            )
+        })?;
+    Ok((config_present && is_designate).then_some(()))
+}
+
 /// The proposal object with `proposalEventId == proposal_id` from a
 /// `RecoveryStateDto` value. `Ok(None)` means "not replicated here yet" (poll
 /// semantics); a missing/non-array `proposals` key or a proposal object without

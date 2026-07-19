@@ -2518,18 +2518,11 @@ async fn s11_recovery_veto_path() {
         "sole admin self-satisfies quorum 1: {res}"
     );
 
-    // Config replicates to bob; his own DTO proves he is a designate. The
-    // engine on a freshly-joined node spawns asynchronously, so a "no engine"
-    // refusal is not-yet-converged, not a failure.
+    // Config replicates to bob; his own DTO proves he is a designate
+    // (loud-contract predicate — missing DTO keys fail fast, only
+    // `config: null` / the freshly-joined no-engine window keep polling).
     poll_until(Duration::from_secs(120), || async {
-        let st = match recovery_state(&bob, &community).await {
-            Ok(st) => st,
-            Err(e) if e.to_string().contains("no engine for community") => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let configured = st.get("config").is_some_and(|c| !c.is_null())
-            && st.get("selfIsDesignate").and_then(Value::as_bool) == Some(true);
-        Ok(configured.then_some(()))
+        recovery_configured_as_designate(&bob, &community).await
     })
     .await
     .expect("bob sees the designate config and selfIsDesignate");
@@ -2702,14 +2695,7 @@ async fn s12_recovery_time_locked_execution() {
         "sole admin self-satisfies quorum 1: {res}"
     );
     poll_until(Duration::from_secs(120), || async {
-        let st = match recovery_state(&bob, &community).await {
-            Ok(st) => st,
-            Err(e) if e.to_string().contains("no engine for community") => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let configured = st.get("config").is_some_and(|c| !c.is_null())
-            && st.get("selfIsDesignate").and_then(Value::as_bool) == Some(true);
-        Ok(configured.then_some(()))
+        recovery_configured_as_designate(&bob, &community).await
     })
     .await
     .expect("bob sees the designate config");
