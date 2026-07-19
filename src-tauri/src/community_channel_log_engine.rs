@@ -470,6 +470,12 @@ pub struct ChannelLogEngine {
     channel_key: Arc<ChannelKey>,
     log: Arc<Mutex<ChannelLog>>,
     replay_tracker: Arc<Mutex<ChannelLogReplayTracker>>,
+    /// ZEB-688: monotonic count of inbound packets dropped as replays (any of
+    /// `process_inbound_packet`'s three drop sites: 2a fast-path, the
+    /// defensive verify-path arm, 2c atomic-recheck). Relaxed ordering — a
+    /// test barrier to wait on, not a synchronization edge; read via the
+    /// test-gated [`Self::replay_drop_count`].
+    replay_drops: std::sync::atomic::AtomicU64,
     state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
     self_owner: OwnerAddr,
     self_device_id: String,
@@ -560,6 +566,7 @@ impl ChannelLogEngine {
             channel_key: params.channel_key,
             log: Arc::new(Mutex::new(log)),
             replay_tracker: Arc::new(Mutex::new(tracker)),
+            replay_drops: std::sync::atomic::AtomicU64::new(0),
             state_at_hlc: params.state_at_hlc,
             self_owner: params.self_owner,
             self_device_id: params.self_device_id,
@@ -1652,6 +1659,8 @@ impl ChannelLogEngine {
                     err = ?e,
                     "drop replay (fast-path)"
                 );
+                self.replay_drops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             // Drop tracker lock here so async verify doesn't hold it.
@@ -1681,6 +1690,8 @@ impl ChannelLogEngine {
                         err = ?e,
                         "drop replay (verify path)"
                     );
+                    self.replay_drops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {
                     tracing::warn!(
@@ -1706,6 +1717,8 @@ impl ChannelLogEngine {
                     err = ?e,
                     "drop replay (atomic-recheck)"
                 );
+                self.replay_drops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         }
@@ -1920,6 +1933,18 @@ impl ChannelLogEngine {
         };
         crate::community_channel_log::seal_rbsr_message(self.channel_key_ref(), &req)
             .unwrap_or_default()
+    }
+
+    /// ZEB-688: monotonic count of inbound packets dropped by the replay
+    /// tracker (all three `process_inbound_packet` drop sites). Test-only
+    /// observability: from outside the engine, a correctly-dropped replay and
+    /// a not-yet-arrived packet are indistinguishable, so replay-rejection
+    /// tests previously proved the drop with a fixed sleep — a negative
+    /// assertion whose only failure mode is a spurious pass. Waiting for this
+    /// counter to increment makes the assertion deterministic.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn replay_drop_count(&self) -> u64 {
+        self.replay_drops.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// ZEB-593 (requester half): ingest one round's reply frames and advance the
@@ -4850,8 +4875,15 @@ mod tests {
         .await
         .expect("first event must land");
 
-        // Give second packet (replay) time to be processed and rejected.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // ZEB-688: wait for the replay drop itself instead of sleeping — the
+        // counter makes the negative assertion below non-vacuous (we KNOW the
+        // second packet reached the drop path before asserting nothing landed).
+        let _ = wait_for(
+            || async { (fix.engine.replay_drop_count() >= 1).then_some(()) },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the replayed packet must be observed dropping");
 
         let listed = fix.engine.list_messages(None, 100).await.expect("list");
         assert_eq!(listed.len(), 1, "replay must be dropped");

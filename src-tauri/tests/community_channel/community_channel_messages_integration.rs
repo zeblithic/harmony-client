@@ -669,24 +669,28 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         hex::encode(channel_id.0)
     );
     let topic_key = zenoh::key_expr::KeyExpr::try_from(topic).expect("key");
+    // ZEB-688: capture the drop counter BEFORE the replay put and wait on the
+    // DELTA — earlier live/backfill delivery overlap may already have produced
+    // replay drops, so an absolute count would race the setup phases.
+    let pre_replay_drops = engine_b2.replay_drop_count();
     session_a
         .put(&topic_key, replay_packet)
         .await
         .expect("replay put");
 
-    // Give the loopback ~1s to arrive at B's subscriber + traverse
-    // verify_channel_event (where the replay tracker drops it).
-    //
-    // ZEB-469 audit: deliberately retained. This is a *negative* assertion — we
-    // confirm the replayed duplicate does NOT re-emit — so its only failure mode
-    // is a spurious pass (the drop simply isn't exercised if the packet is slow),
-    // never a spurious CI failure: A↔B subscriber matching is already established
-    // (B just received all 150 events above), and the replayed id's HLC is the
-    // lane minimum so no in-flight legit delivery can bump its count. A fully
-    // deterministic conversion would require an engine-level "events dropped by
-    // replay tracker" counter to wait on; that instrumentation is out of scope
-    // for this flake-hardening pass (the sleep is not a CI-flake source).
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // ZEB-688 (closes the ZEB-469 audit deferral): wait for B's engine to
+    // OBSERVE the drop instead of sleeping 1s. The emission-count check below
+    // is a *negative* assertion; under the old sleep its only failure mode was
+    // a spurious pass (a slow packet meant the drop path was never exercised —
+    // the count was unchanged for the wrong reason). Waiting on the engine's
+    // replay-drop counter proves the duplicate actually reached the drop path
+    // before we assert nothing re-emitted.
+    wait_until(
+        || async { engine_b2.replay_drop_count() > pre_replay_drops },
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("B must observe the replayed duplicate being dropped");
 
     let post_replay_emits = count_replayed();
     assert_eq!(
