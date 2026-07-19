@@ -68545,6 +68545,21 @@ mod zeb703_outbox_runtime_durability_tests {
             s.outbox.contains_key(&entry_id)
         }));
 
+        // ZEB-246: the runtime delete IPC reads wall_now_ms from the real
+        // clock, so a just-sent entry would trip the fresh-Pending stuck
+        // gate. Backdate created_at past STUCK_THRESHOLD_MS so this entry
+        // qualifies as a stuck manual-delete — the durability property
+        // under test (tombstone persists at runtime) is independent of
+        // delivery state / age.
+        rt.block_on(async {
+            let mut g = crdt_state.lock().await;
+            let e = g.outbox.get_mut(&entry_id).expect("sent entry present");
+            e.created_at.wall_ms = e
+                .created_at
+                .wall_ms
+                .saturating_sub(crate::dm_outbox::STUCK_THRESHOLD_MS + 1_000);
+        });
+
         // Drive the REAL delete command through the tauri IPC boundary.
         let response = tauri::test::get_ipc_response(
             &webview,
