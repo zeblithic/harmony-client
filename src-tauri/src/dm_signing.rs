@@ -283,6 +283,15 @@ pub fn compute_dm_destination_hash(identity_address_hash: [u8; 16]) -> [u8; 16] 
 ///
 /// Returns `None` if the bytes are malformed (invalid X25519 or Ed25519
 /// point encoding). Caller treats `None` as a verification-failure case.
+///
+/// Infallible twin for wire-commitment checks over untrusted bytes:
+/// `crate::community_invite::device_hash_from_identity_pub` — same
+/// `SHA256(X25519 ‖ Ed25519)[..16]` bytes via
+/// `harmony_crypto::hash::truncated_hash`, but no point validation, because
+/// the invite/open-join decode defenses must hash arbitrary wire bytes before
+/// signature verification (ZEB-716). Distinct notion from
+/// `harmony_owner::PubKeyBundle::identity_hash()` (signing-only material);
+/// the two must never be converged.
 pub fn derive_device_hash_from_identity_pub(identity_pub: &[u8; 64]) -> Option<DeviceIdentityHash> {
     let identity = harmony_identity::Identity::from_public_bytes(identity_pub).ok()?;
     Some(DeviceIdentityHash(identity.address_hash))
@@ -750,18 +759,17 @@ mod tests {
     /// PrivateIdentity-based tests aren't silently bypassing it.
     #[test]
     fn sign_dm_packet_matches_private_identity_sign() {
-        // Mirror PrivateIdentity::from_seed's Ed25519 sub-key derivation
-        // (harmony-identity identity.rs:197 uses harmony_crypto::hkdf::DerivedKey,
-        // which wraps the same `hkdf::Hkdf::<Sha256>` we use directly here —
-        // harmony-crypto isn't a direct dep of harmony-client, so we replicate
-        // the HKDF expansion inline rather than introducing one).
-        use hkdf::Hkdf;
-        use sha2::Sha256;
+        // Mirror PrivateIdentity::from_seed's Ed25519 sub-key derivation via
+        // the SAME core primitive it uses (harmony-identity identity.rs:197 →
+        // harmony_crypto::hkdf::DerivedKey), so the mirror stays byte-exact
+        // even if core's HKDF invocation details evolve. (harmony-crypto is a
+        // direct dep since ZEB-716.)
         let seed = [0x42u8; 32];
-        let hk = Hkdf::<Sha256>::new(None, &seed);
+        let dk =
+            harmony_crypto::hkdf::DerivedKey::new(&seed, None, b"harmony-identity-ed25519-v1", 32)
+                .expect("HKDF length 32 within SHA-256 limit");
         let mut ed_arr = [0u8; 32];
-        hk.expand(b"harmony-identity-ed25519-v1", &mut ed_arr)
-            .expect("HKDF length 32 within SHA-256 limit");
+        ed_arr.copy_from_slice(dk.as_bytes());
         let signing_key = SigningKey::from_bytes(&ed_arr);
 
         let private = harmony_identity::PrivateIdentity::from_seed(&seed);

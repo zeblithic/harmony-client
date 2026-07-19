@@ -2836,6 +2836,7 @@ dependencies = [
  "futures-util",
  "harmony-compute",
  "harmony-content",
+ "harmony-crypto",
  "harmony-identity",
  "harmony-mailbox",
  "harmony-owner",

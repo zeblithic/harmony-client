@@ -1345,8 +1345,9 @@ pub enum CommunityInviteVerifyError {
     /// engine's local-insert pipeline rather than at sig classes.
     #[error("engine local-insert error")]
     EngineLocalError,
-    /// inviter_enrollment cert failed verification (bad master signature,
-    /// expired, or non-Master issuer). ZEB-497.
+    /// inviter_enrollment cert failed verification (bad signature, expired,
+    /// or untrusted issuer — Master and ZEB-677 quorum certs both route
+    /// through the ZEB-680 `enrollment_verify` chokepoint). ZEB-497.
     #[error("inviter enrollment cert invalid")]
     InviterEnrollmentCertInvalid,
     /// inviter_enrollment cert binds a different owner than invite_token.inviter.
@@ -1706,15 +1707,25 @@ pub fn decode_packet(bytes: &[u8]) -> Result<CommunityInvitePacket, CommunityInv
     }
 }
 
-/// Compute `SHA256(identity_pub)[..16]`. Mirrors how `DmInvite` Path B
-/// derives `signing_device_hash`; the receiver checks this binding before
-/// running the (more expensive) Ed25519 verify.
+/// Compute the 16-byte device-address hash `SHA256(identity_pub)[..16]` over
+/// the 64-byte combined pub (`X25519(32) ‖ Ed25519(32)`). Mirrors how
+/// `DmInvite` Path B derives `signing_device_hash`; the receiver checks this
+/// binding before running the (more expensive) Ed25519 verify.
+///
+/// Delegates to `harmony_crypto::hash::truncated_hash` — the same primitive
+/// behind `harmony_identity::Identity::address_hash` — so the wire commitment
+/// and the identity-layer device hash cannot drift (ZEB-716). Deliberately
+/// INFALLIBLE: this is a pure-hash commitment over untrusted wire bytes,
+/// enforced by the invite/open-join decode defenses BEFORE any point
+/// validation or signature check, so a non-canonical Ed25519 half must still
+/// hash (and then fail verification downstream). Identity contexts that must
+/// REJECT invalid points use the fallible twin,
+/// `crate::dm_signing::derive_device_hash_from_identity_pub`. Distinct notion
+/// from `harmony_owner::PubKeyBundle::identity_hash()`, which hashes SIGNING
+/// material only (encryption-key rotation preserves it) — the two must never
+/// be converged (ZEB-571 item 14 adjudication).
 pub fn device_hash_from_identity_pub(identity_pub: &[u8; 64]) -> [u8; 16] {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(identity_pub);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest[..16]);
-    out
+    harmony_crypto::hash::truncated_hash(identity_pub)
 }
 
 /// Build a complete [`CommunityInvitePacket`] ready for [`encode_packet`].
@@ -2366,6 +2377,60 @@ mod tests {
     use super::*;
     use crate::owner_state_crypto::canonical_cbor_encode;
     use crate::owner_state_types::{OwnerAddr, SpaceId};
+
+    /// ZEB-716 byte-equivalence pin: the infallible wire commitment equals the
+    /// fallible identity-layer device hash (`harmony_identity::Identity::
+    /// address_hash`) for a well-formed combined pub. Guards the delegation to
+    /// `harmony_crypto::hash::truncated_hash` — if either side ever changes
+    /// its formula, this breaks loudly instead of letting the decode defense
+    /// and the identity layer drift apart.
+    #[test]
+    fn device_hash_matches_identity_address_hash_for_valid_keys() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]);
+        let x_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([0x5Bu8; 32]));
+        let mut pub64 = [0u8; 64];
+        pub64[..32].copy_from_slice(x_pub.as_bytes());
+        pub64[32..].copy_from_slice(sk.verifying_key().as_bytes());
+
+        let wire = device_hash_from_identity_pub(&pub64);
+        let identity = crate::dm_signing::derive_device_hash_from_identity_pub(&pub64)
+            .expect("honestly-built combined pub must parse");
+        assert_eq!(
+            wire, identity.0,
+            "wire commitment and identity-layer device-address hash must be byte-identical"
+        );
+    }
+
+    /// ZEB-716 fallibility-divergence pin: for a NON-canonical Ed25519 half
+    /// the identity layer rejects (`None`) while the wire commitment still
+    /// hashes — the decode defenses run it over arbitrary untrusted bytes
+    /// before any point validation, so infallibility is load-bearing wire
+    /// semantics, not sloppiness.
+    #[test]
+    fn device_hash_stays_infallible_for_invalid_ed25519_point() {
+        // Search for a repeated-byte pattern whose Ed25519 half fails point
+        // decompression. A magic constant like [0xFF; 32] is NOT reliably
+        // invalid — curve25519-dalek REDUCES a non-canonical y mod p instead
+        // of rejecting it — so pick an encoding that is invalid by
+        // construction (roughly half of all y values are off-curve).
+        let bad_ed = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|cand| ed25519_dalek::VerifyingKey::from_bytes(cand).is_err())
+            .expect("some repeated-byte pattern must be off-curve");
+        let mut pub64 = [0u8; 64];
+        pub64[..32].copy_from_slice(&[0x5Bu8; 32]);
+        pub64[32..].copy_from_slice(&bad_ed);
+
+        assert!(
+            crate::dm_signing::derive_device_hash_from_identity_pub(&pub64).is_none(),
+            "identity layer must reject a non-canonical Ed25519 point"
+        );
+        assert_eq!(
+            device_hash_from_identity_pub(&pub64),
+            harmony_crypto::hash::truncated_hash(&pub64),
+            "wire commitment must still hash arbitrary bytes (decode-defense contract)"
+        );
+    }
 
     /// Minimal open-community invite payload with correct 32-byte
     /// `sealed_epoch_key`. Use as a baseline; mutate the field under test.
