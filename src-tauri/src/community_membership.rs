@@ -5534,9 +5534,9 @@ pub enum AutoExecOutcome {
     /// ZEB-300 converge R1: terminal — the SetPower effect is already
     /// present in materialized state (`power_levels[target] == level`),
     /// so nothing was minted. Distinguished from `RoutedProposalPending`
-    /// so the tick's bounded re-dispatch loop (each Finalized SetPower poll
-    /// is re-dispatched every tick within `AUTO_EXEC_RETRY_WINDOW_MS`) can
-    /// tell an idempotent no-op from an in-flight quorum wait: this is the
+    /// so the tick's re-dispatch loop (each Finalized SetPower poll is
+    /// re-dispatched every tick while it stays Finalized) can tell an
+    /// idempotent no-op from an in-flight quorum wait: this is the
     /// stop condition that keeps re-dispatch from re-minting once the
     /// effect lands on every replica. Applies to both the direct-SetPower
     /// and AdminProposal-routed paths.
@@ -5846,9 +5846,9 @@ pub async fn apply_auto_exec_set_power(
     //
     // ZEB-300 converge R1: also read whether the target is ALREADY at
     // `level` in the same locked block. The Tier 2 tick re-dispatches
-    // auto-exec for Finalized SetPower polls every tick within
-    // `AUTO_EXEC_RETRY_WINDOW_MS`, so once the effect has synced in on
-    // this replica a bare re-dispatch would otherwise re-mint. Returning
+    // auto-exec for Finalized SetPower polls every tick while they stay
+    // Finalized, so once the effect has synced in on this replica a bare
+    // re-dispatch would otherwise re-mint. Returning
     // `AlreadyApplied` BEFORE the admin / quorum / mint logic makes
     // re-dispatch idempotent on every replica.
     let (is_admin, blocked_by_quorum, already_at_level) = {

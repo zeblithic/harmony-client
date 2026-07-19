@@ -26,14 +26,6 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 pub const CONTESTABILITY_WINDOW_MS: i128 = 24 * 60 * 60 * 1000;
 /// Archive sweep cadence per spec §2: at-most-once per 24h across all logs.
 pub const ARCHIVE_SWEEP_INTERVAL_MS: i128 = 24 * 60 * 60 * 1000;
-/// ZEB-300 converge R1: re-dispatch Tier 2 SetPower auto-exec for Finalized
-/// polls each tick until the effect lands or the window closes. 1h, anchored
-/// to each replica's own `finalized_at_ms` — long enough that a later-arriving
-/// admin (who mints/countersigns the AdminProposal on a fresh window of its
-/// own) accumulates quorum before every replica's window closes, but bounded
-/// so re-dispatch is not unbounded. The `AlreadyApplied` idempotency guard
-/// stops re-mint the instant the effect syncs in, independent of this window.
-pub const AUTO_EXEC_RETRY_WINDOW_MS: i128 = 60 * 60 * 1000; // 1h
 
 /// Per-tick aggregated stats for tests + observability.
 #[derive(Debug, Default, Clone)]
@@ -65,15 +57,15 @@ pub struct TickStats {
     /// ZEB-300: number of admin-affecting dispatches where this replica had
     /// already signed the canonical proposal and is awaiting other admins'
     /// signatures. Steady state while the routing converges across ticks.
-    /// May be bumped on repeated ticks within `AUTO_EXEC_RETRY_WINDOW_MS`
-    /// — that is expected for the retry loop.
+    /// May be bumped on repeated ticks while the poll is Finalized — that is
+    /// expected for the re-dispatch loop.
     pub tier2_auto_execs_routed_proposal_pending: u32,
     /// ZEB-300 converge R1: number of dispatches that returned
     /// `AutoExecOutcome::AlreadyApplied` — the SetPower effect was already
     /// present in materialized state, so nothing was minted. Counted
     /// separately from `tier2_auto_execs_attempted` (this is an idempotent
     /// no-op re-dispatch, not an attempt to mint). Can accrue on repeated
-    /// ticks within the retry window once the effect has landed — expected.
+    /// ticks while the poll is Finalized once the effect has landed — expected.
     pub tier2_auto_execs_already_applied: u32,
     pub archive_swept: bool,
 }
@@ -241,12 +233,12 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
     //
     // ZEB-300 converge R1: auto-exec dispatch moved OUT of this
     // finalize-transition block into Pass 3b, which re-dispatches for ALL
-    // Finalized SetPower polls within `AUTO_EXEC_RETRY_WINDOW_MS` — not
-    // only on the single tick a poll transitions to Finalized. This fixes
-    // the simultaneous-finalize stall (two admins each mint an
-    // AdminProposal on their finalize tick and neither ever countersigns
-    // the other's, so quorum never accrues). The just-finalized poll is
-    // still dispatched this same tick (its window is 0).
+    // Finalized SetPower polls while they remain Finalized — not only on the
+    // single tick a poll transitions to Finalized. This fixes the
+    // simultaneous-finalize stall (two admins each mint an AdminProposal on
+    // their finalize tick and neither ever countersigns the other's, so
+    // quorum never accrues). The just-finalized poll is still dispatched this
+    // same tick.
     {
         let mut to_finalize: Vec<(SpaceId, PollId)> = Vec::new();
         {
@@ -335,14 +327,22 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
         }
     }
 
-    // ── Pass 3b: Tier 2 SetPower auto-exec (bounded re-dispatch) ─────
-    // ZEB-300 converge R1: collect every Tier 2 poll that is Finalized,
-    // carries an `AutoExecAction::SetPower`, and whose `finalized_at_ms`
-    // is within `AUTO_EXEC_RETRY_WINDOW_MS` of `now_ms`, then dispatch
+    // ── Pass 3b: Tier 2 SetPower auto-exec (re-dispatch while Finalized) ─
+    // ZEB-300 converge R2 (Greptile #2): collect every Tier 2 poll that is
+    // Finalized and carries an `AutoExecAction::SetPower`, then dispatch
     // auto-exec for each. This runs every tick (not only at the finalize
     // transition), so the AdminProposal-routing quorum accumulates across
-    // admins' ticks even when two admins finalize simultaneously. The
-    // just-finalized poll (window == 0) is included here, so single-tick
+    // admins' ticks even when two admins finalize simultaneously. Re-dispatch
+    // continues for the poll's entire Finalized lifetime — there is NO fixed
+    // clock cutoff (the old fixed 1h retry window was shorter than a poll's
+    // actionable lifetime, so an AdminProposal that synced to a needed signer
+    // after 1h would never get auto-countersigned). The natural bound
+    // is the daily archive sweep (Pass 4): it flips the poll to `Archived`
+    // ~24h after finalize, ending re-dispatch via the `lifecycle == Finalized`
+    // filter below. For admin absences longer than that ~24h Finalized
+    // lifetime, recovery is via the manual `countersign_admin_proposal` path
+    // (the routed `AdminProposal` persists `ADMIN_PROPOSAL_EXPIRY_MS` = 30
+    // days). The just-finalized poll is included here, so single-tick
     // finalize-then-dispatch still holds.
     //
     // Idempotency: once the effect lands in materialized state the helper
@@ -351,7 +351,8 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
     // so re-dispatch never re-mints after the effect syncs in on a replica.
     //
     // Stat behavior (acceptable): `Pending`/`SkippedNotAdmin` may be bumped
-    // on repeated ticks within the window — expected for a retry loop.
+    // on repeated ticks while the poll is Finalized — expected for a
+    // re-dispatch loop.
     // `RoutedProposalMinted`/`RoutedProposalCountersigned` each happen at
     // most once per replica per proposal (the planner then returns
     // `Pending`), so they don't inflate. `AlreadyApplied` is counted
@@ -374,11 +375,13 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                     if state.meta.lifecycle != Lifecycle::Finalized {
                         continue;
                     }
-                    let finalized_at = match state.meta.finalized_at_ms {
-                        Some(f) => f,
-                        None => continue,
-                    };
-                    if now_ms - (finalized_at as i128) > AUTO_EXEC_RETRY_WINDOW_MS {
+                    // Defensive: a Finalized poll should always carry a
+                    // finalized_at_ms stamp (Pass 3a stamps it at the
+                    // finalize transition). Skip a stampless Finalized poll
+                    // rather than dispatch on a malformed one. No clock gate:
+                    // re-dispatch runs for the whole Finalized lifetime,
+                    // bounded by the archive sweep (see Pass 3b header).
+                    if state.meta.finalized_at_ms.is_none() {
                         continue;
                     }
                     let auto_exec = match state
@@ -1160,16 +1163,17 @@ mod tests {
         );
     }
 
-    /// ZEB-300 converge R1: a Finalized SetPower poll must be re-dispatched
-    /// on EVERY tick within `AUTO_EXEC_RETRY_WINDOW_MS`, not only on the tick
-    /// it transitions to Finalized. This is the fix for the
-    /// simultaneous-finalize stall (Qodo): if two admins each mint an
-    /// AdminProposal at their finalize tick and the routing only ran once,
-    /// neither would ever countersign the canonical proposal and quorum
-    /// would stall forever. A later tick must re-enter the auto-exec dispatch
-    /// so the canonical proposal can be countersigned.
+    /// ZEB-300 converge R2 (Greptile #2): a Finalized SetPower poll must be
+    /// re-dispatched on EVERY tick while it stays Finalized, not only on the
+    /// tick it transitions to Finalized — and with NO fixed clock cutoff. The
+    /// bound is the poll's Finalized lifetime (until the 24h archive sweep),
+    /// NOT an arbitrary 1h window. This is the fix for the simultaneous-
+    /// finalize stall (Qodo): if two admins each mint an AdminProposal at
+    /// their finalize tick and the routing only ran once, neither would ever
+    /// countersign the canonical proposal and quorum would stall forever. The
+    /// second tick here lands far beyond the old 1h cutoff to prove it's gone.
     #[tokio::test]
-    async fn tier2_auto_exec_redispatches_finalized_poll_within_window() {
+    async fn tier2_auto_exec_redispatches_finalized_poll() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let cid = SpaceId([0x77; 16]);
@@ -1222,8 +1226,10 @@ mod tests {
             "finalize tick must dispatch exactly once"
         );
 
-        // Tick 2: poll is already Finalized; now still within the retry window.
-        let now_ms_2 = now_ms_1 + 30 * 60 * 1000; // +30min < 1h window
+        // Tick 2: poll is already Finalized; `now` is FAR beyond the old 1h
+        // cutoff (+5h) — re-dispatch must still happen, bounded only by the
+        // Finalized lifecycle (the archive sweep, 24h away, has not run).
+        let now_ms_2 = now_ms_1 + 5 * 60 * 60 * 1000; // +5h ≫ old 1h window
         let stats2 = run_voting_tick(&ctx, now_ms_2).await.unwrap();
         assert_eq!(
             stats2.tier2_proposals_finalized, 0,
@@ -1231,17 +1237,20 @@ mod tests {
         );
         assert!(
             calls.load(Ordering::SeqCst) >= 2,
-            "Finalized SetPower poll must be re-dispatched within the retry window (got {})",
+            "Finalized SetPower poll must be re-dispatched while Finalized, \
+             regardless of elapsed time (got {})",
             calls.load(Ordering::SeqCst)
         );
     }
 
-    /// ZEB-300 converge R1: the bounded re-dispatch loop STOPS once
-    /// `now_ms` passes `finalized_at_ms + AUTO_EXEC_RETRY_WINDOW_MS`. Bounds
-    /// the retry so a permanently-stalled proposal (e.g. no other admin ever
-    /// countersigns) does not re-dispatch forever.
+    /// ZEB-300 converge R2 (Greptile #2): re-dispatch is bounded by the
+    /// `lifecycle == Finalized` gate — a poll that is no longer Finalized
+    /// (e.g. the 24h archive sweep has flipped it to Archived) is NOT
+    /// re-dispatched, even though its `finalized_at_ms` stamp still survives.
+    /// This is the natural bound that replaced the old fixed 1h retry-window
+    /// cutoff: the Finalized lifetime, not an arbitrary clock window.
     #[tokio::test]
-    async fn tier2_auto_exec_stops_redispatch_after_window() {
+    async fn tier2_auto_exec_skips_redispatch_when_not_finalized() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let cid = SpaceId([0x77; 16]);
@@ -1252,24 +1261,23 @@ mod tests {
             target_pubkey: target,
             new_power,
         });
-        let mut t2 = Tier2ProposalState::new(cfg, 1);
-        use crate::community_voting_conviction::VoterConvictionState;
-        let mut vs = VoterConvictionState::default();
-        vs.apply_signal(true, 0, 0, 86_400_000);
-        t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
-        let reached_at = 1_000i128;
-        t2.threshold_reached_at_ms = Some(reached_at);
+        let t2 = Tier2ProposalState::new(cfg, 1);
+
+        // Poll is Archived (the post-sweep terminal state), NOT Finalized. Its
+        // `finalized_at_ms` stamp survives archival, so the ONLY thing that can
+        // stop re-dispatch here is the `lifecycle == Finalized` gate — this
+        // proves that gate (not a clock window) is the bound.
+        let mut poll = make_tier2_poll(cid, pid, Lifecycle::Archived, t2);
+        poll.meta.finalized_at_ms = Some(1_000);
 
         let mut log = VotingLog::new();
-        log.polls.insert(
-            pid,
-            make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
-        );
+        log.polls.insert(pid, poll);
         let mut logs = HashMap::new();
         logs.insert(cid, Arc::new(Mutex::new(log)));
 
-        let now_ms_1 = reached_at + 25 * 60 * 60 * 1000;
-        let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms_1);
+        // last_sweep = now so the archive pass is a no-op for this test.
+        let now_ms = 1_000i128;
+        let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms);
 
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_in_closure = Arc::clone(&calls);
@@ -1281,17 +1289,15 @@ mod tests {
             })
         });
 
-        // Tick 1: finalize + dispatch once (finalized_at_ms == now_ms_1).
-        run_voting_tick(&ctx, now_ms_1).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        // Tick 2: now strictly past finalized_at_ms + retry window → no dispatch.
-        let now_ms_2 = now_ms_1 + AUTO_EXEC_RETRY_WINDOW_MS + 1;
-        run_voting_tick(&ctx, now_ms_2).await.unwrap();
+        let stats = run_voting_tick(&ctx, now_ms).await.unwrap();
+        assert_eq!(
+            stats.tier2_proposals_finalized, 0,
+            "Archived poll must not (re-)finalize"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
-            "no re-dispatch once the retry window has closed"
+            0,
+            "a non-Finalized (Archived) poll must NOT be re-dispatched"
         );
     }
 
