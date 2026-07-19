@@ -65756,7 +65756,10 @@ mod settings_rmw_cancellation_tests {
 
         drop(gate); // release the lock; the detached task may now proceed
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // 30s: generous vs. the ~15s worst case observed locally (the mock
+        // pkarr relay's register path dominates) — the budget only bounds a
+        // genuine regression, never paces the test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if landed().await {
                 break;
