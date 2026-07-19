@@ -16,6 +16,7 @@ function deps() {
   let capturedGate: ((pcm: Float32Array) => { send: boolean; ptt: boolean }) | undefined;
   const sender = {
     start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
+    switchInputDevice: vi.fn(async () => {}),
     __setGate: (g: never) => { capturedGate = g; },
   };
   const receiver = { init: vi.fn(async () => {}), destroy: vi.fn(), getActiveSenders: () => [], isSpeaking: () => false };
@@ -539,5 +540,89 @@ describe('CallSession call-outcome recording (ZEB-357)', () => {
     const s = await ringingOut();
     await s.cancel();
     expect(outcomes.map((o) => (o.payload as { outcome: string }).outcome)).toEqual(['canceled']);
+  });
+});
+
+describe('CallSession audio device following (ZEB-359)', () => {
+  function prefsStub() {
+    let input: string | null = null;
+    let output: string | null = null;
+    const subs = new Set<() => void>();
+    return {
+      prefs: {
+        getInput: () => input,
+        getOutput: () => output,
+        listDevices: async () => ({
+          inputs: input ? [{ deviceId: input, label: 'Mic' }] : [],
+          outputs: [],
+        }),
+        subscribe: (cb: () => void) => {
+          subs.add(cb);
+          return () => subs.delete(cb);
+        },
+      },
+      setInput(id: string | null) { input = id; for (const cb of [...subs]) cb(); },
+      setOutput(id: string | null) { output = id; for (const cb of [...subs]) cb(); },
+      subCount: () => subs.size,
+    };
+  }
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it('an input pref change during an active call restarts the sender capture', async () => {
+    const d = deps();
+    const p = prefsStub();
+    const s = new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      audioDevices: p.prefs,
+      ...d.factories,
+    });
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    expect(p.subCount()).toBe(1);
+    p.setInput('mic-b');
+    await flush();
+    expect(d.sender.switchInputDevice).toHaveBeenCalledTimes(1);
+    await s.end();
+  });
+
+  it('ending the call unfollows — later pref changes touch nothing', async () => {
+    const d = deps();
+    const p = prefsStub();
+    const s = new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      audioDevices: p.prefs,
+      ...d.factories,
+    });
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    await s.end();
+    expect(p.subCount()).toBe(0);
+    p.setInput('mic-b');
+    await flush();
+    expect(d.sender.switchInputDevice).not.toHaveBeenCalled();
+  });
+
+  it('an output pref change routes the live mixer', async () => {
+    const d = deps();
+    const p = prefsStub();
+    const mixerWithSink = { ...d.mixer, setOutputDevice: vi.fn(async () => {}) };
+    const s = new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      audioDevices: p.prefs,
+      ...d.factories,
+      makeMixer: () => mixerWithSink as never,
+    });
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    p.setOutput('spk-2');
+    await flush();
+    expect(mixerWithSink.setOutputDevice).toHaveBeenCalledWith('spk-2');
+    await s.end();
   });
 });

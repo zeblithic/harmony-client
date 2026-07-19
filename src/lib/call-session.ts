@@ -21,6 +21,7 @@ import { AudioCapture } from './voice/audio-capture';
 import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
+import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
 
 export type CallPhase =
   | 'idle'
@@ -71,9 +72,11 @@ export interface CallSessionDeps {
   senderHash: Uint8Array;
   vadThreshold?: number;
   // Factories (injected in tests; real defaults built inside connect()).
-  makeSender?: (gate: FrameGate) => Pick<VoiceSender, 'start' | 'stop'>;
+  makeSender?: (gate: FrameGate) => Pick<VoiceSender, 'start' | 'stop' | 'switchInputDevice'>;
   makeReceiver?: () => Pick<VoiceReceiver, 'init' | 'destroy' | 'getActiveSenders' | 'isSpeaking'>;
-  makeMixer?: () => Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy'>;
+  makeMixer?: () => Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy' | 'setOutputDevice'>;
+  /** ZEB-359: device preference source. Absent ⇒ system defaults, no following. */
+  audioDevices?: DeviceFollowerDeps['prefs'];
   /** Resolve an owner hex → { displayName, avatarUrl } for the call UI (optional). */
   resolveCard?: (ownerHex: string) => { displayName?: string; avatarUrl?: string } | undefined;
   /**
@@ -105,9 +108,9 @@ export class CallSession {
 
   private vad: VoiceActivityDetector;
   private coreGate: FrameGate;
-  private sender: Pick<VoiceSender, 'start' | 'stop'> | null = null;
+  private sender: Pick<VoiceSender, 'start' | 'stop' | 'switchInputDevice'> | null = null;
   private receiver: Pick<VoiceReceiver, 'init' | 'destroy' | 'getActiveSenders' | 'isSpeaking'> | null = null;
-  private mixer: Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy'> | null = null;
+  private mixer: Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy' | 'setOutputDevice'> | null = null;
 
   private muted = true;
   private deafened = false;
@@ -355,7 +358,11 @@ export class CallSession {
       await this.deps.invoke('join_dm_call', { callId, spaceId });
       await this.subscribeTransport();
 
-      this.mixer = this.deps.makeMixer ? this.deps.makeMixer() : new VoiceMixer();
+      this.mixer = this.deps.makeMixer
+        ? this.deps.makeMixer()
+        : new VoiceMixer({
+            outputDeviceId: () => this.deps.audioDevices?.getOutput() ?? null,
+          });
       await this.mixer.init();
 
       this.receiver = this.deps.makeReceiver
@@ -386,8 +393,30 @@ export class CallSession {
               this.deps.invoke('send_dm_voice_frame', {
                 payload: { callId: this.callId, frameBytes },
               }),
+            inputDeviceId: () => this.deps.audioDevices?.getInput() ?? null,
           });
       await this.sender.start(); // capture starts; muted gate ⇒ nothing transmits
+
+      // ZEB-359: follow device-pref / hot-plug changes for the call's
+      // lifetime. Unfollowed with the other unlisteners in teardownMedia.
+      if (this.deps.audioDevices) {
+        this.unlisteners.push(
+          followAudioDevices({
+            prefs: this.deps.audioDevices,
+            getSender: () => this.sender,
+            getMixer: () => this.mixer,
+            onMicError: (e) => {
+              // No dedicated mic banner on the DM call UI — keep the call up
+              // listen-only. The sender already deactivated itself on the
+              // failed restart.
+              const msg = e instanceof Error ? e.message : String(e);
+              console.warn('call input switch failed; continuing listen-only:', msg);
+              void this.sender?.stop().catch(() => {});
+              this.sender = null;
+            },
+          }),
+        );
+      }
 
       // Drain the mixer every 20ms (audio cadence), mirroring VoiceSession.
       this.drainTimer = setInterval(() => { this.mixer?.drain(); }, 20);
