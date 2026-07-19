@@ -781,3 +781,85 @@ fn fork_of_quorum_community_resets_to_quorum_1() {
     // (without AdminProposal + countersign) would NOT promote a user at quorum=2.
     // (Tested in Test 4 — documented here for cross-reference.)
 }
+
+/// ZEB-300 (AC #3): Tier 2 auto-exec double-mint self-heals via canonical countersign.
+///
+/// Simulates the simultaneous-tick race in a two-admin, `admin_quorum = 2`
+/// community: both admin replicas' ticks independently mint an
+/// `AdminProposal(SetPower { bob, 100 })` before syncing — two distinct proposals
+/// `P_lo`, `P_hi` with different `EventId`s. This is exactly the case the planner's
+/// canonical selection (smallest `EventId`) exists to resolve; here we prove the
+/// event sequences it emits actually converge through the real `materialize` path.
+///
+///  1. With both proposals but no countersign, each has a single distinct signer
+///     (its proposer) — neither reaches quorum=2, so bob stays at power 0. Proves
+///     distinct-id proposals do NOT pool their signers into one quorum.
+///  2. Every replica deterministically countersigns the canonical (min-`EventId`)
+///     proposal `P_lo`. Once the second admin countersigns it, `P_lo` reaches
+///     quorum and bob is promoted to 100. The non-canonical `P_hi` is left inert
+///     (a single signer) — it never applies, and causes no double-apply or error.
+#[test]
+fn tier2_auto_exec_double_mint_converges_via_canonical_countersign() {
+    let admin1 = OwnerAddr([0x01; 16]);
+    let admin2 = OwnerAddr([0x02; 16]);
+    let bob = OwnerAddr([0x03; 16]);
+
+    let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+    events.push(ev([0x90; 16], bob, 12_000, MembershipEventKind::Join));
+
+    // Simultaneous tick: both admins mint a proposal for the SAME (bob, 100)
+    // before seeing each other's. Canonical = smallest EventId = P_lo.
+    let p_lo = [0x10; 16]; // admin1's proposal (canonical, min EventId)
+    let p_hi = [0x20; 16]; // admin2's proposal (non-canonical)
+    events.push(ev(
+        p_lo,
+        admin1,
+        20_000,
+        MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::SetPower {
+                target: bob,
+                level: 100,
+            },
+        },
+    ));
+    events.push(ev(
+        p_hi,
+        admin2,
+        20_001,
+        MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::SetPower {
+                target: bob,
+                level: 100,
+            },
+        },
+    ));
+
+    // (1) Two distinct proposals, each with one distinct signer → neither reaches
+    //     quorum=2; bob stays at 0. Distinct-id proposals must NOT pool signers.
+    let m_race = materialize(&events, admin1);
+    assert_eq!(
+        m_race.power_levels.get(&bob).copied().unwrap_or(0),
+        0,
+        "two single-signer proposals must not combine to reach quorum"
+    );
+
+    // (2) Convergence round: every replica countersigns the canonical (min-id)
+    //     proposal P_lo. admin1 is already P_lo's proposer (planner => Noop), so
+    //     only admin2's countersign is minted — tipping P_lo to {admin1, admin2} = 2.
+    events.push(ev(
+        [0x11; 16],
+        admin2,
+        21_000,
+        MembershipEventKind::AdminCountersign {
+            target_event_id: p_lo,
+        },
+    ));
+
+    let m_done = materialize(&events, admin1);
+    assert_eq!(
+        m_done.power_levels.get(&bob).copied().unwrap_or(0),
+        100,
+        "canonical proposal P_lo must reach quorum and promote bob to 100"
+    );
+    assert_eq!(m_done.admin_quorum, 2, "admin_quorum stays 2");
+}
