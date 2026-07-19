@@ -323,7 +323,6 @@ impl DmTransport for IrohTunnelDmTransport {
         if !targets.is_empty() {
             match Arc::clone(&self.tunnel_send_sem).try_acquire_owned() {
                 Ok(permit) => {
-                    live_attempt_spawned = true;
                     // Permit held → this attempt WILL run, so it's now worth
                     // rebuilding the bootstrap invite (ZEB-504). Doing it here
                     // rather than before the semaphore avoids signing/encoding
@@ -336,23 +335,44 @@ impl DmTransport for IrohTunnelDmTransport {
                     // this drain inline — awaiting it here would deadlock. Spawning
                     // frees the loop; we return `Transient` immediately and the
                     // deposit rung carries durability regardless.
+                    //
+                    // ZEB-525 (Qodo, PR #500 R1): `live_attempt_spawned` is set
+                    // per ARM, not on permit acquisition — the flag must track
+                    // "a send is actually in flight", and the invite-only arm
+                    // sends nothing when the invite rebuild failed.
                     match entry.message_cid {
                         // ZEB-505: invite-only entry — send the rebuilt bootstrap
                         // invite ALONE (no CidNotify; there is no message). The
                         // deposit rung carries durability exactly as for messages.
+                        // No rebuilt invite (rebuild failure, or recipient already
+                        // acked) → NOTHING to send → no spawn, permit dropped,
+                        // and the flag stays false so the deposit fires on the
+                        // first drain pass instead of after the grace window.
                         None => {
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                if let Some(inv) = &invite_wire {
-                                    for (node_id, contact) in &targets {
-                                        mgr.send_dm(*node_id, contact, inv.clone());
+                            if invite_wire.is_some() {
+                                live_attempt_spawned = true;
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    if let Some(inv) = &invite_wire {
+                                        for (node_id, contact) in &targets {
+                                            mgr.send_dm(*node_id, contact, inv.clone());
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            } else {
+                                tracing::debug!(
+                                    recipient = ?recipient,
+                                    "ZEB-525: invite-only entry with no rebuilt invite; \
+                                     no tunnel attempt — deposit rung carries it immediately"
+                                );
+                            }
                         }
                         // Message entry — send the invite (if still needed) ahead of
                         // the CidNotify so the recipient creates the Space first.
+                        // The CidNotify send is attempted regardless of the invite,
+                        // so this arm is always a live attempt.
                         Some(message_cid) => {
+                            live_attempt_spawned = true;
                             // ZEB-506: carry the sender's FULL cached device set (a
                             // cheap cache lookup under a brief owner-state lock — no
                             // CasOp here, so no drain deadlock) instead of a bare
@@ -823,6 +843,74 @@ mod tests {
         assert!(
             second.is_err(),
             "no CidNotify must follow an invite-only send (there is no message)"
+        );
+    }
+
+    /// ZEB-525 (Qodo, PR #500 R1): an invite-only entry whose bootstrap-invite
+    /// rebuild FAILS (no DM Space in owner-state) sends nothing at all — the
+    /// spawn is skipped, so `send` must return `TransientNoLiveAttempt` (first-
+    /// tick deposit), not `Transient` (grace window). Pre-fix, the flag was set
+    /// on permit acquisition and this case was misclassified as a live attempt.
+    #[tokio::test]
+    async fn send_invite_only_with_failed_invite_rebuild_returns_no_live_attempt() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+
+        // Reachable tunnel contact, but NO DM Space installed → the ZEB-504
+        // invite rebuild errors → `build_bootstrap_invite` returns `None`.
+        let contact = DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey.clone(),
+            pq_kem_pubkey: vec![0x08u8; 32],
+        };
+        let mut owner_state = OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(owner_state));
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
+
+        // Invite-only entry: message_cid: None, recipient un-acked.
+        let cid = ContentId::from_bytes([0xee; 32]);
+        let mut entry = synthetic_outbox_entry(SpaceId([0xcc; 16]), cid, recipient);
+        entry.message_cid = None;
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+
+        let err = transport
+            .send(&entry, recipient, Vec::new())
+            .await
+            .expect_err("must return an error (always-deposit)");
+        assert!(
+            matches!(err, TransportError::TransientNoLiveAttempt(_)),
+            "failed invite rebuild sends nothing → must classify as \
+             TransientNoLiveAttempt for first-tick deposit, got {err:?}"
+        );
+
+        // Nothing was spawned, so nothing routes to the manager. Negative wait
+        // mirrors the shed test: it can only false-pass, never false-fail.
+        let routed =
+            tokio::time::timeout(std::time::Duration::from_millis(300), cmd_rx.recv()).await;
+        assert!(
+            routed.is_err(),
+            "no packet may route when the invite rebuild failed (nothing to send)"
         );
     }
 

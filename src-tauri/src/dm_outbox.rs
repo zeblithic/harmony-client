@@ -324,13 +324,13 @@ impl DmTransport for RuntimeUnicastTransport {
 /// recipient over iroh and marks the entry delivered on butler-ack.
 ///
 /// This transport is therefore a no-op "direct send" that always signals
-/// `TransientNoLiveAttempt`. Returning an error (not `Ok`) is deliberate: it
-/// steers every DM into the deposit rung. An `Ok` would make the outbox treat
-/// the DM as "sent, awaiting ack" and it would never deposit. The
-/// `NoLiveAttempt` flavor (ZEB-525) is equally deliberate: this transport by
-/// definition launches no live attempt, so the deposit fires on the FIRST
-/// drain pass instead of waiting out the one-backoff-window grace that only
-/// exists to let a live attempt win.
+/// `TransientNoLiveAttempt`. Returning an error (not `Ok`) is deliberate: an
+/// `Ok` would steer the pair into the "sent, awaiting ack" arm, which only
+/// deposits from `DEPOSIT_NOACK_WINDOWS` (= 2) windows onward — strictly
+/// later, weakening durability. The `NoLiveAttempt` flavor (ZEB-525) is
+/// equally deliberate: this transport by definition launches no live attempt,
+/// so the deposit fires on the FIRST drain pass instead of waiting out the
+/// one-backoff-window grace that only exists to let a live attempt win.
 ///
 /// Move 1a replaces this with `IrohTunnelDmTransport` on the same
 /// `DmTransport` seam — no other outbox code changes.
