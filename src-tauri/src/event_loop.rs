@@ -171,6 +171,14 @@ pub struct VotingLogAdapterRequest {
     /// Hex-encoded community SpaceId — used to form
     /// `harmony/community/{id_hex}/voting`.
     pub id_hex: String,
+    /// ZEB-717: community SpaceId, for the epoch-key `Space` lookup in
+    /// `crdt_state` when the adapter encrypts/decrypts voting packets.
+    pub community_id: crate::owner_state_types::SpaceId,
+    /// ZEB-717: live owner CRDT state. The adapter reads the community's
+    /// current epoch key from here to encrypt outbound puts and to
+    /// current-epoch-only decrypt inbound samples (wire = ciphertext,
+    /// in-process = plaintext).
+    pub crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     /// Engine outbound → Zenoh `put`.
     pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     /// Zenoh subscriber → engine inbound.
@@ -6644,6 +6652,8 @@ pub async fn run(
                 spawn_voting_log_zenoh_adapter(
                     Arc::clone(&session_arc),
                     req.id_hex,
+                    req.community_id,
+                    req.crdt_state,
                     req.publisher_rx,
                     req.subscriber_tx,
                     Arc::clone(&closing),
@@ -9349,9 +9359,13 @@ pub fn spawn_community_state_zenoh_adapter(
 /// `closing` is set, when the engine drops its publisher_tx, or when
 /// Zenoh closes the subscriber. Engine teardown is driven by the
 /// `VotingLogEnginesMap` lock in stop_inner (same as state-root v1).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_voting_log_zenoh_adapter(
     session: Arc<zenoh::Session>,
     community_id_hex: String,
+    // ZEB-717: epoch-key source for adapter-side voting crypto.
+    community_id: crate::owner_state_types::SpaceId,
+    crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     closing: Arc<AtomicBool>,
@@ -9374,11 +9388,12 @@ pub fn spawn_voting_log_zenoh_adapter(
             }
         };
 
-        // Outbound: drain engine's publisher_rx → Zenoh put.
+        // Outbound: drain engine's publisher_rx → encrypt → Zenoh put.
         let session_pub = Arc::clone(&session);
         let key_pub = key_expr.clone();
         let topic_pub = topic.clone();
         let closing_pub = Arc::clone(&closing);
+        let crdt_state_pub = Arc::clone(&crdt_state);
         let pub_handle = tokio::spawn(async move {
             // Bounded-time shutdown: poll `closing` every second so a
             // node-stop event terminates the publisher within ~1s even
@@ -9397,14 +9412,61 @@ pub fn spawn_voting_log_zenoh_adapter(
                     // publish by one loop iteration.
                     biased;
                     maybe = publisher_rx.recv() => {
-                        let Some(bytes) = maybe else { break; };
-                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
-                            if !closing_pub.load(Ordering::SeqCst) {
-                                tracing::warn!(
-                                    topic = %topic_pub,
-                                    error = %e,
-                                    "community voting-log publish failed"
-                                );
+                        let Some(plaintext) = maybe else { break; };
+                        // ZEB-717: encrypt the engine's plaintext SignedVotingEvent
+                        // CBOR under the community's current epoch key (+ voting AAD)
+                        // before it reaches the wire. Missing epoch state ⇒ drop the
+                        // outbound (a node without the key is not a broadcasting
+                        // member; the engine already applied locally).
+                        let wire: Option<Vec<u8>> = {
+                            let st = crdt_state_pub.lock().await;
+                            match st.spaces.get(&community_id) {
+                                Some(space) => match crate::community_state_sync::encrypt_for_topic_with_aad(
+                                    space,
+                                    &plaintext,
+                                    crate::community_state_sync::VOTING_TOPIC_AAD,
+                                ) {
+                                    Ok(envelope) => {
+                                        let mut w = Vec::new();
+                                        match ciborium::into_writer(&envelope, &mut w) {
+                                            Ok(()) => Some(w),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    topic = %topic_pub,
+                                                    error = %e,
+                                                    "voting envelope encode failed; dropping outbound"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            topic = %topic_pub,
+                                            error = %e,
+                                            "voting encrypt failed; dropping outbound"
+                                        );
+                                        None
+                                    }
+                                },
+                                None => {
+                                    tracing::warn!(
+                                        topic = %topic_pub,
+                                        "no community space for voting encrypt; dropping outbound"
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(wire) = wire {
+                            if let Err(e) = session_pub.put(&key_pub, wire).await {
+                                if !closing_pub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_pub,
+                                        error = %e,
+                                        "community voting-log publish failed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -9415,11 +9477,12 @@ pub fn spawn_voting_log_zenoh_adapter(
             }
         });
 
-        // Inbound: Zenoh subscriber → engine's subscriber_tx.
+        // Inbound: Zenoh subscriber → decrypt (current-epoch-only) → engine's subscriber_tx.
         let session_sub = session;
         let key_sub = key_expr;
         let topic_sub = topic;
         let closing_sub = Arc::clone(&closing);
+        let crdt_state_sub = crdt_state;
         let sub_handle = tokio::spawn(async move {
             let sub = match session_sub.declare_subscriber(&key_sub).await {
                 Ok(s) => s,
@@ -9486,8 +9549,68 @@ pub fn spawn_voting_log_zenoh_adapter(
                                     }
                                     continue;
                                 }
-                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                if subscriber_tx.send(bytes).await.is_err() {
+                                let raw: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                // ZEB-717: decrypt at the wire boundary with the
+                                // current-epoch-only cut (spec §3 D3). A kicked-then-
+                                // rotated member holds only a stale epoch key, so its
+                                // envelope's epoch != current_epoch and is dropped here —
+                                // even though this node still retains that old key in
+                                // old_epoch_keys. The engine downstream sees plaintext
+                                // SignedVotingEvent CBOR exactly as before.
+                                let plaintext: Vec<u8> = {
+                                    let envelope: crate::community_state_sync::EncryptedEnvelope =
+                                        match ciborium::from_reader(raw.as_slice()) {
+                                            Ok(env) => env,
+                                            Err(e) => {
+                                                // debug, not warn: a mesh peer (incl. the kicked
+                                                // member this change contains) can spam malformed
+                                                // envelopes — one warn/packet would flood logs.
+                                                tracing::debug!(
+                                                    topic = %topic_sub,
+                                                    error = %e,
+                                                    "drop voting packet (envelope decode)"
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                    let st = crdt_state_sub.lock().await;
+                                    let Some(space) = st.spaces.get(&community_id) else {
+                                        continue;
+                                    };
+                                    match space.current_epoch {
+                                        Some(cur) if cur == envelope.epoch => {}
+                                        _ => {
+                                            // debug, not warn: stale-epoch drops are both the
+                                            // attack-containment path AND expected for legit votes
+                                            // in flight across a rotation — warn would flood.
+                                            tracing::debug!(
+                                                topic = %topic_sub,
+                                                epoch = envelope.epoch,
+                                                "drop voting packet (stale/unknown epoch)"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    match crate::community_state_sync::decrypt_for_topic_with_aad(
+                                        space,
+                                        &envelope,
+                                        crate::community_state_sync::VOTING_TOPIC_AAD,
+                                    ) {
+                                        Ok(pt) => pt,
+                                        Err(e) => {
+                                            // debug, not warn: tag mismatch = tamper / cross-plane
+                                            // replay from a peer — attacker-controllable, so one
+                                            // warn/packet would flood.
+                                            tracing::debug!(
+                                                topic = %topic_sub,
+                                                error = %e,
+                                                "drop voting packet (decrypt)"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                };
+                                if subscriber_tx.send(plaintext).await.is_err() {
                                     break;
                                 }
                             }

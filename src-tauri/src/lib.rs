@@ -47964,6 +47964,10 @@ async fn ensure_voting_engine_for(
     // request and spawn duplicate Zenoh subscribers on the same topic.
     let req = crate::event_loop::VotingLogAdapterRequest {
         id_hex: hex::encode(community_id.0),
+        // ZEB-717: the adapter reads the community's live epoch key from
+        // crdt_state to encrypt/decrypt voting packets at the wire boundary.
+        community_id,
+        crdt_state: crdt_state.clone(),
         publisher_rx,
         subscriber_tx,
     };

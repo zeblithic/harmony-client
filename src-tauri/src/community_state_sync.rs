@@ -383,6 +383,14 @@ pub enum EpochError {
     MissingEpochState,
 }
 
+/// ZEB-717 D1: domain-separation AAD for the voting Zenoh topic. The voting
+/// adapter binds this via [`encrypt_for_topic_with_aad`] /
+/// [`decrypt_for_topic_with_aad`]; the state-root plane uses empty AAD (the
+/// 2-arg helpers). Both planes share the community epoch key, so this distinct
+/// AAD makes a cross-plane ciphertext fail the AEAD tag rather than merely a
+/// downstream deserialize. Versioned (`-v1`) for future rotation.
+pub const VOTING_TOPIC_AAD: &[u8] = b"harmony-voting-v1";
+
 /// Encrypt `plaintext` under the community's current epoch key,
 /// wrapping the AEAD output in an `EncryptedEnvelope` that tags the
 /// epoch for receiver-side key selection.
@@ -393,6 +401,23 @@ pub enum EpochError {
 /// partially-migrated Space (e.g., deserialized before ZEB-249 fields
 /// were added) can reach this helper and must not panic.
 pub fn encrypt_for_topic(space: &Space, plaintext: &[u8]) -> Result<EncryptedEnvelope, EpochError> {
+    // Empty AAD is byte-identical to the previous no-AAD call, so state-root
+    // wire bytes and fixtures are unchanged.
+    encrypt_for_topic_with_aad(space, plaintext, b"")
+}
+
+/// AAD-parameterized variant of [`encrypt_for_topic`] (ZEB-717 D1).
+///
+/// The voting plane binds `VOTING_TOPIC_AAD` for cryptographic domain
+/// separation from the state-root plane (which passes `b""` via
+/// [`encrypt_for_topic`]) — both share the same community epoch key, so
+/// without a distinct AAD a cross-plane ciphertext would merely fail a
+/// downstream deserialize instead of the AEAD tag. See ZEB-717 spec §3 (D1).
+pub fn encrypt_for_topic_with_aad(
+    space: &Space,
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<EncryptedEnvelope, EpochError> {
     // C6: return Err instead of panicking on missing epoch state.
     let epoch = space.current_epoch.ok_or(EpochError::MissingEpochState)?;
     let key = space
@@ -405,7 +430,13 @@ pub fn encrypt_for_topic(space: &Space, plaintext: &[u8]) -> Result<EncryptedEnv
     OsRng.fill_bytes(&mut nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| EpochError::EncryptionFailed(epoch))?;
 
     Ok(EncryptedEnvelope {
@@ -426,6 +457,22 @@ pub fn decrypt_for_topic(
     space: &Space,
     envelope: &EncryptedEnvelope,
 ) -> Result<Vec<u8>, EpochError> {
+    decrypt_for_topic_with_aad(space, envelope, b"")
+}
+
+/// AAD-parameterized variant of [`decrypt_for_topic`] (ZEB-717 D1). The `aad`
+/// MUST match the one used at encrypt time; a mismatch fails the AEAD tag
+/// (`DecryptionFailed`). Voting passes `VOTING_TOPIC_AAD`, state-root `b""`.
+///
+/// Note: this retains the general current-then-old key selection. The voting
+/// receive path deliberately does NOT rely on the old-key branch — it gates on
+/// `envelope.epoch == current_epoch` first (ZEB-717 spec §3 D3), so a kicked
+/// member's retained old-epoch envelope is refused before this is reached.
+pub fn decrypt_for_topic_with_aad(
+    space: &Space,
+    envelope: &EncryptedEnvelope,
+    aad: &[u8],
+) -> Result<Vec<u8>, EpochError> {
     let current_epoch = space
         .current_epoch
         .ok_or(EpochError::KeyNotAvailable(envelope.epoch))?;
@@ -440,9 +487,49 @@ pub fn decrypt_for_topic(
     cipher
         .decrypt(
             Nonce::from_slice(&envelope.nonce),
-            envelope.ciphertext.as_slice(),
+            chacha20poly1305::aead::Payload {
+                msg: envelope.ciphertext.as_slice(),
+                aad,
+            },
         )
         .map_err(|_| EpochError::DecryptionFailed(envelope.epoch))
+}
+
+/// Test-only helper: build a Community `Space` with `id` at `epoch` under
+/// `key`, empty `old_epoch_keys`. Integration tests seed an `OwnerState` with
+/// this so the voting adapter (ZEB-717) has a live epoch key to encrypt /
+/// current-epoch-only-decrypt against. Callers may set `old_epoch_keys`
+/// afterward to exercise the retained-old-key rejection path.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn test_community_space(id: SpaceId, epoch: u64, key: EpochKey) -> Space {
+    let zero_hlc = Hlc {
+        wall_ms: 0,
+        logical: 0,
+        device_id: "t".into(),
+    };
+    Space {
+        id,
+        kind: crate::owner_state_types::SpaceKind::Community,
+        parent: None,
+        community_id: None,
+        name: "Test".into(),
+        transport: None,
+        members: vec![],
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: zero_hlc.clone(),
+        updated_at: zero_hlc,
+        content_key: None,
+        prior_content_keys: vec![],
+        current_epoch: Some(epoch),
+        current_epoch_key: Some(key),
+        old_epoch_keys: std::collections::BTreeMap::new(),
+        admin_addr: Some(OwnerAddr([0xbb; 16])),
+        is_invite_only: Some(false),
+        shared_in_profile: false,
+        pending_join_at: None,
+    }
 }
 
 /// Default debounce window between a `notify_dirty` and the resulting
@@ -7776,34 +7863,7 @@ mod envelope_tests {
     /// Build a minimal Community-kind Space with the given epoch and key.
     /// Uses placeholder values for fields not relevant to epoch crypto.
     fn build_test_community_space(epoch: u64, key: EpochKey) -> Space {
-        let zero_hlc = Hlc {
-            wall_ms: 0,
-            logical: 0,
-            device_id: "t".into(),
-        };
-        Space {
-            id: SpaceId([0xaa; 16]),
-            kind: SpaceKind::Community,
-            parent: None,
-            community_id: None,
-            name: "Test".into(),
-            transport: None,
-            members: vec![],
-            custom_name: None,
-            notification_pref: None,
-            left_at: None,
-            created_at: zero_hlc.clone(),
-            updated_at: zero_hlc,
-            content_key: None,
-            prior_content_keys: vec![],
-            current_epoch: Some(epoch),
-            current_epoch_key: Some(key),
-            old_epoch_keys: std::collections::BTreeMap::new(),
-            admin_addr: Some(OwnerAddr([0xbb; 16])),
-            is_invite_only: Some(false),
-            shared_in_profile: false,
-            pending_join_at: None,
-        }
+        super::test_community_space(SpaceId([0xaa; 16]), epoch, key)
     }
 
     /// ZEB-597: the case-C publisher must key on the LIVE current_epoch_key
@@ -7884,6 +7944,54 @@ mod envelope_tests {
         assert_eq!(envelope.epoch, 0);
         let decrypted = decrypt_for_topic(&space, &envelope).expect("decrypt");
         assert_eq!(decrypted.as_slice(), plaintext.as_ref());
+    }
+
+    // ZEB-717 D1: AAD domain separation between the voting plane and the
+    // state-root plane, which share the same community epoch key.
+    const VOTING_AAD_FIXTURE: &[u8] = b"harmony-voting-v1";
+
+    #[test]
+    fn aad_round_trip_matches() {
+        let space = build_test_community_space(0, EpochKey::new([0xab; 32]));
+        let pt = b"voting-plaintext";
+        let env = encrypt_for_topic_with_aad(&space, pt, VOTING_AAD_FIXTURE).expect("encrypt");
+        assert_eq!(env.epoch, 0);
+        let out = decrypt_for_topic_with_aad(&space, &env, VOTING_AAD_FIXTURE).expect("decrypt");
+        assert_eq!(out.as_slice(), pt.as_ref());
+    }
+
+    #[test]
+    fn aad_mismatch_rejects() {
+        let space = build_test_community_space(0, EpochKey::new([0xab; 32]));
+        let env = encrypt_for_topic_with_aad(&space, b"x", VOTING_AAD_FIXTURE).expect("encrypt");
+        // Wrong AAD (empty = the state-root domain) must fail the AEAD tag.
+        let err = decrypt_for_topic_with_aad(&space, &env, b"").unwrap_err();
+        assert!(
+            matches!(err, EpochError::DecryptionFailed(_)),
+            "cross-plane AAD mismatch must fail the tag, got {err:?}"
+        );
+        // The 2-arg state-root decrypt (empty AAD) must also refuse a voting envelope.
+        assert!(decrypt_for_topic(&space, &env).is_err());
+    }
+
+    #[test]
+    fn empty_aad_is_byte_compatible_state_root() {
+        // The 2-arg path must be indistinguishable from with_aad(.., b"") — this
+        // is what keeps state-root wire bytes/fixtures unchanged by ZEB-717.
+        let space = build_test_community_space(0, EpochKey::new([0xab; 32]));
+        let env = encrypt_for_topic(&space, b"state-root").expect("encrypt");
+        assert_eq!(
+            decrypt_for_topic(&space, &env)
+                .expect("2-arg decrypt")
+                .as_slice(),
+            b"state-root".as_ref()
+        );
+        assert_eq!(
+            decrypt_for_topic_with_aad(&space, &env, b"")
+                .expect("with_aad(b\"\") decrypt")
+                .as_slice(),
+            b"state-root".as_ref()
+        );
     }
 
     #[test]
