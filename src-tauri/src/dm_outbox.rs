@@ -39,6 +39,15 @@ pub type MessageId = OutboxEntryId;
 pub enum TransportError {
     #[error("transport temporarily unavailable: {0}")]
     Transient(String),
+    /// ZEB-525: transient failure where NO live delivery attempt was even
+    /// launched (no reachable tunnel targets, tunnel-send capacity shed, or a
+    /// deposit-only interim transport). Backoff treatment is identical to
+    /// [`Transient`](Self::Transient); the difference is deposit candidacy —
+    /// drain's Err-arm skips the one-backoff-window grace and deposits on the
+    /// FIRST failure, because the grace window only exists to give an
+    /// in-flight live attempt a chance to win before burning a deposit.
+    #[error("transport temporarily unavailable (no live attempt): {0}")]
+    TransientNoLiveAttempt(String),
     #[error("transport permanently failed: {0}")]
     Permanent(String),
 }
@@ -315,10 +324,13 @@ impl DmTransport for RuntimeUnicastTransport {
 /// recipient over iroh and marks the entry delivered on butler-ack.
 ///
 /// This transport is therefore a no-op "direct send" that always signals
-/// `Transient`. Returning `Transient` (not `Ok`) is deliberate: it steers
-/// every DM into the deposit rung (the `pre_failure_count >= 1` transient
-/// gate fires deposit on the next drain pass). An `Ok` would make the
-/// outbox treat the DM as "sent, awaiting ack" and it would never deposit.
+/// `TransientNoLiveAttempt`. Returning an error (not `Ok`) is deliberate: it
+/// steers every DM into the deposit rung. An `Ok` would make the outbox treat
+/// the DM as "sent, awaiting ack" and it would never deposit. The
+/// `NoLiveAttempt` flavor (ZEB-525) is equally deliberate: this transport by
+/// definition launches no live attempt, so the deposit fires on the FIRST
+/// drain pass instead of waiting out the one-backoff-window grace that only
+/// exists to let a live attempt win.
 ///
 /// Move 1a replaces this with `IrohTunnelDmTransport` on the same
 /// `DmTransport` seam — no other outbox code changes.
@@ -332,7 +344,7 @@ impl DmTransport for DepositOnlyDmTransport {
         _recipient: OwnerAddr,
         _destinations: Vec<[u8; 16]>,
     ) -> Result<(), TransportError> {
-        Err(TransportError::Transient(
+        Err(TransportError::TransientNoLiveAttempt(
             "deposit-only interim (ZEB-474): no direct DM carrier; \
              routing via butler/community-relay deposit"
                 .to_string(),
@@ -1555,8 +1567,20 @@ impl DmOutbox {
                     // contains exactly one direct attempt). Rung outcomes
                     // never touch the AttemptState written above (spec §6:
                     // delivery is never worse than today).
-                    if matches!(e, TransportError::Transient(_))
-                        && pre_failure_count >= 1
+                    //
+                    // ZEB-525: the `pre_failure_count >= 1` grace window
+                    // exists to let an in-flight live attempt win (recipient
+                    // acks via the tunnel before the next tick → deposit
+                    // never fires → butler storage/bandwidth saved). When
+                    // the transport reports it launched NO live attempt
+                    // (`TransientNoLiveAttempt`), the grace buys nothing —
+                    // it is a pure one-window delay on first durability —
+                    // so candidacy fires on the FIRST failure instead.
+                    let no_live_attempt =
+                        matches!(e, TransportError::TransientNoLiveAttempt(_));
+                    if (no_live_attempt
+                        || (matches!(e, TransportError::Transient(_))
+                            && pre_failure_count >= 1))
                         && (self.butler_deposit_client.is_some()
                             || self.community_relay_deposit_client.is_some())
                     {
@@ -9066,13 +9090,15 @@ mod tests {
     // ── ZEB-474 Task 1: DepositOnlyDmTransport unit test ─────────────────────
 
     #[tokio::test]
-    async fn deposit_only_transport_send_signals_transient_to_steer_into_deposit_rung() {
+    async fn deposit_only_transport_send_signals_no_live_attempt_to_steer_into_deposit_rung() {
         // ZEB-474: the deposit-only transport must never claim a direct send
-        // succeeded — returning Transient is what steers the outbox into its
+        // succeeded — returning an error is what steers the outbox into its
         // butler/community-relay deposit rung (which performs real delivery and
         // calls mark_ack_delivered on ack). An Ok here would be a silent
         // black-hole: the outbox would treat the DM as "sent, awaiting ack"
-        // and never deposit it.
+        // and never deposit it. ZEB-525: the flavor is `TransientNoLiveAttempt`
+        // — this transport launches no live attempt, so the deposit fires on
+        // the FIRST drain pass instead of after a one-window grace.
         let t = DepositOnlyDmTransport;
         let entry = OutboxEntry {
             id: OutboxEntryId([1u8; 16]),
@@ -9091,13 +9117,14 @@ mod tests {
         let err = t
             .send(&entry, recipient, vec![[1u8; 16]])
             .await
-            .expect_err("deposit-only send must signal Transient, never Ok");
-        assert!(matches!(err, TransportError::Transient(_)));
+            .expect_err("deposit-only send must signal an error, never Ok");
+        assert!(matches!(err, TransportError::TransientNoLiveAttempt(_)));
     }
 
     // ── ZEB-474 Task 3: deposit-routing integration test ─────────────────────
 
-    /// Drive one drain tick with `DepositOnlyDmTransport` (always Transient).
+    /// Drive one drain tick with `DepositOnlyDmTransport` (always
+    /// `TransientNoLiveAttempt` — ZEB-525).
     async fn drain_with_deposit_only_transport(
         o: &mut DmOutbox,
         state: &mut OwnerState,
@@ -9108,11 +9135,13 @@ mod tests {
     }
 
     /// With `DepositOnlyDmTransport` wired and a butler deposit client
-    /// installed + acking, the DM routes through the deposit rung and is
-    /// marked delivered via `mark_ack_delivered` on the second drain pass
-    /// (first drain records the initial Transient; second fires the rung).
+    /// installed + acking, the DM routes through the deposit rung on the
+    /// FIRST drain pass (ZEB-525: `TransientNoLiveAttempt` bypasses the
+    /// one-window `pre_failure_count >= 1` grace — the deposit-only transport
+    /// launches no live attempt for the grace to wait on) and is marked
+    /// delivered via `mark_ack_delivered` in the same tick.
     #[tokio::test]
-    async fn deposit_only_transport_routes_dm_to_deposit_rung_and_delivers_on_ack() {
+    async fn deposit_only_transport_routes_dm_to_deposit_rung_on_first_tick() {
         let alice = OwnerAddr([0xaa; 16]);
         let bob = OwnerAddr([0xbb; 16]);
         let entry = entry_with_age(7, vec![bob], 1_000);
@@ -9127,23 +9156,15 @@ mod tests {
         let mock = MockDepositClient::returning(DepositRungOutcome::Acked);
         o.set_butler_deposit_client(mock.clone());
 
-        // Tick 1 (t=10_000): first Transient from deposit-only transport.
-        // No prior AttemptState → deposit rung must NOT fire yet.
+        // Tick 1 (t=10_000): the very first NoLiveAttempt failure fires the
+        // deposit rung — no prior AttemptState needed (pre-ZEB-525 this
+        // waited for tick 2) → butler acks → mark_ack_delivered → surfaces
+        // in newly_delivered.
         let outcome1 = drain_with_deposit_only_transport(&mut o, &mut state, 10_000).await;
-        assert!(
-            mock.calls().is_empty(),
-            "first transient must not fire deposit rung (no prior AttemptState)"
-        );
-        assert!(outcome1.newly_delivered.is_empty());
-
-        // Tick 2 (t=15_000, backoff window elapsed): second Transient from
-        // deposit-only transport. AttemptState now exists → deposit rung fires
-        // → butler acks → mark_ack_delivered → surfaces in newly_delivered.
-        let outcome2 = drain_with_deposit_only_transport(&mut o, &mut state, 15_000).await;
         assert_eq!(
             mock.calls().len(),
             1,
-            "deposit rung must fire exactly once on tick 2"
+            "deposit rung must fire on the FIRST tick for a no-live-attempt transport"
         );
         let req = &mock.calls()[0];
         assert_eq!(req.entry_id, entry_id);
@@ -9151,7 +9172,7 @@ mod tests {
         assert_eq!(req.space_id, space_id);
         assert_eq!(req.message_cid, Some(message_cid));
         assert_eq!(
-            outcome2.newly_delivered,
+            outcome1.newly_delivered,
             vec![(space_id, message_cid, bob)],
             "butler ack must surface in newly_delivered (dm-delivered emit)"
         );
@@ -9161,6 +9182,15 @@ mod tests {
             matches!(stored.delivery_status, DeliveryStatus::Complete),
             "sole recipient acked via butler -> Complete"
         );
+
+        // A second tick must not double-deposit: the entry completed on tick 1.
+        let outcome2 = drain_with_deposit_only_transport(&mut o, &mut state, 15_000).await;
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "no further deposit for a completed entry"
+        );
+        assert!(outcome2.newly_delivered.is_empty());
     }
 
     /// ZEB-473 Task 8 / CR4 — always-deposit invariant for the LIVE tunnel
