@@ -4878,7 +4878,7 @@ mod tests {
         // ZEB-688: wait for the replay drop itself instead of sleeping — the
         // counter makes the negative assertion below non-vacuous (we KNOW the
         // second packet reached the drop path before asserting nothing landed).
-        let _ = wait_for(
+        wait_for(
             || async { (fix.engine.replay_drop_count() >= 1).then_some(()) },
             Duration::from_secs(2),
         )
