@@ -33938,6 +33938,10 @@ where
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            // ZEB-713: recovery state is not part of the epoch snapshot;
+            // the hint is superseded by CRDT replay once events arrive.
+            recovery_designates: None,
+            recovery_proposals: Vec::new(),
         };
         if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
             let state_g = state_arc.lock().await;
@@ -42019,6 +42023,14 @@ pub enum ProposalKindDto {
     ChangeQuorum {
         new_quorum: u8,
     },
+    /// ZEB-713: recovery-designate configuration proposal. Designates
+    /// are hex-encoded OwnerAddrs; display-name resolution is the
+    /// frontend's job (same convention as signer_display_names).
+    SetRecoveryDesignates {
+        designate_addrs: Vec<String>,
+        threshold: u8,
+        veto_window_ms: u64,
+    },
 }
 
 /// ZEB-250 §6.2: admin governance feed — all AdminProposal events for a
@@ -42323,6 +42335,15 @@ pub fn compute_pending_admin_proposals(
             },
             ProposalKind::ChangeQuorum { new_quorum } => ProposalKindDto::ChangeQuorum {
                 new_quorum: *new_quorum,
+            },
+            ProposalKind::SetRecoveryDesignates {
+                designates,
+                threshold,
+                veto_window_ms,
+            } => ProposalKindDto::SetRecoveryDesignates {
+                designate_addrs: designates.iter().map(|d| hex::encode(d.0)).collect(),
+                threshold: *threshold,
+                veto_window_ms: *veto_window_ms,
             },
         };
 
@@ -42976,6 +42997,14 @@ pub fn delta_to_change(
         // membership-state; no MembershipChange is projected. Consumed
         // by CommunityRelayResolver.
         | crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. }
+        // ZEB-713: recovery events are governance events with DERIVED
+        // effects (evaluated at materialize time, not at event arrival);
+        // no per-event MembershipChange is projected. The D2 recovery
+        // banner reads the materialized recovery_proposals view via its
+        // own IPC instead.
+        | crate::community_membership::MembershipEventKind::RecoveryProposal { .. }
+        | crate::community_membership::MembershipEventKind::RecoveryCosign { .. }
+        | crate::community_membership::MembershipEventKind::RecoveryVeto { .. }
         // ZEB-495 (ZEB-340 Part 2): DeviceAnnounce only adds a device key to
         // an already-Joined owner's MemberState — it changes no status/power
         // and projects no MembershipChange. (The roster re-renders the owner
@@ -43918,6 +43947,8 @@ mod community_member_dto_tests {
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            recovery_designates: None,
+            recovery_proposals: Vec::new(),
         };
         let dto = member_info_for(&materialized);
 
@@ -43965,6 +43996,8 @@ mod community_member_dto_tests {
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            recovery_designates: None,
+            recovery_proposals: Vec::new(),
         };
         let dto = member_info_for(&materialized);
         assert_eq!(dto.len(), 2);

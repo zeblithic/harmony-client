@@ -6,7 +6,13 @@
   type ProposalKindDto =
     | { kind: 'SetPower'; target_addr: string; target_display_name: string | null; level: number }
     | { kind: 'Kick'; target_addr: string; target_display_name: string | null; reason: string | null }
-    | { kind: 'ChangeQuorum'; new_quorum: number };
+    | { kind: 'ChangeQuorum'; new_quorum: number }
+    | {
+        kind: 'SetRecoveryDesignates';
+        designate_addrs: string[];
+        threshold: number;
+        veto_window_ms: number;
+      };
 
   type PendingAdminProposalDto = {
     event_id: string;
@@ -146,6 +152,10 @@
       }
       case 'ChangeQuorum':
         return `Change quorum to ${kind.new_quorum}`;
+      case 'SetRecoveryDesignates': {
+        const days = Math.round(kind.veto_window_ms / 86_400_000);
+        return `Configure admin recovery (${kind.threshold} of ${kind.designate_addrs.length} designates, ${days}-day veto window)`;
+      }
     }
   }
 
