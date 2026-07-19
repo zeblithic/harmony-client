@@ -43465,11 +43465,32 @@ pub async fn self_heal_community_observer(
             .map(|e| e.id);
 
         let Some(triggered_by) = triggered_by_id else {
-            tracing::warn!(
-                ?community_id,
-                ?target,
-                "self_heal: pending_rotation_for but no Kick/Leave event found — skipping"
-            );
+            // ZEB-713 (PR #497 R2): a recovery-derived kick has no
+            // Kick/Leave event — its rotation cites the executed
+            // RecoveryProposal instead, and synthesizing it belongs to
+            // the ZEB-714 observer wiring because it must first honor
+            // the F=48h finality margin (spec §4.3); firing here at the
+            // deadline would violate that. Expected state, debug-level.
+            let recovery_derived = materialized.recovery_proposals.iter().any(|p| {
+                p.lost_admin == target
+                    && matches!(
+                        p.phase,
+                        crate::community_membership::RecoveryPhase::Executed
+                    )
+            });
+            if recovery_derived {
+                tracing::debug!(
+                    ?community_id,
+                    ?target,
+                    "self_heal: recovery-derived kick — rotation synthesis deferred to ZEB-714 (finality margin)"
+                );
+            } else {
+                tracing::warn!(
+                    ?community_id,
+                    ?target,
+                    "self_heal: pending_rotation_for but no Kick/Leave event found — skipping"
+                );
+            }
             continue;
         };
 

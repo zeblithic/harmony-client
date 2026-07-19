@@ -1937,6 +1937,15 @@ pub enum RecoveryPhase {
     /// `(t_R, event_id)` tie-break. Terminal.
     #[serde(rename = "s")]
     Superseded,
+    /// PR #497 R2 (Greptile P1): the deadline passed but `new_admin`
+    /// was not Joined AS OF THE DEADLINE (replay-time snapshot).
+    /// Terminal — a later rejoin does NOT revive it (that would let a
+    /// stalled proposal retroactively flip a rival group's winner).
+    /// Nothing executed: no promotion, no kick — the community keeps
+    /// its (dead) admin and the designates simply run a fresh proposal
+    /// (a Stalled proposal does not count against RP6).
+    #[serde(rename = "l")]
+    Stalled,
 }
 
 impl CanonicalPayloadSealed for RecoveryPhase {}
@@ -2252,6 +2261,38 @@ struct RecoveryWork {
     /// evaluation time to find the Rth-smallest (t_R).
     sig_walls: Vec<u64>,
     signers: BTreeSet<OwnerAddr>,
+    /// PR #497 R2 (Greptile P1): deadline as computed AT REPLAY TIME
+    /// (when the Rth signature folded) — the cutoff for the
+    /// `new_admin_joined` snapshot below. May differ from evaluate's
+    /// authoritative deadline in exotic late-delivery orderings; both
+    /// are pure functions of the sorted log, so replicas still converge.
+    deadline_at_replay: Option<u64>,
+    /// PR #497 R2 (Greptile P1): running snapshot of "new_admin is
+    /// currently Joined", refreshed after every replayed event whose
+    /// wall is within `deadline_at_replay`. Execution requires this —
+    /// judging Joined-ness AS OF THE DEADLINE (log-derivable, stable
+    /// under later rejoins) instead of at evaluation time, so a
+    /// stalled proposal can never revive and retroactively flip a
+    /// rival group's winner. Without this gate, an execution whose
+    /// new_admin left mid-window would kick the last admin and leave
+    /// the community with no power-100 member at all.
+    new_admin_joined: bool,
+}
+
+/// ZEB-713 (PR #497 R2): once a proposal's distinct-signer count
+/// reaches R, freeze the replay-time deadline used as the
+/// `new_admin_joined` snapshot cutoff. `checked_add` mirrors the
+/// evaluate-side fail-closed arithmetic (an overflowing window leaves
+/// the proposal Expired there, so a None here is inert).
+fn maybe_set_replay_deadline(work: &mut RecoveryWork) {
+    if work.deadline_at_replay.is_some() || work.signers.len() < work.threshold as usize {
+        return;
+    }
+    let mut walls = work.sig_walls.clone();
+    walls.sort_unstable();
+    if let Some(tr) = walls.get(work.threshold as usize - 1) {
+        work.deadline_at_replay = tr.checked_add(work.veto_window_ms);
+    }
 }
 
 /// ZEB-713: fold one cosign signature into a proposal's working state.
@@ -2284,6 +2325,7 @@ fn fold_recovery_cosign(work: &mut RecoveryWork, cosign: QueuedRecoveryCosign) {
     }
     if work.signers.insert(cosign.actor) {
         work.sig_walls.push(cosign.wall_ms);
+        maybe_set_replay_deadline(work);
     }
 }
 
@@ -2360,7 +2402,15 @@ fn evaluate_recovery_phases(
         } else {
             match deadline {
                 None => RecoveryPhase::Collecting,
-                Some(d) if t > d => RecoveryPhase::Executed,
+                // PR #497 R2 (Greptile P1): execution is ATOMIC — it
+                // requires new_admin Joined as of the deadline
+                // (replay-time snapshot). Otherwise the proposal stalls
+                // terminally with NO effects: a kick without the paired
+                // promotion would leave a sole-admin community with no
+                // power-100 member at all, bricked by the recovery
+                // mechanism itself.
+                Some(d) if t > d && work.new_admin_joined => RecoveryPhase::Executed,
+                Some(d) if t > d => RecoveryPhase::Stalled,
                 Some(_) => RecoveryPhase::TimeLocked,
             }
         };
@@ -3473,6 +3523,11 @@ pub fn materialize_with_now(
                     config_digest: *config_digest,
                     sig_walls: vec![event.at.wall_ms],
                     signers: BTreeSet::from([event.actor]),
+                    deadline_at_replay: None,
+                    // RP3 verified new_admin Joined at proposal time; the
+                    // per-event refresh below keeps this current until
+                    // the deadline.
+                    new_admin_joined: is_joined_member(&m, new_admin),
                 };
                 // Fold queued forward-ref cosigns (ZEB-250 R2(b) mirror).
                 if let Some(queued) = rec_pending_cosigns.remove(&event.id) {
@@ -3480,6 +3535,9 @@ pub fn materialize_with_now(
                         fold_recovery_cosign(&mut work, cosign);
                     }
                 }
+                // R=1 (or forward-ref-satisfied) proposals reach
+                // threshold at bind — freeze the snapshot cutoff here.
+                maybe_set_replay_deadline(&mut work);
                 rec_proposals.insert(event.id, work);
             }
             MembershipEventKind::RecoveryCosign { target_event_id } => {
@@ -3513,6 +3571,25 @@ pub fn materialize_with_now(
                 }
             }
         }
+
+        // PR #497 R2 (Greptile P1): refresh each open proposal's
+        // new_admin-Joined snapshot while replay is still within its
+        // deadline window. The last refresh at or before the deadline
+        // is the value execution is judged on — Joined-ness AS OF the
+        // deadline, log-derivable and stable under later rejoins.
+        // Bounded work: RP6 caps open proposals at |designates|.
+        for work in rec_proposals.values_mut() {
+            let within_window = work
+                .deadline_at_replay
+                .map(|d| event.at.wall_ms <= d)
+                .unwrap_or(true);
+            if within_window {
+                work.new_admin_joined = matches!(
+                    m.members.get(&work.new_admin).map(|s| s.status),
+                    Some(MemberStatus::Joined)
+                );
+            }
+        }
     }
 
     // ZEB-713 post-pass: evaluate recovery lifecycles at the now-floor
@@ -3541,12 +3618,11 @@ pub fn materialize_with_now(
             logical: 0,
             device_id: String::new(),
         };
-        // Promote — defensively only while new_admin is still Joined in
-        // the final state (RP3 checked Joined at proposal time; a
-        // member who left during the window is not promoted).
-        if is_joined_member(&m, &work.new_admin) {
-            m.power_levels.insert(work.new_admin, 100);
-        }
+        // Promote. Executed already implies new_admin was Joined as of
+        // the deadline (the evaluate gate); if they left AFTER the
+        // deadline the granted power entry is inert without Joined
+        // status — the same state any departing admin leaves behind.
+        m.power_levels.insert(work.new_admin, 100);
         // Derived kick of the NAMED lost_admin (loss-as-compromise —
         // activity does not immunize the key, spec §6 T9). Mirrors the
         // direct-Kick arm, with one deliberate difference: a
@@ -12878,7 +12954,11 @@ mod zeb_713_recovery_materialize_tests {
     }
 
     #[test]
-    fn new_admin_who_left_during_window_is_not_promoted() {
+    fn new_admin_leaving_during_window_stalls_atomically() {
+        // PR #497 R2 (Greptile P1): execution is atomic. If new_admin
+        // left before the deadline, NOTHING executes — kicking the
+        // (sole) lost admin without the paired promotion would leave
+        // the community with no power-100 member at all.
         let (mut events, digest) = base_world();
         events.push(proposal(digest));
         events.push(cosign([0xB1; 16], d2(), T_R));
@@ -12889,11 +12969,97 @@ mod zeb_713_recovery_materialize_tests {
             MembershipEventKind::Leave,
         ));
         let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
-        // Execution still fires (the kick side), but the departed
-        // new_admin is not promoted.
-        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Stalled);
         assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Joined);
+        // No recovery-derived rotation marker (m_new IS marked — by
+        // their ordinary Leave, the normal ZEB-249 path).
+        assert!(!m.pending_rotation_for.contains(&admin1()));
+
+        // Terminal: a rejoin AFTER the deadline does not revive it.
+        events.push(ev(
+            [0xB7; 16],
+            m_new(),
+            DEADLINE + 50,
+            MembershipEventKind::Join,
+        ));
+        let after = materialize_with_now(&events, admin1(), Some(DEADLINE + 100));
+        assert_eq!(view(&after, P1).phase, RecoveryPhase::Stalled);
+        assert_eq!(after.members[&admin1()].status, MemberStatus::Joined);
+    }
+
+    #[test]
+    fn new_admin_leaving_after_deadline_execution_stands() {
+        // The snapshot is judged AS OF the deadline: a departure after
+        // it does not undo the (already-derived) execution; the granted
+        // power entry is inert without Joined status.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xB6; 16],
+            m_new(),
+            DEADLINE + 200,
+            MembershipEventKind::Leave,
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 300));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(m.power_levels.get(&m_new()).copied(), Some(100));
         assert_eq!(m.members[&admin1()].status, MemberStatus::Banned);
+    }
+
+    #[test]
+    fn stalled_rival_never_flips_the_executed_winner() {
+        // p1 (lower t_R) stalls because its new_admin left mid-window;
+        // p2 executes. When p1's new_admin later rejoins, p1 must STAY
+        // stalled — the deadline-snapshot rule is what keeps the
+        // winner stable instead of retroactively re-deriving p2 away.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest)); // p1: lost=admin1, new=m_new, t0=T0
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xB6; 16],
+            m_new(),
+            DEADLINE - 100,
+            MembershipEventKind::Leave,
+        ));
+        // p2: same lost admin, new=m2, later t_R.
+        events.push(ev(
+            [0xB4; 16],
+            d2(),
+            101_000,
+            MembershipEventKind::RecoveryProposal {
+                lost_admin: admin1(),
+                new_admin: m2(),
+                config_digest: digest,
+            },
+        ));
+        events.push(ev(
+            [0xB5; 16],
+            d1(),
+            111_000,
+            MembershipEventKind::RecoveryCosign {
+                target_event_id: [0xB4; 16],
+            },
+        ));
+        let t_after = 111_000 + W + 1;
+        let m = materialize_with_now(&events, admin1(), Some(t_after));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Stalled);
+        assert_eq!(view(&m, [0xB4; 16]).phase, RecoveryPhase::Executed);
+        assert_eq!(m.power_levels.get(&m2()).copied(), Some(100));
+
+        // m_new rejoins — p1 stays stalled, p2 stays the winner.
+        events.push(ev(
+            [0xB8; 16],
+            m_new(),
+            t_after + 10,
+            MembershipEventKind::Join,
+        ));
+        let after = materialize_with_now(&events, admin1(), Some(t_after + 100));
+        assert_eq!(view(&after, P1).phase, RecoveryPhase::Stalled);
+        assert_eq!(view(&after, [0xB4; 16]).phase, RecoveryPhase::Executed);
+        assert_eq!(after.power_levels.get(&m2()).copied(), Some(100));
+        assert_ne!(after.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
     }
 }
 

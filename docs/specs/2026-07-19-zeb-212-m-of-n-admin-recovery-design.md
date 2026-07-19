@@ -183,6 +183,16 @@ die terminal.
 > tie-break picks one winner per group. This is the §3.2 multi-loss semantics
 > (one proposal per lost admin, each independently executable) — a global
 > single-winner rule would force serial W-day windows for multi-admin loss.
+>
+> **D1 implementation note (PR #497 R2).** Execution is **atomic** and
+> additionally requires `new_admin` to be Joined **as of the deadline**
+> (a replay-time snapshot, log-derivable). If they left mid-window the
+> proposal ends **Stalled** — terminal, no promotion, no kick: kicking the
+> sole lost admin without the paired promotion would leave the community
+> with no power-100 member, bricked by the recovery mechanism itself. A
+> later rejoin does not revive a Stalled proposal (that could retroactively
+> flip a rival group's executed winner); the designates simply run a fresh
+> proposal (Stalled does not count against RP6).
 
 ## 4. Convergence, liveness & partition analysis
 
