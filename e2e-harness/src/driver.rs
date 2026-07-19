@@ -995,6 +995,191 @@ pub async fn poll_reachability_observed(
     .await
 }
 
+// ── ZEB-715: admin-recovery verbs (D3 e2e over the ZEB-714 surface) ──────────
+//
+// Request/response shapes are the camelCase DTOs pinned by
+// `recovery_rpcs_are_registered_and_wired` (src-tauri/src/api/rpc.rs) and
+// `RecoveryStateDto` (src-tauri/src/lib.rs). Per the ZEB-462 rule, an object
+// present but missing an expected camelCase key is surfaced as a loud contract
+// error, never read as absence.
+
+/// `set_recovery_designates` — admin-only config ceremony (spec §3.1). Returns
+/// the `AdminActionResult` value; in these scenarios the founder self-satisfies
+/// `admin_quorum == 1`, so a successful call is `{"kind": "Completed"}`.
+pub async fn set_recovery_designates(
+    node: &NodeHandle,
+    community_id: &str,
+    designate_addrs: &[&str],
+    threshold: u8,
+    veto_window_ms: u64,
+) -> anyhow::Result<Value> {
+    node.rpc(
+        "set_recovery_designates",
+        json!({
+            "communityId": community_id,
+            "designateAddrs": designate_addrs,
+            "threshold": threshold,
+            "vetoWindowMs": veto_window_ms,
+        }),
+    )
+    .await
+}
+
+/// `initiate_admin_recovery` — a designate proposes replacing `lost_admin`
+/// with `new_admin`. Returns the proposal event id (the handle every
+/// cosign/veto and banner assertion keys on).
+pub async fn initiate_admin_recovery(
+    node: &NodeHandle,
+    community_id: &str,
+    lost_admin_addr: &str,
+    new_admin_addr: &str,
+) -> anyhow::Result<String> {
+    let v = node
+        .rpc(
+            "initiate_admin_recovery",
+            json!({
+                "communityId": community_id,
+                "lostAdminAddr": lost_admin_addr,
+                "newAdminAddr": new_admin_addr,
+            }),
+        )
+        .await?;
+    v.get("proposalEventId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "InitiateRecoveryResult missing string `proposalEventId` (DTO/schema mismatch?): {v}"
+            )
+        })
+}
+
+/// `cosign_admin_recovery` — returns the `RecoveryCosignResult` value
+/// (`signersAfter` / `threshold` / `reachedThreshold`).
+pub async fn cosign_admin_recovery(
+    node: &NodeHandle,
+    community_id: &str,
+    proposal_event_id: &str,
+) -> anyhow::Result<Value> {
+    node.rpc(
+        "cosign_admin_recovery",
+        json!({
+            "communityId": community_id,
+            "proposalEventId": proposal_event_id,
+        }),
+    )
+    .await
+}
+
+/// `veto_admin_recovery` — power-100 admin kills the proposal (unit result).
+pub async fn veto_admin_recovery(
+    node: &NodeHandle,
+    community_id: &str,
+    proposal_event_id: &str,
+) -> anyhow::Result<()> {
+    node.rpc(
+        "veto_admin_recovery",
+        json!({
+            "communityId": community_id,
+            "proposalEventId": proposal_event_id,
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// `get_recovery_state` on the real clock — the view every member's banner
+/// polls (`RecoveryStateDto`: `config` / `proposals` / `selfIsDesignate` /
+/// `selfPower`).
+pub async fn recovery_state(node: &NodeHandle, community_id: &str) -> anyhow::Result<Value> {
+    node.rpc("get_recovery_state", json!({ "communityId": community_id }))
+        .await
+}
+
+/// `get_recovery_state` with the ZEB-715 read-side as-of override. Recovery
+/// phases advance with wall clock and the veto window has a 7-day floor (RD4),
+/// so TimeLocked→Executed is only observable by supplying `nowMs`. The
+/// materialization is deterministic in (event set, nowMs) — once both nodes
+/// hold the same events, no polling is needed around this read.
+pub async fn recovery_state_as_of(
+    node: &NodeHandle,
+    community_id: &str,
+    now_ms: u64,
+) -> anyhow::Result<Value> {
+    node.rpc(
+        "get_recovery_state",
+        json!({ "communityId": community_id, "nowMs": now_ms }),
+    )
+    .await
+}
+
+/// Poll predicate for "the designate config has replicated here and this node
+/// is one of the designates". `Ok(None)` = not converged yet — which includes
+/// BOTH `config: null` (the SetRecoveryDesignates proposal hasn't landed) and
+/// the freshly-joined window where the community engine hasn't spawned (the
+/// RPC refuses with "no engine for community"). A MISSING `config` or
+/// `selfIsDesignate` key, or a mis-typed value, is a broken DTO contract,
+/// surfaced loudly per the ZEB-462 rule (Qodo, PR #499 R1) — `config` is an
+/// `Option` serialized as an always-present nullable key, and
+/// `selfIsDesignate` is an always-present bool.
+pub async fn recovery_configured_as_designate(
+    node: &NodeHandle,
+    community_id: &str,
+) -> anyhow::Result<Option<()>> {
+    let st = match recovery_state(node, community_id).await {
+        Ok(st) => st,
+        Err(e) if e.to_string().contains("no engine for community") => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let config_present = !st
+        .get("config")
+        .ok_or_else(|| {
+            anyhow::anyhow!("RecoveryStateDto missing `config` (DTO/schema mismatch?): {st}")
+        })?
+        .is_null();
+    let is_designate = st
+        .get("selfIsDesignate")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "RecoveryStateDto missing bool `selfIsDesignate` (DTO/schema mismatch?): {st}"
+            )
+        })?;
+    Ok((config_present && is_designate).then_some(()))
+}
+
+/// The proposal object with `proposalEventId == proposal_id` from a
+/// `RecoveryStateDto` value. `Ok(None)` means "not replicated here yet" (poll
+/// semantics); a missing/non-array `proposals` key or a proposal object without
+/// a string `proposalEventId` is a broken DTO contract, surfaced loudly.
+pub fn recovery_proposal<'a>(
+    state: &'a Value,
+    proposal_id: &str,
+) -> anyhow::Result<Option<&'a Value>> {
+    let proposals = state
+        .get("proposals")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "RecoveryStateDto missing `proposals` array (DTO/schema mismatch?): {state}"
+            )
+        })?;
+    for p in proposals {
+        let pid = p
+            .get("proposalEventId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                "recovery proposal missing string `proposalEventId` (DTO/schema mismatch?): {p}"
+            )
+            })?;
+        if pid == proposal_id {
+            return Ok(Some(p));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::assert_sas_match;

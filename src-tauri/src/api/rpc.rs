@@ -185,6 +185,17 @@ struct CountersignArgs {
     proposal_event_id: String,
 }
 
+/// ZEB-714/715: `get_recovery_state`. `now_ms` is the D3 e2e's
+/// read-side as-of override (recovery phases advance with wall clock;
+/// the 7-day RD4 floor makes execution unobservable on the real clock).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetRecoveryStateArgs {
+    community_id: String,
+    #[serde(default)]
+    now_ms: Option<u64>,
+}
+
 /// ZEB-714: `set_recovery_designates` (spec §3.1 config ceremony).
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -630,8 +641,10 @@ pub fn build_registry() -> RpcRegistry {
     rpc!(
         m,
         "get_recovery_state",
-        CommunityIdArgs,
-        |state, _sink, a| async move { crate::get_recovery_state_impl(state, a.community_id).await }
+        GetRecoveryStateArgs,
+        |state, _sink, a| async move {
+            crate::get_recovery_state_impl(state, a.community_id, a.now_ms).await
+        }
     );
     rpc!(
         m,
@@ -1588,7 +1601,9 @@ mod tests {
         let cases: Vec<(&str, serde_json::Value)> = vec![
             (
                 "get_recovery_state",
-                serde_json::json!({ "communityId": community_id }),
+                // `nowMs` is optional — send it here to pin that the
+                // as-of override parses on the wire (ZEB-715).
+                serde_json::json!({ "communityId": community_id, "nowMs": 1_700_000_000_000u64 }),
             ),
             (
                 "set_recovery_designates",

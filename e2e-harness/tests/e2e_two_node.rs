@@ -2454,3 +2454,392 @@ async fn s_vines_publish_feed_view_reshare() {
     run.mark_success();
     drop((alice, bob, ah, bh));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S11 (ZEB-715): admin-recovery liveness path — configure designates →
+// designate initiates → cosign to threshold → current admin vetoes →
+// terminal Vetoed, membership unchanged.
+//
+// Cast: alice = founder (power 100 — and the recovery's named lost_admin);
+// bob = ordinary joined member. Designates = {alice, bob}, R = 2. That cast is
+// legal per the CRDT gates (RD2/RC1 require only that a designate be Joined —
+// the admin MAY appear in the list) and is exactly what makes a TWO-node story
+// cover the full verb set: bob initiates as signer 1, alice cosigns to
+// threshold, then alice vetoes. W = the RD4 7-day floor. Every transition here
+// (collecting → timeLocked → vetoed) is event-driven, so this path needs NO
+// time control; the veto authorship window is [t₀, deadline] (spec §4.2),
+// i.e. valid in timeLocked.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s11_recovery_veto_path() {
+    use e2e_harness::driver::*;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    const WEEK_MS: u64 = 7 * 86_400_000;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("s11-recovery-veto").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Community + join + roster convergence (the s1 skeleton).
+    let community = create_community(&alice, "s11-community", true)
+        .await
+        .expect("create community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins via iroh first-contact");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&bob, &community, &alice_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("bob sees alice joined");
+
+    // Founder configures designates {alice, bob}, R=2, W=floor. Sole admin ⇒
+    // the SetRecoveryDesignates proposal self-satisfies admin_quorum == 1.
+    let res = set_recovery_designates(&alice, &community, &[&alice_owner, &bob_owner], 2, WEEK_MS)
+        .await
+        .expect("set_recovery_designates");
+    assert_eq!(
+        res.get("kind").and_then(Value::as_str),
+        Some("Completed"),
+        "sole admin self-satisfies quorum 1: {res}"
+    );
+
+    // Config replicates to bob; his own DTO proves he is a designate
+    // (loud-contract predicate — missing DTO keys fail fast, only
+    // `config: null` / the freshly-joined no-engine window keep polling).
+    poll_until(Duration::from_secs(120), || async {
+        recovery_configured_as_designate(&bob, &community).await
+    })
+    .await
+    .expect("bob sees the designate config and selfIsDesignate");
+
+    // Bob (designate) initiates recovery of alice, naming himself new admin.
+    let proposal = initiate_admin_recovery(&bob, &community, &alice_owner, &bob_owner)
+        .await
+        .expect("initiate_admin_recovery");
+
+    // The collecting proposal replicates to alice (signer 1 of 2).
+    poll_until(Duration::from_secs(120), || async {
+        let st = recovery_state(&alice, &community).await?;
+        Ok(recovery_proposal(&st, &proposal)?
+            .filter(|p| p.get("phase").and_then(Value::as_str) == Some("collecting"))
+            .map(|_| ()))
+    })
+    .await
+    .expect("alice sees the collecting proposal");
+
+    // Alice (also a designate) cosigns to threshold.
+    let cosign = cosign_admin_recovery(&alice, &community, &proposal)
+        .await
+        .expect("cosign_admin_recovery");
+    assert_eq!(
+        cosign.get("reachedThreshold").and_then(Value::as_bool),
+        Some(true),
+        "alice's cosign reaches R=2: {cosign}"
+    );
+
+    // Both replicas converge to timeLocked, which must carry a deadline.
+    for (name, node) in [("alice", &alice), ("bob", &bob)] {
+        poll_until(Duration::from_secs(120), || async {
+            let st = recovery_state(node, &community).await?;
+            match recovery_proposal(&st, &proposal)? {
+                Some(p) if p.get("phase").and_then(Value::as_str) == Some("timeLocked") => {
+                    anyhow::ensure!(
+                        p.get("deadlineMs").and_then(Value::as_u64).is_some(),
+                        "timeLocked must carry deadlineMs: {p}"
+                    );
+                    Ok(Some(()))
+                }
+                _ => Ok(None),
+            }
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{name} converges to timeLocked: {e}"));
+    }
+
+    // The current admin vetoes — restores the status quo (spec §4.2).
+    veto_admin_recovery(&alice, &community, &proposal)
+        .await
+        .expect("veto_admin_recovery");
+
+    // Both replicas resolve to vetoed-by-alice.
+    for (name, node) in [("alice", &alice), ("bob", &bob)] {
+        poll_until(Duration::from_secs(120), || async {
+            let st = recovery_state(node, &community).await?;
+            Ok(recovery_proposal(&st, &proposal)?
+                .filter(|p| {
+                    p.get("phase").and_then(Value::as_str) == Some("vetoed")
+                        && p.get("vetoedByAddr").and_then(Value::as_str)
+                            == Some(alice_owner.as_str())
+                })
+                .map(|_| ()))
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{name} resolves to vetoed-by-alice: {e}"));
+    }
+
+    // Membership unchanged: alice still the power-100 admin (her own DTO),
+    // both members still Joined in both rosters.
+    let a_st = recovery_state(&alice, &community)
+        .await
+        .expect("alice reads final state");
+    assert_eq!(
+        a_st.get("selfPower").and_then(Value::as_u64),
+        Some(100),
+        "veto restored the status quo — alice keeps power 100: {a_st}"
+    );
+    assert!(
+        roster_has_joined(&alice, &community, &bob_owner)
+            .await
+            .expect("alice roster read"),
+        "bob still Joined after the vetoed recovery"
+    );
+    assert!(
+        roster_has_joined(&bob, &community, &alice_owner)
+            .await
+            .expect("bob roster read"),
+        "alice still Joined after the vetoed recovery"
+    );
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S12 (ZEB-715): admin-recovery execution path — cosign to threshold, then
+// observe TimeLocked → Executed and the +48h rotation-finality wall through
+// the read-side `nowMs` as-of override on `get_recovery_state`.
+//
+// Recovery execution is PURE DERIVED state on the `materialized_with_now`
+// now-floor (spec §4.1): no event marks it, a replica simply derives the
+// promotion + kick whenever it materializes with T past the deadline. The RD4
+// 7-day veto-window floor therefore makes execution unobservable on the real
+// clock, and the caller-supplied `nowMs` (ZEB-715's one prod-code seam) IS the
+// sanctioned time control — an as-of query, not a clock mock; every mutating
+// verb stays on the real clock.
+//
+// The execution assertions are BEHAVIORAL, not roster dumps:
+//   * bob (new_admin) watches his own `selfPower` flip to 100 across the
+//     deadline in his own DTO;
+//   * alice (the named lost_admin — loss-as-compromise, spec §2) is
+//     derived-kicked at execution, so her as-of read past the deadline is
+//     REFUSED by get_recovery_state's Joined-caller gate — the kick proven by
+//     the API treating her as a non-member;
+//   * `rotationEligibleAtMs` == deadline + 48h (spec §4.3), and the phase
+//     stays "executed" past that wall — ELIGIBILITY is asserted, not an actual
+//     rotation: synthesis is the self-heal observer's job and is gated on the
+//     REAL wall clock (the F-margin is a materialize-level CRDT invariant),
+//     deliberately out of e2e reach.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s12_recovery_time_locked_execution() {
+    use e2e_harness::driver::*;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    const WEEK_MS: u64 = 7 * 86_400_000;
+    const FINALITY_MS: u64 = 48 * 3_600_000;
+    const MARGIN_MS: u64 = 1_000;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("s12-recovery-exec").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Community + join + roster convergence.
+    let community = create_community(&alice, "s12-community", true)
+        .await
+        .expect("create community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins via iroh first-contact");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&bob, &community, &alice_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("bob sees alice joined");
+
+    // Designates {alice, bob}, R=2, W=floor; bob initiates (lost=alice,
+    // new=bob); alice cosigns to threshold — same dance as S11.
+    let res = set_recovery_designates(&alice, &community, &[&alice_owner, &bob_owner], 2, WEEK_MS)
+        .await
+        .expect("set_recovery_designates");
+    assert_eq!(
+        res.get("kind").and_then(Value::as_str),
+        Some("Completed"),
+        "sole admin self-satisfies quorum 1: {res}"
+    );
+    poll_until(Duration::from_secs(120), || async {
+        recovery_configured_as_designate(&bob, &community).await
+    })
+    .await
+    .expect("bob sees the designate config");
+    let proposal = initiate_admin_recovery(&bob, &community, &alice_owner, &bob_owner)
+        .await
+        .expect("initiate_admin_recovery");
+    poll_until(Duration::from_secs(120), || async {
+        let st = recovery_state(&alice, &community).await?;
+        Ok(recovery_proposal(&st, &proposal)?
+            .filter(|p| p.get("phase").and_then(Value::as_str) == Some("collecting"))
+            .map(|_| ()))
+    })
+    .await
+    .expect("alice sees the collecting proposal");
+    cosign_admin_recovery(&alice, &community, &proposal)
+        .await
+        .expect("cosign_admin_recovery");
+
+    // Both replicas hold the full event set and derive timeLocked with the
+    // SAME deadline (deadline is replay-derived from the Rth signer's wall
+    // time — cross-replica equality is itself a CRDT determinism assertion).
+    let mut deadlines = Vec::new();
+    for (name, node) in [("alice", &alice), ("bob", &bob)] {
+        let d = poll_until(Duration::from_secs(120), || async {
+            let st = recovery_state(node, &community).await?;
+            match recovery_proposal(&st, &proposal)? {
+                Some(p) if p.get("phase").and_then(Value::as_str) == Some("timeLocked") => {
+                    let d = p
+                        .get("deadlineMs")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow::anyhow!("timeLocked must carry deadlineMs: {p}"))?;
+                    Ok(Some(d))
+                }
+                _ => Ok(None),
+            }
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{name} converges to timeLocked: {e}"));
+        deadlines.push(d);
+    }
+    assert_eq!(
+        deadlines[0], deadlines[1],
+        "both replicas derive the same replay deadline"
+    );
+    let deadline = deadlines[0];
+
+    // Just BEFORE the deadline: still timeLocked; bob is an ordinary member.
+    let before = recovery_state_as_of(&bob, &community, deadline - MARGIN_MS)
+        .await
+        .expect("bob as-of read before deadline");
+    let p = recovery_proposal(&before, &proposal)
+        .expect("proposal lookup")
+        .expect("proposal present before deadline");
+    assert_eq!(
+        p.get("phase").and_then(Value::as_str),
+        Some("timeLocked"),
+        "still time-locked just before the deadline: {p}"
+    );
+    let bob_power_before = before
+        .get("selfPower")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            panic!("RecoveryStateDto missing `selfPower` (DTO/schema mismatch?): {before}")
+        });
+    assert!(
+        bob_power_before < 100,
+        "bob is not an admin before execution: {before}"
+    );
+
+    // Just PAST the deadline: executed — bob's own power is 100 and the
+    // rotation-finality wall is published as deadline + F.
+    let after = recovery_state_as_of(&bob, &community, deadline + MARGIN_MS)
+        .await
+        .expect("bob as-of read past deadline");
+    let p = recovery_proposal(&after, &proposal)
+        .expect("proposal lookup")
+        .expect("proposal present past deadline");
+    assert_eq!(
+        p.get("phase").and_then(Value::as_str),
+        Some("executed"),
+        "derived execution past the deadline: {p}"
+    );
+    assert_eq!(
+        after.get("selfPower").and_then(Value::as_u64),
+        Some(100),
+        "bob (new_admin) derives power 100 at execution: {after}"
+    );
+    assert_eq!(
+        p.get("rotationEligibleAtMs").and_then(Value::as_u64),
+        Some(deadline + FINALITY_MS),
+        "rotation eligibility = deadline + 48h finality margin: {p}"
+    );
+
+    // Alice before the deadline: still the power-100 admin. Past it: the
+    // named lost_admin is derived-kicked, so the Joined-caller gate refuses
+    // her read — the kick asserted behaviorally.
+    let a_before = recovery_state_as_of(&alice, &community, deadline - MARGIN_MS)
+        .await
+        .expect("alice as-of read before deadline");
+    assert_eq!(
+        a_before.get("selfPower").and_then(Value::as_u64),
+        Some(100),
+        "alice still the admin before the deadline: {a_before}"
+    );
+    let a_after = recovery_state_as_of(&alice, &community, deadline + MARGIN_MS).await;
+    match a_after {
+        Err(e) if e.to_string().contains("not a Joined member") => {}
+        other => panic!(
+            "alice (named lost_admin) must be derived-kicked past the deadline — \
+             expected the Joined-caller refusal, got: {other:?}"
+        ),
+    }
+
+    // Past the finality wall: still executed (no phantom phase), eligibility
+    // wall passed — the rotation PROMPT may fire; actual rotation synthesis
+    // is the real-clock observer's job, out of e2e reach by design.
+    let post_wall = recovery_state_as_of(&bob, &community, deadline + FINALITY_MS + MARGIN_MS)
+        .await
+        .expect("bob as-of read past the finality wall");
+    let p = recovery_proposal(&post_wall, &proposal)
+        .expect("proposal lookup")
+        .expect("proposal present past the finality wall");
+    assert_eq!(
+        p.get("phase").and_then(Value::as_str),
+        Some("executed"),
+        "phase remains executed past the finality wall: {p}"
+    );
+
+    // The REAL-clock view (no override) still shows timeLocked on both nodes:
+    // the as-of override must never leak into un-overridden reads.
+    for (name, node) in [("alice", &alice), ("bob", &bob)] {
+        let st = recovery_state(node, &community)
+            .await
+            .expect("real-clock read");
+        let p = recovery_proposal(&st, &proposal)
+            .expect("proposal lookup")
+            .expect("proposal present on the real clock");
+        assert_eq!(
+            p.get("phase").and_then(Value::as_str),
+            Some("timeLocked"),
+            "{name}: real-clock view unaffected by earlier as-of reads: {p}"
+        );
+    }
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}

@@ -43171,6 +43171,7 @@ pub fn compute_recovery_state(
 pub(crate) async fn get_recovery_state_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
+    now_ms: Option<u64>,
 ) -> Result<RecoveryStateDto, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
@@ -43196,10 +43197,16 @@ pub(crate) async fn get_recovery_state_impl(
         )
     })?;
 
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // ZEB-715: `now_ms` is a read-side as-of override for the D3 e2e —
+    // the veto-window floor is 7 days (RD4), so TimeLocked→Executed is
+    // unobservable in a test on the real clock. Reads only; every
+    // mutating recovery verb stays on the real wall clock.
+    let wall_now_ms = now_ms.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    });
 
     let admin_addr = engine_arc.admin_addr();
     let materialized = {
@@ -43225,8 +43232,9 @@ pub(crate) async fn get_recovery_state_impl(
 async fn get_recovery_state(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
+    now_ms: Option<u64>,
 ) -> Result<RecoveryStateDto, String> {
-    get_recovery_state_impl(state_lock.inner(), community_id).await
+    get_recovery_state_impl(state_lock.inner(), community_id, now_ms).await
 }
 
 /// ZEB-714: admin IPC that proposes replacing the community's recovery
