@@ -5840,9 +5840,17 @@ pub async fn apply_auto_exec_set_power(
     }
     if blocked_by_quorum {
         // ZEB-300: admin_quorum > 1 + admin-affecting → route through
-        // AdminProposal instead of a direct SetPower (Task 4 replaces this
-        // stub with a call to apply_auto_exec_admin_proposal_set_power).
-        return Ok(AutoExecOutcome::RoutedProposalPending);
+        // AdminProposal (mint proposal / countersign the canonical pending
+        // proposal / no-op) instead of a direct SetPower that verify_event
+        // would reject with SetPowerRequiresQuorum. The wrapper re-reads
+        // state under the engine lock and mints with community_signing_key.
+        return apply_auto_exec_admin_proposal_set_power(
+            node_state,
+            community_id,
+            target_pubkey,
+            level,
+        )
+        .await;
     }
 
     let wall_now_ms = std::time::SystemTime::now()
@@ -5877,6 +5885,144 @@ pub async fn apply_auto_exec_set_power(
     }
     let _ = device_id;
     Ok(AutoExecOutcome::Applied)
+}
+
+/// ZEB-300: route an admin-affecting Tier 2 SetPower auto-exec through the
+/// `AdminProposal` quorum machinery (spec §4.5). Called by
+/// `apply_auto_exec_set_power`'s `blocked_by_quorum` branch when the
+/// community has `admin_quorum > 1` and the change touches the admin tier,
+/// where a direct SetPower would self-reject at `verify_event`.
+///
+/// Reads the community's materialized state + event log under the engine
+/// lock, runs the pure `plan_admin_proposal_auto_exec` planner, and mints
+/// the corresponding event:
+/// - `MintProposal` → `mint_admin_proposal_set_power_event` → `RoutedProposalMinted`
+/// - `Countersign(pid)` → `mint_admin_countersign_event` → `RoutedProposalCountersigned`
+/// - `Noop` → `RoutedProposalPending` (nothing to mint this tick)
+///
+/// Load-bearing (matches the manual `set_power_level` proposal path): the
+/// routed events are signed with `outbox.community_signing_key` (the
+/// enrolled #2 device key community-membership events use), NOT the
+/// direct-SetPower `outbox.signing_key`. A wrong-key event would fail
+/// `verify_event` silently.
+///
+/// Any-admin-proposes + canonical (min-`EventId`) countersign converges
+/// across ticks and tolerates absent admins; dangling proposals from
+/// simultaneous ticks expire per `ADMIN_PROPOSAL_EXPIRY_MS`.
+pub async fn apply_auto_exec_admin_proposal_set_power(
+    node_state: &std::sync::Arc<std::sync::Mutex<crate::NodeState>>,
+    community_id: crate::owner_state_types::SpaceId,
+    target_pubkey: crate::owner_state_types::OwnerAddr,
+    level: u8,
+) -> Result<AutoExecOutcome, String> {
+    // Snapshot the handles we need under the std::sync::Mutex, then drop
+    // the lock before any await (no awaits while holding a std mutex).
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox) = {
+        let g = node_state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker
+                .clone()
+                .ok_or("hlc_tracker missing (node not running?)")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dm_device_id missing (node not running?)")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing (node not running?)")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing (node not running?)")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing (no owner identity?)")?,
+        )
+    };
+
+    let engine_arc = community_registry
+        .engine_arc(&community_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(community_id.0)
+            )
+        })?;
+
+    // Reserve an HLC for the (potential) event; its wall clock is the "now"
+    // the planner uses for proposal-expiry checks. A Noop tick still consumes
+    // an HLC — benign (the monotonic clock simply advances).
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let now_ms = event_hlc.wall_ms;
+
+    // Decide mint-vs-countersign-vs-noop from the materialized state + log.
+    let plan = {
+        let state_arc = engine_arc.state();
+        let state_g = state_arc.lock().await;
+        let mat = state_g.materialized(engine_arc.admin_addr());
+        plan_admin_proposal_auto_exec(
+            &mat,
+            &state_g.events,
+            target_pubkey,
+            level,
+            self_owner,
+            now_ms,
+        )
+    };
+
+    let event = match plan {
+        AdminProposalPlan::Noop => return Ok(AutoExecOutcome::RoutedProposalPending),
+        AdminProposalPlan::MintProposal => {
+            let outbox_g = dm_outbox.lock().await;
+            // ZEB-300: AdminProposal(SetPower) signs with the #2 enrolled
+            // community key, matching the manual set_power_level path.
+            let signing_key = outbox_g.community_signing_key.as_ref();
+            crate::mint_admin_proposal_set_power_event(
+                community_id,
+                self_owner,
+                target_pubkey,
+                level,
+                signing_key,
+                event_hlc,
+            )?
+        }
+        AdminProposalPlan::Countersign(pid) => {
+            let outbox_g = dm_outbox.lock().await;
+            let signing_key = outbox_g.community_signing_key.as_ref();
+            crate::mint_admin_countersign_event(
+                community_id,
+                self_owner,
+                pid,
+                signing_key,
+                event_hlc,
+            )?
+        }
+    };
+
+    let outcome_kind = match plan {
+        AdminProposalPlan::MintProposal => AutoExecOutcome::RoutedProposalMinted,
+        AdminProposalPlan::Countersign(_) => AutoExecOutcome::RoutedProposalCountersigned,
+        AdminProposalPlan::Noop => unreachable!("Noop returned early above"),
+    };
+
+    let insert = engine_arc
+        .insert_local_event(event)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (AdminProposal auto-exec): {e}"))?;
+    if matches!(
+        insert,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(format!(
+            "apply_auto_exec_admin_proposal_set_power: rejected: {insert:?}"
+        ));
+    }
+    Ok(outcome_kind)
 }
 
 #[cfg(test)]
@@ -6262,6 +6408,79 @@ mod auto_exec_tests {
         );
         let _ = admin_pub;
         let _ = target_pub;
+    }
+
+    /// ZEB-300 T4: the AdminProposal-routing auto-exec helper exists, fails
+    /// closed on a bare NodeState (like `apply_auto_exec_set_power`), and its
+    /// routed-mint step produces an `AdminProposal::SetPower` whose signature
+    /// verifies — i.e. a CRDT-acceptable event.
+    ///
+    /// Load-bearing: the helper signs with `outbox.community_signing_key`
+    /// (the enrolled #2 device key that community-membership events use), NOT
+    /// the direct-SetPower `outbox.signing_key`; a wrong-key event would fail
+    /// `verify_event` silently. Reaching the fully-wired two-admin engine
+    /// (CommunitySyncRegistry + dm_outbox + materialized state) is out of
+    /// reach for a pure unit test — as the sibling `..._signing_path_...`
+    /// test documents — so we prove the community_signing_key mint seam
+    /// directly via `mint_admin_proposal_set_power_event` (the exact call the
+    /// helper's `MintProposal` arm makes).
+    #[tokio::test]
+    async fn auto_exec_admin_proposal_routes_and_verifies() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        use ed25519_dalek::{Signature, SigningKey, Verifier};
+
+        // ── Part 1: helper is defined and fails closed on a bare NodeState.
+        let node_state = std::sync::Arc::new(std::sync::Mutex::new(crate::NodeState::default()));
+        let community_id = SpaceId([0xc0; 16]);
+        let target = OwnerAddr([0xbb; 16]);
+        let err = apply_auto_exec_admin_proposal_set_power(&node_state, community_id, target, 100)
+            .await
+            .expect_err("bare NodeState must Err, not panic");
+        assert!(
+            err.contains("missing") || err.contains("not running"),
+            "error must mention missing/not running; got: {err}"
+        );
+
+        // ── Part 2: the routed-mint seam yields a verifiable AdminProposal.
+        // Mint the SAME way the helper's MintProposal arm does — signed with
+        // the community signing key — and prove the AdminProposal::SetPower
+        // event's signature verifies against that key.
+        let admin = OwnerAddr([0xaa; 16]);
+        let community_signing_key = SigningKey::from_bytes(&[0x11; 32]);
+        let hlc = Hlc {
+            wall_ms: 5_000,
+            logical: 0,
+            device_id: "admin".into(),
+        };
+        let event = crate::mint_admin_proposal_set_power_event(
+            community_id,
+            admin,
+            target,
+            100,
+            &community_signing_key,
+            hlc,
+        )
+        .expect("mint AdminProposal::SetPower must succeed");
+
+        assert!(
+            matches!(
+                &event.kind,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetPower { target: t, level: 100 },
+                } if *t == target
+            ),
+            "routed mint must be an AdminProposal::SetPower for the target at level 100; got {:?}",
+            event.kind
+        );
+
+        let bytes = canonical_cbor_encode(&EventPayload::from(&event)).expect("encode payload");
+        assert!(
+            community_signing_key
+                .verifying_key()
+                .verify(&bytes, &Signature::from_bytes(&event.sig))
+                .is_ok(),
+            "AdminProposal signed with community_signing_key must verify"
+        );
     }
 }
 
