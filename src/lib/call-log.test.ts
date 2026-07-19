@@ -57,6 +57,19 @@ describe('encodeCallEvent / parseCallEvent', () => {
     expect(parseCallEvent(CALL_EVENT_MIME, numId)).toBeNull();
   });
 
+  // PR #494 R1 (CodeRabbit): callId is documented as 16 bytes hex-encoded —
+  // enforce the shape so junk payloads fall back to text instead of rendering
+  // as trusted system lines / badge increments.
+  it('returns null when callId is not 32 hex chars', () => {
+    for (const bad of ['call-7', 'ab'.repeat(15), 'ab'.repeat(17), 'zz'.repeat(16), '']) {
+      const body = JSON.stringify({ v: 1, callId: bad, outcome: 'answered' });
+      expect(parseCallEvent(CALL_EVENT_MIME, body)).toBeNull();
+    }
+    // Uppercase hex is still hex — accepted.
+    const upper = JSON.stringify({ v: 1, callId: 'AB'.repeat(16), outcome: 'answered' });
+    expect(parseCallEvent(CALL_EVENT_MIME, upper)).not.toBeNull();
+  });
+
   it('drops a non-numeric durationMs instead of rejecting', () => {
     const body = JSON.stringify({ ...answered, durationMs: 'long' });
     const parsed = parseCallEvent(CALL_EVENT_MIME, body);

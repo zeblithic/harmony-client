@@ -1077,6 +1077,22 @@ describe('NavService — per-channel unread (ZEB-665)', () => {
     expect(s.nodes.find((n) => n.id === 'ch1')!.missedCallCount ?? 0).toBe(0);
   });
 
+  // PR #494 R1 (CodeRabbit): missedCallCount is documented as a subset of
+  // unreadCount — clamp at the boundary so no caller can render a missed
+  // call with zero unread messages.
+  it('setUnread clamps missedCalls to the unread count', () => {
+    const s = seeded();
+    s.nodes = [
+      ...s.nodes,
+      { id: 'dm2', parentId: null, type: 'dm', name: 'Bob', expanded: false, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    // Clamped to 0 == the all-zero no-op path: absent and 0 render identically.
+    s.setUnread('dm2', 0, 1);
+    expect(s.nodes.find((n) => n.id === 'dm2')!.missedCallCount ?? 0).toBe(0);
+    s.setUnread('dm2', 2, 5);
+    expect(s.nodes.find((n) => n.id === 'dm2')!.missedCallCount).toBe(2);
+  });
+
   it('setUnread notifies onChange once per effective change and not on no-ops', () => {
     const s = seeded();
     let changed = 0;

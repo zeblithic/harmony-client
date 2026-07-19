@@ -86,4 +86,6 @@ Old-client degradation: pre-feature clients render the JSON body as a text bubbl
   `read_dm_thread` unchanged (skip if already covered).
 - **T8** Gates: `npx vitest run`, `npx tsc --noEmit`; Rust gates only if T7 adds code
   (`cargo fmt`, clippy `--all-targets`, `scripts/test-select --context task`); full
-  sweep pre-PR. PR body: "Closes ZEB-357."
+  sweep pre-PR. Paste the emitted `round=… bucket=…` summary line into the task
+  report so the selection is auditable (this run: `round=95 k=4 bucket=4/4`,
+  1206/1206). PR body: "Closes ZEB-357."

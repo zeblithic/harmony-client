@@ -120,6 +120,11 @@ export class CallSession {
   /** ZEB-357: true iff this side placed the current call. Gates outcome
    *  recording (single-writer: only the caller authors the call-event). */
   private isCaller = false;
+  /** PR #494 R1 (Qodo): per-call once-only latch for outcome emission. The
+   *  callId guard alone is not enough — end() awaits teardownMedia BEFORE
+   *  resetToIdle clears callId, so a concurrently-delivered call-ended event
+   *  could pass the guards in that window and record a duplicate. */
+  private outcomeRecorded = false;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   private ringTimer: ReturnType<typeof setTimeout> | null = null;
   /** Transport-lifecycle unlisteners (voice-transport-lost/restored). Torn down
@@ -149,6 +154,7 @@ export class CallSession {
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.callId = null; this.spaceId = null;
     this.isCaller = false;
+    this.outcomeRecorded = false;
     this.vad.reset();
     // Single store notification: callers that need to surface an end reason pass
     // it here rather than reset-then-patch, which would briefly flash endReason
@@ -169,6 +175,8 @@ export class CallSession {
    */
   private recordOutcome(outcome: CallOutcome, durationMs?: number): void {
     if (!this.isCaller || !this.callId || !this.spaceId) return;
+    if (this.outcomeRecorded) return; // once per call, even across overlapping terminals
+    this.outcomeRecorded = true;
     const payload: CallEventPayload = { v: 1, callId: this.callId, outcome };
     if (durationMs !== undefined) payload.durationMs = durationMs;
     this.deps.onCallOutcome?.(this.spaceId, payload);
@@ -187,6 +195,7 @@ export class CallSession {
     this.callId = callId;
     this.spaceId = spaceId;
     this.isCaller = true;
+    this.outcomeRecorded = false;
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.vad.reset();
     this.patch({
@@ -201,13 +210,17 @@ export class CallSession {
   async cancel(): Promise<void> {
     if (get(this.store).phase !== 'ringingOut') return;
     const callId = this.callId, spaceId = this.spaceId;
+    // PR #494 R1 (CodeRabbit): commit the terminal BEFORE awaiting the IPC —
+    // a decline landing during the await must not win the race and record a
+    // competing outcome. The user's cancellation is the single terminal.
+    // `canceled` is also the only terminal an unreachable/offline callee ever
+    // gets (there is no caller-side ring timeout) — the recipient renders it
+    // as a missed call.
+    this.recordOutcome('canceled');
+    this.resetToIdle();
     if (callId) {
       await this.deps.invoke('cancel_call', { callId, spaceId }).catch(() => {});
     }
-    // The only terminal an unreachable/offline callee ever gets (there is no
-    // caller-side ring timeout) — the recipient renders it as a missed call.
-    this.recordOutcome('canceled');
-    this.resetToIdle();
   }
 
   /**

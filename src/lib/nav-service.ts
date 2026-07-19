@@ -562,8 +562,10 @@ export class NavService {
     const next = Math.max(0, count);
     // ZEB-357: DM/group-chat rows carry the missed-call subset as a distinct
     // 📞 badge. Channel callers omit the param (defaults 0) — no rollup, DM
-    // rows have no aggregation target (same as unreadCount).
-    const nextMissed = Math.max(0, missedCalls);
+    // rows have no aggregation target (same as unreadCount). Clamped to the
+    // unread count: missed is documented as a subset, and no caller may render
+    // a missed call with zero unread messages (PR #494 R1).
+    const nextMissed = Math.min(next, Math.max(0, missedCalls));
     const nextLevel: NavNode['unreadLevel'] = next > 0 ? 'standard' : 'none';
     if (
       node.unreadCount === next &&

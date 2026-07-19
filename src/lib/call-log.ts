@@ -76,7 +76,9 @@ export function parseCallEvent(mimeType: string, bodyText: string): CallEventPay
   if (typeof raw !== 'object' || raw === null) return null;
   const o = raw as Record<string, unknown>;
   if (o.v !== 1) return null;
-  if (typeof o.callId !== 'string') return null;
+  // 16 bytes hex-encoded (as minted by place_call) — junk shapes fall back to
+  // text rather than rendering as trusted system lines / badge increments.
+  if (typeof o.callId !== 'string' || !/^[0-9a-f]{32}$/i.test(o.callId)) return null;
   if (typeof o.outcome !== 'string' || !OUTCOMES.has(o.outcome)) return null;
   const payload: CallEventPayload = {
     v: 1,
