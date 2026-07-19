@@ -5614,6 +5614,81 @@ pub fn setpower_mint_admin_blocked_by_quorum(
     is_admin_affecting_set_power(mat, target, level)
 }
 
+/// ZEB-300: what (if anything) this admin replica should mint to advance a
+/// finalized admin-affecting Tier 2 SetPower toward AdminProposal quorum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdminProposalPlan {
+    /// No live proposal for this (target, level) — mint a fresh
+    /// `AdminProposal::SetPower` (proposer counts as signer 1).
+    MintProposal,
+    /// A live canonical proposal exists that this replica has not yet
+    /// signed — countersign it (advances toward quorum). Carries the
+    /// canonical proposal's `EventId`.
+    Countersign(EventId),
+    /// Nothing to do this tick: effect already applied, or this replica
+    /// already signed the canonical proposal (as proposer or countersign).
+    Noop,
+}
+
+/// ZEB-300: decide what (if anything) this admin replica should mint to
+/// advance a finalized admin-affecting Tier 2 SetPower toward AdminProposal
+/// quorum. Pure: no `NodeState` / engine — reads the materialized state and
+/// the raw event log so it is unit-testable and every replica computes an
+/// identical decision. See design §4.
+///
+/// Canonical selection: the live proposal with the numerically smallest
+/// `EventId` (`[u8; 16]`) — a total order every replica computes identically,
+/// so ticks converge on one proposal instead of racing separate ones.
+///
+/// Idempotency: each admin signs a given proposal at most once (as proposer
+/// OR as one countersign) — enforced by the already-signed scan.
+pub(crate) fn plan_admin_proposal_auto_exec(
+    mat: &MaterializedMembership,
+    events: &BTreeMap<EventId, SignedMembershipEvent>,
+    target: OwnerAddr,
+    level: u8,
+    self_owner: OwnerAddr,
+    now_ms: u64,
+) -> AdminProposalPlan {
+    // 1. Effect already applied (quorum reached on an earlier tick).
+    if mat.power_levels.get(&target).copied() == Some(level) {
+        return AdminProposalPlan::Noop;
+    }
+    // 2. Live proposals for this exact (target, level); pick the canonical
+    //    (smallest EventId) among those still within the expiry window.
+    let canonical = events
+        .values()
+        .filter(|e| match &e.kind {
+            MembershipEventKind::AdminProposal { proposal_kind } => matches!(
+                proposal_kind,
+                ProposalKind::SetPower { target: t, level: l } if *t == target && *l == level
+            ),
+            _ => false,
+        })
+        .filter(|e| now_ms.saturating_sub(e.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS)
+        .min_by_key(|e| e.id);
+
+    let Some(canonical) = canonical else {
+        // 3. No live candidate → propose.
+        return AdminProposalPlan::MintProposal;
+    };
+
+    // 4/5. Already signed the canonical (proposer or countersign) → nothing
+    //      to do; otherwise countersign it.
+    let already_signed = events.values().any(|e| match &e.kind {
+        MembershipEventKind::AdminProposal { .. } => e.id == canonical.id && e.actor == self_owner,
+        MembershipEventKind::AdminCountersign { target_event_id } => {
+            *target_event_id == canonical.id && e.actor == self_owner
+        }
+        _ => false,
+    });
+    if already_signed {
+        AdminProposalPlan::Noop
+    } else {
+        AdminProposalPlan::Countersign(canonical.id)
+    }
+}
+
 /// ZEB-291 Phase 2 Task 10: auto-exec dispatch from a Tier 2 contestability finalize.
 ///
 /// Signs and applies a `SetPower` membership event using the node's local
@@ -6181,6 +6256,198 @@ mod auto_exec_tests {
         );
         let _ = admin_pub;
         let _ = target_pub;
+    }
+}
+
+#[cfg(test)]
+mod plan_admin_proposal_tests {
+    use super::*;
+
+    const COM: SpaceId = SpaceId([0xc0; 16]);
+
+    fn ev(
+        id: EventId,
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COM,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            kind,
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    fn mk_proposal(
+        id: EventId,
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        level: u8,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        ev(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level },
+            },
+        )
+    }
+
+    fn mk_countersign(
+        id: EventId,
+        actor: OwnerAddr,
+        target_id: EventId,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        ev(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: target_id,
+            },
+        )
+    }
+
+    // (a) already at power => Noop
+    #[test]
+    fn plan_noop_when_target_already_at_level() {
+        let target = OwnerAddr([1; 16]);
+        let me = OwnerAddr([2; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels.insert(target, 100);
+        let events = BTreeMap::new();
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_000),
+            AdminProposalPlan::Noop
+        ));
+    }
+
+    // (b) no candidate => MintProposal
+    #[test]
+    fn plan_mint_when_no_existing_proposal() {
+        let target = OwnerAddr([1; 16]);
+        let me = OwnerAddr([2; 16]);
+        let mat = MaterializedMembership::default();
+        let events = BTreeMap::new();
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_000),
+            AdminProposalPlan::MintProposal
+        ));
+    }
+
+    // (c) one live candidate not signed by me => Countersign(that id)
+    #[test]
+    fn plan_countersign_existing_unsigned_proposal() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
+        match plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500) {
+            AdminProposalPlan::Countersign(got) => assert_eq!(got, pid),
+            other => panic!("expected Countersign, got {other:?}"),
+        }
+    }
+
+    // (d) I already proposed it => Noop
+    #[test]
+    fn plan_noop_when_i_am_proposer() {
+        let target = OwnerAddr([1; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, me, target, 100, 1_000));
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            AdminProposalPlan::Noop
+        ));
+    }
+
+    // (e) I already countersigned it => Noop
+    #[test]
+    fn plan_noop_when_i_already_countersigned() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let cid: EventId = [10u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
+        events.insert(cid, mk_countersign(cid, me, pid, 1_100));
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            AdminProposalPlan::Noop
+        ));
+    }
+
+    // (f) two candidates => Countersign(min EventId)
+    #[test]
+    fn plan_countersign_canonical_min_event_id() {
+        let target = OwnerAddr([1; 16]);
+        let a = OwnerAddr([3; 16]);
+        let b = OwnerAddr([4; 16]);
+        let me = OwnerAddr([2; 16]);
+        let low: EventId = [1u8; 16];
+        let high: EventId = [2u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(high, mk_proposal(high, a, target, 100, 1_000));
+        events.insert(low, mk_proposal(low, b, target, 100, 1_000));
+        match plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500) {
+            AdminProposalPlan::Countersign(got) => assert_eq!(got, low),
+            other => panic!("expected canonical Countersign(low), got {other:?}"),
+        }
+    }
+
+    // (g) only an expired candidate => MintProposal (fresh window)
+    #[test]
+    fn plan_mint_when_only_candidate_expired() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
+        let now = 1_000 + ADMIN_PROPOSAL_EXPIRY_MS + 1;
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, now),
+            AdminProposalPlan::MintProposal
+        ));
+    }
+
+    // (h) candidate for a DIFFERENT (target,level) is ignored => MintProposal
+    #[test]
+    fn plan_mint_ignores_proposal_for_other_target_or_level() {
+        let target = OwnerAddr([1; 16]);
+        let other = OwnerAddr([5; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, proposer, other, 100, 1_000)); // different target
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            AdminProposalPlan::MintProposal
+        ));
     }
 }
 
