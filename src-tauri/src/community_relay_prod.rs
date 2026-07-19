@@ -346,14 +346,13 @@ impl RelayPullCtx for ProdRelayPullCtx {
 ///
 /// `ingest_recovered` mirrors [`crate::dm_inbox_ingest::ProdDmInboxIngestCtx`]'s
 /// `cas_put` → `verify` → `apply_inbox` → emit sequence, reusing the SAME
-/// `pub(crate)` receive-path helpers extracted from `handle_cidnotify_lifted`
-/// (`dm_outbox::verify_cidnotify_admission`,
+/// `pub(crate)` receive-path helpers (`dm_outbox::verify_cidnotify_admission`,
 /// `dm_outbox::decrypt_and_bind_dm_blob`) under the owner-state lock, and the
 /// SAME `dm-received` event. There is NO separate `sender_owner` field on a
 /// `DepositPayload` (unlike the butler's `DmInboxEntry`), so the sender is
 /// derived from the signed CidNotify packet itself by
-/// `verify_cidnotify_admission` (`resolved_owner`), exactly as the direct path
-/// resolves it — no out-of-band sender claim to cross-check.
+/// `verify_cidnotify_admission` (`resolved_owner`), exactly as every other
+/// receive path resolves it — no out-of-band sender claim to cross-check.
 ///
 /// `Err(reason)` from any step leaves the blob unacked (the relay keeps holding
 /// it; a later pull retries), so the relay's coverage-GC `ack ⟹ ingested`

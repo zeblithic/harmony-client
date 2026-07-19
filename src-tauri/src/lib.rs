@@ -2685,16 +2685,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // stop_inner is sync (blocking_lock would panic from async contexts);
     // contention here means a drain tick holds the lock for its brief
     // Phase A window — treat as no-fence (WARN) rather than spinning.
-    let dm_drain_fence = dm_outbox.as_ref().and_then(|o| match o.try_lock() {
-        Ok(g) => Some(g.shutdown_fence_handles()),
-        Err(_) => {
-            tracing::warn!(
-                "ZEB-703: dm_outbox contended at stop; skipping drain-path fence \
-                 (a Phase C mutation may race the final persist)"
-            );
-            None
-        }
-    });
+    // ZEB-710: the contended degrade (WARN + no-fence) now also increments
+    // DM_FENCE_STATS inside the helper, so the wedge is metric-visible.
+    let dm_drain_fence = dm_outbox
+        .as_ref()
+        .and_then(crate::dm_outbox::DmOutbox::snapshot_shutdown_fence_at_stop);
     // ZEB-225 Sub-B Phase 2: drop DM outbox handles after the channel
     // drops. send_dm IPC and the event-loop drain tick both clone these
     // Arcs into local scope before await, so dropping our Arc here just
@@ -11734,6 +11729,13 @@ pub async fn start_node_inner(
                             if let Some(stats) = butler_deposit_stats_for_state.as_ref() {
                                 nh.set_butler_deposit_source(std::sync::Arc::clone(stats));
                             }
+                            // ZEB-710: drain-fence degraded-mode counters —
+                            // the process-global (survives node restarts
+                            // within the process, so a stop-time no-fence
+                            // degrade is visible in the NEXT boot's panel).
+                            nh.set_dm_fence_source(std::sync::Arc::clone(
+                                &crate::dm_outbox::DM_FENCE_STATS,
+                            ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
@@ -13540,8 +13542,8 @@ fn filter_sort_paginate_inbox(
 ///      truncated to `limit`.
 ///   4. Each surviving InboxEntry's `message_cid` is fetched from CAS and
 ///      decrypted via `dm_crypto::decrypt_dm_message` with the prior-keys
-///      fallback (matches `handle_cidnotify_lifted`'s receive path so post-key-
-///      rotation scrollback works).
+///      fallback (matches the receive path's `decrypt_and_bind_dm_blob` so
+///      post-key-rotation scrollback works).
 ///   5. Any per-entry CAS miss (`Ok(None)`) or fetch error (`Err(_)`) or
 ///      decrypt failure surfaces as a single `Err` with the failing
 ///      message_cid in the message — caller can retry. (Partial-result
@@ -13603,9 +13605,9 @@ pub async fn read_dm_thread_inner(
 ///   `received_at.wall_ms < before_hlc`. None = newest first page.
 ///
 /// Decryption uses `dm_crypto::decrypt_dm_message` with the prior-keys
-/// fallback (matches `handle_cidnotify_lifted`'s receive path), so scrollback
-/// after a content_key rotation still surfaces older messages encrypted
-/// under the previous key.
+/// fallback (matches the receive path's `decrypt_and_bind_dm_blob`), so
+/// scrollback after a content_key rotation still surfaces older messages
+/// encrypted under the previous key.
 ///
 /// Frontend uses this on first DM-channel switch to populate the
 /// TextFeed with history. To paginate: pass the oldest entry's
@@ -51604,6 +51606,15 @@ pub(crate) async fn fence_owner_state_flush(
     context: &'static str,
     community_id: &str,
 ) {
+    // Notify BEFORE the persist (PR #493 R1, Qodo): arms the debounced
+    // publish (best-effort propagation of the owner-state root to sibling
+    // devices — what the old synchronous `flush_now` did; never blocks
+    // durability) AND accounts the fenced mutation for the ZEB-710
+    // dirty-window tripwire, so callers that mutate-then-fence without
+    // their own notify (e.g. fork_community) don't trip it. `persist_now`
+    // never consumes `has_pending_dirty`, so the debounce stays armed
+    // across every arm below — including error/timeout.
+    engine.notify_dirty();
     match tokio::time::timeout(timeout, engine.persist_now()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -51621,11 +51632,6 @@ pub(crate) async fn fence_owner_state_flush(
             );
         }
     }
-    // Best-effort propagation of the owner-state root to sibling devices — the
-    // publish `flush_now` used to do synchronously. Fires on the next debounce;
-    // never blocks durability. Also serves as the re-arm on the error/timeout
-    // arms above.
-    engine.notify_dirty();
 }
 
 /// ZEB-462 B: durable-on-commit fence for the COMMUNITY MEMBERSHIP CRDT,
@@ -51676,13 +51682,17 @@ pub(crate) async fn fence_community_crdt_persist(
 mod zeb427_fence_tests {
     use super::*;
 
-    /// Qodo (PR #226 R1): the fence must return within its bound even when
-    /// the engine's internal task is wedged. The fence is now persist-only
-    /// (ZEB-509), so a saturated publisher no longer stalls it directly; to
-    /// wedge the task we make its debounce-wakeup arm block on a full
-    /// publisher channel. With the single-writer task stuck inside
-    /// `publish_root_now`, it can never service the `persist_now` oneshot,
-    /// so only the fence's `timeout` can return control.
+    /// Qodo (PR #226 R1), upgraded by ZEB-710: the fence must stay useful
+    /// even when the engine's internal task is wedged. The fence is
+    /// persist-only (ZEB-509), and since ZEB-710 `persist_now` runs
+    /// DIRECTLY on the caller's stack instead of routing through the
+    /// task's `select!` loop — so a task stuck inside `publish_root_now`
+    /// no longer starves it. This test wedges the task deterministically
+    /// (a flush blocked on a full publisher channel) and pins the upgraded
+    /// contract: the fence returns promptly AND the mutation made while
+    /// the task was wedged is durably on disk. (Pre-ZEB-710 this test
+    /// pinned the old degraded mode — the fence could ONLY return via its
+    /// timeout, persisting nothing.)
     #[tokio::test]
     async fn fence_owner_state_flush_returns_on_stalled_engine() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -51697,17 +51707,18 @@ mod zeb427_fence_tests {
         // drained — the first publish fills it, the second blocks forever.
         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
         let engine = crate::owner_state_sync::SyncEngine::new(
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "fence-test-dev".into(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::owner_state_crdt::OwnerState::default(),
-            )),
+            std::sync::Arc::clone(&state),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
             std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
             pub_tx,
             sub_rx,
-            paths,
+            paths.clone(),
             // Large debounce: only the explicit flush_now calls drive
             // publishes; the wedge below is established deterministically, not
             // via the debounce-wakeup arm.
@@ -51738,6 +51749,13 @@ mod zeb427_fence_tests {
              engine task; it returned ({wedge:?}) — the stall rig is broken"
         );
 
+        // Mutate owner-state WHILE the task is provably wedged. ZEB-710: the
+        // fence's direct persist must still make this durable — the exact
+        // scenario the old channel-routed persist_now could not serve.
+        let tombstoned = crate::owner_state_types::SpaceId([0x77; 16]);
+        state.lock().await.tombstones.insert(tombstoned);
+        engine.notify_dirty();
+
         let started = std::time::Instant::now();
         fence_owner_state_flush(
             &engine,
@@ -51751,14 +51769,16 @@ mod zeb427_fence_tests {
             "bounded fence must return promptly on a stalled engine; took {:?}",
             started.elapsed()
         );
-        // The task is provably wedged inside publish (proven above), so the
-        // persist_now oneshot reply never arrives — only the timeout branch can
-        // return, and elapsed must reflect the bound actually firing.
+        // The discriminating assertion: the mutation made while the task was
+        // wedged reached disk. Pre-ZEB-710 the fence could only return via
+        // its timeout here, persisting nothing — this load would miss the
+        // tombstone.
+        let persisted = crate::owner_state_persist::load_crdt(&paths.crdt)
+            .expect("crdt file must load after the fence");
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(100),
-            "fence returned before its bound on a stalled engine ({:?}) — \
-             the stall rig is broken and this test is vacuous",
-            started.elapsed()
+            persisted.tombstones.contains(&tombstoned),
+            "the fence on a wedged engine must persist the mutation directly \
+             (ZEB-710 direct-persist seam)"
         );
         drop(pub_rx);
     }

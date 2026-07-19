@@ -13,9 +13,9 @@
 //!   2. Baseline: Alice's REAL send-side path (`drain -> push_deposit_candidate
 //!      -> build_cidnotify_packet_bytes -> dm_signing_material()`) signs a
 //!      CidNotify with her #2 device. Bob's REAL receive path
-//!      (`DmOutbox::handle_cidnotify_lifted`, the exact entry point the live
-//!      `ingest_dm_packet` / `ProdDmInboxIngestCtx` / `ProdRelayIngestCtx`
-//!      routes share via `verify_cidnotify_admission` internally) admits +
+//!      (`dm_inbox_ingest::ingest_dm_packet`, the live tunnel entry point —
+//!      it shares `verify_cidnotify_admission` with the `ProdDmInboxIngestCtx`
+//!      / `ProdRelayIngestCtx` recover routes) admits +
 //!      decrypts it against an EMPTY `RevokedDeviceProjection`. Delivered.
 //!   3. Alice's owner is revoked in a community Bob and Alice both belong to:
 //!      modeled by feeding Alice's #2 ed25519 key into Bob's
@@ -40,11 +40,11 @@
 //!      the DM Space directly for its assertions 3-4.
 //!
 //! Every send is the REAL production-signed wire packet (drain/deposit
-//! capture, not hand-built), and every receive runs through the REAL
-//! `DmOutbox::handle_cidnotify_lifted` -> `verify_cidnotify_admission` ->
-//! `verify_cidnotify_sender_binding` path — the same cutoff the live tunnel
-//! (`ingest_dm_packet`) and community-relay recovery
-//! (`ProdRelayIngestCtx`) routes share.
+//! capture, not hand-built), and every receive runs through the REAL live
+//! tunnel receive path `dm_inbox_ingest::ingest_dm_packet` ->
+//! `verify_cidnotify_admission` -> `verify_cidnotify_sender_binding` — the
+//! same cutoff the community-relay recovery (`ProdRelayIngestCtx`) route
+//! shares.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -297,9 +297,10 @@ async fn send_and_capture_cidnotify(
     base_t: u64,
 ) -> (
     harmony_app::dm_envelope::DmCidNotifySigned,
-    [u8; 64],
-    Vec<u8>,
     ContentId,
+    // ZEB-710: the raw signed CidNotify wire bytes — the LIVE receive path
+    // (`ingest_dm_packet`) decodes internally, so callers feed these directly.
+    Vec<u8>,
 ) {
     let deposit_transport = harmony_app::dm_outbox::DepositOnlyDmTransport;
     let (_msg_id, message_cid): (_, ContentId) = {
@@ -340,16 +341,14 @@ async fn send_and_capture_cidnotify(
         .cidnotify_packet
         .clone()
         .expect("deposit carries the CidNotify wire bytes");
-    let (signed, signature, signed_bytes) =
+    // Decode only to surface `signed` (callers assert on `signing_device_hash`);
+    // the raw wire bytes are handed back for the LIVE `ingest_dm_packet` path.
+    let signed =
         match harmony_app::dm_envelope::decode_packet(&cidnotify_wire).expect("decode cidnotify") {
-            harmony_app::dm_envelope::DmPacket::CidNotify {
-                signed,
-                signature,
-                signed_bytes,
-            } => (signed, signature, signed_bytes),
+            harmony_app::dm_envelope::DmPacket::CidNotify { signed, .. } => signed,
             other => panic!("expected CidNotify, got {other:?}"),
         };
-    (signed, signature, signed_bytes, message_cid)
+    (signed, message_cid, cidnotify_wire)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -625,7 +624,8 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
             Arc::new(harmony_app::content_store::InMemoryStub::default());
 
         let (alice_hash3, alice_sk3, alice_priv3) = dummy_hash3_and_key(0x31);
-        let (bob_hash3, bob_sk3, bob_priv3) = dummy_hash3_and_key(0x32);
+        // ZEB-710: Bob receives via `ingest_dm_packet` (device_id "bob-dev"), so
+        // he needs no #3 transport identity nor a receive-side DmOutbox.
         let (carol_hash3, carol_sk3, carol_priv3) = dummy_hash3_and_key(0x33);
         assert_ne!(
             alice_hash3, alice_d2_hash,
@@ -641,15 +641,6 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
             Arc::clone(&alice_device2),
             alice.cert.clone(),
         );
-        let bob_outbox = Arc::new(TokioMutex::new(harmony_app::dm_outbox::DmOutbox::new(
-            "bob-dev".into(),
-            bob.owner,
-            bob_hash3,
-            bob_sk3,
-            bob_priv3,
-            bob_device2,
-            bob.cert.clone(),
-        )));
         let mut carol_outbox = harmony_app::dm_outbox::DmOutbox::new(
             "carol-dev".into(),
             carol.owner,
@@ -683,7 +674,7 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
         // ── ASSERTION 1 (baseline): Alice's #2-signed CidNotify delivers
         //    via the REAL receive path with an EMPTY revocation projection.
         let body1 = b"baseline: alice's #2 is not revoked yet".to_vec();
-        let (signed1, sig1, bytes1, cid1) = send_and_capture_cidnotify(
+        let (signed1, cid1, wire1) = send_and_capture_cidnotify(
             &mut alice_outbox,
             &alice_crdt_state,
             &cas,
@@ -698,18 +689,21 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
             "the REAL drain path signed the baseline CidNotify with Alice's #2"
         );
 
-        harmony_app::dm_outbox::DmOutbox::handle_cidnotify_lifted(
-            Arc::clone(&bob_outbox),
-            Arc::clone(&bob_crdt_state),
-            Arc::clone(&cas),
-            Arc::clone(&sink),
-            signed1,
-            sig1,
-            bytes1,
-            now_ms(),
-            RevokedDeviceProjection::new(),
+        let applied1 = harmony_app::dm_inbox_ingest::ingest_dm_packet(
+            &bob_crdt_state,
+            &cas,
+            &sink,
+            None,
+            bob.owner,
+            "bob-dev",
+            [0u8; 32],
+            &wire1,
+            &RevokedDeviceProjection::new(),
+            None,
         )
-        .await;
+        .await
+        .expect("baseline CidNotify must deliver via the live receive path");
+        assert!(applied1, "baseline delivery is a fresh insert (Ok(true))");
 
         {
             let dm_received: Vec<serde_json::Value> = events
@@ -751,7 +745,7 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
         //    to the inbox (`SignerDeviceRevoked` inside
         //    `verify_cidnotify_sender_binding`). ────────────────────────────
         let body2 = b"post-revocation: this must be dropped".to_vec();
-        let (signed2, sig2, bytes2, cid2) = send_and_capture_cidnotify(
+        let (signed2, cid2, wire2) = send_and_capture_cidnotify(
             &mut alice_outbox,
             &alice_crdt_state,
             &cas,
@@ -767,18 +761,24 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
         );
         assert_ne!(cid2, cid1, "distinct message content -> distinct CID");
 
-        harmony_app::dm_outbox::DmOutbox::handle_cidnotify_lifted(
-            Arc::clone(&bob_outbox),
-            Arc::clone(&bob_crdt_state),
-            Arc::clone(&cas),
-            Arc::clone(&sink),
-            signed2,
-            sig2,
-            bytes2,
-            now_ms(),
-            revoked.clone(),
+        let err = harmony_app::dm_inbox_ingest::ingest_dm_packet(
+            &bob_crdt_state,
+            &cas,
+            &sink,
+            None,
+            bob.owner,
+            "bob-dev",
+            [0u8; 32],
+            &wire2,
+            &revoked,
+            None,
         )
-        .await;
+        .await
+        .expect_err("a CidNotify from a revoked device must be cut off");
+        assert!(
+            err.contains("SignerDeviceRevoked"),
+            "cutoff must come from verify_cidnotify_sender_binding (got: {err})"
+        );
 
         {
             let dm_received_count = events
@@ -811,7 +811,7 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
         );
 
         let body3 = b"control: carol's #2 was never revoked".to_vec();
-        let (signed3, sig3, bytes3, cid3) = send_and_capture_cidnotify(
+        let (signed3, cid3, wire3) = send_and_capture_cidnotify(
             &mut carol_outbox,
             &carol_crdt_state,
             &cas,
@@ -826,18 +826,21 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
             "the control send is signed with Carol's #2 (a different owner+key than Alice's)"
         );
 
-        harmony_app::dm_outbox::DmOutbox::handle_cidnotify_lifted(
-            Arc::clone(&bob_outbox),
-            Arc::clone(&bob_crdt_state),
-            Arc::clone(&cas),
-            Arc::clone(&sink),
-            signed3,
-            sig3,
-            bytes3,
-            now_ms(),
-            revoked.clone(),
+        let applied3 = harmony_app::dm_inbox_ingest::ingest_dm_packet(
+            &bob_crdt_state,
+            &cas,
+            &sink,
+            None,
+            bob.owner,
+            "bob-dev",
+            [0u8; 32],
+            &wire3,
+            &revoked,
+            None,
         )
-        .await;
+        .await
+        .expect("Carol's non-revoked #2 must still deliver through the same handle");
+        assert!(applied3, "control delivery is a fresh insert (Ok(true))");
 
         {
             let dm_received: Vec<serde_json::Value> = events
@@ -883,7 +886,7 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
 }
 
 /// ZEB-685 (S3): the DM-only-contact analogue of the community-revocation gate
-/// above. Proves the SAME real receive-path cutoff (`handle_cidnotify_lifted` ->
+/// above. Proves the SAME real receive-path cutoff (`ingest_dm_packet` ->
 /// `verify_cidnotify_admission` -> `verify_cidnotify_sender_binding`), but with
 /// the `RevokedDeviceProjection` populated by the S3 receive-side handler
 /// `dm_outbox::handle_revocation_push` — fed a REAL master-signed
@@ -967,16 +970,8 @@ async fn dm_only_contact_cutoff_via_revocation_push() {
         captured: Arc::clone(&captured_alice),
     }));
 
-    let (bob_hash3, bob_sk3, bob_priv3) = dummy_hash3_and_key(0x42);
-    let bob_outbox = Arc::new(TokioMutex::new(harmony_app::dm_outbox::DmOutbox::new(
-        "bob-dev".into(),
-        bob.owner,
-        bob_hash3,
-        bob_sk3,
-        bob_priv3,
-        Arc::new(SigningKey::from_bytes(&bob.device_key.to_bytes())),
-        bob.cert.clone(),
-    )));
+    // ZEB-710: Bob receives via `ingest_dm_packet` (device_id "bob-dev"), so he
+    // needs no #3 transport identity nor a receive-side DmOutbox.
 
     let events = Arc::new(StdMutex::new(Vec::<(String, serde_json::Value)>::new()));
     let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(RecordingSink {
@@ -988,7 +983,7 @@ async fn dm_only_contact_cutoff_via_revocation_push() {
     // ── ASSERTION 1 (baseline): Alice's #2-signed CidNotify delivers via the
     //    REAL receive path with an EMPTY revocation projection. ─────────────
     let body1 = b"baseline: alice's device is not revoked yet".to_vec();
-    let (signed1, sig1, bytes1, cid1) = send_and_capture_cidnotify(
+    let (signed1, cid1, wire1) = send_and_capture_cidnotify(
         &mut alice_outbox,
         &alice_crdt_state,
         &cas,
@@ -1002,18 +997,21 @@ async fn dm_only_contact_cutoff_via_revocation_push() {
         signed1.signing_device_hash, alice_d2_hash,
         "the REAL drain path signed the baseline CidNotify with Alice's #2"
     );
-    harmony_app::dm_outbox::DmOutbox::handle_cidnotify_lifted(
-        Arc::clone(&bob_outbox),
-        Arc::clone(&bob_crdt_state),
-        Arc::clone(&cas),
-        Arc::clone(&sink),
-        signed1,
-        sig1,
-        bytes1,
-        now_ms(),
-        RevokedDeviceProjection::new(),
+    let applied1 = harmony_app::dm_inbox_ingest::ingest_dm_packet(
+        &bob_crdt_state,
+        &cas,
+        &sink,
+        None,
+        bob.owner,
+        "bob-dev",
+        [0u8; 32],
+        &wire1,
+        &RevokedDeviceProjection::new(),
+        None,
     )
-    .await;
+    .await
+    .expect("baseline CidNotify must deliver via the live receive path");
+    assert!(applied1, "baseline delivery is a fresh insert (Ok(true))");
     {
         // Assert BOTH the event and the inbox at the baseline, so ASSERTION 2's
         // "dm_received == 1" is a genuine delta (baseline delivered, revoked
@@ -1076,7 +1074,7 @@ async fn dm_only_contact_cutoff_via_revocation_push() {
     // ── ASSERTION 2 (cutoff): the same device sending again is now dropped by
     //    the SAME real receive path — the DM-push feed closed the gap. ───────
     let body2 = b"post-revocation-push: this must be dropped".to_vec();
-    let (signed2, sig2, bytes2, cid2) = send_and_capture_cidnotify(
+    let (signed2, cid2, wire2) = send_and_capture_cidnotify(
         &mut alice_outbox,
         &alice_crdt_state,
         &cas,
@@ -1091,18 +1089,24 @@ async fn dm_only_contact_cutoff_via_revocation_push() {
         "the second send is STILL signed with Alice's (now-revoked) #2"
     );
     assert_ne!(cid2, cid1, "distinct content -> distinct CID");
-    harmony_app::dm_outbox::DmOutbox::handle_cidnotify_lifted(
-        Arc::clone(&bob_outbox),
-        Arc::clone(&bob_crdt_state),
-        Arc::clone(&cas),
-        Arc::clone(&sink),
-        signed2,
-        sig2,
-        bytes2,
-        now_ms(),
-        proj,
+    let err = harmony_app::dm_inbox_ingest::ingest_dm_packet(
+        &bob_crdt_state,
+        &cas,
+        &sink,
+        None,
+        bob.owner,
+        "bob-dev",
+        [0u8; 32],
+        &wire2,
+        &proj,
+        None,
     )
-    .await;
+    .await
+    .expect_err("a CidNotify from the revocation-pushed device must be cut off");
+    assert!(
+        err.contains("SignerDeviceRevoked"),
+        "cutoff must come from verify_cidnotify_sender_binding (got: {err})"
+    );
     {
         let dm_received = events
             .lock()
