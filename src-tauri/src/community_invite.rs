@@ -2408,22 +2408,29 @@ mod tests {
     /// semantics, not sloppiness.
     #[test]
     fn device_hash_stays_infallible_for_invalid_ed25519_point() {
-        // Search for a repeated-byte pattern whose Ed25519 half fails point
-        // decompression. A magic constant like [0xFF; 32] is NOT reliably
+        // Search for a combined pub whose Ed25519 half the IDENTITY layer
+        // itself rejects, using the production predicate as the search
+        // criterion (mirrors `dm_tunnel_contact.rs`) so the fixture can never
+        // drift from the layer under test. A magic constant is NOT reliably
         // invalid — curve25519-dalek REDUCES a non-canonical y mod p instead
-        // of rejecting it — so pick an encoding that is invalid by
-        // construction (roughly half of all y values are off-curve).
-        let bad_ed = (0u8..=255)
-            .map(|b| [b; 32])
-            .find(|cand| ed25519_dalek::VerifyingKey::from_bytes(cand).is_err())
-            .expect("some repeated-byte pattern must be off-curve");
-        let mut pub64 = [0u8; 64];
-        pub64[..32].copy_from_slice(&[0x5Bu8; 32]);
-        pub64[32..].copy_from_slice(&bad_ed);
+        // of rejecting it — and roughly half of all encodings are off-curve,
+        // so a deterministic scan finds one almost immediately.
+        let pub64 = (0u32..20_000)
+            .map(|i| {
+                let mut cand = [0u8; 64];
+                cand[..32].copy_from_slice(&[0x5Bu8; 32]);
+                cand[32] = (i & 0xFF) as u8;
+                cand[33] = (i >> 8) as u8;
+                cand
+            })
+            .find(|cand| crate::dm_signing::derive_device_hash_from_identity_pub(cand).is_none())
+            .expect("a 20k-candidate space must contain an off-curve Ed25519 encoding");
 
+        // Redundant with the search predicate, but states the contract's
+        // rejecting half explicitly next to the hashing half below.
         assert!(
             crate::dm_signing::derive_device_hash_from_identity_pub(&pub64).is_none(),
-            "identity layer must reject a non-canonical Ed25519 point"
+            "identity layer must reject the off-curve Ed25519 point"
         );
         assert_eq!(
             device_hash_from_identity_pub(&pub64),
