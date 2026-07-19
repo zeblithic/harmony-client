@@ -26,6 +26,14 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 pub const CONTESTABILITY_WINDOW_MS: i128 = 24 * 60 * 60 * 1000;
 /// Archive sweep cadence per spec §2: at-most-once per 24h across all logs.
 pub const ARCHIVE_SWEEP_INTERVAL_MS: i128 = 24 * 60 * 60 * 1000;
+/// ZEB-300 converge R1: re-dispatch Tier 2 SetPower auto-exec for Finalized
+/// polls each tick until the effect lands or the window closes. 1h, anchored
+/// to each replica's own `finalized_at_ms` — long enough that a later-arriving
+/// admin (who mints/countersigns the AdminProposal on a fresh window of its
+/// own) accumulates quorum before every replica's window closes, but bounded
+/// so re-dispatch is not unbounded. The `AlreadyApplied` idempotency guard
+/// stops re-mint the instant the effect syncs in, independent of this window.
+pub const AUTO_EXEC_RETRY_WINDOW_MS: i128 = 60 * 60 * 1000; // 1h
 
 /// Per-tick aggregated stats for tests + observability.
 #[derive(Debug, Default, Clone)]
@@ -55,10 +63,18 @@ pub struct TickStats {
     /// advancing it toward `admin_quorum` signatures.
     pub tier2_auto_execs_routed_proposal_countersigned: u32,
     /// ZEB-300: number of admin-affecting dispatches where this replica had
-    /// nothing to mint this tick — the effect was already applied, or this
-    /// replica had already signed the canonical proposal. Steady state
-    /// while the routing converges across ticks.
+    /// already signed the canonical proposal and is awaiting other admins'
+    /// signatures. Steady state while the routing converges across ticks.
+    /// May be bumped on repeated ticks within `AUTO_EXEC_RETRY_WINDOW_MS`
+    /// — that is expected for the retry loop.
     pub tier2_auto_execs_routed_proposal_pending: u32,
+    /// ZEB-300 converge R1: number of dispatches that returned
+    /// `AutoExecOutcome::AlreadyApplied` — the SetPower effect was already
+    /// present in materialized state, so nothing was minted. Counted
+    /// separately from `tier2_auto_execs_attempted` (this is an idempotent
+    /// no-op re-dispatch, not an attempt to mint). Can accrue on repeated
+    /// ticks within the retry window once the effect has landed — expected.
+    pub tier2_auto_execs_already_applied: u32,
     pub archive_swept: bool,
 }
 
@@ -217,16 +233,22 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
         }
     }
 
-    // ── Pass 3: Tier 2 contestability finalize + auto-exec ──────────
+    // ── Pass 3a: Tier 2 contestability finalize ─────────────────────
     // Walk Tier 2 polls in ThresholdReached lifecycle; if 24h elapsed
     // since `max(threshold_reached_at_ms, last_unsignal_after_threshold_ms)`
-    // with no reversion, transition to Finalized and dispatch auto-exec.
+    // with no reversion, transition to Finalized (stamping
+    // `meta.finalized_at_ms`) and emit `voting-proposal-finalized`.
     //
-    // Auto-exec runs AFTER releasing the voting_logs lock so the
-    // auto-exec helper (which itself takes NodeState locks) cannot
-    // deadlock against the tick's outer lock.
+    // ZEB-300 converge R1: auto-exec dispatch moved OUT of this
+    // finalize-transition block into Pass 3b, which re-dispatches for ALL
+    // Finalized SetPower polls within `AUTO_EXEC_RETRY_WINDOW_MS` — not
+    // only on the single tick a poll transitions to Finalized. This fixes
+    // the simultaneous-finalize stall (two admins each mint an
+    // AdminProposal on their finalize tick and neither ever countersigns
+    // the other's, so quorum never accrues). The just-finalized poll is
+    // still dispatched this same tick (its window is 0).
     {
-        let mut to_finalize: Vec<(SpaceId, PollId, AutoExecAction)> = Vec::new();
+        let mut to_finalize: Vec<(SpaceId, PollId)> = Vec::new();
         {
             let logs = ctx.voting_logs.lock().await;
             for (cid, log_mtx) in logs.iter() {
@@ -252,12 +274,12 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                     let uncontested_since =
                         reached_at.max(t2.last_unsignal_after_threshold_ms.unwrap_or(reached_at));
                     if (now_ms - uncontested_since) >= CONTESTABILITY_WINDOW_MS {
-                        to_finalize.push((*cid, *pid, t2.config.auto_exec.clone()));
+                        to_finalize.push((*cid, *pid));
                     }
                 }
             }
         }
-        for (cid, pid, auto_exec) in to_finalize {
+        for (cid, pid) in to_finalize {
             // Re-validate lifecycle == ThresholdReached AND the 24h
             // contestability window before mutating. Two separable
             // invariants because Signal{false} during ThresholdReached
@@ -268,9 +290,10 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
             // collect→mutate gap is TOCTOU-vulnerable (Cursor R8).
             //
             // Also stamp `meta.finalized_at_ms` so the archive sweep can
-            // age this Tier 2 poll. Tier 1 uses its terminal PollResult
-            // event's HLC for the same purpose; Tier 2 has no terminal
-            // event, so the meta field is the only signal (CR R3 Major).
+            // age this Tier 2 poll AND Pass 3b can anchor the auto-exec
+            // retry window. Tier 1 uses its terminal PollResult event's HLC
+            // for the same purpose; Tier 2 has no terminal event, so the
+            // meta field is the only signal (CR R3 Major).
             let mut did_finalize = false;
             {
                 let logs = ctx.voting_logs.lock().await;
@@ -309,53 +332,121 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                     "proposalId": hex::encode(pid.0),
                 }),
             );
-            match &auto_exec {
-                AutoExecAction::None => {}
-                AutoExecAction::SetPower {
-                    target_pubkey,
-                    new_power,
-                } => {
-                    stats.tier2_auto_execs_attempted += 1;
-                    match (ctx.auto_exec_set_power)(cid, *target_pubkey, *new_power).await {
-                        Ok(crate::community_membership::AutoExecOutcome::Applied) => {
-                            stats.tier2_auto_execs_succeeded += 1;
-                        }
-                        Ok(crate::community_membership::AutoExecOutcome::SkippedNotAdmin) => {
-                            // ZEB-297: this replica's local actor is not
-                            // admin in the community, so the mint would
-                            // self-reject. Admins race to mint; HLC LWW
-                            // dedupes; the first admin's SetPower
-                            // propagates here via the existing
-                            // membership log sync.
-                            stats.tier2_auto_execs_skipped_not_admin += 1;
-                        }
-                        Ok(crate::community_membership::AutoExecOutcome::RoutedProposalMinted) => {
-                            // ZEB-300: admin_quorum > 1 + admin-affecting;
-                            // this replica minted a fresh AdminProposal to
-                            // route the change through quorum.
-                            stats.tier2_auto_execs_routed_proposal_minted += 1;
-                        }
-                        Ok(crate::community_membership::AutoExecOutcome::RoutedProposalCountersigned) => {
-                            // ZEB-300: this replica countersigned the
-                            // canonical pending AdminProposal, advancing it
-                            // toward admin_quorum.
-                            stats.tier2_auto_execs_routed_proposal_countersigned += 1;
-                        }
-                        Ok(crate::community_membership::AutoExecOutcome::RoutedProposalPending) => {
-                            // ZEB-300: nothing to mint this tick (effect
-                            // already applied, or this replica already
-                            // signed the canonical proposal).
-                            stats.tier2_auto_execs_routed_proposal_pending += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                community = %hex::encode(cid.0),
-                                proposal = %hex::encode(pid.0),
-                                error = %e,
-                                "auto_exec_set_power failed"
-                            );
-                        }
+        }
+    }
+
+    // ── Pass 3b: Tier 2 SetPower auto-exec (bounded re-dispatch) ─────
+    // ZEB-300 converge R1: collect every Tier 2 poll that is Finalized,
+    // carries an `AutoExecAction::SetPower`, and whose `finalized_at_ms`
+    // is within `AUTO_EXEC_RETRY_WINDOW_MS` of `now_ms`, then dispatch
+    // auto-exec for each. This runs every tick (not only at the finalize
+    // transition), so the AdminProposal-routing quorum accumulates across
+    // admins' ticks even when two admins finalize simultaneously. The
+    // just-finalized poll (window == 0) is included here, so single-tick
+    // finalize-then-dispatch still holds.
+    //
+    // Idempotency: once the effect lands in materialized state the helper
+    // returns `AlreadyApplied` (both the direct-SetPower and
+    // AdminProposal-routed paths guard on `power_levels[target] == level`),
+    // so re-dispatch never re-mints after the effect syncs in on a replica.
+    //
+    // Stat behavior (acceptable): `Pending`/`SkippedNotAdmin` may be bumped
+    // on repeated ticks within the window — expected for a retry loop.
+    // `RoutedProposalMinted`/`RoutedProposalCountersigned` each happen at
+    // most once per replica per proposal (the planner then returns
+    // `Pending`), so they don't inflate. `AlreadyApplied` is counted
+    // separately from `tier2_auto_execs_attempted` (an idempotent no-op
+    // check is not a mint attempt).
+    //
+    // Auto-exec runs AFTER releasing the voting_logs lock so the auto-exec
+    // helper (which itself takes NodeState locks) cannot deadlock against
+    // the tick's outer lock.
+    {
+        let mut to_dispatch: Vec<(SpaceId, PollId, OwnerAddr, u32)> = Vec::new();
+        {
+            let logs = ctx.voting_logs.lock().await;
+            for (cid, log_mtx) in logs.iter() {
+                let log = log_mtx.lock().await;
+                for (pid, state) in log.polls.iter() {
+                    if state.meta.tier != Tier::Conviction {
+                        continue;
                     }
+                    if state.meta.lifecycle != Lifecycle::Finalized {
+                        continue;
+                    }
+                    let finalized_at = match state.meta.finalized_at_ms {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    if now_ms - (finalized_at as i128) > AUTO_EXEC_RETRY_WINDOW_MS {
+                        continue;
+                    }
+                    let auto_exec = match state
+                        .tier_state
+                        .as_tier2()
+                        .map(|t2| t2.config.auto_exec.clone())
+                    {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    if let AutoExecAction::SetPower {
+                        target_pubkey,
+                        new_power,
+                    } = auto_exec
+                    {
+                        to_dispatch.push((*cid, *pid, target_pubkey, new_power));
+                    }
+                }
+            }
+        }
+        for (cid, pid, target_pubkey, new_power) in to_dispatch {
+            match (ctx.auto_exec_set_power)(cid, target_pubkey, new_power).await {
+                Ok(crate::community_membership::AutoExecOutcome::AlreadyApplied) => {
+                    // ZEB-300 converge R1: idempotent no-op — the effect is
+                    // already present in materialized state. NOT counted as
+                    // an attempt (nothing was minted); this is the
+                    // re-dispatch stop condition.
+                    stats.tier2_auto_execs_already_applied += 1;
+                }
+                Ok(crate::community_membership::AutoExecOutcome::Applied) => {
+                    stats.tier2_auto_execs_attempted += 1;
+                    stats.tier2_auto_execs_succeeded += 1;
+                }
+                Ok(crate::community_membership::AutoExecOutcome::SkippedNotAdmin) => {
+                    // ZEB-297: this replica's local actor is not admin in the
+                    // community, so the mint would self-reject. Admins race
+                    // to mint; HLC LWW dedupes; the first admin's SetPower
+                    // propagates here via the existing membership log sync.
+                    stats.tier2_auto_execs_attempted += 1;
+                    stats.tier2_auto_execs_skipped_not_admin += 1;
+                }
+                Ok(crate::community_membership::AutoExecOutcome::RoutedProposalMinted) => {
+                    // ZEB-300: admin_quorum > 1 + admin-affecting; this
+                    // replica minted a fresh AdminProposal to route the
+                    // change through quorum.
+                    stats.tier2_auto_execs_attempted += 1;
+                    stats.tier2_auto_execs_routed_proposal_minted += 1;
+                }
+                Ok(crate::community_membership::AutoExecOutcome::RoutedProposalCountersigned) => {
+                    // ZEB-300: this replica countersigned the canonical
+                    // pending AdminProposal, advancing it toward admin_quorum.
+                    stats.tier2_auto_execs_attempted += 1;
+                    stats.tier2_auto_execs_routed_proposal_countersigned += 1;
+                }
+                Ok(crate::community_membership::AutoExecOutcome::RoutedProposalPending) => {
+                    // ZEB-300: this replica already signed the canonical
+                    // proposal and is awaiting other admins' signatures.
+                    stats.tier2_auto_execs_attempted += 1;
+                    stats.tier2_auto_execs_routed_proposal_pending += 1;
+                }
+                Err(e) => {
+                    stats.tier2_auto_execs_attempted += 1;
+                    tracing::warn!(
+                        community = %hex::encode(cid.0),
+                        proposal = %hex::encode(pid.0),
+                        error = %e,
+                        "auto_exec_set_power failed"
+                    );
                 }
             }
         }
@@ -1066,6 +1157,141 @@ mod tests {
         assert_eq!(
             stats.tier2_auto_execs_routed_proposal_minted, 0,
             "Err path must NOT bump the routed-minted counter"
+        );
+    }
+
+    /// ZEB-300 converge R1: a Finalized SetPower poll must be re-dispatched
+    /// on EVERY tick within `AUTO_EXEC_RETRY_WINDOW_MS`, not only on the tick
+    /// it transitions to Finalized. This is the fix for the
+    /// simultaneous-finalize stall (Qodo): if two admins each mint an
+    /// AdminProposal at their finalize tick and the routing only ran once,
+    /// neither would ever countersign the canonical proposal and quorum
+    /// would stall forever. A later tick must re-enter the auto-exec dispatch
+    /// so the canonical proposal can be countersigned.
+    #[tokio::test]
+    async fn tier2_auto_exec_redispatches_finalized_poll_within_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cid = SpaceId([0x77; 16]);
+        let pid = PollId([0x88; 32]);
+        let target = OwnerAddr([0xcc; 16]);
+        let new_power = 100; // admin-affecting → the routed path this fix serves
+        let cfg = make_tier2_config(AutoExecAction::SetPower {
+            target_pubkey: target,
+            new_power,
+        });
+        let mut t2 = Tier2ProposalState::new(cfg, 1);
+        use crate::community_voting_conviction::VoterConvictionState;
+        let mut vs = VoterConvictionState::default();
+        vs.apply_signal(true, 0, 0, 86_400_000);
+        t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
+        let reached_at = 1_000i128;
+        t2.threshold_reached_at_ms = Some(reached_at);
+
+        let mut log = VotingLog::new();
+        log.polls.insert(
+            pid,
+            make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
+        );
+        let mut logs = HashMap::new();
+        logs.insert(cid, Arc::new(Mutex::new(log)));
+
+        let now_ms_1 = reached_at + 25 * 60 * 60 * 1000;
+        // last_sweep = first tick's now so the archive pass never runs.
+        let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms_1);
+
+        // Shared cross-tick dispatch counter. Always returns Applied (a mock —
+        // it does NOT mutate the stored poll, so the poll stays Finalized and
+        // is eligible for re-dispatch on the next tick).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_closure = Arc::clone(&calls);
+        ctx.auto_exec_set_power = Arc::new(move |_cid, _target, _power| {
+            let calls = Arc::clone(&calls_in_closure);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::community_membership::AutoExecOutcome::Applied)
+            })
+        });
+
+        // Tick 1: poll finalizes (window elapsed) → dispatched once (window 0).
+        let stats1 = run_voting_tick(&ctx, now_ms_1).await.unwrap();
+        assert_eq!(stats1.tier2_proposals_finalized, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "finalize tick must dispatch exactly once"
+        );
+
+        // Tick 2: poll is already Finalized; now still within the retry window.
+        let now_ms_2 = now_ms_1 + 30 * 60 * 1000; // +30min < 1h window
+        let stats2 = run_voting_tick(&ctx, now_ms_2).await.unwrap();
+        assert_eq!(
+            stats2.tier2_proposals_finalized, 0,
+            "already Finalized on tick 2 — no re-finalize"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "Finalized SetPower poll must be re-dispatched within the retry window (got {})",
+            calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// ZEB-300 converge R1: the bounded re-dispatch loop STOPS once
+    /// `now_ms` passes `finalized_at_ms + AUTO_EXEC_RETRY_WINDOW_MS`. Bounds
+    /// the retry so a permanently-stalled proposal (e.g. no other admin ever
+    /// countersigns) does not re-dispatch forever.
+    #[tokio::test]
+    async fn tier2_auto_exec_stops_redispatch_after_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cid = SpaceId([0x77; 16]);
+        let pid = PollId([0x88; 32]);
+        let target = OwnerAddr([0xcc; 16]);
+        let new_power = 100;
+        let cfg = make_tier2_config(AutoExecAction::SetPower {
+            target_pubkey: target,
+            new_power,
+        });
+        let mut t2 = Tier2ProposalState::new(cfg, 1);
+        use crate::community_voting_conviction::VoterConvictionState;
+        let mut vs = VoterConvictionState::default();
+        vs.apply_signal(true, 0, 0, 86_400_000);
+        t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
+        let reached_at = 1_000i128;
+        t2.threshold_reached_at_ms = Some(reached_at);
+
+        let mut log = VotingLog::new();
+        log.polls.insert(
+            pid,
+            make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
+        );
+        let mut logs = HashMap::new();
+        logs.insert(cid, Arc::new(Mutex::new(log)));
+
+        let now_ms_1 = reached_at + 25 * 60 * 60 * 1000;
+        let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms_1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_closure = Arc::clone(&calls);
+        ctx.auto_exec_set_power = Arc::new(move |_cid, _target, _power| {
+            let calls = Arc::clone(&calls_in_closure);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::community_membership::AutoExecOutcome::Applied)
+            })
+        });
+
+        // Tick 1: finalize + dispatch once (finalized_at_ms == now_ms_1).
+        run_voting_tick(&ctx, now_ms_1).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Tick 2: now strictly past finalized_at_ms + retry window → no dispatch.
+        let now_ms_2 = now_ms_1 + AUTO_EXEC_RETRY_WINDOW_MS + 1;
+        run_voting_tick(&ctx, now_ms_2).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no re-dispatch once the retry window has closed"
         );
     }
 
