@@ -26,8 +26,16 @@
   let selectedOutput = $state(audioDevices.getOutput() ?? '');
   const outputSupported = audioDevices.supportsOutputSelection();
 
+  /** Monotonic token so a slow enumeration can't overwrite a newer one
+   *  (PR #495 R1, Qodo): refreshes fire on mount AND every prefs/devicechange
+   *  notification, and enumerateDevices latency lets them resolve out of
+   *  order — only the latest-started refresh may commit. */
+  let refreshSeq = 0;
+
   async function refresh(): Promise<void> {
+    const seq = ++refreshSeq;
     const set = await audioDevices.listDevices();
+    if (seq !== refreshSeq) return; // superseded by a newer refresh
     inputs = set.inputs;
     outputs = set.outputs;
     selectedInput = audioDevices.getInput() ?? '';

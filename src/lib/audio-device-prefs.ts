@@ -199,6 +199,16 @@ export class AudioDevicePrefs {
   }
 
   private notify(): void {
-    for (const cb of [...this.subscribers]) cb();
+    // Isolate subscriber failures (PR #495 R1): this singleton fans out to
+    // three media sessions + the Settings tab — one throwing callback must
+    // neither starve the rest nor propagate out of setInput/setOutput.
+    for (const cb of [...this.subscribers]) {
+      try {
+        cb();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error('audio-device-prefs subscriber threw:', msg);
+      }
+    }
   }
 }

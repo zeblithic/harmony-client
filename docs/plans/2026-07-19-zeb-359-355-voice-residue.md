@@ -89,7 +89,8 @@ stretch backoff loops, group-call device UI beyond what the shared sessions give
 
 - **T1** `voice_reconnect.rs` `ProgressBackoff` + unit tests.
 - **T2** `run_media_subscriber` + swap channel/DM media call sites; control-loop
-  arithmetic adopts `ProgressBackoff`. Gates: fmt, clippy `--all-targets`,
+  arithmetic adopts `ProgressBackoff`. Gates: `cargo fmt --all -- --check`,
+  `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`,
   `scripts/test-select --context task`.
 - **T3** `audio-device-prefs.ts` + tests (persistence, subscribe, devicechange,
   filtering, support detection).
@@ -100,7 +101,9 @@ stretch backoff loops, group-call device UI beyond what the shared sessions give
 - **T6** Session wiring both sessions + tests (construction getters, live
   re-apply, unplug fallback, unsubscribe on teardown).
 - **T7** `VoiceDeviceSettings.svelte` + SettingsPanel Voice tab + tests.
-- **T8** Gates: `npx vitest run`, `npx tsc --noEmit`, cargo fmt/clippy
-  `--all-targets`, `scripts/test-select --context task` (paste summary line);
+- **T8** Gates: `npx vitest run`, `npx tsc --noEmit`,
+  `cargo fmt --all -- --check`,
+  `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`,
+  `scripts/test-select --context task` (paste summary line);
   full sweep `scripts/test-select --full` pre-PR. PR body: "Closes ZEB-359.
   Closes ZEB-355."

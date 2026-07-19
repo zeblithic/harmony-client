@@ -51,9 +51,35 @@ export function followAudioDevices(deps: DeviceFollowerDeps): () => void {
     return inputs.some((d) => d.deviceId === pref);
   };
 
-  // Baseline presence so the first devicechange can detect an unplug edge.
+  const switchGuarded = async (): Promise<void> => {
+    const sender = deps.getSender();
+    if (!sender) return;
+    try {
+      await sender.switchInputDevice();
+    } catch (e) {
+      // Stale-callback guard (PR #495 R1): a switch settling after unfollow
+      // must not invoke onMicError — the session closures read live fields,
+      // so a torn-down follower could otherwise null the sender of a
+      // freshly-rejoined session.
+      if (!stopped) deps.onMicError(e);
+    }
+  };
+
+  // Baseline presence so the first devicechange can detect an unplug edge —
+  // plus a one-time reconcile (PR #495 R1, Qodo): a preferred device that was
+  // absent at capture start but replugged before this follower attached would
+  // otherwise sit on the OS-default fallback with no future edge to fix it.
+  // When the pref is present now, restart the capture leg once so it
+  // deterministically reflects the preference; sessions attach the follower
+  // while still start-muted (D10), so the restart gap is inaudible.
   chain = chain.then(async () => {
     inputPresent = await currentPresence();
+    if (stopped || inputPresent !== true) return;
+    // Only reconcile the pref that was current at follow start — a pref that
+    // changed since then already has a react() queued behind this baseline,
+    // and reconciling here too would restart capture twice.
+    if (deps.prefs.getInput() !== appliedInput) return;
+    await switchGuarded();
   });
 
   const react = async (): Promise<void> => {
@@ -61,23 +87,18 @@ export function followAudioDevices(deps: DeviceFollowerDeps): () => void {
     const wantOut = deps.prefs.getOutput();
     if (wantOut !== appliedOutput) {
       appliedOutput = wantOut;
-      await deps.getMixer()?.setOutputDevice(wantOut);
+      if (!stopped) await deps.getMixer()?.setOutputDevice(wantOut);
     }
     const wantIn = deps.prefs.getInput();
     const present = await currentPresence();
+    if (stopped) return;
     const prefChanged = wantIn !== appliedInput;
     const presenceChanged =
       wantIn !== null && inputPresent !== null && present !== inputPresent;
     appliedInput = wantIn;
     inputPresent = present;
     if (!prefChanged && !presenceChanged) return;
-    const sender = deps.getSender();
-    if (!sender) return;
-    try {
-      await sender.switchInputDevice();
-    } catch (e) {
-      deps.onMicError(e);
-    }
+    await switchGuarded();
   };
 
   const unsubscribe = deps.prefs.subscribe(() => {

@@ -407,6 +407,41 @@ describe('VoiceSender', () => {
       expect(ctx.mockCapture.start).not.toHaveBeenCalled();
     });
 
+    it('a concurrent stop() serializes behind an in-flight switch (no double-destroy, no stale capture)', async () => {
+      // PR #495 R1 (CodeRabbit Major): switchInputDevice must register in the
+      // `starting` mutex so a session teardown arriving mid-switch waits for
+      // the restart instead of destroying the codec under it and leaving the
+      // freshly restarted capture running (open mic) after teardown.
+      const sender = new VoiceSender({
+        ...ctx.config,
+        inputDeviceId: () => 'mic-a',
+      });
+      await sender.start();
+      let releaseRestart!: () => void;
+      const restartParked = new Promise<void>((r) => { releaseRestart = r; });
+      let signalEntered!: () => void;
+      const restartEntered = new Promise<void>((r) => { signalEntered = r; });
+      (ctx.mockCapture.start as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        async () => {
+          signalEntered();
+          await restartParked;
+        },
+      );
+      const switching = sender.switchInputDevice();
+      await restartEntered; // the switch is parked inside its capture restart
+      const stopping = sender.stop();
+      await new Promise((r) => setTimeout(r, 0));
+      // stop() must still be waiting on the in-flight switch: no teardown yet.
+      expect(ctx.mockCodec.destroy).not.toHaveBeenCalled();
+      releaseRestart();
+      await switching;
+      await stopping;
+      // Exactly one codec teardown (stop's), and stop() also stopped the
+      // restarted capture (switch's stop + stop()'s stop).
+      expect(ctx.mockCodec.destroy).toHaveBeenCalledTimes(1);
+      expect(ctx.mockCapture.stop).toHaveBeenCalledTimes(2);
+    });
+
     it('a failed capture restart deactivates the sender and surfaces the error', async () => {
       const sender = new VoiceSender({
         ...ctx.config,

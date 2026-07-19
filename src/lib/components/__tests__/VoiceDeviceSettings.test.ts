@@ -90,6 +90,30 @@ describe('VoiceDeviceSettings', () => {
     expect(labels.some((l) => /unavailable/i.test(l))).toBe(true);
   });
 
+  it('an out-of-order enumeration cannot overwrite a newer result (PR #495 R1)', async () => {
+    const h = makeService();
+    const resolvers: ((v: {
+      inputs: { deviceId: string; label: string }[];
+      outputs: { deviceId: string; label: string }[];
+    }) => void)[] = [];
+    h.svc.listDevices.mockImplementation(
+      () => new Promise((res) => resolvers.push(res)),
+    );
+    render(VoiceDeviceSettings, { audioDevices: h.svc as never });
+    const inputSel = (await screen.findByLabelText('Microphone')) as HTMLSelectElement;
+    h.fire(); // second refresh queued while the mount refresh is still pending
+    await waitFor(() => expect(resolvers.length).toBe(2));
+    // The NEWER (second) enumeration resolves first…
+    resolvers[1]({ inputs: [{ deviceId: 'new', label: 'New Mic' }], outputs: [] });
+    await waitFor(() => expect(inputSel.options.length).toBe(2));
+    // …then the STALE (first) one lands late and must be discarded.
+    resolvers[0]({ inputs: [{ deviceId: 'old', label: 'Old Mic' }], outputs: [] });
+    await new Promise((r) => setTimeout(r, 0));
+    const labels = [...inputSel.options].map((o) => o.textContent ?? '');
+    expect(labels.some((l) => l.includes('New Mic'))).toBe(true);
+    expect(labels.some((l) => l.includes('Old Mic'))).toBe(false);
+  });
+
   it('re-enumerates on service change events and unsubscribes on destroy', async () => {
     const h = makeService({ inputs: [{ deviceId: 'm1', label: 'Mic' }] });
     const { unmount } = render(VoiceDeviceSettings, { audioDevices: h.svc as never });

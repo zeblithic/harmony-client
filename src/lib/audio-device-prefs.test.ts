@@ -106,6 +106,21 @@ describe('AudioDevicePrefs', () => {
     expect(cb).toHaveBeenCalledTimes(2);
   });
 
+  it('a throwing subscriber does not block the others nor the setter (PR #495 R1)', () => {
+    const p = new AudioDevicePrefs({ storage, media: null });
+    const bad = vi.fn(() => {
+      throw new Error('subscriber exploded');
+    });
+    const good = vi.fn();
+    p.subscribe(bad);
+    p.subscribe(good);
+    expect(() => p.setInput('mic-1')).not.toThrow();
+    expect(bad).toHaveBeenCalledTimes(1);
+    expect(good).toHaveBeenCalledTimes(1);
+    // The pref still landed.
+    expect(p.getInput()).toBe('mic-1');
+  });
+
   it('does not notify when setting the same value again', () => {
     const p = new AudioDevicePrefs({ storage, media: null });
     p.setInput('mic-1');

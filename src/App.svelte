@@ -237,6 +237,7 @@
   // Shared by all three media sessions (channel voice, 1:1 calls, group calls)
   // and the Settings → Voice pickers, so a change applies everywhere at once.
   const audioDevicePrefs = new AudioDevicePrefs();
+  $effect(() => () => audioDevicePrefs.destroy());
   // T13: reactive aliases of the voice/call/group-call state stores so the
   // `$store` syntax auto-subscribes in the script + markup (the group-DM header's
   // busy/active/self model and the in-call bar's group-name lookup read these).

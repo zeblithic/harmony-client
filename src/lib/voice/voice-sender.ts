@@ -135,22 +135,35 @@ export class VoiceSender {
   async switchInputDevice(): Promise<void> {
     if (this.starting) await this.starting.catch(() => {});
     if (!this.active || !this.onFrameCb) return;
-    const sr = this.config.sampleRate ??
-      (this.config.codec.codecType === 'codec2' ? 8000 : 16000);
-    await this.config.capture.stop();
+    // Register in the `starting` mutex (PR #495 R1): a concurrent stop()
+    // (session teardown) awaits `starting` first, so it can't destroy the
+    // codec under this restart or leave the freshly restarted capture running
+    // (open mic) after teardown — it tears the new capture down itself once
+    // the switch settles.
+    this.starting = (async () => {
+      const cb = this.onFrameCb!;
+      const sr = this.config.sampleRate ??
+        (this.config.codec.codecType === 'codec2' ? 8000 : 16000);
+      await this.config.capture.stop();
+      try {
+        await this.config.capture.start(
+          cb,
+          undefined,
+          undefined,
+          sr,
+          this.currentInputDevice(),
+        );
+      } catch (err) {
+        this.config.codec.destroy();
+        this.active = false;
+        this.onFrameCb = null;
+        throw err;
+      }
+    })();
     try {
-      await this.config.capture.start(
-        this.onFrameCb,
-        undefined,
-        undefined,
-        sr,
-        this.currentInputDevice(),
-      );
-    } catch (err) {
-      this.config.codec.destroy();
-      this.active = false;
-      this.onFrameCb = null;
-      throw err;
+      await this.starting;
+    } finally {
+      this.starting = null;
     }
   }
 

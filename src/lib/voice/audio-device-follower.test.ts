@@ -91,15 +91,43 @@ describe('followAudioDevices', () => {
     stop();
   });
 
+  it('reconciles once at follow start when the preferred input is present (PR #495 R1)', async () => {
+    // A preferred device absent at capture start but replugged before the
+    // follower attached would otherwise be stuck on the OS-default fallback
+    // with no future edge to fix it — the one-time reconcile covers that
+    // window (sessions attach while start-muted, so the gap is inaudible).
+    h.setDevices(['mic-a']);
+    h.setInput('mic-a');
+    const stop = h.follow();
+    await flush();
+    expect(h.sender.switchInputDevice).toHaveBeenCalledTimes(1);
+    stop();
+  });
+
+  it('skips the initial reconcile when no pref is set or the pref is absent', async () => {
+    const stop = h.follow(); // no pref
+    await flush();
+    expect(h.sender.switchInputDevice).not.toHaveBeenCalled();
+    stop();
+    h.setDevices([]);
+    h.setInput('mic-gone'); // pref set but device absent — nothing to switch to
+    h.sender.switchInputDevice.mockClear();
+    const stop2 = h.follow();
+    await flush();
+    expect(h.sender.switchInputDevice).not.toHaveBeenCalled();
+    stop2();
+  });
+
   it('ignores a devicechange that does not affect the preferred input', async () => {
     h.setDevices(['mic-a', 'mic-b']);
     h.setInput('mic-a');
     const stop = h.follow();
-    await flush();
+    await flush(); // initial reconcile (present at follow start)
+    expect(h.sender.switchInputDevice).toHaveBeenCalledTimes(1);
     h.setDevices(['mic-a', 'mic-b', 'webcam-mic']);
     h.fireDeviceChange();
     await flush();
-    expect(h.sender.switchInputDevice).not.toHaveBeenCalled();
+    expect(h.sender.switchInputDevice).toHaveBeenCalledTimes(1); // unchanged
     stop();
   });
 
@@ -107,11 +135,12 @@ describe('followAudioDevices', () => {
     h.setDevices(['mic-a']);
     h.setInput('mic-a');
     const stop = h.follow();
-    await flush(); // baseline presence recorded
+    await flush(); // baseline presence + initial reconcile
+    expect(h.sender.switchInputDevice).toHaveBeenCalledTimes(1);
     h.setDevices([]);
     h.fireDeviceChange();
     await flush();
-    expect(h.sender.switchInputDevice).toHaveBeenCalledTimes(1);
+    expect(h.sender.switchInputDevice).toHaveBeenCalledTimes(2);
     stop();
   });
 
@@ -119,15 +148,30 @@ describe('followAudioDevices', () => {
     h.setDevices(['mic-a']);
     h.setInput('mic-a');
     const stop = h.follow();
-    await flush();
+    await flush(); // initial reconcile
     h.setDevices([]);
     h.fireDeviceChange();
-    await flush();
+    await flush(); // unplug edge
     h.setDevices(['mic-a']);
     h.fireDeviceChange();
-    await flush();
-    expect(h.sender.switchInputDevice).toHaveBeenCalledTimes(2);
+    await flush(); // replug edge
+    expect(h.sender.switchInputDevice).toHaveBeenCalledTimes(3);
     stop();
+  });
+
+  it('a switch settling after unfollow does not fire onMicError (stale callback)', async () => {
+    let rejectLate!: (e: Error) => void;
+    h.sender.switchInputDevice.mockImplementationOnce(
+      () => new Promise<void>((_res, rej) => { rejectLate = rej; }),
+    );
+    const stop = h.follow(); // no pref → no initial reconcile
+    h.setDevices(['mic-b']);
+    h.setInput('mic-b'); // triggers a switch that parks
+    await flush();
+    stop(); // unfollow while the switch is in flight
+    rejectLate(new Error('late fail'));
+    await flush();
+    expect(h.onMicError).not.toHaveBeenCalled();
   });
 
   it('reports a failed capture restart via onMicError instead of throwing', async () => {
