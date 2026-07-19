@@ -1026,3 +1026,85 @@ describe('MessageService — ZEB-337: self messages use configured ownDisplayNam
     expect(msg.sender.displayName).toBe('You');
   });
 });
+
+// ZEB-357 — call-event DM messages: both ingestion points (live dm-received
+// and read_dm_thread scrollback) must parse the payload onto Message.callEvent
+// and replace `text` with the direction-aware system-line label, so previews /
+// search / old render paths degrade to something human-readable.
+describe('MessageService call-event ingestion (ZEB-357)', () => {
+  let svc: MessageService;
+
+  beforeEach(() => {
+    svc = new MessageService();
+    svc.messages = [];
+  });
+
+  function hexEncode(s: string): string {
+    return Array.from(new TextEncoder().encode(s))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  const CALL_MIME = 'application/x-harmony-call-event+json';
+  const missedBody = JSON.stringify({ v: 1, callId: 'ab'.repeat(16), outcome: 'no_answer' });
+
+  it('dm-received from the peer parses callEvent and labels it as the recipient', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.ownAddress = 'my-own-hex';
+    await svc.connectAdapter(adapter);
+    emit('dm-received', {
+      spaceId: 'aabbccdd', messageCid: 'call-cid-1', from: 'bob-hex',
+      sentAt: 1, receivedAt: 2, body: hexEncode(missedBody), mimeType: CALL_MIME,
+    });
+    const msg = svc.messages.find((m) => m.id === 'call-cid-1')!;
+    expect(msg.callEvent).toEqual({ v: 1, callId: 'ab'.repeat(16), outcome: 'no_answer' });
+    expect(msg.text).toBe('Missed call');
+  });
+
+  it('dm-received authored by self labels it as the author', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.ownAddress = 'my-own-hex';
+    await svc.connectAdapter(adapter);
+    emit('dm-received', {
+      spaceId: 'aabbccdd', messageCid: 'call-cid-2', from: 'my-own-hex',
+      sentAt: 1, receivedAt: 2, body: hexEncode(missedBody), mimeType: CALL_MIME,
+    });
+    const msg = svc.messages.find((m) => m.id === 'call-cid-2')!;
+    expect(msg.callEvent?.outcome).toBe('no_answer');
+    expect(msg.text).toBe('Call — no answer');
+  });
+
+  it('a malformed call-event body falls back to plain text (no callEvent)', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('dm-received', {
+      spaceId: 'aabbccdd', messageCid: 'call-cid-3', from: 'bob-hex',
+      sentAt: 1, receivedAt: 2, body: hexEncode('{broken'), mimeType: CALL_MIME,
+    });
+    const msg = svc.messages.find((m) => m.id === 'call-cid-3')!;
+    expect(msg.callEvent).toBeUndefined();
+    expect(msg.text).toBe('{broken');
+  });
+
+  it('scrollback parses callEvent with direction from isSelfOutbound', async () => {
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        messageCid: 'sb-call-peer', from: 'bob-hex', sentAt: 3, receivedAt: 4,
+        body: hexEncode(missedBody), mimeType: CALL_MIME, isSelfOutbound: false,
+      },
+      {
+        messageCid: 'sb-call-self', from: 'me', sentAt: 1, receivedAt: 2,
+        body: hexEncode(missedBody), mimeType: CALL_MIME, isSelfOutbound: true,
+      },
+    ]);
+    await svc.loadDmThread('space-1');
+    const peer = svc.messages.find((m) => m.id === 'sb-call-peer')!;
+    expect(peer.callEvent?.outcome).toBe('no_answer');
+    expect(peer.text).toBe('Missed call');
+    const self = svc.messages.find((m) => m.id === 'sb-call-self')!;
+    expect(self.callEvent?.outcome).toBe('no_answer');
+    expect(self.text).toBe('Call — no answer');
+  });
+});

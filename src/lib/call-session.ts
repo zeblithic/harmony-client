@@ -11,6 +11,7 @@
 // the DM path can't drift from the channel path's hard-won correctness.
 
 import { writable, get, type Readable } from 'svelte/store';
+import type { CallEventPayload, CallOutcome } from './call-log';
 import { VoiceActivityDetector } from './voice/vad';
 import { makeTalkGate } from './voice/talk-gate';
 import { VoiceSender } from './voice/voice-sender';
@@ -75,6 +76,13 @@ export interface CallSessionDeps {
   makeMixer?: () => Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy'>;
   /** Resolve an owner hex → { displayName, avatarUrl } for the call UI (optional). */
   resolveCard?: (ownerHex: string) => { displayName?: string; avatarUrl?: string } | undefined;
+  /**
+   * ZEB-357: fired once per call at its terminal transition, ONLY when this
+   * side placed the call (single-writer rule — the caller observes every
+   * outcome, so the callee never records). The App wires this to author the
+   * call-event DM message; the session itself stays IPC-schema-agnostic.
+   */
+  onCallOutcome?: (spaceId: string, payload: CallEventPayload) => void;
 }
 
 const INITIAL: CallSessionState = {
@@ -109,6 +117,9 @@ export class CallSession {
   /** The spaceId (DM space) used to place/accept this call; passed to the
    *  signaling verbs (cancel/decline/end) that the backend keys by space. */
   private spaceId: string | null = null;
+  /** ZEB-357: true iff this side placed the current call. Gates outcome
+   *  recording (single-writer: only the caller authors the call-event). */
+  private isCaller = false;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   private ringTimer: ReturnType<typeof setTimeout> | null = null;
   /** Transport-lifecycle unlisteners (voice-transport-lost/restored). Torn down
@@ -137,6 +148,7 @@ export class CallSession {
     this.clearRingTimer();
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.callId = null; this.spaceId = null;
+    this.isCaller = false;
     this.vad.reset();
     // Single store notification: callers that need to surface an end reason pass
     // it here rather than reset-then-patch, which would briefly flash endReason
@@ -146,6 +158,20 @@ export class CallSession {
 
   private clearRingTimer(): void {
     if (this.ringTimer) { clearTimeout(this.ringTimer); this.ringTimer = null; }
+  }
+
+  /**
+   * ZEB-357: emit the terminal outcome for the current call. Must run BEFORE
+   * the resetToIdle that clears callId/spaceId. No-op on the callee side
+   * (single-writer rule) or when the dep isn't wired. The callId guard in
+   * every remote handler already ensures at most one terminal per call — by
+   * the time a stale second terminal arrives, callId is null.
+   */
+  private recordOutcome(outcome: CallOutcome, durationMs?: number): void {
+    if (!this.isCaller || !this.callId || !this.spaceId) return;
+    const payload: CallEventPayload = { v: 1, callId: this.callId, outcome };
+    if (durationMs !== undefined) payload.durationMs = durationMs;
+    this.deps.onCallOutcome?.(this.spaceId, payload);
   }
 
   // ---------------------------------------------------------------------------
@@ -160,6 +186,7 @@ export class CallSession {
     const callId = (await this.deps.invoke('place_call', { spaceId })) as string;
     this.callId = callId;
     this.spaceId = spaceId;
+    this.isCaller = true;
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.vad.reset();
     this.patch({
@@ -177,6 +204,9 @@ export class CallSession {
     if (callId) {
       await this.deps.invoke('cancel_call', { callId, spaceId }).catch(() => {});
     }
+    // The only terminal an unreachable/offline callee ever gets (there is no
+    // caller-side ring timeout) — the recipient renders it as a missed call.
+    this.recordOutcome('canceled');
     this.resetToIdle();
   }
 
@@ -237,8 +267,24 @@ export class CallSession {
     if (callId) {
       await this.deps.invoke('end_call', { callId, spaceId }).catch(() => {});
     }
+    this.recordAnsweredTerminal(phase);
     await this.teardownMedia(callId);
     this.resetToIdle();
+  }
+
+  /**
+   * ZEB-357: caller-side terminal for a call that got past the ring — records
+   * `answered` with the active-phase duration (0 when it ended while still
+   * connecting). An `end()` from `ringingOut` (not reachable via the UI, which
+   * uses cancel there) records `canceled` so it can't masquerade as answered.
+   */
+  private recordAnsweredTerminal(phase: CallPhase): void {
+    if (phase === 'ringingOut') {
+      this.recordOutcome('canceled');
+      return;
+    }
+    const startedAt = get(this.store).startedAt;
+    this.recordOutcome('answered', startedAt !== null ? Date.now() - startedAt : 0);
   }
 
   // ---------------------------------------------------------------------------
@@ -257,6 +303,12 @@ export class CallSession {
   /** Caller side: the callee declined — surface the reason and reset. */
   onRemoteDeclined(callId: string, reason: string): void {
     if (this.callId !== callId || get(this.store).phase !== 'ringingOut') return;
+    // timeout = the callee's ring timer expired (they never picked up);
+    // busy = their device auto-declined while on another call; anything else
+    // is an explicit user decline.
+    this.recordOutcome(
+      reason === 'timeout' ? 'no_answer' : reason === 'busy' ? 'busy' : 'declined',
+    );
     this.resetToIdle(reason);
   }
 
@@ -271,6 +323,7 @@ export class CallSession {
     if (this.callId !== callId) return;
     const phase = get(this.store).phase;
     if (phase === 'idle' || phase === 'ended') return;
+    this.recordAnsweredTerminal(phase);
     await this.teardownMedia(callId);
     this.resetToIdle();
   }

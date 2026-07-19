@@ -21,6 +21,7 @@
 import type { Hlc } from './types';
 import type { UnreadCursorStore } from './unread-cursor-store';
 import { UNREAD_TRACK_CAP } from './channel-unread-service';
+import { isMissedCallHex } from './call-log';
 
 /** Store namespace: cursor keys are `dm:<spaceId>`. Channel keys are
  *  `<communityId>:<channelId>` with 32-hex community ids — no collision. */
@@ -34,6 +35,9 @@ export interface DmThreadPageEntry {
   from: string;
   receivedAt: number;
   isSelfOutbound: boolean;
+  /** ZEB-357: missed-call classification (call-event mime + hex body). */
+  mimeType: string;
+  body: string;
 }
 
 /** The subset of a `dm-received` payload this service reads (the full
@@ -43,6 +47,9 @@ export interface DmArrival {
   messageCid: string;
   from: string;
   receivedAt: number;
+  /** ZEB-357: missed-call classification (call-event mime + hex body). */
+  mimeType: string;
+  body: string;
 }
 
 export interface DmUnreadDeps {
@@ -50,7 +57,9 @@ export interface DmUnreadDeps {
    *  NOT MessageService.loadDmThread — that ingests into the feed cache and
    *  advances its own pagination cursor. */
   listThreadPage(spaceId: string, limit: number): Promise<DmThreadPageEntry[]>;
-  setUnread(spaceId: string, count: number): void;
+  /** ZEB-357: `missedCalls` is the unseen missed-class call-event subset of
+   *  `count` — rendered as a distinct 📞 badge on the DM nav row. */
+  setUnread(spaceId: string, count: number, missedCalls: number): void;
   /** True iff the viewer is looking right at this DM thread's feed. */
   isActiveThread(spaceId: string): boolean;
   isFocused(): boolean;
@@ -65,6 +74,12 @@ const pseudoHlc = (wallMs: number): Hlc => ({ wallMs, logical: 0, deviceId: '' }
 export class DmUnreadService {
   /** Unread message CIDs per space, capped at UNREAD_TRACK_CAP. */
   private sets = new Map<string, Set<string>>();
+  /** ZEB-357: the missed-call subset of `sets` — CIDs of unseen missed-class
+   *  call events. Same lifecycle as the unread sets (cursor-gated add,
+   *  open-clears-all, cleared on owner reconnect / space removal); membership
+   *  in the capped unread set is what gates an add, so this can never exceed
+   *  the tracked unread population. */
+  private missedSets = new Map<string, Set<string>>();
   /** Newest receivedAt ever seen per space (seeds AND arrivals), for clear stamps. */
   private maxSeen = new Map<string, number>();
   /** Spaces seeded this session (cleared by connectOwner / removal). */
@@ -80,6 +95,7 @@ export class DmUnreadService {
   connectOwner(ownerId: string): void {
     this.deps.storage.connectOwner(ownerId);
     this.sets.clear();
+    this.missedSets.clear();
     this.maxSeen.clear();
     this.seeded.clear();
     for (const spaceId of this.materialized) {
@@ -125,7 +141,8 @@ export class DmUnreadService {
         this.deps.storage.set(NS, p.spaceId, pseudoHlc(p.receivedAt));
       }
       const set = this.sets.get(p.spaceId);
-      if (set?.delete(p.messageCid)) this.push(p.spaceId);
+      const removedMissed = this.missedSets.get(p.spaceId)?.delete(p.messageCid) ?? false;
+      if ((set?.delete(p.messageCid) ?? false) || removedMissed) this.push(p.spaceId);
       return;
     }
     if (p.receivedAt <= cursor.wallMs) return; // history replay of read messages
@@ -133,6 +150,10 @@ export class DmUnreadService {
     const before = set.size;
     if (set.size < UNREAD_TRACK_CAP || set.has(p.messageCid)) {
       set.add(p.messageCid);
+      // ZEB-357: tracked missed-class call events feed the 📞 badge too.
+      if (isMissedCallHex(p.mimeType, p.body)) {
+        this.missedSetFor(p.spaceId).add(p.messageCid);
+      }
     }
     if (set.size !== before) this.push(p.spaceId);
   }
@@ -149,6 +170,7 @@ export class DmUnreadService {
     if (seen !== undefined) candidates.push(seen);
     this.deps.storage.set(NS, spaceId, pseudoHlc(Math.max(...candidates)));
     this.sets.get(spaceId)?.clear();
+    this.missedSets.get(spaceId)?.clear();
     this.push(spaceId);
   }
 
@@ -156,6 +178,7 @@ export class DmUnreadService {
    *  thread preserving read state is the better behavior, and it's tiny). */
   onDmSpaceRemoved(spaceId: string): void {
     this.sets.delete(spaceId);
+    this.missedSets.delete(spaceId);
     this.maxSeen.delete(spaceId);
     this.seeded.delete(spaceId);
     this.materialized.delete(spaceId);
@@ -182,13 +205,17 @@ export class DmUnreadService {
       if (m.receivedAt <= fresh.wallMs) continue; // page is uncursored; filter client-side
       if (set.size < UNREAD_TRACK_CAP || set.has(m.messageCid)) {
         set.add(m.messageCid);
+        // ZEB-357: tracked missed-class call events feed the 📞 badge too.
+        if (isMissedCallHex(m.mimeType, m.body)) {
+          this.missedSetFor(spaceId).add(m.messageCid);
+        }
       }
     }
   }
 
   private push(spaceId: string): void {
     const set = this.sets.get(spaceId);
-    this.deps.setUnread(spaceId, set?.size ?? 0);
+    this.deps.setUnread(spaceId, set?.size ?? 0, this.missedSets.get(spaceId)?.size ?? 0);
   }
 
   private setFor(spaceId: string): Set<string> {
@@ -196,6 +223,15 @@ export class DmUnreadService {
     if (!set) {
       set = new Set();
       this.sets.set(spaceId, set);
+    }
+    return set;
+  }
+
+  private missedSetFor(spaceId: string): Set<string> {
+    let set = this.missedSets.get(spaceId);
+    if (!set) {
+      set = new Set();
+      this.missedSets.set(spaceId, set);
     }
     return set;
   }

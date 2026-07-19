@@ -112,6 +112,7 @@
   import { shouldClearMembersLoading } from './lib/members-loading';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
+  import { CALL_EVENT_MIME, encodeCallEvent, describeCallEvent, type CallEventPayload } from './lib/call-log';
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
   import { groupCallBanners } from './lib/group-call-banner-store';
   import { ensureGroupMembers, getCachedGroupMembers, invalidateGroupMembers } from './lib/group-dm-members-cache';
@@ -377,6 +378,45 @@
   /** ZEB-351: build the singleton voice session once owner identity is present.
    *  Idempotent (one-shot guard); fetches device identity via the new IPC, then
    *  wires identity + the Tauri adapter + member-card resolution into the session. */
+  // ZEB-357: author the caller-side call-event DM message. Single writer —
+  // only the caller's CallSession fires this, once per call at its terminal
+  // transition. Mirrors handleSend's optimistic DM path so the system line
+  // appears in the caller's own thread immediately; the callee receives it
+  // like any DM (deposit + tunnel), which is what surfaces a missed call to
+  // an offline callee on next boot (call signaling itself is live-only).
+  function recordCallOutcome(spaceId: string, payload: CallEventPayload): void {
+    const optimisticId = crypto.randomUUID();
+    const optimistic: Message = {
+      id: optimisticId,
+      sender: { address: 'self', displayName: 'You' },
+      text: describeCallEvent(payload, 'author'),
+      timestamp: Date.now(),
+      media: [],
+      priority: 'standard',
+      channel: spaceId,
+      hub: '',
+      deliveryState: 'sending',
+      callEvent: payload,
+    };
+    messageService.pushOptimistic(optimistic);
+    void (async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const result = (await invoke('send_dm', {
+          spaceId,
+          content: Array.from(new TextEncoder().encode(encodeCallEvent(payload))),
+          mimeType: CALL_EVENT_MIME,
+        })) as { messageId: string; messageCid: string };
+        messageService.replaceOptimisticId(optimisticId, result.messageCid, result.messageId);
+      } catch (e) {
+        // Keep the line visible in 'failed' state — losing it would silently
+        // drop the only durable record of the call.
+        messageService.markFailed(optimisticId, e instanceof Error ? e.message : String(e));
+        console.error('call-event record failed:', e);
+      }
+    })();
+  }
+
   async function buildVoiceSession(
     invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>,
     listen: (event: string, handler: (e: { payload: unknown }) => void) => Promise<() => void>,
@@ -421,6 +461,8 @@
             ...(card.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
           };
         },
+        // ZEB-357: caller-side terminal outcomes author a call-event DM.
+        onCallOutcome: recordCallOutcome,
       });
       // ZEB-360: build the group-DM call session from the same identity + adapter
       // deps (getGroupCallSession is a singleton, so reconnect re-runs are no-ops).
@@ -2162,7 +2204,9 @@
             invoke('read_dm_thread', { spaceId, limit, beforeHlc: null }) as Promise<
               import('./lib/dm-unread-service').DmThreadPageEntry[]
             >,
-          setUnread: (spaceId, count) => navService.setUnread(spaceId, count),
+          // ZEB-357: the third param is the missed-call subset → 📞 badge.
+          setUnread: (spaceId, count, missedCalls) =>
+            navService.setUnread(spaceId, count, missedCalls),
           // Same "looking right at it" contract as channelUnread's
           // isActiveChannel below, in DM terms.
           isActiveThread: (spaceId) =>

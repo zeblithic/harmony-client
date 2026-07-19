@@ -4,6 +4,7 @@
   import type { ThreadMetaEntry } from '../feed-utils';
   import { groupMessages } from '../feed-utils';
   import TextMessage from './TextMessage.svelte';
+  import CallEventLine from './CallEventLine.svelte';
   import QuietMessageGroup from './QuietMessageGroup.svelte';
   import ComposeBar from './ComposeBar.svelte';
   import ThreadView from './ThreadView.svelte';
@@ -244,6 +245,13 @@
     <div class="messages-scroll">
       {#each feedItems as item (item.kind === 'message' ? item.message.id : `quiet-${item.messages[0].id}`)}
         {#if item.kind === 'message'}
+          {#if item.message.callEvent}
+            <!-- ZEB-357: call outcomes render as a system line, not a bubble. -->
+            <CallEventLine
+              message={item.message}
+              isSelf={item.message.sender.address === 'self' || (ownAddress !== '' && item.message.sender.address === ownAddress)}
+            />
+          {:else}
           <TextMessage
             message={item.message}
             {collapsed}
@@ -256,6 +264,7 @@
             isSelf={item.message.sender.address === 'self' || (ownAddress !== '' && item.message.sender.address === ownAddress)}
             onDelete={onMessageDelete}
           />
+          {/if}
           {#if threadMeta.has(item.message.id)}
             {@const meta = threadMeta.get(item.message.id)!}
             <ThreadIndicator

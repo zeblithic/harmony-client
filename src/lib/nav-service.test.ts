@@ -1049,6 +1049,34 @@ describe('NavService — per-channel unread (ZEB-665)', () => {
     expect(changed).toBe(0);
   });
 
+  // ZEB-357: the third param carries the missed-call subset for DM rows.
+  it('setUnread stores missedCalls on the node and notifies when only it changes', () => {
+    const s = seeded();
+    s.nodes = [
+      ...s.nodes,
+      { id: 'dm1', parentId: null, type: 'dm', name: 'Alice', expanded: false, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' },
+    ];
+    s.setUnread('dm1', 3, 2);
+    const dm1 = s.nodes.find((n) => n.id === 'dm1')!;
+    expect(dm1.unreadCount).toBe(3);
+    expect(dm1.missedCallCount).toBe(2);
+    let changed = 0;
+    s.onChange = () => { changed++; };
+    // Same unread, different missed — must still notify (not a no-op).
+    s.setUnread('dm1', 3, 0);
+    expect(changed).toBe(1);
+    expect(s.nodes.find((n) => n.id === 'dm1')!.missedCallCount).toBe(0);
+    // Fully identical call → no-op.
+    s.setUnread('dm1', 3, 0);
+    expect(changed).toBe(1);
+  });
+
+  it('setUnread without missedCalls leaves the missed count at 0 (channel callers)', () => {
+    const s = seeded();
+    s.setUnread('ch1', 3);
+    expect(s.nodes.find((n) => n.id === 'ch1')!.missedCallCount ?? 0).toBe(0);
+  });
+
   it('setUnread notifies onChange once per effective change and not on no-ops', () => {
     const s = seeded();
     let changed = 0;

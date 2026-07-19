@@ -84,6 +84,13 @@ export interface Message {
    * send_dm returns; absent on received messages.
    */
   messageId?: string;
+  /**
+   * ZEB-357 — parsed call-event payload for DM messages carrying the
+   * call-event mime type (caller-authored call outcome records). When set,
+   * the feed renders a system line instead of a text bubble; `text` holds
+   * the direction-aware label as a fallback for previews/search.
+   */
+  callEvent?: import('./call-log').CallEventPayload;
 }
 
 export type ThreadDisplayMode = 'panel' | 'inline' | 'muted';
@@ -115,6 +122,11 @@ export interface NavNode {
    *  On a community node it is the sum of its descendant channels' counts.
    *  Reset on restart; cleared when the channel is opened. */
   mentionCount: number;
+  /** ZEB-357: unseen missed-call count on DM / group-chat rows (the
+   *  missed-class subset of unreadCount, from DmUnreadService). Restart-
+   *  durable via the shared unread cursor; cleared when the thread opens.
+   *  Absent/0 on all other node types. */
+  missedCallCount?: number;
   unreadLevel: UnreadLevel;
   /** ZEB-663: channel kind, set only on `type: 'channel'` nodes. Drives the
    *  nav row glyph (# vs 🔊 vs ⚖). Absent on all other node types. */
