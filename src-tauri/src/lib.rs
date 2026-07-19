@@ -32735,6 +32735,222 @@ mod create_community_inner_tests {
     }
 }
 
+/// ZEB-315 regression: the production `MembershipSnapshotResolver`
+/// (`NodeStateMembershipResolver`) must resolve membership **at the event's
+/// HLC**, not at-HEAD. The engine's inbound verify path calls
+/// `snapshot_at(community, &event.hlc)`; before the fix the HLC was
+/// discarded (`_hlc`) and the resolver returned current membership, so an
+/// in-flight event signed by a then-valid member was spuriously rejected
+/// once that member was removed — a liveness gap during membership churn
+/// (and a spec §10 rolling-eligibility violation for peer events).
+#[cfg(test)]
+mod zeb_315_membership_at_event_hlc_tests {
+    use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+    use crate::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use crate::community_voting_log::MembershipSnapshotResolver as _;
+    use crate::content_store::{ContentStore, RuntimeContentStore};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+    use ed25519_dalek::SigningKey;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    struct NopResolver;
+    #[async_trait::async_trait]
+    impl IdentityResolver for NopResolver {
+        async fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
+            None
+        }
+    }
+
+    fn hlc(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "test-dev".into(),
+        }
+    }
+
+    /// Membership event with a dummy signature. The materialization layers
+    /// (`materialize` / `prior_state_at_hlc`) replay only already-verified
+    /// events and never re-check signatures — same posture as the `synth_*`
+    /// fixtures in `community_membership`'s own materialize tests.
+    fn membership_event(
+        id_byte: u8,
+        community: SpaceId,
+        actor: OwnerAddr,
+        kind: MembershipEventKind,
+        at: Hlc,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            id: [id_byte; 16],
+            community_id: community,
+            kind,
+            actor,
+            at,
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+            signer_certs: vec![],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolver_resolves_membership_at_event_hlc_not_at_head() {
+        let community = SpaceId([0xA5; 16]);
+        let admin = OwnerAddr([0xAD; 16]);
+        let member = OwnerAddr([0x33; 16]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            Duration::from_millis(1000),
+        ));
+        let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_id: "test-dev".into(),
+            content_store: cs,
+            identity_resolver: Arc::new(NopResolver),
+            identity_dir: dir.path().to_path_buf(),
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            error_tx: None,
+            delta_tx: None,
+            self_owner: admin,
+            signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
+            crdt_state: None,
+            nav_emitter: None,
+            presence_resync_rx: None,
+        }));
+        let (pub_tx, _pub_rx) = mpsc::channel(8);
+        let (_sub_tx, sub_rx) = mpsc::channel(8);
+        registry
+            .spawn_engine_inner_now(
+                community,
+                EpochKey::new([0x33; 32]),
+                admin,
+                /* is_invite_only */ true,
+                pub_tx,
+                sub_rx,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("spawn community engine");
+
+        // Membership history: member Joins at t=1_000; admin Kicks them at
+        // t=3_000. Inserted directly into the CRDT event map — the replay
+        // layers under test consume verified-event history, not signatures.
+        {
+            let state_arc = registry
+                .state_for(&community)
+                .await
+                .expect("community state present after spawn");
+            let mut st = state_arc.lock().await;
+            let join = membership_event(
+                0x01,
+                community,
+                member,
+                MembershipEventKind::Join,
+                hlc(1_000),
+            );
+            let kick = membership_event(
+                0x02,
+                community,
+                admin,
+                MembershipEventKind::Kick {
+                    target: member,
+                    reason: None,
+                },
+                hlc(3_000),
+            );
+            st.events.insert(join.id, join);
+            st.events.insert(kick.id, kick);
+        }
+
+        // Owner-state Community Space row so the snapshot builders can
+        // resolve `admin_addr`.
+        let mut owner_state = OwnerState::default();
+        owner_state.spaces.insert(
+            community,
+            Space {
+                id: community,
+                kind: SpaceKind::Community,
+                parent: None,
+                community_id: None,
+                name: "zeb-315-community".into(),
+                transport: None,
+                members: vec![],
+                custom_name: None,
+                notification_pref: None,
+                left_at: None,
+                created_at: hlc(1),
+                updated_at: hlc(1),
+                content_key: None,
+                prior_content_keys: vec![],
+                current_epoch: Some(0),
+                current_epoch_key: Some(EpochKey::new([0x33; 32])),
+                old_epoch_keys: BTreeMap::new(),
+                admin_addr: Some(admin),
+                is_invite_only: Some(true),
+                shared_in_profile: false,
+                pending_join_at: None,
+            },
+        );
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+        let resolver = crate::NodeStateMembershipResolver {
+            community_registry: Arc::clone(&registry),
+            crdt_state: Arc::clone(&crdt_state),
+        };
+
+        // At the in-flight event's HLC (t=2_000: after the Join, before the
+        // Kick) the member IS part of the snapshot — this is the case the
+        // at-HEAD resolver got wrong.
+        let snap_mid = resolver
+            .snapshot_at(community, &hlc(2_000))
+            .await
+            .expect("snapshot at t=2000");
+        assert!(
+            snap_mid.members.contains_key(&member),
+            "member Joined at t=1000 must be in the t=2000 snapshot even \
+             though a Kick landed later — inbound verify resolves at event.hlc"
+        );
+
+        // At a post-Kick HLC the same resolver sees them gone.
+        let snap_post = resolver
+            .snapshot_at(community, &hlc(4_000))
+            .await
+            .expect("snapshot at t=4000");
+        assert!(
+            !snap_post.members.contains_key(&member),
+            "kicked member must be absent from a post-Kick snapshot"
+        );
+
+        // The at-HEAD builder (the IPC pre-flight path) also excludes them —
+        // pinning the intentional divergence: minting a NEW event checks
+        // membership "now"; verifying a peer event checks membership at the
+        // event's own HLC.
+        let head = crate::voting_build_snapshot_for_community(
+            Arc::clone(&crdt_state),
+            Arc::clone(&registry),
+            community,
+        )
+        .await
+        .expect("at-HEAD snapshot");
+        assert!(
+            !head.members.contains_key(&member),
+            "at-HEAD snapshot must exclude the kicked member"
+        );
+
+        registry.shutdown_all().await.expect("shutdown_all");
+    }
+}
+
 /// ZEB-598 regression: `list_channels` / `list_community_members` must read a
 /// freshly-redeemed community's inline bootstrap snapshot (seeded as the
 /// `CommunityState.bootstrap_hint`) through the hint-aware `materialized()`
@@ -45299,6 +45515,65 @@ async fn voting_build_snapshot_for_community(
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     space_id: crate::owner_state_types::SpaceId,
 ) -> Result<crate::community_voting_core::MembershipSnapshot, String> {
+    let (admin_addr, engine_state) =
+        voting_resolve_membership_source(&crdt_state, &community_registry, space_id).await?;
+
+    let materialized = {
+        let g = engine_state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+    Ok(voting_membership_snapshot_from_materialized(&materialized))
+}
+
+/// ZEB-315: at-event-HLC variant of `voting_build_snapshot_for_community`.
+/// Re-materializes the community-membership CRDT from the event prefix
+/// strictly before `at` (via `prior_state_at_hlc`, the same projection the
+/// channel-log verify chain uses through `CommunityStateAtHlcAdapter`), so
+/// inbound voting events are verified against the membership that held at
+/// the event's own HLC — a member removed AFTER signing no longer has their
+/// in-flight events rejected during membership churn (spec §10 rolling
+/// eligibility).
+///
+/// `at` is caller-supplied and untrusted (it comes from the event being
+/// verified); see the SECURITY POSTURE note on
+/// `NodeStateMembershipResolver` for why that is accepted here and where
+/// post-removal injection is actually contained (ZEB-717 transport
+/// encryption).
+async fn voting_build_snapshot_for_community_at_hlc(
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    space_id: crate::owner_state_types::SpaceId,
+    at: &crate::owner_state_types::Hlc,
+) -> Result<crate::community_voting_core::MembershipSnapshot, String> {
+    let (admin_addr, engine_state) =
+        voting_resolve_membership_source(&crdt_state, &community_registry, space_id).await?;
+
+    // CommunityStateAtHlcAdapter lock posture: snapshot the event log under
+    // the lock, drop the guard, then run the pure `prior_state_at_hlc`
+    // replay — no need to block the community engine's writer for the
+    // O(events) walk.
+    let events: Vec<crate::community_membership::SignedMembershipEvent> = {
+        let g = engine_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+    let materialized = crate::community_membership::prior_state_at_hlc(&events, at, admin_addr);
+    Ok(voting_membership_snapshot_from_materialized(&materialized))
+}
+
+/// Shared by the at-HEAD and at-HLC snapshot builders: resolve the
+/// community's `admin_addr` from owner-state and the membership CRDT handle
+/// from the sync registry.
+async fn voting_resolve_membership_source(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    community_registry: &std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    space_id: crate::owner_state_types::SpaceId,
+) -> Result<
+    (
+        crate::owner_state_types::OwnerAddr,
+        std::sync::Arc<tokio::sync::Mutex<crate::community_state_crdt::CommunityState>>,
+    ),
+    String,
+> {
     let admin_addr = {
         let s = crdt_state.lock().await;
         let space = s.spaces.get(&space_id).cloned();
@@ -45330,12 +45605,14 @@ async fn voting_build_snapshot_for_community(
                 hex::encode(space_id.0)
             )
         })?;
+    Ok((admin_addr, engine_state))
+}
 
-    let materialized = {
-        let g = engine_state.lock().await;
-        g.materialize_now(admin_addr)
-    };
-
+/// Project a `MaterializedMembership` into the voting layer's
+/// `MembershipSnapshot`: Joined members only, with their power levels.
+fn voting_membership_snapshot_from_materialized(
+    materialized: &crate::community_membership::MaterializedMembership,
+) -> crate::community_voting_core::MembershipSnapshot {
     let mut members = std::collections::HashMap::new();
     for (addr, state) in materialized.members.iter() {
         // Only Joined members are eligible voters in Phase 1. Invited /
@@ -45359,7 +45636,7 @@ async fn voting_build_snapshot_for_community(
             },
         );
     }
-    Ok(crate::community_voting_core::MembershipSnapshot { members })
+    crate::community_voting_core::MembershipSnapshot { members }
 }
 
 /// Pure helper used by both `voting_create_tier1_poll` and the unit
@@ -46179,64 +46456,24 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
     crate::community_voting_tier3::validate_tier3_poll_config(&cfg)
         .map_err(|e| format!("voting_create_tier3_proposal: invalid config: {e:?}"))?;
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        channel_log_registry,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            g.channel_log_registry.clone(),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
-            // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
-            // voting engine's Tier 3 lifecycle emit path. Captured at
-            // start_node so generic IPC handlers can pass a concrete
-            // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
     // Build snapshot + check eligibility BEFORE signing. If we're not
     // eligible to participate in our own proposal, the UI should surface that
     // instead of producing an unusable poll.
     let snapshot = voting_build_snapshot_for_community(
-        crdt_state.clone(),
-        community_registry.clone(),
+        handles.crdt_state.clone(),
+        handles.community_registry.clone(),
         space_id,
     )
     .await?;
-    crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
-        .map_err(|e| format!("voting_create_tier3_proposal: creator not eligible: {e:?}"))?;
+    crate::community_voting_core::check_eligibility(
+        &snapshot,
+        &handles.self_owner,
+        &cfg.eligibility,
+    )
+    .map_err(|e| format!("voting_create_tier3_proposal: creator not eligible: {e:?}"))?;
 
     // ZEB-295 Phase 6: hard gate on se-mode polls — refuse to create a
     // ballot-secret poll unless the community has an active D-FROST
@@ -46256,7 +46493,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
     // at PollCreate time instead of letting the proposer build a poll
     // that no one (including themselves) can vote in.
     if cfg.privacy_mode == "se" {
-        let dfrost_engine_opt = if let Some(reg) = dfrost_log_registry_for_engine.as_ref() {
+        let dfrost_engine_opt = if let Some(reg) = handles.dfrost_log_registry.as_ref() {
             reg.get(space_id).await
         } else {
             None
@@ -46274,49 +46511,27 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
 
     // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community
     // so engine-auto orchestration (kd=ss/sf/cl/rs auto-mint hooks) fires from
-    // real user actions. ensure_voting_engine_for is idempotent — fast-path
-    // returns Ok if the engine is already initialized.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry: community_registry.clone(),
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state.clone(),
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    // real user actions (idempotent — fast-path returns the engine if already
+    // initialized).
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         crate::community_voting_core::build_signed_poll_create_tier3(
             signing_key,
-            self_owner,
+            handles.self_owner,
             &cfg,
             hlc,
         )
@@ -46334,14 +46549,6 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
         .signing_bytes()
         .map_err(|e| format!("voting_create_tier3_proposal: signing_bytes: {e:?}"))?;
     let poll_id = crate::community_voting_core::derive_poll_id(&space_id, &signing_bytes);
-    let engine_arc = {
-        let g = voting_log_engines
-            .lock()
-            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-        g.get(&space_id).cloned().ok_or_else(|| {
-            "voting_create_tier3_proposal: engine missing after ensure".to_string()
-        })?
-    };
     engine_arc
         .publish_event(event, Some(snapshot))
         .await
@@ -46352,7 +46559,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
         poll_id: poll_id_hex.clone(),
         channel_id: hex::encode(channel.0),
         community_id: hex::encode(space_id.0),
-        proposer: hex::encode(self_owner.0),
+        proposer: hex::encode(handles.self_owner.0),
         sortition_size,
         deliberation_window_seconds,
         drafting_window_seconds,
@@ -46369,7 +46576,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
     // chat-fanout: POLL_BODY_MAGIC byte + 64-char ASCII hex poll_id. Failures
     // here are non-fatal — the poll is already in the voting log and the
     // event has fired.
-    if let Some(registry) = channel_log_registry {
+    if let Some(registry) = handles.channel_log_registry {
         match registry.engine(&space_id, &channel).await {
             Some(engine) => {
                 let mut body =
@@ -46467,88 +46674,32 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
         ));
     }
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
     // Resolve space_id from the poll_id by scanning open polls.
-    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+    let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
     // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry,
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state,
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         crate::community_voting_core::build_signed_deliberation_statement(
             signing_key,
-            self_owner,
+            handles.self_owner,
             pid,
             text,
             hlc,
@@ -46561,14 +46712,6 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
     // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine so kd=cl
     // auto-mint (close deliberation when statement-cap or window hits) can
     // observe this Statement and fire.
-    let engine_arc = {
-        let g = voting_log_engines
-            .lock()
-            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-        g.get(&space_id).cloned().ok_or_else(|| {
-            "voting_submit_deliberation_statement: engine missing after ensure".to_string()
-        })?
-    };
     engine_arc
         .publish_event(event, None)
         .await
@@ -46623,88 +46766,32 @@ async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
             )
         })?;
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
     // Resolve space_id from the poll_id by scanning open polls.
-    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+    let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
     // Lazy-register the engine for this community.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry,
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state,
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         crate::community_voting_core::build_signed_deliberation_vote(
             signing_key,
-            self_owner,
+            handles.self_owner,
             pid,
             stmt_hash_bytes,
             vote_code,
@@ -46713,14 +46800,6 @@ async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
         .map_err(|e| format!("voting_cast_deliberation_vote: build_signed: {e:?}"))?
     };
 
-    let engine_arc = {
-        let g = voting_log_engines
-            .lock()
-            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-        g.get(&space_id).cloned().ok_or_else(|| {
-            "voting_cast_deliberation_vote: engine missing after ensure".to_string()
-        })?
-    };
     engine_arc
         .publish_event(event, None)
         .await
@@ -46759,87 +46838,31 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
         ));
     }
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
-    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+    let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
     // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry,
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state,
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         crate::community_voting_core::build_signed_draft_candidate(
             signing_key,
-            self_owner,
+            handles.self_owner,
             pid,
             candidate_text,
             hlc,
@@ -46850,14 +46873,6 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
     let event_hash = hex::encode(crate::community_voting_tier3::event_hash_of(&event));
 
     // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine.
-    let engine_arc = {
-        let g = voting_log_engines
-            .lock()
-            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-        g.get(&space_id).cloned().ok_or_else(|| {
-            "voting_propose_draft_candidate: engine missing after ensure".to_string()
-        })?
-    };
     engine_arc
         .publish_event(event, None)
         .await
@@ -46896,44 +46911,10 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
                 .to_string()
         })?;
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
-    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+    let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
     // Pre-flight: verify the referenced candidate exists in the poll's
     // Tier 3 draft candidates set. Without this check, the Tier 3 apply
@@ -46942,7 +46923,7 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
     // before any await to avoid holding a lock across the signing path.
     {
         let log_arc = {
-            let map = voting_logs.lock().await;
+            let map = handles.voting_logs.lock().await;
             map.get(&space_id).cloned().ok_or_else(|| {
                 format!(
                     "voting_approve_draft_candidate: no log for community {}",
@@ -46974,44 +46955,22 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry,
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state,
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         crate::community_voting_core::build_signed_draft_approval(
             signing_key,
-            self_owner,
+            handles.self_owner,
             pid,
             ceh,
             hlc,
@@ -47020,14 +46979,6 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
     };
 
     // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine.
-    let engine_arc = {
-        let g = voting_log_engines
-            .lock()
-            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-        g.get(&space_id).cloned().ok_or_else(|| {
-            "voting_approve_draft_candidate: engine missing after ensure".to_string()
-        })?
-    };
     engine_arc
         .publish_event(event, None)
         .await
@@ -47058,87 +47009,31 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
     crate::community_voting_tier3::validate_decline_reason(&reason)
         .map_err(|e| format!("voting_decline_sortition: invalid reason: {e:?}"))?;
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
-    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+    let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
     // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry,
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state,
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         crate::community_voting_core::build_signed_mini_public_decline(
             signing_key,
-            self_owner,
+            handles.self_owner,
             pid,
             reason,
             hlc,
@@ -47149,14 +47044,6 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
     // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine so kd=sf
     // (sortition-fallback) auto-mint can observe declines and mint a
     // replacement seat.
-    let engine_arc = {
-        let g = voting_log_engines
-            .lock()
-            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-        g.get(&space_id)
-            .cloned()
-            .ok_or_else(|| "voting_decline_sortition: engine missing after ensure".to_string())?
-    };
     engine_arc
         .publish_event(event, None)
         .await
@@ -47184,73 +47071,13 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         })?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
-    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+    let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
     // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry,
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state,
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine.clone(),
-        beacon_requester_for_engine,
-    )
-    .await?;
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     // Reserve "now" BEFORE the pre-flight: the stage gate in the helper
     // must use the HLC we're about to use for the new ballot, not
@@ -47260,8 +47087,12 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Pre-flight: look up current ratification candidate count AND the poll's
     // privacy_mode from the owning community's voting log. The pu-mode path
@@ -47272,7 +47103,7 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
     // scope as candidate_count so we hit the log exactly once.
     let (candidate_count, privacy_mode) = {
         let log_arc = {
-            let map = voting_logs.lock().await;
+            let map = handles.voting_logs.lock().await;
             map.get(&space_id).cloned().ok_or_else(|| {
                 format!(
                     "voting_cast_ratification_ballot: no log for community {}",
@@ -47345,7 +47176,7 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
             //    an active committee, an se-mode ballot is uncastable —
             //    surface a clear error rather than silently fall back to
             //    pu-mode (which would catastrophically reveal the scores).
-            let registry = dfrost_log_registry_for_engine.as_ref().ok_or(
+            let registry = handles.dfrost_log_registry.as_ref().ok_or(
                 "voting_cast_ratification_ballot: dfrost_log_registry missing — \
                  cannot resolve committee key for se-mode ballot",
             )?;
@@ -47412,11 +47243,11 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
     };
 
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         crate::community_voting_core::build_signed_ratification_ballot_payload(
             signing_key,
-            self_owner,
+            handles.self_owner,
             payload_struct,
             hlc,
         )
@@ -47426,14 +47257,6 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
     // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine so kd=rs
     // (ratification-summary) auto-mint can observe ballots and finalize
     // the poll once quorum + window conditions are met.
-    let engine_arc = {
-        let g = voting_log_engines
-            .lock()
-            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-        g.get(&space_id).cloned().ok_or_else(|| {
-            "voting_cast_ratification_ballot: engine missing after ensure".to_string()
-        })?
-    };
     engine_arc
         .publish_event(event, None)
         .await
@@ -47792,12 +47615,34 @@ type VotingLogEnginesMap = std::sync::Arc<
 >;
 
 /// Production `MembershipSnapshotResolver` that reads from the live
-/// `NodeState` handles (`community_registry` + `crdt_state`). Wraps
-/// `voting_build_snapshot_for_community`. The HLC parameter is currently
-/// unused — the underlying helper returns an at-HEAD snapshot.
+/// `NodeState` handles (`community_registry` + `crdt_state`).
 ///
-/// TODO ZEB-315: plumb historical-HLC resolution so events from
-/// recently-removed members aren't rejected during membership churn.
+/// ZEB-315: resolves membership **at the event's HLC** via
+/// `voting_build_snapshot_for_community_at_hlc` (the `prior_state_at_hlc`
+/// replay), not at-HEAD. The engine's inbound verify path calls this with
+/// `event.hlc`, so an event signed by a then-valid member still verifies
+/// after that member is removed — and eligibility for peer events is
+/// checked against the membership that held when the event was signed
+/// (spec §10 rolling eligibility). IPC pre-flight checks intentionally
+/// keep using the at-HEAD builder: minting a NEW event is a "now"
+/// decision.
+///
+/// SECURITY POSTURE (deliberate — Qodo finding on PR #502 adjudicated):
+/// the event's HLC is self-declared, so a removed member CAN backdate a
+/// new event to before their removal and pass this membership check. That
+/// is accepted at the verify layer by design: at-event-HLC is the only
+/// CONVERGENT rule (at-HEAD made acceptance order-dependent — replicas
+/// that received an event before vs. after the kick permanently diverged,
+/// and inbound Tier 3 PollCreates froze a different electorate per
+/// replica), a backdated mint is byte-indistinguishable from a
+/// legitimately delayed event, and clock-skew / per-actor-monotonic
+/// guards here would reject real late deliveries and multi-device
+/// concurrency. This mirrors the channel-log verify chain
+/// (`CommunityStateAtHlcAdapter`). Containment of post-kick injection is
+/// the TRANSPORT's job — channel-log already has it (epoch-encrypted
+/// packets die at rotation); the voting topic is still plaintext, tracked
+/// as ZEB-717 (epoch-encrypt for parity). Device-identity binding of
+/// `hlc.device_id` is the ZEB-668 device-management surface.
 pub struct NodeStateMembershipResolver {
     pub community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     pub crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
@@ -47808,15 +47653,16 @@ impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMember
     async fn snapshot_at(
         &self,
         community_id: crate::owner_state_types::SpaceId,
-        _hlc: &crate::owner_state_types::Hlc, // TODO ZEB-315: use this for historical resolution
+        hlc: &crate::owner_state_types::Hlc,
     ) -> Result<
         crate::community_voting_core::MembershipSnapshot,
         crate::community_voting_log::SnapshotResolverError,
     > {
-        voting_build_snapshot_for_community(
+        voting_build_snapshot_for_community_at_hlc(
             self.crdt_state.clone(),
             self.community_registry.clone(),
             community_id,
+            hlc,
         )
         .await
         .map_err(crate::community_voting_log::SnapshotResolverError::BackendError)
@@ -47993,6 +47839,127 @@ async fn ensure_voting_engine_for(
         .await
         .map_err(|e| format!("voting_log_adapter_request_tx send failed: {e}"))?;
     Ok(())
+}
+
+/// ZEB-317: everything a voting IPC needs from `NodeState`, captured in ONE
+/// lock acquisition. Replaces the ~70-line tuple-destructure +
+/// signing-key/resolver construction + `ensure_voting_engine_for` +
+/// engine-arc lookup block that was copy-pasted across the voting IPCs
+/// (6 Tier 3 + kd=dv + 3–4 Tier 2), where a plumbing fix to one copy could
+/// silently miss the others.
+///
+/// Two-phase by design — `extract` is synchronous state capture only — so
+/// IPCs that must first resolve their community from a poll scan
+/// (`voting_resolve_community_for_poll` needs `voting_logs`) can do so
+/// between extraction and `ensure_engine`.
+struct VotingEngineNodeHandles {
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    voting_logs: VotingLogsMap,
+    voting_log_engines: VotingLogEnginesMap,
+    dfrost_log_registry:
+        Option<std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>>,
+    beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
+    voting_log_adapter_request_tx:
+        tokio::sync::mpsc::Sender<crate::event_loop::VotingLogAdapterRequest>,
+    self_identity_pub_64: [u8; 64],
+    app_handle_wry: tauri::AppHandle<tauri::Wry>,
+    /// Only `voting_create_tier3_proposal`'s chat fanout reads this; `None`
+    /// in test contexts that bypass `start_node` (fanout call-sites no-op).
+    channel_log_registry:
+        Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>>,
+}
+
+impl VotingEngineNodeHandles {
+    /// Single-lock `NodeState` capture. Field-granular error strings keep
+    /// the pre-refactor per-field failure messages so callers' error modes
+    /// are unchanged.
+    fn extract(state_lock: &tauri::State<'_, Mutex<NodeState>>) -> Result<Self, String> {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        Ok(Self {
+            hlc_tracker: g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            device_id: g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            self_owner: g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            community_registry: g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            dm_outbox: g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            crdt_state: g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            voting_logs: std::sync::Arc::clone(&g.voting_logs),
+            voting_log_engines: std::sync::Arc::clone(&g.voting_log_engines),
+            // ZEB-309 Task 11: dfrost handles so newly-created engines get
+            // wired for VRF beacon requests + kd=ss publication.
+            dfrost_log_registry: g.dfrost_log_registry.clone(),
+            beacon_requester: g.beacon_requester.clone(),
+            voting_log_adapter_request_tx: g
+                .voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing")?,
+            // Needed to construct the production OwnerDeviceCacheResolver.
+            self_identity_pub_64: g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            // Typed Wry AppHandle captured at start_node so generic IPC
+            // handlers never downcast their own `AppHandle<R>`.
+            app_handle_wry: g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
+            channel_log_registry: g.channel_log_registry.clone(),
+        })
+    }
+
+    /// Lazy-register the voting engine for `space_id` and return its Arc.
+    /// Idempotent — `ensure_voting_engine_for`'s fast path returns
+    /// immediately when the engine already exists. Builds the signing key +
+    /// `NodeStateMembershipResolver` exactly as every IPC previously did
+    /// inline.
+    async fn ensure_engine(
+        &self,
+        space_id: crate::owner_state_types::SpaceId,
+    ) -> Result<
+        std::sync::Arc<crate::community_voting_log_engine::VotingLogEngine<tauri::Wry>>,
+        String,
+    > {
+        let local_signing_key = {
+            let outbox_g = self.dm_outbox.lock().await;
+            std::sync::Arc::clone(&outbox_g.signing_key)
+        };
+        let membership_resolver: std::sync::Arc<
+            dyn crate::community_voting_log::MembershipSnapshotResolver,
+        > = std::sync::Arc::new(NodeStateMembershipResolver {
+            community_registry: self.community_registry.clone(),
+            crdt_state: self.crdt_state.clone(),
+        });
+        ensure_voting_engine_for(
+            &self.voting_logs,
+            &self.voting_log_engines,
+            space_id,
+            self.voting_log_adapter_request_tx.clone(),
+            self.hlc_tracker.clone(),
+            self.device_id.clone(),
+            local_signing_key,
+            self.self_owner,
+            membership_resolver,
+            self.crdt_state.clone(),
+            self.self_identity_pub_64,
+            self.app_handle_wry.clone(),
+            self.dfrost_log_registry.clone(),
+            self.beacon_requester.clone(),
+        )
+        .await?;
+        let engine_arc = {
+            let g = self
+                .voting_log_engines
+                .lock()
+                .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+            g.get(&space_id)
+                .cloned()
+                .ok_or_else(|| "voting engine missing after ensure".to_string())?
+        };
+        Ok(engine_arc)
+    }
 }
 
 /// Build + sign a Tier 2 PollCreate event. Mirrors Tier 1's
@@ -48260,124 +48227,60 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         ));
     }
 
-    // ── 3. Extract NodeState handles ──────────────────────────────────
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
-            // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
-            // voting engine's Tier 3 lifecycle emit path. Captured at
-            // start_node so generic IPC handlers can pass a concrete
-            // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ── 3. Extract NodeState handles (ZEB-317 shared helper) ──────────
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
     // ── 4. Build snapshot + verify creator eligibility ────────────────
     let snapshot = voting_build_snapshot_for_community(
-        crdt_state.clone(),
-        community_registry.clone(),
+        handles.crdt_state.clone(),
+        handles.community_registry.clone(),
         space_id,
     )
     .await?;
-    crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
-        .map_err(|e| format!("voting_create_tier2_proposal: creator not eligible: {e:?}"))?;
+    crate::community_voting_core::check_eligibility(
+        &snapshot,
+        &handles.self_owner,
+        &cfg.eligibility,
+    )
+    .map_err(|e| format!("voting_create_tier2_proposal: creator not eligible: {e:?}"))?;
 
     // ── 5. Lazy-register the engine for this community ────────────────
-    // ZEB-298+ZEB-312 PR 1: extract signing key and build membership
-    // resolver before calling ensure_voting_engine_for.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry: community_registry.clone(),
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state.clone(),
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     // ── 6. Reserve HLC + sign PollCreate ──────────────────────────────
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        build_signed_poll_create_tier2(signing_key, self_owner, &cfg, hlc)?
+        build_signed_poll_create_tier2(signing_key, handles.self_owner, &cfg, hlc)?
     };
 
-    // ── 7. Apply locally with snapshot ────────────────────────────────
-    let poll_id = {
-        let log_arc = {
-            let map = voting_logs.lock().await;
-            map.get(&space_id)
-                .cloned()
-                .ok_or("voting_create_tier2_proposal: VotingLog disappeared after register")?
-        };
-        let mut log = log_arc.lock().await;
-        log.apply_with_snapshot(event, &space_id, Some(snapshot))
-            .map_err(|e| format!("voting_create_tier2_proposal: apply: {e:?}"))?
-    };
-
-    // TODO ZEB-291 Task 19.1: invoke `engine.publish_event(event)` once
-    // the Zenoh adapter is wired so peers see this PollCreate. For now
-    // the local apply above is the source of truth single-node and the
-    // engine's local-apply path is intentionally not invoked (would
-    // double-apply).
+    // ── 7. Publish through the engine ─────────────────────────────────
+    // ZEB-318 (closing the old ZEB-291 Task 19.1 TODO): route through
+    // `engine.publish_event` instead of a direct `log.apply_with_snapshot`
+    // so the freshly-created proposal is (a) broadcast live to peers over
+    // the Zenoh adapter and (b) observed by the engine's post-apply hooks
+    // — mirroring the Tier 3 PollCreate path, which passes Some(snapshot)
+    // to freeze the electorate. Compute the PollId BEFORE publish (same
+    // `derive_poll_id(space_id, signing_bytes)` the apply path uses) so
+    // the post-publish UI emit needs no log re-read.
+    let signing_bytes = event
+        .signing_bytes()
+        .map_err(|e| format!("voting_create_tier2_proposal: signing_bytes: {e:?}"))?;
+    let poll_id = crate::community_voting_core::derive_poll_id(&space_id, &signing_bytes);
+    engine_arc
+        .publish_event(event, Some(snapshot))
+        .await
+        .map_err(|e| format!("voting_create_tier2_proposal: publish: {e}"))?;
 
     let poll_id_hex = hex::encode(poll_id.0);
     let payload = VotingTier2ProposalCreatedPayload {
@@ -48409,35 +48312,18 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
         .map_err(|_| "proposal_id must be 32 bytes (64 hex chars)".to_string())?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper. Signal
+    // previously extracted only 7 fields (it never touched the engine);
+    // ZEB-318 routes it through `engine.publish_event`, so it now needs the
+    // full engine plumbing the helper carries.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
     // ── Lookup proposal + verify lifecycle (S1) ────────────────────────
     let log_arcs: Vec<(
         crate::owner_state_types::SpaceId,
         std::sync::Arc<tokio::sync::Mutex<crate::community_voting_log::VotingLog>>,
     )> = {
-        let map = voting_logs.lock().await;
+        let map = handles.voting_logs.lock().await;
         map.iter().map(|(k, v)| (*k, v.clone())).collect()
     };
     let mut found_opt: Option<(
@@ -48479,41 +48365,52 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
     // ── S2 rolling eligibility: confirm caller is currently a member
     // AND satisfies the proposal's Eligibility predicate (mirrors
     // `voting_cast_tier1_ballot`'s `check_eligibility` discipline). ──
-    let snapshot =
-        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
-    if !snapshot.members.contains_key(&self_owner) {
+    let snapshot = voting_build_snapshot_for_community(
+        handles.crdt_state.clone(),
+        handles.community_registry.clone(),
+        space_id,
+    )
+    .await?;
+    if !snapshot.members.contains_key(&handles.self_owner) {
         return Err("voting_signal_tier2: caller is not a current community member".into());
     }
-    crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &eligibility)
+    crate::community_voting_core::check_eligibility(&snapshot, &handles.self_owner, &eligibility)
         .map_err(|e| format!("voting_signal_tier2: ineligible voter: {e:?}"))?;
 
-    // ── Mint + apply ───────────────────────────────────────────────────
+    // ZEB-318: lazy-register the engine (idempotent) — Signal previously
+    // never ensured it, relying on the log alone.
+    let engine_arc = handles.ensure_engine(space_id).await?;
+
+    // ── Mint + publish ─────────────────────────────────────────────────
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        build_signed_signal_tier2(signing_key, self_owner, pid, support, hlc)?
+        build_signed_signal_tier2(signing_key, handles.self_owner, pid, support, hlc)?
     };
-    {
-        let log_arc = {
-            let map = voting_logs.lock().await;
-            map.get(&space_id)
-                .cloned()
-                .ok_or("voting_signal_tier2: VotingLog disappeared between checks")?
-        };
-        let mut log = log_arc.lock().await;
-        log.apply(event, &space_id)
-            .map_err(|e| format!("voting_signal_tier2: apply: {e:?}"))?;
-    }
+    // ZEB-318: route through `engine.publish_event` instead of direct
+    // `log.apply` so (a) the Signal is broadcast live to peers over the
+    // Zenoh adapter and (b) the `maybe_emit_delegate_on_behalf` hook fires
+    // on the originator side too — previously it only fired for peer
+    // replicas via `process_inbound_dispatch`, so single-machine
+    // multi-engine flows never saw the delegate-on-behalf notification.
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_signal_tier2: publish: {e}"))?;
 
     let payload = VotingTier2SignalCastPayload {
         proposal_id: proposal_id.clone(),
-        voter: hex::encode(self_owner.0),
+        voter: hex::encode(handles.self_owner.0),
         support,
     };
     if let Err(e) = app.emit("voting-tier2-signal-cast", &payload) {
@@ -48546,60 +48443,18 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         .map_err(|_| "delegate must be a 16-byte OwnerAddr (32 hex chars)".to_string())?;
     let to_addr = crate::owner_state_types::OwnerAddr(delegate_addr_bytes);
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        community_registry,
-        dm_outbox,
-        crdt_state,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
-            // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
-            // voting engine's Tier 3 lifecycle emit path. Captured at
-            // start_node so generic IPC handlers can pass a concrete
-            // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
     // Membership check: both caller AND delegate must currently be in
     // the community. Both surfaces use 16-byte OwnerAddr keys.
     let snapshot = voting_build_snapshot_for_community(
-        crdt_state.clone(),
-        community_registry.clone(),
+        handles.crdt_state.clone(),
+        handles.community_registry.clone(),
         space_id,
     )
     .await?;
-    if !snapshot.members.contains_key(&self_owner) {
+    if !snapshot.members.contains_key(&handles.self_owner) {
         return Err("voting_delegate_tier2: caller is not a current community member".into());
     }
     if !snapshot.members.contains_key(&to_addr) {
@@ -48607,66 +48462,37 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     }
 
     // Lazy-register the engine so the per-community log exists.
-    // ZEB-298+ZEB-312 PR 1: build signing key + membership resolver for new params.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry: community_registry.clone(),
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state.clone(),
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        build_signed_delegate_tier2(signing_key, self_owner, to_addr, hlc)?
+        build_signed_delegate_tier2(signing_key, handles.self_owner, to_addr, hlc)?
     };
-    {
-        let log_arc = {
-            let map = voting_logs.lock().await;
-            map.get(&space_id)
-                .cloned()
-                .ok_or("voting_delegate_tier2: VotingLog disappeared after register")?
-        };
-        let mut log = log_arc.lock().await;
-        log.apply(event, &space_id)
-            .map_err(|e| format!("voting_delegate_tier2: apply (D2 cycle? stale?): {e:?}"))?;
-    }
+    // ZEB-318: route through `engine.publish_event` (D2 cycle / stale
+    // rejections still surface — the engine's apply path returns the same
+    // VotingLog errors) so the Delegate edge is broadcast live to peers
+    // instead of waiting for backfill.
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_delegate_tier2: publish (D2 cycle? stale?): {e}"))?;
 
     // ZEB-292 Phase 3: surface the delegation change to the local UI so
-    // DelegationWidget + DelegationGraph refresh without polling. The
-    // engine-inbound emit point (for peer-originated Delegate events)
-    // is deferred to ZEB-298, gated on the ZEB-291 Task 19.1 verify_event
-    // wiring that unblocks the inbound apply path.
+    // DelegationWidget + DelegationGraph refresh without polling.
     let payload = VotingDelegationChangedPayload {
         community_id: community_id.clone(),
-        delegator: hex::encode(self_owner.0),
+        delegator: hex::encode(handles.self_owner.0),
         delegate: Some(hex::encode(to_addr.0)),
     };
     if let Err(e) = app.emit("voting-delegation-changed", &payload) {
@@ -48689,108 +48515,38 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let (
-        hlc_tracker,
-        device_id,
-        self_owner,
-        dm_outbox,
-        voting_logs,
-        voting_log_engines,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-        voting_log_adapter_request_tx,
-        community_registry,
-        crdt_state,
-        self_identity_pub_64,
-        app_handle_wry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            std::sync::Arc::clone(&g.voting_logs),
-            std::sync::Arc::clone(&g.voting_log_engines),
-            // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
-            g.dfrost_log_registry.clone(),
-            g.beacon_requester.clone(),
-            // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
-            g.voting_log_adapter_request_tx
-                .clone()
-                .ok_or("voting_log_adapter_request_tx missing")?,
-            // ZEB-298+ZEB-312 PR 1: needed to build NodeStateMembershipResolver.
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
-            // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
-            // voting engine's Tier 3 lifecycle emit path. Captured at
-            // start_node so generic IPC handlers can pass a concrete
-            // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
-        )
-    };
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
 
-    // ZEB-298+ZEB-312 PR 1: build signing key + membership resolver for new params.
-    let local_signing_key_for_engine = {
-        let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
-    };
-    let membership_resolver_for_engine: std::sync::Arc<
-        dyn crate::community_voting_log::MembershipSnapshotResolver,
-    > = std::sync::Arc::new(NodeStateMembershipResolver {
-        community_registry,
-        crdt_state: crdt_state.clone(),
-    });
-    ensure_voting_engine_for(
-        &voting_logs,
-        &voting_log_engines,
-        space_id,
-        voting_log_adapter_request_tx,
-        hlc_tracker.clone(),
-        device_id.clone(),
-        local_signing_key_for_engine,
-        self_owner,
-        membership_resolver_for_engine,
-        crdt_state,
-        self_identity_pub_64,
-        app_handle_wry,
-        dfrost_log_registry_for_engine,
-        beacon_requester_for_engine,
-    )
-    .await?;
+    // Lazy-register the engine so the per-community log exists.
+    let engine_arc = handles.ensure_engine(space_id).await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
     let event = {
-        let outbox_g = dm_outbox.lock().await;
+        let outbox_g = handles.dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        build_signed_undelegate_tier2(signing_key, self_owner, hlc)?
+        build_signed_undelegate_tier2(signing_key, handles.self_owner, hlc)?
     };
-    {
-        let log_arc = {
-            let map = voting_logs.lock().await;
-            map.get(&space_id)
-                .cloned()
-                .ok_or("voting_undelegate_tier2: VotingLog disappeared after register")?
-        };
-        let mut log = log_arc.lock().await;
-        log.apply(event, &space_id)
-            .map_err(|e| format!("voting_undelegate_tier2: apply: {e:?}"))?;
-    }
+    // ZEB-318: route through `engine.publish_event` so the Undelegate is
+    // broadcast live to peers instead of waiting for backfill.
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_undelegate_tier2: publish: {e}"))?;
 
     // ZEB-292 Phase 3: surface the delegation removal to the local UI.
     let payload = VotingDelegationChangedPayload {
         community_id: community_id.clone(),
-        delegator: hex::encode(self_owner.0),
+        delegator: hex::encode(handles.self_owner.0),
         delegate: None,
     };
     if let Err(e) = app.emit("voting-delegation-changed", &payload) {

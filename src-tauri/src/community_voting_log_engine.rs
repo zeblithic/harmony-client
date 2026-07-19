@@ -4655,6 +4655,38 @@ mod tests {
         );
     }
 
+    /// ZEB-318: Tier 2 events routed through `publish_event` — the IPC
+    /// path since the reroute of `voting_signal_tier2` /
+    /// `voting_delegate_tier2` / `voting_undelegate_tier2` /
+    /// `voting_create_tier2_proposal` — must be broadcast live on the
+    /// publisher channel. This is the property the old direct `log.apply`
+    /// IPC path lacked: locally-minted Tier 2 events never reached
+    /// `publisher_tx`, so peers only learned of them via backfill.
+    #[tokio::test]
+    async fn publish_event_broadcasts_tier2_signal_packet() {
+        let local_owner = OwnerAddr([0x11; 16]);
+        let delegate_owner = OwnerAddr([0x22; 16]);
+        let mut fix = delegate_on_behalf_fixture(local_owner, delegate_owner, false).await;
+
+        let signal = signal_event_for_emit(delegate_owner, fix.pid, true, 2_000);
+        let expected_hlc = signal.hlc.clone();
+        fix.engine
+            .publish_event(signal, None)
+            .await
+            .expect("publish_event signal");
+
+        let packet = tokio::time::timeout(Duration::from_secs(1), fix._publisher_rx.recv())
+            .await
+            .expect("Tier 2 Signal must be broadcast within 1s of publish_event")
+            .expect("publisher channel must be open");
+        let decoded: SignedVotingEvent =
+            ciborium::from_reader(packet.as_slice()).expect("broadcast packet decodes");
+        assert_eq!(decoded.kind, PollEventKindCode::Signal);
+        assert_eq!(decoded.tier, Tier::Conviction);
+        assert_eq!(decoded.actor, delegate_owner);
+        assert_eq!(decoded.hlc, expected_hlc);
+    }
+
     // ── ZEB-298 Task 8: process_inbound post-apply hook fan-out ────────────
     //
     // The four hooks fired from `publish_event` must ALSO fire from the
