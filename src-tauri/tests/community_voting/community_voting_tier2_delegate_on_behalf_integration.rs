@@ -53,7 +53,7 @@ use harmony_app::community_voting_log::{
 };
 use harmony_app::community_voting_log_engine::{VotingLogEngine, VotingLogEngineParams};
 use harmony_app::event_loop::spawn_voting_log_zenoh_adapter;
-use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use tauri::Listener;
 
 /// Build a `(SigningKey, OwnerAddr, [u8; 64])` triple from a single-byte seed.
@@ -194,6 +194,22 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     let community_id = SpaceId([0x2C; 16]);
     let community_id_hex = hex::encode(community_id.0);
 
+    // ZEB-717: the voting adapters encrypt/decrypt at the wire boundary using
+    // the community's live epoch key. Both adapters share one crdt_state (same
+    // key, epoch 0) so events round-trip across the two real Zenoh sessions.
+    let crdt_state = Arc::new(Mutex::new({
+        let mut os = harmony_app::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            community_id,
+            harmony_app::community_state_sync::test_community_space(
+                community_id,
+                0,
+                EpochKey::new([0x11; 32]),
+            ),
+        );
+        os
+    }));
+
     // ── Membership snapshot covering both actors ───────────────────────
     let mut members = HashMap::new();
     for owner in [alice_owner, bob_owner] {
@@ -226,6 +242,8 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     let _adapter_a = spawn_voting_log_zenoh_adapter(
         Arc::clone(&session_a),
         community_id_hex.clone(),
+        community_id,
+        Arc::clone(&crdt_state),
         a_pub_rx,
         a_sub_tx,
         Arc::clone(&closing_a),
@@ -238,6 +256,8 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     let _adapter_b = spawn_voting_log_zenoh_adapter(
         Arc::clone(&session_b),
         community_id_hex.clone(),
+        community_id,
+        Arc::clone(&crdt_state),
         b_pub_rx,
         b_sub_tx,
         Arc::clone(&closing_b),

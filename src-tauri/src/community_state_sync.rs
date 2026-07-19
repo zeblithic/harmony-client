@@ -495,6 +495,43 @@ pub fn decrypt_for_topic_with_aad(
         .map_err(|_| EpochError::DecryptionFailed(envelope.epoch))
 }
 
+/// Test-only helper: build a Community `Space` with `id` at `epoch` under
+/// `key`, empty `old_epoch_keys`. Integration tests seed an `OwnerState` with
+/// this so the voting adapter (ZEB-717) has a live epoch key to encrypt /
+/// current-epoch-only-decrypt against. Callers may set `old_epoch_keys`
+/// afterward to exercise the retained-old-key rejection path.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn test_community_space(id: SpaceId, epoch: u64, key: EpochKey) -> Space {
+    let zero_hlc = Hlc {
+        wall_ms: 0,
+        logical: 0,
+        device_id: "t".into(),
+    };
+    Space {
+        id,
+        kind: crate::owner_state_types::SpaceKind::Community,
+        parent: None,
+        community_id: None,
+        name: "Test".into(),
+        transport: None,
+        members: vec![],
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: zero_hlc.clone(),
+        updated_at: zero_hlc,
+        content_key: None,
+        prior_content_keys: vec![],
+        current_epoch: Some(epoch),
+        current_epoch_key: Some(key),
+        old_epoch_keys: std::collections::BTreeMap::new(),
+        admin_addr: Some(OwnerAddr([0xbb; 16])),
+        is_invite_only: Some(false),
+        shared_in_profile: false,
+        pending_join_at: None,
+    }
+}
+
 /// Default debounce window between a `notify_dirty` and the resulting
 /// state-root publish. Mirrors `owner_state_sync::DEFAULT_DEBOUNCE_MS`
 /// (250 ms) — small enough to feel near-instant to a human, large
@@ -7826,34 +7863,7 @@ mod envelope_tests {
     /// Build a minimal Community-kind Space with the given epoch and key.
     /// Uses placeholder values for fields not relevant to epoch crypto.
     fn build_test_community_space(epoch: u64, key: EpochKey) -> Space {
-        let zero_hlc = Hlc {
-            wall_ms: 0,
-            logical: 0,
-            device_id: "t".into(),
-        };
-        Space {
-            id: SpaceId([0xaa; 16]),
-            kind: SpaceKind::Community,
-            parent: None,
-            community_id: None,
-            name: "Test".into(),
-            transport: None,
-            members: vec![],
-            custom_name: None,
-            notification_pref: None,
-            left_at: None,
-            created_at: zero_hlc.clone(),
-            updated_at: zero_hlc,
-            content_key: None,
-            prior_content_keys: vec![],
-            current_epoch: Some(epoch),
-            current_epoch_key: Some(key),
-            old_epoch_keys: std::collections::BTreeMap::new(),
-            admin_addr: Some(OwnerAddr([0xbb; 16])),
-            is_invite_only: Some(false),
-            shared_in_profile: false,
-            pending_join_at: None,
-        }
+        super::test_community_space(SpaceId([0xaa; 16]), epoch, key)
     }
 
     /// ZEB-597: the case-C publisher must key on the LIVE current_epoch_key
