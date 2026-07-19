@@ -1985,6 +1985,13 @@ pub struct RecoveryProposalView {
     pub deadline_ms: Option<u64>,
     #[serde(rename = "ph")]
     pub phase: RecoveryPhase,
+    /// ZEB-714: the admin whose veto killed this proposal — the first
+    /// qualifying veto in replay order (deterministic: replay iterates
+    /// the sorted log). `Some` iff `phase` is `Vetoed`. Default-elided
+    /// so pre-ZEB-714 encodings stay byte-identical (the `"aq"`
+    /// pattern).
+    #[serde(rename = "vb", skip_serializing_if = "Option::is_none", default)]
+    pub vetoed_by: Option<OwnerAddr>,
 }
 
 impl CanonicalPayloadSealed for RecoveryProposalView {}
@@ -2337,6 +2344,18 @@ fn running_recovery_digest(m: &MaterializedMembership) -> Option<[u8; 32]> {
         .and_then(|c| recovery_config_digest(c).ok())
 }
 
+/// ZEB-714: one proposal's lifecycle outcome from
+/// `evaluate_recovery_phases`.
+#[derive(Clone, Copy)]
+struct RecoveryOutcome {
+    phase: RecoveryPhase,
+    /// `t_R + W` — Some once the Rth signature landed.
+    deadline_ms: Option<u64>,
+    /// `Some` iff `phase` is `Vetoed`: the first qualifying vetoer in
+    /// replay order.
+    vetoed_by: Option<OwnerAddr>,
+}
+
 /// ZEB-713: evaluate every recovery proposal's lifecycle phase at time
 /// reference `t` (spec §3.3). Pure in its inputs — called from the
 /// materialize post-pass with `t = max(events_max, now_ms)` (the R4-6
@@ -2345,16 +2364,16 @@ fn running_recovery_digest(m: &MaterializedMembership) -> Option<[u8; 32]> {
 /// in-window cosign/veto has wall ≤ deadline < t and therefore sorts
 /// before the rotation).
 ///
-/// Returns `id → (phase, deadline_ms)`; `deadline_ms` is Some once the
+/// Returns `id → RecoveryOutcome`; `deadline_ms` is Some once the
 /// Rth signature landed. Phase precedence for terminal states:
 /// Vetoed > ConfigChanged > Expired > Superseded.
 fn evaluate_recovery_phases(
     rec_proposals: &BTreeMap<EventId, RecoveryWork>,
-    rec_vetoes: &[(EventId, u64)],
+    rec_vetoes: &[(EventId, u64, OwnerAddr)],
     config_change_walls: &[u64],
     t: u64,
-) -> BTreeMap<EventId, (RecoveryPhase, Option<u64>)> {
-    let mut out: BTreeMap<EventId, (RecoveryPhase, Option<u64>)> = BTreeMap::new();
+) -> BTreeMap<EventId, RecoveryOutcome> {
+    let mut out: BTreeMap<EventId, RecoveryOutcome> = BTreeMap::new();
 
     // Pass 1: per-proposal phase ignoring rivals.
     for (id, work) in rec_proposals.iter() {
@@ -2383,9 +2402,14 @@ fn evaluate_recovery_phases(
         // RV1 window: authored wall in [t₀, deadline]; while no
         // deadline exists (Collecting) the window is open-ended —
         // collecting proposals are vetoable early (spec §6 T1).
-        let vetoed = rec_vetoes.iter().any(|(target, wall)| {
-            target == id && *wall >= t0 && deadline.map(|d| *wall <= d).unwrap_or(true)
-        });
+        // ZEB-714: record the vetoer (first qualifying in replay
+        // order) so the D2 banner can resolve to "vetoed by NAME".
+        let vetoed_by = rec_vetoes
+            .iter()
+            .find(|(target, wall, _)| {
+                target == id && *wall >= t0 && deadline.map(|d| *wall <= d).unwrap_or(true)
+            })
+            .map(|(_, _, actor)| *actor);
         // Config replacement inside [t₀, deadline] kills (§3.3.4). A
         // replacement AFTER the deadline leaves an executed proposal
         // executed. `>= t0` (not `>`) is deliberately fail-closed
@@ -2393,7 +2417,7 @@ fn evaluate_recovery_phases(
         let config_killed = config_change_walls
             .iter()
             .any(|c| *c >= t0 && deadline.map(|d| *c <= d).unwrap_or(true));
-        let phase = if vetoed {
+        let phase = if vetoed_by.is_some() {
             RecoveryPhase::Vetoed
         } else if config_killed {
             RecoveryPhase::ConfigChanged
@@ -2414,7 +2438,18 @@ fn evaluate_recovery_phases(
                 Some(_) => RecoveryPhase::TimeLocked,
             }
         };
-        out.insert(*id, (phase, deadline));
+        out.insert(
+            *id,
+            RecoveryOutcome {
+                phase,
+                deadline_ms: deadline,
+                vetoed_by: if phase == RecoveryPhase::Vetoed {
+                    vetoed_by
+                } else {
+                    None
+                },
+            },
+        );
     }
 
     // Pass 2: rival tie-break — per lost_admin group, the lowest
@@ -2423,13 +2458,14 @@ fn evaluate_recovery_phases(
     // is deliberate: multi-admin loss is recovered via one proposal
     // per lost admin, each independently executable (spec §3.2).
     let mut winners: BTreeMap<OwnerAddr, (u64, EventId)> = BTreeMap::new();
-    for (id, (phase, deadline)) in out.iter() {
-        if *phase != RecoveryPhase::Executed {
+    for (id, outcome) in out.iter() {
+        if outcome.phase != RecoveryPhase::Executed {
             continue;
         }
         let work = &rec_proposals[id];
         // deadline is Some for every Executed proposal; t_R = deadline − W.
-        let tr = deadline
+        let tr = outcome
+            .deadline_ms
             .expect("executed implies deadline")
             .saturating_sub(work.veto_window_ms);
         let key = (tr, *id);
@@ -2443,16 +2479,16 @@ fn evaluate_recovery_phases(
             .or_insert(key);
     }
     for (id, entry) in out.iter_mut() {
-        if entry.0 != RecoveryPhase::Executed {
+        if entry.phase != RecoveryPhase::Executed {
             continue;
         }
         let work = &rec_proposals[id];
         let tr = entry
-            .1
+            .deadline_ms
             .expect("executed implies deadline")
             .saturating_sub(work.veto_window_ms);
         if winners.get(&work.lost_admin) != Some(&(tr, *id)) {
-            entry.0 = RecoveryPhase::Superseded;
+            entry.phase = RecoveryPhase::Superseded;
         }
     }
 
@@ -2631,7 +2667,7 @@ pub fn materialize_with_now(
         std::collections::HashMap::new();
     // Vetoes that passed the RV1 running-state check at their position:
     // (target proposal id, authored wall_ms).
-    let mut rec_vetoes: Vec<(EventId, u64)> = Vec::new();
+    let mut rec_vetoes: Vec<(EventId, u64, OwnerAddr)> = Vec::new();
     // Recovery proposals whose triggered EpochRotation already applied
     // in the main pass. The post-pass derived kick must NOT re-insert
     // pending_rotation_for for these — the rotation arm's remove()
@@ -2969,6 +3005,20 @@ pub fn materialize_with_now(
                     // proposal authorizes nothing (a rotation citing it
                     // is dropped — same silent-drop posture as the
                     // staleness gate above).
+                    //
+                    // ZEB-714 (PR #498 R1, CodeRabbit): the rotation must
+                    // ALSO clear the finality margin F (spec §4.3) —
+                    // `wall_ms > deadline + F`. The observer waits F
+                    // before synthesizing, but that alone is client
+                    // behavior: a hasty/malicious build could author the
+                    // one irreversible follow-on at deadline+1, inside
+                    // the window §4.3 reserves for late veto delivery.
+                    // Enforcing F here makes the containment a CRDT
+                    // invariant. Position-locally stable for the same
+                    // reason as the executed-ness evaluation (the gate
+                    // only widens the margin); `checked_add` fails
+                    // closed (overflow ⇒ never eligible, mirroring
+                    // `recovery_rotation_trigger`).
                     Some(MembershipEventKind::RecoveryProposal {
                         lost_admin,
                         new_admin,
@@ -2981,7 +3031,12 @@ pub fn materialize_with_now(
                             event.at.wall_ms,
                         );
                         match outcomes.get(triggered_by) {
-                            Some((RecoveryPhase::Executed, _)) => {
+                            Some(o)
+                                if o.phase == RecoveryPhase::Executed
+                                    && o.deadline_ms
+                                        .and_then(|d| d.checked_add(RECOVERY_ROTATION_FINALITY_MS))
+                                        .is_some_and(|eligible| event.at.wall_ms > eligible) =>
+                            {
                                 (Some(*lost_admin), Some(*new_admin))
                             }
                             _ => (None, None),
@@ -3567,7 +3622,7 @@ pub fn materialize_with_now(
                 let is_bootstrap_admin =
                     event.actor == admin_addr && !m.members.contains_key(&event.actor);
                 if veto_power == 100 && (is_joined_member(&m, &event.actor) || is_bootstrap_admin) {
-                    rec_vetoes.push((*target_event_id, event.at.wall_ms));
+                    rec_vetoes.push((*target_event_id, event.at.wall_ms, event.actor));
                 }
             }
         }
@@ -3603,12 +3658,12 @@ pub fn materialize_with_now(
         &rec_config_change_walls,
         current_max_wall_ms,
     );
-    for (id, (phase, deadline)) in outcomes.iter() {
-        if *phase != RecoveryPhase::Executed {
+    for (id, outcome) in outcomes.iter() {
+        if outcome.phase != RecoveryPhase::Executed {
             continue;
         }
         let work = &rec_proposals[id];
-        let deadline_ms = deadline.expect("executed implies deadline");
+        let deadline_ms = outcome.deadline_ms.expect("executed implies deadline");
         // Synthetic derived-state HLC for the kick timestamp:
         // deterministic in (events, now_ms) because deadline is a pure
         // function of event data. Empty device_id marks it as derived,
@@ -3670,7 +3725,7 @@ pub fn materialize_with_now(
     let mut view: Vec<RecoveryProposalView> = rec_proposals
         .iter()
         .map(|(id, work)| {
-            let (phase, deadline) = outcomes[id];
+            let outcome = outcomes[id];
             RecoveryProposalView {
                 id: *id,
                 proposer: work.proposer,
@@ -3679,8 +3734,9 @@ pub fn materialize_with_now(
                 signers: work.signers.clone(),
                 threshold: work.threshold,
                 proposed_at_wall_ms: work.t0_wall_ms,
-                deadline_ms: deadline,
-                phase,
+                deadline_ms: outcome.deadline_ms,
+                phase: outcome.phase,
+                vetoed_by: outcome.vetoed_by,
             }
         })
         .collect();
@@ -5338,6 +5394,39 @@ pub const RECOVERY_VETO_WINDOW_FLOOR_MS: u64 = 7 * 86_400_000;
 /// 2. The value survives the u64 → JS-number DTO boundary exactly
 ///    (365 d ≈ 3.2e10 ms « 2^53).
 pub const RECOVERY_VETO_WINDOW_CEILING_MS: u64 = 365 * 86_400_000;
+
+/// ZEB-714 (spec §4.3): finality margin F. Clients do not act on a
+/// recovery-produced `pending_rotation_for` until `now > deadline + F`,
+/// so a veto delivered within F reconverges the membership state before
+/// any irreversible `EpochRotation` event exists. F bounds delivery
+/// delay, not authorship — it can be generous because the veto window W
+/// (≥ 7 d) already did the waiting.
+pub const RECOVERY_ROTATION_FINALITY_MS: u64 = 48 * 3_600_000;
+
+/// ZEB-714: for a `pending_rotation_for` target whose kick was DERIVED
+/// by recovery execution (no Kick/Leave event exists to cite), the
+/// executed `RecoveryProposal` itself is the rotation trigger the
+/// EpochRotation must reference (the D1 trigger-table arm validates
+/// against it). Returns `(proposal_id, eligible_at_ms)` where
+/// `eligible_at_ms = deadline + F` is the wall clock at which clients
+/// may act (spec §4.3), or `None` on overflow (fail closed: never
+/// eligible). Returns `None` when the target's marker is not
+/// recovery-derived. At most one Executed proposal can exist per
+/// `lost_admin` (rival tie-break), so the first match is the only one.
+pub fn recovery_rotation_trigger(
+    m: &MaterializedMembership,
+    target: &OwnerAddr,
+) -> Option<(EventId, Option<u64>)> {
+    m.recovery_proposals.iter().find_map(|p| {
+        (p.lost_admin == *target && p.phase == RecoveryPhase::Executed).then(|| {
+            (
+                p.id,
+                p.deadline_ms
+                    .and_then(|d| d.checked_add(RECOVERY_ROTATION_FINALITY_MS)),
+            )
+        })
+    })
+}
 
 /// ZEB-250: apply an admin-proposal's effect to the running
 /// materialized state when the proposal has reached quorum within the
@@ -12596,10 +12685,13 @@ mod zeb_713_recovery_materialize_tests {
                 })
                 .collect()
         };
+        // ZEB-714 (PR #498 R1): the rotation must clear the finality
+        // margin F — authored past DEADLINE + F.
+        const ROT_AT: u64 = DEADLINE + RECOVERY_ROTATION_FINALITY_MS + 100;
         events.push(ev(
             [0xC0; 16],
             m_new(),
-            DEADLINE + 100,
+            ROT_AT,
             MembershipEventKind::EpochRotation {
                 prior_epoch: 0,
                 triggered_by: P1,
@@ -12609,7 +12701,7 @@ mod zeb_713_recovery_materialize_tests {
 
         // Without the veto: rotation lands (issuer authorized as the
         // recovery-promoted new_admin), pending marker consumed.
-        let diverged = materialize_with_now(&events, admin1(), Some(DEADLINE + 200));
+        let diverged = materialize_with_now(&events, admin1(), Some(ROT_AT + 100));
         assert_eq!(view(&diverged, P1).phase, RecoveryPhase::Executed);
         assert_eq!(diverged.current_epoch, Some(1));
         assert!(
@@ -12621,7 +12713,7 @@ mod zeb_713_recovery_materialize_tests {
         // divergent rotation's trigger is no longer executed, so the
         // epoch advance re-derives away too.
         events.push(veto([0xC1; 16], admin1(), DEADLINE - 1_000));
-        let healed = materialize_with_now(&events, admin1(), Some(DEADLINE + 200));
+        let healed = materialize_with_now(&events, admin1(), Some(ROT_AT + 100));
         assert_eq!(view(&healed, P1).phase, RecoveryPhase::Vetoed);
         assert_eq!(healed.current_epoch, None);
         assert_eq!(healed.members[&admin1()].status, MemberStatus::Joined);
@@ -12632,7 +12724,7 @@ mod zeb_713_recovery_materialize_tests {
         events.push(ev(
             [0xC2; 16],
             admin1(),
-            DEADLINE + 300,
+            ROT_AT + 300,
             MembershipEventKind::Kick {
                 target: m2(),
                 reason: None,
@@ -12641,17 +12733,66 @@ mod zeb_713_recovery_materialize_tests {
         events.push(ev(
             [0xC3; 16],
             admin1(),
-            DEADLINE + 400,
+            ROT_AT + 400,
             MembershipEventKind::EpochRotation {
                 prior_epoch: 0,
                 triggered_by: [0xC2; 16],
                 recipient_ciphertexts: recipients(&[admin1(), d1(), d2(), m_new()]),
             },
         ));
-        let after = materialize_with_now(&events, admin1(), Some(DEADLINE + 500));
+        let after = materialize_with_now(&events, admin1(), Some(ROT_AT + 500));
         assert_eq!(after.current_epoch, Some(1));
         assert_eq!(after.members[&m2()].status, MemberStatus::Banned);
         assert!(after.pending_rotation_for.is_empty());
+    }
+
+    #[test]
+    fn recovery_rotation_inside_finality_margin_is_dropped() {
+        // ZEB-714 (PR #498 R1, CodeRabbit): §4.3's F margin is a CRDT
+        // invariant, not client politeness — a rotation citing an
+        // executed proposal but authored at deadline + 1 (inside the
+        // window reserved for late veto delivery) must be silently
+        // dropped: no epoch advance, pending marker intact.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xC0; 16],
+            m_new(),
+            DEADLINE + 1,
+            MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: P1,
+                recipient_ciphertexts: vec![
+                    RecipientCiphertext {
+                        recipient: d1(),
+                        sealed: Vec::new(),
+                    },
+                    RecipientCiphertext {
+                        recipient: d2(),
+                        sealed: Vec::new(),
+                    },
+                    RecipientCiphertext {
+                        recipient: m_new(),
+                        sealed: Vec::new(),
+                    },
+                    RecipientCiphertext {
+                        recipient: m2(),
+                        sealed: Vec::new(),
+                    },
+                ],
+            },
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 2));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(
+            m.current_epoch, None,
+            "premature rotation must not advance the epoch"
+        );
+        assert!(
+            m.pending_rotation_for.contains(&admin1()),
+            "pending marker must survive a premature rotation"
+        );
     }
 
     #[test]
@@ -13061,6 +13202,105 @@ mod zeb_713_recovery_materialize_tests {
         assert_eq!(after.power_levels.get(&m2()).copied(), Some(100));
         assert_ne!(after.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
     }
+
+    // ── ZEB-714: vetoed_by attribution + rotation-trigger helper ──
+
+    #[test]
+    fn vetoed_by_records_the_vetoing_admin() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(veto([0xB2; 16], admin1(), T_R + 5_000));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        let v = view(&m, P1);
+        assert_eq!(v.phase, RecoveryPhase::Vetoed);
+        assert_eq!(v.vetoed_by, Some(admin1()));
+    }
+
+    #[test]
+    fn vetoed_by_is_none_for_non_vetoed_phases() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        let executed = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&executed, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(view(&executed, P1).vetoed_by, None);
+        let collecting = materialize_with_now(&events[..events.len() - 1], admin1(), Some(T0 + 1));
+        assert_eq!(view(&collecting, P1).phase, RecoveryPhase::Collecting);
+        assert_eq!(view(&collecting, P1).vetoed_by, None);
+    }
+
+    #[test]
+    fn vetoed_by_is_first_qualifying_vetoer_in_replay_order() {
+        let (mut events, digest) = base_world();
+        // Promote m2 to admin (direct SetPower — admin_quorum is 1).
+        events.push(ev(
+            [0xA9; 16],
+            admin1(),
+            2_000,
+            MembershipEventKind::SetPower {
+                target: m2(),
+                level: 100,
+            },
+        ));
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        // Two qualifying vetoes: m2's sorts FIRST in replay (lower wall).
+        events.push(veto([0xB2; 16], admin1(), T_R + 9_000));
+        events.push(veto([0xB3; 16], m2(), T_R + 4_000));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        let v = view(&m, P1);
+        assert_eq!(v.phase, RecoveryPhase::Vetoed);
+        assert_eq!(v.vetoed_by, Some(m2()));
+    }
+
+    #[test]
+    fn rotation_trigger_names_the_executed_proposal_with_finality_wall() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(
+            recovery_rotation_trigger(&m, &admin1()),
+            Some((P1, Some(DEADLINE + RECOVERY_ROTATION_FINALITY_MS)))
+        );
+        // Not a recovery target → None.
+        assert_eq!(recovery_rotation_trigger(&m, &m2()), None);
+    }
+
+    #[test]
+    fn rotation_trigger_is_none_before_execution() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        // Still time-locked: the marker is not set, and even against a
+        // hand-checked view the trigger must not fire.
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::TimeLocked);
+        assert_eq!(recovery_rotation_trigger(&m, &admin1()), None);
+    }
+
+    #[test]
+    fn rotation_trigger_overflowing_finality_fails_closed() {
+        // Direct view construction: a deadline close enough to u64::MAX
+        // that `deadline + F` wraps must yield eligible_at = None
+        // (never eligible), not a tiny wrapped wall.
+        let mut m = MaterializedMembership::default();
+        m.recovery_proposals.push(RecoveryProposalView {
+            id: P1,
+            proposer: d1(),
+            lost_admin: admin1(),
+            new_admin: m_new(),
+            signers: BTreeSet::from([d1(), d2()]),
+            threshold: 2,
+            proposed_at_wall_ms: u64::MAX - 1_000_000,
+            deadline_ms: Some(u64::MAX - 1_000),
+            phase: RecoveryPhase::Executed,
+            vetoed_by: None,
+        });
+        assert_eq!(recovery_rotation_trigger(&m, &admin1()), Some((P1, None)));
+    }
 }
 
 // ── ZEB-713 (ZEB-212 D1) admin-recovery verify_event tests ───────────────────
@@ -13417,6 +13657,7 @@ mod zeb_713_recovery_verify_tests {
             proposed_at_wall_ms: 4_000,
             deadline_ms: None,
             phase: RecoveryPhase::Collecting,
+            vetoed_by: None,
         });
         let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
         assert_eq!(
@@ -13438,6 +13679,7 @@ mod zeb_713_recovery_verify_tests {
             proposed_at_wall_ms: 4_000,
             deadline_ms: None,
             phase: RecoveryPhase::Vetoed,
+            vetoed_by: Some(w.admin.owner),
         });
         let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
         assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));

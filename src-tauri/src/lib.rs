@@ -6684,6 +6684,27 @@ pub async fn start_node_inner(
                         std::sync::Arc::clone(&channel_log_registry);
                     channel_log_registry_arc = Some(channel_log_registry);
 
+                    // ZEB-714: the synthesized-rotation/-catchup dedupe sets
+                    // are declared at THIS scope (not inside the delta
+                    // consumer's epoch-hook block) so the periodic
+                    // recovery-liveness tick spawned below shares them —
+                    // both paths run the same observer and must honor one
+                    // per-session dedupe.
+                    let synth_rotations_shared: std::sync::Arc<
+                        std::sync::Mutex<
+                            std::collections::BTreeSet<(
+                                crate::owner_state_types::SpaceId,
+                                crate::owner_state_types::OwnerAddr,
+                                crate::community_membership::EventId,
+                            )>,
+                        >,
+                    > = std::sync::Arc::new(std::sync::Mutex::new(
+                        std::collections::BTreeSet::new(),
+                    ));
+                    let synth_catchups_shared: SynthCatchupsSet = std::sync::Arc::new(
+                        std::sync::Mutex::new(std::collections::BTreeSet::new()),
+                    );
+
                     // Spawn the delta consumer: each `CommunityMembershipDelta`
                     // becomes one `community-members-changed` Tauri event.
                     // Task exits cleanly when every per-engine `delta_tx`
@@ -6958,17 +6979,11 @@ pub async fn start_node_inner(
                                 // A pure (SpaceId, OwnerAddr) key would suppress the
                                 // second rotation after a rejoin + re-kick sequence,
                                 // leaving the re-kicked member in the community's epoch.
-                                let synthesized_rotations: std::sync::Arc<
-                                    std::sync::Mutex<
-                                        std::collections::BTreeSet<(
-                                            crate::owner_state_types::SpaceId,
-                                            crate::owner_state_types::OwnerAddr,
-                                            crate::community_membership::EventId,
-                                        )>,
-                                    >,
-                                > = std::sync::Arc::new(std::sync::Mutex::new(
-                                    std::collections::BTreeSet::new(),
-                                ));
+                                // ZEB-714: shared with the periodic
+                                // recovery-liveness tick (declared before the
+                                // consumer spawn above).
+                                let synthesized_rotations =
+                                    std::sync::Arc::clone(&synth_rotations_shared);
                                 // Catchup dedupe: (SpaceId, OwnerAddr, EventId, u64).
                                 // Including the originating Join EventId means a
                                 // second rotation producing a new pending_catchup_for
@@ -6981,9 +6996,8 @@ pub async fn start_node_inner(
                                 // needs a catchup after each rotation that advances the
                                 // epoch while they are still pending). ZEB-249 PR #106
                                 // R5 (CodeRabbit Major). Type alias: SynthCatchupsSet.
-                                let synthesized_catchups: SynthCatchupsSet = std::sync::Arc::new(
-                                    std::sync::Mutex::new(std::collections::BTreeSet::new()),
-                                );
+                                let synthesized_catchups: SynthCatchupsSet =
+                                    std::sync::Arc::clone(&synth_catchups_shared);
                                 // ── ZEB-495 (ZEB-340 Part 2): self-introduce
                                 // trigger captures. On EVERY delta, for the
                                 // delta's community, if the owner is Joined but
@@ -7386,6 +7400,37 @@ pub async fn start_node_inner(
                                         ) {
                                             epoch_republish_trigger.fire_coalesced();
                                         }
+                                        // ZEB-714: recovery events deliberately
+                                        // project NO MembershipChange (their
+                                        // effects are derived, not per-event) —
+                                        // the banner reads the materialized view
+                                        // via `get_recovery_state` instead. This
+                                        // dedicated nudge tells the frontend WHEN
+                                        // to re-read. AdminCountersign is
+                                        // included un-filtered: it may tip a
+                                        // SetRecoveryDesignates proposal to
+                                        // quorum, and telling would need an
+                                        // event-log lookup — over-emitting on
+                                        // rare governance events is harmless
+                                        // (the consumer just refetches).
+                                        if matches!(
+                                            event.kind,
+                                            crate::community_membership::MembershipEventKind::RecoveryProposal { .. }
+                                                | crate::community_membership::MembershipEventKind::RecoveryCosign { .. }
+                                                | crate::community_membership::MembershipEventKind::RecoveryVeto { .. }
+                                                | crate::community_membership::MembershipEventKind::AdminCountersign { .. }
+                                                | crate::community_membership::MembershipEventKind::AdminProposal {
+                                                    proposal_kind:
+                                                        crate::community_membership::ProposalKind::SetRecoveryDesignates { .. },
+                                                }
+                                        ) {
+                                            app.emit(
+                                                "community-recovery-changed",
+                                                serde_json::json!({
+                                                    "communityId": hex::encode(community_id.0),
+                                                }),
+                                            );
+                                        }
                                         self_heal_community_observer(
                                             delta.community_id,
                                             registry,
@@ -7687,6 +7732,63 @@ pub async fn start_node_inner(
                                 }
                             },
                         ));
+                    }
+
+                    // ── ZEB-714: periodic recovery-liveness tick. Recovery
+                    // execution is TIME-driven (spec §4.1 now-floor): in an
+                    // idle community the Executed phase appears with zero new
+                    // events, so the delta-driven self-heal hook above never
+                    // fires and the finality-gated rotation would never be
+                    // synthesized. This task re-runs the observer for every
+                    // spawned community on a slow cadence. The observer is
+                    // re-entrant-safe (shared per-session dedupe set +
+                    // materialize's staleness gate), so overlapping with the
+                    // delta path is harmless. Holds only a Weak on the
+                    // registry: the task exits once the registry is dropped
+                    // (stop_node), never keeping it alive.
+                    {
+                        let registry_weak = std::sync::Arc::downgrade(&registry);
+                        let signing_key_for_tick =
+                            std::sync::Arc::clone(&community_signing_key_arc);
+                        let hlc_tracker_for_tick = std::sync::Arc::clone(&tracker);
+                        let device_id_for_tick = device_id.clone();
+                        let self_owner_for_tick = self_owner;
+                        let crdt_state_for_tick = std::sync::Arc::clone(&crdt_state);
+                        let synth_rotations_for_tick =
+                            std::sync::Arc::clone(&synth_rotations_shared);
+                        let synth_catchups_for_tick = std::sync::Arc::clone(&synth_catchups_shared);
+                        tokio::spawn(async move {
+                            const RECOVERY_LIVENESS_TICK_MS: u64 = 15 * 60 * 1000;
+                            let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+                                RECOVERY_LIVENESS_TICK_MS,
+                            ));
+                            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            // interval's first tick fires immediately — skip
+                            // it; boot already runs the delta path for any
+                            // replayed events.
+                            tick.tick().await;
+                            loop {
+                                tick.tick().await;
+                                let Some(registry) = registry_weak.upgrade() else {
+                                    break;
+                                };
+                                for community_id in registry.spawned_community_ids().await {
+                                    self_heal_community_observer(
+                                        community_id,
+                                        std::sync::Arc::clone(&registry),
+                                        std::sync::Arc::clone(&signing_key_for_tick),
+                                        std::sync::Arc::clone(&hlc_tracker_for_tick),
+                                        device_id_for_tick.clone(),
+                                        self_owner_for_tick,
+                                        std::sync::Arc::clone(&crdt_state_for_tick),
+                                        std::sync::Arc::clone(&synth_rotations_for_tick),
+                                        std::sync::Arc::clone(&synth_catchups_for_tick),
+                                    )
+                                    .await;
+                                }
+                            }
+                            tracing::debug!("recovery-liveness tick exiting (registry dropped)");
+                        });
                     }
 
                     // Lift the start_node-held delta sender out for
@@ -40602,6 +40704,132 @@ pub fn mint_admin_proposal_change_quorum_event(
     sign_event(&payload, signing_key).map_err(|e| format!("sign admin_proposal_change_quorum: {e}"))
 }
 
+/// ZEB-714: mint a signed `AdminProposal { SetRecoveryDesignates }`
+/// event — the healthy-admin recovery-config ceremony (spec §3.1),
+/// routed through the unchanged ZEB-250 quorum machinery. Same
+/// signing/HLC contract as the rest of the `mint_admin_proposal_*`
+/// family.
+pub fn mint_admin_proposal_set_recovery_designates_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    designates: Vec<crate::owner_state_types::OwnerAddr>,
+    threshold: u8,
+    veto_window_ms: u64,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{
+        sign_event, EventPayload, MembershipEventKind, ProposalKind,
+    };
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::SetRecoveryDesignates {
+                designates,
+                threshold,
+                veto_window_ms,
+            },
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key)
+        .map_err(|e| format!("sign admin_proposal_set_recovery_designates: {e}"))
+}
+
+/// ZEB-714: mint a signed `RecoveryProposal` event (spec §3.2). The
+/// caller supplies `config_digest` computed from the LIVE materialized
+/// config at command time — binding the proposal to the config
+/// generation server-side (RP5).
+pub fn mint_recovery_proposal_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    lost_admin: crate::owner_state_types::OwnerAddr,
+    new_admin: crate::owner_state_types::OwnerAddr,
+    config_digest: [u8; 32],
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::RecoveryProposal {
+            lost_admin,
+            new_admin,
+            config_digest,
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign recovery_proposal: {e}"))
+}
+
+/// ZEB-714: mint a signed `RecoveryCosign` event referencing an
+/// existing `RecoveryProposal` (spec §3.2 RC1/RC2).
+pub fn mint_recovery_cosign_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target_event_id: [u8; 16],
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::RecoveryCosign { target_event_id },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign recovery_cosign: {e}"))
+}
+
+/// ZEB-714: mint a signed `RecoveryVeto` event referencing an existing
+/// `RecoveryProposal` (spec §3.2 RV1 — one admin veto kills).
+pub fn mint_recovery_veto_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target_event_id: [u8; 16],
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::RecoveryVeto { target_event_id },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign recovery_veto: {e}"))
+}
+
 /// ZEB-250 §6.3: mint a signed AdminCountersign event referencing an
 /// existing AdminProposal. Same signing/HLC contract as the
 /// `mint_admin_proposal_*` family.
@@ -42790,6 +43018,962 @@ async fn propose_change_quorum(
     }
 }
 
+// ── ZEB-714: admin-recovery IPC (D2) ──────────────────────────────────────
+
+/// ZEB-714: recovery-designates config as the UI sees it (spec §3.1).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryConfigDto {
+    pub designate_addrs: Vec<String>,
+    pub threshold: u8,
+    pub veto_window_ms: u64,
+}
+
+/// ZEB-714: one recovery proposal projected for the banner / settings
+/// UI. Addresses are hex; display names resolve client-side from the
+/// roster the frontend already holds.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryProposalDto {
+    pub proposal_event_id: String,
+    pub proposer_addr: String,
+    pub lost_admin_addr: String,
+    pub new_admin_addr: String,
+    pub signer_addrs: Vec<String>,
+    pub signers_so_far: u8,
+    pub threshold: u8,
+    pub proposed_at_wall_ms: u64,
+    pub deadline_ms: Option<u64>,
+    /// "collecting" | "timeLocked" | "executed" | "vetoed" | "expired"
+    /// | "configChanged" | "superseded" | "stalled"
+    pub phase: String,
+    /// Some iff phase == "vetoed".
+    pub vetoed_by_addr: Option<String>,
+    /// For an executed proposal: `deadline + F` (spec §4.3) — before
+    /// this wall clock the UI shows "rotation pending finality".
+    pub rotation_eligible_at_ms: Option<u64>,
+    pub self_has_cosigned: bool,
+}
+
+/// ZEB-714: `get_recovery_state` result — everything the recovery
+/// banner and the Governance settings section need in one read.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryStateDto {
+    pub config: Option<RecoveryConfigDto>,
+    pub proposals: Vec<RecoveryProposalDto>,
+    pub self_is_designate: bool,
+    pub self_power: u8,
+}
+
+/// ZEB-714: `initiate_admin_recovery` result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitiateRecoveryResult {
+    pub proposal_event_id: String,
+    pub signers_so_far: u8,
+    pub threshold: u8,
+}
+
+/// ZEB-714: `cosign_admin_recovery` result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryCosignResult {
+    pub signers_after: u8,
+    pub threshold: u8,
+    pub reached_threshold: bool,
+}
+
+/// ZEB-714: stable camelCase phase strings for the DTO boundary (the
+/// CRDT's 1-char wire codes are an internal encoding detail).
+fn recovery_phase_dto(phase: crate::community_membership::RecoveryPhase) -> &'static str {
+    use crate::community_membership::RecoveryPhase;
+    match phase {
+        RecoveryPhase::Collecting => "collecting",
+        RecoveryPhase::TimeLocked => "timeLocked",
+        RecoveryPhase::Executed => "executed",
+        RecoveryPhase::Vetoed => "vetoed",
+        RecoveryPhase::Expired => "expired",
+        RecoveryPhase::ConfigChanged => "configChanged",
+        RecoveryPhase::Superseded => "superseded",
+        RecoveryPhase::Stalled => "stalled",
+    }
+}
+
+/// ZEB-714: pure projection of the TIME-AWARE materialized view into
+/// the `get_recovery_state` DTO. The caller must materialize via
+/// `materialized_with_now` with real wall-clock ms — recovery phases
+/// advance with time, not events (spec §4.1), so an event-driven view
+/// here would freeze a TimeLocked proposal forever in an idle
+/// community. Extracted for unit testing without a NodeState.
+pub fn compute_recovery_state(
+    materialized: &crate::community_membership::MaterializedMembership,
+    self_owner: crate::owner_state_types::OwnerAddr,
+) -> RecoveryStateDto {
+    use crate::community_membership::{RecoveryPhase, RECOVERY_ROTATION_FINALITY_MS};
+
+    let config = materialized
+        .recovery_designates
+        .as_ref()
+        .map(|c| RecoveryConfigDto {
+            designate_addrs: c.designates.iter().map(|d| hex::encode(d.0)).collect(),
+            threshold: c.threshold,
+            veto_window_ms: c.veto_window_ms,
+        });
+
+    let self_is_designate = materialized
+        .recovery_designates
+        .as_ref()
+        .is_some_and(|c| c.designates.contains(&self_owner));
+
+    let proposals = materialized
+        .recovery_proposals
+        .iter()
+        .map(|p| RecoveryProposalDto {
+            proposal_event_id: hex::encode(p.id),
+            proposer_addr: hex::encode(p.proposer.0),
+            lost_admin_addr: hex::encode(p.lost_admin.0),
+            new_admin_addr: hex::encode(p.new_admin.0),
+            signer_addrs: p.signers.iter().map(|s| hex::encode(s.0)).collect(),
+            signers_so_far: p.signers.len().min(u8::MAX as usize) as u8,
+            threshold: p.threshold,
+            proposed_at_wall_ms: p.proposed_at_wall_ms,
+            deadline_ms: p.deadline_ms,
+            phase: recovery_phase_dto(p.phase).to_string(),
+            vetoed_by_addr: p.vetoed_by.map(|v| hex::encode(v.0)),
+            rotation_eligible_at_ms: (p.phase == RecoveryPhase::Executed)
+                .then(|| {
+                    p.deadline_ms
+                        .and_then(|d| d.checked_add(RECOVERY_ROTATION_FINALITY_MS))
+                })
+                .flatten(),
+            self_has_cosigned: p.signers.contains(&self_owner),
+        })
+        .collect();
+
+    RecoveryStateDto {
+        config,
+        proposals,
+        self_is_designate,
+        self_power: materialized
+            .power_levels
+            .get(&self_owner)
+            .copied()
+            .unwrap_or(0),
+    }
+}
+
+/// ZEB-714: read the community's recovery state (config + proposals)
+/// on the TIME-AWARE now-floor view. Readable by any Joined member —
+/// the recovery banner is deliberately loud to everyone (spec §5.4);
+/// there is nothing admin-privileged in it (designates and proposals
+/// are public CRDT events).
+pub(crate) async fn get_recovery_state_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<RecoveryStateDto, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (registry, self_owner) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+        )
+    };
+
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let admin_addr = engine_arc.admin_addr();
+    let materialized = {
+        let state = engine_arc.state();
+        let g = state.lock().await;
+        // ZEB-714 scope pin: the time-aware uncached accessor — phases
+        // advance with wall clock, not events (spec §4.1).
+        g.materialized_with_now(admin_addr, wall_now_ms)
+    };
+
+    let caller_status = materialized.members.get(&self_owner).map(|m| m.status);
+    if !matches!(
+        caller_status,
+        Some(crate::community_membership::MemberStatus::Joined)
+    ) {
+        return Err("get_recovery_state: caller is not a Joined member".to_string());
+    }
+
+    Ok(compute_recovery_state(&materialized, self_owner))
+}
+
+#[tauri::command]
+async fn get_recovery_state(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<RecoveryStateDto, String> {
+    get_recovery_state_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-714: admin IPC that proposes replacing the community's recovery
+/// designates config (spec §3.1) through the ZEB-250 quorum machinery.
+/// Mirrors `propose_change_quorum`: `Completed` when `admin_quorum == 1`
+/// (self-satisfies), `Pending` otherwise. Friendly pre-checks mirror
+/// the RD1–RD4 verify gates so the UI gets readable errors instead of
+/// insert rejections.
+///
+/// Authorization: caller must be Joined with power ≥ 100.
+pub(crate) async fn set_recovery_designates_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    designate_addrs: Vec<String>,
+    threshold: u8,
+    veto_window_ms: u64,
+) -> Result<AdminActionResult, String> {
+    use crate::community_membership::{
+        RECOVERY_VETO_WINDOW_CEILING_MS, RECOVERY_VETO_WINDOW_FLOOR_MS,
+    };
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    // RD1 static halves before any locks: non-empty, deduped, and the
+    // window bounds (RD4).
+    if designate_addrs.is_empty() {
+        return Err("set_recovery_designates: designates must be non-empty".to_string());
+    }
+    let mut designates: Vec<crate::owner_state_types::OwnerAddr> = Vec::new();
+    for addr_hex in &designate_addrs {
+        let bytes: [u8; 16] = hex::decode(addr_hex)
+            .map_err(|e| format!("set_recovery_designates: invalid designate hex: {e}"))?
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                "set_recovery_designates: designate must be 16 bytes (32 hex chars)".to_string()
+            })?;
+        let addr = crate::owner_state_types::OwnerAddr(bytes);
+        if designates.contains(&addr) {
+            return Err(format!(
+                "set_recovery_designates: duplicate designate {addr_hex}"
+            ));
+        }
+        designates.push(addr);
+    }
+    if threshold < 1 || threshold as usize > designates.len() {
+        return Err(format!(
+            "set_recovery_designates: threshold {} out of range 1..={}",
+            threshold,
+            designates.len()
+        ));
+    }
+    if veto_window_ms < RECOVERY_VETO_WINDOW_FLOOR_MS {
+        return Err(format!(
+            "set_recovery_designates: veto window below the 7-day floor ({veto_window_ms} ms)"
+        ));
+    }
+    if veto_window_ms > RECOVERY_VETO_WINDOW_CEILING_MS {
+        return Err(format!(
+            "set_recovery_designates: veto window above the 365-day ceiling ({veto_window_ms} ms)"
+        ));
+    }
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Generation + registry fence.
+    {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during set_recovery_designates (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during set_recovery_designates (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    // Auth + RD2 (every designate currently Joined) — single read lock.
+    let admin_quorum = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialize_now(admin_addr);
+
+        let caller_status = m.members.get(&self_owner).map(|ms| ms.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("set_recovery_designates: caller is not a Joined member".to_string());
+        }
+        let caller_power = m.power_levels.get(&self_owner).copied().unwrap_or(0);
+        if caller_power < 100 {
+            return Err(format!(
+                "set_recovery_designates: caller power {caller_power} below admin threshold 100"
+            ));
+        }
+
+        for d in &designates {
+            let joined = matches!(
+                m.members.get(d).map(|ms| ms.status),
+                Some(crate::community_membership::MemberStatus::Joined)
+            );
+            if !joined {
+                return Err(format!(
+                    "set_recovery_designates: designate {} is not a Joined member",
+                    hex::encode(d.0)
+                ));
+            }
+        }
+        m.admin_quorum
+    };
+
+    // Mint AdminProposal{SetRecoveryDesignates}.
+    let proposal = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.community_signing_key.as_ref();
+        mint_admin_proposal_set_recovery_designates_event(
+            space_id,
+            self_owner,
+            designates,
+            threshold,
+            veto_window_ms,
+            signing_key,
+            event_hlc,
+        )?
+    };
+    let proposal_id_hex = hex::encode(proposal.id);
+    let outcome = engine_arc.insert_local_event(proposal).await.map_err(|e| {
+        format!("engine.insert_local_event (AdminProposal set_recovery_designates): {e}")
+    })?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err(
+            "set_recovery_designates (AdminProposal)",
+            &outcome,
+        ));
+    }
+
+    if admin_quorum == 1 {
+        Ok(AdminActionResult::Completed)
+    } else {
+        Ok(AdminActionResult::Pending {
+            proposal_event_id: proposal_id_hex,
+            signers_so_far: 1,
+            quorum_required: admin_quorum,
+        })
+    }
+}
+
+#[tauri::command]
+async fn set_recovery_designates(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    designate_addrs: Vec<String>,
+    threshold: u8,
+    veto_window_ms: u64,
+) -> Result<AdminActionResult, String> {
+    set_recovery_designates_impl(
+        state_lock.inner(),
+        community_id,
+        designate_addrs,
+        threshold,
+        veto_window_ms,
+    )
+    .await
+}
+
+/// ZEB-714: designate IPC that initiates admin recovery (spec §3.2).
+/// The proposal's `config_digest` is computed HERE from the live
+/// materialized config — server-side binding to the config generation
+/// (RP5), never a client-supplied digest (two-IPC TOCTOU rule).
+/// Friendly pre-checks mirror RP1–RP6 so the UI gets readable errors.
+///
+/// Authorization: caller must be a Joined designate (NOT an admin
+/// gate — this is precisely the event non-admins may author).
+pub(crate) async fn initiate_admin_recovery_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    lost_admin_addr: String,
+    new_admin_addr: String,
+) -> Result<InitiateRecoveryResult, String> {
+    use crate::community_membership::RecoveryPhase;
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let lost_bytes: [u8; 16] = hex::decode(&lost_admin_addr)
+        .map_err(|e| format!("initiate_admin_recovery: invalid lost_admin hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "initiate_admin_recovery: lost_admin must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let lost_admin = crate::owner_state_types::OwnerAddr(lost_bytes);
+    let new_bytes: [u8; 16] = hex::decode(&new_admin_addr)
+        .map_err(|e| format!("initiate_admin_recovery: invalid new_admin hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "initiate_admin_recovery: new_admin must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let new_admin = crate::owner_state_types::OwnerAddr(new_bytes);
+
+    if lost_admin == new_admin {
+        return Err(
+            "initiate_admin_recovery: new_admin must differ from lost_admin (RP3)".to_string(),
+        );
+    }
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Generation + registry fence.
+    {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during initiate_admin_recovery (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during initiate_admin_recovery (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    // Pre-checks mirroring RP1–RP6 on the time-aware view + server-side
+    // digest computation (RP5) — single read lock.
+    let (config_digest, threshold) = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialized_with_now(admin_addr, wall_now_ms);
+
+        // RP2: config exists.
+        let Some(config) = m.recovery_designates.as_ref() else {
+            return Err(
+                "initiate_admin_recovery: this community has no recovery designates configured"
+                    .to_string(),
+            );
+        };
+        // RP1: caller is a Joined designate.
+        if !config.designates.contains(&self_owner) {
+            return Err("initiate_admin_recovery: caller is not a recovery designate".to_string());
+        }
+        let caller_status = m.members.get(&self_owner).map(|ms| ms.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("initiate_admin_recovery: caller is not a Joined member".to_string());
+        }
+        // RP4: lost_admin currently holds power 100.
+        let lost_power = m.power_levels.get(&lost_admin).copied().unwrap_or(0);
+        if lost_power != 100 {
+            return Err(format!(
+                "initiate_admin_recovery: lost_admin power is {lost_power}, not 100 (RP4)"
+            ));
+        }
+        // RP3: new_admin Joined and not currently power-100.
+        let new_status = m.members.get(&new_admin).map(|ms| ms.status);
+        if !matches!(
+            new_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err(
+                "initiate_admin_recovery: new_admin is not a Joined member (RP3)".to_string(),
+            );
+        }
+        if m.power_levels.get(&new_admin).copied().unwrap_or(0) == 100 {
+            return Err("initiate_admin_recovery: new_admin is already an admin (RP3)".to_string());
+        }
+        // RP6: caller has no other open (collecting / time-locked)
+        // proposal.
+        let has_open = m.recovery_proposals.iter().any(|p| {
+            p.proposer == self_owner
+                && matches!(
+                    p.phase,
+                    RecoveryPhase::Collecting | RecoveryPhase::TimeLocked
+                )
+        });
+        if has_open {
+            return Err(
+                "initiate_admin_recovery: caller already has an open recovery proposal (RP6)"
+                    .to_string(),
+            );
+        }
+
+        // RP5: bind to the LIVE config generation, computed server-side.
+        let digest = crate::community_membership::recovery_config_digest(config)
+            .map_err(|e| format!("initiate_admin_recovery: config digest: {e}"))?;
+        (digest, config.threshold)
+    };
+
+    // Mint + insert RecoveryProposal.
+    let proposal = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.community_signing_key.as_ref();
+        mint_recovery_proposal_event(
+            space_id,
+            self_owner,
+            lost_admin,
+            new_admin,
+            config_digest,
+            signing_key,
+            event_hlc,
+        )?
+    };
+    let proposal_id_hex = hex::encode(proposal.id);
+    let outcome = engine_arc
+        .insert_local_event(proposal)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (RecoveryProposal): {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err(
+            "initiate_admin_recovery (RecoveryProposal)",
+            &outcome,
+        ));
+    }
+
+    Ok(InitiateRecoveryResult {
+        proposal_event_id: proposal_id_hex,
+        signers_so_far: 1,
+        threshold,
+    })
+}
+
+#[tauri::command]
+async fn initiate_admin_recovery(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    lost_admin_addr: String,
+    new_admin_addr: String,
+) -> Result<InitiateRecoveryResult, String> {
+    initiate_admin_recovery_impl(
+        state_lock.inner(),
+        community_id,
+        lost_admin_addr,
+        new_admin_addr,
+    )
+    .await
+}
+
+/// ZEB-714: designate IPC that co-signs an open recovery proposal
+/// (spec §3.2 RC1/RC2). Idempotent: if the caller already signed
+/// (as proposer or via a prior cosign), returns the current state
+/// without minting.
+pub(crate) async fn cosign_admin_recovery_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    proposal_event_id: String,
+) -> Result<RecoveryCosignResult, String> {
+    use crate::community_membership::RecoveryPhase;
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let proposal_id_bytes: [u8; 16] = hex::decode(&proposal_event_id)
+        .map_err(|e| format!("cosign_admin_recovery: invalid proposal_event_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "cosign_admin_recovery: proposal_event_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Generation + registry fence.
+    {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during cosign_admin_recovery (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during cosign_admin_recovery (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    // Locate the proposal in the time-aware view + friendly pre-checks.
+    let (threshold, already_signed) = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialized_with_now(admin_addr, wall_now_ms);
+
+        let Some(view) = m
+            .recovery_proposals
+            .iter()
+            .find(|p| p.id == proposal_id_bytes)
+        else {
+            return Err(format!(
+                "cosign_admin_recovery: proposal {proposal_event_id} not found"
+            ));
+        };
+        match view.phase {
+            RecoveryPhase::Collecting | RecoveryPhase::TimeLocked => {}
+            other => {
+                return Err(format!(
+                    "cosign_admin_recovery: proposal is no longer open (phase: {})",
+                    recovery_phase_dto(other)
+                ));
+            }
+        }
+        (view.threshold, view.signers.contains(&self_owner))
+    };
+
+    if !already_signed {
+        let cosign = {
+            let outbox_g = dm_outbox.lock().await;
+            let signing_key = outbox_g.community_signing_key.as_ref();
+            mint_recovery_cosign_event(
+                space_id,
+                self_owner,
+                proposal_id_bytes,
+                signing_key,
+                event_hlc,
+            )?
+        };
+        let outcome = engine_arc
+            .insert_local_event(cosign)
+            .await
+            .map_err(|e| format!("engine.insert_local_event (RecoveryCosign): {e}"))?;
+        if matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::Rejected(_)
+        ) {
+            return Err(membership_outcome_err("cosign_admin_recovery", &outcome));
+        }
+    }
+
+    // Recompute from the post-insert view.
+    let signers_after = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialized_with_now(admin_addr, wall_now_ms);
+        m.recovery_proposals
+            .iter()
+            .find(|p| p.id == proposal_id_bytes)
+            .map(|p| p.signers.len().min(u8::MAX as usize) as u8)
+            .unwrap_or(0)
+    };
+    Ok(RecoveryCosignResult {
+        signers_after,
+        threshold,
+        reached_threshold: signers_after >= threshold,
+    })
+}
+
+#[tauri::command]
+async fn cosign_admin_recovery(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    proposal_event_id: String,
+) -> Result<RecoveryCosignResult, String> {
+    cosign_admin_recovery_impl(state_lock.inner(), community_id, proposal_event_id).await
+}
+
+/// ZEB-714: admin IPC that vetoes an open recovery proposal (spec §3.2
+/// RV1 — one veto suffices, deliberately not quorum-gated: a veto
+/// restores the status quo ante and cannot escalate anyone's power).
+///
+/// Authorization: caller must be Joined with power 100.
+pub(crate) async fn veto_admin_recovery_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    proposal_event_id: String,
+) -> Result<(), String> {
+    use crate::community_membership::RecoveryPhase;
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let proposal_id_bytes: [u8; 16] = hex::decode(&proposal_event_id)
+        .map_err(|e| format!("veto_admin_recovery: invalid proposal_event_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "veto_admin_recovery: proposal_event_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Generation + registry fence.
+    {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during veto_admin_recovery (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during veto_admin_recovery (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    // Auth (RV1 running-state half) + proposal lookup — single read lock.
+    {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialized_with_now(admin_addr, wall_now_ms);
+
+        let caller_status = m.members.get(&self_owner).map(|ms| ms.status);
+        let is_bootstrap_admin = self_owner == admin_addr && !m.members.contains_key(&self_owner);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) && !is_bootstrap_admin
+        {
+            return Err("veto_admin_recovery: caller is not a Joined member".to_string());
+        }
+        let caller_power = m.power_levels.get(&self_owner).copied().unwrap_or(0);
+        if caller_power < 100 {
+            return Err(format!(
+                "veto_admin_recovery: caller power {caller_power} below admin threshold 100 (RV1)"
+            ));
+        }
+
+        let Some(view) = m
+            .recovery_proposals
+            .iter()
+            .find(|p| p.id == proposal_id_bytes)
+        else {
+            return Err(format!(
+                "veto_admin_recovery: proposal {proposal_event_id} not found"
+            ));
+        };
+        match view.phase {
+            RecoveryPhase::Collecting | RecoveryPhase::TimeLocked => {}
+            other => {
+                return Err(format!(
+                    "veto_admin_recovery: proposal is no longer open (phase: {})",
+                    recovery_phase_dto(other)
+                ));
+            }
+        }
+    }
+
+    let veto = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.community_signing_key.as_ref();
+        mint_recovery_veto_event(
+            space_id,
+            self_owner,
+            proposal_id_bytes,
+            signing_key,
+            event_hlc,
+        )?
+    };
+    let outcome = engine_arc
+        .insert_local_event(veto)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (RecoveryVeto): {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err("veto_admin_recovery", &outcome));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn veto_admin_recovery(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    proposal_event_id: String,
+) -> Result<(), String> {
+    veto_admin_recovery_impl(state_lock.inner(), community_id, proposal_event_id).await
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -43411,11 +44595,21 @@ pub async fn self_heal_community_observer(
         None => return, // engine gone (node stopped) — no-op
     };
 
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
     let admin_addr = engine_arc.admin_addr();
+    // ZEB-714: the TIME-AWARE view (real wall clock on the R4-6
+    // now-floor). Recovery execution is time-driven — with the
+    // event-driven `materialize_now` an Executed phase (and the
+    // recovery-promoted new_admin's power 100) would be invisible here
+    // until an unrelated event happened to land.
     let materialized = {
         let state = engine_arc.state();
         let state_g = state.lock().await;
-        state_g.materialize_now(admin_addr)
+        state_g.materialized_with_now(admin_addr, wall_now_ms)
     };
 
     // Power gate: only admins synthesize rotations/catchups.
@@ -43427,11 +44621,6 @@ pub async fn self_heal_community_observer(
     if local_power < crate::community_membership::POWER_THRESHOLDS.kick {
         return;
     }
-
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
 
     let resolver = registry.identity_resolver();
 
@@ -43464,34 +44653,45 @@ pub async fn self_heal_community_observer(
             .max_by_key(|e| (e.at.wall_ms, e.at.logical, e.at.device_id.as_str(), e.id))
             .map(|e| e.id);
 
-        let Some(triggered_by) = triggered_by_id else {
-            // ZEB-713 (PR #497 R2): a recovery-derived kick has no
-            // Kick/Leave event — its rotation cites the executed
-            // RecoveryProposal instead, and synthesizing it belongs to
-            // the ZEB-714 observer wiring because it must first honor
-            // the F=48h finality margin (spec §4.3); firing here at the
-            // deadline would violate that. Expected state, debug-level.
-            let recovery_derived = materialized.recovery_proposals.iter().any(|p| {
-                p.lost_admin == target
-                    && matches!(
-                        p.phase,
-                        crate::community_membership::RecoveryPhase::Executed
-                    )
-            });
-            if recovery_derived {
-                tracing::debug!(
-                    ?community_id,
-                    ?target,
-                    "self_heal: recovery-derived kick — rotation synthesis deferred to ZEB-714 (finality margin)"
-                );
-            } else {
-                tracing::warn!(
-                    ?community_id,
-                    ?target,
-                    "self_heal: pending_rotation_for but no Kick/Leave event found — skipping"
-                );
+        // ZEB-714: a recovery-derived kick has no Kick/Leave event —
+        // its rotation cites the executed RecoveryProposal instead
+        // (the D1 trigger-table arm validates against it), and it may
+        // only be synthesized once the F=48h finality margin has
+        // passed (spec §4.3): a veto delivered within F must
+        // reconverge the membership state before any irreversible
+        // EpochRotation event exists.
+        let triggered_by = match triggered_by_id {
+            Some(id) => id,
+            None => {
+                match crate::community_membership::recovery_rotation_trigger(&materialized, &target)
+                {
+                    Some((proposal_id, Some(eligible_at))) if wall_now_ms > eligible_at => {
+                        tracing::info!(
+                            ?community_id,
+                            ?target,
+                            "self_heal: recovery-derived rotation past finality margin — synthesizing"
+                        );
+                        proposal_id
+                    }
+                    Some((_, eligible_at)) => {
+                        tracing::debug!(
+                            ?community_id,
+                            ?target,
+                            ?eligible_at,
+                            "self_heal: recovery-derived kick — waiting out the finality margin"
+                        );
+                        continue;
+                    }
+                    None => {
+                        tracing::warn!(
+                            ?community_id,
+                            ?target,
+                            "self_heal: pending_rotation_for but no Kick/Leave event found — skipping"
+                        );
+                        continue;
+                    }
+                }
             }
-            continue;
         };
 
         // M7: dedup key includes trigger event ID — rejoin + re-kick produces a
@@ -61445,6 +62645,11 @@ pub fn run() {
             get_community_governance,
             countersign_admin_proposal,
             propose_change_quorum,
+            get_recovery_state,
+            set_recovery_designates,
+            initiate_admin_recovery,
+            cosign_admin_recovery,
+            veto_admin_recovery,
             create_channel,
             modify_channel,
             delete_channel,
@@ -69367,6 +70572,213 @@ mod list_pending_admin_proposals_tests {
 // NodeState. Crypto is real (PrivateIdentity + sign_event_with_identity)
 // so verify_event accepts the events. Time-sensitive checks use explicit
 // wall_ms values derived from ADMIN_PROPOSAL_EXPIRY_MS.
+// ── ZEB-714: get_recovery_state projection tests ─────────────────────────────
+//
+// The scope-pin vector (ZEB-714 / PR #497 R1): a TimeLocked recovery
+// proposal must flip to Executed purely by advancing the caller's wall
+// clock — ZERO new events — through the same read path the IPC uses
+// (`CommunityState::materialized_with_now` → `compute_recovery_state`).
+#[cfg(test)]
+mod zeb_714_recovery_state_tests {
+    use super::*;
+    use crate::community_membership::{
+        MembershipEventKind, ProposalKind, SignedMembershipEvent, RECOVERY_ROTATION_FINALITY_MS,
+        RECOVERY_VETO_WINDOW_FLOOR_MS,
+    };
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    const COM: SpaceId = SpaceId([0xc0; 16]);
+    const W: u64 = RECOVERY_VETO_WINDOW_FLOOR_MS;
+    const T0: u64 = 100_000;
+    const T_R: u64 = 110_000;
+    const DEADLINE: u64 = T_R + W;
+    const P1: [u8; 16] = [0xB0; 16];
+
+    fn admin1() -> OwnerAddr {
+        OwnerAddr([0x01; 16])
+    }
+    fn d1() -> OwnerAddr {
+        OwnerAddr([0x11; 16])
+    }
+    fn d2() -> OwnerAddr {
+        OwnerAddr([0x12; 16])
+    }
+    fn m_new() -> OwnerAddr {
+        OwnerAddr([0x21; 16])
+    }
+    fn m2() -> OwnerAddr {
+        OwnerAddr([0x22; 16])
+    }
+
+    fn ev(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COM,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            kind,
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// A `CommunityState` holding: five Joins, a self-satisfied
+    /// SetRecoveryDesignates (d1+d2, R=2, W=floor), a RecoveryProposal
+    /// by d1 (lost=admin1, new=m_new) and d2's threshold-tipping cosign.
+    fn time_locked_state() -> crate::community_state_crdt::CommunityState {
+        let mut state = crate::community_state_crdt::CommunityState::new(COM);
+        let events = vec![
+            ev([0xA0; 16], admin1(), 500, MembershipEventKind::Join),
+            ev([0xA1; 16], d1(), 1_000, MembershipEventKind::Join),
+            ev([0xA2; 16], d2(), 1_100, MembershipEventKind::Join),
+            ev([0xA3; 16], m_new(), 1_200, MembershipEventKind::Join),
+            ev([0xA4; 16], m2(), 1_300, MembershipEventKind::Join),
+            ev(
+                [0xA5; 16],
+                admin1(),
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetRecoveryDesignates {
+                        designates: vec![d1(), d2()],
+                        threshold: 2,
+                        veto_window_ms: W,
+                    },
+                },
+            ),
+        ];
+        let digest = {
+            let m = crate::community_membership::materialize(&events, admin1());
+            crate::community_membership::recovery_config_digest(
+                m.recovery_designates.as_ref().expect("configured"),
+            )
+            .expect("digest")
+        };
+        let mut all = events;
+        all.push(ev(
+            P1,
+            d1(),
+            T0,
+            MembershipEventKind::RecoveryProposal {
+                lost_admin: admin1(),
+                new_admin: m_new(),
+                config_digest: digest,
+            },
+        ));
+        all.push(ev(
+            [0xB1; 16],
+            d2(),
+            T_R,
+            MembershipEventKind::RecoveryCosign {
+                target_event_id: P1,
+            },
+        ));
+        for e in all {
+            state.events.insert(e.id, e);
+        }
+        state
+    }
+
+    #[test]
+    fn time_locked_to_executed_via_wall_clock_advance_zero_new_events() {
+        let state = time_locked_state();
+
+        // At the deadline: still time-locked (execution is strictly >).
+        let at = state.materialized_with_now(admin1(), DEADLINE);
+        let dto = compute_recovery_state(&at, m2());
+        assert_eq!(dto.proposals.len(), 1);
+        let p = &dto.proposals[0];
+        assert_eq!(p.phase, "timeLocked");
+        assert_eq!(p.deadline_ms, Some(DEADLINE));
+        assert_eq!(p.rotation_eligible_at_ms, None);
+        assert_eq!(p.signers_so_far, 2);
+        assert_eq!(p.threshold, 2);
+
+        // One millisecond later — SAME state, zero new events — the
+        // proposal reads Executed with the finality wall exposed.
+        let past = state.materialized_with_now(admin1(), DEADLINE + 1);
+        let dto2 = compute_recovery_state(&past, m2());
+        let p2 = &dto2.proposals[0];
+        assert_eq!(p2.phase, "executed");
+        assert_eq!(
+            p2.rotation_eligible_at_ms,
+            Some(DEADLINE + RECOVERY_ROTATION_FINALITY_MS)
+        );
+        assert_eq!(p2.lost_admin_addr, hex::encode(admin1().0));
+        assert_eq!(p2.new_admin_addr, hex::encode(m_new().0));
+        // The derived execution is visible in the same view.
+        assert_eq!(past.power_levels.get(&m_new()).copied(), Some(100));
+    }
+
+    #[test]
+    fn dto_carries_config_and_self_flags() {
+        let state = time_locked_state();
+        let m = state.materialized_with_now(admin1(), T_R + 1);
+
+        // A designate who signed.
+        let for_d1 = compute_recovery_state(&m, d1());
+        assert!(for_d1.self_is_designate);
+        assert!(for_d1.proposals[0].self_has_cosigned);
+        let config = for_d1.config.as_ref().expect("config present");
+        assert_eq!(config.threshold, 2);
+        assert_eq!(config.veto_window_ms, W);
+        assert_eq!(
+            config.designate_addrs,
+            vec![hex::encode(d1().0), hex::encode(d2().0)]
+        );
+
+        // A bystander member.
+        let for_m2 = compute_recovery_state(&m, m2());
+        assert!(!for_m2.self_is_designate);
+        assert!(!for_m2.proposals[0].self_has_cosigned);
+        assert_eq!(for_m2.self_power, 0);
+
+        // The admin sees power 100 (drives the veto affordance).
+        let for_admin = compute_recovery_state(&m, admin1());
+        assert_eq!(for_admin.self_power, 100);
+    }
+
+    #[test]
+    fn dto_maps_vetoed_by_to_hex() {
+        let mut state = time_locked_state();
+        let veto = ev(
+            [0xB2; 16],
+            admin1(),
+            T_R + 5_000,
+            MembershipEventKind::RecoveryVeto {
+                target_event_id: P1,
+            },
+        );
+        state.events.insert(veto.id, veto);
+        let m = state.materialized_with_now(admin1(), DEADLINE + 1);
+        let dto = compute_recovery_state(&m, m2());
+        let p = &dto.proposals[0];
+        assert_eq!(p.phase, "vetoed");
+        assert_eq!(p.vetoed_by_addr, Some(hex::encode(admin1().0)));
+        assert_eq!(p.rotation_eligible_at_ms, None);
+    }
+
+    #[test]
+    fn unconfigured_community_reads_empty_state() {
+        let state = crate::community_state_crdt::CommunityState::new(COM);
+        let m = state.materialized_with_now(admin1(), 1_000);
+        let dto = compute_recovery_state(&m, m2());
+        assert!(dto.config.is_none());
+        assert!(dto.proposals.is_empty());
+        assert!(!dto.self_is_designate);
+    }
+}
+
 #[cfg(test)]
 mod countersign_admin_proposal_tests {
     use super::*;
