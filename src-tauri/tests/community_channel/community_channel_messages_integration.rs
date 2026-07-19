@@ -446,8 +446,8 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     // (i + 1 == 100) already waited for this; assert explicitly so the
     // Phase-1 contract — strong (full volume) AND deterministic — is
     // unmistakable. The loss-free guarantee for the *offline* gap is
-    // Phase 3's ≥ 150 completeness assert + the final exact-150/no-dupes
-    // check.
+    // Phase 3's ≥ 150 completeness assert + the final exact-count/no-dupes
+    // check (151 with the Phase-4 ordering sentinel).
     {
         let got = received_b.lock().expect("received_b lock").len();
         assert!(
@@ -669,24 +669,52 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         hex::encode(channel_id.0)
     );
     let topic_key = zenoh::key_expr::KeyExpr::try_from(topic).expect("key");
+    // ZEB-688: capture the drop counter BEFORE the replay put and wait on the
+    // DELTA — earlier live/backfill delivery overlap may already have produced
+    // replay drops, so an absolute count would race the setup phases.
+    let pre_replay_drops = engine_b2.replay_drop_count();
     session_a
         .put(&topic_key, replay_packet)
         .await
         .expect("replay put");
 
-    // Give the loopback ~1s to arrive at B's subscriber + traverse
-    // verify_channel_event (where the replay tracker drops it).
-    //
-    // ZEB-469 audit: deliberately retained. This is a *negative* assertion — we
-    // confirm the replayed duplicate does NOT re-emit — so its only failure mode
-    // is a spurious pass (the drop simply isn't exercised if the packet is slow),
-    // never a spurious CI failure: A↔B subscriber matching is already established
-    // (B just received all 150 events above), and the replayed id's HLC is the
-    // lane minimum so no in-flight legit delivery can bump its count. A fully
-    // deterministic conversion would require an engine-level "events dropped by
-    // replay tracker" counter to wait on; that instrumentation is out of scope
-    // for this flake-hardening pass (the sleep is not a CI-flake source).
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // ZEB-688 (closes the ZEB-469 audit deferral): wait for B's engine to
+    // OBSERVE a drop instead of sleeping 1s. The emission-count check below
+    // is a *negative* assertion; under the old sleep its only failure mode was
+    // a spurious pass (a slow packet meant the drop path was never exercised —
+    // the count was unchanged for the wrong reason). The counter proves the
+    // drop path ran; the SENTINEL below proves it ran for OUR packet.
+    wait_until(
+        || async { engine_b2.replay_drop_count() > pre_replay_drops },
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("B must observe a replay drop after the replayed put");
+
+    // ZEB-688 R1 (CodeRabbit): the drop counter is engine-global, and a
+    // straggling duplicate from the Phase-3 backfill overlap could satisfy the
+    // delta above before OUR replayed put is processed — reopening the vacuity
+    // window. Close it with an ORDERING barrier: publish one fresh event from
+    // A on the same session+key the replayed put used. Same-session same-key
+    // zenoh puts reach B's subscriber in publication order, and B's receive
+    // loop processes packets serially, so once the sentinel lands in B's log
+    // the replayed put has been fully processed — whatever its outcome.
+    Arc::clone(&engine_a)
+        .publish(b"sentinel-after-replay".to_vec(), None, None, None)
+        .await
+        .expect("publish ordering sentinel");
+    wait_until(
+        || async {
+            engine_b2
+                .list_messages(None, 300)
+                .await
+                .map(|v| v.len() == 151)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("B must receive the post-replay ordering sentinel");
 
     let post_replay_emits = count_replayed();
     assert_eq!(
@@ -696,15 +724,16 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     );
 
     // ── Final state check ────────────────────────────────────────────
-    // B's log contains exactly 150 events in HLC order, no duplicates.
+    // B's log contains exactly 151 events (150 + the ordering sentinel) in
+    // HLC order, no duplicates.
     let final_listed = engine_b2
         .list_messages(None, 300)
         .await
         .expect("final list");
     assert_eq!(
         final_listed.len(),
-        150,
-        "B's log should contain exactly 150 events"
+        151,
+        "B's log should contain exactly 151 events (150 + ordering sentinel)"
     );
 
     // Verify HLC ordering across the entire log.

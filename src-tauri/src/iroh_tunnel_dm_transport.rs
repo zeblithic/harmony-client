@@ -11,18 +11,26 @@
 //!
 //! ## Always-deposit + attempt-tunnel (spec §5.7)
 //!
-//! `send` returns `Err(TransportError::Transient(_))` — byte-for-byte the same
-//! contract `DepositOnlyDmTransport` had. This is deliberate and load-bearing:
-//! the outbox drain's deposit rung fires on a *transient* failure once the pair
-//! has aged ≥ 1 backoff window (`drain_phase_c` Err-arm, `pre_failure_count >=
-//! 1`), so returning `Transient` keeps the butler/community-relay durability
-//! rung firing for EVERY DM exactly as before — no regression for offline
-//! peers. Returning `Ok` would instead steer the pair into the
+//! `send` always returns `Err` (never `Ok`) so the outbox drain's deposit rung
+//! fires for EVERY DM. Returning `Ok` would instead steer the pair into the
 //! "sent-but-never-acked" arm, which only deposits from `DEPOSIT_NOACK_WINDOWS`
 //! (= 2) windows onward — strictly *later*, weakening durability. So the tunnel
 //! is a pure parallel liveness path layered on top of the unchanged deposit
 //! path; the recipient dedups (CRDT inbox) the tunnel copy against the deposit
 //! copy.
+//!
+//! Which `Err` flavor matters (ZEB-525):
+//!
+//! * A tunnel attempt was actually spawned → `Transient`. The drain's Err-arm
+//!   grants one backoff window of grace (`pre_failure_count >= 1`) before
+//!   deposit candidacy — deliberately, so an online recipient's tunnel ack can
+//!   complete the entry first and the deposit (butler storage + a second
+//!   transfer) never fires.
+//! * NO attempt was spawned (no reachable tunnel targets, or the
+//!   `MAX_CONCURRENT_TUNNEL_SENDS` cap shed it) → `TransientNoLiveAttempt`.
+//!   Nothing is in flight for the grace window to protect, so the drain
+//!   deposits on the FIRST failure — offline-from-the-start recipients get
+//!   durability one backoff window (~5-6 s) sooner.
 //!
 //! Inbound ingest is Task 9 (the placeholder drain on the manager's ingest
 //! channel stays for now); this module only carries DMs outbound.
@@ -286,9 +294,11 @@ async fn build_tunnel_dm_packet(
 #[async_trait]
 impl DmTransport for IrohTunnelDmTransport {
     /// Attempt the PQ tunnel to every reachable device of `recipient`, then
-    /// return `Transient` so the always-deposit rung fires for EVERY DM (see
-    /// module docs). `destinations` (the 16-byte Reticulum hashes) is ignored —
-    /// the tunnel routes by iroh NodeId derived from the recipient's PQ keys.
+    /// return `Err` so the always-deposit rung fires for EVERY DM — `Transient`
+    /// when an attempt was spawned, `TransientNoLiveAttempt` when not (ZEB-525;
+    /// see module docs). `destinations` (the 16-byte Reticulum hashes) is
+    /// ignored — the tunnel routes by iroh NodeId derived from the recipient's
+    /// PQ keys.
     async fn send(
         &self,
         entry: &OutboxEntry,
@@ -309,6 +319,7 @@ impl DmTransport for IrohTunnelDmTransport {
         // Acquire a permit up front; if the cap is saturated, SHED this
         // best-effort tunnel attempt — the deposit rung below still carries
         // durability — rather than pile more work onto CAS / the event loop.
+        let mut live_attempt_spawned = false;
         if !targets.is_empty() {
             match Arc::clone(&self.tunnel_send_sem).try_acquire_owned() {
                 Ok(permit) => {
@@ -324,23 +335,44 @@ impl DmTransport for IrohTunnelDmTransport {
                     // this drain inline — awaiting it here would deadlock. Spawning
                     // frees the loop; we return `Transient` immediately and the
                     // deposit rung carries durability regardless.
+                    //
+                    // ZEB-525 (Qodo, PR #500 R1): `live_attempt_spawned` is set
+                    // per ARM, not on permit acquisition — the flag must track
+                    // "a send is actually in flight", and the invite-only arm
+                    // sends nothing when the invite rebuild failed.
                     match entry.message_cid {
                         // ZEB-505: invite-only entry — send the rebuilt bootstrap
                         // invite ALONE (no CidNotify; there is no message). The
                         // deposit rung carries durability exactly as for messages.
+                        // No rebuilt invite (rebuild failure, or recipient already
+                        // acked) → NOTHING to send → no spawn, permit dropped,
+                        // and the flag stays false so the deposit fires on the
+                        // first drain pass instead of after the grace window.
                         None => {
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                if let Some(inv) = &invite_wire {
-                                    for (node_id, contact) in &targets {
-                                        mgr.send_dm(*node_id, contact, inv.clone());
+                            if invite_wire.is_some() {
+                                live_attempt_spawned = true;
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    if let Some(inv) = &invite_wire {
+                                        for (node_id, contact) in &targets {
+                                            mgr.send_dm(*node_id, contact, inv.clone());
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            } else {
+                                tracing::debug!(
+                                    recipient = ?recipient,
+                                    "ZEB-525: invite-only entry with no rebuilt invite; \
+                                     no tunnel attempt — deposit rung carries it immediately"
+                                );
+                            }
                         }
                         // Message entry — send the invite (if still needed) ahead of
                         // the CidNotify so the recipient creates the Space first.
+                        // The CidNotify send is attempted regardless of the invite,
+                        // so this arm is always a live attempt.
                         Some(message_cid) => {
+                            live_attempt_spawned = true;
                             // ZEB-506: carry the sender's FULL cached device set (a
                             // cheap cache lookup under a brief owner-state lock — no
                             // CasOp here, so no drain deadlock) instead of a bare
@@ -416,15 +448,26 @@ impl DmTransport for IrohTunnelDmTransport {
             }
         }
 
-        // ALWAYS return Transient (never Ok): the tunnel is a parallel
-        // liveness attempt; the outbox's deposit rung is the durability
-        // guarantee and must fire for every DM (spec §5.7). See module docs for
-        // why Transient (not Ok) is the correct contract. The spawned attempt
-        // above runs concurrently and never blocks the drain.
-        Err(TransportError::Transient(
-            "ZEB-473: tunnel attempted (best-effort liveness); deposit rung carries durability"
-                .to_string(),
-        ))
+        // ALWAYS return Err (never Ok): the tunnel is a parallel liveness
+        // attempt; the outbox's deposit rung is the durability guarantee and
+        // must fire for every DM (spec §5.7). The flavor tells the drain
+        // whether an attempt is actually in flight (ZEB-525): `Transient`
+        // keeps the one-window deposit grace so a live ack can win;
+        // `TransientNoLiveAttempt` (no targets / capacity shed) deposits on
+        // the first failure — there is nothing for the grace to wait on. The
+        // spawned attempt above runs concurrently and never blocks the drain.
+        if live_attempt_spawned {
+            Err(TransportError::Transient(
+                "ZEB-473: tunnel attempted (best-effort liveness); deposit rung carries durability"
+                    .to_string(),
+            ))
+        } else {
+            Err(TransportError::TransientNoLiveAttempt(
+                "ZEB-525: no tunnel attempt (no reachable targets or capacity shed); \
+                 deposit rung carries durability"
+                    .to_string(),
+            ))
+        }
     }
 }
 
@@ -803,6 +846,74 @@ mod tests {
         );
     }
 
+    /// ZEB-525 (Qodo, PR #500 R1): an invite-only entry whose bootstrap-invite
+    /// rebuild FAILS (no DM Space in owner-state) sends nothing at all — the
+    /// spawn is skipped, so `send` must return `TransientNoLiveAttempt` (first-
+    /// tick deposit), not `Transient` (grace window). Pre-fix, the flag was set
+    /// on permit acquisition and this case was misclassified as a live attempt.
+    #[tokio::test]
+    async fn send_invite_only_with_failed_invite_rebuild_returns_no_live_attempt() {
+        let mgr = test_manager().await;
+        let recipient = OwnerAddr([0x11; 16]);
+        let dsa_pubkey = vec![0x07u8; 32];
+        let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
+
+        // Reachable tunnel contact, but NO DM Space installed → the ZEB-504
+        // invite rebuild errors → `build_bootstrap_invite` returns `None`.
+        let contact = DeviceTunnelContact {
+            iroh_node_id: [0x09; 32],
+            home_relay_url: None,
+            pq_dsa_pubkey: dsa_pubkey.clone(),
+            pq_kem_pubkey: vec![0x08u8; 32],
+        };
+        let mut owner_state = OwnerState::default();
+        owner_state.owner_device_cache.devices.insert(
+            recipient,
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0x33; 16])],
+                device_identity_pubs: vec![None],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                device_tunnel_contacts: vec![Some(contact)],
+            },
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(owner_state));
+        let transport = make_transport(
+            Arc::clone(&mgr),
+            state,
+            Arc::new(crate::content_store::InMemoryStub::default()),
+        );
+
+        // Invite-only entry: message_cid: None, recipient un-acked.
+        let cid = ContentId::from_bytes([0xee; 32]);
+        let mut entry = synthetic_outbox_entry(SpaceId([0xcc; 16]), cid, recipient);
+        entry.message_cid = None;
+
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
+
+        let err = transport
+            .send(&entry, recipient, Vec::new())
+            .await
+            .expect_err("must return an error (always-deposit)");
+        assert!(
+            matches!(err, TransportError::TransientNoLiveAttempt(_)),
+            "failed invite rebuild sends nothing → must classify as \
+             TransientNoLiveAttempt for first-tick deposit, got {err:?}"
+        );
+
+        // Nothing was spawned, so nothing routes to the manager. Negative wait
+        // mirrors the shed test: it can only false-pass, never false-fail.
+        let routed =
+            tokio::time::timeout(std::time::Duration::from_millis(300), cmd_rx.recv()).await;
+        assert!(
+            routed.is_err(),
+            "no packet may route when the invite rebuild failed (nothing to send)"
+        );
+    }
+
     /// ZEB-504: once the recipient has ACKed (an ack implies they admitted a
     /// CidNotify, so the Space exists on their side), `send` omits the invite and
     /// routes only the CidNotify.
@@ -1097,10 +1208,11 @@ mod tests {
     }
 
     /// A recipient with NO tunnel contact (device known-by-hash only) → `send`
-    /// routes NOTHING to the tunnel but STILL returns Transient so the deposit
-    /// rung covers the offline/unreachable peer (no durability regression).
+    /// routes NOTHING to the tunnel and returns `TransientNoLiveAttempt`
+    /// (ZEB-525) so the deposit rung fires on the FIRST drain pass — no live
+    /// attempt exists for the one-window deposit grace to wait on.
     #[tokio::test]
-    async fn send_without_contact_still_returns_transient_for_deposit() {
+    async fn send_without_contact_returns_no_live_attempt_for_immediate_deposit() {
         let mgr = test_manager().await;
 
         let recipient = OwnerAddr([0x22; 16]);
@@ -1135,17 +1247,18 @@ mod tests {
         let err = transport
             .send(&entry, recipient, Vec::new())
             .await
-            .expect_err("must return Transient even with no tunnel target");
+            .expect_err("must return an error even with no tunnel target");
         assert!(
-            matches!(err, TransportError::Transient(_)),
-            "no-contact recipient must still deposit (Transient), got {err:?}"
+            matches!(err, TransportError::TransientNoLiveAttempt(_)),
+            "no-contact recipient must deposit immediately (TransientNoLiveAttempt), got {err:?}"
         );
     }
 
-    /// An UNKNOWN recipient (no cached entry at all) → no tunnel routing, still
-    /// Transient (deposit covers it once Flow A propagates the entry).
+    /// An UNKNOWN recipient (no cached entry at all) → no tunnel routing →
+    /// `TransientNoLiveAttempt` (ZEB-525: deposit fires on the first drain
+    /// pass; Flow A propagating the entry later re-enables tunnel attempts).
     #[tokio::test]
-    async fn send_unknown_recipient_returns_transient() {
+    async fn send_unknown_recipient_returns_no_live_attempt() {
         let mgr = test_manager().await;
         let state = Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
         let transport = make_transport(
@@ -1164,8 +1277,8 @@ mod tests {
         let err = transport
             .send(&entry, recipient, Vec::new())
             .await
-            .expect_err("unknown recipient must return Transient");
-        assert!(matches!(err, TransportError::Transient(_)));
+            .expect_err("unknown recipient must return an error");
+        assert!(matches!(err, TransportError::TransientNoLiveAttempt(_)));
     }
 
     /// ZEB-484: a recipient with a tunnel contact AND the blob in CAS → `send`
@@ -1286,7 +1399,9 @@ mod tests {
 
     /// ZEB-485 (CodeAnt): when the concurrent-tunnel-send cap is saturated, `send`
     /// SHEDS the best-effort tunnel attempt (no spawn, nothing routed to the
-    /// manager) and still returns Transient so the deposit rung carries the DM.
+    /// manager) and returns `TransientNoLiveAttempt` (ZEB-525) so the deposit
+    /// rung carries the DM on the first drain pass — a shed attempt leaves
+    /// nothing in flight for the deposit grace window to wait on.
     #[tokio::test]
     async fn send_sheds_tunnel_attempt_when_concurrency_cap_saturated() {
         let mgr = test_manager().await;
@@ -1339,10 +1454,10 @@ mod tests {
         let err = transport
             .send(&entry, recipient, Vec::new())
             .await
-            .expect_err("must return Transient (always-deposit) even when shed");
+            .expect_err("must return an error (always-deposit) even when shed");
         assert!(
-            matches!(err, TransportError::Transient(_)),
-            "must be Transient so the deposit rung fires, got {err:?}"
+            matches!(err, TransportError::TransientNoLiveAttempt(_)),
+            "shed attempt must deposit immediately (TransientNoLiveAttempt), got {err:?}"
         );
 
         // Nothing was spawned, so nothing routes to the manager. Negative wait:
