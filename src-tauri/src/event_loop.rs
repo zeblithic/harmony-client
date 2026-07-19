@@ -4925,198 +4925,135 @@ pub async fn run(
                                 // an AEAD failure (non-member / stale epoch /
                                 // tamper) is dropped silently.
                                 //
-                                // ZEB-353: on a transport drop the inner receive
-                                // loop ends; instead of returning we re-declare
-                                // the subscriber with exponential backoff (mirror
-                                // the voice-signal sub), emitting transport-lost
-                                // on drop and transport-restored on re-declare so
-                                // the frontend can show "Reconnecting…".
-                                let handle = tokio::spawn(async move {
-                                    let mut sub = sub;
-                                    let mut backoff = std::time::Duration::from_secs(5);
-                                    const MAX_BACKOFF: std::time::Duration =
-                                        std::time::Duration::from_secs(60);
-                                    loop {
-                                        // Track whether this subscription ever
-                                        // carried a frame. Only a connection that
-                                        // made real progress is allowed to reset the
-                                        // backoff; one that declares OK but never
-                                        // receives is flapping and must rate-limit.
-                                        let mut made_progress = false;
-                                        while let Ok(sample) = sub.recv_async().await {
-                                            made_progress = true;
-                                            // ZEB-362 (Qodo perf): the `.../*` subscription also
-                                            // delivers our OWN published frames; skip them before
-                                            // the per-frame verify/open work (mirrors the DM
-                                            // subscriber's self-skip). We never play our own mic
-                                            // back.
-                                            if sample.key_expr().as_str().rsplit('/').next()
-                                                == Some(own_device_hex_sub.as_str())
-                                            {
-                                                continue;
-                                            }
-                                            if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
-                                                tracing::warn!(
-                                                    len = sample.payload().len(),
-                                                    max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
-                                                    "oversized voice packet dropped"
-                                                );
-                                                continue;
-                                            }
-                                            // ZEB-362: authenticate the sender of EVERY frame
-                                            // (always-verify, fail-closed). The topic suffix is
-                                            // now an untrusted hint; the detached Ed25519
-                                            // signature, checked against the device VK we trust
-                                            // from the verified presence roster, binds the frame
-                                            // to its owner.
-                                            //
-                                            // (1) parse the claimed device VK from the suffix.
-                                            let dev = match sample
-                                                .key_expr()
-                                                .as_str()
-                                                .rsplit('/')
-                                                .next()
-                                                .and_then(|h| hex::decode(h).ok())
-                                                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                                            {
-                                                Some(d) => d,
-                                                None => continue, // not 32-byte hex → drop
-                                            };
-                                            // (2) device → verified owner from the signed presence
-                                            //     roster. Unknown device → drop (fail-closed). The
-                                            //     start-muted invariant (D10) means a transmitting
-                                            //     device has already announced presence, so this
-                                            //     costs no real audio.
-                                            let owner = {
-                                                let g = presence_map_media.lock().await;
-                                                g.owner_for_device(&c_sub, &ch_sub, &dev)
-                                            };
-                                            let owner = match owner {
-                                                Some(o) => o,
-                                                None => continue,
-                                            };
-                                            let sealed = sample.payload().to_bytes().to_vec();
-                                            // (3) verify the per-frame signature against the device.
-                                            if crate::voice_crypto::verify_voice_frame_sig(
-                                                &dev, &c_sub, &ch_sub, &sealed,
-                                            )
-                                            .is_err()
-                                            {
-                                                continue; // forged / spoofed-suffix / corrupt → drop
-                                            }
-                                            // (4) moderation drop on the now-AUTHENTICATED owner,
-                                            //     gated for the hot path (no extra locks while no
-                                            //     moderation is active — Qodo perf).
-                                            if mod_active_media
-                                                .load(std::sync::atomic::Ordering::Relaxed)
-                                            {
-                                                let now = (voice_now_ms_media)();
-                                                let g = mod_map_media.lock().await;
-                                                if g.is_muted(&c_sub, &ch_sub, &owner, now)
-                                                    || g.is_kicked(&c_sub, &ch_sub, &owner, now)
-                                                {
-                                                    continue; // moderated sender — un-spoofable now
-                                                }
-                                            }
-                                            // (5) open the packet (AAD binds the device VK).
-                                            let frame = match crate::voice_crypto::open_voice_packet_unchecked(
-                                                &key_for_sub,
-                                                &dev,
-                                                &c_sub,
-                                                &ch_sub,
-                                                &sealed,
-                                            ) {
-                                                Ok(f) => f,
-                                                Err(_) => continue, // wrong key / stale / tamper → drop
-                                            };
-                                            // (6) attribution integrity: the cleartext header's
-                                            //     senderHash (VK[0..16], bytes 7..23) must match the
-                                            //     authenticated device, so a member can't sign their
-                                            //     own frame but mislabel the audio as someone else.
-                                            if frame.len() < 23 || frame[7..23] != dev[..16] {
-                                                continue;
-                                            }
-                                            crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-frame-received", &serde_json::json!({ "frameBytes": frame }));
-                                        }
-                                        // Inner receive loop ended on a transport
-                                        // error. Stop if we're shutting down.
-                                        if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
-                                            break;
-                                        }
-                                        // Reset/grow the backoff based on real
-                                        // progress, not mere re-subscription. A
-                                        // connection that carried frames then dropped
-                                        // is a healthy blip → reset to the initial 5s
-                                        // and re-declare immediately. A connection
-                                        // that declared OK but never received a frame
-                                        // is flapping → sleep the current backoff and
-                                        // grow it (5s → … → 60s cap) so the
-                                        // lost/restored event rate stays bounded
-                                        // instead of spinning. The `closing` re-check
-                                        // inside the re-declare loop still owns
-                                        // shutdown during the sleep.
-                                        // Surface "reconnecting" to the UI BEFORE the
-                                        // no-progress backoff sleep. The session drives
-                                        // its reconnecting flag off this event, so
-                                        // emitting first means a flapping (no-progress)
-                                        // reconnect shows "reconnecting" for the whole
-                                        // backoff window rather than only flipping right
-                                        // before "...restored". The sleep below still
-                                        // rate-limits the re-declare; it just no longer
-                                        // gates the UI signal.
+                                // ZEB-353/355: on a transport drop the shared
+                                // driver (voice_reconnect.rs) re-declares the
+                                // subscriber with progress-aware backoff,
+                                // emitting transport-lost on drop and
+                                // transport-restored on re-declare so the
+                                // frontend can show "Reconnecting…".
+                                let app_frame = app_sub.clone();
+                                let on_frame = async move |sample: zenoh::sample::Sample| {
+                                    // ZEB-362 (Qodo perf): the `.../*` subscription also
+                                    // delivers our OWN published frames; skip them before
+                                    // the per-frame verify/open work (mirrors the DM
+                                    // subscriber's self-skip). We never play our own mic
+                                    // back.
+                                    if sample.key_expr().as_str().rsplit('/').next()
+                                        == Some(own_device_hex_sub.as_str())
+                                    {
+                                        return;
+                                    }
+                                    if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
                                         tracing::warn!(
-                                            key = %sub_key_retry,
-                                            "voice subscriber closed unexpectedly; reconnecting"
+                                            len = sample.payload().len(),
+                                            max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
+                                            "oversized voice packet dropped"
                                         );
-                                        crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-lost", &serde_json::json!({
-                                                "communityId": community_hex,
-                                                "channelId": channel_hex,
-                                            }));
-                                        if made_progress {
-                                            backoff = std::time::Duration::from_secs(5);
-                                        } else {
-                                            tokio::time::sleep(backoff).await;
-                                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
-                                        }
-                                        // Re-declare the subscriber. Like the
-                                        // voice-signal sub, try immediately on the
-                                        // first attempt and only back off *after* a
-                                        // failed re-declare, so a momentary blip
-                                        // recovers without waiting out the backoff.
-                                        loop {
-                                            if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
-                                                return;
-                                            }
-                                            match session_for_media
-                                                .declare_subscriber(&sub_key_retry)
-                                                .await
-                                            {
-                                                Ok(s) => {
-                                                    // Backoff reset is owned by the
-                                                    // made_progress logic above, not
-                                                    // by mere re-subscription.
-                                                    sub = s;
-                                                    crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-restored", &serde_json::json!({
-                                                            "communityId": community_hex,
-                                                            "channelId": channel_hex,
-                                                        }));
-                                                    break;
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        key = %sub_key_retry,
-                                                        error = %e,
-                                                        backoff_s = backoff.as_secs(),
-                                                        "voice subscriber re-declare failed; retrying"
-                                                    );
-                                                    tokio::time::sleep(backoff).await;
-                                                    backoff =
-                                                        std::cmp::min(backoff * 2, MAX_BACKOFF);
-                                                }
-                                            }
+                                        return;
+                                    }
+                                    // ZEB-362: authenticate the sender of EVERY frame
+                                    // (always-verify, fail-closed). The topic suffix is
+                                    // now an untrusted hint; the detached Ed25519
+                                    // signature, checked against the device VK we trust
+                                    // from the verified presence roster, binds the frame
+                                    // to its owner.
+                                    //
+                                    // (1) parse the claimed device VK from the suffix.
+                                    let dev = match sample
+                                        .key_expr()
+                                        .as_str()
+                                        .rsplit('/')
+                                        .next()
+                                        .and_then(|h| hex::decode(h).ok())
+                                        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                                    {
+                                        Some(d) => d,
+                                        None => return, // not 32-byte hex → drop
+                                    };
+                                    // (2) device → verified owner from the signed presence
+                                    //     roster. Unknown device → drop (fail-closed). The
+                                    //     start-muted invariant (D10) means a transmitting
+                                    //     device has already announced presence, so this
+                                    //     costs no real audio.
+                                    let owner = {
+                                        let g = presence_map_media.lock().await;
+                                        g.owner_for_device(&c_sub, &ch_sub, &dev)
+                                    };
+                                    let owner = match owner {
+                                        Some(o) => o,
+                                        None => return,
+                                    };
+                                    let sealed = sample.payload().to_bytes().to_vec();
+                                    // (3) verify the per-frame signature against the device.
+                                    if crate::voice_crypto::verify_voice_frame_sig(
+                                        &dev, &c_sub, &ch_sub, &sealed,
+                                    )
+                                    .is_err()
+                                    {
+                                        return; // forged / spoofed-suffix / corrupt → drop
+                                    }
+                                    // (4) moderation drop on the now-AUTHENTICATED owner,
+                                    //     gated for the hot path (no extra locks while no
+                                    //     moderation is active — Qodo perf).
+                                    if mod_active_media
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        let now = (voice_now_ms_media)();
+                                        let g = mod_map_media.lock().await;
+                                        if g.is_muted(&c_sub, &ch_sub, &owner, now)
+                                            || g.is_kicked(&c_sub, &ch_sub, &owner, now)
+                                        {
+                                            return; // moderated sender — un-spoofable now
                                         }
                                     }
-                                });
+                                    // (5) open the packet (AAD binds the device VK).
+                                    let frame = match crate::voice_crypto::open_voice_packet_unchecked(
+                                        &key_for_sub,
+                                        &dev,
+                                        &c_sub,
+                                        &ch_sub,
+                                        &sealed,
+                                    ) {
+                                        Ok(f) => f,
+                                        Err(_) => return, // wrong key / stale / tamper → drop
+                                    };
+                                    // (6) attribution integrity: the cleartext header's
+                                    //     senderHash (VK[0..16], bytes 7..23) must match the
+                                    //     authenticated device, so a member can't sign their
+                                    //     own frame but mislabel the audio as someone else.
+                                    if frame.len() < 23 || frame[7..23] != dev[..16] {
+                                        return;
+                                    }
+                                    crate::node_event_sink::emit_ser(app_frame.as_ref(), "voice-frame-received", &serde_json::json!({ "frameBytes": frame }));
+                                };
+                                let app_lost = app_sub.clone();
+                                let lost_community = community_hex.clone();
+                                let lost_channel = channel_hex.clone();
+                                let on_lost = move || {
+                                    crate::node_event_sink::emit_ser(app_lost.as_ref(), "voice-transport-lost", &serde_json::json!({
+                                            "communityId": lost_community,
+                                            "channelId": lost_channel,
+                                        }));
+                                };
+                                let on_restored = move || {
+                                    crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-restored", &serde_json::json!({
+                                            "communityId": community_hex,
+                                            "channelId": channel_hex,
+                                        }));
+                                };
+                                let handle =
+                                    tokio::spawn(crate::voice_reconnect::run_media_subscriber(
+                                        crate::voice_reconnect::MediaSubscriberCtx {
+                                            session: session_for_media,
+                                            sub_key: sub_key_retry,
+                                            label: "voice",
+                                            closing: closing_sub,
+                                        },
+                                        sub,
+                                        on_frame,
+                                        on_lost,
+                                        on_restored,
+                                    ));
                                 if let Some(old) = voice_subs.insert((community_id, channel_id), handle) {
                                     old.abort();
                                 }
@@ -5263,9 +5200,11 @@ pub async fn run(
                                     let ctrl_mod_active =
                                         std::sync::Arc::clone(&voice_moderation_active);
                                     let handle = tokio::spawn(async move {
-                                        let mut backoff = std::time::Duration::from_secs(5);
-                                        const MAX_BACKOFF: std::time::Duration =
-                                            std::time::Duration::from_secs(60);
+                                        // ZEB-355: backoff arithmetic shared with the
+                                        // media loops (voice_reconnect.rs); this loop
+                                        // keeps its declare-at-top shape (no UI events).
+                                        let mut backoff =
+                                            crate::voice_reconnect::ProgressBackoff::new();
                                         loop {
                                             let sub = match ctrl_session
                                                 .declare_subscriber(&control_topic)
@@ -5278,17 +5217,14 @@ pub async fn run(
                                                     ) {
                                                         return;
                                                     }
+                                                    let delay = backoff.on_redeclare_failure();
                                                     tracing::warn!(
                                                         %control_topic,
                                                         err = %e,
-                                                        backoff_s = backoff.as_secs(),
+                                                        backoff_s = delay.as_secs(),
                                                         "voice control subscribe failed; retrying"
                                                     );
-                                                    tokio::time::sleep(backoff).await;
-                                                    backoff = std::cmp::min(
-                                                        backoff * 2,
-                                                        MAX_BACKOFF,
-                                                    );
+                                                    tokio::time::sleep(delay).await;
                                                     continue;
                                                 }
                                             };
@@ -5388,12 +5324,8 @@ pub async fn run(
                                                 %control_topic,
                                                 "voice control subscriber closed unexpectedly; reconnecting"
                                             );
-                                            if made_progress {
-                                                backoff = std::time::Duration::from_secs(5);
-                                            } else {
-                                                tokio::time::sleep(backoff).await;
-                                                backoff =
-                                                    std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                            if let Some(delay) = backoff.on_drop(made_progress) {
+                                                tokio::time::sleep(delay).await;
                                             }
                                         }
                                     });
@@ -5658,126 +5590,66 @@ pub async fn run(
                         let sub_key_retry = sub_key.clone();
                         match session.declare_subscriber(&sub_key).await {
                             Ok(sub) => {
-                                // ZEB-353: on a transport drop the inner receive
-                                // loop ends; instead of returning we re-declare the
-                                // subscriber with exponential backoff (mirror the
-                                // voice-signal sub), emitting transport-lost on drop
-                                // and transport-restored on re-declare so the
+                                // ZEB-353/355: on a transport drop the shared
+                                // driver (voice_reconnect.rs) re-declares the
+                                // subscriber with progress-aware backoff,
+                                // emitting transport-lost on drop and
+                                // transport-restored on re-declare so the
                                 // frontend can show "Reconnecting…".
-                                let handle = tokio::spawn(async move {
-                                    let mut sub = sub;
-                                    let mut backoff = std::time::Duration::from_secs(5);
-                                    const MAX_BACKOFF: std::time::Duration =
-                                        std::time::Duration::from_secs(60);
-                                    loop {
-                                        // Track whether this subscription ever
-                                        // carried a frame. Only a connection that
-                                        // made real progress is allowed to reset the
-                                        // backoff; one that declares OK but never
-                                        // receives is flapping and must rate-limit.
-                                        let mut made_progress = false;
-                                        while let Ok(sample) = sub.recv_async().await {
-                                            made_progress = true;
-                                            // Skip our own published frames: on a 2-party
-                                            // DM the `.../*` sub also matches our own
-                                            // {senderDevice} segment, and decrypting +
-                                            // emitting them just to have the frontend drop
-                                            // them by sender hash wastes CPU on the audio
-                                            // hot path (self is ~half of DM traffic).
-                                            if sample.key_expr().as_str().rsplit('/').next()
-                                                == Some(own_device_hex.as_str())
-                                            {
-                                                continue;
-                                            }
-                                            if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
-                                                continue;
-                                            }
-                                            let sealed = sample.payload().to_bytes().to_vec();
-                                            if let Ok(frame) = crate::voice_crypto::decrypt_dm_voice_packet(
-                                                &key_for_sub,
-                                                &call_id,
-                                                crate::voice_crypto::VOICE_DM_PACKET_AAD,
-                                                &sealed,
-                                            ) {
-                                                crate::node_event_sink::emit_ser(app_sub.as_ref(), "dm-voice-frame-received", &serde_json::json!({
-                                                        "callId": call_hex,
-                                                        "frameBytes": frame,
-                                                    }));
-                                            }
-                                        }
-                                        // Inner receive loop ended on a transport
-                                        // error. Stop if we're shutting down.
-                                        if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
-                                            break;
-                                        }
-                                        // Reset/grow the backoff based on real
-                                        // progress, not mere re-subscription. A
-                                        // connection that carried frames then dropped
-                                        // is a healthy blip → reset to the initial 5s
-                                        // and re-declare immediately. A connection
-                                        // that declared OK but never received a frame
-                                        // is flapping → sleep the current backoff and
-                                        // grow it (5s → … → 60s cap) so the
-                                        // lost/restored event rate stays bounded
-                                        // instead of spinning. The `closing` re-check
-                                        // inside the re-declare loop still owns
-                                        // shutdown during the sleep.
-                                        // Surface "reconnecting" to the UI BEFORE the
-                                        // no-progress backoff sleep. The call session
-                                        // drives its reconnecting flag off this event, so
-                                        // emitting first means a flapping (no-progress)
-                                        // reconnect shows "reconnecting" for the whole
-                                        // backoff window rather than only flipping right
-                                        // before "...restored". The sleep below still
-                                        // rate-limits the re-declare; it just no longer
-                                        // gates the UI signal.
-                                        tracing::warn!(
-                                            key = %sub_key_retry,
-                                            "dm voice subscriber closed unexpectedly; reconnecting"
-                                        );
-                                        crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-lost", &serde_json::json!({ "callId": call_hex }));
-                                        if made_progress {
-                                            backoff = std::time::Duration::from_secs(5);
-                                        } else {
-                                            tokio::time::sleep(backoff).await;
-                                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
-                                        }
-                                        // Re-declare the subscriber. Like the
-                                        // voice-signal sub, try immediately on the
-                                        // first attempt and only back off *after* a
-                                        // failed re-declare, so a momentary blip
-                                        // recovers without waiting out the backoff.
-                                        loop {
-                                            if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
-                                                return;
-                                            }
-                                            match session_for_media
-                                                .declare_subscriber(&sub_key_retry)
-                                                .await
-                                            {
-                                                Ok(s) => {
-                                                    // Backoff reset is owned by the
-                                                    // made_progress logic above, not
-                                                    // by mere re-subscription.
-                                                    sub = s;
-                                                    crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-restored", &serde_json::json!({ "callId": call_hex }));
-                                                    break;
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        key = %sub_key_retry,
-                                                        error = %e,
-                                                        backoff_s = backoff.as_secs(),
-                                                        "dm voice subscriber re-declare failed; retrying"
-                                                    );
-                                                    tokio::time::sleep(backoff).await;
-                                                    backoff =
-                                                        std::cmp::min(backoff * 2, MAX_BACKOFF);
-                                                }
-                                            }
-                                        }
+                                let app_frame = app_sub.clone();
+                                let frame_call_hex = call_hex.clone();
+                                let on_frame = async move |sample: zenoh::sample::Sample| {
+                                    // Skip our own published frames: on a 2-party
+                                    // DM the `.../*` sub also matches our own
+                                    // {senderDevice} segment, and decrypting +
+                                    // emitting them just to have the frontend drop
+                                    // them by sender hash wastes CPU on the audio
+                                    // hot path (self is ~half of DM traffic).
+                                    if sample.key_expr().as_str().rsplit('/').next()
+                                        == Some(own_device_hex.as_str())
+                                    {
+                                        return;
                                     }
-                                });
+                                    if sample.payload().len()
+                                        > crate::voice_crypto::MAX_VOICE_PACKET_BYTES
+                                    {
+                                        return;
+                                    }
+                                    let sealed = sample.payload().to_bytes().to_vec();
+                                    if let Ok(frame) = crate::voice_crypto::decrypt_dm_voice_packet(
+                                        &key_for_sub,
+                                        &call_id,
+                                        crate::voice_crypto::VOICE_DM_PACKET_AAD,
+                                        &sealed,
+                                    ) {
+                                        crate::node_event_sink::emit_ser(app_frame.as_ref(), "dm-voice-frame-received", &serde_json::json!({
+                                                "callId": frame_call_hex,
+                                                "frameBytes": frame,
+                                            }));
+                                    }
+                                };
+                                let app_lost = app_sub.clone();
+                                let lost_call_hex = call_hex.clone();
+                                let on_lost = move || {
+                                    crate::node_event_sink::emit_ser(app_lost.as_ref(), "voice-transport-lost", &serde_json::json!({ "callId": lost_call_hex }));
+                                };
+                                let restored_call_hex = call_hex.clone();
+                                let on_restored = move || {
+                                    crate::node_event_sink::emit_ser(app_sub.as_ref(), "voice-transport-restored", &serde_json::json!({ "callId": restored_call_hex }));
+                                };
+                                let handle =
+                                    tokio::spawn(crate::voice_reconnect::run_media_subscriber(
+                                        crate::voice_reconnect::MediaSubscriberCtx {
+                                            session: session_for_media,
+                                            sub_key: sub_key_retry,
+                                            label: "dm voice",
+                                            closing: closing_sub,
+                                        },
+                                        sub,
+                                        on_frame,
+                                        on_lost,
+                                        on_restored,
+                                    ));
                                 dm_voice_keys.insert(call_id, caps.channel_key);
                                 dm_voice_mute_flags.insert(
                                     call_id,

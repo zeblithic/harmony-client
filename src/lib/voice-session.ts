@@ -9,6 +9,7 @@ import { AudioCapture } from './voice/audio-capture';
 import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
+import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
 
 export type SessionPhase = 'idle' | 'joining' | 'connected' | 'leaving';
 
@@ -141,9 +142,11 @@ export interface VoiceSessionDeps {
   senderHash: Uint8Array;
   vadThreshold?: number;
   // Factories (injected in tests; real defaults below).
-  makeSender?: (gate: FrameGate) => Pick<VoiceSender, 'start' | 'stop'>;
+  makeSender?: (gate: FrameGate) => Pick<VoiceSender, 'start' | 'stop' | 'switchInputDevice'>;
   makeReceiver?: () => Pick<VoiceReceiver, 'init' | 'destroy' | 'getActiveSenders' | 'isSpeaking'>;
-  makeMixer?: () => Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy'>;
+  makeMixer?: () => Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy' | 'setOutputDevice'>;
+  /** ZEB-359: device preference source. Absent ⇒ system defaults, no following. */
+  audioDevices?: DeviceFollowerDeps['prefs'];
   /** Resolve an owner hex → { displayName, avatarUrl } for tiles (optional). */
   resolveCard?: (ownerHex: string) => { displayName?: string; avatarUrl?: string } | undefined;
   /** Subscribe/refresh member cards for visible roster owners (optional). */
@@ -200,9 +203,9 @@ export class VoiceSession {
   private deps: VoiceSessionDeps;
 
   private vad: VoiceActivityDetector;
-  private sender: Pick<VoiceSender, 'start' | 'stop'> | null = null;
+  private sender: Pick<VoiceSender, 'start' | 'stop' | 'switchInputDevice'> | null = null;
   private receiver: Pick<VoiceReceiver, 'init' | 'destroy' | 'getActiveSenders' | 'isSpeaking'> | null = null;
-  private mixer: Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy'> | null = null;
+  private mixer: Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy' | 'setOutputDevice'> | null = null;
 
   private muted = true;
   private deafened = false;
@@ -321,7 +324,11 @@ export class VoiceSession {
       backendJoined = true;
 
       // Build engine pieces.
-      this.mixer = this.deps.makeMixer ? this.deps.makeMixer() : new VoiceMixer();
+      this.mixer = this.deps.makeMixer
+        ? this.deps.makeMixer()
+        : new VoiceMixer({
+            outputDeviceId: () => this.deps.audioDevices?.getOutput() ?? null,
+          });
       await this.mixer.init();
 
       this.receiver = this.deps.makeReceiver
@@ -348,6 +355,7 @@ export class VoiceSession {
               senderHash: this.deps.senderHash, communityId: community, channelId: channel,
               invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
               frameGate: this.gate,
+              inputDeviceId: () => this.deps.audioDevices?.getInput() ?? null,
             });
         await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
       } catch (senderErr) {
@@ -373,6 +381,28 @@ export class VoiceSession {
       await this.subscribePresence();
       await this.subscribeTransport();
       await this.subscribeModeration();
+
+      // ZEB-359: follow device-pref / hot-plug changes for the session's
+      // lifetime. Unfollowed with the other unlisteners in cleanupEngine.
+      if (this.deps.audioDevices) {
+        this.unlisteners.push(
+          followAudioDevices({
+            prefs: this.deps.audioDevices,
+            getSender: () => this.sender,
+            getMixer: () => this.mixer,
+            onMicError: (e) => {
+              // Mirror the join-time mic-error path: drop to listen-only
+              // rather than tearing the whole session down. The sender has
+              // already deactivated itself on the failed restart.
+              const msg = e instanceof Error ? e.message : String(e);
+              console.warn('voice input switch failed; listen-only:', msg);
+              void this.sender?.stop().catch(() => {});
+              this.sender = null;
+              this.patch({ micBlocked: true });
+            },
+          }),
+        );
+      }
 
       // Open the soft-cap grace window: an over-cap roster arriving within the
       // next few seconds bounces this join (see maybeBounceForFull). The window

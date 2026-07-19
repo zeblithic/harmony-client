@@ -34,6 +34,7 @@ const TAB_LABELS = [
   'Appearance',
   'Account',
   'Notifications',
+  'Voice',
   'Network',
   'Communities',
   'Friends',

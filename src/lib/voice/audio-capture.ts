@@ -28,13 +28,20 @@ export class AudioCapture {
     createContext?: () => AudioContext,
     createWorkletNode?: (ctx: AudioContext) => AudioWorkletNode,
     sampleRate = 16000,
+    deviceId: string | null = null,
   ): Promise<void> {
     if (this.active) return;
 
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { sampleRate, channelCount: 1, echoCancellation: false },
-      });
+      // ZEB-359: `ideal` (not `exact`) so an unplugged preferred device falls
+      // back to the OS default instead of failing the whole capture.
+      const audio: MediaTrackConstraints = {
+        sampleRate,
+        channelCount: 1,
+        echoCancellation: false,
+        ...(deviceId ? { deviceId: { ideal: deviceId } } : {}),
+      };
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio });
 
       this.context = createContext
         ? createContext()

@@ -17,6 +17,7 @@ function deps() {
   let capturedGate: ((pcm: Float32Array) => { send: boolean; ptt: boolean }) | undefined;
   const sender = {
     start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
+    switchInputDevice: vi.fn(async () => {}),
     __setGate: (g: never) => { capturedGate = g; },
   };
   const receiver = { init: vi.fn(async () => {}), destroy: vi.fn(), getActiveSenders: () => [], isSpeaking: () => false };
@@ -674,5 +675,88 @@ describe('getVoiceSession identity-switch singleton', () => {
     const second = getVoiceSession(vsDeps('fe'.repeat(16)));
     expect(second).not.toBe(first);
     expect(destroySpy).toHaveBeenCalled();
+  });
+});
+
+describe('VoiceSession audio device following (ZEB-359)', () => {
+  function prefsStub() {
+    let input: string | null = null;
+    let output: string | null = null;
+    const subs = new Set<() => void>();
+    return {
+      prefs: {
+        getInput: () => input,
+        getOutput: () => output,
+        listDevices: async () => ({
+          inputs: input ? [{ deviceId: input, label: 'Mic' }] : [],
+          outputs: [],
+        }),
+        subscribe: (cb: () => void) => {
+          subs.add(cb);
+          return () => subs.delete(cb);
+        },
+      },
+      setInput(id: string | null) { input = id; for (const cb of [...subs]) cb(); },
+      setOutput(id: string | null) { output = id; for (const cb of [...subs]) cb(); },
+      subCount: () => subs.size,
+    };
+  }
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it('an input pref change while connected restarts the sender capture', async () => {
+    const d = deps();
+    const p = prefsStub();
+    const s = new VoiceSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      audioDevices: p.prefs,
+      ...d.factories,
+    });
+    await s.join('comm', 'chan');
+    expect(p.subCount()).toBe(1);
+    p.setInput('mic-b');
+    await flush();
+    expect(d.sender.switchInputDevice).toHaveBeenCalledTimes(1);
+    await s.leave();
+  });
+
+  it('leave() unfollows — later pref changes touch nothing', async () => {
+    const d = deps();
+    const p = prefsStub();
+    const s = new VoiceSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      audioDevices: p.prefs,
+      ...d.factories,
+    });
+    await s.join('comm', 'chan');
+    await s.leave();
+    expect(p.subCount()).toBe(0);
+    p.setInput('mic-b');
+    await flush();
+    expect(d.sender.switchInputDevice).not.toHaveBeenCalled();
+  });
+
+  it('a failed live switch drops to listen-only (micBlocked), keeping the call up', async () => {
+    const d = deps();
+    const p = prefsStub();
+    d.sender.switchInputDevice.mockRejectedValueOnce(
+      Object.assign(new Error('no microphone found'), { name: 'NotFoundError' }),
+    );
+    const s = new VoiceSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      audioDevices: p.prefs,
+      ...d.factories,
+    });
+    await s.join('comm', 'chan');
+    p.setInput('mic-b');
+    await flush();
+    expect(get(s.state).phase).toBe('connected');
+    expect(get(s.state).micBlocked).toBe(true);
+    await s.leave();
   });
 });

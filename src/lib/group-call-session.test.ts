@@ -34,7 +34,11 @@ function makeDeps(overrides: Partial<GroupCallSessionDeps> = {}) {
     (listeners.get(ev) ?? []).forEach((h) => h({ payload }));
 
   // No-op media stubs so connect() never touches real audio.
-  const sender = { start: vi.fn(async () => {}), stop: vi.fn(async () => {}) };
+  const sender = {
+    start: vi.fn(async () => {}),
+    stop: vi.fn(async () => {}),
+    switchInputDevice: vi.fn(async () => {}),
+  };
   const receiver = {
     init: vi.fn(async () => {}),
     destroy: vi.fn(),
@@ -370,5 +374,37 @@ describe('GroupCallSession transport reconnect + identity rebuild', () => {
     expect(destroySpy).toHaveBeenCalled();
 
     await tick();
+  });
+});
+
+describe('GroupCallSession audio device following (ZEB-359)', () => {
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it('an input pref change during an active group call restarts the sender capture', async () => {
+    let input: string | null = null;
+    const subs = new Set<() => void>();
+    const prefs = {
+      getInput: () => input,
+      getOutput: () => null,
+      listDevices: async () => ({
+        inputs: input ? [{ deviceId: input, label: 'Mic' }] : [],
+        outputs: [],
+      }),
+      subscribe: (cb: () => void) => {
+        subs.add(cb);
+        return () => subs.delete(cb);
+      },
+    };
+    const d = makeDeps({ audioDevices: prefs });
+    const s = new GroupCallSession(d.deps);
+    s.onIncomingGroup('c1'.repeat(16), BOB, 'space-1');
+    await s.accept();
+    expect(subs.size).toBe(1);
+    input = 'mic-b';
+    for (const cb of [...subs]) cb();
+    await flush();
+    expect(d.sender.switchInputDevice).toHaveBeenCalledTimes(1);
+    await s.leave();
+    expect(subs.size).toBe(0);
   });
 });
