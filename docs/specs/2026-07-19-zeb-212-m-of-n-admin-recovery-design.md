@@ -1,8 +1,9 @@
 # ZEB-212: M-of-N community admin recovery — design
 
 **Status:** accepted (PR #496 merged) — D1 implemented under ZEB-713, D2
-(IPC + UI + finality-gated rotation synthesis) under ZEB-714; see the
-implementation notes in §3.3 and §4.3
+(IPC + UI + finality-gated rotation synthesis) under ZEB-714, D3 (two-node
+e2e over the headless surface, read-side `nowMs` as-of time control) under
+ZEB-715; see the implementation notes in §3.3 and §4.3
 **Ticket:** ZEB-212 (harmony: M-of-N community admin recovery — governance failure case)
 **Author:** Koya, 2026-07-19
 **Builds on:** ZEB-250 (admin quorum, PR #128), ZEB-173 (identity recovery principles), ZEB-677 (fleet quorum ceremonies), ZEB-249 (epoch rotation / backward secrecy)
