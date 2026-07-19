@@ -16,6 +16,7 @@ import { AudioCapture } from './voice/audio-capture';
 import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
+import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
 
 export type GroupCallPhase = 'idle' | 'incoming' | 'connecting' | 'active' | 'leaving';
 
@@ -60,9 +61,11 @@ export interface GroupCallSessionDeps {
   selfDeviceHex: string;
   senderHash: Uint8Array;
   vadThreshold?: number;
-  makeSender?: (gate: FrameGate) => Pick<VoiceSender, 'start' | 'stop'>;
+  makeSender?: (gate: FrameGate) => Pick<VoiceSender, 'start' | 'stop' | 'switchInputDevice'>;
   makeReceiver?: () => Pick<VoiceReceiver, 'init' | 'destroy' | 'getActiveSenders' | 'isSpeaking'>;
-  makeMixer?: () => Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy'>;
+  makeMixer?: () => Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy' | 'setOutputDevice'>;
+  /** ZEB-359: device preference source. Absent ⇒ system defaults, no following. */
+  audioDevices?: DeviceFollowerDeps['prefs'];
   resolveCard?: (ownerHex: string) => { displayName?: string; avatarUrl?: string } | undefined;
   /** Resolve a group DM space → its full member owner-hex list (drives the
    *  ringing/declined rows that have no live beacon yet). */
@@ -82,9 +85,9 @@ export class GroupCallSession {
   private deps: GroupCallSessionDeps;
 
   private vad: VoiceActivityDetector;
-  private sender: Pick<VoiceSender, 'start' | 'stop'> | null = null;
+  private sender: Pick<VoiceSender, 'start' | 'stop' | 'switchInputDevice'> | null = null;
   private receiver: Pick<VoiceReceiver, 'init' | 'destroy' | 'getActiveSenders' | 'isSpeaking'> | null = null;
-  private mixer: Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy'> | null = null;
+  private mixer: Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy' | 'setOutputDevice'> | null = null;
 
   private muted = true;
   private deafened = false;
@@ -281,7 +284,11 @@ export class GroupCallSession {
       await this.deps.invoke('join_group_call', { callId, spaceId });
       await this.subscribeTransport();
 
-      this.mixer = this.deps.makeMixer ? this.deps.makeMixer() : new VoiceMixer();
+      this.mixer = this.deps.makeMixer
+        ? this.deps.makeMixer()
+        : new VoiceMixer({
+            outputDeviceId: () => this.deps.audioDevices?.getOutput() ?? null,
+          });
       await this.mixer.init();
 
       this.receiver = this.deps.makeReceiver
@@ -312,8 +319,29 @@ export class GroupCallSession {
               this.deps.invoke('send_group_voice_frame', {
                 payload: { callId: this.callId, frameBytes },
               }),
+            inputDeviceId: () => this.deps.audioDevices?.getInput() ?? null,
           });
       await this.sender.start(); // capture starts; muted gate ⇒ nothing transmits
+
+      // ZEB-359: follow device-pref / hot-plug changes for the call's
+      // lifetime. Unfollowed with the other unlisteners in teardownMedia.
+      if (this.deps.audioDevices) {
+        this.unlisteners.push(
+          followAudioDevices({
+            prefs: this.deps.audioDevices,
+            getSender: () => this.sender,
+            getMixer: () => this.mixer,
+            onMicError: (e) => {
+              // Keep the call up listen-only; the sender already deactivated
+              // itself on the failed restart (mirrors CallSession).
+              const msg = e instanceof Error ? e.message : String(e);
+              console.warn('group call input switch failed; continuing listen-only:', msg);
+              void this.sender?.stop().catch(() => {});
+              this.sender = null;
+            },
+          }),
+        );
+      }
 
       // Drain the mixer every 20ms (audio cadence), mirroring VoiceSession.
       this.drainTimer = setInterval(() => { this.mixer?.drain(); }, 20);

@@ -30,12 +30,15 @@
   import IrohRelaySettings from './IrohRelaySettings.svelte';
   import LeftCommunitiesPanel from './LeftCommunitiesPanel.svelte';
   import FriendsPanel from './FriendsPanel.svelte';
+  import VoiceDeviceSettings from './VoiceDeviceSettings.svelte';
+  import type { AudioDevicePrefs } from '../audio-device-prefs';
 
   type SettingsTab =
     | 'profile'
     | 'appearance'
     | 'account'
     | 'notifications'
+    | 'voice'
     | 'network'
     | 'communities'
     | 'friends';
@@ -54,6 +57,7 @@
     friendCardService,
     dmInviteService,
     communityService,
+    audioDevices,
     onOpenCard,
     activeTab = $bindable('profile'),
   }: {
@@ -75,6 +79,9 @@
     /** ZEB-435: shared community service for the left-communities management
      *  tab. Optional (existing mounts/tests); the tab renders empty without it. */
     communityService?: CommunityService;
+    /** ZEB-359: shared audio-device preference service for the Voice tab.
+     *  Optional (existing mounts/tests); the tab renders empty without it. */
+    audioDevices?: AudioDevicePrefs;
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
     /**
      * Active tab. Bindable so the app can route to a specific section — e.g. the
@@ -89,6 +96,7 @@
     { id: 'appearance', label: 'Appearance' },
     { id: 'account', label: 'Account' },
     { id: 'notifications', label: 'Notifications' },
+    { id: 'voice', label: 'Voice' },
     { id: 'network', label: 'Network' },
     { id: 'communities', label: 'Communities' },
     { id: 'friends', label: 'Friends' },
@@ -195,6 +203,17 @@
       {onClose}
       {onTrustChange}
     />
+  </div>
+  <div
+    class="tab-content"
+    role="tabpanel"
+    id="settings-tabpanel-voice"
+    aria-labelledby="settings-tab-voice"
+    hidden={activeTab !== 'voice'}
+  >
+    {#if audioDevices}
+      <VoiceDeviceSettings {audioDevices} />
+    {/if}
   </div>
   <div
     class="tab-content"

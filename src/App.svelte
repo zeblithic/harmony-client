@@ -112,6 +112,7 @@
   import { shouldClearMembersLoading } from './lib/members-loading';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
+  import { AudioDevicePrefs } from './lib/audio-device-prefs';
   import { CALL_EVENT_MIME, encodeCallEvent, describeCallEvent, type CallEventPayload } from './lib/call-log';
   import { runQuitTeardown } from './lib/quit-teardown';
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
@@ -232,6 +233,10 @@
   // module-level (sibling to callSession) so T13 can render the group in-call /
   // ring UI; THIS task only wires the session + its remote-event listeners.
   let groupCall = $state<GroupCallSession | null>(null);
+  // ZEB-359: app-lifetime audio device preferences (persisted per device).
+  // Shared by all three media sessions (channel voice, 1:1 calls, group calls)
+  // and the Settings → Voice pickers, so a change applies everywhere at once.
+  const audioDevicePrefs = new AudioDevicePrefs();
   // T13: reactive aliases of the voice/call/group-call state stores so the
   // `$store` syntax auto-subscribes in the script + markup (the group-DM header's
   // busy/active/self model and the in-call bar's group-name lookup read these).
@@ -442,6 +447,7 @@
         selfOwnerHex,
         selfDeviceHex: deviceVkHex,
         senderHash: new Uint8Array(senderHash),
+        audioDevices: audioDevicePrefs,
         resolveCard: (ownerHex: string) => {
           const card = resolveCard(ownerHex);
           if (!card) return undefined;
@@ -463,6 +469,7 @@
         selfOwnerHex,
         selfDeviceHex: deviceVkHex,
         senderHash: new Uint8Array(senderHash),
+        audioDevices: audioDevicePrefs,
         resolveCard: (ownerHex: string) => {
           const card = resolveCard(ownerHex);
           if (!card) return undefined;
@@ -485,6 +492,7 @@
         selfOwnerHex,
         selfDeviceHex: deviceVkHex,
         senderHash: new Uint8Array(senderHash),
+        audioDevices: audioDevicePrefs,
         resolveCard: (ownerHex: string) => {
           const card = resolveCard(ownerHex);
           if (!card) return undefined;
@@ -3883,6 +3891,7 @@
       {friendCardService}
       {dmInviteService}
       {communityService}
+      audioDevices={audioDevicePrefs}
       onOpenCard={openMemberCard}
       bind:activeTab={settingsTab}
     />
