@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::community_membership::{
-    materialize, prior_state_at_event, verify_event, EventId, MaterializedMembership,
-    SignedMembershipEvent, VerifyContext, VerifyError,
+    materialize, materialize_with_now, prior_state_at_event, verify_event, EventId,
+    MaterializedMembership, SignedMembershipEvent, VerifyContext, VerifyError,
 };
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{OwnerAddr, SpaceId};
@@ -346,6 +346,28 @@ impl CommunityState {
     pub fn materialize_now(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
         let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
         materialize(&log, admin_addr)
+    }
+
+    /// ZEB-713: time-aware uncached materialization — the accessor every
+    /// consumer of TIME-DRIVEN derived state (admin-recovery lifecycle:
+    /// `recovery_proposals` phases, recovery execution, its
+    /// `pending_rotation_for` marker) MUST use, passing real wall-clock
+    /// ms. The cached `materialized()` view is event-driven: in an idle
+    /// community it can never advance a Time-locked recovery to
+    /// Executed (same staleness class as PendingJoin's 30-day expiry in
+    /// the cached view — the R4-6 precedent). Not cached: the result
+    /// depends on `now_ms`, so the version-keyed cache cannot hold it.
+    ///
+    /// D2 wiring (ZEB-714): `get_recovery_state`, the recovery banner
+    /// projection, and the ZEB-249 self-healing rotation observer route
+    /// through this.
+    pub fn materialized_with_now(
+        &self,
+        admin_addr: OwnerAddr,
+        now_ms: u64,
+    ) -> MaterializedMembership {
+        let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
+        materialize_with_now(&log, admin_addr, Some(now_ms))
     }
 }
 

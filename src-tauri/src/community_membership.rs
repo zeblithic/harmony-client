@@ -999,6 +999,11 @@ pub enum VerifyError {
     /// ZEB-713 RD4: veto_window_ms is below
     /// `RECOVERY_VETO_WINDOW_FLOOR_MS` (7 days).
     RecoveryVetoWindowTooShort,
+    /// ZEB-713 RD4 (ceiling): veto_window_ms exceeds
+    /// `RECOVERY_VETO_WINDOW_CEILING_MS` (365 days) — guards the
+    /// `t_R + W` deadline arithmetic against u64 wrap and keeps the
+    /// value JS-number-exact across the DTO boundary.
+    RecoveryVetoWindowTooLong,
     /// ZEB-713 RP2: RecoveryProposal in a community with no
     /// recovery_designates configured.
     RecoveryNotConfigured,
@@ -1291,6 +1296,9 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::RecoveryVetoWindowTooShort => {
                 write!(f, "ZEB-713 RD4: veto window below the 7-day floor")
+            }
+            VerifyError::RecoveryVetoWindowTooLong => {
+                write!(f, "ZEB-713 RD4: veto window above the 365-day ceiling")
             }
             VerifyError::RecoveryNotConfigured => {
                 write!(f, "ZEB-713 RP2: no recovery designates configured")
@@ -2318,7 +2326,14 @@ fn evaluate_recovery_phases(
         // ZEB-250 expiry constant, spec §3.3.1).
         let (deadline, collect_expired) = match t_r {
             Some(tr) if tr.saturating_sub(t0) <= ADMIN_PROPOSAL_EXPIRY_MS => {
-                (Some(tr + work.veto_window_ms), false)
+                // Defense-in-depth vs. the RD4 ceiling (PR #497 R1): a
+                // window that slipped past verification (corrupted log,
+                // raw replay) must fail CLOSED — an overflowed deadline
+                // would otherwise wrap small and execute immediately.
+                match tr.checked_add(work.veto_window_ms) {
+                    Some(deadline) => (Some(deadline), false),
+                    None => (None, true),
+                }
             }
             Some(_) => (None, true),
             None => (None, t.saturating_sub(t0) > ADMIN_PROPOSAL_EXPIRY_MS),
@@ -4052,6 +4067,13 @@ pub fn verify_event(
                     if *veto_window_ms < RECOVERY_VETO_WINDOW_FLOOR_MS {
                         return Err(VerifyError::RecoveryVetoWindowTooShort);
                     }
+                    // RD4 ceiling (PR #497 R1): guards the t_R + W
+                    // deadline arithmetic against u64 wrap (an unbounded
+                    // W would let a crafted config execute recovery
+                    // IMMEDIATELY) and keeps the value JS-number-exact.
+                    if *veto_window_ms > RECOVERY_VETO_WINDOW_CEILING_MS {
+                        return Err(VerifyError::RecoveryVetoWindowTooLong);
+                    }
                     // Always admin-affecting (it grants a takeover path);
                     // no AP4 distinction — mirrors ChangeQuorum.
                 }
@@ -5229,6 +5251,17 @@ pub const REACHABILITY_TIMESTAMP_SKEW_MAX_MS: u64 = 30 * 60 * 1000;
 /// client build cannot make honest replicas accept a 1-hour window
 /// (spec §6 T6). The default the D2 UI offers is 30 days.
 pub const RECOVERY_VETO_WINDOW_FLOOR_MS: u64 = 7 * 86_400_000;
+
+/// ZEB-713 RD4 (ceiling, PR #497 R1): upper bound on
+/// `SetRecoveryDesignates.veto_window_ms`. 365 days. Two jobs:
+/// 1. `deadline = t_R + W` stays far from u64 wrap — an unbounded W
+///    could overflow the addition and produce a tiny deadline,
+///    executing a recovery IMMEDIATELY instead of after the time-lock.
+///    (`evaluate_recovery_phases` also uses `checked_add` fail-closed
+///    as defense-in-depth for events that bypassed verification.)
+/// 2. The value survives the u64 → JS-number DTO boundary exactly
+///    (365 d ≈ 3.2e10 ms « 2^53).
+pub const RECOVERY_VETO_WINDOW_CEILING_MS: u64 = 365 * 86_400_000;
 
 /// ZEB-250: apply an admin-proposal's effect to the running
 /// materialized state when the proposal has reached quorum within the
@@ -12806,6 +12839,45 @@ mod zeb_713_recovery_materialize_tests {
     }
 
     #[test]
+    fn overflowing_window_fails_closed_never_executes() {
+        // Defense-in-depth: a u64::MAX window can only enter via events
+        // that BYPASSED verification (the RD4 ceiling rejects it there).
+        // The deadline addition must fail closed (Expired), not wrap
+        // small and execute immediately.
+        let mut events = vec![
+            ev([0xA0; 16], admin1(), 500, MembershipEventKind::Join),
+            ev([0xA1; 16], d1(), 1_000, MembershipEventKind::Join),
+            ev([0xA2; 16], d2(), 1_100, MembershipEventKind::Join),
+            ev([0xA3; 16], m_new(), 1_200, MembershipEventKind::Join),
+            ev(
+                [0xA5; 16],
+                admin1(),
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetRecoveryDesignates {
+                        designates: vec![d1(), d2()],
+                        threshold: 2,
+                        veto_window_ms: u64::MAX,
+                    },
+                },
+            ),
+        ];
+        let digest = recovery_config_digest(
+            materialize(&events, admin1())
+                .recovery_designates
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        let m = materialize_with_now(&events, admin1(), Some(u64::MAX - 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Expired);
+        assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Joined);
+    }
+
+    #[test]
     fn new_admin_who_left_during_window_is_not_promoted() {
         let (mut events, digest) = base_world();
         events.push(proposal(digest));
@@ -13032,6 +13104,21 @@ mod zeb_713_recovery_verify_tests {
         assert_eq!(
             verify_event(&evt, &w.prior, &w.ctx),
             Err(VerifyError::RecoveryVetoWindowTooShort)
+        );
+    }
+
+    #[test]
+    fn rd4_window_above_ceiling_rejected() {
+        let w = world();
+        let evt = set_designates_event(
+            &w,
+            vec![w.d1.owner, w.d2.owner],
+            2,
+            RECOVERY_VETO_WINDOW_CEILING_MS + 1,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryVetoWindowTooLong)
         );
     }
 

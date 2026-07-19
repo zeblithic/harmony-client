@@ -96,7 +96,9 @@ set it)`. Every recovery event binds to it (§3.2), making "the config changed u
 you" a mechanical digest mismatch rather than a special-cased rule.
 
 Verify gates (RD1–RD4): designates non-empty and deduped; every designate currently
-Joined; `1 ≤ threshold ≤ designates.len()`; `veto_window_ms ≥ floor`. An admin may
+Joined; `1 ≤ threshold ≤ designates.len()`; `floor ≤ veto_window_ms ≤ ceiling`
+(ceiling 365 d, added in D1 — bounds the `t_R + W` deadline arithmetic away from
+u64 wrap and keeps the value JS-number-exact on the DTO boundary). An admin may
 name themselves a designate but it is pointless (they can already act); UI discourages.
 
 ### 3.2 Initiation (the lost-admin flow)
