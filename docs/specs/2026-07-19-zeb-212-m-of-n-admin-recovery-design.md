@@ -1,6 +1,7 @@
 # ZEB-212: M-of-N community admin recovery — design
 
-**Status:** proposed (awaiting Jake's review) — R1 revised per PR #496 review
+**Status:** accepted (PR #496 merged) — D1 implemented under ZEB-713; see the
+implementation notes in §3.3 and §4.3
 **Ticket:** ZEB-212 (harmony: M-of-N community admin recovery — governance failure case)
 **Author:** Koya, 2026-07-19
 **Builds on:** ZEB-250 (admin quorum, PR #128), ZEB-173 (identity recovery principles), ZEB-677 (fleet quorum ceremonies), ZEB-249 (epoch rotation / backward secrecy)
@@ -95,7 +96,9 @@ set it)`. Every recovery event binds to it (§3.2), making "the config changed u
 you" a mechanical digest mismatch rather than a special-cased rule.
 
 Verify gates (RD1–RD4): designates non-empty and deduped; every designate currently
-Joined; `1 ≤ threshold ≤ designates.len()`; `veto_window_ms ≥ floor`. An admin may
+Joined; `1 ≤ threshold ≤ designates.len()`; `floor ≤ veto_window_ms ≤ ceiling`
+(ceiling 365 d, added in D1 — bounds the `t_R + W` deadline arithmetic away from
+u64 wrap and keeps the value JS-number-exact on the DTO boundary). An admin may
 name themselves a designate but it is pointless (they can already act); UI discourages.
 
 ### 3.2 Initiation (the lost-admin flow)
@@ -175,6 +178,22 @@ Rival concurrent proposals: at most one proposal may execute; deterministic
 tie-break is lowest `(t_R, event_id)` — every replica picks the same winner, losers
 die terminal.
 
+> **D1 implementation note (ZEB-713).** "At most one" is scoped **per
+> `lost_admin`**: candidates are grouped by the admin they recover, and the
+> tie-break picks one winner per group. This is the §3.2 multi-loss semantics
+> (one proposal per lost admin, each independently executable) — a global
+> single-winner rule would force serial W-day windows for multi-admin loss.
+>
+> **D1 implementation note (PR #497 R2).** Execution is **atomic** and
+> additionally requires `new_admin` to be Joined **as of the deadline**
+> (a replay-time snapshot, log-derivable). If they left mid-window the
+> proposal ends **Stalled** — terminal, no promotion, no kick: kicking the
+> sole lost admin without the paired promotion would leave the community
+> with no power-100 member, bricked by the recovery mechanism itself. A
+> later rejoin does not revive a Stalled proposal (that could retroactively
+> flip a rival group's executed winner); the designates simply run a fresh
+> proposal (Stalled does not count against RP6).
+
 ## 4. Convergence, liveness & partition analysis
 
 ### 4.1 Liveness in an idle community (why the now-floor)
@@ -220,6 +239,22 @@ then-admin in response to the derived `pending_rotation_for`. Two containments:
 
 D1 ships a test vector for exactly this path: derived execution → divergent
 rotation → late veto delivery → membership reconverges → superseding rotation.
+
+> **D1 implementation note (ZEB-713) — the heal is stronger than described
+> above.** A recovery rotation has no Kick event to cite, so its
+> `triggered_by` names the RecoveryProposal itself, and materialize validates
+> the rotation against the proposal's executed-ness (evaluated
+> position-locally at the rotation's wall clock — stable, because every
+> in-window cosign/veto sorts before it). Consequence: on late veto delivery
+> the divergent rotation's trigger is no longer executed, so **the epoch
+> advance itself re-derives away** along with the membership effects — the
+> materialized state needs no manual superseding rotation at all. The
+> restored admin is not epoch-excluded on the membership layer; the §4.3
+> superseding-rotation story survives only as the crypto-layer cleanup for
+> peers who already ingested the divergent epoch KEY (a D2/D3 validation
+> point), with `EpochCatchup` as the delivery vehicle. The F=48h finality
+> margin remains the client-behavior gate before authoring any
+> recovery-triggered rotation.
 
 HLC skew: all comparisons are between event HLCs and the now-floor; a skewed
 initiator only shifts its own wait relative to honest events, and veto validity is

@@ -72,6 +72,35 @@ pub enum ProposalKind {
         #[serde(rename = "nq")]
         new_quorum: u8,
     },
+    /// ZEB-713 (ZEB-212 D1): set or replace the community's recovery
+    /// designate configuration. Routed through the existing AdminProposal
+    /// quorum machinery (AP1–AP5 unchanged; always admin-affecting, like
+    /// ChangeQuorum). Additional shape gates RD1–RD4 at verify_event.
+    ///
+    /// Materializes as `MaterializedMembership.recovery_designates`
+    /// (with the trigger event's HLC as the config generation), from
+    /// which the binding `config_digest` is derived — see
+    /// `recovery_config_digest`. Replacing the config changes the digest
+    /// and thereby mechanically kills in-flight recovery proposals
+    /// (spec §3.3.4).
+    ///
+    /// Variant tag "r" (1-char value, unused in ProposalKind before
+    /// this). Inner field keys are 2-char (ds, th, vw) per the
+    /// same-length-keys invariant at this nesting level.
+    /// See `docs/specs/2026-07-19-zeb-212-m-of-n-admin-recovery-design.md` §3.1.
+    #[serde(rename = "r")]
+    SetRecoveryDesignates {
+        #[serde(rename = "ds")]
+        designates: Vec<OwnerAddr>,
+        /// R: distinct designate signatures required to move a
+        /// RecoveryProposal from Collecting to Time-locked.
+        #[serde(rename = "th")]
+        threshold: u8,
+        /// W: veto window in ms. Floor enforced at RD4
+        /// (`RECOVERY_VETO_WINDOW_FLOOR_MS`).
+        #[serde(rename = "vw")]
+        veto_window_ms: u64,
+    },
 }
 
 /// The five membership event kinds. Adjacently tagged so the wire
@@ -386,6 +415,74 @@ pub enum MembershipEventKind {
         /// the wire encoding is identical to the bare cert.
         #[serde(rename = "ec")]
         enrollment: Box<EnrollmentCert>,
+    },
+
+    /// ZEB-713 (ZEB-212 D1): a recovery designate proposes replacing a
+    /// lost admin identity with a new one. This is the ONE event kind
+    /// deliberately authored by non-admins with elevated effect — gates
+    /// RP1–RP6 (spec §3.2) apply instead of the AdminProposal AP gates
+    /// (whose AP2 power-100-proposer requirement is exactly what a
+    /// bricked sole-admin community cannot satisfy).
+    ///
+    /// Lifecycle (Collecting → Time-locked → Executed/Terminal) is
+    /// evaluated at materialize time on the `materialize_with_now`
+    /// now-floor; execution is PURE DERIVED STATE (no synthetic
+    /// Kick/SetPower events), so a late-delivered RecoveryVeto simply
+    /// re-derives it away. Spec §3.3–§4.
+    ///
+    /// Variant tag "h" (1-char value, unused before this). Inner field
+    /// keys are 2-char (la, na, cd) per the same-length-keys invariant.
+    #[serde(rename = "h")]
+    RecoveryProposal {
+        /// The admin identity being declared lost. Named explicitly —
+        /// execution kicks exactly this OwnerAddr (loss-as-compromise;
+        /// activity heuristics were considered and declined, spec §7).
+        #[serde(rename = "la")]
+        lost_admin: OwnerAddr,
+        /// Currently-Joined member to promote to power 100 on execution.
+        #[serde(rename = "na")]
+        new_admin: OwnerAddr,
+        /// Binds this proposal to the RecoveryDesignates generation it
+        /// was authored under (RP5/RC2). Any config replacement changes
+        /// the digest and mechanically kills the proposal.
+        #[serde(
+            rename = "cd",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        config_digest: [u8; 32],
+    },
+
+    /// ZEB-713: designate co-signature on a RecoveryProposal. Lenient
+    /// forward-ref like AdminCountersign — pairing and RC2 digest
+    /// re-evaluation happen at materialize time. The proposer counts as
+    /// signature 1; the Rth distinct valid signature starts the
+    /// time-lock (t_R). Variant tag "s" (1-char value, unused before).
+    #[serde(rename = "s")]
+    RecoveryCosign {
+        #[serde(
+            rename = "ti",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        target_event_id: EventId,
+    },
+
+    /// ZEB-713: admin-tier kill switch on a RecoveryProposal. A SINGLE
+    /// power-100 signature suffices (deliberately not quorum-gated — a
+    /// veto is a liveness proof restoring the status quo ante and cannot
+    /// escalate anyone's power; spec §3.2 RV1). Validity is judged on
+    /// the veto's AUTHORED HLC lying in `[t₀, deadline]`; veto-wins is
+    /// the convergence rule even when delivery is late (spec §4.2).
+    /// Variant tag "v" (1-char value, unused before this).
+    #[serde(rename = "v")]
+    RecoveryVeto {
+        #[serde(
+            rename = "ti",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        target_event_id: EventId,
     },
 }
 
@@ -891,6 +988,51 @@ pub enum VerifyError {
     /// Must route through AdminProposal + AdminCountersign quorum.
     KickRequiresQuorum,
 
+    // ── ZEB-713 (ZEB-212 D1) admin-recovery verify rules ──
+    /// ZEB-713 RD1: SetRecoveryDesignates designate list is empty or
+    /// contains duplicates.
+    RecoveryDesignatesMalformed,
+    /// ZEB-713 RD2: a listed designate is not a currently-Joined member.
+    RecoveryDesignateNotJoined,
+    /// ZEB-713 RD3: threshold R is 0 or exceeds the designate count.
+    RecoveryThresholdOutOfRange,
+    /// ZEB-713 RD4: veto_window_ms is below
+    /// `RECOVERY_VETO_WINDOW_FLOOR_MS` (7 days).
+    RecoveryVetoWindowTooShort,
+    /// ZEB-713 RD4 (ceiling): veto_window_ms exceeds
+    /// `RECOVERY_VETO_WINDOW_CEILING_MS` (365 days) — guards the
+    /// `t_R + W` deadline arithmetic against u64 wrap and keeps the
+    /// value JS-number-exact across the DTO boundary.
+    RecoveryVetoWindowTooLong,
+    /// ZEB-713 RP2: RecoveryProposal in a community with no
+    /// recovery_designates configured.
+    RecoveryNotConfigured,
+    /// ZEB-713 RP1: RecoveryProposal actor is not a currently-Joined
+    /// recovery designate.
+    RecoveryProposalActorNotDesignate,
+    /// ZEB-713 RP3: new_admin is not currently Joined, already holds
+    /// power 100, or equals lost_admin.
+    RecoveryProposalNewAdminInvalid,
+    /// ZEB-713 RP4: lost_admin is not a currently-Joined power-100
+    /// member.
+    RecoveryProposalLostAdminNotAdmin,
+    /// ZEB-713 RP5: the proposal's config_digest does not match the
+    /// live RecoveryDesignates generation.
+    RecoveryProposalConfigDigestMismatch,
+    /// ZEB-713 RP6: the actor already has an open (Collecting or
+    /// TimeLocked) recovery proposal.
+    RecoveryProposalActorHasOpenProposal,
+    /// ZEB-713 RC1: RecoveryCosign actor is not a currently-Joined
+    /// recovery designate.
+    RecoveryCosignActorNotDesignate,
+    /// ZEB-713: RecoveryCosign target_event_id is malformed (all-zero).
+    RecoveryCosignTargetIdMalformed,
+    /// ZEB-713 RV1: RecoveryVeto actor is not a currently-Joined
+    /// power-100 member.
+    RecoveryVetoActorNotAdmin,
+    /// ZEB-713: RecoveryVeto target_event_id is malformed (all-zero).
+    RecoveryVetoTargetIdMalformed,
+
     // ── ZEB-321 RCH1-RCH5 ReachabilityAnnounce verify rules ──
     //
     // RCH1 (outer SignedMembershipEvent signature) is enforced by the
@@ -1143,6 +1285,54 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::SetPowerRequiresQuorum => write!(f, "ZEB-250: direct admin-affecting SetPower rejected (admin_quorum > 1 — use AdminProposal)"),
             VerifyError::KickRequiresQuorum => write!(f, "ZEB-250: direct Kick of an admin rejected (admin_quorum > 1 — use AdminProposal)"),
+            VerifyError::RecoveryDesignatesMalformed => {
+                write!(f, "ZEB-713 RD1: designate list empty or contains duplicates")
+            }
+            VerifyError::RecoveryDesignateNotJoined => {
+                write!(f, "ZEB-713 RD2: designate is not a currently-Joined member")
+            }
+            VerifyError::RecoveryThresholdOutOfRange => {
+                write!(f, "ZEB-713 RD3: threshold out of range [1, designate count]")
+            }
+            VerifyError::RecoveryVetoWindowTooShort => {
+                write!(f, "ZEB-713 RD4: veto window below the 7-day floor")
+            }
+            VerifyError::RecoveryVetoWindowTooLong => {
+                write!(f, "ZEB-713 RD4: veto window above the 365-day ceiling")
+            }
+            VerifyError::RecoveryNotConfigured => {
+                write!(f, "ZEB-713 RP2: no recovery designates configured")
+            }
+            VerifyError::RecoveryProposalActorNotDesignate => {
+                write!(f, "ZEB-713 RP1: proposal actor is not a Joined designate")
+            }
+            VerifyError::RecoveryProposalNewAdminInvalid => {
+                write!(
+                    f,
+                    "ZEB-713 RP3: new_admin not Joined, already admin, or equals lost_admin"
+                )
+            }
+            VerifyError::RecoveryProposalLostAdminNotAdmin => {
+                write!(f, "ZEB-713 RP4: lost_admin is not a Joined power-100 member")
+            }
+            VerifyError::RecoveryProposalConfigDigestMismatch => {
+                write!(f, "ZEB-713 RP5: config_digest does not match live config")
+            }
+            VerifyError::RecoveryProposalActorHasOpenProposal => {
+                write!(f, "ZEB-713 RP6: actor already has an open recovery proposal")
+            }
+            VerifyError::RecoveryCosignActorNotDesignate => {
+                write!(f, "ZEB-713 RC1: cosign actor is not a Joined designate")
+            }
+            VerifyError::RecoveryCosignTargetIdMalformed => {
+                write!(f, "ZEB-713: RecoveryCosign target_event_id is malformed")
+            }
+            VerifyError::RecoveryVetoActorNotAdmin => {
+                write!(f, "ZEB-713 RV1: veto actor is not a Joined power-100 member")
+            }
+            VerifyError::RecoveryVetoTargetIdMalformed => {
+                write!(f, "ZEB-713: RecoveryVeto target_event_id is malformed")
+            }
             VerifyError::ReachabilityInnerSigInvalid => {
                 write!(f, "ZEB-321 RCH2 inner ReachabilityAnnounce signature invalid")
             }
@@ -1629,6 +1819,21 @@ pub struct MaterializedMembership {
         skip_serializing_if = "is_default_admin_quorum"
     )]
     pub admin_quorum: u8,
+
+    /// ZEB-713: recovery-designate configuration, set only via a
+    /// quorum-approved `SetRecoveryDesignates` proposal. `None` =
+    /// recovery disabled (pre-ZEB-713 behavior). Default-elided on the
+    /// wire (`skip_serializing_if`) so pre-ZEB-713 cached snapshots stay
+    /// byte-identical — the `admin_quorum` compat pattern.
+    #[serde(rename = "rd", default, skip_serializing_if = "Option::is_none")]
+    pub recovery_designates: Option<RecoveryDesignates>,
+
+    /// ZEB-713: derived per-proposal recovery lifecycle view, rebuilt by
+    /// the materialize post-pass. Sorted by `(proposed_at_wall_ms, id)`
+    /// for deterministic encoding. Empty-elided for snapshot
+    /// byte-compat.
+    #[serde(rename = "rp", default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_proposals: Vec<RecoveryProposalView>,
 }
 
 impl Default for MaterializedMembership {
@@ -1641,6 +1846,8 @@ impl Default for MaterializedMembership {
             pending_rotation_for: BTreeSet::new(),
             pending_catchup_for: BTreeSet::new(),
             admin_quorum: 1,
+            recovery_designates: None,
+            recovery_proposals: Vec::new(),
         }
     }
 }
@@ -1652,6 +1859,136 @@ pub(crate) fn default_admin_quorum() -> u8 {
 pub(crate) fn is_default_admin_quorum(q: &u8) -> bool {
     *q == 1
 }
+
+/// ZEB-713: materialized recovery-designate configuration, set only via
+/// a quorum-approved `ProposalKind::SetRecoveryDesignates`. Absent
+/// (`recovery_designates: None`) = recovery disabled = pre-ZEB-713
+/// behavior.
+///
+/// All field keys are 2-char (ds, th, vw, sa) per the same-length-keys
+/// invariant at this nesting level. `set_at` is the HLC of the event
+/// that tipped the setting proposal over quorum — it is the config
+/// GENERATION, which is why replacing the config always changes
+/// `recovery_config_digest` even when the designate list is identical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryDesignates {
+    #[serde(rename = "ds")]
+    pub designates: Vec<OwnerAddr>,
+    /// R: distinct designate signatures required to initiate.
+    #[serde(rename = "th")]
+    pub threshold: u8,
+    /// W: veto window in ms (RD4 floor: `RECOVERY_VETO_WINDOW_FLOOR_MS`).
+    #[serde(rename = "vw")]
+    pub veto_window_ms: u64,
+    /// Config generation: HLC of the quorum-trigger event that applied
+    /// the SetRecoveryDesignates proposal.
+    #[serde(rename = "sa")]
+    pub set_at: Hlc,
+}
+
+impl CanonicalPayloadSealed for RecoveryDesignates {}
+impl CanonicalPayload for RecoveryDesignates {}
+
+/// ZEB-713: the binding digest every RecoveryProposal / RecoveryCosign
+/// is validated against (RP5 / RC2): blake3 over the canonical CBOR of
+/// the full materialized `RecoveryDesignates` (designates, threshold,
+/// veto_window_ms, set_at generation).
+///
+/// Fallible only through `canonical_cbor_encode` (which cannot fail for
+/// this shape in practice); callers treat an encode error as digest
+/// mismatch — fail closed.
+pub fn recovery_config_digest(config: &RecoveryDesignates) -> Result<[u8; 32], CryptoError> {
+    let bytes = canonical_cbor_encode(config)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// ZEB-713: lifecycle phase of a materialized recovery proposal.
+/// 1-char serde codes (values, not keys — same convention as
+/// `MemberStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryPhase {
+    /// Fewer than R distinct valid signatures so far and the 30-day
+    /// initiation window has not lapsed.
+    #[serde(rename = "c")]
+    Collecting,
+    /// R signatures reached at t_R; waiting out the veto window
+    /// (`deadline_ms = t_R + W`).
+    #[serde(rename = "t")]
+    TimeLocked,
+    /// Deadline passed with no qualifying veto — the derived execution
+    /// (promotion + kick of `lost_admin`) is reflected in this
+    /// materialized state.
+    #[serde(rename = "e")]
+    Executed,
+    /// Killed by an admin veto authored inside `[t₀, deadline]`.
+    /// Terminal.
+    #[serde(rename = "v")]
+    Vetoed,
+    /// R signatures were not reached within 30 days of t₀ (or arrived
+    /// too late to count). Terminal.
+    #[serde(rename = "x")]
+    Expired,
+    /// The bound RecoveryDesignates config was replaced while the
+    /// proposal was collecting or time-locked (digest mismatch).
+    /// Terminal.
+    #[serde(rename = "k")]
+    ConfigChanged,
+    /// A rival proposal for the same `lost_admin` won the deterministic
+    /// `(t_R, event_id)` tie-break. Terminal.
+    #[serde(rename = "s")]
+    Superseded,
+    /// PR #497 R2 (Greptile P1): the deadline passed but `new_admin`
+    /// was not Joined AS OF THE DEADLINE (replay-time snapshot).
+    /// Terminal — a later rejoin does NOT revive it (that would let a
+    /// stalled proposal retroactively flip a rival group's winner).
+    /// Nothing executed: no promotion, no kick — the community keeps
+    /// its (dead) admin and the designates simply run a fresh proposal
+    /// (a Stalled proposal does not count against RP6).
+    #[serde(rename = "l")]
+    Stalled,
+}
+
+impl CanonicalPayloadSealed for RecoveryPhase {}
+impl CanonicalPayload for RecoveryPhase {}
+
+/// ZEB-713: derived per-proposal view built by `materialize_with_now`'s
+/// recovery post-pass. Consumed by verify_event's RP6 open-proposal
+/// gate and by the D2 UI (`get_recovery_state`). All field keys are
+/// 2-char per the same-length-keys invariant at this nesting level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryProposalView {
+    #[serde(
+        rename = "id",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub id: EventId,
+    #[serde(rename = "pr")]
+    pub proposer: OwnerAddr,
+    #[serde(rename = "la")]
+    pub lost_admin: OwnerAddr,
+    #[serde(rename = "na")]
+    pub new_admin: OwnerAddr,
+    /// Distinct valid signers so far (proposer included). Sorted
+    /// (BTreeSet) for deterministic encoding.
+    #[serde(rename = "sn")]
+    pub signers: BTreeSet<OwnerAddr>,
+    /// R bound from the proposal's config generation.
+    #[serde(rename = "th")]
+    pub threshold: u8,
+    /// t₀ (proposal HLC wall_ms).
+    #[serde(rename = "t0")]
+    pub proposed_at_wall_ms: u64,
+    /// `t_R + W` — Some once the Rth signature landed (TimeLocked and
+    /// beyond), None while Collecting/Expired-in-collecting.
+    #[serde(rename = "dl", skip_serializing_if = "Option::is_none", default)]
+    pub deadline_ms: Option<u64>,
+    #[serde(rename = "ph")]
+    pub phase: RecoveryPhase,
+}
+
+impl CanonicalPayloadSealed for RecoveryProposalView {}
+impl CanonicalPayload for RecoveryProposalView {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberState {
@@ -1900,6 +2237,228 @@ pub fn materialize(
 /// fixed input pair — the function is still `(events, admin_addr,
 /// now_ms) -> MaterializedMembership`, just with an explicit now
 /// reference rather than an implicit one derived from event ordering.
+/// ZEB-713: per-proposal working state accumulated during the main
+/// replay pass. A work entry exists only for proposals that were VALID
+/// at their bind position (config present, digest matched, actor a
+/// Joined designate in the running state) — invalid proposals never
+/// become work entries and are invisible to the lifecycle.
+///
+/// `threshold` / `veto_window_ms` / `designates` are SNAPSHOTS of the
+/// config generation the proposal bound to (digest-verified), so a
+/// later config replacement cannot retroactively change R or W — it
+/// kills the proposal instead (digest mismatch, spec §3.3.4).
+struct RecoveryWork {
+    proposer: OwnerAddr,
+    lost_admin: OwnerAddr,
+    new_admin: OwnerAddr,
+    t0_wall_ms: u64,
+    threshold: u8,
+    veto_window_ms: u64,
+    designates: Vec<OwnerAddr>,
+    config_digest: [u8; 32],
+    /// wall_ms of each distinct valid signature (proposer's included).
+    /// Unsorted — forward-ref cosigns can carry walls ≤ t0; sorted at
+    /// evaluation time to find the Rth-smallest (t_R).
+    sig_walls: Vec<u64>,
+    signers: BTreeSet<OwnerAddr>,
+    /// PR #497 R2 (Greptile P1): deadline as computed AT REPLAY TIME
+    /// (when the Rth signature folded) — the cutoff for the
+    /// `new_admin_joined` snapshot below. May differ from evaluate's
+    /// authoritative deadline in exotic late-delivery orderings; both
+    /// are pure functions of the sorted log, so replicas still converge.
+    deadline_at_replay: Option<u64>,
+    /// PR #497 R2 (Greptile P1): running snapshot of "new_admin is
+    /// currently Joined", refreshed after every replayed event whose
+    /// wall is within `deadline_at_replay`. Execution requires this —
+    /// judging Joined-ness AS OF THE DEADLINE (log-derivable, stable
+    /// under later rejoins) instead of at evaluation time, so a
+    /// stalled proposal can never revive and retroactively flip a
+    /// rival group's winner. Without this gate, an execution whose
+    /// new_admin left mid-window would kick the last admin and leave
+    /// the community with no power-100 member at all.
+    new_admin_joined: bool,
+}
+
+/// ZEB-713 (PR #497 R2): once a proposal's distinct-signer count
+/// reaches R, freeze the replay-time deadline used as the
+/// `new_admin_joined` snapshot cutoff. `checked_add` mirrors the
+/// evaluate-side fail-closed arithmetic (an overflowing window leaves
+/// the proposal Expired there, so a None here is inert).
+fn maybe_set_replay_deadline(work: &mut RecoveryWork) {
+    if work.deadline_at_replay.is_some() || work.signers.len() < work.threshold as usize {
+        return;
+    }
+    let mut walls = work.sig_walls.clone();
+    walls.sort_unstable();
+    if let Some(tr) = walls.get(work.threshold as usize - 1) {
+        work.deadline_at_replay = tr.checked_add(work.veto_window_ms);
+    }
+}
+
+/// ZEB-713: fold one cosign signature into a proposal's working state.
+/// RC1/RC2 dynamic halves: the cosigner must be Joined at their
+/// position (`joined`), the running config digest at their position
+/// must equal the proposal's bound digest (`running_digest`), the
+/// cosigner must be in the BOUND designate set, and distinct from
+/// prior signers (BTreeSet dedup).
+/// ZEB-713: facts recorded for a cosign at its replay position —
+/// everything the fold needs to judge validity once the target proposal
+/// is known (forward-ref cosigns are queued as these).
+struct QueuedRecoveryCosign {
+    wall_ms: u64,
+    actor: OwnerAddr,
+    /// Running config digest at the cosign's position (RC2).
+    running_digest: Option<[u8; 32]>,
+    /// Actor was Joined at the cosign's position (RC1 dynamic half).
+    joined: bool,
+}
+
+fn fold_recovery_cosign(work: &mut RecoveryWork, cosign: QueuedRecoveryCosign) {
+    if !cosign.joined {
+        return;
+    }
+    if cosign.running_digest != Some(work.config_digest) {
+        return;
+    }
+    if !work.designates.contains(&cosign.actor) {
+        return;
+    }
+    if work.signers.insert(cosign.actor) {
+        work.sig_walls.push(cosign.wall_ms);
+        maybe_set_replay_deadline(work);
+    }
+}
+
+/// ZEB-713: the current running config's digest, or None when recovery
+/// is unconfigured / the digest cannot be computed (fail closed).
+fn running_recovery_digest(m: &MaterializedMembership) -> Option<[u8; 32]> {
+    m.recovery_designates
+        .as_ref()
+        .and_then(|c| recovery_config_digest(c).ok())
+}
+
+/// ZEB-713: evaluate every recovery proposal's lifecycle phase at time
+/// reference `t` (spec §3.3). Pure in its inputs — called from the
+/// materialize post-pass with `t = max(events_max, now_ms)` (the R4-6
+/// now-floor) and position-locally from the EpochRotation trigger arm
+/// with `t = rotation.at.wall_ms` (stable there because every
+/// in-window cosign/veto has wall ≤ deadline < t and therefore sorts
+/// before the rotation).
+///
+/// Returns `id → (phase, deadline_ms)`; `deadline_ms` is Some once the
+/// Rth signature landed. Phase precedence for terminal states:
+/// Vetoed > ConfigChanged > Expired > Superseded.
+fn evaluate_recovery_phases(
+    rec_proposals: &BTreeMap<EventId, RecoveryWork>,
+    rec_vetoes: &[(EventId, u64)],
+    config_change_walls: &[u64],
+    t: u64,
+) -> BTreeMap<EventId, (RecoveryPhase, Option<u64>)> {
+    let mut out: BTreeMap<EventId, (RecoveryPhase, Option<u64>)> = BTreeMap::new();
+
+    // Pass 1: per-proposal phase ignoring rivals.
+    for (id, work) in rec_proposals.iter() {
+        let t0 = work.t0_wall_ms;
+        let r = work.threshold as usize;
+        let mut walls = work.sig_walls.clone();
+        walls.sort_unstable();
+        let t_r = walls.get(r.saturating_sub(1)).copied();
+        // Deadline exists only once R distinct signatures landed AND
+        // the Rth arrived within the 30-day initiation window (the
+        // ZEB-250 expiry constant, spec §3.3.1).
+        let (deadline, collect_expired) = match t_r {
+            Some(tr) if tr.saturating_sub(t0) <= ADMIN_PROPOSAL_EXPIRY_MS => {
+                // Defense-in-depth vs. the RD4 ceiling (PR #497 R1): a
+                // window that slipped past verification (corrupted log,
+                // raw replay) must fail CLOSED — an overflowed deadline
+                // would otherwise wrap small and execute immediately.
+                match tr.checked_add(work.veto_window_ms) {
+                    Some(deadline) => (Some(deadline), false),
+                    None => (None, true),
+                }
+            }
+            Some(_) => (None, true),
+            None => (None, t.saturating_sub(t0) > ADMIN_PROPOSAL_EXPIRY_MS),
+        };
+        // RV1 window: authored wall in [t₀, deadline]; while no
+        // deadline exists (Collecting) the window is open-ended —
+        // collecting proposals are vetoable early (spec §6 T1).
+        let vetoed = rec_vetoes.iter().any(|(target, wall)| {
+            target == id && *wall >= t0 && deadline.map(|d| *wall <= d).unwrap_or(true)
+        });
+        // Config replacement inside [t₀, deadline] kills (§3.3.4). A
+        // replacement AFTER the deadline leaves an executed proposal
+        // executed. `>= t0` (not `>`) is deliberately fail-closed
+        // toward killing the recovery attempt on an exact wall tie.
+        let config_killed = config_change_walls
+            .iter()
+            .any(|c| *c >= t0 && deadline.map(|d| *c <= d).unwrap_or(true));
+        let phase = if vetoed {
+            RecoveryPhase::Vetoed
+        } else if config_killed {
+            RecoveryPhase::ConfigChanged
+        } else if collect_expired {
+            RecoveryPhase::Expired
+        } else {
+            match deadline {
+                None => RecoveryPhase::Collecting,
+                // PR #497 R2 (Greptile P1): execution is ATOMIC — it
+                // requires new_admin Joined as of the deadline
+                // (replay-time snapshot). Otherwise the proposal stalls
+                // terminally with NO effects: a kick without the paired
+                // promotion would leave a sole-admin community with no
+                // power-100 member at all, bricked by the recovery
+                // mechanism itself.
+                Some(d) if t > d && work.new_admin_joined => RecoveryPhase::Executed,
+                Some(d) if t > d => RecoveryPhase::Stalled,
+                Some(_) => RecoveryPhase::TimeLocked,
+            }
+        };
+        out.insert(*id, (phase, deadline));
+    }
+
+    // Pass 2: rival tie-break — per lost_admin group, the lowest
+    // (t_R, event_id) among executable candidates wins; losers are
+    // Superseded (spec §3.3). Grouping by lost_admin (not globally)
+    // is deliberate: multi-admin loss is recovered via one proposal
+    // per lost admin, each independently executable (spec §3.2).
+    let mut winners: BTreeMap<OwnerAddr, (u64, EventId)> = BTreeMap::new();
+    for (id, (phase, deadline)) in out.iter() {
+        if *phase != RecoveryPhase::Executed {
+            continue;
+        }
+        let work = &rec_proposals[id];
+        // deadline is Some for every Executed proposal; t_R = deadline − W.
+        let tr = deadline
+            .expect("executed implies deadline")
+            .saturating_sub(work.veto_window_ms);
+        let key = (tr, *id);
+        winners
+            .entry(work.lost_admin)
+            .and_modify(|best| {
+                if key < *best {
+                    *best = key;
+                }
+            })
+            .or_insert(key);
+    }
+    for (id, entry) in out.iter_mut() {
+        if entry.0 != RecoveryPhase::Executed {
+            continue;
+        }
+        let work = &rec_proposals[id];
+        let tr = entry
+            .1
+            .expect("executed implies deadline")
+            .saturating_sub(work.veto_window_ms);
+        if winners.get(&work.lost_admin) != Some(&(tr, *id)) {
+            entry.0 = RecoveryPhase::Superseded;
+        }
+    }
+
+    out
+}
+
 pub fn materialize_with_now(
     events: &[SignedMembershipEvent],
     admin_addr: OwnerAddr,
@@ -2056,6 +2615,33 @@ pub fn materialize_with_now(
         std::collections::HashSet::new();
     let mut seen_admin_proposals: std::collections::HashSet<EventId> =
         std::collections::HashSet::new();
+
+    // ZEB-713: recovery working state (spec §3.3). Bind-valid proposals
+    // accumulate signatures during the main pass; lifecycle phases and
+    // the derived execution are evaluated in a POST-pass against the
+    // now-floor — execution is triggered by TIME passing, not by any
+    // event, so it cannot be applied at an event position (an idle
+    // community would never execute, the exact R4-6 pathology).
+    let mut rec_proposals: BTreeMap<EventId, RecoveryWork> = BTreeMap::new();
+    // Forward-ref cosigns (clock skew can sort a cosign before its
+    // target proposal — the ZEB-250 R2(b) pattern). Each entry records
+    // the facts needed for a later fold: (wall, actor, running config
+    // digest at the cosign's position, actor-was-Joined at position).
+    let mut rec_pending_cosigns: std::collections::HashMap<EventId, Vec<QueuedRecoveryCosign>> =
+        std::collections::HashMap::new();
+    // Vetoes that passed the RV1 running-state check at their position:
+    // (target proposal id, authored wall_ms).
+    let mut rec_vetoes: Vec<(EventId, u64)> = Vec::new();
+    // Recovery proposals whose triggered EpochRotation already applied
+    // in the main pass. The post-pass derived kick must NOT re-insert
+    // pending_rotation_for for these — the rotation arm's remove()
+    // runs during the main pass, BEFORE the post-pass insert would.
+    let mut rec_rotation_applied: std::collections::HashSet<EventId> =
+        std::collections::HashSet::new();
+    // wall_ms of each APPLIED SetRecoveryDesignates (config generation
+    // changes) — a change landing inside a proposal's [t₀, deadline]
+    // kills it (spec §3.3.4).
+    let mut rec_config_change_walls: Vec<u64> = Vec::new();
 
     for (idx, event) in sorted.iter().enumerate() {
         match &event.kind {
@@ -2364,10 +2950,44 @@ pub fn materialize_with_now(
                 // rotation that was issued before its trigger, enabling
                 // epoch-advance races.
                 let triggered_event = sorted[..idx].iter().find(|e| &e.id == triggered_by);
-                let kick_target = match triggered_event.map(|e| &e.kind) {
-                    Some(MembershipEventKind::Kick { target, .. }) => Some(*target),
-                    Some(MembershipEventKind::Leave) => triggered_event.map(|e| e.actor),
-                    _ => None,
+                // ZEB-713: the second tuple slot is the recovery-promoted
+                // issuer additionally authorized to author THIS rotation
+                // (None for the Kick/Leave trigger paths).
+                let (kick_target, recovery_issuer) = match triggered_event.map(|e| &e.kind) {
+                    Some(MembershipEventKind::Kick { target, .. }) => (Some(*target), None),
+                    Some(MembershipEventKind::Leave) => (triggered_event.map(|e| e.actor), None),
+                    // ZEB-713: an EXECUTED recovery proposal authorizes
+                    // rotating out its lost_admin — the derived kick has
+                    // no Kick event to cite, so the proposal itself is
+                    // the trigger. Executed-ness (incl. the rival
+                    // tie-break) is evaluated position-locally at THIS
+                    // rotation's wall clock: every in-window cosign and
+                    // veto has wall ≤ deadline < rotation wall and
+                    // therefore already sorted before this event, so the
+                    // outcome computed here never flips as later events
+                    // replay. A collecting / vetoed / superseded
+                    // proposal authorizes nothing (a rotation citing it
+                    // is dropped — same silent-drop posture as the
+                    // staleness gate above).
+                    Some(MembershipEventKind::RecoveryProposal {
+                        lost_admin,
+                        new_admin,
+                        ..
+                    }) => {
+                        let outcomes = evaluate_recovery_phases(
+                            &rec_proposals,
+                            &rec_vetoes,
+                            &rec_config_change_walls,
+                            event.at.wall_ms,
+                        );
+                        match outcomes.get(triggered_by) {
+                            Some((RecoveryPhase::Executed, _)) => {
+                                (Some(*lost_admin), Some(*new_admin))
+                            }
+                            _ => (None, None),
+                        }
+                    }
+                    _ => (None, None),
                 };
                 let Some(target) = kick_target else {
                     continue;
@@ -2445,7 +3065,20 @@ pub fn materialize_with_now(
                     Some(MembershipEventKind::Leave)
                 ) && issuer == target
                     && m.members.contains_key(&issuer);
-                if !is_admin && !is_self_leaver {
+                // ZEB-713: the recovery-promoted new_admin may author the
+                // rotation for the recovery-derived kick. Their power-100
+                // promotion is DERIVED (post-pass) and therefore not yet
+                // visible in the running power_levels at this position —
+                // without this path, the sole-admin recovery case would
+                // have no authorizable rotation issuer at all. Joined
+                // re-check mirrors RP3 (and blocks a new_admin who left
+                // during the window).
+                let is_recovery_new_admin = recovery_issuer == Some(issuer)
+                    && matches!(
+                        m.members.get(&issuer).map(|s| s.status),
+                        Some(MemberStatus::Joined)
+                    );
+                if !is_admin && !is_self_leaver && !is_recovery_new_admin {
                     continue;
                 }
 
@@ -2454,6 +3087,11 @@ pub fn materialize_with_now(
                 // Tasks 5/6). materialize is pure replay.
                 m.current_epoch = Some(current + 1);
                 m.pending_rotation_for.remove(&target);
+                // ZEB-713: a recovery-triggered rotation is complete —
+                // tell the post-pass not to re-mark the target pending.
+                if recovery_issuer.is_some() {
+                    rec_rotation_applied.insert(*triggered_by);
+                }
             }
             MembershipEventKind::EpochCatchup {
                 epoch,
@@ -2715,6 +3353,13 @@ pub fn materialize_with_now(
                         {
                             apply_admin_proposal_effect(&mut m, &kind, event);
                             applied_admin_proposals.insert(event.id);
+                            // ZEB-713: an applied SetRecoveryDesignates is a
+                            // config-generation change — record its wall so
+                            // the recovery post-pass can kill in-flight
+                            // proposals it landed inside (spec §3.3.4).
+                            if matches!(kind, ProposalKind::SetRecoveryDesignates { .. }) {
+                                rec_config_change_walls.push(event.at.wall_ms);
+                            }
                         }
                     }
                 }
@@ -2767,6 +3412,11 @@ pub fn materialize_with_now(
                             // Preserves CRDT causality: moderation is not backdated.
                             apply_admin_proposal_effect(&mut m, &kind, event);
                             applied_admin_proposals.insert(*target_event_id);
+                            // ZEB-713: record config-generation changes for
+                            // the recovery post-pass (spec §3.3.4).
+                            if matches!(kind, ProposalKind::SetRecoveryDesignates { .. }) {
+                                rec_config_change_walls.push(event.at.wall_ms);
+                            }
                         }
                     }
                 }
@@ -2843,8 +3493,199 @@ pub fn materialize_with_now(
                     member.revoked_device_keys.insert(vk);
                 }
             }
+            MembershipEventKind::RecoveryProposal {
+                lost_admin,
+                new_admin,
+                config_digest,
+            } => {
+                // ZEB-713: bind-time validity against the RUNNING state
+                // (defense-in-depth re-check of RP1/RP5 — verify_event
+                // gated at insert; a proposal invalid here never becomes
+                // a work entry and is invisible to the lifecycle).
+                let Some(config) = m.recovery_designates.clone() else {
+                    continue;
+                };
+                if running_recovery_digest(&m) != Some(*config_digest) {
+                    continue;
+                }
+                if !config.designates.contains(&event.actor) || !is_joined_member(&m, &event.actor)
+                {
+                    continue;
+                }
+                let mut work = RecoveryWork {
+                    proposer: event.actor,
+                    lost_admin: *lost_admin,
+                    new_admin: *new_admin,
+                    t0_wall_ms: event.at.wall_ms,
+                    threshold: config.threshold,
+                    veto_window_ms: config.veto_window_ms,
+                    designates: config.designates.clone(),
+                    config_digest: *config_digest,
+                    sig_walls: vec![event.at.wall_ms],
+                    signers: BTreeSet::from([event.actor]),
+                    deadline_at_replay: None,
+                    // RP3 verified new_admin Joined at proposal time; the
+                    // per-event refresh below keeps this current until
+                    // the deadline.
+                    new_admin_joined: is_joined_member(&m, new_admin),
+                };
+                // Fold queued forward-ref cosigns (ZEB-250 R2(b) mirror).
+                if let Some(queued) = rec_pending_cosigns.remove(&event.id) {
+                    for cosign in queued {
+                        fold_recovery_cosign(&mut work, cosign);
+                    }
+                }
+                // R=1 (or forward-ref-satisfied) proposals reach
+                // threshold at bind — freeze the snapshot cutoff here.
+                maybe_set_replay_deadline(&mut work);
+                rec_proposals.insert(event.id, work);
+            }
+            MembershipEventKind::RecoveryCosign { target_event_id } => {
+                // ZEB-713: record the position-local facts and fold (or
+                // queue when the target hasn't been reached in HLC order).
+                let cosign = QueuedRecoveryCosign {
+                    wall_ms: event.at.wall_ms,
+                    actor: event.actor,
+                    running_digest: running_recovery_digest(&m),
+                    joined: is_joined_member(&m, &event.actor),
+                };
+                if let Some(work) = rec_proposals.get_mut(target_event_id) {
+                    fold_recovery_cosign(work, cosign);
+                } else {
+                    rec_pending_cosigns
+                        .entry(*target_event_id)
+                        .or_default()
+                        .push(cosign);
+                }
+            }
+            MembershipEventKind::RecoveryVeto { target_event_id } => {
+                // ZEB-713 RV1 running-state half: power-100 AND
+                // Joined-or-bootstrap-admin at this position. The
+                // [t₀, deadline] authored-window check happens at
+                // evaluation time (the target may not even be bound yet).
+                let veto_power = m.power_levels.get(&event.actor).copied().unwrap_or(0);
+                let is_bootstrap_admin =
+                    event.actor == admin_addr && !m.members.contains_key(&event.actor);
+                if veto_power == 100 && (is_joined_member(&m, &event.actor) || is_bootstrap_admin) {
+                    rec_vetoes.push((*target_event_id, event.at.wall_ms));
+                }
+            }
+        }
+
+        // PR #497 R2 (Greptile P1): refresh each open proposal's
+        // new_admin-Joined snapshot while replay is still within its
+        // deadline window. The last refresh at or before the deadline
+        // is the value execution is judged on — Joined-ness AS OF the
+        // deadline, log-derivable and stable under later rejoins.
+        // Bounded work: RP6 caps open proposals at |designates|.
+        for work in rec_proposals.values_mut() {
+            let within_window = work
+                .deadline_at_replay
+                .map(|d| event.at.wall_ms <= d)
+                .unwrap_or(true);
+            if within_window {
+                work.new_admin_joined = matches!(
+                    m.members.get(&work.new_admin).map(|s| s.status),
+                    Some(MemberStatus::Joined)
+                );
+            }
         }
     }
+
+    // ZEB-713 post-pass: evaluate recovery lifecycles at the now-floor
+    // and apply the derived execution (spec §3.3.3). Execution is PURE
+    // DERIVED STATE — no synthetic Kick/SetPower events — so a
+    // late-delivered veto re-derives it away on the next materialize
+    // (spec §4.2).
+    let outcomes = evaluate_recovery_phases(
+        &rec_proposals,
+        &rec_vetoes,
+        &rec_config_change_walls,
+        current_max_wall_ms,
+    );
+    for (id, (phase, deadline)) in outcomes.iter() {
+        if *phase != RecoveryPhase::Executed {
+            continue;
+        }
+        let work = &rec_proposals[id];
+        let deadline_ms = deadline.expect("executed implies deadline");
+        // Synthetic derived-state HLC for the kick timestamp:
+        // deterministic in (events, now_ms) because deadline is a pure
+        // function of event data. Empty device_id marks it as derived,
+        // not authored.
+        let derived_at = Hlc {
+            wall_ms: deadline_ms,
+            logical: 0,
+            device_id: String::new(),
+        };
+        // Promote. Executed already implies new_admin was Joined as of
+        // the deadline (the evaluate gate); if they left AFTER the
+        // deadline the granted power entry is inert without Joined
+        // status — the same state any departing admin leaves behind.
+        m.power_levels.insert(work.new_admin, 100);
+        // Derived kick of the NAMED lost_admin (loss-as-compromise —
+        // activity does not immunize the key, spec §6 T9). Mirrors the
+        // direct-Kick arm, with one deliberate difference: a
+        // record-less bootstrap admin gets a Banned record INSERTED —
+        // RP4 explicitly admits that identity, and without a record the
+        // verify-side bootstrap-admin exceptions (None membership ⇒
+        // "never kicked") would keep honoring the dead key forever.
+        let prior_status = m.members.get(&work.lost_admin).map(|s| s.status);
+        match m.members.get_mut(&work.lost_admin) {
+            Some(ms) => {
+                // First-execution-wins on an already-Banned target
+                // (idempotent, preserves the earlier left_at).
+                if ms.status != MemberStatus::Banned {
+                    ms.status = MemberStatus::Banned;
+                    ms.left_at = Some(derived_at.clone());
+                }
+            }
+            None if work.lost_admin == admin_addr => {
+                m.members.insert(
+                    work.lost_admin,
+                    MemberState {
+                        status: MemberStatus::Banned,
+                        joined_at: derived_at.clone(),
+                        left_at: Some(derived_at.clone()),
+                        enrolled_device_keys: BTreeSet::new(),
+                        revoked_device_keys: BTreeSet::new(),
+                    },
+                );
+            }
+            None => {}
+        }
+        // ZEB-249 hand-off: the derived kick marks the rotation need;
+        // the existing self-healing path picks it up. PendingJoin guard
+        // mirrors the direct-Kick arm (R4-1). Skipped when this
+        // proposal's rotation already landed during the main pass
+        // (rotation-then-insert would leave a stale pending marker).
+        if !matches!(prior_status, Some(MemberStatus::PendingJoin))
+            && !rec_rotation_applied.contains(id)
+        {
+            m.pending_rotation_for.insert(work.lost_admin);
+        }
+    }
+    // Derived per-proposal view for RP6 and the D2 UI, sorted by
+    // (t₀, id) for deterministic encoding.
+    let mut view: Vec<RecoveryProposalView> = rec_proposals
+        .iter()
+        .map(|(id, work)| {
+            let (phase, deadline) = outcomes[id];
+            RecoveryProposalView {
+                id: *id,
+                proposer: work.proposer,
+                lost_admin: work.lost_admin,
+                new_admin: work.new_admin,
+                signers: work.signers.clone(),
+                threshold: work.threshold,
+                proposed_at_wall_ms: work.t0_wall_ms,
+                deadline_ms: deadline,
+                phase,
+            }
+        })
+        .collect();
+    view.sort_by_key(|v| (v.proposed_at_wall_ms, v.id));
+    m.recovery_proposals = view;
 
     m
 }
@@ -3272,6 +4113,46 @@ pub fn verify_event(
                         return Err(VerifyError::AdminProposalNotAdminAffecting);
                     }
                 }
+                ProposalKind::SetRecoveryDesignates {
+                    designates,
+                    threshold,
+                    veto_window_ms,
+                } => {
+                    // ZEB-713 RD1: non-empty, no duplicates.
+                    if designates.is_empty() {
+                        return Err(VerifyError::RecoveryDesignatesMalformed);
+                    }
+                    let distinct: BTreeSet<&OwnerAddr> = designates.iter().collect();
+                    if distinct.len() != designates.len() {
+                        return Err(VerifyError::RecoveryDesignatesMalformed);
+                    }
+                    // RD2: every designate currently Joined. (An admin may
+                    // name themselves — pointless but harmless; the UI
+                    // discourages it. Spec §3.1.)
+                    for d in designates {
+                        if !is_joined_member(prior_state, d) {
+                            return Err(VerifyError::RecoveryDesignateNotJoined);
+                        }
+                    }
+                    // RD3: 1 <= R <= designate count.
+                    if *threshold < 1 || (*threshold as usize) > designates.len() {
+                        return Err(VerifyError::RecoveryThresholdOutOfRange);
+                    }
+                    // RD4: window floor, enforced on every replica so a
+                    // modified client can't shorten it (spec §6 T6).
+                    if *veto_window_ms < RECOVERY_VETO_WINDOW_FLOOR_MS {
+                        return Err(VerifyError::RecoveryVetoWindowTooShort);
+                    }
+                    // RD4 ceiling (PR #497 R1): guards the t_R + W
+                    // deadline arithmetic against u64 wrap (an unbounded
+                    // W would let a crafted config execute recovery
+                    // IMMEDIATELY) and keeps the value JS-number-exact.
+                    if *veto_window_ms > RECOVERY_VETO_WINDOW_CEILING_MS {
+                        return Err(VerifyError::RecoveryVetoWindowTooLong);
+                    }
+                    // Always admin-affecting (it grants a takeover path);
+                    // no AP4 distinction — mirrors ChangeQuorum.
+                }
                 ProposalKind::ChangeQuorum { new_quorum } => {
                     // AP3: new_quorum >= 1.
                     if *new_quorum < 1 {
@@ -3323,6 +4204,128 @@ pub fn verify_event(
             // be in the event log yet. Lenient forward-ref semantics
             // mirror ZEB-254's JoinCountersign — out-of-order DAG-sync
             // delivery is normal. Pairing happens at materialize time.
+        }
+        MembershipEventKind::RecoveryProposal {
+            lost_admin,
+            new_admin,
+            config_digest,
+        } => {
+            // ZEB-713 §3.2 — gates RP1-RP6. Deliberately NOT the AP
+            // gates: AP2 (power-100 proposer) is exactly what a
+            // bricked sole-admin community cannot satisfy.
+
+            // RP2: recovery must be configured.
+            let Some(config) = prior_state.recovery_designates.as_ref() else {
+                return Err(VerifyError::RecoveryNotConfigured);
+            };
+            // RP1: actor is a designate AND currently Joined. (This is
+            // precisely the event non-admins may author — no power gate.)
+            if !config.designates.contains(&event.actor)
+                || !is_joined_member(prior_state, &event.actor)
+            {
+                return Err(VerifyError::RecoveryProposalActorNotDesignate);
+            }
+            // RP4: lost_admin is a currently-Joined power-100 member.
+            // (A genuinely lost admin never authored a Leave, so Joined
+            // is the honest state; an admin who LEFT is not recoverable
+            // — their departure was voluntary and epoch-rotated already.)
+            // Bootstrap-admin exception (mirrors the EpochRotation C4
+            // arm): ctx.admin_addr may hold the implicit bootstrap
+            // power 100 without a member record; None membership means
+            // "was never kicked/banned" and the identity is exactly the
+            // one a sole-admin community loses.
+            let lost_power = prior_state
+                .power_levels
+                .get(lost_admin)
+                .copied()
+                .unwrap_or(0);
+            let lost_is_bootstrap_admin =
+                *lost_admin == ctx.admin_addr && !prior_state.members.contains_key(lost_admin);
+            if lost_power != 100
+                || !(is_joined_member(prior_state, lost_admin) || lost_is_bootstrap_admin)
+            {
+                return Err(VerifyError::RecoveryProposalLostAdminNotAdmin);
+            }
+            // RP3: new_admin currently Joined, not already power-100,
+            // and distinct from lost_admin.
+            let new_power = prior_state
+                .power_levels
+                .get(new_admin)
+                .copied()
+                .unwrap_or(0);
+            if new_admin == lost_admin
+                || new_power == 100
+                || !is_joined_member(prior_state, new_admin)
+            {
+                return Err(VerifyError::RecoveryProposalNewAdminInvalid);
+            }
+            // RP5: digest binds the proposal to the live config
+            // generation. Encode failure => fail closed (mismatch).
+            match recovery_config_digest(config) {
+                Ok(live) if live == *config_digest => {}
+                _ => return Err(VerifyError::RecoveryProposalConfigDigestMismatch),
+            }
+            // RP6: one open proposal per designate — structural spam
+            // bound (≤ |designates| open proposals community-wide,
+            // spec §6 T1). Open = Collecting or TimeLocked in the
+            // prior state's derived view (which is evaluated on the
+            // R4-6 now-floor, so expired proposals don't block).
+            let has_open = prior_state.recovery_proposals.iter().any(|p| {
+                p.proposer == event.actor
+                    && matches!(
+                        p.phase,
+                        RecoveryPhase::Collecting | RecoveryPhase::TimeLocked
+                    )
+            });
+            if has_open {
+                return Err(VerifyError::RecoveryProposalActorHasOpenProposal);
+            }
+        }
+        MembershipEventKind::RecoveryCosign { target_event_id } => {
+            // ZEB-713 RC1 (static half): actor is a designate AND
+            // currently Joined. Distinctness and the RC2 digest check
+            // are materialize-time concerns — the target proposal may
+            // not be in the log yet (lenient forward-ref, mirrors
+            // AdminCountersign).
+            let Some(config) = prior_state.recovery_designates.as_ref() else {
+                return Err(VerifyError::RecoveryNotConfigured);
+            };
+            if !config.designates.contains(&event.actor)
+                || !is_joined_member(prior_state, &event.actor)
+            {
+                return Err(VerifyError::RecoveryCosignActorNotDesignate);
+            }
+            if target_event_id.iter().all(|b| *b == 0) {
+                return Err(VerifyError::RecoveryCosignTargetIdMalformed);
+            }
+        }
+        MembershipEventKind::RecoveryVeto { target_event_id } => {
+            // ZEB-713 RV1 (static half): power-100 + Joined. ONE veto
+            // suffices — deliberately not quorum-gated (a veto is a
+            // liveness proof restoring the status quo ante; quorum
+            // would only help an attacker who already silenced most
+            // admins, spec §3.2). The [t₀, deadline] authored-HLC
+            // window is a materialize-time concern (forward-ref).
+            let veto_power = prior_state
+                .power_levels
+                .get(&event.actor)
+                .copied()
+                .unwrap_or(0);
+            // Bootstrap-admin exception (mirrors EpochRotation C4 + RP4
+            // above): the implicit-power bootstrap admin — the very
+            // identity recovery usually targets — must be able to veto
+            // even without an explicit member record (T9: the veto IS
+            // the proof of life).
+            let veto_is_bootstrap_admin =
+                event.actor == ctx.admin_addr && !prior_state.members.contains_key(&event.actor);
+            if veto_power != 100
+                || !(is_joined_member(prior_state, &event.actor) || veto_is_bootstrap_admin)
+            {
+                return Err(VerifyError::RecoveryVetoActorNotAdmin);
+            }
+            if target_event_id.iter().all(|b| *b == 0) {
+                return Err(VerifyError::RecoveryVetoTargetIdMalformed);
+            }
         }
         MembershipEventKind::ReachabilityAnnounce { .. } => {
             // ZEB-321: membership status (RCH5) is enforced in the
@@ -3706,6 +4709,14 @@ pub fn verify_event(
         MembershipEventKind::AdminCountersign { .. } => {
             // All AdminCountersign gates (AC1-AC3) are handled in the
             // joined-membership block above. No separate power rule needed.
+        }
+        MembershipEventKind::RecoveryProposal { .. }
+        | MembershipEventKind::RecoveryCosign { .. }
+        | MembershipEventKind::RecoveryVeto { .. } => {
+            // ZEB-713: all recovery gates (RP1-RP6, RC1, RV1 static
+            // halves) are handled in the joined-membership block above.
+            // Window/digest/distinctness checks are materialize-time
+            // concerns (lenient forward-ref). No separate power rule.
         }
         MembershipEventKind::ReachabilityAnnounce { payload } => {
             // ZEB-321 RCH1-RCH5 enforcement.
@@ -4311,6 +5322,23 @@ pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// records (spec §5.5 silent-drop semantics).
 pub const REACHABILITY_TIMESTAMP_SKEW_MAX_MS: u64 = 30 * 60 * 1000;
 
+/// ZEB-713 RD4: floor on `SetRecoveryDesignates.veto_window_ms`.
+/// 7 days — enforced at verify time on every replica, so a malicious
+/// client build cannot make honest replicas accept a 1-hour window
+/// (spec §6 T6). The default the D2 UI offers is 30 days.
+pub const RECOVERY_VETO_WINDOW_FLOOR_MS: u64 = 7 * 86_400_000;
+
+/// ZEB-713 RD4 (ceiling, PR #497 R1): upper bound on
+/// `SetRecoveryDesignates.veto_window_ms`. 365 days. Two jobs:
+/// 1. `deadline = t_R + W` stays far from u64 wrap — an unbounded W
+///    could overflow the addition and produce a tiny deadline,
+///    executing a recovery IMMEDIATELY instead of after the time-lock.
+///    (`evaluate_recovery_phases` also uses `checked_add` fail-closed
+///    as defense-in-depth for events that bypassed verification.)
+/// 2. The value survives the u64 → JS-number DTO boundary exactly
+///    (365 d ≈ 3.2e10 ms « 2^53).
+pub const RECOVERY_VETO_WINDOW_CEILING_MS: u64 = 365 * 86_400_000;
+
 /// ZEB-250: apply an admin-proposal's effect to the running
 /// materialized state when the proposal has reached quorum within the
 /// 30-day window. Translates the wrapped ProposalKind into the same
@@ -4356,6 +5384,23 @@ fn apply_admin_proposal_effect(
             // AdminProposal events in the same replay see the updated threshold
             // (single-pass-with-running-state, spec §5.2).
             m.admin_quorum = *new_quorum;
+        }
+        ProposalKind::SetRecoveryDesignates {
+            designates,
+            threshold,
+            veto_window_ms,
+        } => {
+            // ZEB-713: install/replace the recovery config. `set_at` is
+            // the quorum-trigger event's HLC — the config GENERATION —
+            // so even an identical designate list re-set produces a new
+            // digest and kills in-flight proposals bound to the old one
+            // (running-state, same single-pass rule as ChangeQuorum).
+            m.recovery_designates = Some(RecoveryDesignates {
+                designates: designates.clone(),
+                threshold: *threshold,
+                veto_window_ms: *veto_window_ms,
+                set_at: effective_event.at.clone(),
+            });
         }
     }
 }
@@ -11240,6 +12285,1269 @@ mod zeb_250_admin_proposal_materialize_tests {
             m.power_levels.get(&target).copied().unwrap_or(0),
             100,
             "target must be promoted to 100 (effect applied exactly once)"
+        );
+    }
+}
+
+// ── ZEB-713 (ZEB-212 D1) admin-recovery materialize/lifecycle tests ──────────
+
+#[cfg(test)]
+mod zeb_713_recovery_materialize_tests {
+    use super::*;
+
+    const COM: SpaceId = SpaceId([0xc0; 16]);
+    const W: u64 = RECOVERY_VETO_WINDOW_FLOOR_MS;
+    const T0: u64 = 100_000;
+    const T_R: u64 = 110_000;
+    const DEADLINE: u64 = T_R + W;
+    const P1: EventId = [0xB0; 16];
+
+    fn admin1() -> OwnerAddr {
+        OwnerAddr([0x01; 16])
+    }
+    fn d1() -> OwnerAddr {
+        OwnerAddr([0x11; 16])
+    }
+    fn d2() -> OwnerAddr {
+        OwnerAddr([0x12; 16])
+    }
+    fn m_new() -> OwnerAddr {
+        OwnerAddr([0x21; 16])
+    }
+    fn m2() -> OwnerAddr {
+        OwnerAddr([0x22; 16])
+    }
+
+    fn ev(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COM,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            kind,
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// Base world: bootstrap admin (with explicit Join), two designates,
+    /// two regular members, and a quorum-applied RecoveryDesignates
+    /// config (R=2, W=floor). Returns (events, config digest).
+    fn base_world() -> (Vec<SignedMembershipEvent>, [u8; 32]) {
+        let events = vec![
+            ev([0xA0; 16], admin1(), 500, MembershipEventKind::Join),
+            ev([0xA1; 16], d1(), 1_000, MembershipEventKind::Join),
+            ev([0xA2; 16], d2(), 1_100, MembershipEventKind::Join),
+            ev([0xA3; 16], m_new(), 1_200, MembershipEventKind::Join),
+            ev([0xA4; 16], m2(), 1_300, MembershipEventKind::Join),
+            ev(
+                [0xA5; 16],
+                admin1(),
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetRecoveryDesignates {
+                        designates: vec![d1(), d2()],
+                        threshold: 2,
+                        veto_window_ms: W,
+                    },
+                },
+            ),
+        ];
+        let m = materialize(&events, admin1());
+        let config = m
+            .recovery_designates
+            .as_ref()
+            .expect("config must materialize via quorum self-satisfy");
+        let digest = recovery_config_digest(config).expect("digest");
+        (events, digest)
+    }
+
+    fn proposal(digest: [u8; 32]) -> SignedMembershipEvent {
+        ev(
+            P1,
+            d1(),
+            T0,
+            MembershipEventKind::RecoveryProposal {
+                lost_admin: admin1(),
+                new_admin: m_new(),
+                config_digest: digest,
+            },
+        )
+    }
+
+    fn cosign(id: [u8; 16], actor: OwnerAddr, wall_ms: u64) -> SignedMembershipEvent {
+        ev(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::RecoveryCosign {
+                target_event_id: P1,
+            },
+        )
+    }
+
+    fn veto(id: [u8; 16], actor: OwnerAddr, wall_ms: u64) -> SignedMembershipEvent {
+        ev(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::RecoveryVeto {
+                target_event_id: P1,
+            },
+        )
+    }
+
+    fn view(m: &MaterializedMembership, id: EventId) -> &RecoveryProposalView {
+        m.recovery_proposals
+            .iter()
+            .find(|p| p.id == id)
+            .expect("proposal view present")
+    }
+
+    #[test]
+    fn config_materializes_via_quorum_self_satisfy() {
+        let (events, _) = base_world();
+        let m = materialize(&events, admin1());
+        let config = m.recovery_designates.expect("configured");
+        assert_eq!(config.designates, vec![d1(), d2()]);
+        assert_eq!(config.threshold, 2);
+        assert_eq!(config.veto_window_ms, W);
+        assert_eq!(config.set_at.wall_ms, 10_000);
+    }
+
+    #[test]
+    fn full_recovery_executes_strictly_past_deadline() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+
+        // AT the deadline: still time-locked (execution requires T > deadline).
+        let at = materialize_with_now(&events, admin1(), Some(DEADLINE));
+        assert_eq!(view(&at, P1).phase, RecoveryPhase::TimeLocked);
+        assert_eq!(view(&at, P1).deadline_ms, Some(DEADLINE));
+        assert_ne!(at.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+
+        // Strictly past: executed — promotion + derived kick + rotation marker.
+        let done = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&done, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(done.power_levels.get(&m_new()).copied(), Some(100));
+        assert_eq!(done.members[&admin1()].status, MemberStatus::Banned);
+        assert!(done.pending_rotation_for.contains(&admin1()));
+        // Derived-kick left_at is the synthetic deadline HLC.
+        assert_eq!(
+            done.members[&admin1()].left_at.as_ref().map(|h| h.wall_ms),
+            Some(DEADLINE)
+        );
+    }
+
+    #[test]
+    fn idle_community_executes_on_now_floor_alone() {
+        // §4.1: no event after the cosign — events_max stays below the
+        // deadline forever. Only the caller-supplied now-floor advances
+        // the lifecycle.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+
+        let stuck = materialize(&events, admin1());
+        assert_eq!(view(&stuck, P1).phase, RecoveryPhase::TimeLocked);
+
+        let live = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&live, P1).phase, RecoveryPhase::Executed);
+    }
+
+    #[test]
+    fn collecting_below_threshold_never_executes() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Collecting);
+        assert_eq!(view(&m, P1).deadline_ms, None);
+        assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+    }
+
+    #[test]
+    fn collecting_expires_after_30_days() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        let m = materialize_with_now(&events, admin1(), Some(T0 + ADMIN_PROPOSAL_EXPIRY_MS + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Expired);
+    }
+
+    #[test]
+    fn late_threshold_signature_expires_proposal() {
+        // Rth signature landing after the 30-day initiation window:
+        // dead, even long past what its deadline would have been.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        let late_tr = T0 + ADMIN_PROPOSAL_EXPIRY_MS + 1_000;
+        events.push(cosign([0xB1; 16], d2(), late_tr));
+        let m = materialize_with_now(&events, admin1(), Some(late_tr + W + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Expired);
+        assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+    }
+
+    #[test]
+    fn veto_during_time_lock_kills() {
+        // T9: the vetoer IS the named lost admin — the veto is the
+        // proof of life.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(veto([0xB2; 16], admin1(), DEADLINE - 1_000));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Vetoed);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Joined);
+        assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+        assert!(m.pending_rotation_for.is_empty());
+    }
+
+    #[test]
+    fn veto_during_collecting_kills() {
+        // Collecting proposals are vetoable early (§6 T1) — the veto
+        // survives the threshold being reached afterwards.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(veto([0xB2; 16], admin1(), 105_000));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Vetoed);
+    }
+
+    #[test]
+    fn veto_authored_after_deadline_is_ineffective() {
+        // RV1 bounds veto AUTHORSHIP to [t₀, deadline] — there is no
+        // veto-after-the-fact right.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(veto([0xB2; 16], admin1(), DEADLINE + 5));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 10));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Banned);
+    }
+
+    #[test]
+    fn veto_by_non_admin_is_ignored() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        // d1 has power 0 — their veto records nothing.
+        events.push(veto([0xB2; 16], d1(), DEADLINE - 1_000));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+    }
+
+    #[test]
+    fn late_delivered_veto_rederives_execution_away() {
+        // §4.2: execution is pure derived state. A veto authored inside
+        // the window but DELIVERED after replicas already executed must
+        // revert promotion, derived kick, and the rotation marker on
+        // re-materialization.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+
+        let executed = materialize_with_now(&events, admin1(), Some(DEADLINE + 2_000));
+        assert_eq!(view(&executed, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(executed.members[&admin1()].status, MemberStatus::Banned);
+
+        // The late-delivered veto (authored in-window).
+        events.push(veto([0xB2; 16], admin1(), DEADLINE - 1));
+        let reverted = materialize_with_now(&events, admin1(), Some(DEADLINE + 2_000));
+        assert_eq!(view(&reverted, P1).phase, RecoveryPhase::Vetoed);
+        assert_eq!(reverted.members[&admin1()].status, MemberStatus::Joined);
+        assert_ne!(
+            reverted.power_levels.get(&m_new()).copied().unwrap_or(0),
+            100
+        );
+        assert!(reverted.pending_rotation_for.is_empty());
+    }
+
+    #[test]
+    fn recovery_rotation_executes_and_late_veto_heals_divergence() {
+        // §4.3 heal vector: derived execution → new_admin authors the
+        // recovery-triggered EpochRotation (divergent) → late veto
+        // delivery → membership AND epoch re-derive away → a normal
+        // kick+rotation afterwards still works.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        // Recovery rotation by the promoted new_admin, citing the
+        // proposal as trigger. Recipients: everyone Joined except the
+        // kicked lost_admin.
+        let recipients = |addrs: &[OwnerAddr]| -> Vec<RecipientCiphertext> {
+            addrs
+                .iter()
+                .map(|a| RecipientCiphertext {
+                    recipient: *a,
+                    sealed: Vec::new(),
+                })
+                .collect()
+        };
+        events.push(ev(
+            [0xC0; 16],
+            m_new(),
+            DEADLINE + 100,
+            MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: P1,
+                recipient_ciphertexts: recipients(&[d1(), d2(), m_new(), m2()]),
+            },
+        ));
+
+        // Without the veto: rotation lands (issuer authorized as the
+        // recovery-promoted new_admin), pending marker consumed.
+        let diverged = materialize_with_now(&events, admin1(), Some(DEADLINE + 200));
+        assert_eq!(view(&diverged, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(diverged.current_epoch, Some(1));
+        assert!(
+            diverged.pending_rotation_for.is_empty(),
+            "recovery rotation must consume the pending marker"
+        );
+
+        // Late veto delivery: the whole derived chain reverts — the
+        // divergent rotation's trigger is no longer executed, so the
+        // epoch advance re-derives away too.
+        events.push(veto([0xC1; 16], admin1(), DEADLINE - 1_000));
+        let healed = materialize_with_now(&events, admin1(), Some(DEADLINE + 200));
+        assert_eq!(view(&healed, P1).phase, RecoveryPhase::Vetoed);
+        assert_eq!(healed.current_epoch, None);
+        assert_eq!(healed.members[&admin1()].status, MemberStatus::Joined);
+        assert_ne!(healed.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+
+        // Normal lifecycle still works post-heal: restored admin kicks
+        // m2 and rotates.
+        events.push(ev(
+            [0xC2; 16],
+            admin1(),
+            DEADLINE + 300,
+            MembershipEventKind::Kick {
+                target: m2(),
+                reason: None,
+            },
+        ));
+        events.push(ev(
+            [0xC3; 16],
+            admin1(),
+            DEADLINE + 400,
+            MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: [0xC2; 16],
+                recipient_ciphertexts: recipients(&[admin1(), d1(), d2(), m_new()]),
+            },
+        ));
+        let after = materialize_with_now(&events, admin1(), Some(DEADLINE + 500));
+        assert_eq!(after.current_epoch, Some(1));
+        assert_eq!(after.members[&m2()].status, MemberStatus::Banned);
+        assert!(after.pending_rotation_for.is_empty());
+    }
+
+    #[test]
+    fn rival_proposals_same_lost_admin_tie_break_lowest_tr() {
+        let (mut events, digest) = base_world();
+        // p1: d1 proposes m_new (t_R = 110_000).
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        // p2: d2 proposes m2 for the SAME lost admin (t_R = 111_000).
+        events.push(ev(
+            [0xB4; 16],
+            d2(),
+            101_000,
+            MembershipEventKind::RecoveryProposal {
+                lost_admin: admin1(),
+                new_admin: m2(),
+                config_digest: digest,
+            },
+        ));
+        events.push(ev(
+            [0xB5; 16],
+            d1(),
+            111_000,
+            MembershipEventKind::RecoveryCosign {
+                target_event_id: [0xB4; 16],
+            },
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(111_000 + W + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(view(&m, [0xB4; 16]).phase, RecoveryPhase::Superseded);
+        assert_eq!(m.power_levels.get(&m_new()).copied(), Some(100));
+        assert_ne!(m.power_levels.get(&m2()).copied().unwrap_or(0), 100);
+    }
+
+    #[test]
+    fn rival_proposals_different_lost_admins_both_execute() {
+        let (mut events, digest) = base_world();
+        // Promote m2 to a second admin first (direct SetPower, quorum=1).
+        events.push(ev(
+            [0xA6; 16],
+            admin1(),
+            20_000,
+            MembershipEventKind::SetPower {
+                target: m2(),
+                level: 100,
+            },
+        ));
+        // p1: lost=admin1 → new=m_new.
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        // p2: lost=m2 → new=d2 (distinct lost admin — own group).
+        events.push(ev(
+            [0xB4; 16],
+            d2(),
+            101_000,
+            MembershipEventKind::RecoveryProposal {
+                lost_admin: m2(),
+                new_admin: d2(),
+                config_digest: digest,
+            },
+        ));
+        events.push(ev(
+            [0xB5; 16],
+            d1(),
+            111_000,
+            MembershipEventKind::RecoveryCosign {
+                target_event_id: [0xB4; 16],
+            },
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(111_000 + W + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(view(&m, [0xB4; 16]).phase, RecoveryPhase::Executed);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Banned);
+        assert_eq!(m.members[&m2()].status, MemberStatus::Banned);
+        assert_eq!(m.power_levels.get(&m_new()).copied(), Some(100));
+        assert_eq!(m.power_levels.get(&d2()).copied(), Some(100));
+    }
+
+    #[test]
+    fn config_change_mid_collecting_kills() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        // Config re-set (same designates — the GENERATION changes) lands
+        // between t₀ and the would-be threshold signature.
+        events.push(ev(
+            [0xA7; 16],
+            admin1(),
+            105_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetRecoveryDesignates {
+                    designates: vec![d1(), d2()],
+                    threshold: 2,
+                    veto_window_ms: W,
+                },
+            },
+        ));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::ConfigChanged);
+        assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+    }
+
+    #[test]
+    fn config_change_mid_time_lock_kills() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xA7; 16],
+            admin1(),
+            DEADLINE - 500,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetRecoveryDesignates {
+                    designates: vec![d1(), d2()],
+                    threshold: 2,
+                    veto_window_ms: W,
+                },
+            },
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::ConfigChanged);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Joined);
+    }
+
+    #[test]
+    fn config_change_after_deadline_leaves_execution_standing() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xA7; 16],
+            admin1(),
+            DEADLINE + 50,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetRecoveryDesignates {
+                    designates: vec![d1(), d2()],
+                    threshold: 2,
+                    veto_window_ms: W,
+                },
+            },
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 100));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+    }
+
+    #[test]
+    fn forward_ref_cosign_before_proposal_counts() {
+        // Clock skew sorts the cosign BEFORE the proposal — it must be
+        // queued and folded (ZEB-250 R2(b) mirror). t_R becomes the 2nd
+        // smallest signature wall = t₀ itself.
+        let (mut events, digest) = base_world();
+        events.push(cosign([0xB1; 16], d2(), 99_000));
+        events.push(proposal(digest));
+        let m = materialize_with_now(&events, admin1(), Some(T0 + W + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(view(&m, P1).deadline_ms, Some(T0 + W));
+    }
+
+    #[test]
+    fn non_designate_cosign_is_ignored() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(ev(
+            [0xB1; 16],
+            m_new(),
+            T_R,
+            MembershipEventKind::RecoveryCosign {
+                target_event_id: P1,
+            },
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Collecting);
+    }
+
+    #[test]
+    fn duplicate_cosigner_counts_once() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        // The proposer cosigning their own proposal adds nothing.
+        events.push(cosign([0xB1; 16], d1(), T_R));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Collecting);
+        assert_eq!(view(&m, P1).signers.len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_admin_without_record_gets_banned_record_on_execution() {
+        // No explicit Join for admin1: the derived kick must INSERT a
+        // Banned record so the verify-side bootstrap-admin exceptions
+        // (None membership ⇒ "never kicked") stop honoring the dead key.
+        let (mut events, digest) = {
+            let mut events = vec![
+                ev([0xA1; 16], d1(), 1_000, MembershipEventKind::Join),
+                ev([0xA2; 16], d2(), 1_100, MembershipEventKind::Join),
+                ev([0xA3; 16], m_new(), 1_200, MembershipEventKind::Join),
+                ev(
+                    [0xA5; 16],
+                    admin1(),
+                    10_000,
+                    MembershipEventKind::AdminProposal {
+                        proposal_kind: ProposalKind::SetRecoveryDesignates {
+                            designates: vec![d1(), d2()],
+                            threshold: 2,
+                            veto_window_ms: W,
+                        },
+                    },
+                ),
+            ];
+            let m = materialize(&events, admin1());
+            let digest = recovery_config_digest(m.recovery_designates.as_ref().unwrap()).unwrap();
+            events.push(proposal(digest));
+            (events, digest)
+        };
+        let _ = digest;
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Banned);
+        assert!(m.pending_rotation_for.contains(&admin1()));
+    }
+
+    #[test]
+    fn terminal_states_are_stable_and_replay_deterministic() {
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        // Late extra cosign after execution: no-op (already terminal).
+        events.push(cosign([0xB3; 16], d1(), DEADLINE + 500));
+
+        let a = materialize_with_now(&events, admin1(), Some(DEADLINE + 1_000));
+        let b = materialize_with_now(&events, admin1(), Some(DEADLINE + 1_000));
+        assert_eq!(a, b, "materialize must be deterministic");
+        assert_eq!(view(&a, P1).phase, RecoveryPhase::Executed);
+
+        // Input order independence: reversed delivery converges.
+        let mut reversed = events.clone();
+        reversed.reverse();
+        let c = materialize_with_now(&reversed, admin1(), Some(DEADLINE + 1_000));
+        assert_eq!(a, c, "delivery order must not matter");
+    }
+
+    #[test]
+    fn invalid_bind_digest_proposal_is_invisible() {
+        // A proposal carrying a stale/wrong digest never becomes a work
+        // entry (defense-in-depth mirror of RP5).
+        let (mut events, _) = base_world();
+        events.push(ev(
+            P1,
+            d1(),
+            T0,
+            MembershipEventKind::RecoveryProposal {
+                lost_admin: admin1(),
+                new_admin: m_new(),
+                config_digest: [0xAB; 32],
+            },
+        ));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert!(m.recovery_proposals.is_empty());
+        assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+    }
+
+    #[test]
+    fn overflowing_window_fails_closed_never_executes() {
+        // Defense-in-depth: a u64::MAX window can only enter via events
+        // that BYPASSED verification (the RD4 ceiling rejects it there).
+        // The deadline addition must fail closed (Expired), not wrap
+        // small and execute immediately.
+        let mut events = vec![
+            ev([0xA0; 16], admin1(), 500, MembershipEventKind::Join),
+            ev([0xA1; 16], d1(), 1_000, MembershipEventKind::Join),
+            ev([0xA2; 16], d2(), 1_100, MembershipEventKind::Join),
+            ev([0xA3; 16], m_new(), 1_200, MembershipEventKind::Join),
+            ev(
+                [0xA5; 16],
+                admin1(),
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetRecoveryDesignates {
+                        designates: vec![d1(), d2()],
+                        threshold: 2,
+                        veto_window_ms: u64::MAX,
+                    },
+                },
+            ),
+        ];
+        let digest = recovery_config_digest(
+            materialize(&events, admin1())
+                .recovery_designates
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        let m = materialize_with_now(&events, admin1(), Some(u64::MAX - 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Expired);
+        assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Joined);
+    }
+
+    #[test]
+    fn new_admin_leaving_during_window_stalls_atomically() {
+        // PR #497 R2 (Greptile P1): execution is atomic. If new_admin
+        // left before the deadline, NOTHING executes — kicking the
+        // (sole) lost admin without the paired promotion would leave
+        // the community with no power-100 member at all.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xB6; 16],
+            m_new(),
+            DEADLINE - 100,
+            MembershipEventKind::Leave,
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Stalled);
+        assert_ne!(m.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Joined);
+        // No recovery-derived rotation marker (m_new IS marked — by
+        // their ordinary Leave, the normal ZEB-249 path).
+        assert!(!m.pending_rotation_for.contains(&admin1()));
+
+        // Terminal: a rejoin AFTER the deadline does not revive it.
+        events.push(ev(
+            [0xB7; 16],
+            m_new(),
+            DEADLINE + 50,
+            MembershipEventKind::Join,
+        ));
+        let after = materialize_with_now(&events, admin1(), Some(DEADLINE + 100));
+        assert_eq!(view(&after, P1).phase, RecoveryPhase::Stalled);
+        assert_eq!(after.members[&admin1()].status, MemberStatus::Joined);
+    }
+
+    #[test]
+    fn new_admin_leaving_after_deadline_execution_stands() {
+        // The snapshot is judged AS OF the deadline: a departure after
+        // it does not undo the (already-derived) execution; the granted
+        // power entry is inert without Joined status.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xB6; 16],
+            m_new(),
+            DEADLINE + 200,
+            MembershipEventKind::Leave,
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 300));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(m.power_levels.get(&m_new()).copied(), Some(100));
+        assert_eq!(m.members[&admin1()].status, MemberStatus::Banned);
+    }
+
+    #[test]
+    fn stalled_rival_never_flips_the_executed_winner() {
+        // p1 (lower t_R) stalls because its new_admin left mid-window;
+        // p2 executes. When p1's new_admin later rejoins, p1 must STAY
+        // stalled — the deadline-snapshot rule is what keeps the
+        // winner stable instead of retroactively re-deriving p2 away.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest)); // p1: lost=admin1, new=m_new, t0=T0
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xB6; 16],
+            m_new(),
+            DEADLINE - 100,
+            MembershipEventKind::Leave,
+        ));
+        // p2: same lost admin, new=m2, later t_R.
+        events.push(ev(
+            [0xB4; 16],
+            d2(),
+            101_000,
+            MembershipEventKind::RecoveryProposal {
+                lost_admin: admin1(),
+                new_admin: m2(),
+                config_digest: digest,
+            },
+        ));
+        events.push(ev(
+            [0xB5; 16],
+            d1(),
+            111_000,
+            MembershipEventKind::RecoveryCosign {
+                target_event_id: [0xB4; 16],
+            },
+        ));
+        let t_after = 111_000 + W + 1;
+        let m = materialize_with_now(&events, admin1(), Some(t_after));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Stalled);
+        assert_eq!(view(&m, [0xB4; 16]).phase, RecoveryPhase::Executed);
+        assert_eq!(m.power_levels.get(&m2()).copied(), Some(100));
+
+        // m_new rejoins — p1 stays stalled, p2 stays the winner.
+        events.push(ev(
+            [0xB8; 16],
+            m_new(),
+            t_after + 10,
+            MembershipEventKind::Join,
+        ));
+        let after = materialize_with_now(&events, admin1(), Some(t_after + 100));
+        assert_eq!(view(&after, P1).phase, RecoveryPhase::Stalled);
+        assert_eq!(view(&after, [0xB4; 16]).phase, RecoveryPhase::Executed);
+        assert_eq!(after.power_levels.get(&m2()).copied(), Some(100));
+        assert_ne!(after.power_levels.get(&m_new()).copied().unwrap_or(0), 100);
+    }
+}
+
+// ── ZEB-713 (ZEB-212 D1) admin-recovery verify_event tests ───────────────────
+
+#[cfg(test)]
+mod zeb_713_recovery_verify_tests {
+    use super::*;
+
+    const COM: SpaceId = SpaceId([0xc0; 16]);
+
+    fn hlc(wall_ms: u64, dev: &str) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: dev.into(),
+        }
+    }
+
+    fn joined_state(wall_ms: u64, dev: &str) -> MemberState {
+        MemberState {
+            status: MemberStatus::Joined,
+            joined_at: hlc(wall_ms, dev),
+            left_at: None,
+            enrolled_device_keys: BTreeSet::new(),
+            revoked_device_keys: BTreeSet::new(),
+        }
+    }
+
+    fn sign_with_identity(payload: EventPayload, owner: &TestOwner) -> SignedMembershipEvent {
+        sign_event(&payload, &owner.device_key).expect("sign_event must succeed")
+    }
+
+    /// Fixture world: admin (power 100), two designates, one regular
+    /// member (the recovery candidate), with a live RecoveryDesignates
+    /// config (R=2, W=floor).
+    struct World {
+        admin: TestOwner,
+        d1: TestOwner,
+        d2: TestOwner,
+        member: TestOwner,
+        prior: MaterializedMembership,
+        digest: [u8; 32],
+        ctx: VerifyContext,
+    }
+
+    fn world() -> World {
+        let admin = mint_test_owner(0x01);
+        let d1 = mint_test_owner(0x02);
+        let d2 = mint_test_owner(0x03);
+        let member = mint_test_owner(0x04);
+        let mut prior = MaterializedMembership::default();
+        for (o, dev) in [(&admin, "a"), (&d1, "d1"), (&d2, "d2"), (&member, "m")] {
+            prior.members.insert(o.owner, joined_state(0, dev));
+        }
+        prior.power_levels.insert(admin.owner, 100);
+        for o in [&admin, &d1, &d2, &member] {
+            test_enroll_member(&mut prior, o);
+        }
+        let config = RecoveryDesignates {
+            designates: vec![d1.owner, d2.owner],
+            threshold: 2,
+            veto_window_ms: RECOVERY_VETO_WINDOW_FLOOR_MS,
+            set_at: hlc(1_000, "cfg"),
+        };
+        let digest = recovery_config_digest(&config).expect("digest");
+        prior.recovery_designates = Some(config);
+        let ctx = VerifyContext {
+            expected_community_id: COM,
+            admin_addr: admin.owner,
+            is_invite_only: false,
+        };
+        World {
+            admin,
+            d1,
+            d2,
+            member,
+            prior,
+            digest,
+            ctx,
+        }
+    }
+
+    fn set_designates_event(
+        w: &World,
+        designates: Vec<OwnerAddr>,
+        threshold: u8,
+        veto_window_ms: u64,
+    ) -> SignedMembershipEvent {
+        sign_with_identity(
+            EventPayload {
+                id: [0x31; 16],
+                community_id: COM,
+                kind: MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetRecoveryDesignates {
+                        designates,
+                        threshold,
+                        veto_window_ms,
+                    },
+                },
+                actor: w.admin.owner,
+                at: hlc(5_000, "a"),
+            },
+            &w.admin,
+        )
+    }
+
+    fn proposal_event(
+        _w: &World,
+        actor: &TestOwner,
+        lost_admin: OwnerAddr,
+        new_admin: OwnerAddr,
+        config_digest: [u8; 32],
+    ) -> SignedMembershipEvent {
+        sign_with_identity(
+            EventPayload {
+                id: [0x41; 16],
+                community_id: COM,
+                kind: MembershipEventKind::RecoveryProposal {
+                    lost_admin,
+                    new_admin,
+                    config_digest,
+                },
+                actor: actor.owner,
+                at: hlc(6_000, "p"),
+            },
+            actor,
+        )
+    }
+
+    // ── RD gates (SetRecoveryDesignates shape, via AdminProposal) ──
+
+    #[test]
+    fn rd1_empty_designates_rejected() {
+        let w = world();
+        let evt = set_designates_event(&w, vec![], 1, RECOVERY_VETO_WINDOW_FLOOR_MS);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryDesignatesMalformed)
+        );
+    }
+
+    #[test]
+    fn rd1_duplicate_designates_rejected() {
+        let w = world();
+        let evt = set_designates_event(
+            &w,
+            vec![w.d1.owner, w.d1.owner],
+            1,
+            RECOVERY_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryDesignatesMalformed)
+        );
+    }
+
+    #[test]
+    fn rd2_designate_not_joined_rejected() {
+        let mut w = world();
+        w.prior.members.get_mut(&w.d2.owner).unwrap().status = MemberStatus::Left;
+        let evt = set_designates_event(
+            &w,
+            vec![w.d1.owner, w.d2.owner],
+            1,
+            RECOVERY_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryDesignateNotJoined)
+        );
+    }
+
+    #[test]
+    fn rd3_threshold_zero_rejected() {
+        let w = world();
+        let evt = set_designates_event(&w, vec![w.d1.owner], 0, RECOVERY_VETO_WINDOW_FLOOR_MS);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryThresholdOutOfRange)
+        );
+    }
+
+    #[test]
+    fn rd3_threshold_above_designate_count_rejected() {
+        let w = world();
+        let evt = set_designates_event(
+            &w,
+            vec![w.d1.owner, w.d2.owner],
+            3,
+            RECOVERY_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryThresholdOutOfRange)
+        );
+    }
+
+    #[test]
+    fn rd4_window_below_floor_rejected() {
+        let w = world();
+        let evt = set_designates_event(
+            &w,
+            vec![w.d1.owner, w.d2.owner],
+            2,
+            RECOVERY_VETO_WINDOW_FLOOR_MS - 1,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryVetoWindowTooShort)
+        );
+    }
+
+    #[test]
+    fn rd4_window_above_ceiling_rejected() {
+        let w = world();
+        let evt = set_designates_event(
+            &w,
+            vec![w.d1.owner, w.d2.owner],
+            2,
+            RECOVERY_VETO_WINDOW_CEILING_MS + 1,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryVetoWindowTooLong)
+        );
+    }
+
+    #[test]
+    fn rd_valid_set_designates_accepted() {
+        let w = world();
+        let evt = set_designates_event(
+            &w,
+            vec![w.d1.owner, w.d2.owner],
+            2,
+            RECOVERY_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // ── RP gates (RecoveryProposal) ──
+
+    #[test]
+    fn rp2_unconfigured_rejected() {
+        let mut w = world();
+        w.prior.recovery_designates = None;
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryNotConfigured)
+        );
+    }
+
+    #[test]
+    fn rp1_actor_not_designate_rejected() {
+        let w = world();
+        let evt = proposal_event(
+            &w,
+            &w.member.clone(),
+            w.admin.owner,
+            w.member.owner,
+            w.digest,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryProposalActorNotDesignate)
+        );
+    }
+
+    #[test]
+    fn rp1_designate_no_longer_joined_rejected() {
+        let mut w = world();
+        w.prior.members.get_mut(&w.d1.owner).unwrap().status = MemberStatus::Left;
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryProposalActorNotDesignate)
+        );
+    }
+
+    #[test]
+    fn rp4_lost_admin_not_admin_rejected() {
+        let w = world();
+        // "lost" target is a regular member, not power-100.
+        let evt = proposal_event(&w, &w.d1.clone(), w.member.owner, w.d2.owner, w.digest);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryProposalLostAdminNotAdmin)
+        );
+    }
+
+    #[test]
+    fn rp4_bootstrap_admin_without_member_record_accepted() {
+        let mut w = world();
+        // The bootstrap admin may have implicit power with no member
+        // record (never explicitly Joined) — recovery must still be
+        // able to name them lost.
+        w.prior.members.remove(&w.admin.owner);
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    #[test]
+    fn rp3_new_admin_already_admin_rejected() {
+        let mut w = world();
+        w.prior.power_levels.insert(w.member.owner, 100);
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryProposalNewAdminInvalid)
+        );
+    }
+
+    #[test]
+    fn rp3_new_admin_equals_lost_admin_rejected() {
+        let w = world();
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.admin.owner, w.digest);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryProposalNewAdminInvalid)
+        );
+    }
+
+    #[test]
+    fn rp3_new_admin_not_joined_rejected() {
+        let mut w = world();
+        w.prior.members.get_mut(&w.member.owner).unwrap().status = MemberStatus::Left;
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryProposalNewAdminInvalid)
+        );
+    }
+
+    #[test]
+    fn rp5_config_digest_mismatch_rejected() {
+        let w = world();
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, [0xAB; 32]);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryProposalConfigDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn rp6_open_proposal_by_same_actor_rejected() {
+        let mut w = world();
+        w.prior.recovery_proposals.push(RecoveryProposalView {
+            id: [0x99; 16],
+            proposer: w.d1.owner,
+            lost_admin: w.admin.owner,
+            new_admin: w.member.owner,
+            signers: BTreeSet::from([w.d1.owner]),
+            threshold: 2,
+            proposed_at_wall_ms: 4_000,
+            deadline_ms: None,
+            phase: RecoveryPhase::Collecting,
+        });
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryProposalActorHasOpenProposal)
+        );
+    }
+
+    #[test]
+    fn rp6_terminal_proposal_does_not_block() {
+        let mut w = world();
+        w.prior.recovery_proposals.push(RecoveryProposalView {
+            id: [0x99; 16],
+            proposer: w.d1.owner,
+            lost_admin: w.admin.owner,
+            new_admin: w.member.owner,
+            signers: BTreeSet::from([w.d1.owner]),
+            threshold: 2,
+            proposed_at_wall_ms: 4_000,
+            deadline_ms: None,
+            phase: RecoveryPhase::Vetoed,
+        });
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    #[test]
+    fn rp_valid_proposal_accepted() {
+        let w = world();
+        let evt = proposal_event(&w, &w.d1.clone(), w.admin.owner, w.member.owner, w.digest);
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // ── RC gates (RecoveryCosign) ──
+
+    fn cosign_event(_w: &World, actor: &TestOwner, target: EventId) -> SignedMembershipEvent {
+        sign_with_identity(
+            EventPayload {
+                id: [0x51; 16],
+                community_id: COM,
+                kind: MembershipEventKind::RecoveryCosign {
+                    target_event_id: target,
+                },
+                actor: actor.owner,
+                at: hlc(7_000, "c"),
+            },
+            actor,
+        )
+    }
+
+    #[test]
+    fn rc1_not_designate_rejected() {
+        let w = world();
+        let evt = cosign_event(&w, &w.member.clone(), [0x41; 16]);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryCosignActorNotDesignate)
+        );
+    }
+
+    #[test]
+    fn rc_unconfigured_rejected() {
+        let mut w = world();
+        w.prior.recovery_designates = None;
+        let evt = cosign_event(&w, &w.d2.clone(), [0x41; 16]);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryNotConfigured)
+        );
+    }
+
+    #[test]
+    fn rc_zero_target_rejected() {
+        let w = world();
+        let evt = cosign_event(&w, &w.d2.clone(), [0u8; 16]);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryCosignTargetIdMalformed)
+        );
+    }
+
+    #[test]
+    fn rc_valid_forward_ref_accepted() {
+        // Target proposal not in any log — lenient forward-ref, mirrors
+        // AdminCountersign.
+        let w = world();
+        let evt = cosign_event(&w, &w.d2.clone(), [0x41; 16]);
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // ── RV gates (RecoveryVeto) ──
+
+    fn veto_event(_w: &World, actor: &TestOwner, target: EventId) -> SignedMembershipEvent {
+        sign_with_identity(
+            EventPayload {
+                id: [0x61; 16],
+                community_id: COM,
+                kind: MembershipEventKind::RecoveryVeto {
+                    target_event_id: target,
+                },
+                actor: actor.owner,
+                at: hlc(8_000, "v"),
+            },
+            actor,
+        )
+    }
+
+    #[test]
+    fn rv1_non_admin_rejected() {
+        let w = world();
+        let evt = veto_event(&w, &w.d1.clone(), [0x41; 16]);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryVetoActorNotAdmin)
+        );
+    }
+
+    #[test]
+    fn rv1_admin_accepted() {
+        let w = world();
+        let evt = veto_event(&w, &w.admin.clone(), [0x41; 16]);
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    #[test]
+    fn rv_zero_target_rejected() {
+        let w = world();
+        let evt = veto_event(&w, &w.admin.clone(), [0u8; 16]);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::RecoveryVetoTargetIdMalformed)
         );
     }
 }

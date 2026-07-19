@@ -33938,6 +33938,10 @@ where
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            // ZEB-713: recovery state is not part of the epoch snapshot;
+            // the hint is superseded by CRDT replay once events arrive.
+            recovery_designates: None,
+            recovery_proposals: Vec::new(),
         };
         if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
             let state_g = state_arc.lock().await;
@@ -42019,6 +42023,14 @@ pub enum ProposalKindDto {
     ChangeQuorum {
         new_quorum: u8,
     },
+    /// ZEB-713: recovery-designate configuration proposal. Designates
+    /// are hex-encoded OwnerAddrs; display-name resolution is the
+    /// frontend's job (same convention as signer_display_names).
+    SetRecoveryDesignates {
+        designate_addrs: Vec<String>,
+        threshold: u8,
+        veto_window_ms: u64,
+    },
 }
 
 /// ZEB-250 §6.2: admin governance feed — all AdminProposal events for a
@@ -42323,6 +42335,15 @@ pub fn compute_pending_admin_proposals(
             },
             ProposalKind::ChangeQuorum { new_quorum } => ProposalKindDto::ChangeQuorum {
                 new_quorum: *new_quorum,
+            },
+            ProposalKind::SetRecoveryDesignates {
+                designates,
+                threshold,
+                veto_window_ms,
+            } => ProposalKindDto::SetRecoveryDesignates {
+                designate_addrs: designates.iter().map(|d| hex::encode(d.0)).collect(),
+                threshold: *threshold,
+                veto_window_ms: *veto_window_ms,
             },
         };
 
@@ -42976,6 +42997,14 @@ pub fn delta_to_change(
         // membership-state; no MembershipChange is projected. Consumed
         // by CommunityRelayResolver.
         | crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. }
+        // ZEB-713: recovery events are governance events with DERIVED
+        // effects (evaluated at materialize time, not at event arrival);
+        // no per-event MembershipChange is projected. The D2 recovery
+        // banner reads the materialized recovery_proposals view via its
+        // own IPC instead.
+        | crate::community_membership::MembershipEventKind::RecoveryProposal { .. }
+        | crate::community_membership::MembershipEventKind::RecoveryCosign { .. }
+        | crate::community_membership::MembershipEventKind::RecoveryVeto { .. }
         // ZEB-495 (ZEB-340 Part 2): DeviceAnnounce only adds a device key to
         // an already-Joined owner's MemberState — it changes no status/power
         // and projects no MembershipChange. (The roster re-renders the owner
@@ -43436,11 +43465,32 @@ pub async fn self_heal_community_observer(
             .map(|e| e.id);
 
         let Some(triggered_by) = triggered_by_id else {
-            tracing::warn!(
-                ?community_id,
-                ?target,
-                "self_heal: pending_rotation_for but no Kick/Leave event found — skipping"
-            );
+            // ZEB-713 (PR #497 R2): a recovery-derived kick has no
+            // Kick/Leave event — its rotation cites the executed
+            // RecoveryProposal instead, and synthesizing it belongs to
+            // the ZEB-714 observer wiring because it must first honor
+            // the F=48h finality margin (spec §4.3); firing here at the
+            // deadline would violate that. Expected state, debug-level.
+            let recovery_derived = materialized.recovery_proposals.iter().any(|p| {
+                p.lost_admin == target
+                    && matches!(
+                        p.phase,
+                        crate::community_membership::RecoveryPhase::Executed
+                    )
+            });
+            if recovery_derived {
+                tracing::debug!(
+                    ?community_id,
+                    ?target,
+                    "self_heal: recovery-derived kick — rotation synthesis deferred to ZEB-714 (finality margin)"
+                );
+            } else {
+                tracing::warn!(
+                    ?community_id,
+                    ?target,
+                    "self_heal: pending_rotation_for but no Kick/Leave event found — skipping"
+                );
+            }
             continue;
         };
 
@@ -43918,6 +43968,8 @@ mod community_member_dto_tests {
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            recovery_designates: None,
+            recovery_proposals: Vec::new(),
         };
         let dto = member_info_for(&materialized);
 
@@ -43965,6 +44017,8 @@ mod community_member_dto_tests {
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            recovery_designates: None,
+            recovery_proposals: Vec::new(),
         };
         let dto = member_info_for(&materialized);
         assert_eq!(dto.len(), 2);
