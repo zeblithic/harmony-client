@@ -5558,6 +5558,25 @@ pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: 
     )
 }
 
+/// ZEB-250 §4.3 / ZEB-300 T1: a SetPower is "admin-affecting" when it grants
+/// top power (`level == max`) or touches a member who currently holds top
+/// power. Extracted so the direct-SetPower quorum guard and the
+/// AdminProposal-routing planner share one predicate (previously copied
+/// inline in `verify_event`, the `set_power_level` IPC, and
+/// `setpower_mint_admin_blocked_by_quorum`).
+///
+/// Uses `POWER_THRESHOLDS.max` (the admin-tier cap), NOT
+/// `POWER_THRESHOLDS.set_power` (the minimum power to CALL SetPower). These
+/// are coincidentally equal (100) in v1 but conceptually distinct.
+pub(crate) fn is_admin_affecting_set_power(
+    mat: &MaterializedMembership,
+    target: OwnerAddr,
+    level: u8,
+) -> bool {
+    let target_power = mat.power_levels.get(&target).copied().unwrap_or(0);
+    level == POWER_THRESHOLDS.max || target_power == POWER_THRESHOLDS.max
+}
+
 /// ZEB-297 R2 (CodeRabbit Major): mirrors `verify_event`'s third SetPower
 /// precondition — direct SetPower of an admin-affecting target is rejected
 /// when `admin_quorum > 1` (spec §4.5 / ZEB-250). Without this check, a
@@ -5592,8 +5611,7 @@ pub fn setpower_mint_admin_blocked_by_quorum(
     if mat.admin_quorum <= 1 {
         return false;
     }
-    let target_power = mat.power_levels.get(&target).copied().unwrap_or(0);
-    level == POWER_THRESHOLDS.max || target_power == POWER_THRESHOLDS.max
+    is_admin_affecting_set_power(mat, target, level)
 }
 
 /// ZEB-291 Phase 2 Task 10: auto-exec dispatch from a Tier 2 contestability finalize.
@@ -6009,6 +6027,25 @@ mod auto_exec_tests {
         // target is moderator-tier; moving 30 → 70 is non-admin-affecting.
         mat.power_levels.insert(target, 30);
         assert!(!setpower_mint_admin_blocked_by_quorum(&mat, target, 70));
+    }
+
+    /// ZEB-300 T1: the extracted `is_admin_affecting_set_power` helper
+    /// classifies a (target, level) as admin-affecting when the new level
+    /// grants top power OR the target currently holds top power — the same
+    /// predicate the three prior inline copies used.
+    #[test]
+    fn is_admin_affecting_set_power_true_for_promote_to_100() {
+        let mut mat = MaterializedMembership::default();
+        let target = OwnerAddr([7u8; 16]);
+        // target currently non-admin (power 0), level 100 => admin-affecting
+        assert!(is_admin_affecting_set_power(&mat, target, 100));
+        // target currently admin (power 100), level 50 (demote) => admin-affecting
+        mat.power_levels.insert(target, 100);
+        assert!(is_admin_affecting_set_power(&mat, target, 50));
+        // non-admin-affecting: target power 10, level 20
+        let other = OwnerAddr([8u8; 16]);
+        mat.power_levels.insert(other, 10);
+        assert!(!is_admin_affecting_set_power(&mat, other, 20));
     }
 
     /// Apply-auto-exec helper test: bounds-check on `new_power > 100`.
