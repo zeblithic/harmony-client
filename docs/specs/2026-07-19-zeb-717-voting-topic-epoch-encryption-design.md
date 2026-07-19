@@ -119,82 +119,105 @@ before attempting decryption; decrypt the current-epoch envelope with `current_e
 
 ## 4. Architecture
 
-**Crypto lives in the engine; the Zenoh adapter stays a pure byte relay.**
-`spawn_voting_log_zenoh_adapter` is **unchanged**.
+**Crypto lives in the Zenoh adapter (the wire boundary); the engine is unchanged.**
+Placement chosen at implementation review (2026-07-19): the voting engine has no `crdt_state` today
+(unlike the state-root plane's `handle_incoming_publish`, which already holds it), and 27 of 28
+engine-construction sites are tests that bridge engine↔engine over plaintext mpsc. Encrypting in the
+engine would force a heavyweight `Arc<Mutex<OwnerState>>` coupling onto the engine and make every
+bridge test carry ciphertext (shared-epoch-key seeding across ~6 files). Encrypting at the adapter —
+the layer that actually touches Zenoh, spawned from the event loop where `crdt_state` already lives —
+gives a cleaner invariant (**everything on the Zenoh wire is ciphertext; everything in-process is
+plaintext**), keeps voting-logic tests decoupled from crypto, and leaves all in-process/mpsc-bridged
+tests untouched. Trade-off accepted: voting's adapter is no longer a pure byte relay (channel-log and
+state-root adapters still are).
 
-### 4.1 Engine gains the live key source
+### 4.1 Adapter gains the live key source
 
-`VotingLogEngine<R>` / `VotingLogEngineParams` gain `crdt_state: Arc<Mutex<OwnerState>>`. It is
-already in scope at the sole construction site `ensure_voting_engine_for` (`lib.rs:47847`, which
-already clones `crdt_state` into `OwnerDeviceCacheResolver`). The engine reads the community `Space`
-(`crdt_state.lock().spaces.get(&self.community_id)`) for the live epoch key at encrypt/decrypt time.
+`spawn_voting_log_zenoh_adapter` (`event_loop.rs:9352`) and its `VotingLogAdapterRequest`
+(`event_loop.rs:170`) gain `community_id: SpaceId` + `crdt_state: Arc<Mutex<OwnerState>>`. Both are on
+hand where the request is built (`ensure_voting_engine_for`, `lib.rs:47965`, which already clones
+`crdt_state` into `OwnerDeviceCacheResolver`). The adapter reads the community `Space`
+(`crdt_state.lock().await.spaces.get(&community_id)`) for the live epoch key at put/recv time. The
+`VotingLogEngine` and its `Params` are **unchanged**.
 
-### 4.2 Publish seam (`community_voting_log_engine.rs:1543-1694`)
+### 4.2 Publish seam — adapter outbound (`event_loop.rs:9399-9410`)
 
-After CBOR-encoding the `SignedVotingEvent` into `packet`:
-
-```
-let plaintext = packet;                       // existing ciborium::into_writer output
-let envelope = {                              // brief crdt_state lock, crypto only
-    let st = self.crdt_state.lock().await;
-    let space = st.spaces.get(&self.community_id).ok_or("no such community space")?;
-    encrypt_for_topic_with_aad(space, &plaintext, VOTING_TOPIC_AAD)?   // encrypts under current epoch
-};
-let mut wire = Vec::new();
-ciborium::into_writer(&envelope, &mut wire)?;
-self.publisher_tx.send(wire).await …          // was: send(packet)
-```
-
-The `crdt_state` lock is held only for the (sync, microsecond) key read + crypto and released before
-any `voting_log` lock — no new lock-ordering edge. `MissingEpochState` → the publish IPC returns an
-error (a node without the community epoch key cannot vote; intended containment, never a panic).
-
-### 4.3 Receive seam (`community_voting_log_engine.rs:2506` `process_inbound_dispatch`)
-
-Decrypt **once** at the wire-ingress boundary with the current-epoch-only cut, then feed the plaintext
-to both existing decode sites (the `:2515` lifecycle peek and `process_inbound`'s decode at `:2417`):
+The engine still sends plaintext `SignedVotingEvent` CBOR on `publisher_rx`. Before `session_pub.put`,
+the adapter encrypts:
 
 ```
-async fn process_inbound_dispatch(self: &Arc<Self>, packet: &[u8]) -> Result<(), String> {
-    let envelope: EncryptedEnvelope = ciborium::from_reader(packet)
-        .map_err(|e| format!("voting envelope decode: {e}"))?;
-    let plaintext = {                          // single lock: epoch gate + decrypt, no TOCTOU
-        let st = self.crdt_state.lock().await;
-        let space = st.spaces.get(&self.community_id).ok_or("no such community space")?;
-        // D3 current-epoch-only cut — the containment gate:
-        match space.current_epoch {
-            Some(cur) if cur == envelope.epoch => {}
-            _ => return Ok(()),                // stale/unknown epoch -> drop (kicked-then-rotated path)
+maybe = publisher_rx.recv() => {
+    let Some(plaintext) = maybe else { break; };
+    let wire = {                                   // brief crdt_state lock, crypto only
+        let st = crdt_state.lock().await;
+        match st.spaces.get(&community_id) {
+            Some(space) => match encrypt_for_topic_with_aad(space, &plaintext, VOTING_TOPIC_AAD) {
+                Ok(env) => { let mut w = Vec::new(); ciborium::into_writer(&env, &mut w).ok(); Some(w) }
+                Err(e) => { tracing::warn!(%topic_pub, err=%e, "voting encrypt failed; dropping outbound"); None }
+            },
+            None => { tracing::warn!(%topic_pub, "no community space; dropping outbound voting packet"); None }
         }
-        decrypt_for_topic_with_aad(space, &envelope, VOTING_TOPIC_AAD)
-            .map_err(|e| format!("voting decrypt: {e}"))?   // tag mismatch -> drop
     };
-    // …existing body, but the :2515 peek and Self::process_inbound both consume `&plaintext`
+    if let Some(wire) = wire {
+        if let Err(e) = session_pub.put(&key_pub, wire).await { /* existing !closing warn */ }
+    }
 }
 ```
 
-`process_inbound`'s `packet: &[u8]` signature is unchanged — it receives plaintext, so all downstream
-verify/apply/dedup logic is byte-for-byte identical to today. The receive-loop callsite already logs
-`Err` at `warn` and does not propagate, so decode/decrypt failures degrade to a dropped packet exactly
-like today's malformed-packet path.
+Missing epoch state → the outbound packet is dropped (the engine already applied locally; a node
+without the epoch key is not a broadcasting member — intended containment). No panic.
+
+### 4.3 Receive seam — adapter inbound (`event_loop.rs:9489-9492`)
+
+The bytes off Zenoh are now an `EncryptedEnvelope` CBOR. Before forwarding plaintext to the engine on
+`subscriber_tx`, the adapter applies the current-epoch-only cut and decrypts:
+
+```
+let raw: Vec<u8> = sample.payload().to_bytes().to_vec();
+let plaintext = {                                  // single lock: epoch gate + decrypt, no TOCTOU
+    let envelope: EncryptedEnvelope = match ciborium::from_reader(raw.as_slice()) {
+        Ok(env) => env,
+        Err(e) => { tracing::warn!(%topic_sub, err=%e, "drop voting packet (envelope decode)"); continue; }
+    };
+    let st = crdt_state.lock().await;
+    let Some(space) = st.spaces.get(&community_id) else { continue; };
+    // D3 current-epoch-only cut — the containment gate:
+    match space.current_epoch {
+        Some(cur) if cur == envelope.epoch => {}
+        _ => { tracing::warn!(%topic_sub, epoch=envelope.epoch, "drop voting packet (stale/unknown epoch)"); continue; }
+    }
+    match decrypt_for_topic_with_aad(space, &envelope, VOTING_TOPIC_AAD) {
+        Ok(pt) => pt,
+        Err(e) => { tracing::warn!(%topic_sub, err=%e, "drop voting packet (decrypt)"); continue; }
+    }
+};
+if subscriber_tx.send(plaintext).await.is_err() { break; }
+```
+
+The engine's `process_inbound_dispatch` / `process_inbound` receive plaintext `SignedVotingEvent` CBOR
+exactly as today — **zero engine changes**. The 64 KiB size cap already applied to the raw payload
+still runs first.
 
 ### 4.4 Data flow summary
 
 ```
-publish:  SignedVotingEvent --cbor--> plaintext --encrypt@current+AAD--> EncryptedEnvelope --cbor--> wire --> Zenoh put
-receive:  Zenoh sample --cbor--> EncryptedEnvelope --[epoch==current?]--> decrypt@current+AAD --> plaintext --cbor--> SignedVotingEvent --> verify@hlc --> apply
+publish:  engine: SignedVotingEvent --cbor--> plaintext --> publisher_rx
+          adapter: encrypt@current+AAD --> EncryptedEnvelope --cbor--> Zenoh put
+receive:  adapter: Zenoh sample --cbor--> EncryptedEnvelope --[epoch==current?]--> decrypt@current+AAD --> plaintext
+          engine:  subscriber_rx --> SignedVotingEvent --> verify@hlc --> apply
 ```
 
 ## 5. Error handling
 
-- **Publish, missing epoch key:** `MissingEpochState` → publish IPC returns an error. A non-member
-  without the epoch key must not emit voting events.
-- **Receive, stale/unknown epoch:** `envelope.epoch != current_epoch` → drop (`warn`). Containment
-  path for a kicked-then-rotated member.
+All handled in the adapter; every failure is a drop the adapter loops already tolerate (no panic, no
+change to engine error surfaces):
+
+- **Publish, missing epoch state:** adapter drops the outbound packet (`warn`). The engine already
+  applied locally; a node without the epoch key is not a broadcasting member (intended containment).
+- **Receive, stale/unknown epoch:** `envelope.epoch != current_epoch` → `continue` (drop, `warn`).
+  Containment path for a kicked-then-rotated member.
 - **Receive, tag mismatch (tamper or cross-plane replay):** `DecryptionFailed(epoch)` → drop.
 - **Receive, malformed envelope CBOR:** decode error → drop, same posture as today's malformed packet.
-
-No new panics; all failures are `Result` drops the receive loop already tolerates.
 
 ## 6. Testing
 
@@ -240,9 +263,10 @@ pins.
 
 ## 8. Files touched
 
-- `src-tauri/src/community_state_sync.rs` — add `encrypt_for_topic_with_aad` / `decrypt_for_topic_with_aad`; existing 2-arg helpers delegate with `b""`.
-- `src-tauri/src/community_voting_log_engine.rs` — `crdt_state` field on engine + `VotingLogEngineParams`; encrypt at publish seam; current-epoch-only decrypt at `process_inbound_dispatch`; `VOTING_TOPIC_AAD` const.
-- `src-tauri/src/lib.rs` — thread `crdt_state` into the engine at `ensure_voting_engine_for`.
-- `src-tauri/tests/community_voting/community_voting_zenoh_integration.rs` — post-kick+rotation rejection test.
-- `src-tauri/tests/wire_format/…` voting fixtures — envelope wire refresh.
-- `src-tauri/src/event_loop.rs` — **no change** (`spawn_voting_log_zenoh_adapter` stays a byte relay).
+- `src-tauri/src/community_state_sync.rs` — add `encrypt_for_topic_with_aad` / `decrypt_for_topic_with_aad` (existing 2-arg helpers delegate with `b""`); `pub const VOTING_TOPIC_AAD = b"harmony-voting-v1"`. **[done — Task 1]**
+- `src-tauri/src/event_loop.rs` — `VotingLogAdapterRequest` gains `community_id: SpaceId` + `crdt_state`; `spawn_voting_log_zenoh_adapter` gains the same params and does encrypt-on-put + current-epoch-only-decrypt-on-recv.
+- `src-tauri/src/lib.rs` — populate the two new `VotingLogAdapterRequest` fields at `ensure_voting_engine_for` (`crdt_state` already in scope).
+- `src-tauri/tests/community_voting/community_voting_zenoh_integration.rs` — seed epoch state on both nodes; post-kick+rotation rejection test.
+- `src-tauri/tests/community_voting/community_voting_tier2_delegate_on_behalf_integration.rs` — seed epoch state (uses the real adapter).
+- `src-tauri/tests/wire_format/…` voting fixtures — envelope wire refresh (if any pin topic bytes).
+- `src-tauri/src/community_voting_log_engine.rs` — **no change** (engine stays wire-format-agnostic; all mpsc-bridged voting tests untouched).

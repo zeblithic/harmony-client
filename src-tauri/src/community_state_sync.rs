@@ -383,6 +383,14 @@ pub enum EpochError {
     MissingEpochState,
 }
 
+/// ZEB-717 D1: domain-separation AAD for the voting Zenoh topic. The voting
+/// adapter binds this via [`encrypt_for_topic_with_aad`] /
+/// [`decrypt_for_topic_with_aad`]; the state-root plane uses empty AAD (the
+/// 2-arg helpers). Both planes share the community epoch key, so this distinct
+/// AAD makes a cross-plane ciphertext fail the AEAD tag rather than merely a
+/// downstream deserialize. Versioned (`-v1`) for future rotation.
+pub const VOTING_TOPIC_AAD: &[u8] = b"harmony-voting-v1";
+
 /// Encrypt `plaintext` under the community's current epoch key,
 /// wrapping the AEAD output in an `EncryptedEnvelope` that tags the
 /// epoch for receiver-side key selection.
