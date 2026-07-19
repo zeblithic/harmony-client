@@ -44,16 +44,21 @@ pub struct TickStats {
     /// returned `Err`). Each Tier 2 finalization with a SetPower auto-
     /// exec increments exactly one of these four on every replica.
     pub tier2_auto_execs_skipped_not_admin: u32,
-    /// ZEB-297 R2: number of `AutoExecAction::SetPower` dispatches
-    /// skipped because the community has `admin_quorum > 1` AND the
-    /// outcome is admin-affecting (would require AdminProposal routing
-    /// per spec §4.5). Direct SetPower would self-reject at
-    /// `verify_event` with `SetPowerRequiresQuorum`; the auto-exec
-    /// path declines to mint a doomed event. Tier 2 cannot currently
-    /// route through AdminProposal — a follow-up ticket tracks that
-    /// architectural gap. Until then, the outcome lands as a NoOp on
-    /// every replica.
-    pub tier2_auto_execs_skipped_requires_quorum: u32,
+    /// ZEB-300: number of `AutoExecAction::SetPower` dispatches on an
+    /// admin-affecting change under `admin_quorum > 1` where this replica
+    /// minted a fresh `AdminProposal::SetPower` (no prior live proposal for
+    /// the exact target/level). Routes admin-tier changes through the
+    /// AdminProposal quorum machinery per spec §4.5.
+    pub tier2_auto_execs_routed_proposal_minted: u32,
+    /// ZEB-300: number of admin-affecting dispatches where this replica
+    /// countersigned the canonical pending `AdminProposal::SetPower`,
+    /// advancing it toward `admin_quorum` signatures.
+    pub tier2_auto_execs_routed_proposal_countersigned: u32,
+    /// ZEB-300: number of admin-affecting dispatches where this replica had
+    /// nothing to mint this tick — the effect was already applied, or this
+    /// replica had already signed the canonical proposal. Steady state
+    /// while the routing converges across ticks.
+    pub tier2_auto_execs_routed_proposal_pending: u32,
     pub archive_swept: bool,
 }
 
@@ -324,15 +329,23 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                             // membership log sync.
                             stats.tier2_auto_execs_skipped_not_admin += 1;
                         }
-                        Ok(crate::community_membership::AutoExecOutcome::SkippedRequiresQuorum) => {
-                            // ZEB-297 R2: community has admin_quorum > 1
-                            // and the outcome is admin-affecting; direct
-                            // SetPower would be rejected with
-                            // SetPowerRequiresQuorum. Tier 2 auto-exec
-                            // cannot route through AdminProposal yet —
-                            // tracked as a follow-up. Skip with telemetry
-                            // so the gap is visible in stats.
-                            stats.tier2_auto_execs_skipped_requires_quorum += 1;
+                        Ok(crate::community_membership::AutoExecOutcome::RoutedProposalMinted) => {
+                            // ZEB-300: admin_quorum > 1 + admin-affecting;
+                            // this replica minted a fresh AdminProposal to
+                            // route the change through quorum.
+                            stats.tier2_auto_execs_routed_proposal_minted += 1;
+                        }
+                        Ok(crate::community_membership::AutoExecOutcome::RoutedProposalCountersigned) => {
+                            // ZEB-300: this replica countersigned the
+                            // canonical pending AdminProposal, advancing it
+                            // toward admin_quorum.
+                            stats.tier2_auto_execs_routed_proposal_countersigned += 1;
+                        }
+                        Ok(crate::community_membership::AutoExecOutcome::RoutedProposalPending) => {
+                            // ZEB-300: nothing to mint this tick (effect
+                            // already applied, or this replica already
+                            // signed the canonical proposal).
+                            stats.tier2_auto_execs_routed_proposal_pending += 1;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -923,16 +936,17 @@ mod tests {
         );
     }
 
-    /// ZEB-297 R2: when the auto-exec callback returns
-    /// `SkippedRequiresQuorum` (community has `admin_quorum > 1` and the
-    /// outcome is admin-affecting), the tick must increment
-    /// `tier2_auto_execs_skipped_requires_quorum` rather than
+    /// ZEB-300: when the auto-exec callback returns `RoutedProposalMinted`
+    /// (community has `admin_quorum > 1` and the outcome is admin-affecting,
+    /// so this replica minted an `AdminProposal::SetPower`), the tick must
+    /// increment `tier2_auto_execs_routed_proposal_minted` rather than
     /// `tier2_auto_execs_succeeded` or `tier2_auto_execs_skipped_not_admin`.
-    /// Pins the dispatch's three-way branch so a future variant addition
-    /// or counter-name rename can't silently re-route quorum-blocked
-    /// dispatches into the wrong bucket.
+    /// Pins the dispatch's branch so a future variant addition or
+    /// counter-name rename can't silently re-route dispatches into the
+    /// wrong bucket.
     #[tokio::test]
-    async fn community_voting_tick_tier2_auto_exec_set_power_skipped_when_quorum_blocks() {
+    async fn community_voting_tick_tier2_auto_exec_set_power_routes_to_proposal_when_quorum_blocks()
+    {
         let cid = SpaceId([0x55; 16]);
         let pid = PollId([0x66; 32]);
         let target = OwnerAddr([0xcc; 16]);
@@ -960,13 +974,14 @@ mod tests {
         let now_ms = reached_at + 25 * 60 * 60 * 1000;
         let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms);
 
-        // Override the captured callback to simulate an admin replica in
-        // a multi-admin-quorum community: return SkippedRequiresQuorum
-        // instead of Applied. The real helper does this via
-        // setpower_mint_admin_blocked_by_quorum at the engine boundary.
+        // Override the captured callback to simulate an admin replica in a
+        // multi-admin-quorum community that minted the routing proposal:
+        // return RoutedProposalMinted instead of Applied. The real helper
+        // does this via apply_auto_exec_admin_proposal_set_power at the
+        // engine boundary.
         ctx.auto_exec_set_power = Arc::new(|_cid, _target, _power| {
             Box::pin(async {
-                Ok(crate::community_membership::AutoExecOutcome::SkippedRequiresQuorum)
+                Ok(crate::community_membership::AutoExecOutcome::RoutedProposalMinted)
             })
         });
 
@@ -975,15 +990,23 @@ mod tests {
         assert_eq!(stats.tier2_auto_execs_attempted, 1);
         assert_eq!(
             stats.tier2_auto_execs_succeeded, 0,
-            "quorum-skip path must NOT bump the success counter"
+            "routed path must NOT bump the success counter"
         );
         assert_eq!(
             stats.tier2_auto_execs_skipped_not_admin, 0,
-            "quorum-skip path must NOT collide with the not-admin counter"
+            "routed path must NOT collide with the not-admin counter"
         );
         assert_eq!(
-            stats.tier2_auto_execs_skipped_requires_quorum, 1,
-            "quorum-skip path must bump the dedicated quorum-skip counter exactly once"
+            stats.tier2_auto_execs_routed_proposal_minted, 1,
+            "routed-mint path must bump the dedicated routed-minted counter exactly once"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_routed_proposal_countersigned, 0,
+            "routed-mint path must NOT bump the countersigned counter"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_routed_proposal_pending, 0,
+            "routed-mint path must NOT bump the pending counter"
         );
     }
 
@@ -1041,8 +1064,8 @@ mod tests {
             "Err path must NOT bump the not-admin skip counter"
         );
         assert_eq!(
-            stats.tier2_auto_execs_skipped_requires_quorum, 0,
-            "Err path must NOT bump the quorum-skip counter"
+            stats.tier2_auto_execs_routed_proposal_minted, 0,
+            "Err path must NOT bump the routed-minted counter"
         );
     }
 

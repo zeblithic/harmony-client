@@ -5513,16 +5513,24 @@ pub enum AutoExecOutcome {
     /// log sync. This is the intentional "wrong replica" path, not a
     /// failure.
     SkippedNotAdmin,
-    /// Community has `admin_quorum > 1` and the SetPower outcome is
-    /// admin-affecting (`new_power == 100` OR target currently holds
-    /// power 100). Direct SetPower would self-reject at `verify_event`
-    /// with `SetPowerRequiresQuorum` (spec §4.5 / ZEB-250) — admin-tier
-    /// changes in multi-admin-quorum communities must route through
-    /// `AdminProposal`, which Tier 2 auto-exec does not yet do. Skip
-    /// so no HLC is burned and no doomed event is minted; the broader
-    /// architectural fix (auto-route through AdminProposal when quorum
-    /// requires it) is tracked separately as a follow-up.
-    SkippedRequiresQuorum,
+    /// ZEB-300: community has `admin_quorum > 1` and the SetPower outcome
+    /// is admin-affecting (`new_power == 100` OR target currently holds
+    /// power 100), so it routes through `AdminProposal` instead of a
+    /// direct SetPower. This replica had no live proposal for the exact
+    /// (target, level) and minted a fresh `AdminProposal::SetPower` (it
+    /// counts as signer 1). Peers countersign to quorum via CRDT sync.
+    RoutedProposalMinted,
+    /// ZEB-300: a live canonical `AdminProposal::SetPower` for this exact
+    /// (target, level) already existed and this replica had not yet
+    /// signed it, so it minted an `AdminCountersign` advancing the
+    /// proposal toward `admin_quorum` signatures.
+    RoutedProposalCountersigned,
+    /// ZEB-300: nothing to mint this tick — either the effect is already
+    /// applied (quorum reached on an earlier tick) or this replica has
+    /// already signed the canonical proposal (as proposer or countersign).
+    /// The routing converges across ticks; a pending outcome is the
+    /// steady state until a peer supplies the final quorum signature.
+    RoutedProposalPending,
 }
 
 /// ZEB-297: pure helper deciding whether the local actor is allowed
@@ -5588,11 +5596,11 @@ pub(crate) fn is_admin_affecting_set_power(
 /// population.
 ///
 /// Returns `true` when the (target, level) combination would be rejected
-/// by the quorum guard at `verify_event`; the auto-exec caller should
-/// short-circuit with `AutoExecOutcome::SkippedRequiresQuorum` rather
-/// than mint. Returns `false` when `admin_quorum <= 1` (single-admin
-/// community, direct SetPower allowed) or when the change is not
-/// admin-affecting (e.g., moderator-tier reassignment).
+/// by the quorum guard at `verify_event`; the auto-exec caller then routes
+/// through `AdminProposal` (ZEB-300) instead of minting a direct SetPower.
+/// Returns `false` when `admin_quorum <= 1` (single-admin community, direct
+/// SetPower allowed) or when the change is not admin-affecting (e.g.,
+/// moderator-tier reassignment).
 ///
 /// ZEB-297 R3 (Cursor Low): uses `POWER_THRESHOLDS.max` (the admin-tier
 /// power cap), NOT `POWER_THRESHOLDS.set_power` (the minimum power to
@@ -5714,14 +5722,15 @@ pub(crate) fn plan_admin_proposal_auto_exec(
 /// and HLC LWW dedupes; the first admin's event propagates to every
 /// replica via the existing membership log sync.
 ///
-/// ZEB-297 R2: also returns `Ok(AutoExecOutcome::SkippedRequiresQuorum)`
-/// when the community has `admin_quorum > 1` AND the (target, level)
-/// combination is admin-affecting (`new_power == 100` or target currently
-/// holds power 100). Direct SetPower in that case would self-reject at
-/// `verify_event` with `SetPowerRequiresQuorum` (spec §4.5). Tier 2
-/// auto-exec cannot currently route through `AdminProposal`, so the
-/// outcome lands as a NoOp on every replica; a follow-up ticket tracks
-/// the AdminProposal-routing fix.
+/// ZEB-300: when the community has `admin_quorum > 1` AND the (target,
+/// level) combination is admin-affecting (`new_power == 100` or target
+/// currently holds power 100), a direct SetPower would self-reject at
+/// `verify_event` with `SetPowerRequiresQuorum` (spec §4.5), so this
+/// branch routes through `apply_auto_exec_admin_proposal_set_power`
+/// instead — minting an `AdminProposal::SetPower` (returning
+/// `RoutedProposalMinted`), countersigning the canonical pending proposal
+/// (`RoutedProposalCountersigned`), or doing nothing this tick
+/// (`RoutedProposalPending`). The routing converges across ticks.
 ///
 /// Returns `Err` (as String, matching the existing IPC error convention)
 /// if:
@@ -5830,13 +5839,10 @@ pub async fn apply_auto_exec_set_power(
         return Ok(AutoExecOutcome::SkippedNotAdmin);
     }
     if blocked_by_quorum {
-        tracing::warn!(
-            community = %hex::encode(community_id.0),
-            target = %hex::encode(target_pubkey.0),
-            new_power,
-            "auto_exec_set_power: skipping — admin_quorum > 1 and outcome is admin-affecting (Tier 2 cannot route through AdminProposal yet)"
-        );
-        return Ok(AutoExecOutcome::SkippedRequiresQuorum);
+        // ZEB-300: admin_quorum > 1 + admin-affecting → route through
+        // AdminProposal instead of a direct SetPower (Task 4 replaces this
+        // stub with a call to apply_auto_exec_admin_proposal_set_power).
+        return Ok(AutoExecOutcome::RoutedProposalPending);
     }
 
     let wall_now_ms = std::time::SystemTime::now()
