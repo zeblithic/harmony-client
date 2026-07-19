@@ -45533,6 +45533,12 @@ async fn voting_build_snapshot_for_community(
 /// the event's own HLC — a member removed AFTER signing no longer has their
 /// in-flight events rejected during membership churn (spec §10 rolling
 /// eligibility).
+///
+/// `at` is caller-supplied and untrusted (it comes from the event being
+/// verified); see the SECURITY POSTURE note on
+/// `NodeStateMembershipResolver` for why that is accepted here and where
+/// post-removal injection is actually contained (ZEB-717 transport
+/// encryption).
 async fn voting_build_snapshot_for_community_at_hlc(
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
@@ -47620,6 +47626,23 @@ type VotingLogEnginesMap = std::sync::Arc<
 /// (spec §10 rolling eligibility). IPC pre-flight checks intentionally
 /// keep using the at-HEAD builder: minting a NEW event is a "now"
 /// decision.
+///
+/// SECURITY POSTURE (deliberate — Qodo finding on PR #502 adjudicated):
+/// the event's HLC is self-declared, so a removed member CAN backdate a
+/// new event to before their removal and pass this membership check. That
+/// is accepted at the verify layer by design: at-event-HLC is the only
+/// CONVERGENT rule (at-HEAD made acceptance order-dependent — replicas
+/// that received an event before vs. after the kick permanently diverged,
+/// and inbound Tier 3 PollCreates froze a different electorate per
+/// replica), a backdated mint is byte-indistinguishable from a
+/// legitimately delayed event, and clock-skew / per-actor-monotonic
+/// guards here would reject real late deliveries and multi-device
+/// concurrency. This mirrors the channel-log verify chain
+/// (`CommunityStateAtHlcAdapter`). Containment of post-kick injection is
+/// the TRANSPORT's job — channel-log already has it (epoch-encrypted
+/// packets die at rotation); the voting topic is still plaintext, tracked
+/// as ZEB-717 (epoch-encrypt for parity). Device-identity binding of
+/// `hlc.device_id` is the ZEB-668 device-management surface.
 pub struct NodeStateMembershipResolver {
     pub community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     pub crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
