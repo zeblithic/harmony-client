@@ -185,6 +185,34 @@ struct CountersignArgs {
     proposal_event_id: String,
 }
 
+/// ZEB-714: `set_recovery_designates` (spec §3.1 config ceremony).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetRecoveryDesignatesArgs {
+    community_id: String,
+    designate_addrs: Vec<String>,
+    threshold: u8,
+    veto_window_ms: u64,
+}
+
+/// ZEB-714: `initiate_admin_recovery` (spec §3.2).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InitiateRecoveryArgs {
+    community_id: String,
+    lost_admin_addr: String,
+    new_admin_addr: String,
+}
+
+/// ZEB-714: `cosign_admin_recovery` / `veto_admin_recovery` — both take
+/// the target proposal's event id.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryProposalTargetArgs {
+    community_id: String,
+    proposal_event_id: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateCommunityArgs {
@@ -447,7 +475,7 @@ struct SetIdentityDiscoverableArgs {
 
 // ── Registry ─────────────────────────────────────────────────────────
 
-/// Build the curated v1 RPC surface (69 commands). Every handler calls
+/// Build the curated v1 RPC surface (74 commands). Every handler calls
 /// the same `*_impl` seam its Tauri wrapper calls, so the GUI and the
 /// headless API observe identical behavior and error strings.
 pub fn build_registry() -> RpcRegistry {
@@ -594,6 +622,67 @@ pub fn build_registry() -> RpcRegistry {
             async move {
                 crate::countersign_admin_proposal_impl(state, a.community_id, a.proposal_event_id)
                     .await
+            }
+        }
+    );
+    // ZEB-714: admin-recovery verbs (D2) — full parity with the Tauri
+    // surface so the D3 e2e can drive both sides headlessly.
+    rpc!(
+        m,
+        "get_recovery_state",
+        CommunityIdArgs,
+        |state, _sink, a| async move { crate::get_recovery_state_impl(state, a.community_id).await }
+    );
+    rpc!(
+        m,
+        "set_recovery_designates",
+        SetRecoveryDesignatesArgs,
+        |state, _sink, a| {
+            async move {
+                crate::set_recovery_designates_impl(
+                    state,
+                    a.community_id,
+                    a.designate_addrs,
+                    a.threshold,
+                    a.veto_window_ms,
+                )
+                .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "initiate_admin_recovery",
+        InitiateRecoveryArgs,
+        |state, _sink, a| {
+            async move {
+                crate::initiate_admin_recovery_impl(
+                    state,
+                    a.community_id,
+                    a.lost_admin_addr,
+                    a.new_admin_addr,
+                )
+                .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "cosign_admin_recovery",
+        RecoveryProposalTargetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::cosign_admin_recovery_impl(state, a.community_id, a.proposal_event_id).await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "veto_admin_recovery",
+        RecoveryProposalTargetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::veto_admin_recovery_impl(state, a.community_id, a.proposal_event_id).await
             }
         }
     );
@@ -1483,6 +1572,61 @@ mod tests {
         }
     }
 
+    /// ZEB-714: dispatch proof for the five admin-recovery verbs — each
+    /// must be registered and its camelCase arg struct must accept the
+    /// wire shape. On a default NodeState every impl deterministically
+    /// fails at the owner-not-loaded seam (a `Command` error), which is
+    /// exactly the proof that registration + arg parsing succeeded.
+    #[tokio::test]
+    async fn recovery_rpcs_are_registered_and_wired() {
+        let reg = build_registry();
+        let community_id = "c0".repeat(16);
+        let proposal_target = serde_json::json!({
+            "communityId": community_id,
+            "proposalEventId": "b0".repeat(16),
+        });
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "get_recovery_state",
+                serde_json::json!({ "communityId": community_id }),
+            ),
+            (
+                "set_recovery_designates",
+                serde_json::json!({
+                    "communityId": community_id,
+                    "designateAddrs": ["11".repeat(16), "12".repeat(16)],
+                    "threshold": 2,
+                    "vetoWindowMs": 30u64 * 86_400_000,
+                }),
+            ),
+            (
+                "initiate_admin_recovery",
+                serde_json::json!({
+                    "communityId": community_id,
+                    "lostAdminAddr": "01".repeat(16),
+                    "newAdminAddr": "21".repeat(16),
+                }),
+            ),
+            ("cosign_admin_recovery", proposal_target.clone()),
+            ("veto_admin_recovery", proposal_target),
+        ];
+        for (verb, args) in cases {
+            let state = Arc::new(Mutex::new(NodeState::default()));
+            match reg.dispatch(verb, state, test_sink(), args).await {
+                Err(RpcError::UnknownCommand) => panic!("{verb} must be registered"),
+                Err(RpcError::BadArgs(msg)) => {
+                    panic!("{verb}: arg struct rejected the wire shape: {msg}")
+                }
+                // Owner-not-loaded (or a friendly pre-check) — args
+                // parsed, impl reached.
+                Err(RpcError::Command(_)) => {}
+                Ok(v) => {
+                    panic!("{verb}: expected owner-not-loaded error on default state, got {v:?}")
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn null_args_treated_as_empty() {
         let reg = build_registry();
@@ -1942,6 +2086,12 @@ mod tests {
             "countersign_admin_proposal",
             "kick_from_community",
             "unban_from_community",
+            // admin recovery (ZEB-714)
+            "get_recovery_state",
+            "set_recovery_designates",
+            "initiate_admin_recovery",
+            "cosign_admin_recovery",
+            "veto_admin_recovery",
             // channels
             "create_channel",
             "list_channels",

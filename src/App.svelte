@@ -2674,6 +2674,40 @@
         console.warn('[harmony-client] mention alerter init failed:', e);
       }
 
+      // ── ZEB-714: community admin-recovery alerter. Power-100 members get
+      // the OS-notification treatment for collecting / time-locked recovery
+      // proposals (spec §5.4), app-wide — the per-community banner only
+      // renders while that community is open. Fetches the recovery state on
+      // the dedicated change event; the DTO carries selfPower, so no roster
+      // access is needed here.
+      try {
+        const { createDefaultRecoveryAlerter } = await import('./lib/recovery-alert');
+        const recoveryAlerter = await createDefaultRecoveryAlerter({
+          showToast: (m) => { toastStore.show(m); },
+        });
+        const unlistenRecoveryChanged = await listen('community-recovery-changed', (event) => {
+          const p = (event as { payload: { communityId?: string } }).payload;
+          const communityId = p?.communityId;
+          if (!communityId) return;
+          void (async () => {
+            try {
+              const { invoke } = await import('@tauri-apps/api/core');
+              const state = await invoke<import('./lib/recovery-types').RecoveryStateDto>(
+                'get_recovery_state',
+                { communityId },
+              );
+              const name = navService.getCommunityNameBySpaceId(communityId) ?? 'a community';
+              await recoveryAlerter.onRecoveryState(communityId, name, state);
+            } catch {
+              // Not joined / engine down — nothing to alert on.
+            }
+          })();
+        });
+        fileManagerService.addUnlisten(unlistenRecoveryChanged);
+      } catch (e) {
+        console.warn('[harmony-client] recovery alerter init failed:', e);
+      }
+
       // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
       // The backend emits these once per call-state transition; route each into
       // the CallSession state machine (built lazily in buildVoiceSession, so

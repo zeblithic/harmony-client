@@ -13,6 +13,7 @@
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
   import CommunityMembersPanel from './CommunityMembersPanel.svelte';
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
+  import RecoveryBanner from './RecoveryBanner.svelte';
   import CommunityProposalsPanel from './CommunityProposalsPanel.svelte';
   import Tier3ProposalPanel from './Tier3ProposalPanel.svelte';
   import CharterView from './CharterView.svelte';
@@ -412,6 +413,17 @@
       >⚙️</button>
     </div>
   </header>
+
+  <!-- ZEB-714: community admin-recovery banner (spec §5.4) — above the
+       columns so EVERY member sees it regardless of the active view. -->
+  <RecoveryBanner
+    {communityId}
+    myAddress={ownAddress}
+    resolveName={(addr) =>
+      members.find((m) => m.address === addr)?.displayName ??
+      resolveMentionLabel(addr, resolveNickname, resolveCard)}
+    onOpenRecoverySettings={() => (settingsModalOpen = true)}
+  />
 
   <div class="two-cols">
     {#if activeView === 'charter' && votingAdapter}

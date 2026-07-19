@@ -22,6 +22,14 @@
   import ChangeQuorumDialog from './ChangeQuorumDialog.svelte';
   import RoleBadge from './governance/RoleBadge.svelte';
   import PipMeter from './governance/PipMeter.svelte';
+  import RecoveryConfigDialog from './RecoveryConfigDialog.svelte';
+  import InitiateRecoveryDialog from './InitiateRecoveryDialog.svelte';
+  import type { RecoveryStateDto } from '../recovery-types';
+  import {
+    RECOVERY_FLAGS_CHANGED_EVENT,
+    dismissSoleAdminNudge,
+    isSoleAdminNudgeDismissed,
+  } from '../recovery-flags';
 
   let {
     communityId,
@@ -140,6 +148,41 @@
     }
   }
 
+  // ZEB-714: admin-recovery state (config + selfIsDesignate). Fetched on
+  // mount; readable by any Joined member. null until loaded / on failure.
+  let recoveryState = $state<RecoveryStateDto | null>(null);
+  let showRecoveryConfigDialog = $state(false);
+  let showInitiateRecoveryDialog = $state(false);
+  // Bumped on recovery-flag writes so the localStorage-backed sole-admin
+  // nudge re-derives without a remount (the BackupReminderBanner pattern).
+  let recoveryFlagsTick = $state(0);
+  let latestRecoveryCallId = 0;
+
+  async function refreshRecoveryState() {
+    const myCallId = ++latestRecoveryCallId;
+    try {
+      const result = await invoke<RecoveryStateDto>('get_recovery_state', { communityId });
+      if (myCallId !== latestRecoveryCallId) return;
+      recoveryState = result;
+    } catch {
+      if (myCallId !== latestRecoveryCallId) return;
+      recoveryState = null;
+    }
+  }
+
+  $effect(() => {
+    void communityId;
+    void refreshRecoveryState();
+    const onFlags = () => {
+      recoveryFlagsTick += 1;
+    };
+    window.addEventListener(RECOVERY_FLAGS_CHANGED_EVENT, onFlags);
+    return () => {
+      latestRecoveryCallId++;
+      window.removeEventListener(RECOVERY_FLAGS_CHANGED_EVENT, onFlags);
+    };
+  });
+
   let joinedMembers = $derived(members.filter((m) => m.status === 'joined'));
   let adminCount = $derived(joinedMembers.filter((m) => m.power >= POWER_THRESHOLDS.setPower).length);
   let amOnlyAdmin = $derived(
@@ -153,6 +196,29 @@
   let canAdmin = $derived(myPower >= POWER_THRESHOLDS.setPower);
   let currentAdminCount = $derived(adminCount);
   let currentAdminQuorum = $derived(adminQuorum);
+
+  // ZEB-714: sole-admin recovery nudge (spec §5.1) — exactly one
+  // power-100 member, no designates configured, not dismissed.
+  let showSoleAdminNudge = $derived.by(() => {
+    void recoveryFlagsTick;
+    return (
+      canAdmin &&
+      amOnlyAdmin &&
+      recoveryState !== null &&
+      recoveryState.config === null &&
+      !isSoleAdminNudgeDismissed(myAddress, communityId)
+    );
+  });
+  let recoveryDesignateNames = $derived(
+    (recoveryState?.config?.designateAddrs ?? []).map(
+      (addr) => members.find((m) => m.address === addr)?.displayName ?? addr.slice(0, 8),
+    ),
+  );
+  let recoveryWindowDays = $derived.by(() => {
+    const ms = recoveryState?.config?.vetoWindowMs ?? 0;
+    const days = ms / 86_400_000;
+    return Number.isInteger(days) ? `${days}` : `~${days.toFixed(1)}`;
+  });
 
   // ZEB-250: pending-badge map — indexed by target_addr for O(1) member-row lookup.
   // Only fetched when caller is admin (IPC is admin-gated per spec §7.5).
@@ -522,12 +588,94 @@
       </div>
     {/if}
 
+    <!-- ZEB-714: Admin recovery section (spec §5.1 / §5.3). Visible to
+         admins (configuration) and to recovery designates (initiation) —
+         verbally distinct from fleet/device recovery (spec §8). -->
+    {#if canAdmin || recoveryState?.selfIsDesignate}
+      <div class="section admin-recovery-section" aria-label="Admin recovery">
+        <div class="section-label">Admin recovery</div>
+
+        {#if showSoleAdminNudge}
+          <div class="recovery-nudge" role="status">
+            <span class="recovery-nudge-text">
+              If you lose your identity, this community cannot replace you.
+              Configure recovery designates.
+            </span>
+            <button
+              class="recovery-nudge-dismiss"
+              aria-label="Dismiss recovery nudge"
+              onclick={() => dismissSoleAdminNudge(myAddress, communityId)}
+            >✕</button>
+          </div>
+        {/if}
+
+        {#if recoveryState?.config}
+          <p class="recovery-config-info">
+            Recovery is configured: {recoveryState.config.threshold} of
+            {recoveryState.config.designateAddrs.length} designates
+            ({recoveryDesignateNames.map((n) => `@${n}`).join(', ')}) can propose a
+            replacement admin after a {recoveryWindowDays}-day veto window.
+          </p>
+        {:else if recoveryState !== null}
+          <p class="recovery-config-info">
+            No recovery designates configured. If this community's only admin
+            identity is lost, no one can replace them and the community cannot
+            be administered again.
+          </p>
+        {/if}
+
+        {#if canAdmin}
+          <button class="recovery-config-btn" onclick={() => (showRecoveryConfigDialog = true)}>
+            {recoveryState?.config ? 'Change recovery settings…' : 'Configure recovery…'}
+          </button>
+        {/if}
+
+        {#if recoveryState?.selfIsDesignate}
+          <p class="recovery-designate-info">
+            You are a recovery designate for this community. If an admin's
+            identity is lost, you can start the recovery process.
+          </p>
+          <button
+            class="recovery-initiate-btn"
+            onclick={() => (showInitiateRecoveryDialog = true)}
+          >
+            Initiate admin recovery…
+          </button>
+        {/if}
+      </div>
+    {/if}
+
     {#if showChangeQuorumDialog && canAdmin}
       <ChangeQuorumDialog
         {communityId}
         currentQuorum={currentAdminQuorum}
         currentAdminCount={currentAdminCount}
         onClose={() => (showChangeQuorumDialog = false)}
+      />
+    {/if}
+
+    {#if showRecoveryConfigDialog && canAdmin}
+      <RecoveryConfigDialog
+        {communityId}
+        {joinedMembers}
+        {myAddress}
+        existing={recoveryState?.config ?? null}
+        onClose={() => (showRecoveryConfigDialog = false)}
+        onSaved={() => {
+          void refreshRecoveryState();
+        }}
+      />
+    {/if}
+
+    {#if showInitiateRecoveryDialog && recoveryState?.selfIsDesignate}
+      <InitiateRecoveryDialog
+        {communityId}
+        {members}
+        {myAddress}
+        onClose={() => (showInitiateRecoveryDialog = false)}
+        onInitiated={() => {
+          void refreshRecoveryState();
+        }}
       />
     {/if}
 
@@ -1008,6 +1156,57 @@
     border-color: var(--accent);
   }
   .change-quorum-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  /* ZEB-714: admin recovery section */
+  .recovery-nudge {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.6rem;
+    margin-bottom: 8px;
+    border-radius: 7px;
+    background: var(--gov-clay-soft);
+    color: var(--gov-clay-deep);
+    border: 1px solid color-mix(in srgb, var(--gov-clay) 35%, var(--surface-raised));
+  }
+  .recovery-nudge-text {
+    flex: 1;
+    font-size: 0.8rem;
+  }
+  .recovery-nudge-dismiss {
+    border: none;
+    background: transparent;
+    color: var(--gov-clay-deep);
+    font: inherit;
+    cursor: pointer;
+    padding: 2px 6px;
+  }
+  .recovery-config-info,
+  .recovery-designate-info {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin: 0 0 8px;
+  }
+  .recovery-config-btn,
+  .recovery-initiate-btn {
+    background: var(--surface-raised);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    margin-bottom: 8px;
+  }
+  .recovery-config-btn:hover,
+  .recovery-initiate-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--accent);
+  }
+  .recovery-config-btn:focus-visible,
+  .recovery-initiate-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }

@@ -1,6 +1,7 @@
 # ZEB-212: M-of-N community admin recovery — design
 
-**Status:** accepted (PR #496 merged) — D1 implemented under ZEB-713; see the
+**Status:** accepted (PR #496 merged) — D1 implemented under ZEB-713, D2
+(IPC + UI + F-gated rotation synthesis) under ZEB-714; see the
 implementation notes in §3.3 and §4.3
 **Ticket:** ZEB-212 (harmony: M-of-N community admin recovery — governance failure case)
 **Author:** Koya, 2026-07-19

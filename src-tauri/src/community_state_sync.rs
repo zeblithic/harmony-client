@@ -5220,6 +5220,16 @@ impl CommunitySyncRegistry {
         self.engines.lock().await.get(community_id).cloned()
     }
 
+    /// ZEB-714: snapshot of every spawned community's id. Used by the
+    /// periodic recovery-liveness tick to run the self-heal observer
+    /// over idle communities — a time-driven recovery execution (spec
+    /// §4.1 now-floor) produces no CRDT delta, so without a tick the
+    /// delta-driven observer would never see the Executed phase and
+    /// never synthesize the finality-gated rotation.
+    pub async fn spawned_community_ids(&self) -> Vec<SpaceId> {
+        self.engines.lock().await.keys().copied().collect()
+    }
+
     /// ZEB-249 Task 6: returns a clone of the registry's shared
     /// `IdentityResolver`. IPC handlers that need to look up members'
     /// 64-byte identity pubs (e.g., to derive X25519 pubkeys for
