@@ -338,4 +338,90 @@ describe('VoiceSender', () => {
     // would have been seq 1 and been dropped as "late".
     expect(seqOf(1)).toBe(4);
   });
+
+  // ZEB-359: preferred-input threading + live switch.
+  describe('input device selection', () => {
+    it('start passes the current inputDeviceId to capture.start', async () => {
+      const sender = new VoiceSender({
+        ...ctx.config,
+        inputDeviceId: () => 'mic-7',
+      });
+      await sender.start();
+      expect(ctx.mockCapture.start).toHaveBeenCalledWith(
+        expect.any(Function),
+        undefined,
+        undefined,
+        16000,
+        'mic-7',
+      );
+    });
+
+    it('start passes null (system default) when no provider is configured', async () => {
+      const sender = new VoiceSender(ctx.config);
+      await sender.start();
+      expect(ctx.mockCapture.start).toHaveBeenCalledWith(
+        expect.any(Function),
+        undefined,
+        undefined,
+        16000,
+        null,
+      );
+    });
+
+    it('switchInputDevice restarts capture with the new pref, preserving codec and clock', async () => {
+      let pref: string | null = 'mic-a';
+      const sender = new VoiceSender({
+        ...ctx.config,
+        inputDeviceId: () => pref,
+      });
+      await sender.start();
+      const before = ctx.getCapturedOnFrame()!;
+      before(new Float32Array(320)); // seq 0
+
+      pref = 'mic-b';
+      await sender.switchInputDevice();
+
+      expect(ctx.mockCapture.stop).toHaveBeenCalledTimes(1);
+      expect(ctx.mockCapture.start).toHaveBeenCalledTimes(2);
+      expect(
+        (ctx.mockCapture.start as ReturnType<typeof vi.fn>).mock.calls[1][4],
+      ).toBe('mic-b');
+      // Codec survives the switch (no re-init, no destroy)…
+      expect(ctx.mockCodec.destroy).not.toHaveBeenCalled();
+      expect(ctx.mockCodec.init).toHaveBeenCalledTimes(1);
+      // …and the stream clock continues: the next frame is seq 1, not 0.
+      const after = ctx.getCapturedOnFrame()!;
+      after(new Float32Array(320));
+      const last = ctx.mockInvoke.mock.calls.at(-1)!;
+      const payload = (last[1] as Record<string, unknown>).payload as {
+        frameBytes: number[];
+      };
+      const header = new Uint8Array(payload.frameBytes.slice(0, HEADER_SIZE));
+      expect(decodeHeader(header).sequence).toBe(1);
+    });
+
+    it('switchInputDevice is a no-op while the sender is not active', async () => {
+      const sender = new VoiceSender(ctx.config);
+      await sender.switchInputDevice();
+      expect(ctx.mockCapture.stop).not.toHaveBeenCalled();
+      expect(ctx.mockCapture.start).not.toHaveBeenCalled();
+    });
+
+    it('a failed capture restart deactivates the sender and surfaces the error', async () => {
+      const sender = new VoiceSender({
+        ...ctx.config,
+        inputDeviceId: () => 'mic-a',
+      });
+      await sender.start();
+      (ctx.mockCapture.start as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error('mic gone'),
+      );
+      await expect(sender.switchInputDevice()).rejects.toThrow('mic gone');
+      // The sender must not pretend audio still flows: codec released, and a
+      // subsequent start() fully re-initializes.
+      expect(ctx.mockCodec.destroy).toHaveBeenCalledTimes(1);
+      await sender.start();
+      expect(ctx.mockCodec.init).toHaveBeenCalledTimes(2);
+    });
+  });
 });

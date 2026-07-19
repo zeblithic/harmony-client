@@ -35,6 +35,12 @@ export interface VoiceSenderConfig {
    * plain number[] (JSON-serializable over IPC). Absent ⇒ legacy channel path.
    */
   publishFrame?: (frameBytes: number[]) => Promise<unknown>;
+  /**
+   * ZEB-359: preferred capture device provider, re-read at every capture
+   * (re)start so a settings change picks up without reconstructing the sender.
+   * Absent / returning null ⇒ system default.
+   */
+  inputDeviceId?: () => string | null;
 }
 
 /**
@@ -54,9 +60,16 @@ export class VoiceSender {
   private active = false;
   /** Non-null while async initialization is in progress. */
   private starting: Promise<void> | null = null;
+  /** The frame callback handed to capture, retained so a device switch can
+   *  restart capture without touching codec state (ZEB-359). */
+  private onFrameCb: ((pcm: Float32Array) => void) | null = null;
 
   constructor(config: VoiceSenderConfig) {
     this.config = config;
+  }
+
+  private currentInputDevice(): string | null {
+    return this.config.inputDeviceId ? this.config.inputDeviceId() : null;
   }
 
   /**
@@ -74,25 +87,27 @@ export class VoiceSender {
         (this.config.codec.codecType === 'codec2' ? 8000 : 16000);
       await this.config.codec.init(sr, 1);
       try {
+        this.onFrameCb = (pcm) => {
+          const decision = this.config.frameGate
+            ? this.config.frameGate(pcm)
+            : { send: true, ptt: true };
+          if (decision.send) this.sendFrame(pcm, decision.ptt);
+          // Advance the stream clock for EVERY captured frame, even gated
+          // (DTX / VAD-silence) ones we don't transmit. The receiver's jitter
+          // buffer advances its playhead every 20 ms regardless of arrivals;
+          // if the sender froze its sequence across a silence gap, the first
+          // resumed frame would land "behind" the playhead and be discarded
+          // as late — silently killing speech after every pause. Advancing
+          // per captured frame keeps sequence/timestamp aligned with
+          // wall-clock playback so resumed audio stays in sync.
+          this.advanceClock();
+        };
         await this.config.capture.start(
-          (pcm) => {
-            const decision = this.config.frameGate
-              ? this.config.frameGate(pcm)
-              : { send: true, ptt: true };
-            if (decision.send) this.sendFrame(pcm, decision.ptt);
-            // Advance the stream clock for EVERY captured frame, even gated
-            // (DTX / VAD-silence) ones we don't transmit. The receiver's jitter
-            // buffer advances its playhead every 20 ms regardless of arrivals;
-            // if the sender froze its sequence across a silence gap, the first
-            // resumed frame would land "behind" the playhead and be discarded
-            // as late — silently killing speech after every pause. Advancing
-            // per captured frame keeps sequence/timestamp aligned with
-            // wall-clock playback so resumed audio stays in sync.
-            this.advanceClock();
-          },
+          this.onFrameCb,
           undefined,
           undefined,
           sr,
+          this.currentInputDevice(),
         );
       } catch (err) {
         // Codec initialized but capture failed — clean up codec to prevent leak
@@ -105,6 +120,37 @@ export class VoiceSender {
       await this.starting;
     } finally {
       this.starting = null;
+    }
+  }
+
+  /**
+   * ZEB-359: live input-device switch — restart ONLY the capture leg with the
+   * current preferred device. Codec state and the stream clock survive, so the
+   * receiver just sees a short silence gap (same shape as a DTX pause).
+   *
+   * On capture-restart failure the sender deactivates (codec released, error
+   * surfaced) rather than pretending audio still flows; callers reuse their
+   * existing mic-error handling and a later start() re-initializes fully.
+   */
+  async switchInputDevice(): Promise<void> {
+    if (this.starting) await this.starting.catch(() => {});
+    if (!this.active || !this.onFrameCb) return;
+    const sr = this.config.sampleRate ??
+      (this.config.codec.codecType === 'codec2' ? 8000 : 16000);
+    await this.config.capture.stop();
+    try {
+      await this.config.capture.start(
+        this.onFrameCb,
+        undefined,
+        undefined,
+        sr,
+        this.currentInputDevice(),
+      );
+    } catch (err) {
+      this.config.codec.destroy();
+      this.active = false;
+      this.onFrameCb = null;
+      throw err;
     }
   }
 
@@ -131,6 +177,7 @@ export class VoiceSender {
     }
     this.config.codec.destroy();
     this.active = false;
+    this.onFrameCb = null;
   }
 
   /**

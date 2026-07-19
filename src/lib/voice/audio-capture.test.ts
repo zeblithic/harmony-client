@@ -129,4 +129,38 @@ describe('AudioCapture', () => {
     const capture = new AudioCapture();
     await expect(capture.stop()).resolves.toBeUndefined();
   });
+
+  // ZEB-359: preferred-input threading.
+  it('start passes a preferred deviceId as an ideal constraint', async () => {
+    const capture = new AudioCapture();
+    await capture.start(
+      vi.fn(),
+      () => mocks.ctx as unknown as AudioContext,
+      () => mocks.workletNode as unknown as AudioWorkletNode,
+      16000,
+      'mic-42',
+    );
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith({
+      audio: {
+        sampleRate: 16000,
+        channelCount: 1,
+        echoCancellation: false,
+        deviceId: { ideal: 'mic-42' },
+      },
+    });
+  });
+
+  it('start omits the deviceId constraint for the system default (null)', async () => {
+    const capture = new AudioCapture();
+    await capture.start(
+      vi.fn(),
+      () => mocks.ctx as unknown as AudioContext,
+      () => mocks.workletNode as unknown as AudioWorkletNode,
+      16000,
+      null,
+    );
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith({
+      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: false },
+    });
+  });
 });

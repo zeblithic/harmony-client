@@ -61,7 +61,18 @@ export function mixFrames(frames: Float32Array[], frameLen: number): Float32Arra
 export interface VoiceMixerConfig {
   createContext?: () => AudioContext;
   createWorkletNode?: (ctx: AudioContext) => AudioWorkletNode;
+  /**
+   * ZEB-359: preferred playback device provider, read at init. Absent /
+   * returning null ⇒ system default. Only honored where the platform exposes
+   * `AudioContext.setSinkId` (Chromium/WebView2; WKWebView does not).
+   */
+  outputDeviceId?: () => string | null;
 }
+
+/** `setSinkId` is a Chromium extension not present in every TS dom lib. */
+type SinkCapableContext = AudioContext & {
+  setSinkId?: (id: string) => Promise<void>;
+};
 
 /**
  * Mixes per-sender PCM frames into one playback stream.
@@ -98,6 +109,31 @@ export class VoiceMixer {
     node.connect(ctx.destination);
     this.node = node;
     if (ctx.state === 'suspended') await ctx.resume();
+    // ZEB-359: route to the preferred output where the platform allows it. A
+    // fresh context already plays to the system default, so null needs no call.
+    const preferredOut = this.config.outputDeviceId?.() ?? null;
+    if (preferredOut) await this.applySink(preferredOut);
+  }
+
+  /**
+   * ZEB-359: live output-device switch. `null` resets to the system default
+   * (empty sinkId per spec). No-op before init or where `setSinkId` is
+   * unsupported; a rejection (device unplugged mid-call) falls back to the
+   * current sink rather than failing playback.
+   */
+  async setOutputDevice(id: string | null): Promise<void> {
+    await this.applySink(id ?? '');
+  }
+
+  private async applySink(id: string): Promise<void> {
+    const ctx = this.ctx as SinkCapableContext | null;
+    if (!ctx?.setSinkId) return;
+    try {
+      await ctx.setSinkId(id);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('voice output setSinkId failed; using current sink:', msg);
+    }
   }
 
   pushFrame(senderHex: string, pcm: Float32Array | null): void {

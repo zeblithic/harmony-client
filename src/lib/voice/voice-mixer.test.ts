@@ -110,4 +110,78 @@ describe('VoiceMixer', () => {
     const sent = node.port.postMessage.mock.calls[0][0] as Float32Array;
     expect(Array.from(sent)).toEqual([0, 0]);
   });
+
+  // ZEB-359: output device routing (AudioContext.setSinkId where supported).
+  describe('output device routing', () => {
+    function mockSinkCtx() {
+      const base = mockCtx();
+      const setSinkId = vi.fn().mockResolvedValue(undefined);
+      return {
+        node: base.node,
+        setSinkId,
+        ctx: { ...base.ctx, setSinkId },
+      };
+    }
+
+    it('init applies the preferred output via setSinkId when supported', async () => {
+      const { ctx, node, setSinkId } = mockSinkCtx();
+      const mixer = new VoiceMixer({
+        createContext: () => ctx as unknown as AudioContext,
+        createWorkletNode: () => node as unknown as AudioWorkletNode,
+        outputDeviceId: () => 'spk-1',
+      });
+      await mixer.init();
+      expect(setSinkId).toHaveBeenCalledWith('spk-1');
+    });
+
+    it('init skips setSinkId for the system default (null pref)', async () => {
+      const { ctx, node, setSinkId } = mockSinkCtx();
+      const mixer = new VoiceMixer({
+        createContext: () => ctx as unknown as AudioContext,
+        createWorkletNode: () => node as unknown as AudioWorkletNode,
+        outputDeviceId: () => null,
+      });
+      await mixer.init();
+      expect(setSinkId).not.toHaveBeenCalled();
+    });
+
+    it('init tolerates a platform without setSinkId (WKWebView)', async () => {
+      const { ctx, node } = mockCtx();
+      const mixer = new VoiceMixer({
+        createContext: () => ctx as unknown as AudioContext,
+        createWorkletNode: () => node as unknown as AudioWorkletNode,
+        outputDeviceId: () => 'spk-1',
+      });
+      await expect(mixer.init()).resolves.toBeUndefined();
+    });
+
+    it('a rejecting setSinkId is non-fatal (falls back to default output)', async () => {
+      const { ctx, node, setSinkId } = mockSinkCtx();
+      setSinkId.mockRejectedValue(new Error('sink gone'));
+      const mixer = new VoiceMixer({
+        createContext: () => ctx as unknown as AudioContext,
+        createWorkletNode: () => node as unknown as AudioWorkletNode,
+        outputDeviceId: () => 'spk-gone',
+      });
+      await expect(mixer.init()).resolves.toBeUndefined();
+    });
+
+    it('setOutputDevice routes the live context; null resets to default', async () => {
+      const { ctx, node, setSinkId } = mockSinkCtx();
+      const mixer = new VoiceMixer({
+        createContext: () => ctx as unknown as AudioContext,
+        createWorkletNode: () => node as unknown as AudioWorkletNode,
+      });
+      await mixer.init();
+      await mixer.setOutputDevice('spk-2');
+      expect(setSinkId).toHaveBeenCalledWith('spk-2');
+      await mixer.setOutputDevice(null);
+      expect(setSinkId).toHaveBeenCalledWith('');
+    });
+
+    it('setOutputDevice before init is a no-op', async () => {
+      const mixer = new VoiceMixer();
+      await expect(mixer.setOutputDevice('spk-2')).resolves.toBeUndefined();
+    });
+  });
 });
