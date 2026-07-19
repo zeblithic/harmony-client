@@ -373,3 +373,44 @@ async fn read_dm_thread_self_message_delivery_state_reflects_outbox_status() {
         }
     }
 }
+
+/// ZEB-357: the call-event feature rests on `send_dm` → `read_dm_thread`
+/// carrying an arbitrary (non-text) mime type through unchanged — the mime is
+/// the frontend's ONLY discriminator for call-event DM messages (no field was
+/// added to the durable types). Pins the round-trip for the exact production
+/// mime + a JSON body.
+#[tokio::test]
+async fn read_dm_thread_preserves_call_event_mime_type_zeb357() {
+    let (mut state, mut outbox, cas, alice, space_id) = fixture().await;
+
+    const CALL_EVENT_MIME: &str = "application/x-harmony-call-event+json";
+    let body: &[u8] =
+        br#"{"v":1,"callId":"abababababababababababababababab","outcome":"no_answer"}"#;
+    outbox
+        .send_dm(
+            &mut state,
+            cas.as_ref(),
+            space_id,
+            body.to_vec(),
+            CALL_EVENT_MIME.into(),
+            1_000_000,
+            None,
+        )
+        .await
+        .expect("send_dm ok");
+
+    let result = read_dm_thread_inner(&state, cas.as_ref(), space_id, 50, None, alice)
+        .await
+        .expect("read_dm_thread_inner ok");
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].mime_type, CALL_EVENT_MIME,
+        "mime type must round-trip unchanged — it is the call-event discriminator"
+    );
+    assert_eq!(
+        hex::decode(&result[0].body).unwrap(),
+        body,
+        "JSON body survives encrypt/decrypt unchanged"
+    );
+}

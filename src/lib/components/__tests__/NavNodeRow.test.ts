@@ -57,6 +57,32 @@ describe('NavNodeRow', () => {
     expect(screen.queryByTestId('mention-badge')).toBeNull();
   });
 
+  it('shows a missed-call badge on a DM row when missedCallCount > 0 (ZEB-357)', () => {
+    render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'dm', name: 'Alice', missedCallCount: 2 }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    const badge = screen.getByTestId('missed-call-badge');
+    expect(badge.textContent).toContain('2');
+    expect(badge.getAttribute('aria-label')).toBe('2 missed calls');
+  });
+
+  it('renders no missed-call badge when missedCallCount is 0 or absent (ZEB-357)', () => {
+    render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'dm', name: 'Alice' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    expect(screen.queryByTestId('missed-call-badge')).toBeNull();
+  });
+
   it('renders color bands matching ancestry depth', () => {
     const { container } = render(NavNodeRow, {
       props: {

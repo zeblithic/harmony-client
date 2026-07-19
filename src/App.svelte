@@ -112,6 +112,8 @@
   import { shouldClearMembersLoading } from './lib/members-loading';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { getCallSession, type CallSession } from './lib/call-session';
+  import { CALL_EVENT_MIME, encodeCallEvent, describeCallEvent, type CallEventPayload } from './lib/call-log';
+  import { runQuitTeardown } from './lib/quit-teardown';
   import { getGroupCallSession, type GroupCallSession } from './lib/group-call-session';
   import { groupCallBanners } from './lib/group-call-banner-store';
   import { ensureGroupMembers, getCachedGroupMembers, invalidateGroupMembers } from './lib/group-dm-members-cache';
@@ -377,6 +379,54 @@
   /** ZEB-351: build the singleton voice session once owner identity is present.
    *  Idempotent (one-shot guard); fetches device identity via the new IPC, then
    *  wires identity + the Tauri adapter + member-card resolution into the session. */
+  // ZEB-357: author the caller-side call-event DM message. Single writer —
+  // only the caller's CallSession fires this, once per call at its terminal
+  // transition. Mirrors handleSend's optimistic DM path so the system line
+  // appears in the caller's own thread immediately; the callee receives it
+  // like any DM (deposit + tunnel), which is what surfaces a missed call to
+  // an offline callee on next boot (call signaling itself is live-only).
+  // PR #494 R1 (CodeRabbit): in-flight call-event writes, drained by the
+  // bounded quit teardown below — a detached send racing quit_app must not
+  // lose the only durable record of a call. Entries self-remove on settle.
+  const pendingCallRecordWrites = new Set<Promise<unknown>>();
+
+  function recordCallOutcome(spaceId: string, payload: CallEventPayload): void {
+    const optimisticId = crypto.randomUUID();
+    const optimistic: Message = {
+      id: optimisticId,
+      sender: { address: 'self', displayName: 'You' },
+      text: describeCallEvent(payload, 'author'),
+      timestamp: Date.now(),
+      media: [],
+      priority: 'standard',
+      channel: spaceId,
+      hub: '',
+      deliveryState: 'sending',
+      callEvent: payload,
+    };
+    messageService.pushOptimistic(optimistic);
+    const write = (async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const result = (await invoke('send_dm', {
+          spaceId,
+          content: Array.from(new TextEncoder().encode(encodeCallEvent(payload))),
+          mimeType: CALL_EVENT_MIME,
+        })) as { messageId: string; messageCid: string };
+        messageService.replaceOptimisticId(optimisticId, result.messageCid, result.messageId);
+      } catch (e) {
+        // Keep the line visible in 'failed' state — losing it would silently
+        // drop the only durable record of the call. (Qodo R1: log the derived
+        // message, not the raw caught value.)
+        const msg = e instanceof Error ? e.message : String(e);
+        messageService.markFailed(optimisticId, msg);
+        console.error('call-event record failed:', msg);
+      }
+    })();
+    pendingCallRecordWrites.add(write);
+    void write.finally(() => pendingCallRecordWrites.delete(write));
+  }
+
   async function buildVoiceSession(
     invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>,
     listen: (event: string, handler: (e: { payload: unknown }) => void) => Promise<() => void>,
@@ -421,6 +471,8 @@
             ...(card.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
           };
         },
+        // ZEB-357: caller-side terminal outcomes author a call-event DM.
+        onCallOutcome: recordCallOutcome,
       });
       // ZEB-360: build the group-DM call session from the same identity + adapter
       // deps (getGroupCallSession is a singleton, so reconnect re-runs are no-ops).
@@ -2162,7 +2214,9 @@
             invoke('read_dm_thread', { spaceId, limit, beforeHlc: null }) as Promise<
               import('./lib/dm-unread-service').DmThreadPageEntry[]
             >,
-          setUnread: (spaceId, count) => navService.setUnread(spaceId, count),
+          // ZEB-357: the third param is the missed-call subset → 📞 badge.
+          setUnread: (spaceId, count, missedCalls) =>
+            navService.setUnread(spaceId, count, missedCalls),
           // Same "looking right at it" contract as channelUnread's
           // isActiveChannel below, in DM terms.
           isActiveThread: (spaceId) =>
@@ -2759,19 +2813,21 @@
             groupLeave = groupCall.leave().catch(() => {});
           }
         }
-        const teardown = Promise.allSettled([
-          voiceSession?.leave() ?? Promise.resolve(),
-          callSession?.end() ?? Promise.resolve(),
-          groupLeave,
-        ]);
-        const timedOut = Symbol('timeout');
-        const raced = await Promise.race([
-          teardown,
-          new Promise((r) => setTimeout(() => r(timedOut), 1500)),
-        ]);
-        if (raced === timedOut) {
-          console.warn('[harmony-client] voice teardown on quit exceeded 1.5s; quitting anyway');
-        }
+        // PR #494 R1 (CodeRabbit): the drain also awaits in-flight call-event
+        // DM writes — callSession.end() registers the terminal record into
+        // pendingCallRecordWrites, and runQuitTeardown snapshots that set
+        // AFTER the teardowns settle so the record can't be orphaned by
+        // quit_app. Same single 1.5s bound as before.
+        await runQuitTeardown({
+          teardowns: [
+            voiceSession?.leave() ?? Promise.resolve(),
+            callSession?.end() ?? Promise.resolve(),
+            groupLeave,
+          ],
+          pendingWrites: () => [...pendingCallRecordWrites],
+          timeoutMs: 1500,
+          warn: (m) => console.warn(`[harmony-client] ${m}`),
+        });
         await invoke('quit_app');
       });
       fileManagerService.addUnlisten(unlistenQuit);

@@ -1,6 +1,7 @@
 import type { TauriAdapter } from './zenoh-service';
 import type { Message, MessagePriority } from './types';
 import { messages as mockMessages } from './mock-data';
+import { describeCallEvent, parseCallEvent, type CallEventPayload } from './call-log';
 
 /** Wire format for channel messages from the Rust backend. */
 export interface ChannelMessageEvent {
@@ -35,6 +36,26 @@ function hexToUtf8(hex: string): string {
     bytes[i] = n;
   }
   return new TextDecoder().decode(bytes);
+}
+
+/**
+ * ZEB-357: when a DM carries the call-event mime type, attach the parsed
+ * payload and swap the raw JSON text for the direction-aware system-line
+ * label (used by previews/search and any non-system render path). A payload
+ * that fails to parse leaves the message as ordinary text — the decoded JSON
+ * body is an acceptable degraded rendering, never a crash.
+ */
+function applyCallEvent(
+  msg: Message,
+  mimeType: string,
+  bodyText: string,
+  isSelf: boolean,
+): CallEventPayload | null {
+  const ev = parseCallEvent(mimeType, bodyText);
+  if (!ev) return null;
+  msg.callEvent = ev;
+  msg.text = describeCallEvent(ev, isSelf ? 'author' : 'recipient');
+  return ev;
 }
 
 /**
@@ -202,6 +223,8 @@ export class MessageService {
           // DM messages never render. (Fix A from PR #81 review.)
           hub: '',
         };
+        // ZEB-357: call-event DMs render as a system line, not a bubble.
+        applyCallEvent(msg, payload.mimeType, text, sender.address === 'self');
         this.messages = [...this.messages, msg];
         this.onChange?.();
       }));
@@ -480,6 +503,8 @@ export class MessageService {
             msg.messageId = r.messageId;
           }
         }
+        // ZEB-357: call-event DMs render as a system line, not a bubble.
+        applyCallEvent(msg, r.mimeType, text, r.isSelfOutbound);
         return msg;
       })
       .reverse();

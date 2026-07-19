@@ -371,3 +371,173 @@ describe('CallSession transport reconnect (ZEB-353)', () => {
     expect(get(s.state).reconnecting).toBe(false);
   });
 });
+
+// ZEB-357 — caller-authored call outcomes. The CALLER is the single writer of
+// one call-event record per call, fired via the onCallOutcome dep at each
+// terminal transition. The callee side must never fire it.
+describe('CallSession call-outcome recording (ZEB-357)', () => {
+  let d: ReturnType<typeof deps>;
+  let outcomes: Array<{ spaceId: string; payload: unknown }>;
+  beforeEach(() => {
+    d = deps();
+    outcomes = [];
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function newSession() {
+    return new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      onCallOutcome: (spaceId, payload) => { outcomes.push({ spaceId, payload }); },
+      ...d.factories,
+    });
+  }
+
+  /** Place a call as the caller on 'space-1'; backend mints 'call-7'. */
+  async function ringingOut() {
+    d.invoke.mockImplementation(async (cmd: string) =>
+      cmd === 'place_call' ? 'call-7' : undefined);
+    const s = newSession();
+    await s.placeCall('space-1');
+    return s;
+  }
+
+  it('caller cancel records canceled (captured before the state reset)', async () => {
+    const s = await ringingOut();
+    await s.cancel();
+    expect(get(s.state).phase).toBe('idle');
+    expect(outcomes).toEqual([
+      { spaceId: 'space-1', payload: { v: 1, callId: 'call-7', outcome: 'canceled' } },
+    ]);
+  });
+
+  it('remote decline maps timeout→no_answer, busy→busy, user→declined', async () => {
+    for (const [reason, outcome] of [
+      ['timeout', 'no_answer'],
+      ['busy', 'busy'],
+      ['user', 'declined'],
+    ] as const) {
+      outcomes = [];
+      const s = await ringingOut();
+      s.onRemoteDeclined('call-7', reason);
+      expect(get(s.state).phase).toBe('idle');
+      expect(outcomes).toEqual([
+        { spaceId: 'space-1', payload: { v: 1, callId: 'call-7', outcome } },
+      ]);
+    }
+  });
+
+  it('answered call hung up by the caller records answered with the active-phase duration', async () => {
+    vi.useFakeTimers();
+    const s = await ringingOut();
+    await s.onRemoteAccepted('call-7'); // → connecting → active (startedAt stamped)
+    expect(get(s.state).phase).toBe('active');
+    vi.advanceTimersByTime(263_000);
+    await s.end();
+    expect(outcomes).toEqual([
+      {
+        spaceId: 'space-1',
+        payload: { v: 1, callId: 'call-7', outcome: 'answered', durationMs: 263_000 },
+      },
+    ]);
+  });
+
+  it('answered call hung up by the PEER records answered on the caller', async () => {
+    vi.useFakeTimers();
+    const s = await ringingOut();
+    await s.onRemoteAccepted('call-7');
+    vi.advanceTimersByTime(5_000);
+    await s.onRemoteEnded('call-7');
+    expect(get(s.state).phase).toBe('idle');
+    expect(outcomes).toEqual([
+      {
+        spaceId: 'space-1',
+        payload: { v: 1, callId: 'call-7', outcome: 'answered', durationMs: 5_000 },
+      },
+    ]);
+  });
+
+  it('records exactly once per call (remote end after own end does not double-fire)', async () => {
+    const s = await ringingOut();
+    await s.onRemoteAccepted('call-7');
+    await s.end();
+    await s.onRemoteEnded('call-7'); // stale echo for the already-ended call
+    expect(outcomes).toHaveLength(1);
+  });
+
+  // PR #494 R1 (Qodo): end() records, then AWAITS teardownMedia before
+  // resetToIdle clears callId — a call-ended event delivered in that window
+  // passed both guards and recorded a second call-event DM.
+  it('overlapping end() and onRemoteEnded() during a slow teardown record exactly once', async () => {
+    const s = await ringingOut();
+    await s.onRemoteAccepted('call-7');
+    // Block teardownMedia mid-flight: sender.stop() hangs on a deferred, and
+    // stopEntered proves end() is parked there BEFORE the overlapping event
+    // runs (so the once-mock can't be consumed by the wrong teardown).
+    let releaseStop!: () => void;
+    const stopEntered = new Promise<void>((entered) => {
+      d.sender.stop.mockImplementationOnce(() => {
+        entered();
+        return new Promise<void>((r) => { releaseStop = r; });
+      });
+    });
+    const ending = s.end(); // enters teardown, does NOT resolve yet
+    await stopEntered; // end() is now parked inside teardownMedia
+    await s.onRemoteEnded('call-7'); // concurrent peer hangup in the window
+    releaseStop();
+    await ending;
+    expect(outcomes).toHaveLength(1);
+  });
+
+  // PR #494 R1 (CodeRabbit): cancel() awaited the cancel_call IPC BEFORE
+  // recording — a decline landing during that await recorded first, then
+  // cancel recorded again (double record, and the caller's own cancellation
+  // must stay the single terminal).
+  it('a decline racing an in-flight cancel records only the canceled outcome', async () => {
+    let releaseCancel!: () => void;
+    d.invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'place_call') return Promise.resolve('call-7');
+      if (cmd === 'cancel_call') {
+        return new Promise<void>((r) => { releaseCancel = r; });
+      }
+      return Promise.resolve(undefined);
+    });
+    const s = newSession();
+    await s.placeCall('space-1');
+    const cancelling = s.cancel(); // IPC in flight
+    s.onRemoteDeclined('call-7', 'timeout'); // decline arrives mid-cancel
+    releaseCancel();
+    await cancelling;
+    expect(outcomes.map((o) => (o.payload as { outcome: string }).outcome)).toEqual(['canceled']);
+  });
+
+  it('callee flows never record: decline, ring-timeout, and answered-then-ended', async () => {
+    // Explicit decline.
+    const s1 = newSession();
+    s1.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s1.decline('user');
+    // Ring timeout (auto-decline).
+    vi.useFakeTimers();
+    const s2 = newSession();
+    s2.onIncoming('call-2', 'cc'.repeat(16), 'space-1');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(get(s2.state).phase).toBe('idle');
+    vi.useRealTimers();
+    // Full answered call on the callee side.
+    const s3 = newSession();
+    s3.onIncoming('call-3', 'cc'.repeat(16), 'space-1');
+    await s3.accept();
+    await s3.end();
+    expect(outcomes).toEqual([]);
+  });
+
+  it('caller cancel of an unreachable callee still records canceled (offline-callee path)', async () => {
+    // No decline/accept ever arrives — the only terminal is the caller's cancel.
+    const s = await ringingOut();
+    await s.cancel();
+    expect(outcomes.map((o) => (o.payload as { outcome: string }).outcome)).toEqual(['canceled']);
+  });
+});

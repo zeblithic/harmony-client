@@ -552,7 +552,7 @@ export class NavService {
    *  owning community up to Σ(children) with a `quiet` dot (numbers on
    *  channels, dot on the community — deliberate messenger idiom; DM rows
    *  have no aggregation target). */
-  setUnread(channelId: string, count: number): void {
+  setUnread(channelId: string, count: number, missedCalls: number = 0): void {
     const node = this.nodes.find(
       (n) =>
         n.id === channelId &&
@@ -560,10 +560,23 @@ export class NavService {
     );
     if (!node) return;
     const next = Math.max(0, count);
+    // ZEB-357: DM/group-chat rows carry the missed-call subset as a distinct
+    // 📞 badge. Channel callers omit the param (defaults 0) — no rollup, DM
+    // rows have no aggregation target (same as unreadCount). Clamped to the
+    // unread count: missed is documented as a subset, and no caller may render
+    // a missed call with zero unread messages (PR #494 R1).
+    const nextMissed = Math.min(next, Math.max(0, missedCalls));
     const nextLevel: NavNode['unreadLevel'] = next > 0 ? 'standard' : 'none';
-    if (node.unreadCount === next && node.unreadLevel === nextLevel) return;
+    if (
+      node.unreadCount === next &&
+      node.unreadLevel === nextLevel &&
+      (node.missedCallCount ?? 0) === nextMissed
+    ) {
+      return;
+    }
     const delta = next - node.unreadCount;
     node.unreadCount = next;
+    node.missedCallCount = nextMissed;
     node.unreadLevel = nextLevel;
     // Incremental community rollup (the applyMentionDelta idiom) — setUnread
     // sits on the per-message hot path, so no full-node scan here. setChannels

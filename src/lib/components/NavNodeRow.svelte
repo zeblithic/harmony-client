@@ -311,6 +311,17 @@
       >@{node.mentionCount}</span>
     {/if}
 
+    <!-- ZEB-357: missed-call badge on DM rows — the missed-class subset of
+         unread, so the phone glyph disambiguates "you missed a call" from
+         ordinary unread messages at a glance. -->
+    {#if (node.missedCallCount ?? 0) > 0}
+      <span
+        class="missed-call-badge"
+        data-testid="missed-call-badge"
+        aria-label={`${node.missedCallCount} missed call${node.missedCallCount === 1 ? '' : 's'}`}
+      >📞{node.missedCallCount}</span>
+    {/if}
+
     <!-- Unread indicators (ZEB-665: display caps at 99+; the tracker's
          internal set is capped at 100, so 100 means "at least 100"). -->
     {#if node.unreadLevel === 'standard' && node.unreadCount > 0}
@@ -557,6 +568,18 @@
      with --on-accent for AA-safe contrast in both themes. */
   .mention-badge {
     background: var(--gov-clay-deep);
+    color: var(--on-accent);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+
+  /* ZEB-357: missed-call badge — mention-badge geometry with the accent
+     palette (the phone glyph itself carries the distinction). */
+  .missed-call-badge {
+    background: var(--accent);
     color: var(--on-accent);
     font-size: 11px;
     font-weight: 700;

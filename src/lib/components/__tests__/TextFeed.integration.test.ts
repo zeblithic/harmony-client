@@ -347,4 +347,34 @@ describe('TextFeed Integration', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Start call' }));
     expect(onStartCall).toHaveBeenCalledWith('space-xyz');
   });
+
+  // ── 9. Call-event system lines (ZEB-357) ──────────────────────────
+
+  it('renders a call-event message as a system line, not a text bubble', () => {
+    const callMsg = msg({
+      id: 'call-1',
+      sender: bob,
+      text: 'Missed call',
+      timestamp: base + 400_000,
+      callEvent: { v: 1, callId: 'ab'.repeat(16), outcome: 'no_answer' },
+    });
+    renderFeed({ channelType: 'dm', messages: [...MESSAGES, callMsg] });
+    const line = screen.getByTestId('call-event-line');
+    expect(line.textContent).toContain('Missed call');
+    // The system line replaces the bubble — the fallback text must not ALSO
+    // render as a normal message body.
+    expect(screen.queryAllByText('Missed call')).toHaveLength(1);
+  });
+
+  it('a self-authored call-event renders the author-side label', () => {
+    const callMsg = msg({
+      id: 'call-2',
+      sender: { address: 'self', displayName: 'You' },
+      text: 'Call — no answer',
+      timestamp: base + 500_000,
+      callEvent: { v: 1, callId: 'cd'.repeat(16), outcome: 'no_answer' },
+    });
+    renderFeed({ channelType: 'dm', messages: [callMsg] });
+    expect(screen.getByTestId('call-event-line').textContent).toContain('Call — no answer');
+  });
 });

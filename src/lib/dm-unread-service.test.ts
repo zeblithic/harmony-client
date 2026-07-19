@@ -13,12 +13,45 @@ const entry = (
   from: isSelfOutbound ? 'me' : 'peer',
   receivedAt,
   isSelfOutbound,
+  mimeType: 'text/plain',
+  body: '',
 });
 const arrival = (messageCid: string, receivedAt: number, from = 'peer') => ({
   spaceId: 's1',
   messageCid,
   from,
   receivedAt,
+  mimeType: 'text/plain',
+  body: '',
+});
+
+// ── ZEB-357 call-event fixtures ─────────────────────────────────────
+const CALL_MIME = 'application/x-harmony-call-event+json';
+const hexOf = (s: string) =>
+  Array.from(new TextEncoder().encode(s))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+const callBody = (outcome: string) =>
+  hexOf(JSON.stringify({ v: 1, callId: 'ab'.repeat(16), outcome }));
+const callArrival = (
+  messageCid: string,
+  receivedAt: number,
+  outcome: string,
+  from = 'peer',
+) => ({
+  ...arrival(messageCid, receivedAt, from),
+  mimeType: CALL_MIME,
+  body: callBody(outcome),
+});
+const callEntry = (
+  messageCid: string,
+  receivedAt: number,
+  outcome: string,
+  isSelfOutbound = false,
+): DmThreadPageEntry => ({
+  ...entry(messageCid, receivedAt, isSelfOutbound),
+  mimeType: CALL_MIME,
+  body: callBody(outcome),
 });
 
 class MemStore implements UnreadCursorStore {
@@ -39,9 +72,14 @@ function harness(over: Partial<DmUnreadDeps> = {}) {
   const store = new MemStore();
   store.connectOwner('me');
   const pushes: Array<[string, number]> = [];
+  // ZEB-357: parallel capture of the missed-call count pushed alongside unread.
+  const missedPushes: Array<[string, number]> = [];
   const deps: DmUnreadDeps = {
     listThreadPage: vi.fn(async () => []),
-    setUnread: (id, n) => pushes.push([id, n]),
+    setUnread: (id, n, missed) => {
+      pushes.push([id, n]);
+      missedPushes.push([id, missed ?? 0]);
+    },
     isActiveThread: () => false,
     isFocused: () => true,
     selfOwnerId: () => 'me',
@@ -49,7 +87,7 @@ function harness(over: Partial<DmUnreadDeps> = {}) {
     now: () => 5000,
     ...over,
   };
-  return { svc: new DmUnreadService(deps), deps, store, pushes };
+  return { svc: new DmUnreadService(deps), deps, store, pushes, missedPushes };
 }
 const lastCount = (pushes: Array<[string, number]>, id: string) =>
   [...pushes].reverse().find(([sid]) => sid === id)?.[1];
@@ -216,5 +254,84 @@ describe('DmUnreadService (ZEB-666)', () => {
     // still counts (channel parity: gate is the cursor, not seededness).
     svc.onDmReceived(arrival('m2', 300));
     expect(lastCount(pushes, 's1')).toBe(1);
+  });
+});
+
+// ZEB-357 — missed-call badge: a parallel count of unseen missed-class call
+// events (no_answer / canceled / busy from the peer), pushed alongside the
+// unread count and cleared by the same open-clears-all / cursor discipline.
+describe('DmUnreadService missed-call badge (ZEB-357)', () => {
+  function seeded(over: Partial<DmUnreadDeps> = {}) {
+    const h = harness(over);
+    h.store.set('dm', 's1', { wallMs: 100, logical: 0, deviceId: '' });
+    return h;
+  }
+
+  it('a live missed call-event counts in BOTH unread and missed', () => {
+    const { svc, pushes, missedPushes } = seeded();
+    svc.onDmReceived(callArrival('c1', 200, 'no_answer'));
+    expect(lastCount(pushes, 's1')).toBe(1);
+    expect(lastCount(missedPushes, 's1')).toBe(1);
+  });
+
+  it('canceled and busy count as missed; answered and declined do not', () => {
+    const { svc, missedPushes } = seeded();
+    svc.onDmReceived(callArrival('c1', 200, 'canceled'));
+    svc.onDmReceived(callArrival('c2', 300, 'busy'));
+    svc.onDmReceived(callArrival('c3', 400, 'answered'));
+    svc.onDmReceived(callArrival('c4', 500, 'declined'));
+    expect(lastCount(missedPushes, 's1')).toBe(2);
+  });
+
+  it('a plain text arrival never counts as missed', () => {
+    const { svc, missedPushes } = seeded();
+    svc.onDmReceived(arrival('m1', 200));
+    expect(lastCount(missedPushes, 's1')).toBe(0);
+  });
+
+  it('a self-authored call-event (own sibling device) counts in neither', () => {
+    const { svc, pushes, missedPushes } = seeded();
+    svc.onDmReceived(callArrival('c1', 200, 'no_answer', 'me'));
+    expect(lastCount(pushes, 's1') ?? 0).toBe(0);
+    expect(lastCount(missedPushes, 's1') ?? 0).toBe(0);
+  });
+
+  it('focused + active thread: a missed call-event is seen immediately, not counted', () => {
+    const { svc, missedPushes } = seeded({
+      isActiveThread: (id) => id === 's1',
+      isFocused: () => true,
+    });
+    svc.onDmReceived(callArrival('c1', 200, 'no_answer'));
+    expect(lastCount(missedPushes, 's1') ?? 0).toBe(0);
+  });
+
+  it('markThreadRead clears the missed count with the unread count', () => {
+    const { svc, pushes, missedPushes } = seeded();
+    svc.onDmReceived(callArrival('c1', 200, 'no_answer'));
+    expect(lastCount(missedPushes, 's1')).toBe(1);
+    svc.markThreadRead('s1');
+    expect(lastCount(pushes, 's1')).toBe(0);
+    expect(lastCount(missedPushes, 's1')).toBe(0);
+  });
+
+  it('seed counts missed call-events strictly newer than the cursor', async () => {
+    const { svc, store, missedPushes } = harness({
+      listThreadPage: async () => [
+        callEntry('c3', 300, 'no_answer'),
+        callEntry('c2', 200, 'answered'),
+        callEntry('c1', 100, 'no_answer'), // == cursor → dropped (strict >)
+        callEntry('c0', 50, 'canceled', true), // self-outbound → dropped
+      ],
+    });
+    store.set('dm', 's1', { wallMs: 100, logical: 0, deviceId: '' });
+    await svc.onDmSpaceMaterialized('s1');
+    expect(lastCount(missedPushes, 's1')).toBe(1);
+  });
+
+  it('history replay at or below the cursor does not count as missed', () => {
+    const { svc, missedPushes } = seeded();
+    svc.onDmReceived(callArrival('c1', 100, 'no_answer')); // == cursor
+    svc.onDmReceived(callArrival('c0', 50, 'no_answer')); // older
+    expect(lastCount(missedPushes, 's1') ?? 0).toBe(0);
   });
 });
