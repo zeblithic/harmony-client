@@ -1576,11 +1576,9 @@ impl DmOutbox {
                     // (`TransientNoLiveAttempt`), the grace buys nothing —
                     // it is a pure one-window delay on first durability —
                     // so candidacy fires on the FIRST failure instead.
-                    let no_live_attempt =
-                        matches!(e, TransportError::TransientNoLiveAttempt(_));
+                    let no_live_attempt = matches!(e, TransportError::TransientNoLiveAttempt(_));
                     if (no_live_attempt
-                        || (matches!(e, TransportError::Transient(_))
-                            && pre_failure_count >= 1))
+                        || (matches!(e, TransportError::Transient(_)) && pre_failure_count >= 1))
                         && (self.butler_deposit_client.is_some()
                             || self.community_relay_deposit_client.is_some())
                     {

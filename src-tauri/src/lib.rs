@@ -38589,7 +38589,9 @@ async fn set_presence_visibility(
 /// Persist runs first; when no node is running (`map: None`) the persisted
 /// value is applied to the map at next boot (see start_node).
 async fn set_presence_visibility_detached(
-    map: Option<std::sync::Arc<tokio::sync::Mutex<crate::community_presence::CommunityPresenceMap>>>,
+    map: Option<
+        std::sync::Arc<tokio::sync::Mutex<crate::community_presence::CommunityPresenceMap>>,
+    >,
     path: std::path::PathBuf,
     visible: bool,
 ) -> Result<(), String> {
