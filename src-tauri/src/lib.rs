@@ -1162,11 +1162,12 @@ pub struct NodeState {
     /// paths (local IPC + peer inbound) converge on a single source of
     /// truth.
     ///
-    /// TODO ZEB-291 Task 19.1: wire the engines' mpsc pairs to the
-    /// existing Zenoh adapter (`harmony/community/{id}/voting` key). Phase
-    /// 2 ships with stub mpsc endpoints (drop-on-floor publisher, never-fed
-    /// subscriber) so the registry surface + lifetime management are in
-    /// place; cross-peer voting sync lights up when Task 19.1 lands.
+    /// Task 19.1 (wired): `ensure_voting_engine_for` enqueues a
+    /// `VotingLogAdapterRequest`; the event-loop select! arm drains it and
+    /// calls `spawn_voting_log_zenoh_adapter` against the live Zenoh session,
+    /// bridging each engine's mpsc pair to the adapter
+    /// (`harmony/community/{id}/voting` key). IPCs publish via
+    /// `engine.publish_event`, so cross-peer voting sync is live.
     pub voting_log_engines: std::sync::Arc<
         std::sync::Mutex<
             std::collections::HashMap<
@@ -12743,12 +12744,18 @@ pub async fn start_node_inner(
             // TODO ZEB-291 Task 20.1: thread `Arc<Mutex<NodeState>>`
             // through `apply_auto_exec_set_power` so a finalized
             // Tier 2 SetPower proposal actually rewrites the target's
-            // power level. Today the tick still finalizes the proposal
-            // (lifecycle → Finalized + Tauri event emitted) and the
-            // skipped auto-exec is observable via the tracing::warn!
-            // line below. Single-node Phase 2 acceptance: Finalized
-            // status + UI signal is sufficient; cross-peer power
-            // rewrite lands with the Task 19.1 + 20.1 follow-up.
+            // power level. Blocked as of ZEB-300 converge R2: the tick
+            // task is spawned `'static` (tokio::spawn) so its auto-exec
+            // closure must own a `'static` NodeState handle, but
+            // `start_node_inner` only holds `state: &Mutex<NodeState>`
+            // (Tauri manages `Mutex<NodeState>`, not `Arc<..>`), and
+            // `apply_auto_exec_set_power` requires `&Arc<Mutex<NodeState>>`.
+            // Wiring needs either an Arc-typed managed state threaded through
+            // start_node_inner, or a handle-taking variant of the helper —
+            // both larger than a closure swap. Today the tick still finalizes
+            // the proposal (lifecycle → Finalized + Tauri event emitted) and
+            // the skipped auto-exec is observable via the tracing::warn!
+            // line below.
             {
                 let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                 if guard.generation == our_gen {
