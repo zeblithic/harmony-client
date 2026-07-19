@@ -49,9 +49,20 @@ On each admin replica's tick, for a finalized admin-affecting SetPower under `ad
 ### Convergence properties
 
 - **Staggered ticks (common case)** — replica A ticks → mints P_A → syncs → replica B ticks → sees P_A (sole ⇒ canonical) → countersigns → P_A has `{A, B}` = quorum 2 → **both replicas materialize target at `level` after one tick each** (satisfies AC #3).
-- **Simultaneous ticks (edge)** — A and B both mint before syncing (P_A, P_B). On the next tick each deterministically countersigns `min(P_A.id, P_B.id)` = say P_A → P_A reaches quorum; **self-heals in one extra tick**. The non-canonical P_B is left **inert** — it never reaches quorum, has no effect, and expires after `ADMIN_PROPOSAL_EXPIRY_MS` (30 days). Inert dangling proposals are the accepted cost of coordinator-free availability.
+- **Simultaneous ticks (edge)** — A and B both mint before syncing (P_A, P_B). On a **later** tick each deterministically countersigns `min(P_A.id, P_B.id)` = say P_A → P_A reaches quorum; **self-heals within the auto-exec retry window** (see below). The non-canonical P_B is left **inert** — it never reaches quorum, has no effect, and expires after `ADMIN_PROPOSAL_EXPIRY_MS` (30 days). Inert dangling proposals are the accepted cost of coordinator-free availability.
 - **Absent admin** — a proposal already synced to the log is enough; any other admin countersigns the canonical one. No dependence on the proposer staying online.
 - **Single admin with `admin_quorum > 1`** (out of scope, §7) — mints a proposal that can never reach quorum; degrades to an inert proposal, no panic.
+
+### Bounded re-dispatch in the tick (ZEB-300 converge R1)
+
+The "later tick" above only works if `run_voting_tick` **revisits Finalized polls** — the original tick dispatched auto-exec ONLY on the single tick a poll transitioned `ThresholdReached → Finalized`, so in the simultaneous-finalize case A and B would each mint P_A / P_B on their own finalize tick and **neither would ever countersign the other's**: quorum stalls forever (Qodo). The fix splits Pass 3 into:
+
+- **Pass 3a** — the finalize transition (unchanged): stamp `meta.finalized_at_ms`, emit `voting-proposal-finalized`.
+- **Pass 3b** — re-dispatch auto-exec for **every** Finalized Tier 2 SetPower poll whose `finalized_at_ms` is within `AUTO_EXEC_RETRY_WINDOW_MS` (1h) of `now_ms`. The just-finalized poll is included (its window is 0), so single-tick finalize-then-dispatch still holds.
+
+The window is anchored to **each replica's own** `finalized_at_ms`, so a later-arriving admin (whose replica finalizes the poll later) gets a **fresh** window of its own; because the AdminProposal itself persists `ADMIN_PROPOSAL_EXPIRY_MS` (30 days), quorum accumulates across admins' individually-anchored retry windows even though no single replica re-dispatches for more than an hour.
+
+**Idempotency stops re-mint** once the effect lands. Both the direct-SetPower guard (`apply_auto_exec_set_power`) and the AdminProposal-routed planner (step 1) check `power_levels[target] == level` and return the terminal `AutoExecOutcome::AlreadyApplied` — so re-dispatch is a cheap no-op on every replica the instant the SetPower materializes, independent of the retry window's clock.
 
 ---
 
@@ -65,7 +76,8 @@ All decision logic lives in a **pure, `NodeState`-free** function (cheap to unit
 pub(crate) enum AdminProposalPlan {
     MintProposal,
     Countersign(EventId),   // EventId = [u8; 16]
-    Noop,
+    AlreadyApplied,         // effect already in materialized state → terminal
+    Pending,                // I already signed the canonical; awaiting quorum
 }
 
 pub(crate) fn plan_admin_proposal_auto_exec(
@@ -79,14 +91,16 @@ pub(crate) fn plan_admin_proposal_auto_exec(
 ```
 
 Logic:
-1. If `mat.power_levels.get(&target) == Some(&level)` → `Noop` (effect already applied).
+1. If `mat.power_levels.get(&target) == Some(&level)` → `AlreadyApplied` (effect already applied; **terminal** — the tick's re-dispatch stops here, so nothing re-mints once the SetPower lands on this replica).
 2. Collect **live** candidates: `AdminProposal { proposal_kind: SetPower { target: t, level: l } }` with `t == target && l == level` and `now_ms.saturating_sub(e.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS`.
 3. If none → `MintProposal`.
 4. `canonical = candidates.min_by_key(|e| e.id)`.
-5. If this admin already signed `canonical.id` (an `AdminProposal` with that id and `actor == self_owner`, or an `AdminCountersign` targeting it) → `Noop`.
+5. If this admin already signed `canonical.id` (an `AdminProposal` with that id and `actor == self_owner`, or an `AdminCountersign` targeting it) → `Pending` (nothing to mint this tick, but **not** terminal — the effect has not landed yet, so re-dispatch keeps polling until a peer supplies the final quorum signature).
 6. Else → `Countersign(canonical.id)`.
 
 The already-signed scan reuses the exact predicate from `countersign_admin_proposal_impl` (`lib.rs:43172-43182`).
+
+The wrapper maps the plan to `AutoExecOutcome`: `MintProposal → RoutedProposalMinted`, `Countersign → RoutedProposalCountersigned`, `AlreadyApplied → AlreadyApplied`, `Pending → RoutedProposalPending`. Splitting the old `Noop` into `AlreadyApplied` (terminal) and `Pending` (in-flight) is what lets Pass 3b's bounded re-dispatch distinguish "stop, the effect landed" from "keep polling, quorum still accruing".
 
 ---
 
@@ -100,12 +114,13 @@ The already-signed scan reuses the exact predicate from `countersign_admin_propo
   - `Noop` → `RoutedProposalPending`.
 - In `apply_auto_exec_set_power`, replace the `blocked_by_quorum` NoOp branch (`:5739-5747`) with a call to the new helper. The direct-SetPower path (below) is **untouched**.
 - **Signing key (load-bearing):** the AdminProposal/AdminCountersign events MUST be signed with `outbox.community_signing_key` — matching the manual `set_power_level` proposal path (`lib.rs:41863`) — **not** the `outbox.signing_key` used by the direct-SetPower arm. Signing with the wrong key makes the routed events fail `verify_event` silently.
-- **`AutoExecOutcome`**: retire `SkippedRequiresQuorum`; add `RoutedProposalMinted`, `RoutedProposalCountersigned`, `RoutedProposalPending`.
+- **`AutoExecOutcome`**: retire `SkippedRequiresQuorum`; add `RoutedProposalMinted`, `RoutedProposalCountersigned`, `RoutedProposalPending`, and (ZEB-300 converge R1) the terminal `AlreadyApplied` (effect already in materialized state — nothing minted; the re-dispatch stop condition, returned by both the direct-SetPower and AdminProposal-routed paths).
 - **DRY**: extract the triplicated admin-affecting test into `fn is_admin_affecting_set_power(mat, target, level) -> bool` and call it from `setpower_mint_admin_blocked_by_quorum`, the `set_power_level` IPC, and (optionally) the `verify_event` SetPower arm. Behavior-preserving refactor.
 
 **`src-tauri/src/community_voting_tick.rs`**
-- `TickStats`: retire `tier2_auto_execs_skipped_requires_quorum`; add `tier2_auto_execs_routed_proposal_minted`, `_routed_proposal_countersigned`, `_routed_proposal_pending`.
-- Tick dispatch (`:307-347`): update the `match` on `AutoExecOutcome` to bump the new stats. The `AutoExecSetPowerFn` closure signature `(SpaceId, OwnerAddr, u32)` is **unchanged** — only the returned enum grows, so no tick-signature churn.
+- `TickStats`: retire `tier2_auto_execs_skipped_requires_quorum`; add `tier2_auto_execs_routed_proposal_minted`, `_routed_proposal_countersigned`, `_routed_proposal_pending`, and (ZEB-300 converge R1) `tier2_auto_execs_already_applied`.
+- Tick dispatch: update the `match` on `AutoExecOutcome` to bump the new stats. The `AutoExecSetPowerFn` closure signature `(SpaceId, OwnerAddr, u32)` is **unchanged** — only the returned enum grows, so no tick-signature churn.
+- **Pass 3 split (ZEB-300 converge R1):** add `AUTO_EXEC_RETRY_WINDOW_MS` (1h); Pass 3a keeps only the finalize transition, Pass 3b re-dispatches auto-exec for every Finalized SetPower poll within the window (see §3). `AlreadyApplied` is counted separately from `tier2_auto_execs_attempted` (idempotent no-op, not a mint attempt).
 
 **`src-tauri/src/lib.rs`**
 - No signature changes to the `apply_auto_exec_set_power` wiring in `start_node`. If the `set_power_level` IPC adopts the shared `is_admin_affecting_set_power` helper, update that call site.
@@ -114,14 +129,18 @@ The already-signed scan reuses the exact predicate from `countersign_admin_propo
 
 ## 6. Testing (planner + materialize; per approved depth)
 
-**Pure-planner unit tests** (in `community_membership.rs`, `mod auto_exec_tests` or a new sibling) — exhaustive:
-- already-at-power → `Noop`
+**Pure-planner unit tests** (in `community_membership.rs`, `mod plan_admin_proposal_tests`) — exhaustive:
+- already-at-power → `AlreadyApplied`
 - no candidate → `MintProposal`
 - one live candidate, not yet signed by me → `Countersign(that.id)`
-- one live candidate I proposed → `Noop`
-- one live candidate I already countersigned → `Noop`
+- one live candidate I proposed → `Pending`
+- one live candidate I already countersigned → `Pending`
 - two candidates → `Countersign(min EventId)` (canonical selection)
 - only-expired candidate(s) → `MintProposal` (fresh window)
+
+**Tick re-dispatch tests (ZEB-300 converge R1)** (in `community_voting_tick.rs`):
+- `tier2_auto_exec_redispatches_finalized_poll_within_window` — a poll finalizes on tick 1 (dispatched once), then a second tick within `AUTO_EXEC_RETRY_WINDOW_MS` re-dispatches auto-exec while the poll is already Finalized.
+- `tier2_auto_exec_stops_redispatch_after_window` — the same, but a second tick past `finalized_at_ms + AUTO_EXEC_RETRY_WINDOW_MS` does NOT re-dispatch.
 
 **Materialize convergence test** (reuse the hand-built-events pattern in `tests/community_misc/community_admin_quorum_integration.rs`, incl. its `bootstrap_two_admins_raise_quorum` helper): two admins, `admin_quorum = 2`, promote a non-admin to 100 → construct `AdminProposal` (admin A) + `AdminCountersign` (admin B) → `materialize` → assert `power_levels[target] == 100` on the merged log (both replicas see the same log ⇒ same materialization). Covers AC #3 without a heavyweight dual-live-engine + tick fixture (which the recon confirmed does not yet exist).
 
