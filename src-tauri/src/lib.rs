@@ -13547,9 +13547,16 @@ pub struct DmThreadMessage {
     /// `MessagePayload.sent_at.wall_ms` — sender's HLC at compose time.
     pub sent_at: u64,
     /// `InboxEntry.received_at.wall_ms` — local HLC at apply_inbox time.
-    /// Pagination cursor: callers pass the oldest entry's value as
-    /// `before_hlc` to fetch the next page.
+    /// Display/ordering value only. ZEB-244: this is NO LONGER the
+    /// pagination cursor — use `cursor` (a full-HLC token) so same-
+    /// millisecond page boundaries don't skip siblings.
     pub received_at: u64,
+    /// ZEB-244: opaque pagination cursor for this entry — an
+    /// `encode_dm_cursor` token over the full `received_at` HLC
+    /// `(wall_ms, logical, device_id)`. Callers store the oldest entry's
+    /// `cursor` and pass it back verbatim as `before_hlc` for the next
+    /// page. Opaque: the frontend must not parse it.
+    pub cursor: String,
     /// Hex-encoded plaintext body (decrypted from CAS storage_blob).
     pub body: String,
     pub mime_type: String,
@@ -13588,6 +13595,40 @@ pub struct DmThreadMessage {
     pub message_id: Option<String>,
 }
 
+/// ZEB-244: encode an `Hlc` as the opaque pagination cursor string
+/// `"{wall_ms}:{logical}:{device_id}"`. The frontend treats the result as
+/// a black box: it stores the oldest page entry's `cursor` and passes it
+/// back verbatim as `before_hlc` for the next page. `wall_ms`/`logical`
+/// are numeric so they can never contain `:`; `device_id` may, which is
+/// why `decode_dm_cursor` uses `splitn(3, ':')` (device_id = "the rest").
+pub(crate) fn encode_dm_cursor(hlc: &crate::owner_state_types::Hlc) -> String {
+    format!("{}:{}:{}", hlc.wall_ms, hlc.logical, hlc.device_id)
+}
+
+/// ZEB-244: inverse of `encode_dm_cursor`. `splitn(3, ':')` keeps any `:`
+/// inside `device_id` intact. A malformed cursor is a hard error (the
+/// frontend only ever echoes back a token we minted, so a bad one means a
+/// caller bug, not a soft-fallback case).
+pub(crate) fn decode_dm_cursor(s: &str) -> Result<crate::owner_state_types::Hlc, String> {
+    let mut parts = s.splitn(3, ':');
+    let wall_ms = parts
+        .next()
+        .ok_or("cursor: missing wall_ms")?
+        .parse::<u64>()
+        .map_err(|e| format!("cursor wall_ms: {e}"))?;
+    let logical = parts
+        .next()
+        .ok_or("cursor: missing logical")?
+        .parse::<u32>()
+        .map_err(|e| format!("cursor logical: {e}"))?;
+    let device_id = parts.next().ok_or("cursor: missing device_id")?.to_string();
+    Ok(crate::owner_state_types::Hlc {
+        wall_ms,
+        logical,
+        device_id,
+    })
+}
+
 /// Pure helper: sort InboxEntries by `received_at` descending, drop entries
 /// at or past the `before_hlc` cursor, then truncate to `limit`.
 ///
@@ -13596,16 +13637,25 @@ pub struct DmThreadMessage {
 /// each had its own copy of the sort+filter+truncate body — production
 /// hit the IPC's copy while tests only ever hit the inner's, so a quiet
 /// divergence (e.g., flipping the cursor comparison inclusivity) would
-/// never be caught.
+/// never be caught. For the same reason the cursor decode lives HERE, so
+/// both paths exercise it identically.
+///
+/// ZEB-244: `before_hlc` is now a full-HLC cursor (an `encode_dm_cursor`
+/// token), not a bare `wall_ms`. The filter compares on the same
+/// `(wall_ms, logical, device_id)` lexicographic key the sort uses, so a
+/// page boundary that lands mid-millisecond no longer drops sibling
+/// entries sharing that `wall_ms` (the previous `wall_ms`-only `<` cursor
+/// skipped every same-ms entry past the boundary).
 ///
 /// Lock-free + pure: takes owned entries by value so the caller can
 /// gather them under whatever lock and drop the lock before invoking
-/// this. Returns the truncated, sorted, cursor-filtered vec.
+/// this. Returns the truncated, sorted, cursor-filtered vec, or `Err` if
+/// the cursor string is malformed.
 fn filter_sort_paginate_inbox(
     entries: Vec<crate::owner_state_types::InboxEntry>,
-    before_hlc: Option<u64>,
+    before_hlc: Option<String>,
     limit: usize,
-) -> Vec<crate::owner_state_types::InboxEntry> {
+) -> Result<Vec<crate::owner_state_types::InboxEntry>, String> {
     let mut entries = entries;
     // Sort by received_at descending. Hlc has no Ord impl, so compare on
     // the (wall_ms, logical, device_id) tuple — same lex ordering
@@ -13628,10 +13678,115 @@ fn filter_sort_paginate_inbox(
         key_b.cmp(&key_a) // descending: larger keys first
     });
     if let Some(cursor) = before_hlc {
-        entries.retain(|e| e.received_at.wall_ms < cursor);
+        let cur = decode_dm_cursor(&cursor)?;
+        // Keep entries strictly older than the cursor entry, in the same
+        // lex order as the sort. Matches the descending page contract:
+        // page N+1 = everything strictly-older-than page N's last entry.
+        entries.retain(|e| {
+            (
+                e.received_at.wall_ms,
+                e.received_at.logical,
+                e.received_at.device_id.as_str(),
+            ) < (cur.wall_ms, cur.logical, cur.device_id.as_str())
+        });
     }
     entries.truncate(limit);
-    entries
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod zeb_244_cursor_tests {
+    use super::*;
+    use crate::owner_state_types::{ContentId, Hlc, InboxEntry, OwnerAddr, SpaceId};
+
+    fn entry(cid_byte: u8, wall_ms: u64, logical: u32, device_id: &str) -> InboxEntry {
+        InboxEntry {
+            space_id: SpaceId([7u8; 16]),
+            message_cid: ContentId::from_bytes([cid_byte; 32]),
+            from: OwnerAddr([1u8; 16]),
+            received_at: Hlc {
+                wall_ms,
+                logical,
+                device_id: device_id.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn cursor_round_trips_including_colon_in_device_id() {
+        // device_id may itself contain ':'; splitn(3) keeps it whole.
+        let hlc = Hlc {
+            wall_ms: 1234,
+            logical: 7,
+            device_id: "dev:with:colons".into(),
+        };
+        let encoded = encode_dm_cursor(&hlc);
+        assert_eq!(encoded, "1234:7:dev:with:colons");
+        assert_eq!(decode_dm_cursor(&encoded).expect("decode ok"), hlc);
+    }
+
+    #[test]
+    fn decode_rejects_malformed_cursor() {
+        assert!(decode_dm_cursor("nope").is_err());
+        assert!(decode_dm_cursor("1000:notanumber:dev").is_err());
+        assert!(decode_dm_cursor("1000").is_err());
+    }
+
+    #[test]
+    fn paginates_same_wall_ms_entries_without_skip_or_dup() {
+        // 5 InboxEntries all at wall_ms=1000. The old wall_ms-only cursor
+        // (`retain(received_at.wall_ms < cursor)`) would drop EVERY same-ms
+        // sibling once page 1's oldest wall_ms became the cursor — skipping
+        // 3 of the 5. Distinct (logical, device_id) with some shared logical
+        // exercises the device_id tiebreak of the lexicographic filter.
+        let all = vec![
+            entry(0, 1000, 0, "a"),
+            entry(1, 1000, 0, "b"),
+            entry(2, 1000, 1, "a"),
+            entry(3, 1000, 1, "b"),
+            entry(4, 1000, 2, "a"),
+        ];
+
+        let mut seen: Vec<u8> = Vec::new();
+        let mut cursor: Option<String> = None;
+        // Bounded page loop (5 entries / page-size 2 → 3 pages; cap at 10).
+        for _ in 0..10 {
+            let page =
+                filter_sort_paginate_inbox(all.clone(), cursor.clone(), 2).expect("filter ok");
+            if page.is_empty() {
+                break;
+            }
+            for e in &page {
+                seen.push(e.message_cid.to_bytes()[0]);
+            }
+            cursor = Some(encode_dm_cursor(&page.last().unwrap().received_at));
+        }
+
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![0, 1, 2, 3, 4],
+            "all 5 same-wall_ms entries surface exactly once across pages"
+        );
+    }
+
+    #[test]
+    fn page_boundary_descending_order_is_stable() {
+        // Sanity: the surfaced order across pages is the full descending
+        // (wall_ms, logical, device_id) sequence, no reordering at the seam.
+        let all = vec![
+            entry(0, 1000, 0, "a"),
+            entry(1, 1000, 0, "b"),
+            entry(2, 1000, 1, "a"),
+        ];
+        let page1 = filter_sort_paginate_inbox(all.clone(), None, 2).expect("p1");
+        assert_eq!(page1[0].message_cid.to_bytes()[0], 2); // (1000,1,"a")
+        assert_eq!(page1[1].message_cid.to_bytes()[0], 1); // (1000,0,"b")
+        let cursor = encode_dm_cursor(&page1[1].received_at);
+        let page2 = filter_sort_paginate_inbox(all, Some(cursor), 2).expect("p2");
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].message_cid.to_bytes()[0], 0); // (1000,0,"a")
+    }
 }
 
 /// Pure inner implementation of `read_dm_thread`. The `#[tauri::command]`
@@ -13661,7 +13816,7 @@ pub async fn read_dm_thread_inner(
     cas: &dyn crate::content_store::ContentStore,
     space_id: crate::owner_state_types::SpaceId,
     limit: usize,
-    before_hlc: Option<u64>,
+    before_hlc: Option<String>,
     self_owner: crate::owner_state_types::OwnerAddr,
 ) -> Result<Vec<DmThreadMessage>, String> {
     let space = state
@@ -13679,7 +13834,7 @@ pub async fn read_dm_thread_inner(
     // memory; no .await crosses the borrow of `state`.
     let raw: Vec<crate::owner_state_types::InboxEntry> =
         state.inbox_entries_for_space(space_id).cloned().collect();
-    let entries = filter_sort_paginate_inbox(raw, before_hlc, limit);
+    let entries = filter_sort_paginate_inbox(raw, before_hlc, limit)?;
     // Snapshot the outbox so decrypt_inbox_entries can populate per-entry
     // delivery_state without re-locking. Cheap (Phase 4 scale: tens of
     // entries max).
@@ -13722,7 +13877,7 @@ async fn read_dm_thread(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     space_id: String,
     limit: usize,
-    before_hlc: Option<u64>,
+    before_hlc: Option<String>,
 ) -> Result<Vec<DmThreadMessage>, String> {
     read_dm_thread_impl(state_lock.inner(), space_id, limit, before_hlc).await
 }
@@ -13732,7 +13887,7 @@ pub(crate) async fn read_dm_thread_impl(
     state: &std::sync::Mutex<NodeState>,
     space_id: String,
     limit: usize,
-    before_hlc: Option<u64>,
+    before_hlc: Option<String>,
 ) -> Result<Vec<DmThreadMessage>, String> {
     let space_id_hex = space_id;
     // Snapshot handles under the sync mutex; release before any .await.
@@ -13782,7 +13937,7 @@ pub(crate) async fn read_dm_thread_impl(
             .inbox_entries_for_space(space_id)
             .cloned()
             .collect();
-        let entries = filter_sort_paginate_inbox(raw, before_hlc, limit);
+        let entries = filter_sort_paginate_inbox(raw, before_hlc, limit)?;
         // Snapshot the outbox so the decrypt loop can populate
         // per-entry delivery_state without re-locking. Cheap (Phase 4
         // scale: tens of entries max).
@@ -13909,6 +14064,7 @@ async fn decrypt_inbox_entries(
             from: hex::encode(entry.from.0),
             sent_at: payload.sent_at.wall_ms,
             received_at: entry.received_at.wall_ms,
+            cursor: encode_dm_cursor(&entry.received_at),
             body: hex::encode(&payload.body),
             mime_type: payload.mime_type,
             is_self_outbound,

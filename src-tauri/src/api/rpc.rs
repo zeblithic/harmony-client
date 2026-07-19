@@ -380,7 +380,9 @@ struct SendDmArgs {
 struct ReadDmThreadArgs {
     space_id: String,
     limit: usize,
-    before_hlc: Option<u64>,
+    /// ZEB-244: opaque full-HLC pagination cursor (an `encode_dm_cursor`
+    /// token), was a bare `wall_ms`. Echo back the oldest entry's `cursor`.
+    before_hlc: Option<String>,
 }
 
 /// ZEB-487: relay opt-in control. Note the existing `CommunityIdArgs` uses

@@ -204,8 +204,9 @@ async fn read_dm_thread_paginates_via_before_hlc_cursor() {
     assert_eq!(hex::decode(&page1[0].body).unwrap(), b"msg-4");
     assert_eq!(hex::decode(&page1[1].body).unwrap(), b"msg-3");
 
-    // Page 2: cursor = oldest received_at on page 1 (msg-3's wall_ms).
-    let cursor = page1[1].received_at;
+    // Page 2: cursor = oldest entry's opaque cursor on page 1 (msg-3).
+    // ZEB-244: the cursor is now a full-HLC token, not a bare wall_ms.
+    let cursor = page1[1].cursor.clone();
     let page2 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
         .await
         .expect("page 2 ok");
@@ -213,16 +214,16 @@ async fn read_dm_thread_paginates_via_before_hlc_cursor() {
     assert_eq!(hex::decode(&page2[0].body).unwrap(), b"msg-2");
     assert_eq!(hex::decode(&page2[1].body).unwrap(), b"msg-1");
 
-    // Page 3: cursor = oldest received_at on page 2 (msg-1's wall_ms).
-    let cursor = page2[1].received_at;
+    // Page 3: cursor = oldest entry's cursor on page 2 (msg-1).
+    let cursor = page2[1].cursor.clone();
     let page3 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
         .await
         .expect("page 3 ok");
     assert_eq!(page3.len(), 1, "only msg-0 left");
     assert_eq!(hex::decode(&page3[0].body).unwrap(), b"msg-0");
 
-    // Page 4: cursor = oldest received_at on page 3 → empty.
-    let cursor = page3[0].received_at;
+    // Page 4: cursor = oldest entry's cursor on page 3 → empty.
+    let cursor = page3[0].cursor.clone();
     let page4 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
         .await
         .expect("page 4 ok");
