@@ -9562,13 +9562,14 @@ pub fn spawn_voting_log_zenoh_adapter(
                                         match ciborium::from_reader(raw.as_slice()) {
                                             Ok(env) => env,
                                             Err(e) => {
-                                                if !closing_sub.load(Ordering::SeqCst) {
-                                                    tracing::warn!(
-                                                        topic = %topic_sub,
-                                                        error = %e,
-                                                        "drop voting packet (envelope decode)"
-                                                    );
-                                                }
+                                                // debug, not warn: a mesh peer (incl. the kicked
+                                                // member this change contains) can spam malformed
+                                                // envelopes — one warn/packet would flood logs.
+                                                tracing::debug!(
+                                                    topic = %topic_sub,
+                                                    error = %e,
+                                                    "drop voting packet (envelope decode)"
+                                                );
                                                 continue;
                                             }
                                         };
@@ -9579,13 +9580,14 @@ pub fn spawn_voting_log_zenoh_adapter(
                                     match space.current_epoch {
                                         Some(cur) if cur == envelope.epoch => {}
                                         _ => {
-                                            if !closing_sub.load(Ordering::SeqCst) {
-                                                tracing::warn!(
-                                                    topic = %topic_sub,
-                                                    epoch = envelope.epoch,
-                                                    "drop voting packet (stale/unknown epoch)"
-                                                );
-                                            }
+                                            // debug, not warn: stale-epoch drops are both the
+                                            // attack-containment path AND expected for legit votes
+                                            // in flight across a rotation — warn would flood.
+                                            tracing::debug!(
+                                                topic = %topic_sub,
+                                                epoch = envelope.epoch,
+                                                "drop voting packet (stale/unknown epoch)"
+                                            );
                                             continue;
                                         }
                                     }
@@ -9596,13 +9598,14 @@ pub fn spawn_voting_log_zenoh_adapter(
                                     ) {
                                         Ok(pt) => pt,
                                         Err(e) => {
-                                            if !closing_sub.load(Ordering::SeqCst) {
-                                                tracing::warn!(
-                                                    topic = %topic_sub,
-                                                    error = %e,
-                                                    "drop voting packet (decrypt)"
-                                                );
-                                            }
+                                            // debug, not warn: tag mismatch = tamper / cross-plane
+                                            // replay from a peer — attacker-controllable, so one
+                                            // warn/packet would flood.
+                                            tracing::debug!(
+                                                topic = %topic_sub,
+                                                error = %e,
+                                                "drop voting packet (decrypt)"
+                                            );
                                             continue;
                                         }
                                     }

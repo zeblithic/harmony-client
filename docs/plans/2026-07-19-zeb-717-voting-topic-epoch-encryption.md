@@ -4,7 +4,7 @@
 
 **Goal:** Epoch-encrypt the voting Zenoh topic so a kicked-then-rotated member can no longer inject voting events.
 
-**Architecture:** Reuse the community state-root plane's `EncryptedEnvelope` + live-`crdt_state` epoch-key machinery for *encrypt*, but apply a channel-log-style **current-epoch-only** receive cut (reject `envelope.epoch != current_epoch`) — the provably-unique transport test that separates a kicked member (held `K(N)`) from a retained member (gets `K(N+1)`). Crypto lives in `community_voting_log_engine`; the Zenoh adapter stays an unmodified byte relay.
+**Architecture:** Reuse the community state-root plane's `EncryptedEnvelope` + live-`crdt_state` epoch-key machinery for *encrypt*, but apply a channel-log-style **current-epoch-only** receive cut (reject `envelope.epoch != current_epoch`) — the provably-unique transport test that separates a kicked member (held `K(N)`) from a retained member (gets `K(N+1)`). **Crypto lives in the Zenoh adapter** (`spawn_voting_log_zenoh_adapter`, the wire boundary); the engine is unchanged (placement changed at review — see the note below and spec §4).
 
 **Tech Stack:** Rust, ChaCha20-Poly1305 (`chacha20poly1305` crate), `ciborium` CBOR, tokio, zenoh.
 
@@ -22,7 +22,7 @@
 ## Global Constraints
 
 - Cargo commands run from `src-tauri/`. Always `--locked` and `--features test-fixtures`.
-- Iterative gates use `scripts/test-select --context task` (k=4) to avoid the ~50min full-integration relink on every task; the **final** task runs the full CI-parity sweep (`--workspace --all-targets`).
+- Iterative gates use scoped `cargo nextest --test community_voting_tests` (+ `--lib` unit runs) to avoid the ~50min full-integration relink on every task; the **final** task runs the full CI-parity sweep (`--workspace --all-targets`).
 - `VOTING_TOPIC_AAD = b"harmony-voting-v1"` (exact bytes; versioned).
 - Flag-day migration: publish AND receive change together; no plaintext-accept path. Wire changes from raw `SignedVotingEvent` CBOR to `EncryptedEnvelope` CBOR.
 - State-root plane wire bytes MUST NOT move: the 2-arg `encrypt_for_topic`/`decrypt_for_topic` keep byte-identical output (empty-AAD delegation).
@@ -178,7 +178,19 @@ git commit -m "ZEB-717: AAD-parameterized encrypt/decrypt_for_topic helpers (sta
 
 ---
 
-### Task 2: Thread `crdt_state` into the voting engine
+### ⚠️ SUPERSEDED — Tasks 2 & 3 below described the engine-crypto approach that was NOT built
+
+> The crypto was placed in the **adapter**, not the engine (see the top-of-file note + spec §4). The
+> two sections below are retained only as history — they do **not** describe the shipped code. What
+> actually landed (one commit, `6591fcb1`):
+> - `event_loop.rs`: `VotingLogAdapterRequest` + `spawn_voting_log_zenoh_adapter` gain
+>   `community_id` + `crdt_state`; encrypt on `put` under the current epoch + `VOTING_TOPIC_AAD`;
+>   current-epoch-only gate + decrypt on recv before forwarding plaintext to the engine.
+> - `lib.rs`: populate the two new request fields at `ensure_voting_engine_for`.
+> - The `VotingLogEngine` and its `Params` are **unchanged**; the two real-adapter integration tests
+>   (zenoh + tier2-delegate) seed a shared epoch key via `community_state_sync::test_community_space`.
+
+### Task 2 (superseded): Thread `crdt_state` into the voting engine
 
 **Files:**
 - Modify: `src-tauri/src/community_voting_log_engine.rs` (`VotingLogEngine<R>` struct `:246-308`; `VotingLogEngineParams` `:198-234`; `start`/constructor)
@@ -232,7 +244,7 @@ git commit -m "ZEB-717: thread crdt_state into VotingLogEngine (no behavior chan
 
 ---
 
-### Task 3: Flag-day cutover — encrypt on publish, current-epoch-only decrypt on receive
+### Task 3 (superseded — see the ⚠️ note above): Flag-day cutover — encrypt on publish, current-epoch-only decrypt on receive
 
 **Files:**
 - Modify: `src-tauri/src/community_voting_log_engine.rs` (add `VOTING_TOPIC_AAD` const; publish seam `:1543-1694`; `process_inbound_dispatch` `:2506`)
@@ -432,7 +444,7 @@ Only if a fixture pins topic bytes: add a `#[cfg(any(test, feature = "test-fixtu
 - [ ] **Step 3: Full CI-parity sweep**
 
 Run: `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures`
-Then: `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` and `cargo fmt --all -- --check`
+Then: `cargo clippy --locked --workspace --all-targets --features test-fixtures --no-deps -- -D warnings` and `cargo fmt --all -- --check`
 Then (frontend, from repo root): `npx tsc --noEmit && npx vitest run` (expected unaffected — no frontend change).
 Expected: all green.
 
@@ -451,13 +463,13 @@ git commit -m "ZEB-717: refresh voting wire fixtures for encrypted envelope; ful
 - §3 D1 (voting AAD) → Task 1 + `VOTING_TOPIC_AAD` in Task 3. ✓
 - §3 D2 (flag-day) → Task 3 (publish+receive cut over together; no plaintext-accept). ✓
 - §3 D3 / §2 (current-epoch-only) → Task 3 Step 5 epoch gate + Task 4 acceptance test. ✓
-- §4.1 (crdt_state on engine) → Task 2. ✓
-- §4.2 publish seam → Task 3 Step 4. ✓ §4.3 receive seam → Task 3 Step 5. ✓
-- §5 error handling (drops, no panic) → Task 3 Steps 4-5 (all `Result`/warn+return). ✓
-- §6 tests → Task 1 (AAD unit), Task 3 (publish/receive unit + happy-path integration), Task 4 (acceptance), Task 5 (fixtures). ✓
+- §4.1 (crdt_state at the adapter) → as-built adapter cutover (`6591fcb1`). ✓
+- §4.2 adapter outbound (encrypt on put) + §4.3 adapter inbound (current-epoch gate + decrypt) → as-built cutover. ✓
+- §5 error handling (drops, no panic) → adapter drop paths; attacker-controllable inbound drops log at `debug` (R1 anti-flood hardening). ✓
+- §6 tests → Task 1 (AAD unit), `community_voting_tests` (happy-path + tier2 real-adapter), Task 4 (acceptance w/ readiness barrier + FIFO sentinel), Task 5 (fixtures unchanged — engine still emits plaintext CBOR). ✓
 - §6 state-root byte-compat → Task 1 `empty_aad_is_byte_compatible_state_root`. ✓
-- Adapter unchanged (§4) → no task touches `event_loop.rs`. ✓
+- Engine unchanged → the ~26 mpsc-bridged voting tests untouched. ✓
 
 **Placeholder scan:** test bodies in Tasks 3/4 are sketched with exact assertions but rely on file-local harness helpers (`test_engine_with_epoch`, `FixedResolvers` seeding) that must be read from the file at execution — flagged inline as "reuse existing pattern," not left as blind TODOs. Acceptable for inline execution with full context.
 
-**Type consistency:** `encrypt_for_topic_with_aad`/`decrypt_for_topic_with_aad` signatures identical across Tasks 1/3; `crdt_state: Arc<Mutex<OwnerState>>` identical across Tasks 2/3; `VOTING_TOPIC_AAD = b"harmony-voting-v1"` identical in const (Task 3) and tests (Tasks 3/4). ✓
+**Type consistency:** `encrypt_for_topic_with_aad`/`decrypt_for_topic_with_aad` signatures identical (Task 1) and reused by the adapter; `crdt_state: Arc<Mutex<OwnerState>>` on `VotingLogAdapterRequest` + the adapter signature (as-built); `VOTING_TOPIC_AAD = b"harmony-voting-v1"` identical in the const (Task 1) and the adapter/tests. ✓

@@ -243,6 +243,28 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
     drop(_engine_b);
 }
 
+/// Craft an encrypted voting envelope for `event` under `space`'s current epoch
+/// (+ voting AAD) and `put` it directly on the topic — models a raw publisher /
+/// attacker who controls the wire bytes, with no adapter-side crypto in the way.
+async fn craft_and_put_voting(
+    session: &zenoh::Session,
+    topic: &str,
+    space: &harmony_app::owner_state_types::Space,
+    event: &harmony_app::community_voting_core::SignedVotingEvent,
+) {
+    let mut plaintext = Vec::new();
+    ciborium::ser::into_writer(event, &mut plaintext).expect("encode event");
+    let envelope = harmony_app::community_state_sync::encrypt_for_topic_with_aad(
+        space,
+        &plaintext,
+        harmony_app::community_state_sync::VOTING_TOPIC_AAD,
+    )
+    .expect("encrypt under space epoch");
+    let mut wire = Vec::new();
+    ciborium::ser::into_writer(&envelope, &mut wire).expect("encode envelope");
+    session.put(topic, wire).await.expect("zenoh put");
+}
+
 /// ZEB-717 acceptance criterion: a member kicked at the N→N+1 epoch rotation,
 /// holding only the stale epoch-N key, cannot inject a voting event — even
 /// though the receiver still RETAINS K(N) in `old_epoch_keys`. The transport's
@@ -252,9 +274,14 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
 /// gate that can, and it must key on the CURRENT epoch, not merely on whether
 /// the receiver holds the key.
 ///
-/// Control (second phase): once the "kicked" node rotates its own view to
-/// epoch N+1 with the current key, a same-shaped event DOES apply on B — proving
-/// the earlier drop was epoch-specific, not a broken pipe.
+/// Delivery is proven, not assumed: a **readiness barrier** polls until an
+/// epoch-1 event actually applies on B (peer link live + B decrypts the current
+/// epoch), and a FIFO **sentinel** epoch-1 event is published immediately AFTER
+/// the stale one on the same session + key. Zenoh delivers per-publisher in
+/// order, so once B applies the sentinel the stale packet was delivered too —
+/// its absence then proves the epoch gate DROPPED it, not that it was lost. The
+/// sentinel doubles as the current-epoch control. (Readiness discipline over a
+/// fixed warm-up sleep — Qodo #504.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kicked_then_rotated_member_injection_is_dropped() {
     let cfg = zenoh::Config::default();
@@ -263,19 +290,17 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
 
     let community_id = SpaceId([0xac; 16]);
     let community_id_hex = hex::encode(community_id.0);
+    let topic = format!("harmony/community/{}/voting", community_id_hex);
 
     let k0 = EpochKey::new([0xa0; 32]); // epoch-0 key the kicked member still holds
     let k1 = EpochKey::new([0xb1; 32]); // epoch-1 key installed by the rotation
 
-    // Kicked member A: stuck at epoch 0 (only holds K0).
-    let crdt_state_a = Arc::new(Mutex::new({
-        let mut os = harmony_app::owner_state_crdt::OwnerState::default();
-        os.spaces.insert(
-            community_id,
-            harmony_app::community_state_sync::test_community_space(community_id, 0, k0.clone()),
-        );
-        os
-    }));
+    // Publisher-side epoch snapshots for crafting envelopes directly: the kicked
+    // member is stuck at epoch 0 (K0); an honest member publishes at epoch 1 (K1).
+    let space_e0 =
+        harmony_app::community_state_sync::test_community_space(community_id, 0, k0.clone());
+    let space_e1 =
+        harmony_app::community_state_sync::test_community_space(community_id, 1, k1.clone());
 
     // Receiver B: rotated to epoch 1, but RETAINS K0 in old_epoch_keys — the
     // whole point is that key retention alone must NOT admit the stale injection.
@@ -289,7 +314,7 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
     }));
 
     // Actor is a valid member in B's snapshot, so verify_voting_event passes for
-    // BOTH the stale and the control event — only the transport epoch differs.
+    // every event — only the transport epoch differs.
     let (keypair, actor, pub_64) = fixture_identity(0xcd);
     let resolvers = Arc::new(FixedResolvers {
         identity: HashMap::from([(actor, pub_64)]),
@@ -306,21 +331,8 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
     let id_resolver: Arc<dyn VotingIdentityResolver> = resolvers.clone();
     let mem_resolver: Arc<dyn MembershipSnapshotResolver> = resolvers.clone();
 
-    // Adapter A (publisher) — encrypts under the kicked member's stale epoch view.
-    let closing_a = Arc::new(AtomicBool::new(false));
-    let (a_pub_tx, a_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-    let (a_sub_tx_unused, _a_sub_rx_unused) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-    let _adapter_a = spawn_voting_log_zenoh_adapter(
-        Arc::clone(&session_a),
-        community_id_hex.clone(),
-        community_id,
-        Arc::clone(&crdt_state_a),
-        a_pub_rx,
-        a_sub_tx_unused,
-        Arc::clone(&closing_a),
-    );
-
-    // Adapter B (subscriber) + engine B.
+    // Only B runs an adapter (the component under test) + engine. A is a raw
+    // publisher that crafts envelopes directly via `craft_and_put_voting`.
     let closing_b = Arc::new(AtomicBool::new(false));
     let (b_pub_tx, b_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let (b_sub_tx, b_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -333,14 +345,6 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
         b_sub_tx,
         Arc::clone(&closing_b),
     );
-
-    // Warm up the Zenoh peer link (encrypted-then-dropped WARMUP bytes are fine —
-    // they're epoch-0 envelopes that B's gate drops, but the put/subscribe
-    // handshake still establishes the link).
-    for _ in 0..100 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = a_pub_tx.send(b"WARMUP".to_vec()).await;
-    }
 
     let log_b = Arc::new(Mutex::new(VotingLog::default()));
     let _engine_b = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
@@ -378,50 +382,56 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
         build_signed_poll_create_tier1(&keypair, actor, &cfg_poll, hlc).expect("build poll create")
     };
 
-    // ── Phase 1: STALE injection (A encrypts under epoch 0) — must be dropped ──
-    let stale = make_event(1_700_000_000_000, "kicked-a");
-    let stale_pid = derive_poll_id(&community_id, &stale.signing_bytes().expect("sb"));
-    let mut pkt = Vec::new();
-    ciborium::ser::into_writer(&stale, &mut pkt).expect("encode");
-    a_pub_tx.send(pkt).await.expect("push stale");
-
-    // The link is warm, so 1.5s is ample: if it were going to apply it would
-    // have. It must NOT — epoch-0 envelope vs B.current_epoch = 1.
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(
-            !log_b.lock().await.has_poll(&stale_pid),
-            "stale-epoch injection from a kicked member was applied — ZEB-717 cut failed"
-        );
-    }
-
-    // ── Phase 2: CONTROL — A rotates its own view to epoch 1 + K1; must apply ──
-    {
-        let mut g = crdt_state_a.lock().await;
-        let space = g.spaces.get_mut(&community_id).expect("space present");
-        space.current_epoch = Some(1);
-        space.current_epoch_key = Some(k1.clone());
-    }
-    let control = make_event(1_700_000_001_000, "member-a");
-    let control_pid = derive_poll_id(&community_id, &control.signing_bytes().expect("sb"));
-    let mut pkt2 = Vec::new();
-    ciborium::ser::into_writer(&control, &mut pkt2).expect("encode");
-    a_pub_tx.send(pkt2).await.expect("push control");
-
-    let mut applied = false;
-    for _ in 0..60 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if log_b.lock().await.has_poll(&control_pid) {
-            applied = true;
+    // ── Readiness barrier: an epoch-1 event MUST apply on B before we test the
+    // drop, so a later non-application can only mean "dropped", never "link not
+    // up yet". Re-publish each iteration until it lands (waits exactly as long
+    // as discovery needs — no fixed warm-up sleep).
+    let ready = make_event(1_700_000_000_000, "ready");
+    let ready_pid = derive_poll_id(&community_id, &ready.signing_bytes().expect("sb"));
+    let mut link_up = false;
+    for _ in 0..100 {
+        craft_and_put_voting(&session_a, &topic, &space_e1, &ready).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if log_b.lock().await.has_poll(&ready_pid) {
+            link_up = true;
             break;
         }
     }
     assert!(
-        applied,
-        "current-epoch event must apply on B — the earlier drop was epoch-specific, not a broken pipe"
+        link_up,
+        "peer link never came up / B never applied the epoch-1 readiness event"
     );
 
-    closing_a.store(true, std::sync::atomic::Ordering::SeqCst);
+    // ── STALE injection under epoch 0 (the kicked member's retained key) ──
+    let stale = make_event(1_700_000_001_000, "kicked");
+    let stale_pid = derive_poll_id(&community_id, &stale.signing_bytes().expect("sb"));
+    craft_and_put_voting(&session_a, &topic, &space_e0, &stale).await;
+
+    // ── SENTINEL under epoch 1, published AFTER the stale on the same session +
+    // key. Per-publisher FIFO ⇒ once B applies the sentinel the stale arrived
+    // too; the sentinel also serves as the current-epoch control.
+    let sentinel = make_event(1_700_000_002_000, "member");
+    let sentinel_pid = derive_poll_id(&community_id, &sentinel.signing_bytes().expect("sb"));
+    craft_and_put_voting(&session_a, &topic, &space_e1, &sentinel).await;
+
+    let mut sentinel_applied = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if log_b.lock().await.has_poll(&sentinel_pid) {
+            sentinel_applied = true;
+            break;
+        }
+    }
+    assert!(
+        sentinel_applied,
+        "epoch-1 sentinel (sent after the stale) must apply on B — current epoch is accepted"
+    );
+    assert!(
+        !log_b.lock().await.has_poll(&stale_pid),
+        "stale epoch-0 injection was delivered before the sentinel but must be DROPPED by the \
+         current-epoch-only gate — a retained old key must not admit it"
+    );
+
     closing_b.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(_engine_b);
 }
