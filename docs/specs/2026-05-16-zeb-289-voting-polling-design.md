@@ -483,6 +483,8 @@ voting_contest_tier2_finalization(proposal_id: PollId) -> Result<()>
 
 V1 scope: `none` (signals only) and `set_power { target_pubkey, new_power }`. Other downstream actions (kick, set_admin_quorum, update_channel_config, set_community_policy) are out of scope for v1 — communities build IFTTT-style automation on top of the signal events through their own admin workflows or community-bot layers. Voting just emits the signal.
 
+**Admin-quorum interaction (ZEB-300).** When the community has `admin_quorum > 1` and the `set_power` outcome is *admin-affecting* (ZEB-250 §4.3: `new_power == 100`, or the target currently holds power 100), a *direct* `SetPower` is rejected by `verify_event` (`SetPowerRequiresQuorum`), so auto-exec instead routes through `AdminProposal`. Each admin replica's tick runs a deterministic planner: mint an `AdminProposal::SetPower` if no live one exists for that `(target, level)`, otherwise countersign the **canonical** (smallest-`EventId`) pending proposal it has not yet signed. This converges across ticks without a coordinator and tolerates absent admins; under a simultaneous-tick race the non-canonical proposal is left inert and expires per `ADMIN_PROPOSAL_EXPIRY_MS`. See ZEB-300 and `docs/specs/2026-07-19-zeb-300-tier2-adminproposal-setpower-design.md`.
+
 ## 6. Tier 3 — Sortition + Pol.is + STAR
 
 Constitutional decisions. Multi-stage: selection → deliberation → drafting → ratification. Supports two privacy modes (ballot-secret D-FROST, receipt-free TRIP).
