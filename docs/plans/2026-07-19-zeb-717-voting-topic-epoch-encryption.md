@@ -10,6 +10,15 @@
 
 **Spec:** `docs/specs/2026-07-19-zeb-717-voting-topic-epoch-encryption-design.md`
 
+> **Implementation note (placement changed at review):** crypto was moved from the *engine* to the
+> *Zenoh adapter* (the wire boundary) after implementation revealed the voting engine has no
+> `crdt_state` and 27/28 engine-construction sites are plaintext-mpsc bridge tests. See spec §4 (the
+> authoritative architecture). Tasks 2–3 below were superseded by a single **adapter cutover** task
+> (`spawn_voting_log_zenoh_adapter` + `VotingLogAdapterRequest` gain `community_id`+`crdt_state`;
+> encrypt-on-put, current-epoch-only-decrypt-on-recv). Task 1 (AAD helpers), Task 4 (acceptance test),
+> and Task 5 (sweep) landed as written. The engine is unchanged, so the mpsc-bridged voting tests were
+> untouched.
+
 ## Global Constraints
 
 - Cargo commands run from `src-tauri/`. Always `--locked` and `--features test-fixtures`.
