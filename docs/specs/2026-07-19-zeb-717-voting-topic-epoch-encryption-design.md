@@ -4,7 +4,7 @@
 **Author:** Koya (fleet)
 **Date:** 2026-07-19
 **Ticket:** [ZEB-717](https://linear.app/zeblith/issue/ZEB-717)
-**Related:** ZEB-249 community backward-secrecy (`docs/specs/2026-05-11-zeb-249-community-backward-secrecy-design.md`), ZEB-315 at-event-HLC membership resolution (PR #502)
+**Related:** ZEB-249 community backward-secrecy (`docs/specs/2026-05-11-zeb-249-community-backward-secrecy-design.md`), ZEB-315 at-event-HLC membership resolution (PR #502), ZEB-718 voting backfill (follow-up)
 
 ## 1. Problem
 
@@ -231,7 +231,7 @@ pins.
   rotation is dropped at already-rotated peers with no recovery, because voting has no backfill. This
   is inherent to any transport cut that defeats the kicked member (proof in §2) and is within voting's
   existing no-backfill availability posture. Recovery is unlocked by the deferred voting backfill /
-  pull-on-rejoin (`community_voting_log.rs:14`), tracked separately — a follow-up ticket will record it.
+  pull-on-rejoin (`community_voting_log.rs:14`), tracked in [ZEB-718](https://linear.app/zeblith/issue/ZEB-718).
 - **Device-identity binding** of `event.hlc.device_id` to enrolled devices — owned by the ZEB-668
   device-management family (ticket §scope item 4).
 - **Channel-log data-plane rotation survival** (a separate, pre-existing limitation; channel-log
