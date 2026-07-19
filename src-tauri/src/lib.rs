@@ -4975,14 +4975,15 @@ pub async fn start_node_inner(
                     ));
                     // ZEB-474 (Move 2) → ZEB-473 (Move 1a): the deposit-only
                     // interim default. `DepositOnlyDmTransport::send` signals
-                    // Transient, steering every DM into the outbox's
-                    // butler/community-relay deposit rung. This is REPLACED
-                    // below (just before the NodeState lift-out, once the
-                    // `TunnelManager` exists) with `IrohTunnelDmTransport` when
-                    // the iroh endpoint bound — but kept as the fallback when
-                    // there is no tunnel transport this session, in which case
-                    // DMs remain deposit-only exactly as before. Both return
-                    // Transient → the always-deposit invariant holds either way.
+                    // TransientNoLiveAttempt (ZEB-525), steering every DM into
+                    // the outbox's butler/community-relay deposit rung on the
+                    // first drain pass. This is REPLACED below (just before the
+                    // NodeState lift-out, once the `TunnelManager` exists) with
+                    // `IrohTunnelDmTransport` when the iroh endpoint bound —
+                    // but kept as the fallback when there is no tunnel
+                    // transport this session, in which case DMs remain
+                    // deposit-only exactly as before. Both always return Err →
+                    // the always-deposit invariant holds either way.
                     let mut transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
                         std::sync::Arc::new(crate::dm_outbox::DepositOnlyDmTransport);
 
@@ -38560,15 +38561,12 @@ async fn set_presence_visibility(
             g.connectivity_settings_path.clone(),
         )
     };
-    // Live: flip the shared gate if a node is running. If not, the persisted
-    // value below is applied to the map at next boot (see start_node).
-    if let Some(m) = map {
-        m.lock().await.set_visible(visible);
-    }
-    // Durable: persist so an invisible user stays hidden across restarts. The
-    // offload + locking rationale lives on persist_presence_visibility_locked.
+    // Persist + flip the live gate as one cancellation-surviving unit
+    // (ZEB-697). Ordering is now persist-FIRST (was live-first), matching the
+    // identity-discoverable toggle: a failed persist leaves the live gate
+    // untouched instead of flipping a state that silently reverts on restart.
     let path = connectivity_settings_path(settings_path)?;
-    persist_presence_visibility_locked(path, visible).await?;
+    set_presence_visibility_detached(map, path, visible).await?;
 
     // Notify the frontend so any panel showing self-presence (e.g. the member
     // list self-dot) re-renders without polling. Mirrors the identity-
@@ -38581,6 +38579,36 @@ async fn set_presence_visibility(
     }
 
     Ok(())
+}
+
+/// ZEB-697: run the presence-visibility persist + live-gate flip as ONE
+/// cancellation-surviving unit (same rationale as
+/// [`set_identity_discoverable_detached`] — the setter is reachable over the
+/// headless API surface, where a client disconnect drops the handler future
+/// between the two steps, splitting durable from live state until restart).
+/// Persist runs first; when no node is running (`map: None`) the persisted
+/// value is applied to the map at next boot (see start_node).
+async fn set_presence_visibility_detached(
+    map: Option<std::sync::Arc<tokio::sync::Mutex<crate::community_presence::CommunityPresenceMap>>>,
+    path: std::path::PathBuf,
+    visible: bool,
+) -> Result<(), String> {
+    tokio::spawn(async move {
+        // Durable: persist so an invisible user stays hidden across restarts.
+        // The offload + locking rationale lives on
+        // persist_presence_visibility_locked.
+        persist_presence_visibility_locked(path, visible).await?;
+        // Live: flip the shared gate if a node is running.
+        if let Some(m) = map {
+            m.lock().await.set_visible(visible);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "set_presence_visibility: detached toggle task failed");
+        format!("presence-visibility toggle task: {e}")
+    })?
 }
 
 /// IPC: ZEB-600. Read the current presence visibility (`true` = visible). Prefers
@@ -54838,6 +54866,40 @@ async fn persist_identity_discoverable_locked(
     Ok(())
 }
 
+/// ZEB-697: run the identity-discoverable persist + live pkarr-publication
+/// toggle as ONE cancellation-surviving unit. Both commands sit on the async
+/// headless API surface, where a client disconnect drops the handler future
+/// mid-await — sequencing the two steps on the caller's frame let a cancel
+/// land the durable settings write (cancellation-surviving since ZEB-696)
+/// while skipping the live transition, leaving disk saying "not discoverable"
+/// with the pkarr publication still active until restart/reconcile. The
+/// detached task runs to completion even if the caller is dropped; the pair
+/// can no longer split. Persist stays FIRST: a failed persist leaves the live
+/// publication untouched (state never diverges on the error path either).
+async fn set_identity_discoverable_detached(
+    path: std::path::PathBuf,
+    id_pub: std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>,
+    enabled: bool,
+) -> Result<(), String> {
+    tokio::spawn(async move {
+        persist_identity_discoverable_locked(path, enabled).await?;
+        if enabled {
+            id_pub.enable().await;
+        } else {
+            id_pub.disable().await;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        // A JoinError means the detached task panicked (or was aborted at
+        // shutdown) — log it backend-side so the frontend Err isn't the only
+        // diagnostic signal.
+        tracing::warn!(error = %e, "connectivity_set_identity_discoverable: detached toggle task failed");
+        format!("identity-discoverable toggle task: {e}")
+    })?
+}
+
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
 /// `connectivity-settings.json` and registers / unregisters the pkarr
 /// identity publication accordingly.
@@ -54865,18 +54927,9 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
         return Err("connectivity_settings_path missing".into());
     };
 
-    // Persist the preference. The offload + locking rationale lives on
-    // persist_identity_discoverable_locked.
-    persist_identity_discoverable_locked(path, enabled).await?;
-
-    // Toggle the publication.
-    if enabled {
-        id_pub.enable().await;
-    } else {
-        id_pub.disable().await;
-    }
-
-    Ok(())
+    // Persist + toggle the publication as one cancellation-surviving unit
+    // (ZEB-697; offload + locking rationale on the callees).
+    set_identity_discoverable_detached(path, id_pub, enabled).await
 }
 
 #[tauri::command]
@@ -65669,6 +65722,135 @@ mod settings_rmw_cancellation_tests {
             move || {
                 connectivity_settings::ConnectivitySettings::load_or_default(&check)
                     .identity_discoverable
+            },
+        )
+        .await;
+    }
+
+    // ── ZEB-697: the persist + LIVE-state pair must also survive caller
+    // cancellation as a unit. ZEB-696 (above) proved the durable half lands;
+    // pre-fix, a cancel between the two steps landed the persist while
+    // skipping the live transition (or, for presence, the inverse). These
+    // tests cancel the detached-unit future after its first poll and assert
+    // BOTH halves land.
+
+    /// Poll `fut` once while the settings write lock is held (parking the
+    /// detached task's persist), CANCEL it, release the lock, then await
+    /// `landed` (async probe — the live half needs async access). Shared by
+    /// the two ZEB-697 pair tests.
+    async fn assert_cancelled_toggle_pair_lands<Fut, P, PFut>(fut: Fut, landed: P)
+    where
+        Fut: std::future::Future<Output = Result<(), String>>,
+        P: Fn() -> PFut,
+        PFut: std::future::Future<Output = bool>,
+    {
+        let gate = connectivity_settings_write_lock().lock().await;
+
+        let mut fut = Box::pin(fut);
+        let polled = tokio::time::timeout(std::time::Duration::from_millis(50), &mut fut).await;
+        assert!(
+            polled.is_err(),
+            "toggle must not complete while the write lock is held"
+        );
+        drop(fut); // cancel the caller between the pair's two steps
+
+        drop(gate); // release the lock; the detached task may now proceed
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if landed().await {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled toggle's persist+live pair never landed — has the \
+                 pair moved back onto the cancellable caller frame (ZEB-697)?"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_discoverable_toggle_pair_survives_future_cancellation() {
+        use harmony_pkarr::{testing::MockPkarrRelay, PkarrPublisher, RelayClient, RelayPool};
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let publisher = std::sync::Arc::new(PkarrPublisher::new(client));
+        let _ph = std::sync::Arc::clone(&publisher).spawn();
+
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut id_pub_bytes = [0u8; 64];
+        id_pub_bytes[32..].copy_from_slice(&sk.verifying_key().to_bytes());
+        let id_pub = std::sync::Arc::new(pkarr_identity_publisher::PkarrIdentityPublisher::new(
+            std::sync::Arc::clone(&publisher),
+            sk,
+            id_pub_bytes,
+            std::sync::Arc::new(|| b"fake-routing".to_vec()),
+        ));
+
+        let check = path.clone();
+        assert_cancelled_toggle_pair_lands(
+            super::set_identity_discoverable_detached(path, id_pub, true),
+            move || {
+                let check = check.clone();
+                let publisher = std::sync::Arc::clone(&publisher);
+                async move {
+                    // Disk half (non-default value proves the write landed)…
+                    let disk = tokio::task::spawn_blocking(move || {
+                        connectivity_settings::ConnectivitySettings::load_or_default(&check)
+                            .identity_discoverable
+                    })
+                    .await
+                    .expect("disk probe task");
+                    // …AND the live half: the pkarr publication registered.
+                    let live = publisher
+                        .active_handles()
+                        .await
+                        .contains(&pkarr_identity_publisher::HANDLE.to_string());
+                    disk && live
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn presence_visibility_toggle_pair_survives_future_cancellation() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        let map = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::community_presence::CommunityPresenceMap::new(),
+        ));
+        assert!(
+            map.lock().await.is_visible(),
+            "precondition: presence defaults to visible"
+        );
+
+        let check = path.clone();
+        let probe_map = std::sync::Arc::clone(&map);
+        assert_cancelled_toggle_pair_lands(
+            super::set_presence_visibility_detached(Some(std::sync::Arc::clone(&map)), path, false),
+            move || {
+                let check = check.clone();
+                let map = std::sync::Arc::clone(&probe_map);
+                async move {
+                    // visible=false persists presence_invisible=true (non-default)…
+                    let disk = tokio::task::spawn_blocking(move || {
+                        connectivity_settings::ConnectivitySettings::load_or_default(&check)
+                            .presence_invisible
+                    })
+                    .await
+                    .expect("disk probe task");
+                    // …AND the live gate flipped to invisible.
+                    let live = !map.lock().await.is_visible();
+                    disk && live
+                }
             },
         )
         .await;
