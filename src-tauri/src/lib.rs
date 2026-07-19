@@ -13797,8 +13797,9 @@ mod zeb_244_cursor_tests {
 ///   2. The Space MUST have a `content_key`; otherwise `MissingContentKey`.
 ///   3. InboxEntries are filtered to `space_id`, sorted by `received_at`
 ///      DESCENDING (newest first), the optional `before_hlc` cursor
-///      filters out entries with `received_at.wall_ms >= cursor`, then
-///      truncated to `limit`.
+///      (ZEB-244: an `encode_dm_cursor` token) drops entries not
+///      strictly-older than it in `(wall_ms, logical, device_id)` lex
+///      order, then truncated to `limit`.
 ///   4. Each surviving InboxEntry's `message_cid` is fetched from CAS and
 ///      decrypted via `dm_crypto::decrypt_dm_message` with the prior-keys
 ///      fallback (matches the receive path's `decrypt_and_bind_dm_blob` so
@@ -13860,8 +13861,11 @@ pub async fn read_dm_thread_inner(
 ///
 /// - `space_id_hex`: 32-character hex of a 16-byte SpaceId.
 /// - `limit`: max entries per page (UI page size, typical 50).
-/// - `before_hlc`: if `Some(wall_ms)`, return entries with
-///   `received_at.wall_ms < before_hlc`. None = newest first page.
+/// - `before_hlc`: ZEB-244 — an **opaque** full-HLC pagination cursor
+///   (an `encode_dm_cursor` token, NOT a bare `wall_ms`). Returns entries
+///   whose `received_at` is strictly-older than the cursor in
+///   `(wall_ms, logical, device_id)` lex order. `None` = newest first
+///   page. A malformed token is a hard error (decode failure).
 ///
 /// Decryption uses `dm_crypto::decrypt_dm_message` with the prior-keys
 /// fallback (matches the receive path's `decrypt_and_bind_dm_blob`), so
@@ -13869,8 +13873,8 @@ pub async fn read_dm_thread_inner(
 /// encrypted under the previous key.
 ///
 /// Frontend uses this on first DM-channel switch to populate the
-/// TextFeed with history. To paginate: pass the oldest entry's
-/// `received_at` as `before_hlc` for the next call.
+/// TextFeed with history. To paginate: pass the oldest entry's `cursor`
+/// field (not `received_at`) as `before_hlc` for the next call.
 // Param rename per PR #81 round 4 — see send_dm above for rationale.
 #[tauri::command]
 async fn read_dm_thread(

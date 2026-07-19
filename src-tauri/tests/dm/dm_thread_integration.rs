@@ -249,6 +249,65 @@ async fn read_dm_thread_paginates_via_before_hlc_cursor() {
     );
 }
 
+// ZEB-244: the test above pages over strictly-increasing wall_ms, so the
+// old wall_ms-only cursor would produce the same result. This one seeds
+// messages that SHARE a wall_ms and differ only in the HLC logical
+// component, with page boundaries between them — the exact case the old
+// cursor skipped. Exercises the full read_dm_thread_inner path (received_at
+// -> DmThreadMessage.cursor -> before_hlc round-trip), complementing the
+// unit test on filter_sort_paginate_inbox.
+#[tokio::test]
+async fn read_dm_thread_paginates_same_wall_ms_no_skip() {
+    let (mut state, mut outbox, cas, alice, space_id) = fixture().await;
+
+    // Seed 3 messages all at wall_ms=1_000. Thread each send's prev_hlc from
+    // the prior entry so next_hlc bumps the logical component:
+    // received_at = (1000,0) / (1000,1) / (1000,2) — same ms, distinct HLC.
+    let mut prev: Option<Hlc> = None;
+    for i in 0..3u64 {
+        let (msg_id, _cid) = outbox
+            .send_dm(
+                &mut state,
+                cas.as_ref(),
+                space_id,
+                format!("same-ms-{i}").into_bytes(),
+                "text/plain".into(),
+                1_000,
+                prev.as_ref(),
+            )
+            .await
+            .expect("send_dm ok");
+        prev = Some(state.outbox.get(&msg_id).expect("entry").created_at.clone());
+    }
+
+    // Page size 1 forces a boundary between each same-wall_ms sibling — the
+    // old cursor would collapse them to before_hlc=1000 and drop 2 of 3.
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let page = read_dm_thread_inner(&state, cas.as_ref(), space_id, 1, cursor.clone(), alice)
+            .await
+            .expect("page ok");
+        if page.is_empty() {
+            break;
+        }
+        assert_eq!(page.len(), 1, "page size 1");
+        seen.push(hex::decode(&page[0].body).unwrap());
+        cursor = Some(page[0].cursor.clone());
+    }
+
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            b"same-ms-0".to_vec(),
+            b"same-ms-1".to_vec(),
+            b"same-ms-2".to_vec()
+        ],
+        "all 3 same-wall_ms messages surface across pages, no skip/dup"
+    );
+}
+
 #[tokio::test]
 async fn read_dm_thread_self_message_delivery_state_reflects_outbox_status() {
     // Phase 4 / PR #81 review fix: read_dm_thread must populate
