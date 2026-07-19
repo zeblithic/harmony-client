@@ -843,8 +843,10 @@ pub enum FriendHandshakeError {
     /// The body exceeds [`FRIEND_MAX_PACKET_LEN`]. Bounds work on hostile input.
     #[error("friend packet exceeds size limit: len={len} max={max}")]
     TooLarge { len: usize, max: usize },
-    /// `cert.verify()` failed, or the cert's issuer is not `Master`.
-    #[error("enrollment cert invalid (verify failed or non-Master issuer)")]
+    /// Cert verification failed at the ZEB-680 `enrollment_verify`
+    /// chokepoint: bad signature or an untrusted issuer (Master and ZEB-677
+    /// quorum certs both route through the same chokepoint).
+    #[error("enrollment cert invalid (verify failed or untrusted issuer)")]
     EnrollmentCertInvalid,
     /// `cert.owner_id` does not equal the claimed owner address.
     #[error("enrollment owner mismatch: cert binds a different owner_id")]

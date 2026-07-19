@@ -107,6 +107,11 @@ harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "1ec
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "1ecb4160ee62f19da23158e246e856d449159f93" }
 harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "1ecb4160ee62f19da23158e246e856d449159f93" }
 harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "1ecb4160ee62f19da23158e246e856d449159f93", features = ["recovery"] }
+# ZEB-716: direct dep for `hash::truncated_hash` — the primitive behind
+# harmony-identity's device address_hash — so the community-invite wire
+# commitment delegates to it instead of open-coding SHA256[..16]. Already in
+# the lock transitively; the ml-dsa/ml-kem pins below exist for its benefit.
+harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", rev = "1ecb4160ee62f19da23158e246e856d449159f93" }
 # ZEB-323 Phase 2b: pkarr-based discovery policies. Now pinned to the same
 # workspace-wide rev as the crates above (was 2aaf403b, ZEB-380 PR1 — see
 # git history for the RelayPool/health + real-wire-format provenance).
