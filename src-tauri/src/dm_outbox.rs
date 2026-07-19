@@ -525,6 +525,16 @@ const BACKOFF_MULTIPLIER: u64 = 2;
 const BACKOFF_CAP_MS: u64 = 5 * 60 * 1_000; // 5 min
 const BACKOFF_MAX_EXPONENT: u32 = 8; // 5s * 2^8 = 1280s -> capped at 5min
 pub const EXPIRATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000; // 30 days
+/// ZEB-246: minimum age before an in-flight (`Pending`/`Partial`) OutboxEntry
+/// may be manually deleted. Below this, `delete_dm_outbox_entry` rejects with
+/// `NotYetStuck` so a direct IPC call can't turn manual-cleanup into an
+/// unsend/cancel-delivery primitive (outside Phase 4's documented contract).
+/// Mirrors the UI's `TextMessage.svelte:canDelete` 60s "stuck" threshold — the
+/// duplication is deliberate defense-in-depth: the backend must not trust the
+/// frontend to be the only gate (a devtools/extension/future code path could
+/// call the IPC directly). `Expired`/terminal entries bypass this (they are
+/// stuck by definition); `Complete` continues to error with `AlreadyDelivered`.
+pub const STUCK_THRESHOLD_MS: u64 = 60_000; // 60s
 /// ZEB-703 (PR #485 Greptile P1): cap on concurrent detached Phase C tasks
 /// (one permit each, held for the task's lifetime incl. deposit rungs).
 /// Drain ticks fire every ~250ms and Phase C is usually sub-second, so 64
@@ -660,6 +670,13 @@ pub struct DeleteDmOutboxOutcome {
 pub enum DeleteDmError {
     #[error("message {0:?} is already complete (all recipients acked); refusing to erase delivered self-history")]
     AlreadyDelivered(OutboxEntryId),
+    /// ZEB-246: an in-flight (`Pending`/`Partial`) entry younger than
+    /// `STUCK_THRESHOLD_MS`. Manual delete targets stuck/expired entries;
+    /// deleting a fresh in-flight entry would be an unsend/cancel-delivery
+    /// primitive outside Phase 4's contract. `age_ms`/`threshold_ms` are
+    /// surfaced so the IPC/UI can explain the wait.
+    #[error("message is still in flight ({age_ms}ms old, must be {threshold_ms}ms to delete); wait for it to expire or complete")]
+    NotYetStuck { age_ms: u64, threshold_ms: u64 },
 }
 
 /// Per-process DM-outbox state. One instance per running node, shared between
@@ -1163,10 +1180,32 @@ impl DmOutbox {
         // wiped. Idempotent miss → Ok(default()); Complete hit → Err so the
         // caller can distinguish "refusing to erase delivered history" from
         // "the entry was already deleted/never existed."
+        //
+        // ZEB-246: an in-flight (Pending/Partial) entry younger than
+        // STUCK_THRESHOLD_MS is also refused — otherwise a direct IPC call
+        // (bypassing the UI's 60s canDelete gate) could delete a message
+        // mid-delivery, turning manual-cleanup into an unsend primitive.
+        // `saturating_sub` keeps a future-stamped created_at (clock skew)
+        // conservatively "fresh" (age 0 → rejected) rather than underflowing.
+        // Expired entries are stuck by definition and stay deletable.
         match state.outbox.get(&message_id) {
             None => return Ok(DeleteDmOutboxOutcome::default()),
             Some(e) if matches!(e.delivery_status, DeliveryStatus::Complete) => {
                 return Err(DeleteDmError::AlreadyDelivered(message_id));
+            }
+            Some(e)
+                if matches!(
+                    e.delivery_status,
+                    DeliveryStatus::Pending | DeliveryStatus::Partial
+                ) =>
+            {
+                let age_ms = wall_now_ms.saturating_sub(e.created_at.wall_ms);
+                if age_ms < STUCK_THRESHOLD_MS {
+                    return Err(DeleteDmError::NotYetStuck {
+                        age_ms,
+                        threshold_ms: STUCK_THRESHOLD_MS,
+                    });
+                }
             }
             Some(_) => {}
         }
@@ -8302,9 +8341,10 @@ mod tests {
             },
         );
 
-        // Act.
+        // Act. Delete past the ZEB-246 stuck threshold (entry created at
+        // wall=1_000) so this Pending entry qualifies for manual delete.
         let outcome = o
-            .delete_dm_outbox_entry(&mut state, msg_id, 2_000)
+            .delete_dm_outbox_entry(&mut state, msg_id, 1_000 + STUCK_THRESHOLD_MS + 1_000)
             .expect("delete_dm_outbox_entry ok");
 
         // Assert: OutboxEntry gone.
@@ -8411,6 +8451,7 @@ mod tests {
             .expect_err("Complete entries must not be deletable");
         match err {
             DeleteDmError::AlreadyDelivered(id) => assert_eq!(id, msg_id),
+            other => panic!("expected AlreadyDelivered, got {other:?}"),
         }
 
         // Post-condition: nothing was removed.
@@ -8421,6 +8462,119 @@ mod tests {
         assert!(
             state.inbox.contains_key(&inbox_key),
             "self-InboxEntry must remain — delivered history is preserved"
+        );
+    }
+
+    // ── ZEB-246: in-flight entries below STUCK_THRESHOLD_MS aren't deletable ─
+    //
+    // A direct IPC call must not be able to delete a fresh Pending/Partial
+    // entry (that would be an unsend primitive). Only entries that have aged
+    // past the 60s stuck threshold — or are Expired/terminal — may be
+    // manually removed. Complete stays refused with AlreadyDelivered.
+
+    #[tokio::test]
+    async fn delete_dm_outbox_entry_rejects_fresh_pending() {
+        // Arrange: send a DM at wall=1_000; it starts Pending (bob unacked).
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic("dev", alice);
+        let (msg_id, _msg_cid) = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"in-flight".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+        assert!(matches!(
+            state.outbox.get(&msg_id).unwrap().delivery_status,
+            DeliveryStatus::Pending
+        ));
+        let message_cid = state.outbox.get(&msg_id).unwrap().message_cid.unwrap();
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+
+        // Act: delete only 30s later — below the 60s stuck threshold.
+        let err = o
+            .delete_dm_outbox_entry(&mut state, msg_id, 1_000 + 30_000)
+            .expect_err("fresh in-flight entry must not be deletable");
+        match err {
+            DeleteDmError::NotYetStuck {
+                age_ms,
+                threshold_ms,
+            } => {
+                assert_eq!(age_ms, 30_000);
+                assert_eq!(threshold_ms, STUCK_THRESHOLD_MS);
+            }
+            other => panic!("expected NotYetStuck, got {other:?}"),
+        }
+
+        // Post-condition: nothing removed, no tombstone written.
+        assert!(state.outbox.contains_key(&msg_id), "entry must remain");
+        assert!(
+            state.inbox.contains_key(&inbox_key),
+            "InboxEntry must remain"
+        );
+        assert!(
+            !state.outbox_tombstones.contains_key(&msg_id),
+            "no tombstone on a rejected delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_dm_outbox_entry_accepts_stuck_pending() {
+        // Arrange: same fresh Pending entry created at wall=1_000.
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic("dev", alice);
+        let (msg_id, _msg_cid) = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"stuck".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+        let message_cid = state.outbox.get(&msg_id).unwrap().message_cid.unwrap();
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+
+        // Act: delete 70s later — past the 60s stuck threshold.
+        let outcome = o
+            .delete_dm_outbox_entry(&mut state, msg_id, 1_000 + 70_000)
+            .expect("stuck in-flight entry must be deletable");
+
+        // Post-condition: entry + InboxEntry gone, tombstone written.
+        assert_eq!(outcome.deleted_outbox_id, Some(msg_id));
+        assert!(!state.outbox.contains_key(&msg_id), "entry removed");
+        assert!(!state.inbox.contains_key(&inbox_key), "InboxEntry removed");
+        assert!(
+            state.outbox_tombstones.contains_key(&msg_id),
+            "tombstone written on accepted delete"
         );
     }
 
@@ -8468,6 +8622,16 @@ mod tests {
             .expect("outbox entry must exist before delete")
             .created_at
             .clone();
+
+        // ZEB-246: force the entry Expired so the fresh-Pending stuck gate
+        // doesn't block this same-millisecond delete — Expired entries are
+        // stuck by definition and bypass the freshness check. The tombstone
+        // mint path being tested here is identical regardless of status.
+        state
+            .outbox
+            .get_mut(&msg_id)
+            .expect("entry exists")
+            .delivery_status = DeliveryStatus::Expired;
 
         // Pre-condition: outbox is populated, no tombstone yet.
         assert!(state.outbox.contains_key(&msg_id));

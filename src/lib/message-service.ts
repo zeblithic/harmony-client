@@ -105,10 +105,12 @@ export class MessageService {
    *  entries from offline-fallback `send()` calls during the pre-connect
    *  window (ZEB-209 bot R1). */
   private mockSeededIds = new Set<string>();
-  /** Per-channel pagination cursor for `loadDmThread` — tracks the
-   *  oldest `received_at.wall_ms` we've fetched so the next page-up
-   *  call can ask for entries strictly older than this. */
-  private dmThreadCursors = new Map<string, number>();
+  /** Per-channel pagination cursor for `loadDmThread` — the oldest
+   *  entry's opaque `cursor` token (a full-HLC string, ZEB-244) we've
+   *  fetched, so the next page-up call can ask for entries strictly
+   *  older than it. Stored + echoed verbatim; never parsed frontend-side
+   *  (was a bare `received_at.wall_ms`, which skipped same-ms siblings). */
+  private dmThreadCursors = new Map<string, string>();
   /** SpaceIds we've already loaded scrollback for in this session.
    *  `loadDmThread` is called on every channel switch (see App.svelte
    *  handleNodeClick) — without this guard each switch would advance
@@ -443,6 +445,9 @@ export class MessageService {
       from: string;
       sentAt: number;
       receivedAt: number;
+      /** ZEB-244: opaque full-HLC pagination cursor for this entry.
+       *  Stored + echoed back verbatim as `beforeHlc`; never parsed. */
+      cursor: string;
       body: string;
       mimeType: string;
       isSelfOutbound: boolean;
@@ -519,11 +524,12 @@ export class MessageService {
       this.messages = [...filtered, ...this.messages];
     }
 
-    // Cursor for next page-up: oldest received_at from this page. The
-    // backend returns newest-first, so results[results.length-1] is the
-    // oldest. Stored even if we filtered everything (still want to
-    // advance past this page on the next call).
-    this.dmThreadCursors.set(spaceId, results[results.length - 1].receivedAt);
+    // Cursor for next page-up: oldest entry's opaque `cursor` from this
+    // page (ZEB-244 full-HLC token, not a bare wall_ms). The backend
+    // returns newest-first, so results[results.length-1] is the oldest.
+    // Stored even if we filtered everything (still want to advance past
+    // this page on the next call).
+    this.dmThreadCursors.set(spaceId, results[results.length - 1].cursor);
     this.onChange?.();
   }
 

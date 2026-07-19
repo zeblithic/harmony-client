@@ -599,9 +599,9 @@ describe('MessageService loadDmThread', () => {
   it('fetches read_dm_thread IPC and populates messages oldest-first', async () => {
     const { adapter } = createMockAdapter();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { messageCid: 'cid3', from: 'self-hex', sentAt: 3000, receivedAt: 3001, body: hexEncode('newest'), mimeType: 'text/plain', isSelfOutbound: true, deliveryState: 'delivered' },
-      { messageCid: 'cid2', from: 'bob-hex', sentAt: 2000, receivedAt: 2001, body: hexEncode('mid'), mimeType: 'text/plain', isSelfOutbound: false },
-      { messageCid: 'cid1', from: 'self-hex', sentAt: 1000, receivedAt: 1001, body: hexEncode('oldest'), mimeType: 'text/plain', isSelfOutbound: true, deliveryState: 'delivered' },
+      { messageCid: 'cid3', from: 'self-hex', sentAt: 3000, receivedAt: 3001, cursor: '3001:0:dev', body: hexEncode('newest'), mimeType: 'text/plain', isSelfOutbound: true, deliveryState: 'delivered' },
+      { messageCid: 'cid2', from: 'bob-hex', sentAt: 2000, receivedAt: 2001, cursor: '2001:0:dev', body: hexEncode('mid'), mimeType: 'text/plain', isSelfOutbound: false },
+      { messageCid: 'cid1', from: 'self-hex', sentAt: 1000, receivedAt: 1001, cursor: '1001:0:dev', body: hexEncode('oldest'), mimeType: 'text/plain', isSelfOutbound: true, deliveryState: 'delivered' },
     ]);
     await svc.connectAdapter(adapter);
     await svc.loadDmThread('aabbcc');
@@ -671,11 +671,13 @@ describe('MessageService loadDmThread', () => {
     // for the same SpaceId are no-ops. The test asserts the cursor is
     // STORED (so a future explicit-backfill caller can use it) but NOT
     // re-invoked. Test renamed accordingly.
+    // ZEB-244: the stored cursor is now the oldest entry's opaque `cursor`
+    // token (full-HLC string), not its bare receivedAt wall_ms.
     const { adapter } = createMockAdapter();
     const invokeMock = adapter.invoke as ReturnType<typeof vi.fn>;
     invokeMock.mockResolvedValueOnce([
-      { messageCid: 'cid3', from: 'self-hex', sentAt: 3000, receivedAt: 3001, body: hexEncode('p1-newest'), mimeType: 'text/plain', isSelfOutbound: true },
-      { messageCid: 'cid2', from: 'bob-hex', sentAt: 2000, receivedAt: 2001, body: hexEncode('p1-oldest'), mimeType: 'text/plain', isSelfOutbound: false },
+      { messageCid: 'cid3', from: 'self-hex', sentAt: 3000, receivedAt: 3001, cursor: '3001:0:dev', body: hexEncode('p1-newest'), mimeType: 'text/plain', isSelfOutbound: true },
+      { messageCid: 'cid2', from: 'bob-hex', sentAt: 2000, receivedAt: 2001, cursor: '2001:0:dev', body: hexEncode('p1-oldest'), mimeType: 'text/plain', isSelfOutbound: false },
     ]);
     await svc.connectAdapter(adapter);
 

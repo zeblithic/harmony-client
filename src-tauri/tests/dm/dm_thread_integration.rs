@@ -204,8 +204,9 @@ async fn read_dm_thread_paginates_via_before_hlc_cursor() {
     assert_eq!(hex::decode(&page1[0].body).unwrap(), b"msg-4");
     assert_eq!(hex::decode(&page1[1].body).unwrap(), b"msg-3");
 
-    // Page 2: cursor = oldest received_at on page 1 (msg-3's wall_ms).
-    let cursor = page1[1].received_at;
+    // Page 2: cursor = oldest entry's opaque cursor on page 1 (msg-3).
+    // ZEB-244: the cursor is now a full-HLC token, not a bare wall_ms.
+    let cursor = page1[1].cursor.clone();
     let page2 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
         .await
         .expect("page 2 ok");
@@ -213,16 +214,16 @@ async fn read_dm_thread_paginates_via_before_hlc_cursor() {
     assert_eq!(hex::decode(&page2[0].body).unwrap(), b"msg-2");
     assert_eq!(hex::decode(&page2[1].body).unwrap(), b"msg-1");
 
-    // Page 3: cursor = oldest received_at on page 2 (msg-1's wall_ms).
-    let cursor = page2[1].received_at;
+    // Page 3: cursor = oldest entry's cursor on page 2 (msg-1).
+    let cursor = page2[1].cursor.clone();
     let page3 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
         .await
         .expect("page 3 ok");
     assert_eq!(page3.len(), 1, "only msg-0 left");
     assert_eq!(hex::decode(&page3[0].body).unwrap(), b"msg-0");
 
-    // Page 4: cursor = oldest received_at on page 3 → empty.
-    let cursor = page3[0].received_at;
+    // Page 4: cursor = oldest entry's cursor on page 3 → empty.
+    let cursor = page3[0].cursor.clone();
     let page4 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
         .await
         .expect("page 4 ok");
@@ -245,6 +246,65 @@ async fn read_dm_thread_paginates_via_before_hlc_cursor() {
             b"msg-0".to_vec(),
         ],
         "pagination covers all 5 in descending order, no overlap/skips"
+    );
+}
+
+// ZEB-244: the test above pages over strictly-increasing wall_ms, so the
+// old wall_ms-only cursor would produce the same result. This one seeds
+// messages that SHARE a wall_ms and differ only in the HLC logical
+// component, with page boundaries between them — the exact case the old
+// cursor skipped. Exercises the full read_dm_thread_inner path (received_at
+// -> DmThreadMessage.cursor -> before_hlc round-trip), complementing the
+// unit test on filter_sort_paginate_inbox.
+#[tokio::test]
+async fn read_dm_thread_paginates_same_wall_ms_no_skip() {
+    let (mut state, mut outbox, cas, alice, space_id) = fixture().await;
+
+    // Seed 3 messages all at wall_ms=1_000. Thread each send's prev_hlc from
+    // the prior entry so next_hlc bumps the logical component:
+    // received_at = (1000,0) / (1000,1) / (1000,2) — same ms, distinct HLC.
+    let mut prev: Option<Hlc> = None;
+    for i in 0..3u64 {
+        let (msg_id, _cid) = outbox
+            .send_dm(
+                &mut state,
+                cas.as_ref(),
+                space_id,
+                format!("same-ms-{i}").into_bytes(),
+                "text/plain".into(),
+                1_000,
+                prev.as_ref(),
+            )
+            .await
+            .expect("send_dm ok");
+        prev = Some(state.outbox.get(&msg_id).expect("entry").created_at.clone());
+    }
+
+    // Page size 1 forces a boundary between each same-wall_ms sibling — the
+    // old cursor would collapse them to before_hlc=1000 and drop 2 of 3.
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let page = read_dm_thread_inner(&state, cas.as_ref(), space_id, 1, cursor.clone(), alice)
+            .await
+            .expect("page ok");
+        if page.is_empty() {
+            break;
+        }
+        assert_eq!(page.len(), 1, "page size 1");
+        seen.push(hex::decode(&page[0].body).unwrap());
+        cursor = Some(page[0].cursor.clone());
+    }
+
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            b"same-ms-0".to_vec(),
+            b"same-ms-1".to_vec(),
+            b"same-ms-2".to_vec()
+        ],
+        "all 3 same-wall_ms messages surface across pages, no skip/dup"
     );
 }
 
