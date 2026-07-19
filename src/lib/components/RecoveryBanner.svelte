@@ -133,7 +133,9 @@
           (p.phase === 'executed' ||
             p.phase === 'vetoed' ||
             p.phase === 'expired' ||
-            p.phase === 'stalled') &&
+            p.phase === 'stalled' ||
+            p.phase === 'configChanged' ||
+            p.phase === 'superseded') &&
           !isResolvedProposalDismissed(myAddress, communityId, p.proposalEventId),
       )
       .map((p) => ({
@@ -173,6 +175,10 @@
         return `Recovery of @${name(p.lostAdminAddr)} was vetoed${p.vetoedByAddr ? ` by @${name(p.vetoedByAddr)}` : ''}`;
       case 'stalled':
         return `Recovery of @${name(p.lostAdminAddr)} stalled — the proposed admin left before the veto window closed`;
+      case 'configChanged':
+        return `Recovery of @${name(p.lostAdminAddr)} was cancelled by a change to the recovery settings`;
+      case 'superseded':
+        return `Recovery of @${name(p.lostAdminAddr)} was superseded by another recovery proposal`;
       default:
         return `Recovery of @${name(p.lostAdminAddr)} expired without enough signatures`;
     }

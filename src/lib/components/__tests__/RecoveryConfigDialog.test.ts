@@ -104,6 +104,36 @@ describe('RecoveryConfigDialog', () => {
     expect(bobRow.getAttribute('aria-selected')).toBe('true');
   });
 
+  it('drops departed designates from the seed and surfaces a removal note', () => {
+    renderDialog({
+      designateAddrs: ['11'.repeat(16), 'aa'.repeat(16)], // aa… is not in the roster
+      threshold: 2,
+      vetoWindowMs: 21 * DAY_MS,
+    });
+    // bob (joined) stays selected; the departed address has no row and is
+    // not silently resubmittable.
+    const bobRow = screen.getByRole('option', { name: /@bob/ });
+    expect(bobRow.getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('status').textContent).toContain(
+      'left the community and will be removed when you save',
+    );
+    // Threshold clamps to the 1 surviving designate.
+    const threshold = screen.getByLabelText('Recovery threshold') as HTMLInputElement;
+    expect(threshold.value).toBe('1');
+  });
+
+  it('disables save on a fractional veto-window value', async () => {
+    renderDialog();
+    await fireEvent.click(screen.getByRole('option', { name: /@bob/ }));
+    const save = screen.getByRole('button', { name: /Save recovery settings/ });
+    expect(save).not.toBeDisabled();
+    const windowDays = screen.getByLabelText('Veto window in days') as HTMLInputElement;
+    await fireEvent.input(windowDays, { target: { value: '7.5' } });
+    expect(save).toBeDisabled();
+    await fireEvent.input(windowDays, { target: { value: '8' } });
+    expect(save).not.toBeDisabled();
+  });
+
   it('surfaces IPC rejection as an inline error and stays open', async () => {
     (invoke as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error('set_recovery_designates: designate is not a Joined member'),

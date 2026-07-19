@@ -3005,6 +3005,20 @@ pub fn materialize_with_now(
                     // proposal authorizes nothing (a rotation citing it
                     // is dropped — same silent-drop posture as the
                     // staleness gate above).
+                    //
+                    // ZEB-714 (PR #498 R1, CodeRabbit): the rotation must
+                    // ALSO clear the finality margin F (spec §4.3) —
+                    // `wall_ms > deadline + F`. The observer waits F
+                    // before synthesizing, but that alone is client
+                    // behavior: a hasty/malicious build could author the
+                    // one irreversible follow-on at deadline+1, inside
+                    // the window §4.3 reserves for late veto delivery.
+                    // Enforcing F here makes the containment a CRDT
+                    // invariant. Position-locally stable for the same
+                    // reason as the executed-ness evaluation (the gate
+                    // only widens the margin); `checked_add` fails
+                    // closed (overflow ⇒ never eligible, mirroring
+                    // `recovery_rotation_trigger`).
                     Some(MembershipEventKind::RecoveryProposal {
                         lost_admin,
                         new_admin,
@@ -3017,7 +3031,12 @@ pub fn materialize_with_now(
                             event.at.wall_ms,
                         );
                         match outcomes.get(triggered_by) {
-                            Some(o) if o.phase == RecoveryPhase::Executed => {
+                            Some(o)
+                                if o.phase == RecoveryPhase::Executed
+                                    && o.deadline_ms
+                                        .and_then(|d| d.checked_add(RECOVERY_ROTATION_FINALITY_MS))
+                                        .is_some_and(|eligible| event.at.wall_ms > eligible) =>
+                            {
                                 (Some(*lost_admin), Some(*new_admin))
                             }
                             _ => (None, None),
@@ -12666,10 +12685,13 @@ mod zeb_713_recovery_materialize_tests {
                 })
                 .collect()
         };
+        // ZEB-714 (PR #498 R1): the rotation must clear the finality
+        // margin F — authored past DEADLINE + F.
+        const ROT_AT: u64 = DEADLINE + RECOVERY_ROTATION_FINALITY_MS + 100;
         events.push(ev(
             [0xC0; 16],
             m_new(),
-            DEADLINE + 100,
+            ROT_AT,
             MembershipEventKind::EpochRotation {
                 prior_epoch: 0,
                 triggered_by: P1,
@@ -12679,7 +12701,7 @@ mod zeb_713_recovery_materialize_tests {
 
         // Without the veto: rotation lands (issuer authorized as the
         // recovery-promoted new_admin), pending marker consumed.
-        let diverged = materialize_with_now(&events, admin1(), Some(DEADLINE + 200));
+        let diverged = materialize_with_now(&events, admin1(), Some(ROT_AT + 100));
         assert_eq!(view(&diverged, P1).phase, RecoveryPhase::Executed);
         assert_eq!(diverged.current_epoch, Some(1));
         assert!(
@@ -12691,7 +12713,7 @@ mod zeb_713_recovery_materialize_tests {
         // divergent rotation's trigger is no longer executed, so the
         // epoch advance re-derives away too.
         events.push(veto([0xC1; 16], admin1(), DEADLINE - 1_000));
-        let healed = materialize_with_now(&events, admin1(), Some(DEADLINE + 200));
+        let healed = materialize_with_now(&events, admin1(), Some(ROT_AT + 100));
         assert_eq!(view(&healed, P1).phase, RecoveryPhase::Vetoed);
         assert_eq!(healed.current_epoch, None);
         assert_eq!(healed.members[&admin1()].status, MemberStatus::Joined);
@@ -12702,7 +12724,7 @@ mod zeb_713_recovery_materialize_tests {
         events.push(ev(
             [0xC2; 16],
             admin1(),
-            DEADLINE + 300,
+            ROT_AT + 300,
             MembershipEventKind::Kick {
                 target: m2(),
                 reason: None,
@@ -12711,17 +12733,66 @@ mod zeb_713_recovery_materialize_tests {
         events.push(ev(
             [0xC3; 16],
             admin1(),
-            DEADLINE + 400,
+            ROT_AT + 400,
             MembershipEventKind::EpochRotation {
                 prior_epoch: 0,
                 triggered_by: [0xC2; 16],
                 recipient_ciphertexts: recipients(&[admin1(), d1(), d2(), m_new()]),
             },
         ));
-        let after = materialize_with_now(&events, admin1(), Some(DEADLINE + 500));
+        let after = materialize_with_now(&events, admin1(), Some(ROT_AT + 500));
         assert_eq!(after.current_epoch, Some(1));
         assert_eq!(after.members[&m2()].status, MemberStatus::Banned);
         assert!(after.pending_rotation_for.is_empty());
+    }
+
+    #[test]
+    fn recovery_rotation_inside_finality_margin_is_dropped() {
+        // ZEB-714 (PR #498 R1, CodeRabbit): §4.3's F margin is a CRDT
+        // invariant, not client politeness — a rotation citing an
+        // executed proposal but authored at deadline + 1 (inside the
+        // window reserved for late veto delivery) must be silently
+        // dropped: no epoch advance, pending marker intact.
+        let (mut events, digest) = base_world();
+        events.push(proposal(digest));
+        events.push(cosign([0xB1; 16], d2(), T_R));
+        events.push(ev(
+            [0xC0; 16],
+            m_new(),
+            DEADLINE + 1,
+            MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: P1,
+                recipient_ciphertexts: vec![
+                    RecipientCiphertext {
+                        recipient: d1(),
+                        sealed: Vec::new(),
+                    },
+                    RecipientCiphertext {
+                        recipient: d2(),
+                        sealed: Vec::new(),
+                    },
+                    RecipientCiphertext {
+                        recipient: m_new(),
+                        sealed: Vec::new(),
+                    },
+                    RecipientCiphertext {
+                        recipient: m2(),
+                        sealed: Vec::new(),
+                    },
+                ],
+            },
+        ));
+        let m = materialize_with_now(&events, admin1(), Some(DEADLINE + 2));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
+        assert_eq!(
+            m.current_epoch, None,
+            "premature rotation must not advance the epoch"
+        );
+        assert!(
+            m.pending_rotation_for.contains(&admin1()),
+            "pending marker must survive a premature rotation"
+        );
     }
 
     #[test]

@@ -179,6 +179,22 @@ describe('RecoveryBanner', () => {
     });
   });
 
+  it('resolves configChanged and superseded proposals with explicit copy', async () => {
+    mockRecoveryState(
+      makeState({
+        proposals: [
+          makeProposal({ phase: 'configChanged' }),
+          makeProposal({ proposalEventId: 'b1'.repeat(16), phase: 'superseded' }),
+        ],
+      }),
+    );
+    const { getByText } = renderBanner();
+    await waitFor(() => {
+      expect(getByText(/cancelled by a change to the recovery settings/)).toBeTruthy();
+      expect(getByText(/superseded by another recovery proposal/)).toBeTruthy();
+    });
+  });
+
   it('shows rotation-pending-finality on an executed proposal until the finality wall', async () => {
     mockRecoveryState(
       makeState({

@@ -49,7 +49,9 @@ export class RecoveryAlertService {
               const remaining = Math.max(0, p.threshold - p.signersSoFar);
               return `Admin recovery proposed in ${communityName} — ${remaining} more signature${remaining === 1 ? '' : 's'} needed. As an admin, you can veto.`;
             })()
-          : `Admin recovery in ${communityName} executes on ${new Date(p.deadlineMs ?? 0).toLocaleDateString()} unless an admin vetoes.`;
+          : p.deadlineMs !== null
+            ? `Admin recovery in ${communityName} executes on ${new Date(p.deadlineMs).toLocaleDateString()} unless an admin vetoes.`
+            : `Admin recovery in ${communityName} executes once its veto window closes unless an admin vetoes.`;
 
       if (await this.focusedSafe()) {
         this.deps.showToast(body);

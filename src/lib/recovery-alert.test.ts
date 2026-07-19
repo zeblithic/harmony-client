@@ -106,6 +106,21 @@ describe('RecoveryAlertService', () => {
     expect(deps.toasts).toHaveLength(2);
   });
 
+  it('time-locked with a null deadline uses the window-closes copy, never the epoch date', async () => {
+    const deps = makeDeps(false);
+    const svc = new RecoveryAlertService(deps);
+    await svc.onRecoveryState(
+      'com-1',
+      'Zeblithic',
+      makeState({
+        proposals: [makeProposal({ phase: 'timeLocked', deadlineMs: null, signersSoFar: 2 })],
+      }),
+    );
+    expect(deps.osNotifications).toHaveLength(1);
+    expect(deps.osNotifications[0].body).toContain('once its veto window closes');
+    expect(deps.osNotifications[0].body).not.toContain('1970');
+  });
+
   it('ignores terminal phases', async () => {
     const deps = makeDeps(true);
     const svc = new RecoveryAlertService(deps);

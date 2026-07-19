@@ -32,7 +32,23 @@
     onSaved: (result: AdminActionResult) => void;
   } = $props();
 
-  let selected: string[] = $state(untrack(() => existing?.designateAddrs ?? []));
+  // ZEB-714 (PR #498 R1, CodeRabbit): seed only from designates still in
+  // the Joined roster — a designate who left has no picker row, so a
+  // stale address would be invisible, unremovable, and re-submitting it
+  // trips the RD2 "not a Joined member" rejection with no way out.
+  // Departed designates surface via `departedDesignates` below instead.
+  let selected: string[] = $state(
+    untrack(() => {
+      const joinedAddrs = new Set(joinedMembers.map((m) => m.address));
+      return (existing?.designateAddrs ?? []).filter((a) => joinedAddrs.has(a));
+    }),
+  );
+  // Existing designates no longer Joined — shown as an informational row
+  // so the admin sees WHY the designate count changed on re-save.
+  let departedDesignates = $derived.by(() => {
+    const joinedAddrs = new Set(joinedMembers.map((m) => m.address));
+    return (existing?.designateAddrs ?? []).filter((a) => !joinedAddrs.has(a));
+  });
   let threshold = $state(untrack(() => existing?.threshold ?? 1));
   let windowDays = $state(
     untrack(() => {
@@ -66,11 +82,16 @@
     return m.displayName ?? m.address.slice(0, 8);
   }
 
+  // Integrality guards (Qodo PR #498 R1): the backend takes `u8`/`u64`,
+  // so a fractional typed value (e.g. "7.5" days) would serialize as a
+  // JSON float and fail serde at the IPC boundary with an opaque error.
   let canSubmit = $derived(
     !submitting &&
       selected.length >= 1 &&
+      Number.isInteger(threshold) &&
       threshold >= 1 &&
       threshold <= selected.length &&
+      Number.isInteger(windowDays) &&
       windowDays >= MIN_WINDOW_DAYS &&
       windowDays <= MAX_WINDOW_DAYS,
   );
@@ -147,6 +168,12 @@
       </li>
     {/each}
   </ul>
+  {#if departedDesignates.length > 0}
+    <p class="departed-note" role="status">
+      {departedDesignates.length === 1 ? 'One existing designate has' : `${departedDesignates.length} existing designates have`}
+      left the community and will be removed when you save.
+    </p>
+  {/if}
 
   <div class="field-label">Signatures required to propose recovery</div>
   <div class="control-row">
@@ -154,6 +181,7 @@
       type="range"
       min={1}
       max={Math.max(1, selected.length)}
+      step={1}
       bind:value={threshold}
       aria-label="Recovery threshold slider"
       disabled={selected.length === 0}
@@ -162,6 +190,7 @@
       type="number"
       min={1}
       max={Math.max(1, selected.length)}
+      step={1}
       bind:value={threshold}
       aria-label="Recovery threshold"
       disabled={selected.length === 0}
@@ -175,6 +204,7 @@
       type="range"
       min={MIN_WINDOW_DAYS}
       max={MAX_WINDOW_DAYS}
+      step={1}
       bind:value={windowDays}
       aria-label="Veto window slider"
     />
@@ -182,6 +212,7 @@
       type="number"
       min={MIN_WINDOW_DAYS}
       max={MAX_WINDOW_DAYS}
+      step={1}
       bind:value={windowDays}
       aria-label="Veto window in days"
     />
@@ -293,6 +324,11 @@
   }
   .window-note {
     font-size: 0.75rem;
+    margin-block: 0.35rem 0;
+  }
+  .departed-note {
+    font-size: 0.75rem;
+    color: var(--gov-clay-deep);
     margin-block: 0.35rem 0;
   }
   .error {
