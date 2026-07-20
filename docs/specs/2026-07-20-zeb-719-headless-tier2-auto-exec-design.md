@@ -101,7 +101,7 @@ command passes `None` (uses `wry_handle`).
 | `api/rpc.rs` `start_node` (bespoke) | **headless RPC reboot** | `__access.clone().node_state_arc()` |
 | `api/rpc.rs` `mint_owner_identity` (bespoke) | **headless mint** | `__access.clone().node_state_arc()` |
 | `owner_commands.rs` GUI `mint_owner_identity` command | GUI mint | `None` (wry `Some`) |
-| `tests/profile/profile_isolation.rs`, `tests/api/api_server.rs` | test harnesses | `None` |
+| `tests/profile/profile_isolation.rs`, `tests/api/api_server.rs` | headless test harnesses | `Some(Arc::clone(&state))` (mirror serve; inert — no Tier-2 finalized) |
 
 ## Testing
 

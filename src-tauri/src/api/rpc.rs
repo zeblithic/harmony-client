@@ -502,12 +502,12 @@ pub fn build_registry() -> RpcRegistry {
     m.insert(
         "start_node",
         Box::new(
-            move |__access: Arc<dyn super::NodeStateAccess>,
+            move |access: Arc<dyn super::NodeStateAccess>,
                   sink: Arc<dyn NodeEventSink>,
                   raw: serde_json::Value| {
                 Box::pin(async move {
-                    let owned = __access.clone().node_state_arc();
-                    let state = __access.node_state();
+                    let owned = access.clone().node_state_arc();
+                    let state = access.node_state();
                     let raw = if raw.is_null() {
                         serde_json::json!({})
                     } else {
@@ -540,12 +540,22 @@ pub fn build_registry() -> RpcRegistry {
     m.insert(
         "mint_owner_identity",
         Box::new(
-            move |__access: Arc<dyn super::NodeStateAccess>,
+            move |access: Arc<dyn super::NodeStateAccess>,
                   sink: Arc<dyn NodeEventSink>,
-                  _raw: serde_json::Value| {
+                  raw: serde_json::Value| {
                 Box::pin(async move {
-                    let owned = __access.clone().node_state_arc();
-                    let state = __access.node_state();
+                    let owned = access.clone().node_state_arc();
+                    let state = access.node_state();
+                    // Preserve the `rpc!` macro's arg-shape contract (Qodo): normalize
+                    // Null→{} and reject malformed payloads with BadArgs, so the bespoke
+                    // handler keeps the file's IPC/RPC parity promise.
+                    let raw = if raw.is_null() {
+                        serde_json::json!({})
+                    } else {
+                        raw
+                    };
+                    let _args: EmptyArgs = serde_json::from_value(raw)
+                        .map_err(|e| RpcError::BadArgs(e.to_string()))?;
                     let out =
                         crate::owner_commands::mint_owner_identity_impl(state, sink, None, owned)
                             .await

@@ -3445,16 +3445,16 @@ mod build_auto_exec_fn_tests {
         );
 
         // Headless owned handle → dispatches to the real helper, which fails closed
-        // on a bare NodeState (missing hlc_tracker / dm_outbox / registry).
+        // on a bare NodeState (missing hlc_tracker / dm_outbox / registry). The
+        // headless branch's ONLY Err source is `apply_auto_exec_set_power`, so `Err`
+        // here — vs the old stub's `Ok(SkippedNotAdmin)` — is itself the complete
+        // discriminator that the closure dispatched. Asserting on the error-STRING
+        // would be brittle to harmless message refactors (Qodo), so we don't.
         let arc = std::sync::Arc::new(std::sync::Mutex::new(crate::NodeState::default()));
         let headless = super::build_auto_exec_fn(None, Some(arc));
-        let err = headless(cid, target, 50)
+        headless(cid, target, 50)
             .await
-            .expect_err("headless dispatch must Err on a bare NodeState");
-        assert!(
-            err.contains("missing") || err.contains("not running"),
-            "must be a missing-handles dispatch error (proves real dispatch), got: {err}"
-        );
+            .expect_err("headless dispatch must Err on a bare NodeState (not the stub's Ok)");
     }
 }
 
