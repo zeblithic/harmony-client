@@ -148,7 +148,11 @@ Mirror `community_state_persist.rs`:
 // on-disk record (versioned, community-id-checked, plaintext CBOR):
 struct PersistedVotingLog { version: u8, community_id: SpaceId,
                             events: Vec<SignedVotingEvent>, policy: CommunityVotingPolicy,
-                            poll_restore: HashMap<PollId, PollRestore> }   // D3 tick-driven overlay
+                            poll_restore: HashMap<PollId, PollRestore> }   // D3 non-event overlay
+// PollRestore { meta, tier2_timing, tier3_community_epoch } — everything set OUTSIDE the event
+// stream: PollMeta lifecycle (tick), the Tier-2 contestability clock (tick), and the Tier-3
+// D-FROST epoch (engine's set_tier3_poll_epoch after PollCreate). `last_hlc` /
+// `poll_create_event_hash` ARE set inside apply, so replay reconstructs them — no overlay needed.
 // The path helper OWNS the SpaceId→hex conversion (never a preformatted &str) so voting.cbor
 // can never diverge from the sibling crdt.cbor:
 fn voting_path_for(identity_dir: &Path, community_id: &SpaceId) -> PathBuf  // communities/{id_hex}/voting.cbor
@@ -187,6 +191,14 @@ because voting is now peer-recoverable via backfill. A **transient I/O error on 
 `ensure_voting_engine_for` responds by leaving persistence **disarmed** for that session (it does not
 `install_persist_dir`), so the first mutation can't overwrite the still-recoverable on-disk file with
 empty state. A clean restart that reads successfully re-arms persistence.
+
+**IPC policy write must honor the same disarm (R2, Greptile P1-2).** The engine's disarm only governs
+`persist_now`; the IPC `voting_set_notify_on_delegate_signal` persists policy on its own path and would
+otherwise bypass it — and it can run against an *un-reconciled* in-memory log (empty `events`).
+It therefore persists via **`save_policy_only(path, id, new_policy)`**, a load-guarded policy-only
+write: `Err` (skip) on a present-but-unreadable file, and otherwise a rewrite of the on-disk `events` +
+`poll_restore` with the new policy — preserving events the caller's in-memory log may not have loaded.
+Held under the shared `voting_log` mutex so it serializes with `persist_now`.
 
 The engine needs the write path: `ensure_voting_engine_for` / `VotingLogEngineParams` gain
 `identity_dir: PathBuf` (in scope at every call site via `resolve_identity_dir`).

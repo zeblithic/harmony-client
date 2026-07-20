@@ -34,7 +34,8 @@ use crate::owner_state_types::SpaceId;
 const VOTING_LOG_SCHEMA_VERSION: u8 = 1;
 
 /// Per-poll state that replaying `events` does NOT reconstruct, because it is
-/// set by tick-driven in-place mutation rather than by any event:
+/// set by tick-driven or engine-side in-place mutation rather than by any
+/// event:
 /// - `meta`: the whole `PollMeta` (Tier-1 auto-close → `Closed`, Tier-2
 ///   finalize → `Finalized` + `finalized_at_ms`, archive → `Archived`).
 ///   Without it a restart resurrects Finalized/Archived polls as active
@@ -43,10 +44,23 @@ const VOTING_LOG_SCHEMA_VERSION: u8 = 1;
 ///   (`threshold_reached_at_ms`, `last_unsignal_after_threshold_ms`). Without
 ///   it a mid-contestability proposal's 24h window resets on restart,
 ///   re-opening a reversion window. `None` for non-Tier-2 polls.
+/// - `tier3_community_epoch`: the Tier-3 D-FROST epoch. `apply` sets it to `0`
+///   at PollCreate; the engine then patches the real epoch via
+///   `set_tier3_poll_epoch` (read from `DfrostLogRegistry`) — a non-event
+///   mutation. Replay alone leaves it `0`, so a reloaded in-flight Tier-3 poll
+///   would derive its beacon seed with epoch 0 (`derive_beacon_seed` /
+///   `verify_ss` mismatch) and stall. `None` for non-Tier-3 polls. (`last_hlc`
+///   and `poll_create_event_hash`, by contrast, ARE set inside `apply`, so
+///   replay reconstructs them — they need no overlay.)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PollRestore {
     pub meta: PollMeta,
     pub tier2_timing: Option<(Option<i128>, Option<i128>)>,
+    /// `#[serde(default)]` so a `voting.cbor` written before this field existed
+    /// (interim dev builds of this branch) still decodes — a missing value
+    /// means "no Tier-3 epoch overlay", identical to prior behaviour.
+    #[serde(default)]
+    pub tier3_community_epoch: Option<u64>,
 }
 
 /// The persisted record. `version` + `community_id` ride inside the
@@ -105,11 +119,16 @@ pub fn snapshot_for_persist(log: &VotingLog, community_id: &SpaceId) -> VotingLo
                 )),
                 _ => None,
             };
+            let tier3_community_epoch = state
+                .tier_state
+                .as_tier3()
+                .map(|t3| t3.meta.community_epoch);
             (
                 *pid,
                 PollRestore {
                     meta: state.meta.clone(),
                     tier2_timing,
+                    tier3_community_epoch,
                 },
             )
         })
@@ -147,6 +166,42 @@ pub fn save_voting_log(
     community_id: &SpaceId,
 ) -> Result<(), PersistError> {
     write_snapshot(path, &snapshot_for_persist(log, community_id))
+}
+
+/// Persist ONLY a policy change, preserving the on-disk `events` +
+/// `poll_restore` and NEVER clobbering a recoverable file. The IPC policy path
+/// (`voting_set_notify_on_delegate_signal`) calls this instead of
+/// `save_voting_log` because it can run against an un-reconciled in-memory log
+/// (empty `events`) or after boot-reconcile disarmed the engine's persistence
+/// on an unreadable file — writing the in-memory log directly would then
+/// overwrite recoverable voting history with an empty event set. Behaviour by
+/// on-disk state:
+/// - **I/O error on an existing file** → `Err` (skip; present-but-unreadable —
+///   the same disarm the engine applies, enforced independently here).
+/// - **Missing / corrupt (quarantined)** → write `{ [], new_policy, {} }`
+///   (policy-only durability; a corrupt file self-heals).
+/// - **Readable** → rewrite the loaded `events` + `poll_restore` with
+///   `new_policy` (preserves events even when the caller's in-memory log had
+///   not loaded them).
+pub fn save_policy_only(
+    path: &Path,
+    community_id: &SpaceId,
+    new_policy: &CommunityVotingPolicy,
+) -> Result<(), PersistError> {
+    // `load_voting_log` returns `Err` ONLY on a non-NotFound I/O error
+    // (present-but-unreadable); missing → empty, corrupt → quarantine + empty.
+    let (events, _old_policy, poll_restore) = load_voting_log(path, community_id)?;
+    let record = PersistedVotingLog {
+        version: VOTING_LOG_SCHEMA_VERSION,
+        community_id: *community_id,
+        events,
+        policy: new_policy.clone(),
+        poll_restore,
+    };
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&record, &mut bytes)
+        .map_err(|e| PersistError::CborEncode(e.to_string()))?;
+    write_atomic(path, &bytes)
 }
 
 /// Load the persisted `(events, policy)` for `expected_id`.
@@ -358,5 +413,51 @@ mod tests {
         let (events, policy, _pm) = load_voting_log(&path, &cid).unwrap();
         assert!(events.is_empty());
         assert_eq!(policy, CommunityVotingPolicy::default());
+    }
+
+    // ── ZEB-718 R2 (Greptile P1-2): policy persist must not clobber ────────
+
+    #[test]
+    fn save_policy_only_preserves_events_and_updates_policy() {
+        // A community with persisted events; a later policy-only IPC must
+        // update the policy WITHOUT dropping the events (the IPC's in-memory
+        // log may not have loaded them).
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([9u8; 16]);
+        let path = voting_path_for(dir.path(), &cid);
+        let mut log = VotingLog::default();
+        log.events.push(test_event(100, 0, "d1"));
+        log.events.push(test_event(200, 1, "d2"));
+        save_voting_log(&path, &log, &cid).unwrap();
+
+        let new_policy = CommunityVotingPolicy {
+            notify_on_delegate_signal: true,
+            ..Default::default()
+        };
+        save_policy_only(&path, &cid, &new_policy).unwrap();
+
+        let (events, policy, _pm) = load_voting_log(&path, &cid).unwrap();
+        assert_eq!(events, log.events, "policy-only write must preserve events");
+        assert_eq!(policy, new_policy, "policy must be updated");
+    }
+
+    #[test]
+    fn save_policy_only_skips_unreadable_existing_file() {
+        // Force a non-NotFound I/O read error by making voting.cbor a
+        // directory (EISDIR). A policy write must then return Err and NOT
+        // overwrite the recoverable file — mirrors the engine's disarm.
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0xAu8; 16]);
+        let path = voting_path_for(dir.path(), &cid);
+        std::fs::create_dir_all(&path).unwrap();
+        let new_policy = CommunityVotingPolicy {
+            notify_on_delegate_signal: true,
+            ..Default::default()
+        };
+        assert!(
+            save_policy_only(&path, &cid, &new_policy).is_err(),
+            "an unreadable existing file must not be clobbered by a policy write"
+        );
+        assert!(path.is_dir(), "the file must be left untouched");
     }
 }

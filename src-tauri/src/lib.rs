@@ -46423,12 +46423,21 @@ async fn voting_set_notify_on_delegate_signal(
     let mut policy = log_g.policy().clone();
     policy.notify_on_delegate_signal = enabled;
     log_g.set_policy(policy);
-    // ZEB-718: persist the policy change so it survives restart (the
-    // policy is not derivable from replayed events).
+    // ZEB-718: persist the policy change so it survives restart (the policy is
+    // not derivable from replayed events). Uses `save_policy_only` — a
+    // load-guarded policy-only write — NOT `save_voting_log`: this IPC may run
+    // against an un-reconciled in-memory log (empty events) or after
+    // boot-reconcile disarmed persistence on an unreadable file, and writing
+    // the in-memory log directly would clobber recoverable voting history.
+    // `save_policy_only` preserves the on-disk events + poll_restore and skips
+    // (Err) when the file is present-but-unreadable. Held across the write
+    // under `log_g` so it serializes with the engine's `persist_now`.
     if let Some(dir) = identity_dir {
         let path = crate::community_voting_persist::voting_path_for(&dir, &space_id);
-        if let Err(e) = crate::community_voting_persist::save_voting_log(&path, &log_g, &space_id) {
-            tracing::warn!(community_id = %community_id, err = %e, "voting policy persist failed");
+        if let Err(e) =
+            crate::community_voting_persist::save_policy_only(&path, &space_id, log_g.policy())
+        {
+            tracing::warn!(community_id = %community_id, err = %e, "voting policy persist skipped/failed");
         }
     }
     Ok(())
@@ -47957,6 +47966,12 @@ async fn reconcile_voting_from_state(
                 }
             }
         }
+        // Restore the Tier-3 D-FROST epoch (set by the engine's
+        // `set_tier3_poll_epoch`, not by any event — replay leaves it 0). Uses
+        // the public setter, which no-ops for non-Tier-3 polls.
+        if let Some(epoch) = restore.tier3_community_epoch {
+            log.set_tier3_poll_epoch(&pid, epoch);
+        }
     }
     tracing::info!(
         ?community_id,
@@ -48028,6 +48043,43 @@ mod zeb718_voting_reconcile_tests {
             actor,
             // Replay does not re-verify signatures (trusted local disk),
             // so an unsigned fixture is sufficient.
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn tier3_poll_create(actor: OwnerAddr, wall: u64) -> SignedVotingEvent {
+        let cfg = crate::community_voting_core::Tier3PollConfigPayload {
+            proposal_text: "Amend charter".into(),
+            // Tier-3 config validation requires sortition_size in 20..=300
+            // (validate_tier3_poll_config); the electorate size is not checked
+            // at create (selection happens later at the beacon stage).
+            sortition_size: 20,
+            deliberation_window_seconds: 3600,
+            drafting_window_seconds: 3600,
+            ratification_window_seconds: 3600,
+            privacy_mode: "pu".into(),
+            incentive_mode: "d".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&cfg, &mut payload).expect("encode tier3 cfg");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            actor,
             payload,
             sig: vec![0u8; 64],
         }
@@ -48145,6 +48197,67 @@ mod zeb718_voting_reconcile_tests {
             "tick-driven Finalized lifecycle must survive restart, not resurrect as Open"
         );
         assert_eq!(state.meta.finalized_at_ms, Some(1_234));
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_tier3_community_epoch() {
+        // The engine patches a Tier-3 poll's `community_epoch` via
+        // `set_tier3_poll_epoch` AFTER the PollCreate applies (reading the live
+        // D-FROST epoch) — a non-event mutation. Replaying events alone leaves
+        // it 0, which would make the reloaded poll derive its beacon seed with
+        // epoch 0 and stall (Greptile P1-1). The overlay must restore it.
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x79; 16]);
+        let actor = OwnerAddr([0xcc; 16]);
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(
+                tier3_poll_create(actor, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier3 create");
+        // Sanity: apply leaves community_epoch at 0.
+        assert_eq!(
+            log.polls
+                .get(&pid)
+                .and_then(|s| s.tier_state.as_tier3())
+                .map(|t3| t3.meta.community_epoch),
+            Some(0),
+            "apply must leave epoch 0 (patched by the engine, not the event)"
+        );
+        // Engine patches the real epoch (non-event mutation).
+        assert!(log.set_tier3_poll_epoch(&pid, 42));
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        assert_eq!(
+            g.polls
+                .get(&pid)
+                .and_then(|s| s.tier_state.as_tier3())
+                .map(|t3| t3.meta.community_epoch),
+            Some(42),
+            "Tier-3 community_epoch must survive restart, not reset to 0"
+        );
     }
 
     #[tokio::test]
