@@ -147,19 +147,46 @@ Mirror `community_state_persist.rs`:
 ```
 // on-disk record (versioned, community-id-checked, plaintext CBOR):
 struct PersistedVotingLog { version: u8, community_id: SpaceId,
-                            events: Vec<SignedVotingEvent>, policy: CommunityVotingPolicy }
-pub fn save_voting_log(path: &Path, log: &VotingLog, community_id: SpaceId) -> Result<(), PersistError>
-pub fn load_voting_log(path: &Path, expected_id: SpaceId)
-        -> Result<(Vec<SignedVotingEvent>, CommunityVotingPolicy), PersistError>   // quarantine→default on corrupt
-fn voting_path_for(identity_dir: &Path, id_hex: &str) -> PathBuf   // communities/{id_hex}/voting.cbor
+                            events: Vec<SignedVotingEvent>, policy: CommunityVotingPolicy,
+                            poll_restore: HashMap<PollId, PollRestore> }   // D3 tick-driven overlay
+// The path helper OWNS the SpaceId→hex conversion (never a preformatted &str) so voting.cbor
+// can never diverge from the sibling crdt.cbor:
+fn voting_path_for(identity_dir: &Path, community_id: &SpaceId) -> PathBuf  // communities/{id_hex}/voting.cbor
+// Split persist so blocking disk I/O runs off the async worker with no lock held:
+fn snapshot_for_persist(log: &VotingLog, community_id: &SpaceId) -> VotingLogSnapshot   // clone under the lock
+fn write_snapshot(path: &Path, snapshot: &VotingLogSnapshot) -> Result<(), PersistError> // blocking encode+write; spawn_blocking
+pub fn save_voting_log(path: &Path, log: &VotingLog, community_id: &SpaceId) -> Result<(), PersistError> // sync convenience = snapshot+write
+pub fn load_voting_log(path: &Path, expected_id: &SpaceId)
+        -> Result<(Vec<SignedVotingEvent>, CommunityVotingPolicy, HashMap<PollId, PollRestore>), PersistError>
+//   missing file            → Ok((empty, default, empty))
+//   decode / version / id-mismatch → quarantine aside + Ok(empty default)   (self-heals; peer-recoverable)
+//   OTHER I/O error on an existing file → Err   (present-but-unreadable: caller must NOT arm persistence & clobber it)
 ```
 
-`VotingLog` gains a read accessor for `policy` (already `policy()`), and `save_voting_log` reads the
-public `events` field. The engine gains a **persist hook** `persist_now()` that snapshots `{events,
-policy}` under the log lock and atomic-writes `voting.cbor`. It is called after every mutation that
-changes the log: local mint (`publish_event`), inbound apply (`process_inbound`), backfill apply
-(§4.3), archive-prune (`archive_finalized_polls`), and policy change (IPC `set_policy`). Full-rewrite
-per mutation is O(n) in log size; at voting volume (sparse, archive-bounded) this is negligible.
+`VotingLog` gains a read accessor for `policy` (already `policy()`), and the snapshot reads the
+public `events` field. The engine gains a **persist hook** `persist_now()` that clones a `{events,
+policy, poll_restore}` snapshot and runs the CBOR-encode + atomic write inside **`spawn_blocking`** so
+`std::fs` I/O never parks a Tokio worker (repo persistence pattern — PRs #74/#380/#381). It is called
+after every mutation that changes the log: local mint (`publish_event`), inbound apply
+(`process_inbound`), backfill apply (§4.3), archive-prune (`archive_finalized_polls`), and policy change
+(IPC `set_policy`). The per-community `voting_log` mutex is held **across** the `spawn_blocking` write
+(not released after the snapshot): `persist_now` runs concurrently from three tasks (IPC publish /
+inbound loop / backfill apply) and the tick archive sweep writes the same `voting.cbor` — all serialize
+on this one mutex, so holding it across the write prevents two writers racing on the fixed `.tmp` name
+and landing out of order (a stale snapshot renaming last → lost update). The hold is a sub-ms clone +
+off-worker write on a sparse path, so contention is negligible. The tick archive sweep first snapshots
+the map's Arcs and **drops the global `voting_logs` lock** (so a 24h sweep can't block every community's
+voting), then for each pruned log holds *that* community's `voting_log` mutex across its `spawn_blocking`
+write — same serialization discipline. Full-rewrite per mutation is O(n) in log size; at voting volume
+(sparse, archive-bounded) this is negligible.
+
+**Load-error discipline (D2, as-built):** the "quarantine → default" self-heal applies ONLY to a file
+that is present but *malformed* (decode / version / id-mismatch) — a corrupt local file self-heals
+because voting is now peer-recoverable via backfill. A **transient I/O error on an existing file**
+(e.g. permissions, a failing read) is NOT treated as empty: `load_voting_log` returns `Err`, and
+`ensure_voting_engine_for` responds by leaving persistence **disarmed** for that session (it does not
+`install_persist_dir`), so the first mutation can't overwrite the still-recoverable on-disk file with
+empty state. A clean restart that reads successfully re-arms persistence.
 
 The engine needs the write path: `ensure_voting_engine_for` / `VotingLogEngineParams` gain
 `identity_dir: PathBuf` (in scope at every call site via `resolve_identity_dir`).
@@ -186,9 +213,12 @@ wire-agnostic: it hands out plaintext; the adapter owns all crypto (ZEB-717 inva
 
 A lean **backfill driver** (mirror `run_backfill_driver` / `BackfillLatch` but no paging — full-dump is
 atomic) is spawned per engine at `ensure_voting_engine_for`. It issues a full-dump `get` on the
-backfill key (`ConsolidationMode::None`, `Locality::Remote` to skip self-reply) and, for each reply
-`EncryptedEnvelope`, applies the **current-epoch cut then decrypt** (identical to the live inbound seam,
-`event_loop.rs:9553-9612`) → plaintext `SignedVotingEvent` CBOR → hands it to a new engine method:
+backfill key (`ConsolidationMode::None`, `Locality::Remote` to skip self-reply, **`.timeout(10s)`** so a
+hung/never-completing round can't stall anti-entropy — mirrors the RBSR get path) and, for each reply
+`EncryptedEnvelope`, **caps the payload at `MAX_VOTING_PAYLOAD_BYTES` (64 KiB) before materializing it**
+(replies are peer-controlled — parity with the live subscriber's allocation-DoS guard), then applies the
+**current-epoch cut then decrypt** (identical to the live inbound seam) → plaintext `SignedVotingEvent`
+CBOR → hands it to a new engine method:
 
 ```
 async fn apply_backfilled_event(&self, plaintext: &[u8]) -> Result<Option<PollId>, String>
@@ -209,6 +239,18 @@ Driver re-arm (voting engine persists across reconnects, so spawn-time pull alon
 
 Presence-resync (new-holder) re-arm is optional and deferred; the periodic floor + transport edge cover
 the acceptance criteria.
+
+**Out-of-order arrival — no buffering needed (self-healing by construction).** Replies stream one frame
+at a time and apply immediately; with multiple responders there is no cross-responder causal-order
+guarantee, so a dependent event (e.g. a `BallotCast` for a poll whose `PollCreate` hasn't arrived yet)
+can be rejected by `apply_with_snapshot`/eligibility. This does **not** lose the event: `apply_backfilled_event`
+records the dedup coordinate (`seen_coords.insert`) **only after a successful apply** — every failure
+path (`decode` / `snapshot resolve` / `verify` / `eligibility` / `apply`) returns without recording. So a
+rejected event is *not* suppressed, and the next periodic full-dump re-pull re-delivers and re-attempts
+it, by which time its predecessor (delivered earlier in the same or a prior pull) is present. The scheme
+converges in at most *D* pulls, where *D* is the dependency depth (shallow for voting: `PollCreate` →
+`BallotCast`/`Signal` → Tier-3 stage events). Explicit reply buffering / topological reordering is
+therefore an unnecessary complication and is deliberately **not** implemented.
 
 ### 4.4 Boot reconcile (D6) — `reconcile_voting_from_state`
 

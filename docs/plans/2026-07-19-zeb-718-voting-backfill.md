@@ -4,14 +4,14 @@
 
 **Goal:** Give the community voting subsystem restart-durability (persist `VotingLog`, replay on boot) and peer-to-peer anti-entropy (a full-dump backfill pull that recovers events missed on the live topic, including ZEB-717 cross-rotation drops).
 
-**Architecture:** Mirror channel-log's backfill *structure* (Zenoh queryable + engine-supplied read closure + a per-engine driver) but the voting adapter's *crypto* (re-encrypt served events under the current epoch — which doubles as backfill access control, preserving the ZEB-717 cut). Backfill apply dedups by exact event coordinate (not the per-lane high-water tracker) so in-lane gaps recover. Persist only the serde-clean subset `{events, policy}` and replay to rebuild materialized state.
+**Architecture:** Mirror channel-log's backfill *structure* (Zenoh queryable + engine-supplied read closure + a per-engine driver) but the voting adapter's *crypto* (re-encrypt served events under the current epoch — which doubles as backfill access control, preserving the ZEB-717 cut). Backfill apply dedups by exact event coordinate (not the per-lane high-water tracker) so in-lane gaps recover. Persist the serde-clean subset `{events, policy, poll_restore}` and replay `events` to rebuild materialized tally/conviction — with the per-poll `poll_restore` overlay reapplied after replay to restore tick-driven lifecycle state that events alone don't reconstruct (see Task 1 and design §D3).
 
 **Tech Stack:** Rust (tokio, zenoh, ciborium/serde, ChaCha20-Poly1305 via existing `community_state_sync` seams). Design: `docs/specs/2026-07-19-zeb-718-voting-backfill-and-persistence-design.md`.
 
 ## Global Constraints
 
 - Gates (run from `src-tauri/`): `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. Frontend unaffected (no TS/Svelte changes expected).
-- Iterative dev gates use `scripts/test-select --context task` (k=4) then `--context round` for converge; final pre-PR sweep is the full `--workspace --all-targets` run.
+- Iterative dev gates use `scripts/test-select --context task` (k=4) then `--context round` for converge; **paste the emitted `round=… bucket=…` summary line into the task report** so the selective run is auditable (CLAUDE.md convention). Final pre-PR sweep is the full `--workspace --all-targets` run (CI-parity; not selective).
 - **Engine stays wire-agnostic** (ZEB-717 invariant): the `VotingLogEngine` never encrypts/decrypts; all crypto lives in the adapter (`event_loop.rs`). The engine hands out and receives *plaintext* `SignedVotingEvent` CBOR.
 - **At-rest = plaintext CBOR** (codebase convention; events are signed → tamper-evident). No per-community at-rest key.
 - **Keychain safety:** any test touching identity persistence sets `HARMONY_PASSPHRASE` and injects `keychain: None`; never construct `KeychainStore::new()` from test-reachable code (CLAUDE.md ZEB-428).
@@ -41,9 +41,9 @@
 - Consumes: `VotingLog` (`community_voting_log.rs:56`, `pub events`, `policy()`), `SignedVotingEvent`, `CommunityVotingPolicy`, `SpaceId`.
 - Produces:
   - `pub struct PersistError` (enum: `Io(String)`, `Decode(String)`, `Version(u8)`, `CommunityIdMismatch)` — mirror `community_state_persist::PersistError`.
-  - `pub fn voting_path_for(identity_dir: &Path, community_id: &SpaceId) -> PathBuf` → `communities/{id_hex}/voting.cbor`.
-  - `pub fn save_voting_log(path: &Path, log: &VotingLog, community_id: &SpaceId) -> Result<(), PersistError>`
-  - `pub fn load_voting_log(path: &Path, expected_id: &SpaceId) -> Result<(Vec<SignedVotingEvent>, CommunityVotingPolicy), PersistError>` (quarantine → return `(vec![], default)` on corrupt/mismatch).
+  - `pub fn voting_path_for(identity_dir: &Path, community_id: &SpaceId) -> PathBuf` → `communities/{id_hex}/voting.cbor`. The helper owns the `SpaceId`→hex conversion (never accept a preformatted `&str`) so `voting.cbor` can never diverge from the sibling `crdt.cbor`.
+  - `pub fn save_voting_log(path: &Path, log: &VotingLog, community_id: &SpaceId) -> Result<(), PersistError>` (sync convenience wrapper). Hot paths use the split form `snapshot_for_persist(log, id) -> VotingLogSnapshot` (clone under the lock) + `write_snapshot(path, &snapshot)` (blocking encode + atomic write, run under `spawn_blocking`) so disk I/O never parks a Tokio worker or holds a log lock (repo pattern — PRs #74/#380/#381).
+  - `pub fn load_voting_log(path: &Path, expected_id: &SpaceId) -> Result<(Vec<SignedVotingEvent>, CommunityVotingPolicy, HashMap<PollId, PollRestore>), PersistError>`. **Missing file** → `Ok((vec![], default, empty))`. **Decode / version / community_id mismatch** → quarantine aside + return the empty default (self-heals; peer-recoverable). **Other I/O error on an existing file** → `Err` (the file is present but temporarily unreadable — the caller must NOT arm persistence and clobber it with empty). `poll_restore` (a `PollId → PollRestore` overlay) carries tick-driven state replay can't reconstruct.
 
 **Design notes:** Serialize a versioned record. `SpaceId` hex: reuse the existing `id_hex` conversion used at `community_state_sync.rs:4870` (`paths_for`) — match it exactly so paths align with `crdt.cbor`. Plaintext CBOR. Atomic write = temp + rename (mirror `community_state_persist::write_atomic` `:213`); dir-fsync not required (peer-recoverable), but reuse `owner_state_persist::save_atomically` if you prefer the fsync-strong path — either is acceptable; match `community_state_persist` for consistency with the sibling `crdt.cbor`.
 
@@ -209,7 +209,9 @@ async fn publish_persists_voting_log_to_disk_and_reloads() {
 - Consumes: Task 1 `load_voting_log`; `VotingLog::apply_with_snapshot`; `NodeStateMembershipResolver::snapshot_at` (`lib.rs:47810`); `ensure_voting_engine_for`.
 - Produces: `async fn reconcile_voting_from_state(voting_logs, voting_log_engines, identity_dir, community_id, resolver, ...engine params...) -> Result<(), String>`.
 
-**Design notes:** For each community (already enumerated as `community_snapshots`, `:7830`), after its sync engine is reconciled (so membership-at-HLC is available): `load_voting_log(voting_path_for(identity_dir, id), id)` → build `VotingLog`, `set_policy(policy)` → for each event in stored order, `let snap = resolver.snapshot_at(id, event.hlc()).await.ok(); log.apply_with_snapshot(event.clone(), &id, snap).ok();` (skip+log per-event errors) → insert `Arc::new(Mutex::new(log))` into `voting_logs` **before** `ensure_voting_engine_for` (so the engine attaches to the reloaded log via its get-or-insert). Then `ensure_voting_engine_for(..)` (D6 eager spawn).
+**Design notes:** For each community (already enumerated as `community_snapshots`, `:7830`), after its sync engine is reconciled (so membership-at-HLC is available): `load_voting_log(voting_path_for(identity_dir, id), id)` → build `VotingLog`, `set_policy(policy)` → for each event in stored order, `let snap = resolver.snapshot_at(id, event.hlc()).await.ok(); log.apply_with_snapshot(event.clone(), &id, snap).ok();` (skip+log per-event errors) → overlay `poll_restore` (restore each poll's `meta` + Tier-2 timing) → insert `Arc::new(Mutex::new(log))` into `voting_logs` (via `entry().or_insert_with`, so a policy-only log with zero events is still inserted).
+
+> **As-built (reload timing):** reconcile runs **lazily on first voting access** for a community (invoked at the head of `ensure_voting_engine_for`), not from an eager boot loop. Restart-durability holds either way — the first IPC/tick/inbound touch for a community reloads-then-attaches before any mutation. Eager boot-spawn (pre-warming every community's engine at `start_node`) is a deferred enhancement (design §7); it would only change *when* the reload happens, not *whether*. If the reload hits an I/O error on an existing file, `ensure_voting_engine_for` leaves persistence **disarmed** for that session rather than overwriting the unreadable file with empty state.
 
 - [ ] **Step 1: Write the failing test** — persist a log, drop in-memory state, reconcile, assert rebuild.
 

@@ -9379,6 +9379,12 @@ pub fn spawn_community_state_zenoh_adapter(
     })
 }
 
+/// Max accepted voting wire payload (CBOR `EncryptedEnvelope`). Voting events
+/// are small (typically <2 KiB); cap peer-controlled payloads before
+/// materializing them to prevent allocation-DoS. Enforced on BOTH the live
+/// subscriber and the backfill requester (both ingest remote-controlled bytes).
+const MAX_VOTING_PAYLOAD_BYTES: usize = 64 * 1024;
+
 /// ZEB-718: encrypt a plaintext voting frame under the community's CURRENT
 /// epoch (+ voting AAD) as an `EncryptedEnvelope` CBOR. Returns `None`
 /// (drop) if epoch state is missing or encode fails. Mirrors the adapter's
@@ -9651,6 +9657,9 @@ pub fn spawn_voting_log_zenoh_adapter(
                     .get(backfill_topic_req.as_str())
                     .consolidation(zenoh::query::ConsolidationMode::None)
                     .allowed_destination(zenoh::sample::Locality::Remote)
+                    // Bound the query so a hung/never-completing round can't
+                    // stall anti-entropy forever (mirrors the RBSR get path).
+                    .timeout(std::time::Duration::from_secs(10))
                     .await
                 {
                     Ok(receiver) => loop {
@@ -9659,6 +9668,12 @@ pub fn spawn_voting_log_zenoh_adapter(
                             res = receiver.recv_async() => {
                                 let Ok(reply) = res else { break; };
                                 if let Ok(sample) = reply.into_result() {
+                                    // Cap peer-controlled reply payloads before
+                                    // materializing — parity with the live
+                                    // subscriber's allocation-DoS guard.
+                                    if sample.payload().len() > MAX_VOTING_PAYLOAD_BYTES {
+                                        continue;
+                                    }
                                     let raw = sample.payload().to_bytes().to_vec();
                                     if let Some(plaintext) = voting_decrypt_current_epoch_cut(
                                         &crdt_state_req, community_id, &raw,
@@ -9760,7 +9775,6 @@ pub fn spawn_voting_log_zenoh_adapter(
                                 // peer-controlled allocation attacks before we even
                                 // decode for verification.
                                 let payload_len = sample.payload().len();
-                                const MAX_VOTING_PAYLOAD_BYTES: usize = 64 * 1024;
                                 if payload_len > MAX_VOTING_PAYLOAD_BYTES {
                                     if !closing_sub.load(Ordering::SeqCst) {
                                         tracing::warn!(

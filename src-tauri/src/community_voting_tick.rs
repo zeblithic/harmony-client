@@ -466,27 +466,49 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
     {
         let mut last_sweep = ctx.last_archive_sweep_ms.lock().await;
         if (now_ms - *last_sweep) >= ARCHIVE_SWEEP_INTERVAL_MS {
-            let logs = ctx.voting_logs.lock().await;
-            for (space_id, log_mtx) in logs.iter() {
+            let now_wall_ms_u64 = if now_ms < 0 { 0 } else { now_ms as u64 };
+            // Snapshot the map's Arcs, then drop the global map lock BEFORE
+            // mutating individual logs or touching disk — holding
+            // `voting_logs` across N disk writes would block every
+            // community's voting for the duration of the sweep. Each log has
+            // its own mutex, so cloned Arcs stay valid after the map unlocks.
+            let entries: Vec<(SpaceId, std::sync::Arc<tokio::sync::Mutex<VotingLog>>)> = {
+                let logs = ctx.voting_logs.lock().await;
+                logs.iter().map(|(k, v)| (*k, v.clone())).collect()
+            };
+            for (space_id, log_mtx) in entries {
                 let mut log = log_mtx.lock().await;
-                let now_wall_ms_u64 = if now_ms < 0 { 0 } else { now_ms as u64 };
                 let archived = log.archive_finalized_polls(now_wall_ms_u64);
                 // ZEB-718: persist the pruned log so archived events don't
                 // resurrect on reload and the on-disk file stays bounded.
                 if !archived.is_empty() {
                     if let Some(dir) = ctx.identity_dir.as_ref() {
-                        let path = crate::community_voting_persist::voting_path_for(dir, space_id);
-                        if let Err(e) =
-                            crate::community_voting_persist::save_voting_log(&path, &log, space_id)
-                        {
-                            tracing::warn!(
-                                community_id = ?space_id,
-                                err = %e,
-                                "voting archive persist failed"
-                            );
+                        let path = crate::community_voting_persist::voting_path_for(dir, &space_id);
+                        let snapshot =
+                            crate::community_voting_persist::snapshot_for_persist(&log, &space_id);
+                        // Hold this per-community log lock across the write so
+                        // the sweep serializes with the engine's `persist_now`
+                        // (which shares this same mutex) — preventing a
+                        // temp-file race on `voting.cbor`. `spawn_blocking`
+                        // keeps the blocking `std::fs` write off the async
+                        // worker; the sweep is 24h-cadence so the hold is a
+                        // non-issue.
+                        let write_result = tokio::task::spawn_blocking(move || {
+                            crate::community_voting_persist::write_snapshot(&path, &snapshot)
+                        })
+                        .await;
+                        match write_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(community_id = ?space_id, err = %e, "voting archive persist failed")
+                            }
+                            Err(join_err) => {
+                                tracing::warn!(community_id = ?space_id, err = %join_err, "voting archive persist task panicked")
+                            }
                         }
                     }
                 }
+                drop(log);
             }
             *last_sweep = now_ms;
             stats.archive_swept = true;

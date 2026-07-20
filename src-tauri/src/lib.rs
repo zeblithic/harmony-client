@@ -47893,13 +47893,35 @@ async fn reconcile_voting_from_state(
     ) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(?community_id, err = %e, "voting reconcile: load failed; starting empty");
-            return Ok(());
+            // A transient I/O error (file present but unreadable — `load`
+            // maps NotFound to empty, so this is NOT first-boot) must NOT be
+            // swallowed as "empty": arming persistence and letting the first
+            // mutation rewrite this path would clobber recoverable state.
+            // Propagate so `ensure_voting_engine_for` leaves persistence
+            // disarmed this session; a clean restart re-reads and re-arms.
+            tracing::error!(?community_id, err = %e, "voting reconcile: load failed on an existing file; leaving persistence disarmed this session to avoid clobbering it");
+            return Err(format!("voting reconcile load failed: {e}"));
         }
     };
-    // Nothing to restore — a never-voted community's empty log + default
-    // policy is exactly what a lazy spawn would create anyway.
+    // A never-voted community with default policy is exactly what a lazy
+    // spawn would create — nothing to restore. But a policy-only change
+    // (IPC persists `policy` even before any event exists) must survive
+    // restart, so restore it into a fresh log below.
     if events.is_empty() {
+        if policy == crate::community_voting_conviction::CommunityVotingPolicy::default() {
+            return Ok(());
+        }
+        let mut log = crate::community_voting_log::VotingLog::new();
+        log.set_policy(policy);
+        {
+            let mut map = voting_logs.lock().await;
+            map.entry(community_id)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(log)));
+        }
+        tracing::info!(
+            ?community_id,
+            "voting reconcile: restored persisted policy (no events)"
+        );
         return Ok(());
     }
 
@@ -48124,6 +48146,74 @@ mod zeb718_voting_reconcile_tests {
         );
         assert_eq!(state.meta.finalized_at_ms, Some(1_234));
     }
+
+    #[tokio::test]
+    async fn reconcile_restores_policy_only_log_without_events() {
+        // A community whose only persisted state is a non-default policy
+        // (IPC persists `policy` even before any vote). The early-return must
+        // NOT treat "no events" as "nothing to restore" — the policy would be
+        // silently lost across restart otherwise.
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x77; 16]);
+
+        let policy = crate::community_voting_conviction::CommunityVotingPolicy {
+            notify_on_delegate_signal: true,
+            ..Default::default()
+        };
+        let mut log = VotingLog::new();
+        log.set_policy(policy.clone());
+        assert!(log.events.is_empty(), "fixture has no events");
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
+            snapshot: MembershipSnapshot {
+                members: HashMap::new(),
+            },
+        });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("policy-only log must be inserted");
+        assert_eq!(
+            restored.lock().await.policy(),
+            &policy,
+            "persisted policy must survive restart even with zero events"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_errors_on_unreadable_existing_file_to_disarm_persistence() {
+        // Force a non-NotFound I/O read error by making the voting.cbor path a
+        // DIRECTORY: `std::fs::read` on a dir fails (EISDIR) portably. A
+        // transient read failure on an existing file must surface as `Err`, so
+        // the caller (`ensure_voting_engine_for`) leaves persistence disarmed
+        // rather than clobbering the recoverable on-disk state with empty.
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x78; 16]);
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        std::fs::create_dir_all(&path).unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
+            snapshot: MembershipSnapshot {
+                members: HashMap::new(),
+            },
+        });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let result =
+            reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver).await;
+        assert!(
+            result.is_err(),
+            "an unreadable existing file must surface as Err (disarms persistence), not be swallowed as empty"
+        );
+        assert!(
+            voting_logs.lock().await.is_empty(),
+            "a failed reload must not insert a log"
+        );
+    }
 }
 
 /// Lazy-register a `VotingLogEngine` for `community_id` if none exists,
@@ -48201,14 +48291,14 @@ async fn ensure_voting_engine_for(
     // voting log (load + replay) so the engine attaches to restored
     // in-flight state after a restart. Idempotent + a no-op when nothing
     // is persisted; the get-or-insert below then finds the reloaded log.
-    reconcile_voting_from_state(
+    let reconcile_ok = reconcile_voting_from_state(
         voting_logs,
         identity_dir.as_deref(),
         community_id,
         &membership_resolver,
     )
     .await
-    .ok();
+    .is_ok();
 
     // Get-or-insert the VotingLog Arc — same shape as the IPC fast path.
     let log_arc = {
@@ -48274,8 +48364,22 @@ async fn ensure_voting_engine_for(
     // policy} after each mutation. Installed on the freshly-started engine
     // before the race resolution below; if this caller loses the insertion
     // race the engine is dropped harmlessly.
+    //
+    // Arm persistence ONLY if the reload above succeeded. A reload that hit
+    // an I/O error on an existing file means the on-disk state is present but
+    // temporarily unreadable — persisting now would overwrite it with the
+    // freshly-started empty log. Run this session in-memory-only; a clean
+    // restart that reads successfully re-arms persistence.
     if let Some(dir) = identity_dir {
-        engine.install_persist_dir(dir);
+        if reconcile_ok {
+            engine.install_persist_dir(dir);
+        } else {
+            tracing::warn!(
+                ?community_id,
+                "voting: persistence disarmed this session (voting-log reload failed); \
+                 not overwriting the on-disk file"
+            );
+        }
     }
 
     // ZEB-309 Phase 4a-main Task 11: wire DfrostLog handle so the engine

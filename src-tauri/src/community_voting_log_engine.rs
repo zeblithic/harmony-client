@@ -380,13 +380,36 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             return;
         };
         let path = crate::community_voting_persist::voting_path_for(&dir, &self.community_id);
+        let community_id = self.community_id;
+        // Clone a serde-clean snapshot, then run the blocking CBOR-encode +
+        // atomic write on a `spawn_blocking` thread so `std::fs` never parks a
+        // Tokio worker (repo persistence pattern — PRs #74/#380/#381).
+        //
+        // The `voting_log` lock is intentionally held ACROSS the write, not
+        // released after the snapshot: `persist_now` runs concurrently from
+        // three tasks (IPC publish / inbound receive loop / backfill apply)
+        // and the 24h tick archive sweep writes the same `voting.cbor` — all
+        // serialize on this one per-community mutex. Releasing before the
+        // write would let two writers race on the fixed `.tmp` name and land
+        // out of order (a stale snapshot renaming last → lost update). The
+        // hold is a sub-ms clone+write on a sparse path, and the blocking I/O
+        // is off-worker, so contention is negligible.
         let log = self.voting_log.lock().await;
-        if let Err(e) =
-            crate::community_voting_persist::save_voting_log(&path, &log, &self.community_id)
-        {
+        let snapshot = crate::community_voting_persist::snapshot_for_persist(&log, &community_id);
+        let write_result = tokio::task::spawn_blocking(move || {
+            crate::community_voting_persist::write_snapshot(&path, &snapshot)
+        })
+        .await;
+        drop(log);
+        let write_err = match write_result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join_err) => Some(format!("persist task panicked: {join_err}")),
+        };
+        if let Some(err) = write_err {
             tracing::warn!(
-                community_id = ?self.community_id,
-                err = %e,
+                community_id = ?community_id,
+                err = %err,
                 "voting persist_now: failed to write voting.cbor \
                  (continuing; log is peer-recoverable via backfill)"
             );

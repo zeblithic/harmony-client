@@ -81,16 +81,19 @@ pub fn voting_path_for(identity_dir: &Path, community_id: &SpaceId) -> PathBuf {
         .join("voting.cbor")
 }
 
-/// Persist the serde-clean subset of `log` for `community_id` via
-/// atomic write. Plaintext CBOR at rest — voting events are signed
-/// (tamper-evident); the codebase convention encrypts only raw private
-/// keys, not materialized/log state (channel-log segments are likewise
-/// plaintext at rest).
-pub fn save_voting_log(
-    path: &Path,
-    log: &VotingLog,
-    community_id: &SpaceId,
-) -> Result<(), PersistError> {
+/// An owned, `Send + 'static` snapshot of the serde-clean subset of a
+/// `VotingLog`, built while holding the log lock and then handed to
+/// `write_snapshot` on a blocking thread. This split (snapshot under the
+/// async lock → CBOR-encode + `std::fs` write off the Tokio worker via
+/// `spawn_blocking`) is the codebase's persistence pattern (PRs #74/#380/
+/// #381): it keeps blocking disk I/O from parking async worker threads and
+/// avoids holding `voting_log`/`voting_logs` locks across the write.
+pub struct VotingLogSnapshot(PersistedVotingLog);
+
+/// Build a `VotingLogSnapshot` from `log`. Cheap-ish (clones `events`,
+/// `policy`, and the per-poll `poll_restore` overlay) but does NO I/O, so
+/// the caller holds the log lock only for the clone, not the disk write.
+pub fn snapshot_for_persist(log: &VotingLog, community_id: &SpaceId) -> VotingLogSnapshot {
     let poll_restore: HashMap<PollId, PollRestore> = log
         .polls
         .iter()
@@ -111,17 +114,39 @@ pub fn save_voting_log(
             )
         })
         .collect();
-    let record = PersistedVotingLog {
+    VotingLogSnapshot(PersistedVotingLog {
         version: VOTING_LOG_SCHEMA_VERSION,
         community_id: *community_id,
         events: log.events.clone(),
         policy: log.policy().clone(),
         poll_restore,
-    };
+    })
+}
+
+/// CBOR-encode `snapshot` and atomically replace `path`. Blocking (`std::fs`
+/// write + rename) — run under `spawn_blocking`, never on an async worker
+/// while holding a lock. Plaintext CBOR at rest — voting events are signed
+/// (tamper-evident); the codebase convention encrypts only raw private
+/// keys, not materialized/log state (channel-log segments are likewise
+/// plaintext at rest).
+pub fn write_snapshot(path: &Path, snapshot: &VotingLogSnapshot) -> Result<(), PersistError> {
     let mut bytes = Vec::new();
-    ciborium::into_writer(&record, &mut bytes)
+    ciborium::into_writer(&snapshot.0, &mut bytes)
         .map_err(|e| PersistError::CborEncode(e.to_string()))?;
     write_atomic(path, &bytes)
+}
+
+/// Convenience sync wrapper: `snapshot_for_persist` + `write_snapshot` in one
+/// call. Retained for the non-latency-critical / test call sites that already
+/// hold the log by reference and don't need the blocking I/O moved off-worker.
+/// Hot paths (`persist_now`, the tick archive sweep) use the split form so the
+/// `std::fs` write runs on a blocking thread with no lock held.
+pub fn save_voting_log(
+    path: &Path,
+    log: &VotingLog,
+    community_id: &SpaceId,
+) -> Result<(), PersistError> {
+    write_snapshot(path, &snapshot_for_persist(log, community_id))
 }
 
 /// Load the persisted `(events, policy)` for `expected_id`.
