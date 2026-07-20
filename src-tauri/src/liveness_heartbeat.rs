@@ -122,5 +122,39 @@ mod tests {
             !run_liveness_heartbeat_once(&doc, &device_signing_key, later).await,
             "the re-signed cert is fresh again at `later`"
         );
+        // The re-signed cert is stamped at `later` (timestamp advanced).
+        let g = doc.lock().await;
+        let device_id = *g.enrollments.keys().next().unwrap();
+        assert_eq!(
+            g.liveness.get(&device_id).unwrap().timestamp,
+            later,
+            "the re-signed cert timestamp advanced to `later`"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_once_publishes_when_missing() {
+        let now = 1_700_000_222;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(now).unwrap();
+        state.liveness.clear(); // legacy identity with no self-liveness
+        let device_id = *state.enrollments.keys().next().unwrap();
+        let doc = Arc::new(tokio::sync::Mutex::new(state));
+        assert!(
+            run_liveness_heartbeat_once(&doc, &device_signing_key, now).await,
+            "a missing cert must be published"
+        );
+        let g = doc.lock().await;
+        assert_eq!(
+            g.liveness
+                .get(&device_id)
+                .expect("cert present after refresh")
+                .timestamp,
+            now,
+            "the new cert is stamped at `now`"
+        );
     }
 }

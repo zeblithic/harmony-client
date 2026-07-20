@@ -60,8 +60,9 @@ Devices panel.
 ## Design
 
 Mirror the established `run_voting_tick` / `spawn_voting_tick` split
-(`src-tauri/src/community_voting_tick.rs`): a synchronous, unit-testable
-single-iteration function plus a thin interval loop that spawns it.
+(`src-tauri/src/community_voting_tick.rs`): an async, unit-testable
+single-iteration function (it awaits the resident doc's `tokio::sync::Mutex`)
+plus a thin interval loop that spawns it.
 
 ### New module `src-tauri/src/liveness_heartbeat.rs`
 

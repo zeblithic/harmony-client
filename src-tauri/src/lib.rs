@@ -2475,8 +2475,14 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                     handle.abort();
                 }
             }
-            // ZEB-410: abort the liveness heartbeat under the same lock.
-            if let Ok(mut slot) = guard.liveness_heartbeat_handle.lock() {
+            // ZEB-410: abort the liveness heartbeat under the same lock. Recover a
+            // poisoned slot (into_inner) so shutdown can still take + abort the
+            // stored handle rather than leaking the task.
+            {
+                let mut slot = guard
+                    .liveness_heartbeat_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(handle) = slot.take() {
                     handle.abort();
                 }
@@ -11748,10 +11754,14 @@ pub async fn start_node_inner(
                                 hb_device_sk,
                                 crate::liveness_heartbeat::LIVENESS_HEARTBEAT_INTERVAL,
                             );
-                            if let Ok(mut slot) = guard.liveness_heartbeat_handle.lock() {
-                                if let Some(old) = slot.replace(handle) {
-                                    old.abort();
-                                }
+                            // Recover a poisoned slot (into_inner) so a failed lock
+                            // can't leave the just-spawned task untracked (leaked).
+                            let mut slot = guard
+                                .liveness_heartbeat_handle
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if let Some(old) = slot.replace(handle) {
+                                old.abort();
                             }
                         }
                         guard.owner_quorum_doc = owner_quorum_doc_opt.clone();

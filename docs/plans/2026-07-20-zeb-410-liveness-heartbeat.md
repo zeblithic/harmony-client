@@ -265,17 +265,19 @@ Grep `voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None))` → 
 
 - [ ] **Step 3: Abort the handle in `stop_inner`**
 
-Grep for the `voting_tick_handle` abort in `stop_inner` (~L2466 — `if let Ok(mut slot) = guard.voting_tick_handle.lock()`). Immediately after that block, add the mirror:
+Grep for the `voting_tick_handle` abort in `stop_inner` (~L2466 — `if let Ok(mut slot) = guard.voting_tick_handle.lock()`). Immediately after that block, add the mirror — recovering a poisoned slot (`into_inner`) so shutdown can still take + abort the stored handle rather than leaking the task:
 
 ```rust
-            if let Ok(mut slot) = guard.liveness_heartbeat_handle.lock() {
-                if let Some(h) = slot.take() {
-                    h.abort();
+            {
+                let mut slot = guard
+                    .liveness_heartbeat_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(handle) = slot.take() {
+                    handle.abort();
                 }
             }
 ```
-
-(Match the exact shape of the adjacent `voting_tick_handle` abort — copy its `.lock()`/`.take()`/`.abort()` structure verbatim, adjusting only the field name.)
 
 - [ ] **Step 4: Declare the signing-key `_opt` local**
 
@@ -297,54 +299,61 @@ Grep `owner_trust_sync_engine_opt = Some(std::sync::Arc::clone(&owner_trust_sync
                         Some(std::sync::Arc::new(loaded.device_signing_key.clone()));
 ```
 
-- [ ] **Step 6: Add the spawn block after the voting-tick block**
+- [ ] **Step 6: Add the spawn + slot-store inside the owner-trust guard-store block**
 
-Grep for the end of the voting-tick spawn block (the closing `}` of the block that starts with the `ZEB-291 Phase 2 Task 20 — periodic voting tick` comment, ~L12885, immediately before the `zenoh-status` / `"connected"` emit). Insert a sibling block:
+> **As-built:** the spawn lives **inside** the owner-trust guard-store block (right
+> after `guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();`), NOT at the
+> later voting-tick block — the `_opt` locals are out of scope there. Because the
+> spawn and the slot-store happen while `guard` is already held, they are skipped
+> together on a lock-poison rollback (no untracked task) and need no separate
+> generation re-lock. Grep for `guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();`
+> and insert immediately after it:
 
 ```rust
-            // ── ZEB-410 — periodic self-liveness heartbeat ─────────────
-            // Re-signs the local device's LivenessCert on a timer (node-start
-            // + hourly) so a device — especially a headless serve node that
-            // never opens the Devices panel — stays Full in siblings'
-            // evaluate_trust. Reuses refresh_self_liveness (~15d gate) + the
-            // owner-trust-v1 sync path (notify_dirty). Only spawns when a
-            // resident trust engine + owner identity exist (all three _opt are
-            // Some). Mirrors the voting-tick block's generation gate + slot
-            // replace; the device signing key lives only in the task closure.
-            {
-                let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-                if guard.generation == our_gen {
-                    let hb_handle_slot =
-                        std::sync::Arc::clone(&guard.liveness_heartbeat_handle);
-                    drop(guard);
-
-                    if let (Some(doc), Some(engine), Some(device_sk)) = (
-                        owner_trust_doc_opt.clone(),
-                        owner_trust_sync_engine_opt.clone(),
-                        heartbeat_device_sk_opt.clone(),
-                    ) {
-                        let handle = crate::liveness_heartbeat::spawn_liveness_heartbeat(
-                            doc,
-                            engine,
-                            device_sk,
-                            crate::liveness_heartbeat::LIVENESS_HEARTBEAT_INTERVAL,
-                        );
-                        let prev = match hb_handle_slot.lock() {
-                            Ok(mut slot) => slot.replace(handle),
-                            Err(_) => None,
-                        };
-                        if let Some(old) = prev {
-                            old.abort();
+                        // ZEB-410: spawn the periodic self-liveness heartbeat here,
+                        // where the three inputs (trust doc + engine, device signing
+                        // key) are in scope and `guard` is held. Reuses
+                        // refresh_self_liveness (~15d gate) + the owner-trust-v1 sync
+                        // path (notify_dirty). Spawn + slot-store live in this one
+                        // guard block, so a lock-poison rollback skips both together
+                        // (no leak) and stop_inner aborts via the NodeState slot. The
+                        // device signing key lives only in the task closure — never on
+                        // NodeState. Only spawns when a resident trust engine + owner
+                        // identity exist (all three _opt are Some).
+                        if let (Some(hb_doc), Some(hb_engine), Some(hb_device_sk)) = (
+                            owner_trust_doc_opt.clone(),
+                            owner_trust_sync_engine_opt.clone(),
+                            heartbeat_device_sk_opt.clone(),
+                        ) {
+                            let handle = crate::liveness_heartbeat::spawn_liveness_heartbeat(
+                                hb_doc,
+                                hb_engine,
+                                hb_device_sk,
+                                crate::liveness_heartbeat::LIVENESS_HEARTBEAT_INTERVAL,
+                            );
+                            // Recover a poisoned slot (into_inner) so a failed lock
+                            // can't leave the just-spawned task untracked (leaked).
+                            let mut slot = guard
+                                .liveness_heartbeat_handle
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if let Some(old) = slot.replace(handle) {
+                                old.abort();
+                            }
                         }
-                    }
-                }
-            }
 ```
+
+The matching `stop_inner` abort (Step 3) likewise recovers a poisoned slot with
+`.lock().unwrap_or_else(|e| e.into_inner())` before `take()`.
 
 - [ ] **Step 7: Compile-check the wiring**
 
 Run: `cd src-tauri && cargo check --locked --lib --features test-fixtures`
-Expected: clean (exit 0). If the compiler reports `owner_trust_doc_opt`/`owner_trust_sync_engine_opt`/`heartbeat_device_sk_opt` out of scope at the spawn block, the block was inserted past the enclosing scope — move it up to immediately after the voting-tick block (the brace-depth scan proved those locals are in scope there). If it reports `heartbeat_device_sk_opt` never read on some path, that is expected only if Step 5 was missed.
+Expected: clean (exit 0). The `_opt` locals are in scope at the guard-store block
+(they are consumed there by the existing `guard.owner_trust_* = ..._opt.clone()`
+lines), so the spawn compiles. (An earlier draft placed the spawn at the voting-tick
+block and failed with `not found in this scope` — the guard-store block is the
+correct home.)
 
 - [ ] **Step 8: Full CI-parity gate sweep**
 
