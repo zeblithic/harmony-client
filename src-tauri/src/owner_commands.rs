@@ -402,6 +402,13 @@ fn build_owner_state_view(
     let now = now_unix();
     let active_window = trust::DEFAULT_ACTIVE_WINDOW_SECS;
     let freshness = trust::DEFAULT_FRESHNESS_WINDOW_SECS;
+    // ZEB-721: surface a regressed host clock (our own cert stamped in the future)
+    // so the panel can warn; `None` when healthy. Same helper the refresh path uses.
+    let self_clock_regressed_skew_secs = crate::owner_state::self_liveness_future_skew_secs(
+        &loaded.state,
+        &loaded.device_signing_key,
+        now,
+    );
     let this_device_id = derive_this_device_id(&loaded.device_signing_key);
     let this_device_hex = hex::encode(this_device_id);
     let self_is_master = loaded.master_seed.is_some();
@@ -581,6 +588,7 @@ fn build_owner_state_view(
         can_arm_enrollment,
         quorum_requests,
         quorum_armed_until_ms,
+        self_clock_regressed_skew_secs,
     }
 }
 
@@ -3625,6 +3633,49 @@ mod revoke_tests {
             expired_arm,
         );
         assert_eq!(view2.quorum_armed_until_ms, None);
+    }
+
+    /// ZEB-721: `build_owner_state_view` surfaces a regressed host clock (this
+    /// device's own liveness cert stamped in the future) via
+    /// `self_clock_regressed_skew_secs`, and reports `None` when healthy.
+    #[test]
+    fn view_surfaces_self_clock_regressed_skew() {
+        let (mut state, a_sk, ..) = quorum_view_fixture(now_unix());
+        let a_id = crate::owner_state::device_id_from_signing_key(&a_sk);
+        let owner_id = state.owner_id;
+        // Healthy: force A's own cert to a clearly-past timestamp. Direct insert
+        // bypasses the add_liveness LWW (which would keep the fixture's newer cert).
+        let past = harmony_owner::certs::LivenessCert::sign(&a_sk, owner_id, now_unix() - 100_000)
+            .unwrap();
+        state.liveness.insert(a_id, past);
+        let healthy = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert_eq!(
+            healthy.self_clock_regressed_skew_secs, None,
+            "a past-stamped self-cert must surface no skew"
+        );
+        // Regress: stamp A's own liveness cert an hour into the future (wins the
+        // LWW merge), simulating a host clock that moved backwards after signing.
+        let future = now_unix() + 3600;
+        let cert = harmony_owner::certs::LivenessCert::sign(&a_sk, owner_id, future).unwrap();
+        state.add_liveness(cert).unwrap();
+        let regressed = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        let skew = regressed
+            .self_clock_regressed_skew_secs
+            .expect("a future-stamped self-cert must surface a skew");
+        assert!(
+            skew > 3000 && skew <= 3600,
+            "skew ≈ future − now (~1h), got {skew}"
+        );
     }
 
     /// ZEB-668 S5: `fleetEpochStale` = any revocation newer than the last

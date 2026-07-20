@@ -46,6 +46,12 @@ pub struct OwnerStateView {
     /// enrollment co-sign window closes; `None` when not armed.
     #[serde(default)]
     pub quorum_armed_until_ms: Option<u64>,
+    /// ZEB-721: seconds THIS device's own liveness cert is stamped in the future
+    /// relative to the host clock at snapshot time — the host clock regressed
+    /// behind an already-signed cert, pausing liveness renewal until it recovers.
+    /// `None` when healthy. Drives the DevicesPanel clock-regressed banner.
+    #[serde(default)]
+    pub self_clock_regressed_skew_secs: Option<u64>,
 }
 
 /// ZEB-677 S3: one pending quorum co-sign request, pre-joined server-side
@@ -2232,10 +2238,15 @@ mod tests {
                 can_cosign: true,
             }],
             quorum_armed_until_ms: Some(1_700_000_400_000),
+            self_clock_regressed_skew_secs: Some(7200),
         };
         let json = serde_json::to_string(&view).unwrap();
         // The wire format MUST be camelCase — JS depends on this.
         assert!(json.contains("\"ownerId\""), "expected ownerId, got {json}");
+        assert!(
+            json.contains("\"selfClockRegressedSkewSecs\":7200"),
+            "expected selfClockRegressedSkewSecs:7200, got {json}"
+        );
         assert!(
             json.contains("\"canBackUp\""),
             "expected canBackUp, got {json}"
