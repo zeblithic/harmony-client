@@ -78,6 +78,30 @@ enum Command {
         #[arg(long)]
         events: bool,
     },
+
+    /// Watch a running node's channel(s) for new messages, emitting one JSON
+    /// line per message on stdout (ZEB-480): filtered, resumable, self-healing
+    /// — the push analog of `api --events`. Reads <data-dir>/api/{port,token}.
+    Watch {
+        /// Community id (hex) the watched channels belong to.
+        #[arg(long, value_name = "HEX")]
+        community: String,
+        /// Channel id (hex) to watch; repeatable (>=1).
+        #[arg(long = "channel", value_name = "HEX", required = true)]
+        channels: Vec<String>,
+        /// Resume cursor `wallMs:logical:deviceId`; seeds all channels.
+        #[arg(long, value_name = "HLC")]
+        since: Option<String>,
+        /// Self-persist + auto-resume per-channel cursors at this path.
+        #[arg(long, value_name = "PATH")]
+        cursor_file: Option<PathBuf>,
+        /// Emit untouched firehose frames instead of the normalized projection.
+        #[arg(long)]
+        raw: bool,
+        /// Exit on disconnect (code 3) instead of reconnecting.
+        #[arg(long)]
+        no_retry: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -320,6 +344,33 @@ fn main() {
                 }) => {
                     init_tracing();
                     std::process::exit(harmony_app::api_cli(command, args, events));
+                }
+                Some(Command::Watch {
+                    community,
+                    channels,
+                    since,
+                    cursor_file,
+                    raw,
+                    no_retry,
+                }) => {
+                    init_tracing();
+                    let since = match since.as_deref().map(harmony_app::api::watch::parse_since) {
+                        Some(Ok(h)) => Some(h),
+                        Some(Err(e)) => {
+                            eprintln!("watch: {e}");
+                            std::process::exit(2);
+                        }
+                        None => None,
+                    };
+                    let cfg = harmony_app::WatchConfig {
+                        community_id: community,
+                        channels,
+                        since,
+                        cursor_file,
+                        raw,
+                        no_retry,
+                    };
+                    std::process::exit(harmony_app::api_watch(cfg));
                 }
                 None => {
                     // Default path — launch the Tauri runtime.

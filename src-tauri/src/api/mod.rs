@@ -9,6 +9,7 @@ pub mod events;
 pub mod gui_host;
 pub mod lock;
 pub mod rpc;
+pub mod watch;
 
 use crate::node_event_sink::NodeEventSink;
 use crate::NodeState;

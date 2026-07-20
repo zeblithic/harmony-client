@@ -32,3 +32,5 @@ mod common;
 mod api_cli;
 #[path = "api/api_server.rs"]
 mod api_server;
+#[path = "api/watch.rs"]
+mod watch;

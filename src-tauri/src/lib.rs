@@ -25168,6 +25168,7 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
 
 /// ZEB-452: `harmony-app api` CLI entry (thin client for the localhost API).
 pub use crate::api::cli::api_cli;
+pub use crate::api::watch::{api_watch, WatchConfig};
 
 /// ZEB-445: resolve on ctrl-c (all platforms) or SIGTERM (unix — what
 /// systemd / `kill` send). Never resolves spuriously: if no handler can be
