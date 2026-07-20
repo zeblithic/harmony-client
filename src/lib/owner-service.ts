@@ -38,6 +38,12 @@ export interface OwnerStateView {
    * predating S4 omits it (read as `=== true`).
    */
   canArmEnrollment?: boolean;
+  /**
+   * ZEB-721: seconds THIS device's own liveness cert is stamped in the future
+   * vs the host clock — the clock regressed behind an already-signed cert,
+   * pausing liveness renewal until it recovers. Absent/`undefined` when healthy.
+   */
+  selfClockRegressedSkewSecs?: number;
 }
 
 /**
