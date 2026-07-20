@@ -2387,6 +2387,89 @@ mod integration_tests {
         );
     }
 
+    /// ZEB-674 Task 2: the per-CID `file_grants` union in
+    /// `merge_remote_into_local` is a CRDT — merging must be commutative and
+    /// converge to the same Vec regardless of direction. Two of the owner's
+    /// devices each hold a DIFFERENT grant list for the SAME cid (different
+    /// order, an overlapping grantee with a different `granted_at`). B→A and
+    /// A→B must both yield the byte-identical list: set-union of grantees,
+    /// `min(granted_at)` per grantee, sorted by `grantee_owner`. This pins
+    /// commutativity + dedup + min + deterministic order in one shot.
+    #[test]
+    fn file_grants_merge_converges_both_directions() {
+        use crate::owner_state_types::{GrantEntry, OwnerAddr};
+
+        let cid = [0x99u8; 32];
+        // X < Y by OwnerAddr ordering, so the sorted result is [X, Y].
+        let x = OwnerAddr([1u8; 16]);
+        let y = OwnerAddr([2u8; 16]);
+
+        // A: [X@5, Y@3]; B: [Y@7, X@2] — different order, overlapping grantees
+        // with different granted_at (X: min(5,2)=2, Y: min(3,7)=3).
+        let mk = |grants: Vec<GrantEntry>| {
+            let mut s = OwnerState::default();
+            s.file_grants.insert(cid, grants);
+            s
+        };
+        let a0 = mk(vec![
+            GrantEntry {
+                grantee_owner: x,
+                granted_at: 5,
+            },
+            GrantEntry {
+                grantee_owner: y,
+                granted_at: 3,
+            },
+        ]);
+        let b0 = mk(vec![
+            GrantEntry {
+                grantee_owner: y,
+                granted_at: 7,
+            },
+            GrantEntry {
+                grantee_owner: x,
+                granted_at: 2,
+            },
+        ]);
+
+        // Deduped set-union with min(granted_at), sorted by grantee_owner.
+        let expected = vec![
+            GrantEntry {
+                grantee_owner: x,
+                granted_at: 2,
+            },
+            GrantEntry {
+                grantee_owner: y,
+                granted_at: 3,
+            },
+        ];
+
+        // Merge B → A (fresh copies so each direction starts clean).
+        let mut a = a0.clone();
+        super::merge_remote_into_local(&mut a, b0.clone());
+
+        // Merge A → B.
+        let mut b = b0;
+        super::merge_remote_into_local(&mut b, a0);
+
+        let a_grants = a.file_grants.get(&cid).expect("A has grants for cid");
+        let b_grants = b.file_grants.get(&cid).expect("B has grants for cid");
+
+        assert_eq!(
+            a_grants, b_grants,
+            "merge must be commutative: B→A and A→B diverge\nA: {a_grants:?}\nB: {b_grants:?}"
+        );
+        assert_eq!(
+            *a_grants, expected,
+            "union must dedup to min(granted_at) per grantee, sorted by grantee_owner: {a_grants:?}"
+        );
+        assert_eq!(
+            a_grants.len(),
+            2,
+            "overlapping grantees must dedup, not stack"
+        );
+    }
+
     /// 10 randomized sequences of (mutate-on-A, mutate-on-B,
     /// publish-A, publish-B) operations. After draining, A and B
     /// must hold equal `OwnerState.spaces` maps (the only field this

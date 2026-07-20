@@ -61,7 +61,7 @@ pub const FILE_GRANT_SEAL_INFO: &[u8] = b"harmony-file-grant-v1";
 /// same-length-keys precondition — every field name encodes to 2 bytes). Both
 /// byte-array fields ride as definite-length CBOR arrays (mirrors
 /// `DepositFrame`'s fixed `[u8; 16]` owner fields), which is deterministic.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileGrantInner {
     /// The shared file's encrypted root ContentId, canonical 32-byte form.
     #[serde(rename = "ci")]
@@ -79,6 +79,22 @@ pub struct FileGrantInner {
     /// ever travels sealed inside this struct's per-device envelope.
     #[serde(rename = "dk")]
     pub dek: [u8; 32],
+}
+
+/// Redacting `Debug` (mirrors `EpochKey`'s custom impl): the non-secret
+/// metadata fields print for diagnostics, but the raw DEK is NEVER emitted —
+/// so a stray `{:?}` on a `FileGrantInner` (log line, panic message) can't leak
+/// key material.
+impl std::fmt::Debug for FileGrantInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileGrantInner")
+            .field("cid", &self.cid)
+            .field("file_name", &self.file_name)
+            .field("file_size", &self.file_size)
+            .field("mime", &self.mime)
+            .field("dek", &"<redacted>")
+            .finish()
+    }
 }
 
 impl CanonicalPayloadSealed for FileGrantInner {}
