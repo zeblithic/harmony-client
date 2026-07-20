@@ -127,6 +127,12 @@ struct CrdtFileV2 {
     /// `skip_serializing_if` keeps existing file shapes compact.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     revoked_dm_devices: BTreeMap<crate::owner_state_types::OwnerAddr, BTreeSet<[u8; 32]>>,
+    /// ZEB-674 Task 1 (C1): persisted per-file sealed DEK store (root CID
+    /// bytes → KeyTree-sealed DEK blob). Absent in pre-ZEB-674 V2 files;
+    /// `serde(default)` loads those as empty (no schema-version bump — absent
+    /// == empty). `skip_serializing_if` keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    file_deks: BTreeMap<[u8; 32], Vec<u8>>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -142,6 +148,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             outbox_tombstones: s.outbox_tombstones.clone(),
             friend_graph: s.friend_graph.clone(),
             revoked_dm_devices: s.revoked_dm_devices.clone(),
+            file_deks: s.file_deks.clone(),
         }
     }
 }
@@ -159,6 +166,7 @@ impl From<CrdtFileV2> for OwnerState {
             outbox_tombstones: f.outbox_tombstones,
             friend_graph: f.friend_graph,
             revoked_dm_devices: f.revoked_dm_devices,
+            file_deks: f.file_deks,
         }
     }
 }

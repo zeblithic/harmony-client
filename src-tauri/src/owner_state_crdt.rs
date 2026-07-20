@@ -86,6 +86,25 @@ pub struct OwnerState {
     /// pruned outright. So the store is NOT grow-only — it can shrink.
     #[serde(rename = "rd", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub revoked_dm_devices: BTreeMap<crate::owner_state_types::OwnerAddr, BTreeSet<[u8; 32]>>,
+    /// ZEB-674 Task 1 (C1): per-file Data Encryption Keys for encrypted
+    /// personal-file sharing, each sealed AT REST under the owner's `KeyTree`
+    /// (via `owner_state_crypto::encrypt_file_dek`, the `FriendEntry`
+    /// sealed-secret idiom). Keyed by the ingest ROOT ContentId's canonical
+    /// 32-byte form (`ContentId::to_bytes()`); `ContentId` is not `Ord`, so
+    /// the key is its byte form, which round-trips losslessly via
+    /// `ContentId::from_bytes`. The value is NEVER the raw DEK — always the
+    /// sealed blob.
+    ///
+    /// Replicates across the owner's own bound devices via Flow A. Merge is a
+    /// GROW-ONLY union, first-writer-wins per CID (see
+    /// `owner_state_sync::merge_remote_into_local`): a CID is content-addressed
+    /// over its ciphertext, so any sealed blob a sibling device holds for it
+    /// unseals — under the owner's shared KeyTree — to the one DEK that
+    /// decrypts that ciphertext; which sealed blob survives is therefore
+    /// immaterial to the observable key. Absent on the wire when empty
+    /// (`skip_serializing_if` + `default`) so pre-ZEB-674 snapshots load empty.
+    #[serde(rename = "fd", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub file_deks: BTreeMap<[u8; 32], Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

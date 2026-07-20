@@ -259,6 +259,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         outbox_tombstones,
         friend_graph,
         revoked_dm_devices,
+        file_deks,
     } = remote;
 
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
@@ -413,6 +414,16 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
             Some(crate::friend_graph::FriendStatus::Revoked)
         )
     });
+
+    // ZEB-674 Task 1: per-file DEK store — GROW-ONLY union, first-writer-wins
+    // per CID. A CID is content-addressed over its ciphertext, so every sealed
+    // blob a sibling device holds for it unseals (under the owner's shared
+    // KeyTree) to the same DEK; `or_insert` (keep existing, insert when absent)
+    // therefore converges regardless of merge order. No HLC / LWW is needed —
+    // the key already pins the payload.
+    for (cid, sealed) in file_deks {
+        local.file_deks.entry(cid).or_insert(sealed);
+    }
 }
 
 #[cfg(test)]

@@ -177,6 +177,7 @@ pub mod emoji_names;
 pub mod enrollment_verify;
 pub mod event_loop;
 pub mod feed_authority;
+pub mod file_sharing;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
 pub mod fleet_net_persist;
@@ -19881,6 +19882,159 @@ async fn ingest_content(
     send_ingest_with_name(&content_index, root.to_bytes(), file_name, size_bytes, None)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// ZEB-674 Task 1 (C1): pure inner for the encrypted-file ingest path.
+///
+/// Generates a FRESH per-file DEK, encrypts the WHOLE plaintext blob under it
+/// (`community_state_sync::encrypt_blob` — deterministic nonce, so a given
+/// (DEK, plaintext) reproduces the same ciphertext/CID), ingests the resulting
+/// ciphertext as an encrypted + serveable artifact, then seals the DEK at rest
+/// under the owner's `KeyTree` and stores it on `OwnerState.file_deks` keyed by
+/// the ingest root CID.
+///
+/// The pipeline does NOT encrypt — it is handed PRE-ENCRYPTED ciphertext.
+/// `ContentFlags{ encrypted: true }` + `serveable: true` stamp every emitted
+/// leaf + bundle CID so decrypt-on-fetch and member-to-member serve behave
+/// (see [`streaming_ingest_with_options`]).
+///
+/// `sync_engine` is the owner-state SyncEngine: `notify_dirty()` is REQUIRED
+/// after the local `file_deks` mutation, or the sealed DEK is dropped on the
+/// floor — never persisted, never replicated (ZEB-709). Pass `None` only in
+/// focused tests that inspect `crdt_state` directly.
+///
+/// NOTE: whole-blob DEK encryption materializes the full plaintext AND
+/// ciphertext in memory (this path is not streaming, unlike [`ingest_content`]).
+/// Callers gate large files upstream.
+pub async fn ingest_content_encrypted_inner(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    keytree: &crate::owner_state_crypto::KeyTree,
+    sync_engine: Option<&std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    plaintext: Vec<u8>,
+    file_name: String,
+) -> Result<IngestResult, String> {
+    use harmony_content::chunker::ChunkerConfig;
+
+    // 1. Fresh per-file DEK.
+    let dek = crate::file_sharing::generate_file_dek();
+
+    // 2. Encrypt the whole blob under the DEK. The CID is computed over this
+    //    ciphertext, so a fresh DEK yields a fresh root CID.
+    let ciphertext = crate::community_state_sync::encrypt_blob(&dek, &plaintext)
+        .map_err(|e| format!("encrypt_blob: {e:?}"))?;
+
+    // 3. Ingest the PRE-ENCRYPTED ciphertext as an encrypted + serveable
+    //    artifact (flags stamped onto every leaf + bundle CID).
+    let opts = IngestOptions {
+        flags: harmony_content::cid::ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+        serveable: true,
+    };
+    let (root, size_bytes) = streaming_ingest_with_options(
+        std::io::Cursor::new(ciphertext),
+        ingest_tx,
+        ChunkerConfig::DEFAULT,
+        None,
+        opts,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 4. Seal the DEK at rest and store it keyed by the root CID. A crdt_state
+    //    mutation without a following notify_dirty would never persist NOR
+    //    replicate (ZEB-709).
+    let sealed = crate::file_sharing::seal_dek_at_rest(keytree, &dek)
+        .map_err(|e| format!("seal DEK at rest: {e:?}"))?;
+    {
+        let mut st = crdt_state.lock().await;
+        st.file_deks.insert(root.to_bytes(), sealed);
+    }
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
+    }
+
+    // 5. Insert the sidecar row pointing at the streamed root CID.
+    send_ingest_with_name(content_index, root.to_bytes(), file_name, size_bytes, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// ZEB-674 Task 1 (C1): encrypted-file ingest via the native file picker.
+///
+/// Mirrors [`ingest_content`] but routes through the per-file-DEK encrypt path
+/// (fresh DEK → whole-blob encrypt → EncryptedDurable + serveable ingest →
+/// sealed DEK on `OwnerState`). Backend-only; Task 6 wires the frontend.
+#[tauri::command]
+async fn ingest_content_encrypted(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<IngestResult, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    // 1. Native file picker dialog.
+    let (path_tx, path_rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_file(move |path| {
+        let _ = path_tx.send(path);
+    });
+    let file_path = path_rx
+        .await
+        .map_err(|_| "dialog error".to_string())?
+        .ok_or_else(|| "upload cancelled".to_string())?;
+
+    let path = file_path
+        .as_path()
+        .ok_or_else(|| "unsupported file path".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // 2. Snapshot the handles the encrypt path needs, then drop the sync lock
+    //    before any await. `owner_keytree`/`crdt_state` are `None` pre-mint.
+    let (ingest_tx, content_index, crdt_state, keytree, sync_engine) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let ingest_tx = guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let crdt_state = guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        let keytree = guard
+            .owner_keytree
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        (
+            ingest_tx,
+            guard.content_index.clone(),
+            crdt_state,
+            keytree,
+            guard.sync_engine.clone(),
+        )
+    };
+
+    // 3. Read the whole file into memory — whole-blob DEK encryption is not
+    //    streaming (see the inner's NOTE).
+    let plaintext = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+
+    ingest_content_encrypted_inner(
+        &ingest_tx,
+        &content_index,
+        &crdt_state,
+        &keytree,
+        sync_engine.as_ref(),
+        plaintext,
+        file_name,
+    )
+    .await
 }
 
 /// ZEB-343: ingest an in-memory byte buffer (a normalized avatar PNG from the
@@ -63229,6 +63383,7 @@ pub fn run() {
             fetch_profile_doc,
             export_content,
             ingest_content,
+            ingest_content_encrypted,
             ingest_avatar_bytes,
             ingest_vine_video,
             ingest_profile_doc,
