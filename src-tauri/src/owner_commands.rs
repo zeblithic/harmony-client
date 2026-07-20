@@ -726,7 +726,8 @@ pub(crate) async fn get_owner_state_inner(
         };
         let (snapshot, refreshed) = {
             let mut g = doc.lock().await;
-            let refreshed = refresh_self_liveness(&mut g, &loaded.device_signing_key, now_unix());
+            let refreshed =
+                refresh_self_liveness(&mut g, &loaded.device_signing_key, now_unix()).wrote();
             (g.clone(), refreshed)
         };
         // Only nudge the engine when the refresh actually wrote — a panel
@@ -756,7 +757,7 @@ pub(crate) async fn get_owner_state_inner(
                 Some(l) => l,
                 None => return Ok(None),
             };
-            if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()) {
+            if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()).wrote() {
                 // Fail open: the in-memory state already carries the fresh liveness, so
                 // the panel renders correctly even if persistence fails. A persist error
                 // must NOT block the Devices panel (it didn't before this change); the

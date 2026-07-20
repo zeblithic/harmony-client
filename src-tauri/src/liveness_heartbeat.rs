@@ -44,25 +44,10 @@ pub async fn run_liveness_heartbeat_once(
     now_secs: u64,
 ) -> bool {
     let mut g = doc.lock().await;
-    // Regressed-clock guard: if our own cert is stamped in the future relative to
-    // `now`, the host clock moved backwards since we signed it. `refresh_self_liveness`
-    // will (correctly) see it as fresh and no-op, so renewal is suppressed until the
-    // clock recovers — surface that explicitly instead of a silent no-op. Re-signing
-    // cannot fix it here (a lower timestamp loses the liveness CRDT merge); the
-    // systemic remediation (clock sanity / cert-in-future handling in the shared
-    // refresh path) is tracked as a follow-up (ZEB-721).
-    let device_id = crate::owner_state::device_id_from_signing_key(device_sk);
-    if let Some(cert) = g.liveness.get(&device_id) {
-        if cert.timestamp > now_secs {
-            tracing::warn!(
-                target: "harmony_liveness",
-                cert_ts = cert.timestamp,
-                now = now_secs,
-                "self-liveness cert is stamped in the future — host clock regressed; not renewing until the clock recovers"
-            );
-        }
-    }
-    refresh_self_liveness(&mut g, device_sk, now_secs)
+    // ZEB-721: regressed-clock detection (cert stamped in the future) now lives in
+    // the shared `refresh_self_liveness`, which warns once and reports
+    // `ClockRegressed`. Here we only need whether it wrote, to nudge the engine.
+    refresh_self_liveness(&mut g, device_sk, now_secs).wrote()
 }
 
 /// Spawn the interval loop. On the rare tick that actually re-signs, nudge the
