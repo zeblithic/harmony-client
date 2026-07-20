@@ -53,16 +53,20 @@ On each admin replica's tick, for a finalized admin-affecting SetPower under `ad
 - **Absent admin** — a proposal already synced to the log is enough; any other admin countersigns the canonical one. No dependence on the proposer staying online.
 - **Single admin with `admin_quorum > 1`** (out of scope, §7) — mints a proposal that can never reach quorum; degrades to an inert proposal, no panic.
 
-### Bounded re-dispatch in the tick (ZEB-300 converge R1)
+### Re-dispatch in the tick (ZEB-300 converge R1, refined R2)
 
 The "later tick" above only works if `run_voting_tick` **revisits Finalized polls** — the original tick dispatched auto-exec ONLY on the single tick a poll transitioned `ThresholdReached → Finalized`, so in the simultaneous-finalize case A and B would each mint P_A / P_B on their own finalize tick and **neither would ever countersign the other's**: quorum stalls forever (Qodo). The fix splits Pass 3 into:
 
 - **Pass 3a** — the finalize transition (unchanged): stamp `meta.finalized_at_ms`, emit `voting-proposal-finalized`.
-- **Pass 3b** — re-dispatch auto-exec for **every** Finalized Tier 2 SetPower poll whose `finalized_at_ms` is within `AUTO_EXEC_RETRY_WINDOW_MS` (1h) of `now_ms`. The just-finalized poll is included (its window is 0), so single-tick finalize-then-dispatch still holds.
+- **Pass 3b** — re-dispatch auto-exec for **every** poll that is still `Lifecycle::Finalized` and carries a SetPower auto-exec. The just-finalized poll is included (same tick), so single-tick finalize-then-dispatch still holds.
 
-The window is anchored to **each replica's own** `finalized_at_ms`, so a later-arriving admin (whose replica finalizes the poll later) gets a **fresh** window of its own; because the AdminProposal itself persists `ADMIN_PROPOSAL_EXPIRY_MS` (30 days), quorum accumulates across admins' individually-anchored retry windows even though no single replica re-dispatches for more than an hour.
+**R2 (Greptile):** the R1 version gated Pass 3b on an arbitrary `AUTO_EXEC_RETRY_WINDOW_MS` (1h) since `finalized_at_ms`. That cutoff was shorter than the poll's actionable lifetime — a poll stays `Finalized` until the 24h archive sweep (`ARCHIVE_SWEEP_INTERVAL_MS`) flips it to `Archived` — so a canonical proposal that synced to a needed signer after 1h would never be auto-countersigned. R2 **removes the fixed window**: re-dispatch continues for as long as the poll is `Finalized`, bounded naturally by the archive sweep (~24h). Each replica's re-dispatch is still anchored to its own local finalize (a later-arriving admin's replica finalizes later and re-dispatches from then), and because the AdminProposal persists `ADMIN_PROPOSAL_EXPIRY_MS` (30 days), quorum accumulates across admins. For admin absences longer than the ~24h Finalized lifetime, recovery is via the manual `countersign_admin_proposal` IPC (the proposal is still live).
 
-**Idempotency stops re-mint** once the effect lands. Both the direct-SetPower guard (`apply_auto_exec_set_power`) and the AdminProposal-routed planner (step 1) check `power_levels[target] == level` and return the terminal `AutoExecOutcome::AlreadyApplied` — so re-dispatch is a cheap no-op on every replica the instant the SetPower materializes, independent of the retry window's clock.
+**Idempotency stops re-mint** once the effect lands. Both the direct-SetPower guard (`apply_auto_exec_set_power`) and the AdminProposal-routed planner (step 1) check `power_levels[target] == level` and return the terminal `AutoExecOutcome::AlreadyApplied` — so re-dispatch is a cheap no-op on every replica the instant the SetPower materializes.
+
+### Production wiring (ZEB-300 converge R2, Task 20.1)
+
+The voting tick's `auto_exec_set_power` callback was a **stub** in production (`lib.rs`, returned `SkippedNotAdmin` unconditionally — the deliberate ZEB-291 Phase-2 "Task 20.1" deferral). R2 **wires it**: the `'static` tick closure captures the typed Tauri `AppHandle` (`wry_handle`) and, at call time, fetches the managed `Mutex<NodeState>` via `app.state().inner()`, dispatching through `apply_auto_exec_set_power`. To make this typecheck the helper's parameter was relaxed `&Arc<Mutex<NodeState>>` → `&Mutex<NodeState>` (it only locks — never Arc-clones; existing `&Arc<…>` call sites still compile by Deref coercion). Cross-peer voting sync ("Task 19.1") was already live — the voting-log Zenoh adapter is spawned via `ensure_voting_engine_for` and IPCs publish through `engine.publish_event`; the resulting SetPower/AdminProposal membership events ride the already-wired community state-root log. The headless serve/test path (`wry_handle == None`) keeps the `SkippedNotAdmin` stub (a follow-up: expose an owned `NodeState` handle to the serve boot so agent-testing can exercise auto-exec).
 
 ---
 
@@ -120,10 +124,10 @@ The wrapper maps the plan to `AutoExecOutcome`: `MintProposal → RoutedProposal
 **`src-tauri/src/community_voting_tick.rs`**
 - `TickStats`: retire `tier2_auto_execs_skipped_requires_quorum`; add `tier2_auto_execs_routed_proposal_minted`, `_routed_proposal_countersigned`, `_routed_proposal_pending`, and (ZEB-300 converge R1) `tier2_auto_execs_already_applied`.
 - Tick dispatch: update the `match` on `AutoExecOutcome` to bump the new stats. The `AutoExecSetPowerFn` closure signature `(SpaceId, OwnerAddr, u32)` is **unchanged** — only the returned enum grows, so no tick-signature churn.
-- **Pass 3 split (ZEB-300 converge R1):** add `AUTO_EXEC_RETRY_WINDOW_MS` (1h); Pass 3a keeps only the finalize transition, Pass 3b re-dispatches auto-exec for every Finalized SetPower poll within the window (see §3). `AlreadyApplied` is counted separately from `tier2_auto_execs_attempted` (idempotent no-op, not a mint attempt).
+- **Pass 3 split (ZEB-300 converge R1; window removed R2):** Pass 3a keeps only the finalize transition, Pass 3b re-dispatches auto-exec for every poll still `Lifecycle::Finalized` carrying a SetPower auto-exec (bounded by the 24h archive sweep; see §3). `AlreadyApplied` is counted separately from `tier2_auto_execs_attempted` (idempotent no-op, not a mint attempt).
 
 **`src-tauri/src/lib.rs`**
-- No signature changes to the `apply_auto_exec_set_power` wiring in `start_node`. If the `set_power_level` IPC adopts the shared `is_admin_affecting_set_power` helper, update that call site.
+- **Task 20.1 (R2):** wire the `start_node_inner` voting-tick `auto_exec_set_power` closure to `apply_auto_exec_set_power` via `wry_handle`'s managed-state seam (see §3 "Production wiring"). `apply_auto_exec_set_power` / `apply_auto_exec_admin_proposal_set_power` take `&Mutex<NodeState>`.
 
 ---
 
@@ -136,11 +140,11 @@ The wrapper maps the plan to `AutoExecOutcome`: `MintProposal → RoutedProposal
 - one live candidate I proposed → `Pending`
 - one live candidate I already countersigned → `Pending`
 - two candidates → `Countersign(min EventId)` (canonical selection)
-- only-expired candidate(s) → `MintProposal` (fresh window)
+- only-expired candidate(s) → `MintProposal` (fresh proposal)
 
-**Tick re-dispatch tests (ZEB-300 converge R1)** (in `community_voting_tick.rs`):
-- `tier2_auto_exec_redispatches_finalized_poll_within_window` — a poll finalizes on tick 1 (dispatched once), then a second tick within `AUTO_EXEC_RETRY_WINDOW_MS` re-dispatches auto-exec while the poll is already Finalized.
-- `tier2_auto_exec_stops_redispatch_after_window` — the same, but a second tick past `finalized_at_ms + AUTO_EXEC_RETRY_WINDOW_MS` does NOT re-dispatch.
+**Tick re-dispatch tests (ZEB-300 converge R1; renamed R2)** (in `community_voting_tick.rs`):
+- `tier2_auto_exec_redispatches_finalized_poll` — a poll finalizes on tick 1 (dispatched once), then a later tick (well past the old 1h cutoff) still re-dispatches auto-exec while the poll is `Finalized`.
+- `tier2_auto_exec_skips_redispatch_when_not_finalized` — a poll whose lifecycle is not `Finalized` (e.g. `Archived`) is NOT re-dispatched, proving the `lifecycle == Finalized` filter is the bound.
 
 **Materialize convergence test** (reuse the hand-built-events pattern in `tests/community_misc/community_admin_quorum_integration.rs`, incl. its `bootstrap_two_admins_raise_quorum` helper): two admins, `admin_quorum = 2`, promote a non-admin to 100 → construct `AdminProposal` (admin A) + `AdminCountersign` (admin B) → `materialize` → assert `power_levels[target] == 100` on the merged log (both replicas see the same log ⇒ same materialization). Covers AC #3 without a heavyweight dual-live-engine + tick fixture (which the recon confirmed does not yet exist).
 
