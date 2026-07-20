@@ -337,6 +337,12 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     #[allow(dead_code)]
     pub(crate) membership_resolver:
         Option<std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>>,
+    /// ZEB-718: install-once `identity_dir` for on-disk persistence.
+    /// `None` until installed by the production `ensure_voting_engine_for`;
+    /// while `None`, `persist_now` is a no-op (tests / lightweight
+    /// harnesses that don't persist). `std::sync::Mutex` because the read
+    /// is a quick clone with no `.await` held across the guard.
+    persist_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// ZEB-307 PhantomData<fn() -> R>: makes VotingLogEngine<R> unconditionally
     /// Send + Sync even when R = tauri::Wry (which is !Send because its
     /// EventLoop holds Rc<>). The engine only owns R through this marker,
@@ -347,6 +353,44 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
 impl<R: tauri::Runtime> VotingLogEngine<R> {
     pub fn community_id(&self) -> SpaceId {
         self.community_id
+    }
+
+    /// ZEB-718: install the `identity_dir` that `persist_now` writes
+    /// under. Install-once from the production `ensure_voting_engine_for`;
+    /// tests that don't persist simply never call it.
+    pub fn install_persist_dir(&self, identity_dir: std::path::PathBuf) {
+        if let Ok(mut g) = self.persist_dir.lock() {
+            *g = Some(identity_dir);
+        }
+    }
+
+    /// ZEB-718: snapshot `{events, policy}` and atomically rewrite
+    /// `voting.cbor`. No-op when no `identity_dir` is installed. Never
+    /// panics — a write failure is logged and swallowed (the in-memory
+    /// log is authoritative and peer-recoverable via backfill). Called
+    /// after every log mutation (publish, inbound apply, backfill apply,
+    /// archive sweep, policy change).
+    pub(crate) async fn persist_now(&self) {
+        // Clone the path out from under the std mutex before any await.
+        let dir = match self.persist_dir.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        let Some(dir) = dir else {
+            return;
+        };
+        let path = crate::community_voting_persist::voting_path_for(&dir, &self.community_id);
+        let log = self.voting_log.lock().await;
+        if let Err(e) =
+            crate::community_voting_persist::save_voting_log(&path, &log, &self.community_id)
+        {
+            tracing::warn!(
+                community_id = ?self.community_id,
+                err = %e,
+                "voting persist_now: failed to write voting.cbor \
+                 (continuing; log is peer-recoverable via backfill)"
+            );
+        }
     }
 
     /// Construct an engine, spawn its inbound receive loop, and return
@@ -392,6 +436,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             local_signing: RwLock::new(None),
             identity_resolver: params.identity_resolver,
             membership_resolver: params.membership_resolver,
+            persist_dir: std::sync::Mutex::new(None),
             _phantom: PhantomData,
         });
 
@@ -1688,6 +1733,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             pid
         };
 
+        // ZEB-718: persist the locally-minted event so it survives restart.
+        // Any hook-minted follow-up events below persist themselves via
+        // their own recursive `publish_event`.
+        self.persist_now().await;
+
         // (3a) After a Tier 3 PollCreate is applied, trigger a VRF beacon
         // request. The stored poll epoch is now authoritative; the beacon
         // request uses it via the poll's meta (not a fresh dfrost query).
@@ -2580,6 +2630,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             tracker.record(&event);
         }
 
+        // ZEB-718: persist the recovered event so it survives restart.
+        self.persist_now().await;
+
         Ok(Some(applied_poll_id))
     }
 
@@ -2671,6 +2724,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             // Dropped silently (dedup or resolvers absent); no hooks.
             return Ok(());
         };
+
+        // ZEB-718: persist the peer-received event so it survives restart.
+        self.persist_now().await;
 
         // ── Post-apply hooks: same order + same guards as publish_event ──
         //
@@ -3292,6 +3348,33 @@ mod tests {
             2,
             "both polls present after gap recovery"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_backfilled_persists_to_disk_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let community_id = SpaceId([0x73; 16]);
+        let (key, owner, pub64) = fixture_identity_engine(0x73);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let engine =
+            start_backfill_test_engine(community_id, owner, pub64, Arc::clone(&voting_log)).await;
+        engine.install_persist_dir(dir.path().to_path_buf());
+
+        let ev = signed_poll_create(&key, owner, "dev", 1_000);
+        engine
+            .apply_backfilled_event(&encode_event(&ev))
+            .await
+            .unwrap();
+
+        // persist_now fired after apply — the on-disk log round-trips.
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &community_id);
+        assert!(
+            path.exists(),
+            "voting.cbor must exist after a persisted mutation"
+        );
+        let (events, _policy) =
+            crate::community_voting_persist::load_voting_log(&path, &community_id).unwrap();
+        assert_eq!(events, vec![ev], "persisted log reloads the applied event");
     }
 
     // ── VotingReplayTracker ────────────────────────────────────────────────

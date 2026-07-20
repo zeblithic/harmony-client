@@ -101,6 +101,9 @@ pub struct VotingTickContext {
     pub last_archive_sweep_ms: Arc<Mutex<i128>>,
     pub emit: EmitFn,
     pub auto_exec_set_power: AutoExecSetPowerFn,
+    /// ZEB-718: identity_dir for persisting a pruned log after the archive
+    /// sweep. `None` ⇒ no persistence (test/headless contexts).
+    pub identity_dir: Option<std::path::PathBuf>,
 }
 
 /// Run one tick cycle. Returns aggregated stats for testing/observability.
@@ -464,10 +467,26 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
         let mut last_sweep = ctx.last_archive_sweep_ms.lock().await;
         if (now_ms - *last_sweep) >= ARCHIVE_SWEEP_INTERVAL_MS {
             let logs = ctx.voting_logs.lock().await;
-            for log_mtx in logs.values() {
+            for (space_id, log_mtx) in logs.iter() {
                 let mut log = log_mtx.lock().await;
                 let now_wall_ms_u64 = if now_ms < 0 { 0 } else { now_ms as u64 };
-                let _archived = log.archive_finalized_polls(now_wall_ms_u64);
+                let archived = log.archive_finalized_polls(now_wall_ms_u64);
+                // ZEB-718: persist the pruned log so archived events don't
+                // resurrect on reload and the on-disk file stays bounded.
+                if !archived.is_empty() {
+                    if let Some(dir) = ctx.identity_dir.as_ref() {
+                        let path = crate::community_voting_persist::voting_path_for(dir, space_id);
+                        if let Err(e) =
+                            crate::community_voting_persist::save_voting_log(&path, &log, space_id)
+                        {
+                            tracing::warn!(
+                                community_id = ?space_id,
+                                err = %e,
+                                "voting archive persist failed"
+                            );
+                        }
+                    }
+                }
             }
             *last_sweep = now_ms;
             stats.archive_swept = true;
@@ -655,6 +674,7 @@ mod tests {
             last_archive_sweep_ms: Arc::new(Mutex::new(last_sweep_ms)),
             emit,
             auto_exec_set_power,
+            identity_dir: None,
         };
         (ctx, captured_events, captured_auto_exec)
     }
