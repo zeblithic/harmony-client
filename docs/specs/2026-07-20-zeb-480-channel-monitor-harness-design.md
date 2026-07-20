@@ -113,8 +113,11 @@ consumer should not have to decode a JSON number array.
 ```json
 {"source":"live","seq":42,"communityId":"…","channelId":"…","messageId":"…",
  "author":"…","at":{"wallMs":1721000000000,"logical":3,"deviceId":"…"},
- "body":"(Ildwyn) roster converged","replyTo":null,"kind":null,"mentions":[]}
+ "body":"(Ildwyn) roster converged"}
 ```
+
+(Absent optional fields — `replyTo`/`kind`/`pollId`/`mentions` — are **omitted**, not
+`null`, per `skip_serializing_if`; a message that has them shows them populated.)
 
 `WatchLine` fields: `source` (`"backfill"|"live"`), `seq` (`u64` live / `null` backfill),
 `communityId`, `channelId`, `messageId`, `author`, `at: HlcDto`, `body: String`, and
@@ -166,8 +169,8 @@ to the local node. A node can only watch channels it is a member of — it alrea
   via the `post_channel_message` RPC → assert a `source:"live"` line for it; advance/stop, post
   again while "down", restart the watch with the persisted cursor → assert the missed message
   arrives as `source:"backfill"` exactly once (dedupe holds across the boundary).
-- **e2e smoke (`--features e2e`, never in CI):** spawn the real `harmony-app api-watch` CLI via
-  `NodeHandle`, post from a second node, assert the CLI prints the NDJSON line. This proves the
+- **e2e smoke (`--features e2e`, never in CI):** spawn the real `harmony-app watch` CLI against a
+  `NodeHandle`-spawned node, post a message, assert the CLI prints the NDJSON line. This proves the
   subprocess/stdout path the CC-harness wrapper depends on.
 
 Iterative gates use `scripts/test-select --context task|round` (the lib change relinks integ

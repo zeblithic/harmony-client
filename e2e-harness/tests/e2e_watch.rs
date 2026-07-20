@@ -39,7 +39,10 @@ async fn watch_subprocess_prints_channel_message() {
         .await
         .expect("mint");
     let community_id = node
-        .rpc("create_community", json!({"name": "watch-e2e", "isInviteOnly": false}))
+        .rpc(
+            "create_community",
+            json!({"name": "watch-e2e", "isInviteOnly": false}),
+        )
         .await
         .expect("create_community")
         .as_str()
@@ -106,6 +109,11 @@ async fn watch_subprocess_prints_channel_message() {
     .await
     .unwrap_or(false);
 
-    let _ = child.start_kill();
-    assert!(found, "watch subprocess must print the posted channel message");
+    // kill() sends SIGKILL AND reaps the child (start_kill alone would not wait,
+    // potentially leaking the process).
+    let _ = child.kill().await;
+    assert!(
+        found,
+        "watch subprocess must print the posted channel message"
+    );
 }
