@@ -65,6 +65,17 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Epoch-checked sibling of [`now_unix`] (ZEB-721): `None` when the host clock is
+/// before the Unix epoch. Liveness-refresh callers use this to SKIP signing a
+/// bogus `timestamp = 0` cert (instantly stale to every peer) instead of
+/// `unwrap_or(0)`-ing — mirroring the heartbeat's pre-epoch skip.
+fn now_unix_checked() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .ok()
+}
+
 /// Wire → crate reason mapping (ZEB-668 S2 spec §3: three UI reasons; `Other`
 /// unused by the UI).
 pub(crate) fn parse_revoke_reason(reason: &str) -> Result<RevocationReason, String> {
@@ -388,9 +399,23 @@ fn build_owner_state_view(
     fleet: FleetJoin,
     quorum: QuorumJoin,
 ) -> OwnerStateView {
-    let now = now_unix();
+    // ZEB-721: keep the epoch-checked clock so a pre-epoch (`None`) clock does NOT
+    // surface a false regression. `now` stays 0 for the other view computations
+    // below, which already tolerate a broken clock.
+    let now_checked = now_unix_checked();
+    let now = now_checked.unwrap_or(0);
     let active_window = trust::DEFAULT_ACTIVE_WINDOW_SECS;
     let freshness = trust::DEFAULT_FRESHNESS_WINDOW_SECS;
+    // ZEB-721: surface a regressed host clock (our own cert stamped in the future)
+    // so the panel can warn; `None` when healthy OR when the clock is pre-epoch.
+    // Same helper the refresh path uses.
+    let self_clock_regressed_skew_secs = now_checked.and_then(|now| {
+        crate::owner_state::self_liveness_future_skew_secs(
+            &loaded.state,
+            &loaded.device_signing_key,
+            now,
+        )
+    });
     let this_device_id = derive_this_device_id(&loaded.device_signing_key);
     let this_device_hex = hex::encode(this_device_id);
     let self_is_master = loaded.master_seed.is_some();
@@ -570,6 +595,7 @@ fn build_owner_state_view(
         can_arm_enrollment,
         quorum_requests,
         quorum_armed_until_ms,
+        self_clock_regressed_skew_secs,
     }
 }
 
@@ -726,7 +752,17 @@ pub(crate) async fn get_owner_state_inner(
         };
         let (snapshot, refreshed) = {
             let mut g = doc.lock().await;
-            let refreshed = refresh_self_liveness(&mut g, &loaded.device_signing_key, now_unix());
+            // ZEB-721: skip on a pre-epoch clock rather than stamping a 0-ts cert.
+            let refreshed = match now_unix_checked() {
+                Some(now) => refresh_self_liveness(&mut g, &loaded.device_signing_key, now).wrote(),
+                None => {
+                    tracing::warn!(
+                        target: "harmony_liveness",
+                        "get_owner_state: host clock before Unix epoch; skipping self-liveness refresh"
+                    );
+                    false
+                }
+            };
             (g.clone(), refreshed)
         };
         // Only nudge the engine when the refresh actually wrote — a panel
@@ -756,7 +792,20 @@ pub(crate) async fn get_owner_state_inner(
                 Some(l) => l,
                 None => return Ok(None),
             };
-            if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()) {
+            // ZEB-721: skip on a pre-epoch clock rather than stamping a 0-ts cert.
+            let did_write = match now_unix_checked() {
+                Some(now) => {
+                    refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now).wrote()
+                }
+                None => {
+                    tracing::warn!(
+                        target: "harmony_liveness",
+                        "get_owner_state: host clock before Unix epoch; skipping self-liveness refresh"
+                    );
+                    false
+                }
+            };
+            if did_write {
                 // Fail open: the in-memory state already carries the fresh liveness, so
                 // the panel renders correctly even if persistence fails. A persist error
                 // must NOT block the Devices panel (it didn't before this change); the
@@ -1738,6 +1787,20 @@ mod tests {
     };
     use harmony_owner::state::OwnerState;
     use serial_test::serial;
+
+    #[test]
+    fn now_unix_checked_is_some_for_a_normal_clock() {
+        // ZEB-721: `now_unix_checked` returns `None` ONLY for a pre-epoch host
+        // clock (before 1970) — exactly when the panel path must SKIP the liveness
+        // refresh rather than stamp a `timestamp = 0` cert. On any normal clock it
+        // is `Some`. We deliberately assert nothing about the absolute value: the
+        // test must not depend on the runner's wall clock being set to any era
+        // (that would be flaky in exactly the clock-skew scenarios this PR is about).
+        assert!(
+            now_unix_checked().is_some(),
+            "a normal (post-epoch) host clock must yield Some"
+        );
+    }
 
     /// RAII guard: sets an env var on construction, removes it on drop (even on panic).
     /// Prevents a panicking test from leaking HARMONY_PASSPHRASE into the next
@@ -3577,6 +3640,49 @@ mod revoke_tests {
             expired_arm,
         );
         assert_eq!(view2.quorum_armed_until_ms, None);
+    }
+
+    /// ZEB-721: `build_owner_state_view` surfaces a regressed host clock (this
+    /// device's own liveness cert stamped in the future) via
+    /// `self_clock_regressed_skew_secs`, and reports `None` when healthy.
+    #[test]
+    fn view_surfaces_self_clock_regressed_skew() {
+        let (mut state, a_sk, ..) = quorum_view_fixture(now_unix());
+        let a_id = crate::owner_state::device_id_from_signing_key(&a_sk);
+        let owner_id = state.owner_id;
+        // Healthy: force A's own cert to a clearly-past timestamp. Direct insert
+        // bypasses the add_liveness LWW (which would keep the fixture's newer cert).
+        let past = harmony_owner::certs::LivenessCert::sign(&a_sk, owner_id, now_unix() - 100_000)
+            .unwrap();
+        state.liveness.insert(a_id, past);
+        let healthy = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert_eq!(
+            healthy.self_clock_regressed_skew_secs, None,
+            "a past-stamped self-cert must surface no skew"
+        );
+        // Regress: stamp A's own liveness cert an hour into the future (wins the
+        // LWW merge), simulating a host clock that moved backwards after signing.
+        let future = now_unix() + 3600;
+        let cert = harmony_owner::certs::LivenessCert::sign(&a_sk, owner_id, future).unwrap();
+        state.add_liveness(cert).unwrap();
+        let regressed = build_owner_state_view(
+            &masterless_loaded(&state, &a_sk),
+            "d".into(),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        let skew = regressed
+            .self_clock_regressed_skew_secs
+            .expect("a future-stamped self-cert must surface a skew");
+        assert!(
+            skew > 3000 && skew <= 3600,
+            "skew ≈ future − now (~1h), got {skew}"
+        );
     }
 
     /// ZEB-668 S5: `fleetEpochStale` = any revocation newer than the last

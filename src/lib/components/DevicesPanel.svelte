@@ -808,6 +808,16 @@
     return new Date(ms).toLocaleDateString();
   }
 
+  /** ZEB-721: coarse "~Nm / ~Nh / ~Nd" rendering of a clock-regression skew (seconds). */
+  function formatApproxDuration(secs: number): string {
+    const m = Math.floor(secs / 60);
+    if (m < 60) return `~${Math.max(1, m)}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `~${h}h`;
+    const d = Math.floor(h / 24);
+    return `~${d}d`;
+  }
+
   async function handleConfirmMint() {
     mintInFlight = true;
     mintError = null;
@@ -907,6 +917,21 @@
           onRestored={() => location.reload()}
           onCancel={() => { restoreOpen = false; }}
         />
+      {/if}
+
+      <!-- ZEB-721: regressed host clock. This device's own liveness cert is
+           stamped in the future, so renewal is paused and peers will eventually
+           see it age out. Informational only — the remedy is fixing the clock. -->
+      {#if typeof state.selfClockRegressedSkewSecs === 'number' && state.selfClockRegressedSkewSecs > 0}
+        <div class="epoch-banner" data-testid="clock-regressed-banner" role="alert">
+          <p class="epoch-text">
+            This device's clock appears to have moved backwards ({formatApproxDuration(
+              state.selfClockRegressedSkewSecs
+            )} behind its last check-in). Liveness renewal is paused until the clock is
+            corrected — re-sync system time (NTP) to restore trust freshness on your other
+            devices.
+          </p>
+        </div>
       {/if}
 
       <!-- ZEB-668 S5: fleet-key staleness. Rendered only on the backend's

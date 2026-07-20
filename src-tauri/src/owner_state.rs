@@ -46,6 +46,12 @@ pub struct OwnerStateView {
     /// enrollment co-sign window closes; `None` when not armed.
     #[serde(default)]
     pub quorum_armed_until_ms: Option<u64>,
+    /// ZEB-721: seconds THIS device's own liveness cert is stamped in the future
+    /// relative to the host clock at snapshot time — the host clock regressed
+    /// behind an already-signed cert, pausing liveness renewal until it recovers.
+    /// `None` when healthy. Drives the DevicesPanel clock-regressed banner.
+    #[serde(default)]
+    pub self_clock_regressed_skew_secs: Option<u64>,
 }
 
 /// ZEB-677 S3: one pending quorum co-sign request, pre-joined server-side
@@ -860,41 +866,100 @@ pub fn read_enrolled_device_vk_hex(
         .collect())
 }
 
+/// Outcome of a self-liveness refresh attempt (ZEB-721). `Refreshed` is the only
+/// variant that mutated `state`; the others explain *why* nothing was written so
+/// callers can persist-on-write and surface clock health from one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivenessRefreshOutcome {
+    /// Re-signed a fresh cert at `now`. Caller MUST persist + notify_dirty.
+    Refreshed,
+    /// Existing cert is still fresh (< freshness/2 old). Healthy steady state.
+    Fresh,
+    /// Our own cert is stamped in the FUTURE relative to `now` — the host clock
+    /// regressed behind it. Not re-signed (a lower timestamp loses the liveness
+    /// CRDT merge, and fabricating time is not our posture, ZEB-721). Self-heals
+    /// when the clock recovers; surfaced instead of a silent no-op.
+    ClockRegressed { skew_secs: u64 },
+    /// Signing or `add_liveness` failed (already warn-logged). A no-op to callers.
+    SignFailed,
+}
+
+impl LivenessRefreshOutcome {
+    /// True iff the call mutated `state` (caller must persist + notify_dirty).
+    pub fn wrote(self) -> bool {
+        matches!(self, Self::Refreshed)
+    }
+}
+
+/// Seconds this device's own liveness cert is stamped in the FUTURE relative to
+/// `now` — i.e. the host clock regressed behind our own cert. `None` when there
+/// is no self-cert or it is at/behind `now` (healthy). Shared by the refresh
+/// decision and the `OwnerStateView` surfacing so both agree. ZEB-721.
+pub fn self_liveness_future_skew_secs(
+    state: &OwnerState,
+    device_sk: &SigningKey,
+    now: u64,
+) -> Option<u64> {
+    let device_id = device_id_from_signing_key(device_sk);
+    state
+        .liveness
+        .get(&device_id)
+        .and_then(|c| c.timestamp.checked_sub(now))
+        .filter(|&skew| skew > 0)
+}
+
 /// Ensure the local device (derived from `device_sk`) has a fresh `LivenessCert`
-/// in `state`. Returns `true` if it mutated `state` (caller must then persist via
-/// [`save_owner_state_cbor_only`]).
+/// in `state`. Returns a [`LivenessRefreshOutcome`]; only `Refreshed` mutated
+/// `state` (caller must then persist via [`save_owner_state_cbor_only`] /
+/// `notify_dirty`).
 ///
 /// ZEB-342: without an active (liveness-bearing) local device, `evaluate_trust`
 /// refuses the sole device with `StaleTrustState` (the fresh-mint "● refused"
-/// badge). Publishes when the local device has no liveness or its liveness is
+/// badge). Re-signs when the local device has no liveness or its liveness is
 /// older than `DEFAULT_FRESHNESS_WINDOW_SECS / 2` (~15 days), bounding writes to
-/// ~once per boot per fortnight. On a signing/add error it logs at warn and
-/// returns `false` — the panel falls back to today's behavior rather than failing.
-pub fn refresh_self_liveness(state: &mut OwnerState, device_sk: &SigningKey, now: u64) -> bool {
+/// ~once per boot per fortnight.
+///
+/// ZEB-721: if our own cert is stamped in the *future* relative to `now`, the
+/// host clock regressed behind it. We do NOT re-sign (a lower timestamp loses the
+/// liveness CRDT merge, and fabricating time is not our posture) — we report
+/// `ClockRegressed { skew_secs }` so callers can surface it. Logging is left to
+/// the callers so it can be deduplicated: the heartbeat warns only on the
+/// healthy→regressed transition, and the Devices panel shows a banner. This is
+/// the single detection point shared by the panel-load and heartbeat call sites.
+pub fn refresh_self_liveness(
+    state: &mut OwnerState,
+    device_sk: &SigningKey,
+    now: u64,
+) -> LivenessRefreshOutcome {
     use harmony_owner::certs::LivenessCert;
 
     let device_id = device_id_from_signing_key(device_sk);
     let threshold = harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2;
-    let stale = match state.liveness.get(&device_id) {
-        Some(c) => c.timestamp < now.saturating_sub(threshold),
-        None => true,
-    };
-    if !stale {
-        return false;
-    }
-    let cert = match LivenessCert::sign(device_sk, state.owner_id, now) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "refresh_self_liveness: liveness sign failed");
-            return false;
+    match state.liveness.get(&device_id) {
+        // Regressed clock: cert looks fresh forever → renewal suppressed. Report
+        // it (callers log/surface, deduplicated) instead of a silent no-op;
+        // self-heals when the clock recovers.
+        Some(cert) if cert.timestamp > now => LivenessRefreshOutcome::ClockRegressed {
+            skew_secs: cert.timestamp - now,
+        },
+        // Fresh enough — nothing to do.
+        Some(cert) if cert.timestamp >= now.saturating_sub(threshold) => {
+            LivenessRefreshOutcome::Fresh
         }
-    };
-    match state.add_liveness(cert) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "refresh_self_liveness: add_liveness failed");
-            false
-        }
+        // Stale or missing → (re-)sign.
+        _ => match LivenessCert::sign(device_sk, state.owner_id, now) {
+            Ok(cert) => match state.add_liveness(cert) {
+                Ok(()) => LivenessRefreshOutcome::Refreshed,
+                Err(e) => {
+                    tracing::warn!(error = %e, "refresh_self_liveness: add_liveness failed");
+                    LivenessRefreshOutcome::SignFailed
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "refresh_self_liveness: liveness sign failed");
+                LivenessRefreshOutcome::SignFailed
+            }
+        },
     }
 }
 
@@ -1746,8 +1811,11 @@ mod persistence_tests {
         state.liveness.clear(); // simulate a legacy identity with no liveness
         let device_id = *state.enrollments.keys().next().unwrap();
 
-        let mutated = refresh_self_liveness(&mut state, &device_signing_key, now);
-        assert!(mutated, "missing liveness must trigger a publish");
+        assert_eq!(
+            refresh_self_liveness(&mut state, &device_signing_key, now),
+            LivenessRefreshOutcome::Refreshed,
+            "missing liveness must trigger a publish"
+        );
         assert_eq!(state.liveness.len(), 1);
         assert_eq!(
             harmony_owner::trust::evaluate_trust(
@@ -1771,8 +1839,11 @@ mod persistence_tests {
         } = mint_owner(now).unwrap();
         // Ensure a fresh liveness exists (independent of mint_owner's own behavior).
         refresh_self_liveness(&mut state, &device_signing_key, now);
-        let mutated = refresh_self_liveness(&mut state, &device_signing_key, now);
-        assert!(!mutated, "fresh liveness must NOT be re-published");
+        assert_eq!(
+            refresh_self_liveness(&mut state, &device_signing_key, now),
+            LivenessRefreshOutcome::Fresh,
+            "fresh liveness must NOT be re-published"
+        );
     }
 
     #[test]
@@ -1789,9 +1860,68 @@ mod persistence_tests {
 
         // Advance past the refresh threshold (freshness / 2).
         let later = mint_t + harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2 + 1;
-        let mutated = refresh_self_liveness(&mut state, &device_signing_key, later);
-        assert!(mutated, "stale liveness must be re-signed");
+        assert_eq!(
+            refresh_self_liveness(&mut state, &device_signing_key, later),
+            LivenessRefreshOutcome::Refreshed,
+            "stale liveness must be re-signed"
+        );
         assert!(state.liveness.get(&device_id).unwrap().timestamp > old_ts);
+    }
+
+    #[test]
+    fn refresh_self_liveness_reports_clock_regressed_and_does_not_resign() {
+        let mint_t = 1_700_000_000;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(mint_t).unwrap();
+        let device_id = *state.enrollments.keys().next().unwrap();
+        // mint_owner already signs a self-liveness cert at `mint_t` — that is the
+        // monotonic floor the regression must not move.
+        assert_eq!(state.liveness.get(&device_id).unwrap().timestamp, mint_t);
+        // Host clock regresses 100 days behind the already-signed cert.
+        let regressed = mint_t - 100 * 24 * 60 * 60;
+        let out = refresh_self_liveness(&mut state, &device_signing_key, regressed);
+        assert_eq!(
+            out,
+            LivenessRefreshOutcome::ClockRegressed {
+                skew_secs: mint_t - regressed
+            },
+            "a future-stamped cert must report the regression"
+        );
+        assert!(!out.wrote(), "a regressed clock must not write");
+        assert_eq!(
+            state.liveness.get(&device_id).unwrap().timestamp,
+            mint_t,
+            "the cert timestamp must not move backwards"
+        );
+    }
+
+    #[test]
+    fn self_liveness_future_skew_secs_some_when_future_none_when_healthy() {
+        let t = 1_700_000_000;
+        let MintResult {
+            mut state,
+            device_signing_key,
+            ..
+        } = mint_owner(t).unwrap();
+        let _ = refresh_self_liveness(&mut state, &device_signing_key, t);
+        assert_eq!(
+            self_liveness_future_skew_secs(&state, &device_signing_key, t),
+            None,
+            "cert stamped exactly at `now` is healthy"
+        );
+        assert_eq!(
+            self_liveness_future_skew_secs(&state, &device_signing_key, t - 10),
+            Some(10),
+            "cert 10s ahead of `now` = 10s of regression skew"
+        );
+        assert_eq!(
+            self_liveness_future_skew_secs(&state, &device_signing_key, t + 10),
+            None,
+            "cert behind `now` is healthy (no skew)"
+        );
     }
 
     #[test]
@@ -1833,7 +1963,7 @@ mod persistence_tests {
             "precondition: legacy identity is Refused before refresh"
         );
 
-        if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now) {
+        if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now).wrote() {
             save_owner_state_cbor_only(dir.path(), &loaded.state).unwrap();
         }
 
@@ -2103,10 +2233,15 @@ mod tests {
                 can_cosign: true,
             }],
             quorum_armed_until_ms: Some(1_700_000_400_000),
+            self_clock_regressed_skew_secs: Some(7200),
         };
         let json = serde_json::to_string(&view).unwrap();
         // The wire format MUST be camelCase — JS depends on this.
         assert!(json.contains("\"ownerId\""), "expected ownerId, got {json}");
+        assert!(
+            json.contains("\"selfClockRegressedSkewSecs\":7200"),
+            "expected selfClockRegressedSkewSecs:7200, got {json}"
+        );
         assert!(
             json.contains("\"canBackUp\""),
             "expected canBackUp, got {json}"
