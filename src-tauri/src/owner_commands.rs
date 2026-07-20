@@ -65,6 +65,17 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Epoch-checked sibling of [`now_unix`] (ZEB-721): `None` when the host clock is
+/// before the Unix epoch. Liveness-refresh callers use this to SKIP signing a
+/// bogus `timestamp = 0` cert (instantly stale to every peer) instead of
+/// `unwrap_or(0)`-ing — mirroring the heartbeat's pre-epoch skip.
+fn now_unix_checked() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .ok()
+}
+
 /// Wire → crate reason mapping (ZEB-668 S2 spec §3: three UI reasons; `Other`
 /// unused by the UI).
 pub(crate) fn parse_revoke_reason(reason: &str) -> Result<RevocationReason, String> {
@@ -726,8 +737,17 @@ pub(crate) async fn get_owner_state_inner(
         };
         let (snapshot, refreshed) = {
             let mut g = doc.lock().await;
-            let refreshed =
-                refresh_self_liveness(&mut g, &loaded.device_signing_key, now_unix()).wrote();
+            // ZEB-721: skip on a pre-epoch clock rather than stamping a 0-ts cert.
+            let refreshed = match now_unix_checked() {
+                Some(now) => refresh_self_liveness(&mut g, &loaded.device_signing_key, now).wrote(),
+                None => {
+                    tracing::warn!(
+                        target: "harmony_liveness",
+                        "get_owner_state: host clock before Unix epoch; skipping self-liveness refresh"
+                    );
+                    false
+                }
+            };
             (g.clone(), refreshed)
         };
         // Only nudge the engine when the refresh actually wrote — a panel
@@ -757,7 +777,20 @@ pub(crate) async fn get_owner_state_inner(
                 Some(l) => l,
                 None => return Ok(None),
             };
-            if refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now_unix()).wrote() {
+            // ZEB-721: skip on a pre-epoch clock rather than stamping a 0-ts cert.
+            let did_write = match now_unix_checked() {
+                Some(now) => {
+                    refresh_self_liveness(&mut loaded.state, &loaded.device_signing_key, now).wrote()
+                }
+                None => {
+                    tracing::warn!(
+                        target: "harmony_liveness",
+                        "get_owner_state: host clock before Unix epoch; skipping self-liveness refresh"
+                    );
+                    false
+                }
+            };
+            if did_write {
                 // Fail open: the in-memory state already carries the fresh liveness, so
                 // the panel renders correctly even if persistence fails. A persist error
                 // must NOT block the Devices panel (it didn't before this change); the
@@ -1739,6 +1772,20 @@ mod tests {
     };
     use harmony_owner::state::OwnerState;
     use serial_test::serial;
+
+    #[test]
+    fn now_unix_checked_is_some_for_a_normal_clock() {
+        // ZEB-721: `now_unix_checked` returns `None` ONLY for a pre-epoch host
+        // clock — exactly when the panel path must SKIP the liveness refresh
+        // rather than stamp a `timestamp = 0` cert. On any post-1970 clock it is
+        // `Some` with a sane seconds-since-epoch value.
+        let n = now_unix_checked();
+        assert!(n.is_some(), "a normal host clock must yield Some");
+        assert!(
+            n.unwrap() > 1_600_000_000,
+            "sanity: seconds since the Unix epoch are large"
+        );
+    }
 
     /// RAII guard: sets an env var on construction, removes it on drop (even on panic).
     /// Prevents a panicking test from leaking HARMONY_PASSPHRASE into the next
