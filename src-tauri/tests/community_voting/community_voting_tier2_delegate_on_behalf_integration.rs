@@ -56,6 +56,18 @@ use harmony_app::event_loop::spawn_voting_log_zenoh_adapter;
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use tauri::Listener;
 
+/// ZEB-718: no-op backfill closures — this test exercises only the live
+/// pub/sub delegate-on-behalf path (no backfill).
+fn noop_backfill() -> (
+    harmony_app::event_loop::VotingBackfillReadFn,
+    harmony_app::event_loop::VotingBackfillApplyFn,
+) {
+    (
+        Arc::new(|| Box::pin(async { Vec::new() })),
+        Arc::new(|_frame| Box::pin(async {})),
+    )
+}
+
 /// Build a `(SigningKey, OwnerAddr, [u8; 64])` triple from a single-byte seed.
 /// Address binding here matches the defense-in-depth check performed by
 /// `verify_voting_event` on the inbound path.
@@ -239,6 +251,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     let closing_a = Arc::new(AtomicBool::new(false));
     let (a_pub_tx, a_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let (a_sub_tx, a_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (bf_read_a, bf_apply_a) = noop_backfill();
     let _adapter_a = spawn_voting_log_zenoh_adapter(
         Arc::clone(&session_a),
         community_id_hex.clone(),
@@ -246,6 +259,9 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
         Arc::clone(&crdt_state),
         a_pub_rx,
         a_sub_tx,
+        bf_read_a,
+        bf_apply_a,
+        Duration::from_secs(86_400),
         Arc::clone(&closing_a),
     );
 
@@ -253,6 +269,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     let closing_b = Arc::new(AtomicBool::new(false));
     let (b_pub_tx, b_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let (b_sub_tx, b_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (bf_read_b, bf_apply_b) = noop_backfill();
     let _adapter_b = spawn_voting_log_zenoh_adapter(
         Arc::clone(&session_b),
         community_id_hex.clone(),
@@ -260,6 +277,9 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
         Arc::clone(&crdt_state),
         b_pub_rx,
         b_sub_tx,
+        bf_read_b,
+        bf_apply_b,
+        Duration::from_secs(86_400),
         Arc::clone(&closing_b),
     );
 

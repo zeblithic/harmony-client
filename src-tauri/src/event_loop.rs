@@ -164,9 +164,28 @@ pub struct CommunityRootFetchRequest {
     pub report: tokio::sync::oneshot::Sender<usize>,
 }
 
+/// ZEB-718: closure the backfill responder calls to read the engine's
+/// live voting events as plaintext `SignedVotingEvent` CBOR frames. The
+/// adapter re-encrypts each frame under the **current** epoch before
+/// replying, so it passes the requester's current-epoch cut.
+pub type VotingBackfillReadFn = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// ZEB-718: closure the backfill requester calls with each decrypted
+/// (current-epoch) plaintext `SignedVotingEvent` CBOR frame, to apply it
+/// through the engine's coordinate-dedup backfill path.
+pub type VotingBackfillApplyFn = std::sync::Arc<
+    dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// ZEB-298+ZEB-312 PR 1: per-community voting-log adapter request.
-/// Same shape as `CommunityAdapterRequest` (state-root v1) — voting
-/// is per-community + pub/sub-only (no queryable, no backfill in PR 1).
+/// ZEB-718: gains a backfill queryable (responder) + a pull driver
+/// (requester) alongside the pub/sub live path.
 pub struct VotingLogAdapterRequest {
     /// Hex-encoded community SpaceId — used to form
     /// `harmony/community/{id_hex}/voting`.
@@ -183,6 +202,14 @@ pub struct VotingLogAdapterRequest {
     pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     /// Zenoh subscriber → engine inbound.
     pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// ZEB-718: backfill responder — reads the engine's live events as
+    /// plaintext frames (the adapter re-encrypts under the current epoch).
+    pub read_for_backfill: VotingBackfillReadFn,
+    /// ZEB-718: backfill requester — applies a decrypted current-epoch
+    /// frame via the engine's coordinate-dedup path.
+    pub apply_backfilled: VotingBackfillApplyFn,
+    /// ZEB-718: periodic anti-entropy floor between backfill pulls.
+    pub backfill_interval: std::time::Duration,
 }
 
 /// ZEB-270 Phase 3 Task 4.5: per-channel adapter request handed from
@@ -6656,6 +6683,9 @@ pub async fn run(
                     req.crdt_state,
                     req.publisher_rx,
                     req.subscriber_tx,
+                    req.read_for_backfill,
+                    req.apply_backfilled,
+                    req.backfill_interval,
                     Arc::clone(&closing),
                 );
             }
@@ -9349,13 +9379,74 @@ pub fn spawn_community_state_zenoh_adapter(
     })
 }
 
+/// Max accepted voting wire payload (CBOR `EncryptedEnvelope`). Voting events
+/// are small (typically <2 KiB); cap peer-controlled payloads before
+/// materializing them to prevent allocation-DoS. Enforced on BOTH the live
+/// subscriber and the backfill requester (both ingest remote-controlled bytes).
+const MAX_VOTING_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// ZEB-718: encrypt a plaintext voting frame under the community's CURRENT
+/// epoch (+ voting AAD) as an `EncryptedEnvelope` CBOR. Returns `None`
+/// (drop) if epoch state is missing or encode fails. Mirrors the adapter's
+/// outbound-put crypto so backfill replies are wire-identical to live
+/// packets — and, crucially, so a served event passes the requester's
+/// current-epoch cut (this is what recovers ZEB-717 cross-rotation drops).
+async fn voting_encrypt_current_epoch(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    plaintext: &[u8],
+) -> Option<Vec<u8>> {
+    let st = crdt_state.lock().await;
+    let space = st.spaces.get(&community_id)?;
+    let envelope = crate::community_state_sync::encrypt_for_topic_with_aad(
+        space,
+        plaintext,
+        crate::community_state_sync::VOTING_TOPIC_AAD,
+    )
+    .ok()?;
+    let mut w = Vec::new();
+    ciborium::into_writer(&envelope, &mut w).ok()?;
+    Some(w)
+}
+
+/// ZEB-718: decode + **current-epoch-only** decrypt an `EncryptedEnvelope`
+/// CBOR backfill reply. Returns `None` (drop) on decode failure,
+/// stale/unknown epoch (the ZEB-717 cut, preserved on the backfill path —
+/// a kicked-then-rotated member's served envelope can't be decrypted), or
+/// decrypt failure. Mirrors the adapter's inbound receive cut.
+async fn voting_decrypt_current_epoch_cut(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    raw: &[u8],
+) -> Option<Vec<u8>> {
+    let envelope: crate::community_state_sync::EncryptedEnvelope =
+        ciborium::from_reader(raw).ok()?;
+    let st = crdt_state.lock().await;
+    let space = st.spaces.get(&community_id)?;
+    match space.current_epoch {
+        Some(cur) if cur == envelope.epoch => {}
+        _ => return None,
+    }
+    crate::community_state_sync::decrypt_for_topic_with_aad(
+        space,
+        &envelope,
+        crate::community_state_sync::VOTING_TOPIC_AAD,
+    )
+    .ok()
+}
+
 /// ZEB-298+ZEB-312 PR 1: per-community Zenoh adapter for the VotingLog
-/// data plane. Structurally identical to
-/// `spawn_community_state_zenoh_adapter` — pub/sub only (no queryable,
-/// no backfill in PR 1). Topic: `harmony/community/{id_hex}/voting`.
+/// data plane. Topic: `harmony/community/{id_hex}/voting` (live pub/sub).
+///
+/// ZEB-718: additionally spawns a **backfill responder** (a queryable on
+/// `harmony/community/{id_hex}/voting/backfill` that re-encrypts the
+/// engine's live events under the current epoch) and a **backfill
+/// requester** (a periodic `get` that decrypts replies through the
+/// current-epoch cut and applies them via the engine's coordinate-dedup
+/// path). Full-dump (no RBSR, no watermark) — voting volume is sparse.
 ///
 /// The function is fire-and-forget: `event_loop::run`'s select! arm
-/// calls it and drops the `JoinHandle`. The spawned task exits when
+/// calls it and drops the `JoinHandle`. The spawned tasks exit when
 /// `closing` is set, when the engine drops its publisher_tx, or when
 /// Zenoh closes the subscriber. Engine teardown is driven by the
 /// `VotingLogEnginesMap` lock in stop_inner (same as state-root v1).
@@ -9368,9 +9459,15 @@ pub fn spawn_voting_log_zenoh_adapter(
     crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    // ZEB-718: backfill responder read closure + requester apply closure +
+    // the periodic pull floor.
+    read_for_backfill: VotingBackfillReadFn,
+    apply_backfilled: VotingBackfillApplyFn,
+    backfill_interval: std::time::Duration,
     closing: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let topic = format!("harmony/community/{}/voting", community_id_hex);
+    let backfill_topic = format!("harmony/community/{}/voting/backfill", community_id_hex);
 
     tokio::spawn(async move {
         let key_expr = match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
@@ -9477,6 +9574,147 @@ pub fn spawn_voting_log_zenoh_adapter(
             }
         });
 
+        // ── ZEB-718 backfill responder (queryable) ──────────────────────
+        // On each query, read the engine's live events (plaintext frames)
+        // and reply one per event, re-encrypted under the CURRENT epoch so
+        // the requester's current-epoch cut accepts them (this is what
+        // recovers a cross-rotation-dropped vote — ZEB-717 §2.1).
+        let session_qbl = Arc::clone(&session);
+        let crdt_state_qbl = Arc::clone(&crdt_state);
+        let closing_qbl = Arc::clone(&closing);
+        let backfill_topic_qbl = backfill_topic.clone();
+        let qbl_handle = tokio::spawn(async move {
+            let bf_key = match zenoh::key_expr::KeyExpr::try_from(backfill_topic_qbl.clone()) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        topic = %backfill_topic_qbl,
+                        "voting backfill key_expr invalid; responder skipped"
+                    );
+                    return;
+                }
+            };
+            let qbl = match session_qbl.declare_queryable(&bf_key).await {
+                Ok(q) => q,
+                Err(e) => {
+                    if !closing_qbl.load(Ordering::SeqCst) {
+                        tracing::warn!(
+                            error = %e,
+                            topic = %backfill_topic_qbl,
+                            "failed to declare voting backfill queryable"
+                        );
+                    }
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = qbl.recv_async() => {
+                        let Ok(query) = res else { break; };
+                        let frames = (read_for_backfill)().await;
+                        for frame in frames {
+                            // Re-encrypt under the CURRENT epoch at serve time.
+                            let Some(wire) = voting_encrypt_current_epoch(
+                                &crdt_state_qbl, community_id, &frame,
+                            ).await else {
+                                // No current epoch state — nothing serveable.
+                                break;
+                            };
+                            if let Err(e) = query.reply(query.key_expr(), wire).await {
+                                tracing::debug!(
+                                    topic = %backfill_topic_qbl,
+                                    error = %e,
+                                    "voting backfill reply failed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_qbl.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ── ZEB-718 backfill requester (periodic full-dump pull) ────────
+        // Pulls on spawn (join/reconnect catch-up) and every
+        // `backfill_interval` (anti-entropy floor). Each reply is decrypted
+        // through the current-epoch cut and applied via the engine's
+        // coordinate-dedup path (recovering in-lane gaps).
+        let session_req = Arc::clone(&session);
+        let crdt_state_req = Arc::clone(&crdt_state);
+        let closing_req = Arc::clone(&closing);
+        let backfill_topic_req = backfill_topic.clone();
+        let req_handle = tokio::spawn(async move {
+            loop {
+                // One full-dump pull. ConsolidationMode::None streams every
+                // per-event reply; Locality::Remote excludes our own
+                // responder's self-reply.
+                match session_req
+                    .get(backfill_topic_req.as_str())
+                    .consolidation(zenoh::query::ConsolidationMode::None)
+                    .allowed_destination(zenoh::sample::Locality::Remote)
+                    // Bound the query so a hung/never-completing round can't
+                    // stall anti-entropy forever (mirrors the RBSR get path).
+                    .timeout(std::time::Duration::from_secs(10))
+                    .await
+                {
+                    Ok(receiver) => loop {
+                        tokio::select! {
+                            biased;
+                            res = receiver.recv_async() => {
+                                let Ok(reply) = res else { break; };
+                                if let Ok(sample) = reply.into_result() {
+                                    // Cap peer-controlled reply payloads before
+                                    // materializing — parity with the live
+                                    // subscriber's allocation-DoS guard.
+                                    if sample.payload().len() > MAX_VOTING_PAYLOAD_BYTES {
+                                        continue;
+                                    }
+                                    let raw = sample.payload().to_bytes().to_vec();
+                                    if let Some(plaintext) = voting_decrypt_current_epoch_cut(
+                                        &crdt_state_req, community_id, &raw,
+                                    ).await {
+                                        (apply_backfilled)(plaintext).await;
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                                if closing_req.load(Ordering::SeqCst) { return; }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        if !closing_req.load(Ordering::SeqCst) {
+                            tracing::debug!(
+                                topic = %backfill_topic_req,
+                                error = %e,
+                                "voting backfill get failed"
+                            );
+                        }
+                    }
+                }
+                // Wait `backfill_interval` before the next pull, waking every
+                // second so a flipped `closing` unblocks teardown promptly.
+                let step = std::time::Duration::from_secs(1);
+                let mut remaining = backfill_interval;
+                loop {
+                    if closing_req.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let this = remaining.min(step);
+                    tokio::time::sleep(this).await;
+                    remaining = remaining.saturating_sub(this);
+                }
+            }
+        });
+
         // Inbound: Zenoh subscriber → decrypt (current-epoch-only) → engine's subscriber_tx.
         let session_sub = session;
         let key_sub = key_expr;
@@ -9537,7 +9775,6 @@ pub fn spawn_voting_log_zenoh_adapter(
                                 // peer-controlled allocation attacks before we even
                                 // decode for verification.
                                 let payload_len = sample.payload().len();
-                                const MAX_VOTING_PAYLOAD_BYTES: usize = 64 * 1024;
                                 if payload_len > MAX_VOTING_PAYLOAD_BYTES {
                                     if !closing_sub.load(Ordering::SeqCst) {
                                         tracing::warn!(
@@ -9641,6 +9878,8 @@ pub fn spawn_voting_log_zenoh_adapter(
 
         let _ = pub_handle.await;
         let _ = sub_handle.await;
+        let _ = qbl_handle.await;
+        let _ = req_handle.await;
     })
 }
 

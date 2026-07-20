@@ -28,7 +28,7 @@
 //! Without that ordering, the local event loops back via the subscriber path
 //! and gets double-applied. See `publish_event` below.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -149,9 +149,26 @@ pub type BeaconRequester = Arc<
 /// `(0, 0)` is treated as "never seen" — Phase 2 has no production
 /// events at the epoch HLC; only unit-test scaffolding which constructs
 /// events strictly after `record`.
+/// Exact per-event coordinate: `(actor, device_id, wall_ms, logical)`.
+/// Uniquely identifies one event position on a device lane (a device's
+/// HLC is monotone, so it never signs two distinct events at the same
+/// coordinate). Used by the ZEB-718 backfill apply path.
+type VotingEventCoord = (OwnerAddr, String, u64, u32);
+
 #[derive(Debug, Default)]
 pub struct VotingReplayTracker {
     seen: HashMap<(OwnerAddr, String), (u64, u32)>,
+    /// ZEB-718: every coordinate ever recorded (live or backfilled). The
+    /// live path dedups via the per-lane high-water `seen` map (cheap,
+    /// correct for monotone live delivery); the **backfill** path dedups
+    /// via this exact-coordinate set instead, because a cross-rotation
+    /// drop leaves an *in-lane gap* (a peer holds a later event `e2` on a
+    /// lane but missed the earlier `e1`) — the high-water mark would
+    /// wrongly swallow the backfilled `e1`. Grows one entry per distinct
+    /// event; at voting volume (sparse, archive-bounded polls) this is
+    /// negligible, and it is deliberately NOT pruned on archive so a
+    /// re-broadcast archived event is not resurrected.
+    seen_coords: HashSet<VotingEventCoord>,
 }
 
 impl VotingReplayTracker {
@@ -163,9 +180,20 @@ impl VotingReplayTracker {
         (event.hlc.wall_ms, event.hlc.logical)
     }
 
-    /// Unconditionally bump the high-water mark for an event's lane.
-    /// Called by `publish_event` BEFORE the broadcast (the self-loopback
-    /// fix from ZEB-270) and by `process_inbound` after a successful apply.
+    fn coord(event: &SignedVotingEvent) -> VotingEventCoord {
+        (
+            event.actor,
+            event.hlc.device_id.clone(),
+            event.hlc.wall_ms,
+            event.hlc.logical,
+        )
+    }
+
+    /// Unconditionally bump the high-water mark for an event's lane AND
+    /// record its exact coordinate (ZEB-718). Called by `publish_event`
+    /// BEFORE the broadcast (the self-loopback fix from ZEB-270) and by
+    /// `process_inbound` after a successful apply — so both live paths
+    /// populate `seen_coords` for the backfill dedup for free.
     pub fn record(&mut self, event: &SignedVotingEvent) {
         let key = (event.actor, event.hlc.device_id.clone());
         let ord = Self::ordinal(event);
@@ -173,6 +201,7 @@ impl VotingReplayTracker {
         if ord > *entry {
             *entry = ord;
         }
+        self.seen_coords.insert(Self::coord(event));
     }
 
     /// Returns true if this event has already been seen on its lane
@@ -185,6 +214,14 @@ impl VotingReplayTracker {
             Some(&max_ord) => Self::ordinal(event) <= max_ord,
             None => false,
         }
+    }
+
+    /// ZEB-718: returns true iff this **exact** event coordinate was
+    /// already recorded. Unlike `contains`, this does NOT treat an
+    /// older-than-high-water event as seen — so the backfill path
+    /// recovers in-lane gaps a cross-rotation drop left behind.
+    pub fn seen_coord(&self, event: &SignedVotingEvent) -> bool {
+        self.seen_coords.contains(&Self::coord(event))
     }
 }
 
@@ -300,6 +337,12 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     #[allow(dead_code)]
     pub(crate) membership_resolver:
         Option<std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>>,
+    /// ZEB-718: install-once `identity_dir` for on-disk persistence.
+    /// `None` until installed by the production `ensure_voting_engine_for`;
+    /// while `None`, `persist_now` is a no-op (tests / lightweight
+    /// harnesses that don't persist). `std::sync::Mutex` because the read
+    /// is a quick clone with no `.await` held across the guard.
+    persist_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// ZEB-307 PhantomData<fn() -> R>: makes VotingLogEngine<R> unconditionally
     /// Send + Sync even when R = tauri::Wry (which is !Send because its
     /// EventLoop holds Rc<>). The engine only owns R through this marker,
@@ -310,6 +353,84 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
 impl<R: tauri::Runtime> VotingLogEngine<R> {
     pub fn community_id(&self) -> SpaceId {
         self.community_id
+    }
+
+    /// ZEB-718: install the `identity_dir` that `persist_now` writes
+    /// under. Install-once from the production `ensure_voting_engine_for`;
+    /// tests that don't persist simply never call it.
+    pub fn install_persist_dir(&self, identity_dir: std::path::PathBuf) {
+        if let Ok(mut g) = self.persist_dir.lock() {
+            *g = Some(identity_dir);
+        }
+    }
+
+    /// ZEB-718: snapshot `{events, policy}` and atomically rewrite
+    /// `voting.cbor`. No-op when no `identity_dir` is installed. Never
+    /// panics — a write failure is logged and swallowed (the in-memory
+    /// log is authoritative and peer-recoverable via backfill). Called
+    /// after every log mutation (publish, inbound apply, backfill apply,
+    /// archive sweep, policy change).
+    pub(crate) async fn persist_now(&self) {
+        // Clone the path out from under the std mutex before any await.
+        let dir = match self.persist_dir.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        let Some(dir) = dir else {
+            return;
+        };
+        let path = crate::community_voting_persist::voting_path_for(&dir, &self.community_id);
+        let community_id = self.community_id;
+        // Clone a serde-clean snapshot, then run the blocking CBOR-encode +
+        // atomic write on a `spawn_blocking` thread so `std::fs` never parks a
+        // Tokio worker (repo persistence pattern — PRs #74/#380/#381).
+        //
+        // The `voting_log` lock is intentionally held ACROSS the write, not
+        // released after the snapshot: `persist_now` runs concurrently from
+        // three tasks (IPC publish / inbound receive loop / backfill apply)
+        // and the 24h tick archive sweep writes the same `voting.cbor` — all
+        // serialize on this one per-community mutex. Releasing before the
+        // write would let two writers race on the fixed `.tmp` name and land
+        // out of order (a stale snapshot renaming last → lost update). The
+        // hold is a sub-ms clone+write on a sparse path, and the blocking I/O
+        // is off-worker, so contention is negligible.
+        let log = self.voting_log.lock().await;
+        let snapshot = crate::community_voting_persist::snapshot_for_persist(&log, &community_id);
+        let write_result = tokio::task::spawn_blocking(move || {
+            crate::community_voting_persist::write_snapshot(&path, &snapshot)
+        })
+        .await;
+        drop(log);
+        let write_err = match write_result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join_err) => Some(format!("persist task panicked: {join_err}")),
+        };
+        if let Some(err) = write_err {
+            tracing::warn!(
+                community_id = ?community_id,
+                err = %err,
+                "voting persist_now: failed to write voting.cbor \
+                 (continuing; log is peer-recoverable via backfill)"
+            );
+        }
+    }
+
+    /// ZEB-718: plaintext `SignedVotingEvent` CBOR frames for the live
+    /// (non-archived) voting log — one per event. Consumed by the backfill
+    /// responder (in the Zenoh adapter), which re-encrypts each frame under
+    /// the community's **current** epoch at serve time so it passes the
+    /// requester's current-epoch cut. Archived events are already pruned
+    /// from `log.events`, so this is naturally the "live polls only" set.
+    pub(crate) async fn read_backfill_frames(&self) -> Vec<Vec<u8>> {
+        let log = self.voting_log.lock().await;
+        log.events
+            .iter()
+            .filter_map(|ev| {
+                let mut buf = Vec::new();
+                ciborium::into_writer(ev, &mut buf).ok().map(|()| buf)
+            })
+            .collect()
     }
 
     /// Construct an engine, spawn its inbound receive loop, and return
@@ -355,6 +476,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             local_signing: RwLock::new(None),
             identity_resolver: params.identity_resolver,
             membership_resolver: params.membership_resolver,
+            persist_dir: std::sync::Mutex::new(None),
             _phantom: PhantomData,
         });
 
@@ -1651,6 +1773,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             pid
         };
 
+        // ZEB-718: persist the locally-minted event so it survives restart.
+        // Any hook-minted follow-up events below persist themselves via
+        // their own recursive `publish_event`.
+        self.persist_now().await;
+
         // (3a) After a Tier 3 PollCreate is applied, trigger a VRF beacon
         // request. The stored poll epoch is now authoritative; the beacon
         // request uses it via the poll's meta (not a fresh dfrost query).
@@ -2476,6 +2603,76 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         Ok(Some((event, applied_poll_id)))
     }
 
+    /// ZEB-718: apply an event received via the backfill pull path.
+    ///
+    /// Mirrors `process_inbound` (decode → verify@hlc → eligibility →
+    /// apply → record) with two deliberate differences:
+    /// 1. **Dedup by exact coordinate** (`tracker.seen_coord`), not the
+    ///    per-lane high-water mark — so a cross-rotation in-lane gap (a
+    ///    later event on the lane was received, the earlier one dropped)
+    ///    is recovered rather than swallowed.
+    /// 2. **No post-apply orchestration hooks** — backfilled events are
+    ///    historical; the inbound dispatch already suppresses the
+    ///    orchestration cascade for the same peer-mint-HLC-race reason.
+    ///
+    /// Returns `Ok(None)` on a duplicate coordinate or when resolvers are
+    /// not wired; `Ok(Some(pid))` on a fresh apply.
+    pub(crate) async fn apply_backfilled_event(
+        &self,
+        packet: &[u8],
+    ) -> Result<Option<PollId>, String> {
+        let event: SignedVotingEvent =
+            ciborium::from_reader(packet).map_err(|e| format!("decode: {e}"))?;
+
+        // Coordinate dedup — NOT the high-water gate (see method doc).
+        {
+            let tracker = self.tracker.lock().await;
+            if tracker.seen_coord(&event) {
+                return Ok(None);
+            }
+        }
+
+        let (Some(id_resolver), Some(mem_resolver)) = (
+            self.identity_resolver.as_ref(),
+            self.membership_resolver.as_ref(),
+        ) else {
+            tracing::debug!(
+                community_id = ?self.community_id,
+                "apply_backfilled_event: dropping event — resolvers not wired"
+            );
+            return Ok(None);
+        };
+
+        let snapshot = mem_resolver
+            .snapshot_at(self.community_id, &event.hlc)
+            .await
+            .map_err(|e| format!("snapshot resolve: {e}"))?;
+
+        crate::community_voting_core::verify_voting_event(&event, &snapshot, id_resolver.as_ref())
+            .await
+            .map_err(|e| format!("verify: {e}"))?;
+
+        inbound_eligibility_check(&event, &snapshot, &self.voting_log).await?;
+
+        let applied_poll_id: PollId = {
+            let mut log = self.voting_log.lock().await;
+            log.apply_with_snapshot(event.clone(), &self.community_id, Some(snapshot))
+                .map_err(|e| format!("apply: {e:?}"))?
+        };
+
+        // Record AFTER a successful apply — records both the high-water
+        // mark and the exact coordinate (so a re-backfill dedups).
+        {
+            let mut tracker = self.tracker.lock().await;
+            tracker.record(&event);
+        }
+
+        // ZEB-718: persist the recovered event so it survives restart.
+        self.persist_now().await;
+
+        Ok(Some(applied_poll_id))
+    }
+
     /// ZEB-298 Task 8: inbound dispatch wrapper. Invoked from the receive
     /// loop with `Arc::clone(&engine)` so the four post-apply hooks have
     /// `self`-method access.
@@ -2564,6 +2761,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             // Dropped silently (dedup or resolvers absent); no hooks.
             return Ok(());
         };
+
+        // ZEB-718: persist the peer-received event so it survives restart.
+        self.persist_now().await;
 
         // ── Post-apply hooks: same order + same guards as publish_event ──
         //
@@ -2873,6 +3073,36 @@ async fn inbound_eligibility_check(
     Ok(())
 }
 
+// ── ZEB-718 backfill test seam ───────────────────────────────────────────────
+
+/// Test seam (ZEB-718): build the backfill read + apply closures for
+/// `engine`, so integration tests — which see only the public API — can wire
+/// the real backfill path into `spawn_voting_log_zenoh_adapter`. Mirrors the
+/// closures `ensure_voting_engine_for` builds in production (the underlying
+/// `read_backfill_frames` / `apply_backfilled_event` are `pub(crate)`).
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn backfill_closures_for_test<R: tauri::Runtime>(
+    engine: &Arc<VotingLogEngine<R>>,
+) -> (
+    crate::event_loop::VotingBackfillReadFn,
+    crate::event_loop::VotingBackfillApplyFn,
+) {
+    let e_read = Arc::clone(engine);
+    let read: crate::event_loop::VotingBackfillReadFn = Arc::new(move || {
+        let e = Arc::clone(&e_read);
+        Box::pin(async move { e.read_backfill_frames().await })
+    });
+    let e_apply = Arc::clone(engine);
+    let apply: crate::event_loop::VotingBackfillApplyFn = Arc::new(move |frame: Vec<u8>| {
+        let e = Arc::clone(&e_apply);
+        Box::pin(async move {
+            let _ = e.apply_backfilled_event(&frame).await;
+        })
+    });
+    (read, apply)
+}
+
 // ── process_inbound_for_test seam ───────────────────────────────────────────
 
 /// ZEB-298+ZEB-312 PR 1 test seam: invoke `process_inbound` directly from
@@ -3058,6 +3288,166 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::into_writer(event, &mut buf).expect("encode event");
         buf
+    }
+
+    // ── ZEB-718 backfill apply helpers ─────────────────────────────────────
+
+    /// Build a Tier-1 PollCreate signed by `key` for `owner` on `device`
+    /// at `wall`, so `verify_voting_event` accepts it.
+    fn signed_poll_create(
+        key: &ed25519_dalek::SigningKey,
+        owner: OwnerAddr,
+        device: &str,
+        wall: u64,
+    ) -> SignedVotingEvent {
+        use ed25519_dalek::Signer;
+        let mut ev = poll_create_event(owner, device, wall);
+        let sb = ev.signing_bytes().expect("signing_bytes");
+        ev.sig = key.sign(&sb).to_bytes().to_vec();
+        ev
+    }
+
+    /// Start a minimal production-wired engine whose only member is
+    /// `owner` (power 10), sharing `voting_log` with the caller so it can
+    /// assert on the materialized state.
+    async fn start_backfill_test_engine(
+        community_id: SpaceId,
+        owner: OwnerAddr,
+        pub64: [u8; 64],
+        voting_log: Arc<Mutex<VotingLog>>,
+    ) -> Arc<VotingLogEngine<tauri::test::MockRuntime>> {
+        let mut members = HashMap::new();
+        members.insert(
+            owner,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let resolvers = Arc::new(FixedTestResolvers {
+            identity: HashMap::from([(owner, pub64)]),
+            snapshot: MembershipSnapshot { members },
+        });
+        let id_resolver: Arc<dyn crate::community_voting_core::VotingIdentityResolver> =
+            resolvers.clone();
+        let mem_resolver: Arc<dyn crate::community_voting_log::MembershipSnapshotResolver> =
+            resolvers;
+        let (publisher_tx, _publisher_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (_subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(8);
+        let app = tauri::test::mock_app();
+        VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log,
+            publisher_tx,
+            subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: Some(app.handle().clone()),
+            identity_resolver: Some(id_resolver),
+            membership_resolver: Some(mem_resolver),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn apply_backfilled_skips_already_applied_coordinate() {
+        let community_id = SpaceId([0x71; 16]);
+        let (key, owner, pub64) = fixture_identity_engine(0x71);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let engine =
+            start_backfill_test_engine(community_id, owner, pub64, Arc::clone(&voting_log)).await;
+
+        let packet = encode_event(&signed_poll_create(&key, owner, "dev", 1_000));
+
+        let first = engine.apply_backfilled_event(&packet).await.unwrap();
+        assert!(first.is_some(), "first backfill applies");
+        assert_eq!(voting_log.lock().await.polls.len(), 1);
+
+        let second = engine.apply_backfilled_event(&packet).await.unwrap();
+        assert!(second.is_none(), "duplicate coordinate is skipped");
+        assert_eq!(
+            voting_log.lock().await.polls.len(),
+            1,
+            "no double-apply on re-backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_backfilled_recovers_in_lane_gap_the_high_water_would_drop() {
+        let community_id = SpaceId([0x72; 16]);
+        let (key, owner, pub64) = fixture_identity_engine(0x72);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let engine =
+            start_backfill_test_engine(community_id, owner, pub64, Arc::clone(&voting_log)).await;
+
+        // Two independent polls on the SAME device lane; e1 older than e2.
+        let e1 = signed_poll_create(&key, owner, "dev", 1_000);
+        let e2 = signed_poll_create(&key, owner, "dev", 2_000);
+
+        // Apply e2 first — advances the high-water for (owner,"dev") past e1.
+        let r2 = engine
+            .apply_backfilled_event(&encode_event(&e2))
+            .await
+            .unwrap();
+        assert!(r2.is_some());
+
+        // The live high-water gate WOULD now drop e1 (proving the gap);
+        // the coordinate gate does not.
+        {
+            let t = engine.tracker.lock().await;
+            assert!(
+                t.contains(&e1),
+                "high-water gate would wrongly drop the in-lane-gap e1"
+            );
+            assert!(!t.seen_coord(&e1), "e1's exact coordinate is unseen");
+        }
+
+        let r1 = engine
+            .apply_backfilled_event(&encode_event(&e1))
+            .await
+            .unwrap();
+        assert!(
+            r1.is_some(),
+            "in-lane gap e1 must be recovered by coordinate dedup"
+        );
+        assert_eq!(
+            voting_log.lock().await.polls.len(),
+            2,
+            "both polls present after gap recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_backfilled_persists_to_disk_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let community_id = SpaceId([0x73; 16]);
+        let (key, owner, pub64) = fixture_identity_engine(0x73);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let engine =
+            start_backfill_test_engine(community_id, owner, pub64, Arc::clone(&voting_log)).await;
+        engine.install_persist_dir(dir.path().to_path_buf());
+
+        let ev = signed_poll_create(&key, owner, "dev", 1_000);
+        engine
+            .apply_backfilled_event(&encode_event(&ev))
+            .await
+            .unwrap();
+
+        // persist_now fired after apply — the on-disk log round-trips.
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &community_id);
+        assert!(
+            path.exists(),
+            "voting.cbor must exist after a persisted mutation"
+        );
+        let (events, _policy, poll_restore) =
+            crate::community_voting_persist::load_voting_log(&path, &community_id).unwrap();
+        assert_eq!(events, vec![ev], "persisted log reloads the applied event");
+        // The applied PollCreate materialized one poll, so its restore persists.
+        assert_eq!(
+            poll_restore.len(),
+            1,
+            "the applied poll's tick-state overlay is persisted"
+        );
     }
 
     // ── VotingReplayTracker ────────────────────────────────────────────────

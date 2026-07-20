@@ -152,6 +152,7 @@ pub mod community_voting_conviction;
 pub mod community_voting_core;
 pub mod community_voting_log;
 pub mod community_voting_log_engine;
+pub mod community_voting_persist;
 pub mod community_voting_sortition;
 pub mod community_voting_star;
 pub mod community_voting_tick;
@@ -12809,6 +12810,8 @@ pub async fn start_node_inner(
                         last_archive_sweep_ms: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
                         emit: emit_fn,
                         auto_exec_set_power: auto_exec_fn,
+                        // ZEB-718: persist a log pruned by the archive sweep.
+                        identity_dir: crate::owner_commands::resolve_identity_dir().ok(),
                     };
                     let handle = crate::community_voting_tick::spawn_voting_tick(
                         tick_ctx,
@@ -46396,11 +46399,14 @@ async fn voting_set_notify_on_delegate_signal(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let voting_logs = {
+    let (voting_logs, identity_dir) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        std::sync::Arc::clone(&g.voting_logs)
+        (
+            std::sync::Arc::clone(&g.voting_logs),
+            g.identity_dir.clone(),
+        )
     };
 
     let log_arc = {
@@ -46417,6 +46423,23 @@ async fn voting_set_notify_on_delegate_signal(
     let mut policy = log_g.policy().clone();
     policy.notify_on_delegate_signal = enabled;
     log_g.set_policy(policy);
+    // ZEB-718: persist the policy change so it survives restart (the policy is
+    // not derivable from replayed events). Uses `save_policy_only` — a
+    // load-guarded policy-only write — NOT `save_voting_log`: this IPC may run
+    // against an un-reconciled in-memory log (empty events) or after
+    // boot-reconcile disarmed persistence on an unreadable file, and writing
+    // the in-memory log directly would clobber recoverable voting history.
+    // `save_policy_only` preserves the on-disk events + poll_restore and skips
+    // (Err) when the file is present-but-unreadable. Held across the write
+    // under `log_g` so it serializes with the engine's `persist_now`.
+    if let Some(dir) = identity_dir {
+        let path = crate::community_voting_persist::voting_path_for(&dir, &space_id);
+        if let Err(e) =
+            crate::community_voting_persist::save_policy_only(&path, &space_id, log_g.policy())
+        {
+            tracing::warn!(community_id = %community_id, err = %e, "voting policy persist skipped/failed");
+        }
+    }
     Ok(())
 }
 
@@ -47833,6 +47856,479 @@ impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMember
     }
 }
 
+/// ZEB-718: at boot, load a community's persisted voting log from disk and
+/// replay its events to rebuild the in-memory `VotingLog` (polls +
+/// delegation graph), inserting it into `voting_logs` so the lazily-spawned
+/// engine attaches to the reloaded state (its `entry(..).or_insert_with`
+/// keeps the reloaded log instead of a fresh empty one).
+///
+/// Replay is pure materialization (`apply_with_snapshot`): the events come
+/// from our own trusted disk, so signatures are NOT re-verified; only the
+/// membership snapshot at each event's own HLC is needed for correct
+/// tally/conviction weighting (ZEB-315 rolling eligibility). Replay alone
+/// does NOT reconstruct tick-driven lifecycle (Closed/Finalized/Archived +
+/// `finalized_at_ms` are in-place `PollMeta` mutations, not events), so the
+/// persisted per-poll `PollMeta` overlay is restored after replay.
+///
+/// Non-fatal throughout: a missing/corrupt file yields an empty log
+/// (recovered later via backfill), and a per-event replay error is logged
+/// and skipped.
+async fn reconcile_voting_from_state(
+    voting_logs: &VotingLogsMap,
+    identity_dir: Option<&std::path::Path>,
+    community_id: crate::owner_state_types::SpaceId,
+    membership_resolver: &std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    >,
+) -> Result<(), String> {
+    let Some(identity_dir) = identity_dir else {
+        return Ok(());
+    };
+    // Idempotent + cheap on repeat: if this community's log is already
+    // populated (a prior reconcile, or live events), there is nothing to
+    // restore — skip the disk read + replay.
+    {
+        let map = voting_logs.lock().await;
+        if let Some(existing) = map.get(&community_id) {
+            if !existing.lock().await.events.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+    let path = crate::community_voting_persist::voting_path_for(identity_dir, &community_id);
+    let (events, policy, poll_restore) = match crate::community_voting_persist::load_voting_log(
+        &path,
+        &community_id,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            // A transient I/O error (file present but unreadable — `load`
+            // maps NotFound to empty, so this is NOT first-boot) must NOT be
+            // swallowed as "empty": arming persistence and letting the first
+            // mutation rewrite this path would clobber recoverable state.
+            // Propagate so `ensure_voting_engine_for` leaves persistence
+            // disarmed this session; a clean restart re-reads and re-arms.
+            tracing::error!(?community_id, err = %e, "voting reconcile: load failed on an existing file; leaving persistence disarmed this session to avoid clobbering it");
+            return Err(format!("voting reconcile load failed: {e}"));
+        }
+    };
+    // A never-voted community with default policy is exactly what a lazy
+    // spawn would create — nothing to restore. But a policy-only change
+    // (IPC persists `policy` even before any event exists) must survive
+    // restart, so restore it into a fresh log below.
+    if events.is_empty() {
+        if policy == crate::community_voting_conviction::CommunityVotingPolicy::default() {
+            return Ok(());
+        }
+        let mut log = crate::community_voting_log::VotingLog::new();
+        log.set_policy(policy);
+        {
+            let mut map = voting_logs.lock().await;
+            map.entry(community_id)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(log)));
+        }
+        tracing::info!(
+            ?community_id,
+            "voting reconcile: restored persisted policy (no events)"
+        );
+        return Ok(());
+    }
+
+    let mut log = crate::community_voting_log::VotingLog::new();
+    log.set_policy(policy);
+    let mut replayed = 0usize;
+    for event in events {
+        let snap = membership_resolver
+            .snapshot_at(community_id, &event.hlc)
+            .await
+            .ok();
+        match log.apply_with_snapshot(event.clone(), &community_id, snap) {
+            Ok(_) => replayed += 1,
+            Err(e) => {
+                tracing::warn!(?community_id, err = ?e, "voting reconcile: skipped un-replayable event")
+            }
+        }
+    }
+    // Overlay the persisted per-poll tick-driven state. Replaying events
+    // rebuilds each poll's tally/conviction but NOT its tick-driven
+    // lifecycle (Closed/Finalized/Archived + finalized_at_ms in `meta`) nor
+    // the Tier-2 contestability clock (threshold_reached_at_ms /
+    // last_unsignal_after_threshold_ms in `tier_state`). Restoring both
+    // prevents a restart from resurrecting a Finalized/Archived poll as
+    // active `Open`, or resetting a mid-contestability proposal's 24h window.
+    for (pid, restore) in poll_restore {
+        if let Some(state) = log.polls.get_mut(&pid) {
+            state.meta = restore.meta;
+            if let Some((threshold_reached, last_unsignal)) = restore.tier2_timing {
+                if let crate::community_voting_log::TierState::Tier2(t2) = &mut state.tier_state {
+                    t2.threshold_reached_at_ms = threshold_reached;
+                    t2.last_unsignal_after_threshold_ms = last_unsignal;
+                }
+            }
+        }
+        // Restore the Tier-3 D-FROST epoch (set by the engine's
+        // `set_tier3_poll_epoch`, not by any event — replay leaves it 0). Uses
+        // the public setter, which no-ops for non-Tier-3 polls.
+        if let Some(epoch) = restore.tier3_community_epoch {
+            log.set_tier3_poll_epoch(&pid, epoch);
+        }
+    }
+    tracing::info!(
+        ?community_id,
+        replayed,
+        "voting reconcile: replayed persisted voting log"
+    );
+    {
+        let mut map = voting_logs.lock().await;
+        map.entry(community_id)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(log)));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod zeb718_voting_reconcile_tests {
+    use super::*;
+    use crate::community_voting_core::{
+        Eligibility, MemberAttrs, MembershipSnapshot, PollEventKindCode, SignedVotingEvent, Tier,
+    };
+    use crate::community_voting_log::{
+        MembershipSnapshotResolver, SnapshotResolverError, VotingLog,
+    };
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct StubResolver {
+        snapshot: MembershipSnapshot,
+    }
+
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for StubResolver {
+        async fn snapshot_at(
+            &self,
+            _community_id: SpaceId,
+            _hlc: &Hlc,
+        ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+            Ok(self.snapshot.clone())
+        }
+    }
+
+    fn tier1_poll_create(actor: OwnerAddr, wall: u64) -> SignedVotingEvent {
+        let cfg = crate::community_voting_approval::Tier1PollConfig {
+            options: vec!["A".into(), "B".into()],
+            window_seconds: 3600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: crate::community_membership::ChannelId([0x11; 16]),
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&cfg, &mut payload).expect("encode cfg");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Approval,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            actor,
+            // Replay does not re-verify signatures (trusted local disk),
+            // so an unsigned fixture is sufficient.
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn tier3_poll_create(actor: OwnerAddr, wall: u64) -> SignedVotingEvent {
+        let cfg = crate::community_voting_core::Tier3PollConfigPayload {
+            proposal_text: "Amend charter".into(),
+            // Tier-3 config validation requires sortition_size in 20..=300
+            // (validate_tier3_poll_config); the electorate size is not checked
+            // at create (selection happens later at the beacon stage).
+            sortition_size: 20,
+            deliberation_window_seconds: 3600,
+            drafting_window_seconds: 3600,
+            ratification_window_seconds: 3600,
+            privacy_mode: "pu".into(),
+            incentive_mode: "d".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&cfg, &mut payload).expect("encode tier3 cfg");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            actor,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_replays_persisted_voting_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x74; 16]);
+        let actor = OwnerAddr([0xaa; 16]);
+
+        // Persist a log holding one Tier-1 PollCreate.
+        let mut log = VotingLog::new();
+        log.events.push(tier1_poll_create(actor, 1_000));
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        // Resolver reports `actor` as a member at any HLC.
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
+            snapshot: MembershipSnapshot { members },
+        });
+
+        // Fresh empty registry — reconcile must load + replay from disk.
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("voting log reloaded for community");
+        assert_eq!(
+            restored.lock().await.polls.len(),
+            1,
+            "the persisted poll rematerialized on replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_missing_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x75; 16]);
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
+            snapshot: MembershipSnapshot {
+                members: HashMap::new(),
+            },
+        });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+        assert!(
+            voting_logs.lock().await.is_empty(),
+            "no file → no inserted log"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_tick_driven_finalized_lifecycle() {
+        use crate::community_voting_core::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x76; 16]);
+        let actor = OwnerAddr([0xbb; 16]);
+
+        // Materialize a poll, then simulate the tick flipping it to
+        // Finalized — an in-place PollMeta mutation, NOT an event. Replaying
+        // events alone would resurrect it as Open; the persisted overlay
+        // must restore Finalized.
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(
+                tier1_poll_create(actor, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply create");
+        {
+            let state = log.polls.get_mut(&pid).expect("poll materialized");
+            state.meta.lifecycle = Lifecycle::Finalized;
+            state.meta.finalized_at_ms = Some(1_234);
+        }
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        let state = g.polls.get(&pid).expect("poll reloaded");
+        assert_eq!(
+            state.meta.lifecycle,
+            Lifecycle::Finalized,
+            "tick-driven Finalized lifecycle must survive restart, not resurrect as Open"
+        );
+        assert_eq!(state.meta.finalized_at_ms, Some(1_234));
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_tier3_community_epoch() {
+        // The engine patches a Tier-3 poll's `community_epoch` via
+        // `set_tier3_poll_epoch` AFTER the PollCreate applies (reading the live
+        // D-FROST epoch) — a non-event mutation. Replaying events alone leaves
+        // it 0, which would make the reloaded poll derive its beacon seed with
+        // epoch 0 and stall (Greptile P1-1). The overlay must restore it.
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x79; 16]);
+        let actor = OwnerAddr([0xcc; 16]);
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(
+                tier3_poll_create(actor, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier3 create");
+        // Sanity: apply leaves community_epoch at 0.
+        assert_eq!(
+            log.polls
+                .get(&pid)
+                .and_then(|s| s.tier_state.as_tier3())
+                .map(|t3| t3.meta.community_epoch),
+            Some(0),
+            "apply must leave epoch 0 (patched by the engine, not the event)"
+        );
+        // Engine patches the real epoch (non-event mutation).
+        assert!(log.set_tier3_poll_epoch(&pid, 42));
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        assert_eq!(
+            g.polls
+                .get(&pid)
+                .and_then(|s| s.tier_state.as_tier3())
+                .map(|t3| t3.meta.community_epoch),
+            Some(42),
+            "Tier-3 community_epoch must survive restart, not reset to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_policy_only_log_without_events() {
+        // A community whose only persisted state is a non-default policy
+        // (IPC persists `policy` even before any vote). The early-return must
+        // NOT treat "no events" as "nothing to restore" — the policy would be
+        // silently lost across restart otherwise.
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x77; 16]);
+
+        let policy = crate::community_voting_conviction::CommunityVotingPolicy {
+            notify_on_delegate_signal: true,
+            ..Default::default()
+        };
+        let mut log = VotingLog::new();
+        log.set_policy(policy.clone());
+        assert!(log.events.is_empty(), "fixture has no events");
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
+            snapshot: MembershipSnapshot {
+                members: HashMap::new(),
+            },
+        });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("policy-only log must be inserted");
+        assert_eq!(
+            restored.lock().await.policy(),
+            &policy,
+            "persisted policy must survive restart even with zero events"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_errors_on_unreadable_existing_file_to_disarm_persistence() {
+        // Force a non-NotFound I/O read error by making the voting.cbor path a
+        // DIRECTORY: `std::fs::read` on a dir fails (EISDIR) portably. A
+        // transient read failure on an existing file must surface as `Err`, so
+        // the caller (`ensure_voting_engine_for`) leaves persistence disarmed
+        // rather than clobbering the recoverable on-disk state with empty.
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x78; 16]);
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        std::fs::create_dir_all(&path).unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
+            snapshot: MembershipSnapshot {
+                members: HashMap::new(),
+            },
+        });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let result =
+            reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver).await;
+        assert!(
+            result.is_err(),
+            "an unreadable existing file must surface as Err (disarms persistence), not be swallowed as empty"
+        );
+        assert!(
+            voting_logs.lock().await.is_empty(),
+            "a failed reload must not insert a log"
+        );
+    }
+}
+
 /// Lazy-register a `VotingLogEngine` for `community_id` if none exists,
 /// sharing the per-community `Arc<Mutex<VotingLog>>` from `voting_logs`.
 ///
@@ -47847,6 +48343,14 @@ impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMember
 /// requests and arriving beacons trigger kd=ss publication. Pre-existing
 /// engines (already in the map) are NOT re-wired — they were wired at their
 /// creation time.
+/// ZEB-718: periodic anti-entropy floor between voting backfill pulls. The
+/// requester also pulls once on adapter spawn (join/reconnect catch-up), so
+/// this bounds only the recovery latency for events missed *while already
+/// connected* (e.g. a cross-rotation drop). Voting is sparse and a pull is a
+/// small full-dump `get`, so a few-minute floor is cheap. (Transport-up
+/// re-arm for prompter reconnect recovery is a deferred enhancement.)
+const VOTING_BACKFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[allow(clippy::too_many_arguments)]
 async fn ensure_voting_engine_for(
     voting_logs: &VotingLogsMap,
@@ -47881,6 +48385,9 @@ async fn ensure_voting_engine_for(
         std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
     >,
     beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
+    // ZEB-718: identity_dir for on-disk voting-log persistence. `None` ⇒
+    // the engine runs without persistence (test/headless bypass paths).
+    identity_dir: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
     // Fast-path read under the std::Mutex (no awaits). Saves the
     // engine-construction cost when the engine already exists.
@@ -47892,6 +48399,20 @@ async fn ensure_voting_engine_for(
             return Ok(());
         }
     }
+
+    // ZEB-718: on first setup for this community, reload its persisted
+    // voting log (load + replay) so the engine attaches to restored
+    // in-flight state after a restart. Idempotent + a no-op when nothing
+    // is persisted; the get-or-insert below then finds the reloaded log.
+    let reconcile_ok = reconcile_voting_from_state(
+        voting_logs,
+        identity_dir.as_deref(),
+        community_id,
+        &membership_resolver,
+    )
+    .await
+    .is_ok();
+
     // Get-or-insert the VotingLog Arc — same shape as the IPC fast path.
     let log_arc = {
         let mut map = voting_logs.lock().await;
@@ -47952,6 +48473,28 @@ async fn ensure_voting_engine_for(
         .install_local_signing_key(local_signing_key, local_owner)
         .await;
 
+    // ZEB-718: install the identity_dir so the engine persists {events,
+    // policy} after each mutation. Installed on the freshly-started engine
+    // before the race resolution below; if this caller loses the insertion
+    // race the engine is dropped harmlessly.
+    //
+    // Arm persistence ONLY if the reload above succeeded. A reload that hit
+    // an I/O error on an existing file means the on-disk state is present but
+    // temporarily unreadable — persisting now would overwrite it with the
+    // freshly-started empty log. Run this session in-memory-only; a clean
+    // restart that reads successfully re-arms persistence.
+    if let Some(dir) = identity_dir {
+        if reconcile_ok {
+            engine.install_persist_dir(dir);
+        } else {
+            tracing::warn!(
+                ?community_id,
+                "voting: persistence disarmed this session (voting-log reload failed); \
+                 not overwriting the on-disk file"
+            );
+        }
+    }
+
     // ZEB-309 Phase 4a-main Task 11: wire DfrostLog handle so the engine
     // can trigger VRF beacon requests on Tier 3 PollCreate and publish
     // kd=ss on beacon arrival.
@@ -47961,6 +48504,24 @@ async fn ensure_voting_engine_for(
         )
         .await;
     }
+
+    // ZEB-718: backfill closures capture the engine so the adapter's
+    // responder can read live events and its requester can apply recovered
+    // frames through the engine's coordinate-dedup path.
+    let engine_for_backfill_read = std::sync::Arc::clone(&engine);
+    let read_for_backfill: crate::event_loop::VotingBackfillReadFn =
+        std::sync::Arc::new(move || {
+            let e = std::sync::Arc::clone(&engine_for_backfill_read);
+            Box::pin(async move { e.read_backfill_frames().await })
+        });
+    let engine_for_backfill_apply = std::sync::Arc::clone(&engine);
+    let apply_backfilled: crate::event_loop::VotingBackfillApplyFn =
+        std::sync::Arc::new(move |frame: Vec<u8>| {
+            let e = std::sync::Arc::clone(&engine_for_backfill_apply);
+            Box::pin(async move {
+                let _ = e.apply_backfilled_event(&frame).await;
+            })
+        });
 
     // Build the adapter request now but do NOT send yet — we only send if
     // we win the engine map insertion below. This closes the TOCTOU window
@@ -47974,6 +48535,9 @@ async fn ensure_voting_engine_for(
         crdt_state: crdt_state.clone(),
         publisher_rx,
         subscriber_tx,
+        read_for_backfill,
+        apply_backfilled,
+        backfill_interval: VOTING_BACKFILL_INTERVAL,
     };
 
     // Atomic check-and-insert under the std::Mutex. The FIRST caller to
@@ -48042,6 +48606,10 @@ struct VotingEngineNodeHandles {
     /// in test contexts that bypass `start_node` (fanout call-sites no-op).
     channel_log_registry:
         Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>>,
+    /// ZEB-718: identity_dir for voting-log persistence. `None` in test
+    /// contexts that bypass `start_node` — the engine then runs without
+    /// on-disk persistence (`persist_now` is a no-op).
+    identity_dir: Option<std::path::PathBuf>,
 }
 
 impl VotingEngineNodeHandles {
@@ -48075,6 +48643,7 @@ impl VotingEngineNodeHandles {
             // handlers never downcast their own `AppHandle<R>`.
             app_handle_wry: g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
             channel_log_registry: g.channel_log_registry.clone(),
+            identity_dir: g.identity_dir.clone(),
         })
     }
 
@@ -48115,6 +48684,7 @@ impl VotingEngineNodeHandles {
             self.app_handle_wry.clone(),
             self.dfrost_log_registry.clone(),
             self.beacon_requester.clone(),
+            self.identity_dir.clone(),
         )
         .await?;
         let engine_arc = {
