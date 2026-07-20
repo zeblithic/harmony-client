@@ -3372,7 +3372,90 @@ async fn start_node(
     // will pass a WS-broadcast sink with `wry_handle: None`.
     let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
         std::sync::Arc::new(app.clone());
-    start_node_inner(endpoint, sink, Some(app), state.inner()).await
+    start_node_inner(endpoint, sink, Some(app), state.inner(), None).await
+}
+
+/// ZEB-719: build the `'static` voting-tick auto-exec closure. Dispatch precedence:
+/// GUI (`wry_handle`) → fetch Tauri's managed `Mutex<NodeState>` at call time
+/// (byte-identical to the ZEB-300 wiring); else headless (`owned_state`) → dispatch
+/// against the owned Arc the serve node runs on; else → `SkippedNotAdmin` (no handle
+/// available). Extracted from the inline `start_node_inner` closure so the headless
+/// selection is unit-testable without a full node bringup.
+fn build_auto_exec_fn(
+    wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
+    owned_state: Option<std::sync::Arc<Mutex<NodeState>>>,
+) -> crate::community_voting_tick::AutoExecSetPowerFn {
+    std::sync::Arc::new(
+        move |cid: crate::owner_state_types::SpaceId,
+              target: crate::owner_state_types::OwnerAddr,
+              new_power: u32| {
+            let wry = wry_handle.clone();
+            let owned = owned_state.clone();
+            Box::pin(async move {
+                if let Some(app) = wry {
+                    // Tauri manages `Mutex<NodeState>`; hand the `&Mutex` to the
+                    // helper (it only locks). Direct SetPower at admin_quorum==1;
+                    // AdminProposal routing at admin_quorum>1.
+                    use tauri::Manager as _;
+                    let node_state = app.state::<std::sync::Mutex<crate::NodeState>>();
+                    return crate::community_membership::apply_auto_exec_set_power(
+                        node_state.inner(),
+                        cid,
+                        target,
+                        new_power,
+                    )
+                    .await;
+                }
+                if let Some(arc) = owned {
+                    // Headless serve/RPC: dispatch against the owned NodeState Arc
+                    // (same allocation the node runs on).
+                    return crate::community_membership::apply_auto_exec_set_power(
+                        &arc, cid, target, new_power,
+                    )
+                    .await;
+                }
+                Ok(crate::community_membership::AutoExecOutcome::SkippedNotAdmin)
+            })
+        },
+    )
+}
+
+#[cfg(test)]
+mod build_auto_exec_fn_tests {
+    /// ZEB-719 regression guard: the headless-built closure DISPATCHES to
+    /// `apply_auto_exec_set_power` instead of returning the `SkippedNotAdmin` stub.
+    /// The discriminator: a bare `NodeState::default()` makes the real helper fail
+    /// CLOSED (`Err`, missing handles), whereas the old stub returned
+    /// `Ok(SkippedNotAdmin)`. So `Err` here == "the headless path now dispatches".
+    #[tokio::test]
+    async fn headless_dispatches_not_stub() {
+        use crate::owner_state_types::{OwnerAddr, SpaceId};
+        let cid = SpaceId([0x11; 16]);
+        let target = OwnerAddr([0x22; 16]);
+
+        // No handle at all (neither GUI nor owned) → defensive stub.
+        let stub = super::build_auto_exec_fn(None, None);
+        let out = stub(cid, target, 50).await.expect("stub path returns Ok");
+        assert!(
+            matches!(
+                out,
+                crate::community_membership::AutoExecOutcome::SkippedNotAdmin
+            ),
+            "no-handle path must be the SkippedNotAdmin stub"
+        );
+
+        // Headless owned handle → dispatches to the real helper, which fails closed
+        // on a bare NodeState (missing hlc_tracker / dm_outbox / registry). The
+        // headless branch's ONLY Err source is `apply_auto_exec_set_power`, so `Err`
+        // here — vs the old stub's `Ok(SkippedNotAdmin)` — is itself the complete
+        // discriminator that the closure dispatched. Asserting on the error-STRING
+        // would be brittle to harmless message refactors (Qodo), so we don't.
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(crate::NodeState::default()));
+        let headless = super::build_auto_exec_fn(None, Some(arc));
+        headless(cid, target, 50)
+            .await
+            .expect_err("headless dispatch must Err on a bare NodeState (not the stub's Ok)");
+    }
 }
 
 /// ZEB-338: extracted body of `start_node`. Callable from any caller that
@@ -3388,6 +3471,11 @@ pub async fn start_node_inner(
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
     state: &Mutex<NodeState>,
+    // ZEB-719: an owned handle to the SAME `NodeState` for the `'static` voting-tick
+    // auto-exec closure on the headless path. `None` in the GUI (dispatch goes through
+    // `wry_handle`); `Some(Arc::clone(&state))` in the serve boot + headless RPC reboot,
+    // so a finalized Tier-2 SetPower is dispatched instead of stubbed `SkippedNotAdmin`.
+    owned_state: Option<std::sync::Arc<Mutex<NodeState>>>,
 ) -> Result<StartNodeResponse, String> {
     // ZEB-445: `app` aliases the mode-agnostic sink — the body's many
     // emission seams clone it; Tauri-specific needs go through `wry_handle`.
@@ -12764,46 +12852,12 @@ pub async fn start_node_inner(
                         std::sync::Arc::new(move |event_name: &str, payload: serde_json::Value| {
                             app_for_emit.emit(event_name, payload);
                         });
-                    // ZEB-300 Task 20.1: capture the typed Tauri AppHandle so
-                    // the `'static` tick closure can fetch the managed
-                    // `Mutex<NodeState>` at call time. `Some` in the GUI
-                    // (production); `None` in the headless serve/test path,
-                    // where the Tauri managed-state seam is unavailable —
-                    // auto-exec dispatch there is a follow-up (needs the serve
-                    // boot to expose an owned NodeState handle).
-                    let wry_for_auto_exec = wry_handle.clone();
-                    let auto_exec_fn: crate::community_voting_tick::AutoExecSetPowerFn =
-                        std::sync::Arc::new(
-                            move |cid: crate::owner_state_types::SpaceId,
-                                  target: crate::owner_state_types::OwnerAddr,
-                                  new_power: u32| {
-                                let wry = wry_for_auto_exec.clone();
-                                Box::pin(async move {
-                                    match wry {
-                                        Some(app) => {
-                                            // Tauri manages `Mutex<NodeState>`;
-                                            // hand the `&Mutex` to the helper
-                                            // (it only locks). Direct SetPower
-                                            // at admin_quorum==1; AdminProposal
-                                            // routing at admin_quorum>1.
-                                            use tauri::Manager as _;
-                                            let node_state = app
-                                                .state::<std::sync::Mutex<crate::NodeState>>();
-                                            crate::community_membership::apply_auto_exec_set_power(
-                                                node_state.inner(),
-                                                cid,
-                                                target,
-                                                new_power,
-                                            )
-                                            .await
-                                        }
-                                        None => Ok(
-                                            crate::community_membership::AutoExecOutcome::SkippedNotAdmin,
-                                        ),
-                                    }
-                                })
-                            },
-                        );
+                    // ZEB-719: GUI captures the AppHandle (fetches the managed
+                    // `Mutex<NodeState>` via `app.state()` at call time); the
+                    // headless serve/RPC path captures the owned `NodeState` Arc.
+                    // Both dispatch through `apply_auto_exec_set_power`; only a
+                    // no-handle context falls to the `SkippedNotAdmin` stub.
+                    let auto_exec_fn = build_auto_exec_fn(wry_handle.clone(), owned_state.clone());
 
                     let tick_ctx = crate::community_voting_tick::VotingTickContext {
                         voting_logs: voting_logs_clone,
@@ -25006,7 +25060,15 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
 
         // serve auto-starts the node — a serve process with a stopped node
         // is a transient state (after stop_node RPC), not the default.
-        if let Err(e) = start_node_inner(None, sink.clone(), None, &state).await {
+        if let Err(e) = start_node_inner(
+            None,
+            sink.clone(),
+            None,
+            &state,
+            Some(std::sync::Arc::clone(&state)),
+        )
+        .await
+        {
             eprintln!("serve: node start failed: {e}");
             return 1;
         }
@@ -73599,7 +73661,7 @@ mod zeb_687_revoked_feed_boot_tests {
         let events = crate::api::events::ApiEventSink::new();
         let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
             std::sync::Arc::new(events.clone());
-        start_node_inner(None, sink, None, &state)
+        start_node_inner(None, sink, None, &state, None)
             .await
             .expect("node must boot with the minted owner identity loaded");
 

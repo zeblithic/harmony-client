@@ -90,9 +90,13 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
     let state = Arc::new(Mutex::new(harmony_app::NodeState::default()));
     let events = harmony_app::api::events::ApiEventSink::new();
     let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(events.clone());
-    let boot = harmony_app::start_node_inner(None, sink.clone(), None, &state)
-        .await
-        .expect("headless node boots without Tauri");
+    // ZEB-719: pass the owned NodeState handle exactly as `serve_cli` does, so this
+    // headless harness faithfully mirrors the real serve wiring (Tier-2 auto-exec
+    // dispatches rather than stubs). Inert here — no Tier-2 poll is finalized.
+    let boot =
+        harmony_app::start_node_inner(None, sink.clone(), None, &state, Some(Arc::clone(&state)))
+            .await
+            .expect("headless node boots without Tauri");
     assert!(
         !boot.has_owner_identity,
         "fresh profile must boot pre-mint (no owner_state.cbor yet)"

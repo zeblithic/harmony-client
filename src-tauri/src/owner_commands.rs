@@ -1350,7 +1350,7 @@ pub async fn mint_owner_identity(
     // `start_node` command wrapper) and delegate to the shared IPC/RPC seam.
     let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
         std::sync::Arc::new(app.clone());
-    mint_owner_identity_impl(state.inner(), sink, Some(app)).await
+    mint_owner_identity_impl(state.inner(), sink, Some(app), None).await
 }
 
 /// ZEB-445: shared IPC/RPC seam. `wry_handle` is Some in the GUI (keeps
@@ -1372,11 +1372,21 @@ pub(crate) async fn mint_owner_identity_impl(
     state: &Mutex<crate::NodeState>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
+    // ZEB-719: owned NodeState handle threaded into the mint's node RESTART so a
+    // headless node that mints (every agent-testing node mints on first run) keeps
+    // Tier-2 auto-exec wired across that restart. `None` in the GUI (uses wry_handle).
+    owned_state: Option<std::sync::Arc<Mutex<crate::NodeState>>>,
 ) -> Result<MintIpcResult, String> {
     mint_owner_identity_inner(state, KeychainStore::new().ok(), || async {
-        crate::start_node_inner(None, sink.clone(), wry_handle.clone(), state)
-            .await
-            .map(|_| ())
+        crate::start_node_inner(
+            None,
+            sink.clone(),
+            wry_handle.clone(),
+            state,
+            owned_state.clone(),
+        )
+        .await
+        .map(|_| ())
     })
     .await
 }

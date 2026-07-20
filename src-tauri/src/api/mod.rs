@@ -28,11 +28,22 @@ use std::sync::{Arc, Mutex};
 /// into axum handler signatures.
 pub trait NodeStateAccess: Send + Sync + 'static {
     fn node_state(&self) -> &Mutex<NodeState>;
+
+    /// ZEB-719: an owned handle to the `NodeState` for the `'static` voting-tick
+    /// auto-exec closure on the headless path. The GUI host borrows Tauri's managed
+    /// state through its `AppHandle` and dispatches via that seam, so it keeps the
+    /// default `None`. The `Arc<Self>` receiver stays object-safe for `Arc<dyn ..>`.
+    fn node_state_arc(self: Arc<Self>) -> Option<Arc<Mutex<NodeState>>> {
+        None
+    }
 }
 
 impl NodeStateAccess for Mutex<NodeState> {
     fn node_state(&self) -> &Mutex<NodeState> {
         self
+    }
+    fn node_state_arc(self: Arc<Self>) -> Option<Arc<Mutex<NodeState>>> {
+        Some(self)
     }
 }
 
@@ -346,6 +357,34 @@ mod tests {
     use super::*;
     use crate::node_event_sink::FanoutSink;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// ZEB-719: the `Mutex<NodeState>` impl (serve path) hands back the SAME
+    /// allocation as an owned `Arc`, so the headless voting-tick closure dispatches
+    /// against the very NodeState the node runs on.
+    #[test]
+    fn node_state_arc_mutex_impl_returns_same_arc() {
+        let arc: Arc<Mutex<NodeState>> = Arc::new(Mutex::new(NodeState::default()));
+        let dynned: Arc<dyn NodeStateAccess> = arc.clone();
+        let recovered = dynned.node_state_arc().expect("Mutex impl yields Some");
+        assert!(Arc::ptr_eq(&arc, &recovered), "same NodeState allocation");
+    }
+
+    /// The trait default (the GUI-host class, which dispatches via its `AppHandle`)
+    /// returns `None` — so the headless closure falls through to the stub for it.
+    #[test]
+    fn node_state_arc_default_impl_returns_none() {
+        struct NoArc;
+        impl NodeStateAccess for NoArc {
+            fn node_state(&self) -> &Mutex<NodeState> {
+                unreachable!("not exercised")
+            }
+        }
+        let d: Arc<dyn NodeStateAccess> = Arc::new(NoArc);
+        assert!(
+            d.node_state_arc().is_none(),
+            "default is None (GUI-host class)"
+        );
+    }
 
     /// Boot a real server on an ephemeral port with a default (not-running)
     /// NodeState. Returns the handle, the server task, the token read back
