@@ -6,9 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_types::{
-    DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, InboxEntry, InboxKey,
-    LibraryEntry, OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry,
-    ReadMarker, Space, SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
+    DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, GrantEntry, Hlc, InboxEntry,
+    InboxKey, LibraryEntry, OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache,
+    OwnerDeviceEntry, ReadMarker, Space, SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER,
+    MAX_PRIOR_CONTENT_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +106,28 @@ pub struct OwnerState {
     /// (`skip_serializing_if` + `default`) so pre-ZEB-674 snapshots load empty.
     #[serde(rename = "fd", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub file_deks: BTreeMap<[u8; 32], Vec<u8>>,
+    /// ZEB-674 Task 2 (C2): per-file read-access grant records — the owner's
+    /// "Shared with" list. Keyed by the shared file's ROOT ContentId's
+    /// canonical 32-byte form (same `[u8; 32]` = `ContentId::to_bytes()`
+    /// keying as `file_deks`, because `ContentId` is not `Ord`). The value is
+    /// the set of [`GrantEntry`] records for that CID. The sealed key is NOT
+    /// stored here — sealing happens at share time from the DEK (see
+    /// `file_sharing`).
+    ///
+    /// Replicates across the owner's own bound devices via Flow A. Merge is a
+    /// GROW-ONLY UNION per CID (see `owner_state_sync::merge_remote_into_local`),
+    /// NOT the first-writer-wins `or_insert` used for `file_deks`: a CID's grant
+    /// list is a growable SET, so a grant appended on one device must survive a
+    /// merge with a sibling holding a different grant for the same CID (plain
+    /// `or_insert` would silently drop it, diverging the list permanently).
+    /// Revoke is LAZY — a local revoke just drops the record with no tombstone,
+    /// so a still-holding sibling re-adds it on the next merge; this is
+    /// intentional (revoke is best-effort UI honesty and never withdraws
+    /// already-granted crypto access — ZEB-674 plan §Task 5). Absent on the wire
+    /// when empty (`skip_serializing_if` + `default`) so pre-ZEB-674 snapshots
+    /// load empty.
+    #[serde(rename = "fr", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub file_grants: BTreeMap<[u8; 32], Vec<GrantEntry>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -260,6 +260,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         friend_graph,
         revoked_dm_devices,
         file_deks,
+        file_grants,
     } = remote;
 
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
@@ -423,6 +424,44 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // the key already pins the payload.
     for (cid, sealed) in file_deks {
         local.file_deks.entry(cid).or_insert(sealed);
+    }
+
+    // ZEB-674 Task 2: per-file grant records — GROW-ONLY UNION per CID. Unlike
+    // `file_deks` above (a per-CID idempotent sealed blob → first-writer-wins
+    // `or_insert`), a CID's grant list is a growable SET of records: a grant
+    // appended on one device MUST survive a merge with a sibling holding a
+    // different grant for the same CID (a naive `or_insert` on the whole Vec
+    // would keep local's list and silently drop the remote's grants, diverging
+    // the "Shared with" list permanently). Union the entries, deduped by
+    // grantee — on a duplicate grantee the smaller `granted_at` wins, which is
+    // a deterministic set→set function and therefore convergent regardless of
+    // merge order — and keep the list sorted by grantee so the canonically-
+    // encoded state-root is byte-identical across the owner's devices.
+    //
+    // Lazy-revoke note (ZEB-674 plan §Task 5): a local revoke just drops the
+    // record (no tombstone), so a still-holding sibling re-adds it on the next
+    // merge. Intentional — revoke is best-effort UI honesty and never withdraws
+    // already-granted crypto access.
+    for (cid, remote_grants) in file_grants {
+        let entry = local.file_grants.entry(cid).or_default();
+        for g in remote_grants {
+            match entry
+                .iter()
+                .position(|e| e.grantee_owner == g.grantee_owner)
+            {
+                Some(i) => {
+                    if g.granted_at < entry[i].granted_at {
+                        entry[i].granted_at = g.granted_at;
+                    }
+                }
+                None => entry.push(g),
+            }
+        }
+        entry.sort_by(|a, b| {
+            a.grantee_owner
+                .cmp(&b.grantee_owner)
+                .then(a.granted_at.cmp(&b.granted_at))
+        });
     }
 }
 

@@ -2507,6 +2507,29 @@ impl LibraryEntry {
     }
 }
 
+/// ZEB-674 Task 2 (C2): one owner-local record that the owner shared read
+/// access to an encrypted file with a specific grantee — a row in the
+/// owner's "Shared with" list. Stored in `OwnerState.file_grants` keyed by
+/// the file's root ContentId, and replicated across the owner's own devices
+/// via Flow A.
+///
+/// The sealed key is intentionally NOT stored here: sealing to the grantee's
+/// devices happens at share time from the DEK (see `file_sharing`), so this
+/// record only names WHO was granted and WHEN. Revoke is lazy — the record is
+/// simply dropped (no tombstone; see the field doc on `file_grants`).
+///
+/// 2-char field keys (codebase convention; satisfies `canonical_cbor_encode`'s
+/// same-length-keys precondition — mirrors `ReadMarker` / `LibraryEntry`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantEntry {
+    /// The grantee's master `OwnerAddr` (their `owner_id`).
+    #[serde(rename = "go")]
+    pub grantee_owner: OwnerAddr,
+    /// Wall-clock milliseconds when this grant was recorded.
+    #[serde(rename = "ga")]
+    pub granted_at: u64,
+}
+
 #[cfg(test)]
 mod inbox_tests {
     use super::*;

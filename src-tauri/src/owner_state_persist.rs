@@ -133,6 +133,12 @@ struct CrdtFileV2 {
     /// == empty). `skip_serializing_if` keeps existing file shapes compact.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     file_deks: BTreeMap<[u8; 32], Vec<u8>>,
+    /// ZEB-674 Task 2 (C2): persisted per-file grant records (root CID bytes →
+    /// grant list). Absent in pre-Task-2 V2 files; `serde(default)` loads those
+    /// as empty (no schema-version bump — absent == empty). `skip_serializing_if`
+    /// keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    file_grants: BTreeMap<[u8; 32], Vec<crate::owner_state_types::GrantEntry>>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -149,6 +155,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             friend_graph: s.friend_graph.clone(),
             revoked_dm_devices: s.revoked_dm_devices.clone(),
             file_deks: s.file_deks.clone(),
+            file_grants: s.file_grants.clone(),
         }
     }
 }
@@ -167,6 +174,7 @@ impl From<CrdtFileV2> for OwnerState {
             friend_graph: f.friend_graph,
             revoked_dm_devices: f.revoked_dm_devices,
             file_deks: f.file_deks,
+            file_grants: f.file_grants,
         }
     }
 }
