@@ -224,6 +224,17 @@ git commit -m "feat(zeb-410): liveness heartbeat module (run_once + spawn)
 
 ### Task 2: Wire the heartbeat into `start_node_inner` + `NodeState`
 
+> **As-built correction (2026-07-20):** Steps 4-6 below originally targeted the late
+> voting-tick spawn block (`~12843`), reading the `_opt` locals there. The compiler
+> rejected it — those locals are out of scope at that block (which is why voting-tick
+> reads `voting_logs` from `guard`). The spawn was moved **into the owner-trust
+> guard-store block** (`~11726`, right after
+> `guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();`), where the three
+> `_opt` locals are in scope and `guard` is held. Spawn + slot-store live in that one
+> block, so a lock-poison rollback skips both together (no leak) — no cleanup-tuple
+> threading, no signing key on `NodeState`. The field/init/abort mirrors of
+> `voting_tick_handle` (Steps 1-3) are unchanged.
+
 **Files:**
 - Modify: `src-tauri/src/lib.rs` (`NodeState` field + inits + `stop_inner` abort; new `_opt` local; spawn block)
 

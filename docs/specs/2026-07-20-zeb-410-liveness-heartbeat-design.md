@@ -121,40 +121,44 @@ Notes:
 
 ### Wiring into `start_node_inner`
 
-Spawn the heartbeat at the **late voting-tick spawn block** (`lib.rs:~12843-12885`),
-adding a sibling `{ }` block right after it, mirroring `voting_tick_handle`'s
-lifecycle. The three inputs are threaded as **function-body `_opt` locals** — the
-same mechanism the resident trust doc/engine already use:
+Spawn the heartbeat **inside the owner-trust guard-store block** (`lib.rs:~11725`,
+right after `guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();`). This is
+the point where all three inputs are simultaneously in scope **and** the `NodeState`
+`guard` is held — so the spawn and the handle-stash happen in one place.
 
+(As-built note: an earlier draft placed the spawn at the late voting-tick block
+(`~12843`) reading the `_opt` locals directly. The compiler rejected it — those
+`_opt` locals go out of scope before that block, which is precisely why the
+voting-tick block reads `voting_logs` from `guard` rather than a local. The
+guard-store block is the correct home.)
+
+Inputs:
 - `owner_trust_doc_opt` and `owner_trust_sync_engine_opt` already exist (decl
-  `lib.rs:4181`, set `lib.rs:6120-6121`). A brace-depth scan confirms both remain in
-  scope at the `~12843` block (relative nesting stays positive from decl through the
-  spawn block), so the spawn block reads them directly — no `guard` round-trip
-  needed for the values.
+  `lib.rs:~4194`, set `lib.rs:~6120`) and are in scope at the guard-store block
+  (they are consumed there — `guard.owner_trust_doc = owner_trust_doc_opt.clone()`).
 - A **new** sibling local `heartbeat_device_sk_opt: Option<Arc<ed25519_dalek::SigningKey>>`
-  is declared next to `owner_trust_doc_opt` (`~4185`) and set at `~6121`, where
+  declared next to `owner_trust_doc_opt` (`~4199`) and set at `~6122`, where
   `loaded.device_signing_key` is in scope:
   `heartbeat_device_sk_opt = Some(Arc::new(loaded.device_signing_key.clone()));`.
   The key lives **only** in this local and is moved into the task closure — it is
   **never stored on `NodeState`**, keeping secret-key access scoped to the heartbeat
   task. (`loaded.device_signing_key` is dropped later in the function, which is why
-  the key is captured into the local at `~6121` rather than read at the spawn block.)
+  the key is captured into the local at `~6122` rather than read at the spawn block.)
 
-The spawn block itself mirrors the voting-tick block exactly: re-lock `state`, gate
-on `guard.generation == our_gen` (so a superseded start attempt doesn't spawn a
-stale heartbeat), clone the `NodeState.liveness_heartbeat_handle` slot, `drop(guard)`,
-then — only if all three `_opt`s are `Some` (i.e. an owner identity + resident trust
-engine exist) — `spawn_liveness_heartbeat(...)` and `replace()` the slot, aborting
-any prior handle. Because it spawns **under the generation gate after all
-start-failure points**, and stashes into a slot that lives on `NodeState` from node
-construction, it needs **no start-failure cleanup-tuple threading** (unlike the
-early-spawned `community_relay_*` handles) — `stop_inner` always finds and aborts it
-via the slot.
+The spawn block: only if all three `_opt`s are `Some` (i.e. an owner identity +
+resident trust engine exist), call `spawn_liveness_heartbeat(...)` and stash the
+`JoinHandle` into the `guard.liveness_heartbeat_handle` slot (`replace()`, aborting
+any prior handle). Because the **spawn and the stash live in the same guard block**
+that stores the doc/engine, they are **skipped together** on a lock-poison rollback
+that bypasses the block — so a rollback never leaves a spawned-but-untracked task
+(no leak), without any start-failure cleanup-tuple threading (unlike the
+early-spawned `community_relay_*` handles). On the normal path the handle is in the
+`NodeState`-resident slot, so `stop_inner` finds and aborts it.
 
 `JoinHandle` lifecycle (mirror `voting_tick_handle`):
 - new `NodeState` field `pub liveness_heartbeat_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>`
-  (mirror field `lib.rs:1183`, inits `lib.rs:1914` + `lib.rs:70331`);
-- aborted on node stop in `stop_inner` (mirror `lib.rs:2466`).
+  (mirror field `lib.rs:~1184`, inits `lib.rs:~1915` + `lib.rs:~70332`);
+- aborted on node stop in `stop_inner` (mirror `lib.rs:~2467`).
 
 Because the heartbeat captures only these three already-`Arc`/`Clone` handles (not
 the whole `NodeState`), it **avoids the two-seam GUI-`wry_handle`-vs-headless-`owned_Arc`
@@ -231,26 +235,28 @@ correctness impact.
   `spawn_liveness_heartbeat`, `LIVENESS_HEARTBEAT_INTERVAL`, `now_unix_secs` helper,
   unit tests.
 - **Modify:** `src-tauri/src/lib.rs`:
-  - `pub mod liveness_heartbeat;` declaration (near the other `pub mod` lines, ~158).
+  - `pub mod liveness_heartbeat;` declaration (near the other `pub mod` lines, ~208).
   - `NodeState.liveness_heartbeat_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>`
-    field (mirror `voting_tick_handle` `1183`) + inits in the two `NodeState` literals
-    (mirror `1914`, `70331`) + abort in `stop_inner` (mirror `2466`).
+    field (mirror `voting_tick_handle` `~1184`) + inits in the two `NodeState` literals
+    (mirror `~1915`, `~70332`) + abort in `stop_inner` (mirror `~2467`).
   - New sibling local `heartbeat_device_sk_opt: Option<Arc<ed25519_dalek::SigningKey>>`
-    (decl next to `owner_trust_doc_opt` `~4185`), set at `~6121`.
-  - Spawn `{ }` block right after the voting-tick block (`~12885`), mirroring its
-    generation-gate + slot-replace structure, reading the three `_opt` locals.
+    (decl next to `owner_trust_doc_opt` `~4199`), set at `~6122`.
+  - Spawn + slot-store block inside the owner-trust guard-store block (`~11726`,
+    right after `guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();`).
 
 ## Risks / open detail
 
-- **`_opt` local scope** is the one care-point, and it is **verified**: a brace-depth
-  scan from `owner_trust_doc_opt`'s decl (`4181`) to the spawn block (`12843`) shows
-  relative nesting stays positive throughout, so the locals are in scope at the spawn
-  block. The compiler is the backstop — an out-of-scope reference is a build error,
-  not a silent bug.
-- **No start-failure cleanup needed:** because the heartbeat spawns under the
-  generation gate (after all early-return failure points) into a `NodeState`-resident
-  slot, `stop_inner` always finds it — unlike the early-spawned `community_relay_*`
-  handles, no cleanup-tuple threading is required.
+- **`_opt` local scope** was the one care-point, and the **compiler settled it**: the
+  `_opt` locals are in scope at the owner-trust guard-store block (they are consumed
+  there) but **not** at the later voting-tick block — an earlier draft that spawned at
+  the voting-tick block failed to compile (`not found in this scope`), which is why the
+  spawn lives in the guard-store block.
+- **No start-failure cleanup needed:** the spawn and the handle-stash are in the same
+  guard block that stores the trust doc/engine, so a lock-poison rollback that bypasses
+  that block skips both together (no spawned-but-untracked task → no leak). On the
+  normal path the handle is in the `NodeState`-resident slot, so `stop_inner` finds it —
+  unlike the early-spawned `community_relay_*` handles, no cleanup-tuple threading is
+  required. (A superseding start's spawn `replace()`s and aborts the prior handle.)
 - **DRY (deferred):** the panel path's resident branch (`owner_commands.rs:729`/
   `734`) is left untouched — its direct `&mut` guard differs from the heartbeat's
   `tokio::sync::Mutex` lock, so sharing a helper would complicate more than it saves.
