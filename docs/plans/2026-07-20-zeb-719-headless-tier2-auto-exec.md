@@ -290,7 +290,18 @@ git commit -m "feat(voting): dispatch Tier-2 auto-exec on the headless serve+RPC
 **Files:**
 - Modify: `docs/plans/2026-07-20-zeb-719-headless-tier2-auto-exec.md` (as-built notes if anything drifted).
 
-- [ ] **Step 1: Reconcile plan/spec with as-built** (note any line-number drift or signature tweak).
+- [x] **Step 1: Reconcile plan/spec with as-built.**
+
+  **As-built deviation (correct, scope-completing):** the **mint-restart path** was added.
+  `mint_owner_identity` restarts the node via `mint_owner_identity_impl` → `start_node_inner`,
+  and every agent-testing node mints on first run — so `mint_owner_identity_impl` gained an
+  `owned_state` param, and the headless `mint_owner_identity` RPC handler is now bespoke too
+  (passes `__access.clone().node_state_arc()`). Without this, the post-mint tick would re-stub
+  auto-exec on exactly the headless flow the ticket targets. See spec §3b + updated caller matrix.
+
+  Iterative gate results: clippy `--lib` clean; 3 new unit tests pass
+  (`build_auto_exec_fn_tests::headless_dispatches_not_stub`,
+  `node_state_arc_mutex_impl_returns_same_arc`, `node_state_arc_default_impl_returns_none`).
 
 - [ ] **Step 2: Full CI-parity gate** (commit first; long run — relinks integ binaries)
 

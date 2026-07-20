@@ -75,21 +75,33 @@ fn node_state_arc(self: Arc<Self>) -> Option<Arc<Mutex<NodeState>>> { None } // 
   serve node runs on; `Arc<Self>` receiver is object-safe).
 - GUI host (`gui_host.rs`) keeps the default `None` (GUI uses `wry_handle`).
 
-The `start_node` RPC handler becomes **bespoke** (not the generic `rpc!` macro) so it can read
-both `let state = __access.node_state();` and `let owned = __access.clone().node_state_arc();`,
-calling `start_node_inner(a.endpoint, sink, None, state, owned)`.
+Both headless-reboot RPC handlers — `start_node` **and** `mint_owner_identity` — become
+**bespoke** (not the generic `rpc!` macro) so they can read both
+`let state = __access.node_state();` and `let owned = __access.clone().node_state_arc();`.
 
-### 4. Caller matrix (7 sites)
+### 3b. Mint-restart path (as-built — discovered during implementation)
+
+`mint_owner_identity` restarts the node (loads the freshly-minted owner) via
+`mint_owner_identity_impl` → `start_node_inner`. **Every agent-testing node mints on first run**
+(`NodeHandle::spawn` then `rpc("mint_owner_identity")`), so if that restart passed
+`owned_state = None`, the post-mint tick would re-stub auto-exec — defeating the fix for the
+exact flow it targets. So `mint_owner_identity_impl` also gains an
+`owned_state: Option<Arc<Mutex<NodeState>>>` param, threaded into its inner `start_node_inner`
+call; the headless mint RPC handler passes `__access.clone().node_state_arc()`, the GUI mint
+command passes `None` (uses `wry_handle`).
+
+### 4. Caller matrix (as-built)
 
 | Site | Path | `owned_state` |
 |---|---|---|
-| `lib.rs:3375` | GUI `start_node` command wrapper | `None` (wry `Some`) |
-| `owner_commands.rs:1377` | GUI node restart | `None` (wry `Some`) |
-| `lib.rs:25009` | **primary serve boot** | `Some(Arc::clone(&state))` |
-| `lib.rs:73602` | in-lib test (`ok_restart`) | `None` |
-| `api/rpc.rs` `start_node` | **headless RPC (re)boot** | `__access.clone().node_state_arc()` |
-| `tests/profile/profile_isolation.rs:61` | test harness | `None` |
-| `tests/api/api_server.rs:93` | ZEB-445 integration harness | `None` |
+| `lib.rs` GUI `start_node` command wrapper | GUI first boot | `None` (wry `Some`) |
+| `owner_commands.rs` `mint_owner_identity_impl` → `start_node_inner` | mint restart | threaded param (below) |
+| `lib.rs` primary serve boot | **headless serve** | `Some(Arc::clone(&state))` |
+| `lib.rs` in-lib `ok_restart` test | test | `None` |
+| `api/rpc.rs` `start_node` (bespoke) | **headless RPC reboot** | `__access.clone().node_state_arc()` |
+| `api/rpc.rs` `mint_owner_identity` (bespoke) | **headless mint** | `__access.clone().node_state_arc()` |
+| `owner_commands.rs` GUI `mint_owner_identity` command | GUI mint | `None` (wry `Some`) |
+| `tests/profile/profile_isolation.rs`, `tests/api/api_server.rs` | test harnesses | `None` |
 
 ## Testing
 
