@@ -72,6 +72,22 @@ impl MembershipSnapshotResolver for FixedResolvers {
     }
 }
 
+/// ZEB-718: no-op backfill closures for tests that only exercise the live
+/// pub/sub path. The responder serves nothing; the requester applies nothing.
+fn noop_backfill() -> (
+    harmony_app::event_loop::VotingBackfillReadFn,
+    harmony_app::event_loop::VotingBackfillApplyFn,
+) {
+    (
+        Arc::new(|| Box::pin(async { Vec::new() })),
+        Arc::new(|_frame| Box::pin(async {})),
+    )
+}
+
+/// A backfill floor long enough that the periodic pull never fires during a
+/// test; recovery in the ZEB-718 acceptance tests rides the pull-on-spawn.
+const NO_BACKFILL_FLOOR: std::time::Duration = std::time::Duration::from_secs(86_400);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn voting_event_flows_through_two_zenoh_sessions() {
     // Open two default-config peer sessions — they discover each other
@@ -125,6 +141,7 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
     let (a_pub_tx, a_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     // Engine A doesn't need to receive inbound; give it a dummy subscriber_tx.
     let (a_sub_tx_unused, _a_sub_rx_unused) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (bf_read_a, bf_apply_a) = noop_backfill();
     let _adapter_a_handle = spawn_voting_log_zenoh_adapter(
         Arc::clone(&session_a),
         community_id_hex.clone(),
@@ -132,6 +149,9 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
         Arc::clone(&crdt_state),
         a_pub_rx,
         a_sub_tx_unused,
+        bf_read_a,
+        bf_apply_a,
+        NO_BACKFILL_FLOOR,
         Arc::clone(&closing_a),
     );
 
@@ -142,6 +162,7 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
     let closing_b = Arc::new(AtomicBool::new(false));
     let (b_pub_tx, b_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let (b_sub_tx, b_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (bf_read_b, bf_apply_b) = noop_backfill();
     let _adapter_b_handle = spawn_voting_log_zenoh_adapter(
         Arc::clone(&session_b),
         community_id_hex.clone(),
@@ -149,6 +170,9 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
         Arc::clone(&crdt_state),
         b_pub_rx,
         b_sub_tx,
+        bf_read_b,
+        bf_apply_b,
+        NO_BACKFILL_FLOOR,
         Arc::clone(&closing_b),
     );
 
@@ -336,6 +360,7 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
     let closing_b = Arc::new(AtomicBool::new(false));
     let (b_pub_tx, b_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let (b_sub_tx, b_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (bf_read_b, bf_apply_b) = noop_backfill();
     let _adapter_b = spawn_voting_log_zenoh_adapter(
         Arc::clone(&session_b),
         community_id_hex.clone(),
@@ -343,6 +368,9 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
         Arc::clone(&crdt_state_b),
         b_pub_rx,
         b_sub_tx,
+        bf_read_b,
+        bf_apply_b,
+        NO_BACKFILL_FLOOR,
         Arc::clone(&closing_b),
     );
 
@@ -434,4 +462,347 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
 
     closing_b.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(_engine_b);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ZEB-718: voting backfill / pull-on-rejoin acceptance tests.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Build a Tier-1 PollCreate signed by `keypair` for `actor` on `device` at
+/// `wall`, plus its derived PollId.
+fn signed_tier1_create(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    community_id: SpaceId,
+    device: &str,
+    wall: u64,
+) -> (
+    harmony_app::community_voting_core::SignedVotingEvent,
+    harmony_app::community_voting_core::PollId,
+) {
+    let cfg = Tier1PollConfig {
+        options: vec!["a".into(), "b".into()],
+        window_seconds: 600,
+        quorum: None,
+        threshold_percent: None,
+        multi_winner: None,
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        channel_id: ChannelId([0xef; 16]),
+    };
+    let hlc = Hlc {
+        wall_ms: wall,
+        logical: 0,
+        device_id: device.into(),
+    };
+    let ev = build_signed_poll_create_tier1(keypair, actor, &cfg, hlc).expect("build create");
+    let sb = ev.signing_bytes().expect("signing_bytes");
+    let pid = derive_poll_id(&community_id, &sb);
+    (ev, pid)
+}
+
+/// One community `crdt_state` at `epoch` with `key` — the wire-crypto source
+/// the adapter reads for encrypt/decrypt.
+fn crdt_at_epoch(
+    community_id: SpaceId,
+    epoch: u64,
+    key: EpochKey,
+) -> Arc<Mutex<harmony_app::owner_state_crdt::OwnerState>> {
+    Arc::new(Mutex::new({
+        let mut os = harmony_app::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            community_id,
+            harmony_app::community_state_sync::test_community_space(community_id, epoch, key),
+        );
+        os
+    }))
+}
+
+/// Spawn a real `VotingLogEngine` + adapter (with the real backfill closures)
+/// on `session`. Returns the engine (hold it to keep the node alive) and its
+/// shared `VotingLog` (seed / assert through it).
+async fn spawn_real_voting_node(
+    session: Arc<zenoh::Session>,
+    community_id: SpaceId,
+    community_id_hex: &str,
+    crdt_state: Arc<Mutex<harmony_app::owner_state_crdt::OwnerState>>,
+    resolvers: Arc<FixedResolvers>,
+    backfill_interval: std::time::Duration,
+    closing: Arc<AtomicBool>,
+) -> (
+    Arc<VotingLogEngine<tauri::test::MockRuntime>>,
+    Arc<Mutex<VotingLog>>,
+) {
+    let log = Arc::new(Mutex::new(VotingLog::default()));
+    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let id_resolver: Arc<dyn VotingIdentityResolver> = resolvers.clone();
+    let mem_resolver: Arc<dyn MembershipSnapshotResolver> = resolvers.clone();
+    let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        community_id,
+        voting_log: Arc::clone(&log),
+        publisher_tx: pub_tx,
+        subscriber_rx: sub_rx,
+        hlc_tracker: None,
+        device_id: None,
+        app_handle: None,
+        identity_resolver: Some(id_resolver),
+        membership_resolver: Some(mem_resolver),
+    })
+    .await;
+    let (bf_read, bf_apply) =
+        harmony_app::community_voting_log_engine::backfill_closures_for_test(&engine);
+    // Detached adapter task (tokio::spawn keeps running after the handle
+    // drops); it exits when `closing` flips.
+    let _adapter = spawn_voting_log_zenoh_adapter(
+        Arc::clone(&session),
+        community_id_hex.to_string(),
+        community_id,
+        crdt_state,
+        pub_rx,
+        sub_tx,
+        bf_read,
+        bf_apply,
+        backfill_interval,
+        closing,
+    );
+    (engine, log)
+}
+
+fn one_member_resolvers(actor: OwnerAddr, pub_64: [u8; 64]) -> Arc<FixedResolvers> {
+    Arc::new(FixedResolvers {
+        identity: HashMap::from([(actor, pub_64)]),
+        snapshot: MembershipSnapshot {
+            members: HashMap::from([(
+                actor,
+                MemberAttrs {
+                    power: 1,
+                    vouching_depth: 1,
+                },
+            )]),
+        },
+    })
+}
+
+/// Criterion 1: a peer that missed voting events while offline recovers them
+/// on rejoin via the full-dump backfill pull.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backfill_recovers_events_missed_while_offline() {
+    let cfg = zenoh::Config::default();
+    let session_a = Arc::new(zenoh::open(cfg.clone()).await.expect("A open"));
+    let session_b = Arc::new(zenoh::open(cfg).await.expect("B open"));
+
+    let community_id = SpaceId([0x51; 16]);
+    let community_id_hex = hex::encode(community_id.0);
+    let key = EpochKey::new([0x11; 32]);
+
+    let (keypair, actor, pub_64) = fixture_identity(0x5a);
+    let resolvers = one_member_resolvers(actor, pub_64);
+
+    // Node A (source): seed its log with two polls A "created" while B was
+    // offline. A only needs to serve them from `log.events`.
+    let closing_a = Arc::new(AtomicBool::new(false));
+    let (_engine_a, log_a) = spawn_real_voting_node(
+        Arc::clone(&session_a),
+        community_id,
+        &community_id_hex,
+        crdt_at_epoch(community_id, 0, key.clone()),
+        resolvers.clone(),
+        std::time::Duration::from_secs(86_400),
+        Arc::clone(&closing_a),
+    )
+    .await;
+
+    let (e1, pid1) = signed_tier1_create(&keypair, actor, community_id, "a1", 1_700_000_000_001);
+    let (e2, pid2) = signed_tier1_create(&keypair, actor, community_id, "a2", 1_700_000_000_002);
+    {
+        let mut log = log_a.lock().await;
+        log.events.push(e1);
+        log.events.push(e2);
+    }
+
+    // Node B (rejoins): short backfill floor so it re-pulls until A's
+    // responder is discoverable.
+    let closing_b = Arc::new(AtomicBool::new(false));
+    let (_engine_b, log_b) = spawn_real_voting_node(
+        Arc::clone(&session_b),
+        community_id,
+        &community_id_hex,
+        crdt_at_epoch(community_id, 0, key),
+        resolvers.clone(),
+        std::time::Duration::from_millis(300),
+        Arc::clone(&closing_b),
+    )
+    .await;
+
+    let mut recovered = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let log = log_b.lock().await;
+        if log.has_poll(&pid1) && log.has_poll(&pid2) {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(
+        recovered,
+        "B must recover both missed polls via the backfill pull"
+    );
+
+    closing_a.store(true, std::sync::atomic::Ordering::SeqCst);
+    closing_b.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Criterion 2: a legitimate vote dropped across an epoch rotation is recovered
+/// under the NEW epoch. C (rotated to epoch 1) holds `e1`; B (also at epoch 1)
+/// missed it on the live topic (its current-epoch cut dropped the stale epoch-0
+/// packet) and recovers it via backfill — C re-encrypts `e1` under epoch 1 at
+/// serve time, so it passes B's cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backfill_recovers_cross_rotation_dropped_vote_under_new_epoch() {
+    let cfg = zenoh::Config::default();
+    let session_b = Arc::new(zenoh::open(cfg.clone()).await.expect("B open"));
+    let session_c = Arc::new(zenoh::open(cfg).await.expect("C open"));
+
+    let community_id = SpaceId([0x52; 16]);
+    let community_id_hex = hex::encode(community_id.0);
+    let k1 = EpochKey::new([0xb1; 32]); // the post-rotation (epoch 1) key both hold
+
+    let (keypair, actor, pub_64) = fixture_identity(0x5c);
+    let resolvers = one_member_resolvers(actor, pub_64);
+    let (e1, pid1) = signed_tier1_create(&keypair, actor, community_id, "src", 1_700_000_000_100);
+
+    // Node C (responder): rotated to epoch 1, holds e1 (received pre-rotation).
+    let closing_c = Arc::new(AtomicBool::new(false));
+    let (_engine_c, log_c) = spawn_real_voting_node(
+        Arc::clone(&session_c),
+        community_id,
+        &community_id_hex,
+        crdt_at_epoch(community_id, 1, k1.clone()),
+        resolvers.clone(),
+        std::time::Duration::from_secs(86_400),
+        Arc::clone(&closing_c),
+    )
+    .await;
+    log_c.lock().await.events.push(e1);
+
+    // Node B (rotated to epoch 1, missing e1): recovers via backfill.
+    let closing_b = Arc::new(AtomicBool::new(false));
+    let (_engine_b, log_b) = spawn_real_voting_node(
+        Arc::clone(&session_b),
+        community_id,
+        &community_id_hex,
+        crdt_at_epoch(community_id, 1, k1),
+        resolvers.clone(),
+        std::time::Duration::from_millis(300),
+        Arc::clone(&closing_b),
+    )
+    .await;
+
+    let mut recovered = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if log_b.lock().await.has_poll(&pid1) {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(
+        recovered,
+        "B must recover the cross-rotation-dropped vote, re-served under the current epoch"
+    );
+
+    closing_b.store(true, std::sync::atomic::Ordering::SeqCst);
+    closing_c.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Criterion 3: backfill does not weaken the ZEB-717 cut. A kicked-then-rotated
+/// identity K (holds only the epoch-0 key) cannot recover current-epoch backfill
+/// replies — it lacks K(1), so its decrypt cut drops them. Non-vacuous: a
+/// retained member B (at epoch 1) recovers `e1` from the SAME responder M,
+/// proving M is serving and the pull path works; K, on the same M, gets nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backfill_does_not_weaken_the_cut_for_a_kicked_rotated_identity() {
+    let cfg = zenoh::Config::default();
+    let session_m = Arc::new(zenoh::open(cfg.clone()).await.expect("M open"));
+    let session_b = Arc::new(zenoh::open(cfg.clone()).await.expect("B open"));
+    let session_k = Arc::new(zenoh::open(cfg).await.expect("K open"));
+
+    let community_id = SpaceId([0x53; 16]);
+    let community_id_hex = hex::encode(community_id.0);
+    let k0 = EpochKey::new([0xa0; 32]); // stale epoch-0 key the kicked member still holds
+    let k1 = EpochKey::new([0xb1; 32]); // current epoch-1 key retained members hold
+
+    let (keypair, actor, pub_64) = fixture_identity(0x5e);
+    let resolvers = one_member_resolvers(actor, pub_64);
+    let (e1, pid1) = signed_tier1_create(&keypair, actor, community_id, "src", 1_700_000_000_200);
+
+    // Responder M: epoch 1, holds e1.
+    let closing_m = Arc::new(AtomicBool::new(false));
+    let (_engine_m, log_m) = spawn_real_voting_node(
+        Arc::clone(&session_m),
+        community_id,
+        &community_id_hex,
+        crdt_at_epoch(community_id, 1, k1.clone()),
+        resolvers.clone(),
+        std::time::Duration::from_secs(86_400),
+        Arc::clone(&closing_m),
+    )
+    .await;
+    log_m.lock().await.events.push(e1);
+
+    // Positive control B: epoch 1 → recovers e1 (readiness barrier).
+    let closing_b = Arc::new(AtomicBool::new(false));
+    let (_engine_b, log_b) = spawn_real_voting_node(
+        Arc::clone(&session_b),
+        community_id,
+        &community_id_hex,
+        crdt_at_epoch(community_id, 1, k1),
+        resolvers.clone(),
+        std::time::Duration::from_millis(300),
+        Arc::clone(&closing_b),
+    )
+    .await;
+
+    // Kicked K: epoch 0 → must recover nothing from the same responder.
+    let closing_k = Arc::new(AtomicBool::new(false));
+    let (_engine_k, log_k) = spawn_real_voting_node(
+        Arc::clone(&session_k),
+        community_id,
+        &community_id_hex,
+        crdt_at_epoch(community_id, 0, k0),
+        resolvers.clone(),
+        std::time::Duration::from_millis(300),
+        Arc::clone(&closing_k),
+    )
+    .await;
+
+    // Barrier: wait until B has recovered (proves M serves + pull works).
+    let mut b_recovered = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if log_b.lock().await.has_poll(&pid1) {
+            b_recovered = true;
+            break;
+        }
+    }
+    assert!(
+        b_recovered,
+        "positive control: retained member B must recover e1"
+    );
+
+    // Give K ample additional pull cycles, then assert it recovered nothing —
+    // its epoch-0 cut drops M's current-epoch replies.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        !log_k.lock().await.has_poll(&pid1),
+        "kicked-then-rotated K (epoch 0) must NOT recover current-epoch backfill"
+    );
+
+    closing_m.store(true, std::sync::atomic::Ordering::SeqCst);
+    closing_b.store(true, std::sync::atomic::Ordering::SeqCst);
+    closing_k.store(true, std::sync::atomic::Ordering::SeqCst);
 }

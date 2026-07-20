@@ -48067,6 +48067,14 @@ mod zeb718_voting_reconcile_tests {
 /// requests and arriving beacons trigger kd=ss publication. Pre-existing
 /// engines (already in the map) are NOT re-wired — they were wired at their
 /// creation time.
+/// ZEB-718: periodic anti-entropy floor between voting backfill pulls. The
+/// requester also pulls once on adapter spawn (join/reconnect catch-up), so
+/// this bounds only the recovery latency for events missed *while already
+/// connected* (e.g. a cross-rotation drop). Voting is sparse and a pull is a
+/// small full-dump `get`, so a few-minute floor is cheap. (Transport-up
+/// re-arm for prompter reconnect recovery is a deferred enhancement.)
+const VOTING_BACKFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[allow(clippy::too_many_arguments)]
 async fn ensure_voting_engine_for(
     voting_logs: &VotingLogsMap,
@@ -48207,6 +48215,24 @@ async fn ensure_voting_engine_for(
         .await;
     }
 
+    // ZEB-718: backfill closures capture the engine so the adapter's
+    // responder can read live events and its requester can apply recovered
+    // frames through the engine's coordinate-dedup path.
+    let engine_for_backfill_read = std::sync::Arc::clone(&engine);
+    let read_for_backfill: crate::event_loop::VotingBackfillReadFn =
+        std::sync::Arc::new(move || {
+            let e = std::sync::Arc::clone(&engine_for_backfill_read);
+            Box::pin(async move { e.read_backfill_frames().await })
+        });
+    let engine_for_backfill_apply = std::sync::Arc::clone(&engine);
+    let apply_backfilled: crate::event_loop::VotingBackfillApplyFn =
+        std::sync::Arc::new(move |frame: Vec<u8>| {
+            let e = std::sync::Arc::clone(&engine_for_backfill_apply);
+            Box::pin(async move {
+                let _ = e.apply_backfilled_event(&frame).await;
+            })
+        });
+
     // Build the adapter request now but do NOT send yet — we only send if
     // we win the engine map insertion below. This closes the TOCTOU window
     // where two concurrent first-time callers could each send an adapter
@@ -48219,6 +48245,9 @@ async fn ensure_voting_engine_for(
         crdt_state: crdt_state.clone(),
         publisher_rx,
         subscriber_tx,
+        read_for_backfill,
+        apply_backfilled,
+        backfill_interval: VOTING_BACKFILL_INTERVAL,
     };
 
     // Atomic check-and-insert under the std::Mutex. The FIRST caller to

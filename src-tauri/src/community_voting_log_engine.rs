@@ -393,6 +393,23 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         }
     }
 
+    /// ZEB-718: plaintext `SignedVotingEvent` CBOR frames for the live
+    /// (non-archived) voting log — one per event. Consumed by the backfill
+    /// responder (in the Zenoh adapter), which re-encrypts each frame under
+    /// the community's **current** epoch at serve time so it passes the
+    /// requester's current-epoch cut. Archived events are already pruned
+    /// from `log.events`, so this is naturally the "live polls only" set.
+    pub(crate) async fn read_backfill_frames(&self) -> Vec<Vec<u8>> {
+        let log = self.voting_log.lock().await;
+        log.events
+            .iter()
+            .filter_map(|ev| {
+                let mut buf = Vec::new();
+                ciborium::into_writer(ev, &mut buf).ok().map(|()| buf)
+            })
+            .collect()
+    }
+
     /// Construct an engine, spawn its inbound receive loop, and return
     /// an `Arc<Self>` suitable for registry storage.
     pub async fn start(params: VotingLogEngineParams<R>) -> Arc<Self> {
@@ -2577,9 +2594,6 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     ///
     /// Returns `Ok(None)` on a duplicate coordinate or when resolvers are
     /// not wired; `Ok(Some(pid))` on a fresh apply.
-    // Production caller (the backfill requester driver) is wired in ZEB-718 T6;
-    // until then this is exercised only by unit tests.
-    #[allow(dead_code)]
     pub(crate) async fn apply_backfilled_event(
         &self,
         packet: &[u8],
@@ -3034,6 +3048,36 @@ async fn inbound_eligibility_check(
         }
     }
     Ok(())
+}
+
+// ── ZEB-718 backfill test seam ───────────────────────────────────────────────
+
+/// Test seam (ZEB-718): build the backfill read + apply closures for
+/// `engine`, so integration tests — which see only the public API — can wire
+/// the real backfill path into `spawn_voting_log_zenoh_adapter`. Mirrors the
+/// closures `ensure_voting_engine_for` builds in production (the underlying
+/// `read_backfill_frames` / `apply_backfilled_event` are `pub(crate)`).
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn backfill_closures_for_test<R: tauri::Runtime>(
+    engine: &Arc<VotingLogEngine<R>>,
+) -> (
+    crate::event_loop::VotingBackfillReadFn,
+    crate::event_loop::VotingBackfillApplyFn,
+) {
+    let e_read = Arc::clone(engine);
+    let read: crate::event_loop::VotingBackfillReadFn = Arc::new(move || {
+        let e = Arc::clone(&e_read);
+        Box::pin(async move { e.read_backfill_frames().await })
+    });
+    let e_apply = Arc::clone(engine);
+    let apply: crate::event_loop::VotingBackfillApplyFn = Arc::new(move |frame: Vec<u8>| {
+        let e = Arc::clone(&e_apply);
+        Box::pin(async move {
+            let _ = e.apply_backfilled_event(&frame).await;
+        })
+    });
+    (read, apply)
 }
 
 // ── process_inbound_for_test seam ───────────────────────────────────────────

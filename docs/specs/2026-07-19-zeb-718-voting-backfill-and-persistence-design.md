@@ -265,10 +265,31 @@ assert `voting_logs` rebuilds identical materialized state without any peer.
 **Wire fixtures:** backfill replies reuse the existing `EncryptedEnvelope` wire — no new format. Assert
 round-trip (encryption is nondeterministic); inner plaintext `SignedVotingEvent` fixtures unchanged.
 
+## 6.1 Implementation notes (as-built, diverged from plan)
+
+- **Eager boot-spawn (D6) → reload-on-first-setup.** The voting-engine's full handle set (signing key,
+  app_handle, dfrost/beacon) is not assembled at the early per-community boot loop where channel-log
+  reconciles, so `reconcile_voting_from_state` is instead called from `ensure_voting_engine_for`'s
+  first-setup path (idempotent). The engine still spawns lazily (first voting IPC / access), but it
+  attaches to the reloaded log — restart-durability holds; only the *timing* of reload shifts from
+  boot to first-access. Trade-off: a pending Tier-2 finalization on a passive node resumes at first
+  voting access rather than immediately at boot (acceptable at current scale; eager boot-spawn is a
+  future enhancement).
+- **Driver inlined in the adapter** (no separate `community_voting_backfill.rs`): the requester loop
+  lives inside `spawn_voting_log_zenoh_adapter` (which owns the Zenoh session), pulling on spawn and
+  every `VOTING_BACKFILL_INTERVAL` (300s). Transport-up re-arm is deferred (the periodic floor covers
+  reconnect within the interval).
+- **Backfill closures cross the engine↔adapter boundary** via `VotingBackfillReadFn` /
+  `VotingBackfillApplyFn` type aliases; the underlying `read_backfill_frames` / `apply_backfilled_event`
+  stay `pub(crate)`, exposed to integration tests only through the `test-fixtures`-gated
+  `backfill_closures_for_test` seam.
+
 ## 7. Known limitations & out of scope
 
-- **Presence-resync (new-holder) re-arm** deferred (§4.3); periodic floor + transport edge suffice for
-  acceptance. Filed as a follow-up if fleet testing wants faster new-holder convergence.
+- **Transport-up / presence-resync re-arm** deferred; the periodic floor (300s) is the sole re-pull
+  trigger beyond pull-on-spawn. Reconnect/cross-rotation recovery latency is therefore bounded by the
+  floor, not immediate. A follow-up can wire `transport_epoch_rx` for prompter recovery.
+- **Eager boot-spawn** deferred (§6.1) — reload happens at first voting access, not at boot.
 - **Voting policy is local-only** (per-node, IPC-set, ZEB-298); persistence now keeps it across restart,
   but community-wide policy *sync* remains out of scope (separate concern, unchanged).
 - **RBSR for voting** — intentionally not built (§2.3); the additive `rbsr/**` seam can be layered later
