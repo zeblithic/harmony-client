@@ -90,7 +90,7 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
     let state = Arc::new(Mutex::new(harmony_app::NodeState::default()));
     let events = harmony_app::api::events::ApiEventSink::new();
     let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(events.clone());
-    let boot = harmony_app::start_node_inner(None, sink.clone(), None, &state)
+    let boot = harmony_app::start_node_inner(None, sink.clone(), None, &state, None)
         .await
         .expect("headless node boots without Tauri");
     assert!(

@@ -494,12 +494,35 @@ struct SetIdentityDiscoverableArgs {
 pub fn build_registry() -> RpcRegistry {
     let mut m: HashMap<&'static str, RpcHandler> = HashMap::new();
 
-    // Node lifecycle.
-    rpc!(
-        m,
+    // Node lifecycle. ZEB-719: `start_node` is hand-written (not the generic `rpc!`
+    // macro) so it can pass the owned `Arc<Mutex<NodeState>>` for headless Tier-2
+    // auto-exec — the macro only exposes the borrowed `node_state()`. The owned Arc
+    // (same allocation the serve node runs on) lets the `'static` voting-tick closure
+    // dispatch a finalized SetPower instead of the `SkippedNotAdmin` stub.
+    m.insert(
         "start_node",
-        StartNodeArgs,
-        |state, sink, a| async move { crate::start_node_inner(a.endpoint, sink, None, state).await }
+        Box::new(
+            move |__access: Arc<dyn super::NodeStateAccess>,
+                  sink: Arc<dyn NodeEventSink>,
+                  raw: serde_json::Value| {
+                Box::pin(async move {
+                    let owned = __access.clone().node_state_arc();
+                    let state = __access.node_state();
+                    let raw = if raw.is_null() {
+                        serde_json::json!({})
+                    } else {
+                        raw
+                    };
+                    let a: StartNodeArgs = serde_json::from_value(raw)
+                        .map_err(|e| RpcError::BadArgs(e.to_string()))?;
+                    let out = crate::start_node_inner(a.endpoint, sink, None, state, owned)
+                        .await
+                        .map_err(RpcError::Command)?;
+                    serde_json::to_value(out)
+                        .map_err(|e| RpcError::Command(format!("serialize: {e}")))
+                }) as RpcFuture
+            },
+        ) as RpcHandler,
     );
     rpc!(m, "stop_node", EmptyArgs, |state, sink, _a| async move {
         crate::stop_node_impl(state, sink)
@@ -511,10 +534,28 @@ pub fn build_registry() -> RpcRegistry {
     });
     // ZEB-445 DoD: explicit headless identity bootstrap — first boot is
     // pre-mint; the GUI mints via WelcomeModal. `None` wry_handle: no Tauri
-    // runtime headless.
-    rpc!(m, "mint_owner_identity", EmptyArgs, |state, sink, _a| {
-        async move { crate::owner_commands::mint_owner_identity_impl(state, sink, None).await }
-    });
+    // runtime headless. ZEB-719: hand-written (not `rpc!`) so the mint's node
+    // RESTART receives the owned `Arc<Mutex<NodeState>>` — every agent-testing node
+    // mints on first run, so without this the post-mint tick would re-stub auto-exec.
+    m.insert(
+        "mint_owner_identity",
+        Box::new(
+            move |__access: Arc<dyn super::NodeStateAccess>,
+                  sink: Arc<dyn NodeEventSink>,
+                  _raw: serde_json::Value| {
+                Box::pin(async move {
+                    let owned = __access.clone().node_state_arc();
+                    let state = __access.node_state();
+                    let out =
+                        crate::owner_commands::mint_owner_identity_impl(state, sink, None, owned)
+                            .await
+                            .map_err(RpcError::Command)?;
+                    serde_json::to_value(out)
+                        .map_err(|e| RpcError::Command(format!("serialize: {e}")))
+                }) as RpcFuture
+            },
+        ) as RpcHandler,
+    );
 
     // Communities.
     rpc!(

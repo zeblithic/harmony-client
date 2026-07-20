@@ -58,7 +58,7 @@ async fn named_profile_scopes_both_roots_and_boots() {
     let state = Arc::new(Mutex::new(harmony_app::NodeState::default()));
     let events = harmony_app::api::events::ApiEventSink::new();
     let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(events.clone());
-    harmony_app::start_node_inner(None, sink.clone(), None, &state)
+    harmony_app::start_node_inner(None, sink.clone(), None, &state, None)
         .await
         .expect("node must boot on a named profile");
 
