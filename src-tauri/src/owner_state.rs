@@ -921,9 +921,11 @@ pub fn self_liveness_future_skew_secs(
 ///
 /// ZEB-721: if our own cert is stamped in the *future* relative to `now`, the
 /// host clock regressed behind it. We do NOT re-sign (a lower timestamp loses the
-/// liveness CRDT merge, and fabricating time is not our posture) — we warn once
-/// and report `ClockRegressed` so callers can surface it. This is the single
-/// detection point shared by the panel-load and heartbeat call sites.
+/// liveness CRDT merge, and fabricating time is not our posture) — we report
+/// `ClockRegressed { skew_secs }` so callers can surface it. Logging is left to
+/// the callers so it can be deduplicated: the heartbeat warns only on the
+/// healthy→regressed transition, and the Devices panel shows a banner. This is
+/// the single detection point shared by the panel-load and heartbeat call sites.
 pub fn refresh_self_liveness(
     state: &mut OwnerState,
     device_sk: &SigningKey,
@@ -934,19 +936,12 @@ pub fn refresh_self_liveness(
     let device_id = device_id_from_signing_key(device_sk);
     let threshold = harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2;
     match state.liveness.get(&device_id) {
-        // Regressed clock: cert looks fresh forever → renewal suppressed. Surface
-        // instead of a silent no-op; self-heals when the clock recovers.
-        Some(cert) if cert.timestamp > now => {
-            let skew_secs = cert.timestamp - now;
-            tracing::warn!(
-                target: "harmony_liveness",
-                cert_ts = cert.timestamp,
-                now,
-                skew_secs,
-                "self-liveness cert is stamped in the future — host clock regressed; not renewing until the clock recovers"
-            );
-            LivenessRefreshOutcome::ClockRegressed { skew_secs }
-        }
+        // Regressed clock: cert looks fresh forever → renewal suppressed. Report
+        // it (callers log/surface, deduplicated) instead of a silent no-op;
+        // self-heals when the clock recovers.
+        Some(cert) if cert.timestamp > now => LivenessRefreshOutcome::ClockRegressed {
+            skew_secs: cert.timestamp - now,
+        },
         // Fresh enough — nothing to do.
         Some(cert) if cert.timestamp >= now.saturating_sub(threshold) => {
             LivenessRefreshOutcome::Fresh

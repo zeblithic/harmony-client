@@ -101,9 +101,11 @@ impl LivenessRefreshOutcome {
 
 New behavior inside the function, keyed off the existing cert vs `now`:
 
-- `cert.timestamp > now`  → `ClockRegressed { skew_secs: cert.timestamp − now }`
-  **and a single `tracing::warn!`** (moves the detection log out of the heartbeat into the
-  shared path so the panel path gets it too). No write.
+- `cert.timestamp > now`  → `ClockRegressed { skew_secs: cert.timestamp − now }`. No write.
+  The function does **not** log — logging is a caller concern so it can be deduplicated (the
+  heartbeat warns only on the healthy→regressed transition; the panel surfaces a banner).
+  This keeps the shared function a pure detection point and avoids per-call WARN spam under a
+  persistently regressed clock (once/hour from the heartbeat + every panel load would be noise).
 - `cert` absent, or `cert.timestamp < now − 15d` → sign; `Refreshed` (or `SignFailed`).
 - otherwise (`now − 15d ≤ cert.timestamp ≤ now`) → `Fresh`. No write.
 
@@ -157,9 +159,10 @@ is informational; the remedy is fixing the host clock.
 
 ### 4. Heartbeat + call-site glue
 
-- `run_liveness_heartbeat_once` (`liveness_heartbeat.rs:41`): drop its bespoke
-  future-stamp warn (now emitted by the shared path) and translate the enum — `notify_dirty()`
-  + the existing info log only when `outcome.wrote()`.
+- `run_liveness_heartbeat_once` (`liveness_heartbeat.rs:41`): drop its bespoke future-stamp
+  warn and return the `LivenessRefreshOutcome`. The spawn loop keeps a `clock_was_regressed`
+  flag and warns only on the healthy→regressed transition (dedup), and calls `notify_dirty()`
+  + the info log only when `outcome.wrote()`.
 - `get_owner_state` refresh block (`owner_commands.rs:727`): `engine.notify_dirty()` only
   when `outcome.wrote()`; the DTO field is computed at view-build (component 3), independent
   of the refresh outcome.
@@ -170,7 +173,7 @@ is informational; the remedy is fixing the host clock.
 |---|---|---|---|---|
 | Healthy, cert fresh (≤15d) | `Fresh` | no | `None` | n/a |
 | Healthy, cert stale (>15d) | `Refreshed` | yes, at `now` | `None` | n/a |
-| Regressed (cert in future) | `ClockRegressed{skew}` + warn | no | `Some(skew)` | self-heals when clock corrects |
+| Regressed (cert in future) | `ClockRegressed{skew}` (heartbeat warns on transition) | no | `Some(skew)` | self-heals when clock corrects |
 | Pre-epoch (`now` invalid) | *not called* (skip at edge) | no | `None`* | self-heals when clock sane |
 | Sign error | `SignFailed` + warn | no | `None` | retry next tick |
 

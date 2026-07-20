@@ -399,16 +399,23 @@ fn build_owner_state_view(
     fleet: FleetJoin,
     quorum: QuorumJoin,
 ) -> OwnerStateView {
-    let now = now_unix();
+    // ZEB-721: keep the epoch-checked clock so a pre-epoch (`None`) clock does NOT
+    // surface a false regression. `now` stays 0 for the other view computations
+    // below, which already tolerate a broken clock.
+    let now_checked = now_unix_checked();
+    let now = now_checked.unwrap_or(0);
     let active_window = trust::DEFAULT_ACTIVE_WINDOW_SECS;
     let freshness = trust::DEFAULT_FRESHNESS_WINDOW_SECS;
     // ZEB-721: surface a regressed host clock (our own cert stamped in the future)
-    // so the panel can warn; `None` when healthy. Same helper the refresh path uses.
-    let self_clock_regressed_skew_secs = crate::owner_state::self_liveness_future_skew_secs(
-        &loaded.state,
-        &loaded.device_signing_key,
-        now,
-    );
+    // so the panel can warn; `None` when healthy OR when the clock is pre-epoch.
+    // Same helper the refresh path uses.
+    let self_clock_regressed_skew_secs = now_checked.and_then(|now| {
+        crate::owner_state::self_liveness_future_skew_secs(
+            &loaded.state,
+            &loaded.device_signing_key,
+            now,
+        )
+    });
     let this_device_id = derive_this_device_id(&loaded.device_signing_key);
     let this_device_hex = hex::encode(this_device_id);
     let self_is_master = loaded.master_seed.is_some();
@@ -1784,14 +1791,14 @@ mod tests {
     #[test]
     fn now_unix_checked_is_some_for_a_normal_clock() {
         // ZEB-721: `now_unix_checked` returns `None` ONLY for a pre-epoch host
-        // clock — exactly when the panel path must SKIP the liveness refresh
-        // rather than stamp a `timestamp = 0` cert. On any post-1970 clock it is
-        // `Some` with a sane seconds-since-epoch value.
-        let n = now_unix_checked();
-        assert!(n.is_some(), "a normal host clock must yield Some");
+        // clock (before 1970) — exactly when the panel path must SKIP the liveness
+        // refresh rather than stamp a `timestamp = 0` cert. On any normal clock it
+        // is `Some`. We deliberately assert nothing about the absolute value: the
+        // test must not depend on the runner's wall clock being set to any era
+        // (that would be flaky in exactly the clock-skew scenarios this PR is about).
         assert!(
-            n.unwrap() > 1_600_000_000,
-            "sanity: seconds since the Unix epoch are large"
+            now_unix_checked().is_some(),
+            "a normal (post-epoch) host clock must yield Some"
         );
     }
 

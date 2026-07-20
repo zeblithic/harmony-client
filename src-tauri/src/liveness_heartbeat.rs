@@ -13,7 +13,7 @@ use std::time::Duration;
 use harmony_owner::state::OwnerState;
 
 use crate::fleet_sync::FleetSyncEngine;
-use crate::owner_state::refresh_self_liveness;
+use crate::owner_state::{refresh_self_liveness, LivenessRefreshOutcome};
 
 /// Heartbeat check cadence. The first `interval.tick()` fires immediately, so
 /// this is also the node-start refresh. Almost every tick is a cheap no-op —
@@ -34,20 +34,17 @@ fn now_unix_secs() -> Option<u64> {
 }
 
 /// One heartbeat iteration: lock the resident trust doc and run the existing
-/// conditional self-liveness refresh. Returns whether it re-signed (so the
-/// caller can `notify_dirty()` + log). Engine-free by design — mirrors the panel
-/// path's `refresh -> if refreshed notify_dirty` split (`owner_commands.rs:729`/
-/// `734`), keeping this unit trivially testable with just a doc + key.
+/// conditional self-liveness refresh, returning its [`LivenessRefreshOutcome`]
+/// (the caller uses `.wrote()` to decide `notify_dirty()`, and `ClockRegressed`
+/// to log on transition). Engine-free by design, keeping this unit trivially
+/// testable with just a doc + key.
 pub async fn run_liveness_heartbeat_once(
     doc: &Arc<tokio::sync::Mutex<OwnerState>>,
     device_sk: &ed25519_dalek::SigningKey,
     now_secs: u64,
-) -> bool {
+) -> LivenessRefreshOutcome {
     let mut g = doc.lock().await;
-    // ZEB-721: regressed-clock detection (cert stamped in the future) now lives in
-    // the shared `refresh_self_liveness`, which warns once and reports
-    // `ClockRegressed`. Here we only need whether it wrote, to nudge the engine.
-    refresh_self_liveness(&mut g, device_sk, now_secs).wrote()
+    refresh_self_liveness(&mut g, device_sk, now_secs)
 }
 
 /// Spawn the interval loop. On the rare tick that actually re-signs, nudge the
@@ -62,6 +59,9 @@ pub fn spawn_liveness_heartbeat(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
+        // ZEB-721: log a regressed clock only on the healthy→regressed transition,
+        // not every hourly tick, so a persistently broken clock doesn't spam WARN.
+        let mut clock_was_regressed = false;
         loop {
             tick.tick().await;
             let Some(now) = now_unix_secs() else {
@@ -71,7 +71,21 @@ pub fn spawn_liveness_heartbeat(
                 );
                 continue;
             };
-            if run_liveness_heartbeat_once(&doc, &device_sk, now).await {
+            let outcome = run_liveness_heartbeat_once(&doc, &device_sk, now).await;
+            match outcome {
+                LivenessRefreshOutcome::ClockRegressed { skew_secs } => {
+                    if !clock_was_regressed {
+                        tracing::warn!(
+                            target: "harmony_liveness",
+                            skew_secs,
+                            "self-liveness cert is stamped in the future — host clock regressed; not renewing until the clock recovers"
+                        );
+                        clock_was_regressed = true;
+                    }
+                }
+                _ => clock_was_regressed = false,
+            }
+            if outcome.wrote() {
                 engine.notify_dirty();
                 tracing::info!(
                     target: "harmony_liveness",
@@ -107,7 +121,9 @@ mod tests {
         let _ = run_liveness_heartbeat_once(&doc, &device_signing_key, now).await;
         // A just-written cert is fresh → no re-sign.
         assert!(
-            !run_liveness_heartbeat_once(&doc, &device_signing_key, now).await,
+            !run_liveness_heartbeat_once(&doc, &device_signing_key, now)
+                .await
+                .wrote(),
             "a fresh cert must not be re-signed"
         );
     }
@@ -123,17 +139,23 @@ mod tests {
         let doc = Arc::new(tokio::sync::Mutex::new(state));
         let _ = run_liveness_heartbeat_once(&doc, &device_signing_key, t0).await;
         assert!(
-            !run_liveness_heartbeat_once(&doc, &device_signing_key, t0).await,
+            !run_liveness_heartbeat_once(&doc, &device_signing_key, t0)
+                .await
+                .wrote(),
             "cert is fresh at t0"
         );
         // Advance past the refresh threshold (freshness / 2).
         let later = t0 + harmony_owner::trust::DEFAULT_FRESHNESS_WINDOW_SECS / 2 + 1;
         assert!(
-            run_liveness_heartbeat_once(&doc, &device_signing_key, later).await,
+            run_liveness_heartbeat_once(&doc, &device_signing_key, later)
+                .await
+                .wrote(),
             "a stale cert must be re-signed"
         );
         assert!(
-            !run_liveness_heartbeat_once(&doc, &device_signing_key, later).await,
+            !run_liveness_heartbeat_once(&doc, &device_signing_key, later)
+                .await
+                .wrote(),
             "the re-signed cert is fresh again at `later`"
         );
         // The re-signed cert is stamped at `later` (timestamp advanced).
@@ -158,7 +180,9 @@ mod tests {
         let device_id = *state.enrollments.keys().next().unwrap();
         let doc = Arc::new(tokio::sync::Mutex::new(state));
         assert!(
-            run_liveness_heartbeat_once(&doc, &device_signing_key, now).await,
+            run_liveness_heartbeat_once(&doc, &device_signing_key, now)
+                .await
+                .wrote(),
             "a missing cert must be published"
         );
         let g = doc.lock().await;
@@ -173,10 +197,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_once_noop_on_regressed_clock() {
+    async fn heartbeat_once_reports_regressed_clock_and_does_not_resign() {
         // ZEB-721: a host clock that moves *behind* an already-signed cert must not
-        // re-sign (a lower timestamp would lose the liveness CRDT merge) and must
-        // leave the cert timestamp untouched — it only logs a warning.
+        // re-sign (a lower timestamp would lose the liveness CRDT merge), must leave
+        // the cert timestamp untouched, and must report `ClockRegressed` (the spawn
+        // loop logs it on the healthy→regressed transition, deduplicated).
         let t0 = 1_700_000_000;
         let MintResult {
             state,
@@ -191,9 +216,12 @@ mod tests {
         };
         // Clock regresses 100 days behind the cert.
         let regressed = t0 - 100 * 24 * 60 * 60;
-        assert!(
-            !run_liveness_heartbeat_once(&doc, &device_signing_key, regressed).await,
-            "a future-stamped cert must not be re-signed under a regressed clock"
+        assert_eq!(
+            run_liveness_heartbeat_once(&doc, &device_signing_key, regressed).await,
+            LivenessRefreshOutcome::ClockRegressed {
+                skew_secs: t0 - regressed
+            },
+            "a future-stamped cert must report ClockRegressed and not re-sign"
         );
         let g = doc.lock().await;
         assert_eq!(

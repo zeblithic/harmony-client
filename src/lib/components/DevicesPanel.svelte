@@ -925,7 +925,7 @@
       {#if typeof state.selfClockRegressedSkewSecs === 'number' && state.selfClockRegressedSkewSecs > 0}
         <div class="epoch-banner" data-testid="clock-regressed-banner" role="alert">
           <p class="epoch-text">
-            This device's clock appears to have moved backwards (~{formatApproxDuration(
+            This device's clock appears to have moved backwards ({formatApproxDuration(
               state.selfClockRegressedSkewSecs
             )} behind its last check-in). Liveness renewal is paused until the clock is
             corrected — re-sync system time (NTP) to restore trust freshness on your other
