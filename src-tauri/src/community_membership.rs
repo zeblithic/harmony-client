@@ -5513,16 +5513,34 @@ pub enum AutoExecOutcome {
     /// log sync. This is the intentional "wrong replica" path, not a
     /// failure.
     SkippedNotAdmin,
-    /// Community has `admin_quorum > 1` and the SetPower outcome is
-    /// admin-affecting (`new_power == 100` OR target currently holds
-    /// power 100). Direct SetPower would self-reject at `verify_event`
-    /// with `SetPowerRequiresQuorum` (spec §4.5 / ZEB-250) — admin-tier
-    /// changes in multi-admin-quorum communities must route through
-    /// `AdminProposal`, which Tier 2 auto-exec does not yet do. Skip
-    /// so no HLC is burned and no doomed event is minted; the broader
-    /// architectural fix (auto-route through AdminProposal when quorum
-    /// requires it) is tracked separately as a follow-up.
-    SkippedRequiresQuorum,
+    /// ZEB-300: community has `admin_quorum > 1` and the SetPower outcome
+    /// is admin-affecting (`new_power == 100` OR target currently holds
+    /// power 100), so it routes through `AdminProposal` instead of a
+    /// direct SetPower. This replica had no live proposal for the exact
+    /// (target, level) and minted a fresh `AdminProposal::SetPower` (it
+    /// counts as signer 1). Peers countersign to quorum via CRDT sync.
+    RoutedProposalMinted,
+    /// ZEB-300: a live canonical `AdminProposal::SetPower` for this exact
+    /// (target, level) already existed and this replica had not yet
+    /// signed it, so it minted an `AdminCountersign` advancing the
+    /// proposal toward `admin_quorum` signatures.
+    RoutedProposalCountersigned,
+    /// ZEB-300: nothing to mint this tick — this replica has already
+    /// signed the canonical proposal (as proposer or countersign) and is
+    /// awaiting other admins' signatures. The routing converges across
+    /// ticks; a pending outcome is the steady state until a peer supplies
+    /// the final quorum signature.
+    RoutedProposalPending,
+    /// ZEB-300 converge R1: terminal — the SetPower effect is already
+    /// present in materialized state (`power_levels[target] == level`),
+    /// so nothing was minted. Distinguished from `RoutedProposalPending`
+    /// so the tick's re-dispatch loop (each Finalized SetPower poll is
+    /// re-dispatched every tick while it stays Finalized) can tell an
+    /// idempotent no-op from an in-flight quorum wait: this is the
+    /// stop condition that keeps re-dispatch from re-minting once the
+    /// effect lands on every replica. Applies to both the direct-SetPower
+    /// and AdminProposal-routed paths.
+    AlreadyApplied,
 }
 
 /// ZEB-297: pure helper deciding whether the local actor is allowed
@@ -5558,6 +5576,25 @@ pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: 
     )
 }
 
+/// ZEB-250 §4.3 / ZEB-300 T1: a SetPower is "admin-affecting" when it grants
+/// top power (`level == max`) or touches a member who currently holds top
+/// power. Extracted so the direct-SetPower quorum guard and the
+/// AdminProposal-routing planner share one predicate (previously copied
+/// inline in `verify_event`, the `set_power_level` IPC, and
+/// `setpower_mint_admin_blocked_by_quorum`).
+///
+/// Uses `POWER_THRESHOLDS.max` (the admin-tier cap), NOT
+/// `POWER_THRESHOLDS.set_power` (the minimum power to CALL SetPower). These
+/// are coincidentally equal (100) in v1 but conceptually distinct.
+pub(crate) fn is_admin_affecting_set_power(
+    mat: &MaterializedMembership,
+    target: OwnerAddr,
+    level: u8,
+) -> bool {
+    let target_power = mat.power_levels.get(&target).copied().unwrap_or(0);
+    level == POWER_THRESHOLDS.max || target_power == POWER_THRESHOLDS.max
+}
+
 /// ZEB-297 R2 (CodeRabbit Major): mirrors `verify_event`'s third SetPower
 /// precondition — direct SetPower of an admin-affecting target is rejected
 /// when `admin_quorum > 1` (spec §4.5 / ZEB-250). Without this check, a
@@ -5569,11 +5606,11 @@ pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: 
 /// population.
 ///
 /// Returns `true` when the (target, level) combination would be rejected
-/// by the quorum guard at `verify_event`; the auto-exec caller should
-/// short-circuit with `AutoExecOutcome::SkippedRequiresQuorum` rather
-/// than mint. Returns `false` when `admin_quorum <= 1` (single-admin
-/// community, direct SetPower allowed) or when the change is not
-/// admin-affecting (e.g., moderator-tier reassignment).
+/// by the quorum guard at `verify_event`; the auto-exec caller then routes
+/// through `AdminProposal` (ZEB-300) instead of minting a direct SetPower.
+/// Returns `false` when `admin_quorum <= 1` (single-admin community, direct
+/// SetPower allowed) or when the change is not admin-affecting (e.g.,
+/// moderator-tier reassignment).
 ///
 /// ZEB-297 R3 (Cursor Low): uses `POWER_THRESHOLDS.max` (the admin-tier
 /// power cap), NOT `POWER_THRESHOLDS.set_power` (the minimum power to
@@ -5592,8 +5629,95 @@ pub fn setpower_mint_admin_blocked_by_quorum(
     if mat.admin_quorum <= 1 {
         return false;
     }
-    let target_power = mat.power_levels.get(&target).copied().unwrap_or(0);
-    level == POWER_THRESHOLDS.max || target_power == POWER_THRESHOLDS.max
+    is_admin_affecting_set_power(mat, target, level)
+}
+
+/// ZEB-300: what (if anything) this admin replica should mint to advance a
+/// finalized admin-affecting Tier 2 SetPower toward AdminProposal quorum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdminProposalPlan {
+    /// No live proposal for this (target, level) — mint a fresh
+    /// `AdminProposal::SetPower` (proposer counts as signer 1).
+    MintProposal,
+    /// A live canonical proposal exists that this replica has not yet
+    /// signed — countersign it (advances toward quorum). Carries the
+    /// canonical proposal's `EventId`.
+    Countersign(EventId),
+    /// ZEB-300 converge R1: the effect is already applied
+    /// (`power_levels[target] == level` — quorum reached on an earlier
+    /// tick). Terminal: the tick's bounded re-dispatch loop stops here
+    /// (maps to `AutoExecOutcome::AlreadyApplied`), so nothing re-mints.
+    AlreadyApplied,
+    /// ZEB-300 converge R1: this replica has already signed the canonical
+    /// proposal (as proposer or countersign) and is awaiting other admins'
+    /// signatures. Nothing to mint this tick, but NOT terminal — the effect
+    /// has not landed yet, so re-dispatch keeps checking each tick until it
+    /// does (maps to `AutoExecOutcome::RoutedProposalPending`).
+    Pending,
+}
+
+/// ZEB-300: decide what (if anything) this admin replica should mint to
+/// advance a finalized admin-affecting Tier 2 SetPower toward AdminProposal
+/// quorum. Pure: no `NodeState` / engine — reads the materialized state and
+/// the raw event log so it is unit-testable and every replica computes an
+/// identical decision. See design §4.
+///
+/// Canonical selection: the live proposal with the numerically smallest
+/// `EventId` (`[u8; 16]`) — a total order every replica computes identically,
+/// so ticks converge on one proposal instead of racing separate ones.
+///
+/// Idempotency: each admin signs a given proposal at most once (as proposer
+/// OR as one countersign) — enforced by the already-signed scan.
+pub(crate) fn plan_admin_proposal_auto_exec(
+    mat: &MaterializedMembership,
+    events: &BTreeMap<EventId, SignedMembershipEvent>,
+    target: OwnerAddr,
+    level: u8,
+    self_owner: OwnerAddr,
+    now_ms: u64,
+) -> AdminProposalPlan {
+    // 1. Effect already applied (quorum reached on an earlier tick).
+    //    ZEB-300 converge R1: terminal — stops the tick's bounded
+    //    re-dispatch loop so nothing re-mints once the effect lands.
+    if mat.power_levels.get(&target).copied() == Some(level) {
+        return AdminProposalPlan::AlreadyApplied;
+    }
+    // 2. Live proposals for this exact (target, level); pick the canonical
+    //    (smallest EventId) among those still within the expiry window.
+    let canonical = events
+        .values()
+        .filter(|e| match &e.kind {
+            MembershipEventKind::AdminProposal { proposal_kind } => matches!(
+                proposal_kind,
+                ProposalKind::SetPower { target: t, level: l } if *t == target && *l == level
+            ),
+            _ => false,
+        })
+        .filter(|e| now_ms.saturating_sub(e.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS)
+        .min_by_key(|e| e.id);
+
+    let Some(canonical) = canonical else {
+        // 3. No live candidate → propose.
+        return AdminProposalPlan::MintProposal;
+    };
+
+    // 4/5. Already signed the canonical (proposer or countersign) → nothing
+    //      to do; otherwise countersign it.
+    let already_signed = events.values().any(|e| match &e.kind {
+        MembershipEventKind::AdminProposal { .. } => e.id == canonical.id && e.actor == self_owner,
+        MembershipEventKind::AdminCountersign { target_event_id } => {
+            *target_event_id == canonical.id && e.actor == self_owner
+        }
+        _ => false,
+    });
+    if already_signed {
+        // ZEB-300 converge R1: NOT terminal — the effect has not landed
+        // yet, so re-dispatch keeps polling each tick until a peer supplies
+        // the final quorum signature (maps to RoutedProposalPending).
+        AdminProposalPlan::Pending
+    } else {
+        AdminProposalPlan::Countersign(canonical.id)
+    }
 }
 
 /// ZEB-291 Phase 2 Task 10: auto-exec dispatch from a Tier 2 contestability finalize.
@@ -5621,14 +5745,15 @@ pub fn setpower_mint_admin_blocked_by_quorum(
 /// and HLC LWW dedupes; the first admin's event propagates to every
 /// replica via the existing membership log sync.
 ///
-/// ZEB-297 R2: also returns `Ok(AutoExecOutcome::SkippedRequiresQuorum)`
-/// when the community has `admin_quorum > 1` AND the (target, level)
-/// combination is admin-affecting (`new_power == 100` or target currently
-/// holds power 100). Direct SetPower in that case would self-reject at
-/// `verify_event` with `SetPowerRequiresQuorum` (spec §4.5). Tier 2
-/// auto-exec cannot currently route through `AdminProposal`, so the
-/// outcome lands as a NoOp on every replica; a follow-up ticket tracks
-/// the AdminProposal-routing fix.
+/// ZEB-300: when the community has `admin_quorum > 1` AND the (target,
+/// level) combination is admin-affecting (`new_power == 100` or target
+/// currently holds power 100), a direct SetPower would self-reject at
+/// `verify_event` with `SetPowerRequiresQuorum` (spec §4.5), so this
+/// branch routes through `apply_auto_exec_admin_proposal_set_power`
+/// instead — minting an `AdminProposal::SetPower` (returning
+/// `RoutedProposalMinted`), countersigning the canonical pending proposal
+/// (`RoutedProposalCountersigned`), or doing nothing this tick
+/// (`RoutedProposalPending`). The routing converges across ticks.
 ///
 /// Returns `Err` (as String, matching the existing IPC error convention)
 /// if:
@@ -5639,7 +5764,12 @@ pub fn setpower_mint_admin_blocked_by_quorum(
 /// - Signing or apply fails at the CRDT layer (e.g., actor not admin —
 ///   verify_event rejects with InsufficientPower).
 pub async fn apply_auto_exec_set_power(
-    node_state: &std::sync::Arc<std::sync::Mutex<crate::NodeState>>,
+    // Takes `&Mutex<NodeState>` (not `&Arc<..>`): the body only locks it to
+    // snapshot handles, never clones/stores the Arc. This lets production wire
+    // it from Tauri's managed `Mutex<NodeState>` via `app.state().inner()`
+    // (ZEB-300 Task 20.1). `&Arc<Mutex<NodeState>>` call sites still pass by
+    // Deref coercion.
+    node_state: &std::sync::Mutex<crate::NodeState>,
     community_id: crate::owner_state_types::SpaceId,
     target_pubkey: crate::owner_state_types::OwnerAddr,
     new_power: u32,
@@ -5718,15 +5848,27 @@ pub async fn apply_auto_exec_set_power(
     // section) would require holding the engine state lock across
     // the dm_outbox signing await, a pattern not used elsewhere and
     // out of scope for this fix.
-    let (is_admin, blocked_by_quorum) = {
+    //
+    // ZEB-300 converge R1: also read whether the target is ALREADY at
+    // `level` in the same locked block. The Tier 2 tick re-dispatches
+    // auto-exec for Finalized SetPower polls every tick while they stay
+    // Finalized, so once the effect has synced in on this replica a bare
+    // re-dispatch would otherwise re-mint. Returning
+    // `AlreadyApplied` BEFORE the admin / quorum / mint logic makes
+    // re-dispatch idempotent on every replica.
+    let (is_admin, blocked_by_quorum, already_at_level) = {
         let state_arc = engine_arc.state();
         let state_g = state_arc.lock().await;
         let mat = state_g.materialized(engine_arc.admin_addr());
         (
             local_actor_can_mint_set_power(&mat, self_owner),
             setpower_mint_admin_blocked_by_quorum(&mat, target_pubkey, level),
+            mat.power_levels.get(&target_pubkey).copied() == Some(level),
         )
     };
+    if already_at_level {
+        return Ok(AutoExecOutcome::AlreadyApplied);
+    }
     if !is_admin {
         tracing::info!(
             community = %hex::encode(community_id.0),
@@ -5737,13 +5879,18 @@ pub async fn apply_auto_exec_set_power(
         return Ok(AutoExecOutcome::SkippedNotAdmin);
     }
     if blocked_by_quorum {
-        tracing::warn!(
-            community = %hex::encode(community_id.0),
-            target = %hex::encode(target_pubkey.0),
-            new_power,
-            "auto_exec_set_power: skipping — admin_quorum > 1 and outcome is admin-affecting (Tier 2 cannot route through AdminProposal yet)"
-        );
-        return Ok(AutoExecOutcome::SkippedRequiresQuorum);
+        // ZEB-300: admin_quorum > 1 + admin-affecting → route through
+        // AdminProposal (mint proposal / countersign the canonical pending
+        // proposal / no-op) instead of a direct SetPower that verify_event
+        // would reject with SetPowerRequiresQuorum. The wrapper re-reads
+        // state under the engine lock and mints with community_signing_key.
+        return apply_auto_exec_admin_proposal_set_power(
+            node_state,
+            community_id,
+            target_pubkey,
+            level,
+        )
+        .await;
     }
 
     let wall_now_ms = std::time::SystemTime::now()
@@ -5778,6 +5925,165 @@ pub async fn apply_auto_exec_set_power(
     }
     let _ = device_id;
     Ok(AutoExecOutcome::Applied)
+}
+
+/// ZEB-300: route an admin-affecting Tier 2 SetPower auto-exec through the
+/// `AdminProposal` quorum machinery (spec §4.5). Called by
+/// `apply_auto_exec_set_power`'s `blocked_by_quorum` branch when the
+/// community has `admin_quorum > 1` and the change touches the admin tier,
+/// where a direct SetPower would self-reject at `verify_event`.
+///
+/// Reads the community's materialized state + event log under the engine
+/// lock, runs the pure `plan_admin_proposal_auto_exec` planner, and mints
+/// the corresponding event:
+/// - `MintProposal` → `mint_admin_proposal_set_power_event` → `RoutedProposalMinted`
+/// - `Countersign(pid)` → `mint_admin_countersign_event` → `RoutedProposalCountersigned`
+/// - `AlreadyApplied` → `AlreadyApplied` (effect already in materialized state)
+/// - `Pending` → `RoutedProposalPending` (already signed; awaiting quorum)
+///
+/// Load-bearing (matches the manual `set_power_level` proposal path): the
+/// routed events are signed with `outbox.community_signing_key` (the
+/// enrolled #2 device key community-membership events use), NOT the
+/// direct-SetPower `outbox.signing_key`. A wrong-key event would fail
+/// `verify_event` silently.
+///
+/// Any-admin-proposes + canonical (min-`EventId`) countersign converges
+/// across ticks and tolerates absent admins; dangling proposals from
+/// simultaneous ticks expire per `ADMIN_PROPOSAL_EXPIRY_MS`.
+pub async fn apply_auto_exec_admin_proposal_set_power(
+    // `&Mutex<NodeState>` (not `&Arc<..>`) for the same reason as
+    // `apply_auto_exec_set_power` — locked, never Arc-cloned.
+    node_state: &std::sync::Mutex<crate::NodeState>,
+    community_id: crate::owner_state_types::SpaceId,
+    target_pubkey: crate::owner_state_types::OwnerAddr,
+    level: u8,
+) -> Result<AutoExecOutcome, String> {
+    // Snapshot the handles we need under the std::sync::Mutex, then drop
+    // the lock before any await (no awaits while holding a std mutex).
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox) = {
+        let g = node_state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker
+                .clone()
+                .ok_or("hlc_tracker missing (node not running?)")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dm_device_id missing (node not running?)")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing (node not running?)")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing (node not running?)")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing (no owner identity?)")?,
+        )
+    };
+
+    let engine_arc = community_registry
+        .engine_arc(&community_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(community_id.0)
+            )
+        })?;
+
+    // Reserve an HLC for the (potential) event; its wall clock is the "now"
+    // the planner uses for proposal-expiry checks. An AlreadyApplied /
+    // Pending tick still consumes an HLC — benign (the monotonic clock
+    // simply advances).
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let now_ms = event_hlc.wall_ms;
+
+    // Decide mint-vs-countersign-vs-already-applied-vs-pending from the
+    // materialized state + log.
+    //
+    // ZEB-300 R3 (CodeRabbit): plan-then-insert race window. We read
+    // (mat, events) under the engine state lock, DROP it, then mint +
+    // insert the event later (the outbox signing await must not hold the
+    // engine lock). A concurrent same-(target, level) insert from another
+    // admin's tick between the read and our insert is benign: canonical
+    // selection picks the numerically-minimum `EventId` deterministically
+    // on every replica, and materialize applies the effect via LWW at the
+    // event that tips the signer count to quorum, so the logs converge to
+    // one applied SetPower regardless of interleaving. Mirrors the ZEB-297
+    // R3 note on the direct-SetPower path above — full atomicity would
+    // require holding the engine lock across the signing await, a pattern
+    // not used elsewhere.
+    let plan = {
+        let state_arc = engine_arc.state();
+        let state_g = state_arc.lock().await;
+        let mat = state_g.materialized(engine_arc.admin_addr());
+        plan_admin_proposal_auto_exec(
+            &mat,
+            &state_g.events,
+            target_pubkey,
+            level,
+            self_owner,
+            now_ms,
+        )
+    };
+
+    let event = match plan {
+        AdminProposalPlan::AlreadyApplied => return Ok(AutoExecOutcome::AlreadyApplied),
+        AdminProposalPlan::Pending => return Ok(AutoExecOutcome::RoutedProposalPending),
+        AdminProposalPlan::MintProposal => {
+            let outbox_g = dm_outbox.lock().await;
+            // ZEB-300: AdminProposal(SetPower) signs with the #2 enrolled
+            // community key, matching the manual set_power_level path.
+            let signing_key = outbox_g.community_signing_key.as_ref();
+            crate::mint_admin_proposal_set_power_event(
+                community_id,
+                self_owner,
+                target_pubkey,
+                level,
+                signing_key,
+                event_hlc,
+            )?
+        }
+        AdminProposalPlan::Countersign(pid) => {
+            let outbox_g = dm_outbox.lock().await;
+            let signing_key = outbox_g.community_signing_key.as_ref();
+            crate::mint_admin_countersign_event(
+                community_id,
+                self_owner,
+                pid,
+                signing_key,
+                event_hlc,
+            )?
+        }
+    };
+
+    let outcome_kind = match plan {
+        AdminProposalPlan::MintProposal => AutoExecOutcome::RoutedProposalMinted,
+        AdminProposalPlan::Countersign(_) => AutoExecOutcome::RoutedProposalCountersigned,
+        AdminProposalPlan::AlreadyApplied | AdminProposalPlan::Pending => {
+            unreachable!("AlreadyApplied/Pending returned early above")
+        }
+    };
+
+    let insert = engine_arc
+        .insert_local_event(event)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (AdminProposal auto-exec): {e}"))?;
+    if matches!(
+        insert,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(format!(
+            "apply_auto_exec_admin_proposal_set_power: rejected: {insert:?}"
+        ));
+    }
+    Ok(outcome_kind)
 }
 
 #[cfg(test)]
@@ -6011,6 +6317,25 @@ mod auto_exec_tests {
         assert!(!setpower_mint_admin_blocked_by_quorum(&mat, target, 70));
     }
 
+    /// ZEB-300 T1: the extracted `is_admin_affecting_set_power` helper
+    /// classifies a (target, level) as admin-affecting when the new level
+    /// grants top power OR the target currently holds top power — the same
+    /// predicate the three prior inline copies used.
+    #[test]
+    fn is_admin_affecting_set_power_true_for_promote_to_100() {
+        let mut mat = MaterializedMembership::default();
+        let target = OwnerAddr([7u8; 16]);
+        // target currently non-admin (power 0), level 100 => admin-affecting
+        assert!(is_admin_affecting_set_power(&mat, target, 100));
+        // target currently admin (power 100), level 50 (demote) => admin-affecting
+        mat.power_levels.insert(target, 100);
+        assert!(is_admin_affecting_set_power(&mat, target, 50));
+        // non-admin-affecting: target power 10, level 20
+        let other = OwnerAddr([8u8; 16]);
+        mat.power_levels.insert(other, 10);
+        assert!(!is_admin_affecting_set_power(&mat, other, 20));
+    }
+
     /// Apply-auto-exec helper test: bounds-check on `new_power > 100`.
     ///
     /// Spec §4 caps power levels at 100 (admin); the membership
@@ -6144,6 +6469,283 @@ mod auto_exec_tests {
         );
         let _ = admin_pub;
         let _ = target_pub;
+    }
+
+    /// ZEB-300 T4: the AdminProposal-routing auto-exec helper exists, fails
+    /// closed on a bare NodeState (like `apply_auto_exec_set_power`), and its
+    /// routed-mint step produces an `AdminProposal::SetPower` whose signature
+    /// verifies — i.e. a CRDT-acceptable event.
+    ///
+    /// Load-bearing: the helper signs with `outbox.community_signing_key`
+    /// (the enrolled #2 device key that community-membership events use), NOT
+    /// the direct-SetPower `outbox.signing_key`; a wrong-key event would fail
+    /// `verify_event` silently. Reaching the fully-wired two-admin engine
+    /// (CommunitySyncRegistry + dm_outbox + materialized state) is out of
+    /// reach for a pure unit test — as the sibling `..._signing_path_...`
+    /// test documents — so we prove the community_signing_key mint seam
+    /// directly via `mint_admin_proposal_set_power_event` (the exact call the
+    /// helper's `MintProposal` arm makes).
+    #[tokio::test]
+    async fn auto_exec_admin_proposal_routes_and_verifies() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        use ed25519_dalek::{Signature, SigningKey, Verifier};
+
+        // Coverage note (Qodo, honest): this test covers exactly two seams —
+        // (1) the `community_signing_key` mint seam (Part 2, via the same
+        // `mint_admin_proposal_set_power_event` call the wrapper's
+        // MintProposal arm makes), and (2) the bare-NodeState fail-closed
+        // path (Part 1). It does NOT exercise the wrapper's own
+        // plan→branch-select→`insert_local_event` flow: choosing
+        // MintProposal vs Countersign vs AlreadyApplied vs Pending and
+        // inserting the resulting event requires a live engine fixture
+        // (CommunitySyncRegistry + dm_outbox + materialized state), which is
+        // deferred. That branch selection is instead exhaustively unit-tested
+        // against the pure planner in `mod plan_admin_proposal_tests`.
+
+        // ── Part 1: helper is defined and fails closed on a bare NodeState.
+        let node_state = std::sync::Arc::new(std::sync::Mutex::new(crate::NodeState::default()));
+        let community_id = SpaceId([0xc0; 16]);
+        let target = OwnerAddr([0xbb; 16]);
+        let err = apply_auto_exec_admin_proposal_set_power(&node_state, community_id, target, 100)
+            .await
+            .expect_err("bare NodeState must Err, not panic");
+        assert!(
+            err.contains("missing") || err.contains("not running"),
+            "error must mention missing/not running; got: {err}"
+        );
+
+        // ── Part 2: the routed-mint seam yields a verifiable AdminProposal.
+        // Mint the SAME way the helper's MintProposal arm does — signed with
+        // the community signing key — and prove the AdminProposal::SetPower
+        // event's signature verifies against that key.
+        let admin = OwnerAddr([0xaa; 16]);
+        let community_signing_key = SigningKey::from_bytes(&[0x11; 32]);
+        let hlc = Hlc {
+            wall_ms: 5_000,
+            logical: 0,
+            device_id: "admin".into(),
+        };
+        let event = crate::mint_admin_proposal_set_power_event(
+            community_id,
+            admin,
+            target,
+            100,
+            &community_signing_key,
+            hlc,
+        )
+        .expect("mint AdminProposal::SetPower must succeed");
+
+        assert!(
+            matches!(
+                &event.kind,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetPower { target: t, level: 100 },
+                } if *t == target
+            ),
+            "routed mint must be an AdminProposal::SetPower for the target at level 100; got {:?}",
+            event.kind
+        );
+
+        let bytes = canonical_cbor_encode(&EventPayload::from(&event)).expect("encode payload");
+        assert!(
+            community_signing_key
+                .verifying_key()
+                .verify(&bytes, &Signature::from_bytes(&event.sig))
+                .is_ok(),
+            "AdminProposal signed with community_signing_key must verify"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_admin_proposal_tests {
+    use super::*;
+
+    const COM: SpaceId = SpaceId([0xc0; 16]);
+
+    fn ev(
+        id: EventId,
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COM,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            kind,
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    fn mk_proposal(
+        id: EventId,
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        level: u8,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        ev(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level },
+            },
+        )
+    }
+
+    fn mk_countersign(
+        id: EventId,
+        actor: OwnerAddr,
+        target_id: EventId,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        ev(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: target_id,
+            },
+        )
+    }
+
+    // (a) already at power => AlreadyApplied
+    #[test]
+    fn plan_already_applied_when_target_already_at_level() {
+        let target = OwnerAddr([1; 16]);
+        let me = OwnerAddr([2; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels.insert(target, 100);
+        let events = BTreeMap::new();
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_000),
+            AdminProposalPlan::AlreadyApplied
+        ));
+    }
+
+    // (b) no candidate => MintProposal
+    #[test]
+    fn plan_mint_when_no_existing_proposal() {
+        let target = OwnerAddr([1; 16]);
+        let me = OwnerAddr([2; 16]);
+        let mat = MaterializedMembership::default();
+        let events = BTreeMap::new();
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_000),
+            AdminProposalPlan::MintProposal
+        ));
+    }
+
+    // (c) one live candidate not signed by me => Countersign(that id)
+    #[test]
+    fn plan_countersign_existing_unsigned_proposal() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
+        match plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500) {
+            AdminProposalPlan::Countersign(got) => assert_eq!(got, pid),
+            other => panic!("expected Countersign, got {other:?}"),
+        }
+    }
+
+    // (d) I already proposed it => Pending (awaiting other admins' quorum)
+    #[test]
+    fn plan_pending_when_i_am_proposer() {
+        let target = OwnerAddr([1; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, me, target, 100, 1_000));
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            AdminProposalPlan::Pending
+        ));
+    }
+
+    // (e) I already countersigned it => Pending (awaiting other admins' quorum)
+    #[test]
+    fn plan_pending_when_i_already_countersigned() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let cid: EventId = [10u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
+        events.insert(cid, mk_countersign(cid, me, pid, 1_100));
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            AdminProposalPlan::Pending
+        ));
+    }
+
+    // (f) two candidates => Countersign(min EventId)
+    #[test]
+    fn plan_countersign_canonical_min_event_id() {
+        let target = OwnerAddr([1; 16]);
+        let a = OwnerAddr([3; 16]);
+        let b = OwnerAddr([4; 16]);
+        let me = OwnerAddr([2; 16]);
+        let low: EventId = [1u8; 16];
+        let high: EventId = [2u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(high, mk_proposal(high, a, target, 100, 1_000));
+        events.insert(low, mk_proposal(low, b, target, 100, 1_000));
+        match plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500) {
+            AdminProposalPlan::Countersign(got) => assert_eq!(got, low),
+            other => panic!("expected canonical Countersign(low), got {other:?}"),
+        }
+    }
+
+    // (g) only an expired candidate => MintProposal (fresh window)
+    #[test]
+    fn plan_mint_when_only_candidate_expired() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
+        let now = 1_000 + ADMIN_PROPOSAL_EXPIRY_MS + 1;
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, now),
+            AdminProposalPlan::MintProposal
+        ));
+    }
+
+    // (h) candidate for a DIFFERENT (target,level) is ignored => MintProposal
+    #[test]
+    fn plan_mint_ignores_proposal_for_other_target_or_level() {
+        let target = OwnerAddr([1; 16]);
+        let other = OwnerAddr([5; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        events.insert(pid, mk_proposal(pid, proposer, other, 100, 1_000)); // different target
+        assert!(matches!(
+            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            AdminProposalPlan::MintProposal
+        ));
     }
 }
 

@@ -1162,11 +1162,12 @@ pub struct NodeState {
     /// paths (local IPC + peer inbound) converge on a single source of
     /// truth.
     ///
-    /// TODO ZEB-291 Task 19.1: wire the engines' mpsc pairs to the
-    /// existing Zenoh adapter (`harmony/community/{id}/voting` key). Phase
-    /// 2 ships with stub mpsc endpoints (drop-on-floor publisher, never-fed
-    /// subscriber) so the registry surface + lifetime management are in
-    /// place; cross-peer voting sync lights up when Task 19.1 lands.
+    /// Task 19.1 (wired): `ensure_voting_engine_for` enqueues a
+    /// `VotingLogAdapterRequest`; the event-loop select! arm drains it and
+    /// calls `spawn_voting_log_zenoh_adapter` against the live Zenoh session,
+    /// bridging each engine's mpsc pair to the adapter
+    /// (`harmony/community/{id}/voting` key). IPCs publish via
+    /// `engine.publish_event`, so cross-peer voting sync is live.
     pub voting_log_engines: std::sync::Arc<
         std::sync::Mutex<
             std::collections::HashMap<
@@ -12739,16 +12740,17 @@ pub async fn start_node_inner(
             //
             // emit closure forwards Tauri events synchronously (the
             // Tauri AppHandle's `emit` is Send + Sync + cheap).
-            // auto_exec_set_power closure logs-and-skips for now —
-            // TODO ZEB-291 Task 20.1: thread `Arc<Mutex<NodeState>>`
-            // through `apply_auto_exec_set_power` so a finalized
-            // Tier 2 SetPower proposal actually rewrites the target's
-            // power level. Today the tick still finalizes the proposal
-            // (lifecycle → Finalized + Tauri event emitted) and the
-            // skipped auto-exec is observable via the tracing::warn!
-            // line below. Single-node Phase 2 acceptance: Finalized
-            // status + UI signal is sufficient; cross-peer power
-            // rewrite lands with the Task 19.1 + 20.1 follow-up.
+            // auto_exec_set_power closure dispatches a finalized Tier 2
+            // SetPower through the real membership helper (ZEB-300 Task 20.1,
+            // wired). The `'static` tick task (tokio::spawn) can't own a
+            // borrowed `&Mutex<NodeState>`, so the closure captures the
+            // `'static` AppHandle and fetches Tauri's managed
+            // `Mutex<NodeState>` via `app.state()` at call time.
+            // `apply_auto_exec_set_power` takes `&Mutex<NodeState>` (it only
+            // locks — never Arc-clones), so no Arc-typed managed state is
+            // needed. Direct SetPower at admin_quorum==1; AdminProposal
+            // routing at admin_quorum>1; the resulting membership events
+            // propagate cross-peer over the already-wired state-root log.
             {
                 let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                 if guard.generation == our_gen {
@@ -12761,41 +12763,43 @@ pub async fn start_node_inner(
                         std::sync::Arc::new(move |event_name: &str, payload: serde_json::Value| {
                             app_for_emit.emit(event_name, payload);
                         });
+                    // ZEB-300 Task 20.1: capture the typed Tauri AppHandle so
+                    // the `'static` tick closure can fetch the managed
+                    // `Mutex<NodeState>` at call time. `Some` in the GUI
+                    // (production); `None` in the headless serve/test path,
+                    // where the Tauri managed-state seam is unavailable —
+                    // auto-exec dispatch there is a follow-up (needs the serve
+                    // boot to expose an owned NodeState handle).
+                    let wry_for_auto_exec = wry_handle.clone();
                     let auto_exec_fn: crate::community_voting_tick::AutoExecSetPowerFn =
                         std::sync::Arc::new(
                             move |cid: crate::owner_state_types::SpaceId,
                                   target: crate::owner_state_types::OwnerAddr,
                                   new_power: u32| {
+                                let wry = wry_for_auto_exec.clone();
                                 Box::pin(async move {
-                                    // TODO ZEB-291 Task 20.1: when we
-                                    // wire the auto-exec dispatch into
-                                    // a NodeState-aware helper, replace
-                                    // this with the real call. Today we
-                                    // log the intent so observability
-                                    // surfaces the deferred behavior.
-                                    //
-                                    // ZEB-297: stub returns
-                                    // `SkippedNotAdmin` so the tick
-                                    // counts this as an intentional
-                                    // skip rather than a success. The
-                                    // real wiring (Task 20.1) will
-                                    // call `apply_auto_exec_set_power`
-                                    // which decides Applied vs Skipped
-                                    // based on the local actor's
-                                    // materialized power level.
-                                    tracing::warn!(
-                                        community = %hex::encode(cid.0),
-                                        target = %hex::encode(target.0),
-                                        new_power = new_power,
-                                        "voting tick: auto_exec_set_power dispatch \
-                                         deferred (Task 20.1 — NodeState wiring)"
-                                    );
-                                    Ok::<
-                                        crate::community_membership::AutoExecOutcome,
-                                        String,
-                                    >(
-                                        crate::community_membership::AutoExecOutcome::SkippedNotAdmin,
-                                    )
+                                    match wry {
+                                        Some(app) => {
+                                            // Tauri manages `Mutex<NodeState>`;
+                                            // hand the `&Mutex` to the helper
+                                            // (it only locks). Direct SetPower
+                                            // at admin_quorum==1; AdminProposal
+                                            // routing at admin_quorum>1.
+                                            use tauri::Manager as _;
+                                            let node_state = app
+                                                .state::<std::sync::Mutex<crate::NodeState>>();
+                                            crate::community_membership::apply_auto_exec_set_power(
+                                                node_state.inner(),
+                                                cid,
+                                                target,
+                                                new_power,
+                                            )
+                                            .await
+                                        }
+                                        None => Ok(
+                                            crate::community_membership::AutoExecOutcome::SkippedNotAdmin,
+                                        ),
+                                    }
                                 })
                             },
                         );
