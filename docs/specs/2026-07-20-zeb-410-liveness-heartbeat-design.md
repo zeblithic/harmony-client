@@ -205,6 +205,18 @@ correctness impact.
   and retries next interval. No panic, no task exit.
 - The spawned task loop never returns; it is aborted on node stop via the handle.
 - If the resident trust doc/engine are absent, the heartbeat is not spawned at all.
+- **Clock anomalies (ZEB-721 detection).** `now_unix_secs()` returns `Option`: a
+  pre-epoch/broken clock yields `None`, and the loop **skips** that tick with a
+  `warn` rather than passing `0` (which, on a missing cert, would sign a
+  timestamp-`0` cert that is instantly stale to peers). Separately, if our own cert
+  is stamped **in the future** relative to `now` (the host clock regressed since we
+  signed), `run_liveness_heartbeat_once` emits a `warn` — `refresh_self_liveness`
+  correctly no-ops (re-signing with a lower timestamp would lose the liveness CRDT
+  merge), so renewal is suppressed until the clock recovers. The heartbeat can only
+  **detect + surface** this; the systemic remediation (monotonic floor / signing-time
+  clock sanity in the shared refresh path) is tracked as **ZEB-721** — it is a
+  pre-existing property of `refresh_self_liveness` shared with the panel-load path,
+  not introduced here.
 
 ## Testing
 

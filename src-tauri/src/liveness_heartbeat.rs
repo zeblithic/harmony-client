@@ -22,11 +22,15 @@ use crate::owner_state::refresh_self_liveness;
 /// 1 h matches the existing `reachability_publisher::IDLE_REFRESH_INTERVAL`.
 pub const LIVENESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-fn now_unix_secs() -> u64 {
+/// Seconds since the Unix epoch, or `None` if the host clock is before the epoch
+/// (a broken/unset clock). Callers must treat `None` as "skip this tick" rather
+/// than substituting 0 — signing a liveness cert stamped at 0 would be instantly
+/// stale to every peer.
+fn now_unix_secs() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .ok()
 }
 
 /// One heartbeat iteration: lock the resident trust doc and run the existing
@@ -40,6 +44,24 @@ pub async fn run_liveness_heartbeat_once(
     now_secs: u64,
 ) -> bool {
     let mut g = doc.lock().await;
+    // Regressed-clock guard: if our own cert is stamped in the future relative to
+    // `now`, the host clock moved backwards since we signed it. `refresh_self_liveness`
+    // will (correctly) see it as fresh and no-op, so renewal is suppressed until the
+    // clock recovers — surface that explicitly instead of a silent no-op. Re-signing
+    // cannot fix it here (a lower timestamp loses the liveness CRDT merge); the
+    // systemic remediation (clock sanity / cert-in-future handling in the shared
+    // refresh path) is tracked as a follow-up (ZEB-721).
+    let device_id = crate::owner_state::device_id_from_signing_key(device_sk);
+    if let Some(cert) = g.liveness.get(&device_id) {
+        if cert.timestamp > now_secs {
+            tracing::warn!(
+                target: "harmony_liveness",
+                cert_ts = cert.timestamp,
+                now = now_secs,
+                "self-liveness cert is stamped in the future — host clock regressed; not renewing until the clock recovers"
+            );
+        }
+    }
     refresh_self_liveness(&mut g, device_sk, now_secs)
 }
 
@@ -57,7 +79,14 @@ pub fn spawn_liveness_heartbeat(
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
-            if run_liveness_heartbeat_once(&doc, &device_sk, now_unix_secs()).await {
+            let Some(now) = now_unix_secs() else {
+                tracing::warn!(
+                    target: "harmony_liveness",
+                    "system clock is before the Unix epoch; skipping this heartbeat tick"
+                );
+                continue;
+            };
+            if run_liveness_heartbeat_once(&doc, &device_sk, now).await {
                 engine.notify_dirty();
                 tracing::info!(
                     target: "harmony_liveness",
@@ -155,6 +184,37 @@ mod tests {
                 .timestamp,
             now,
             "the new cert is stamped at `now`"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_once_noop_on_regressed_clock() {
+        // ZEB-721: a host clock that moves *behind* an already-signed cert must not
+        // re-sign (a lower timestamp would lose the liveness CRDT merge) and must
+        // leave the cert timestamp untouched — it only logs a warning.
+        let t0 = 1_700_000_000;
+        let MintResult {
+            state,
+            device_signing_key,
+            ..
+        } = mint_owner(t0).unwrap();
+        let doc = Arc::new(tokio::sync::Mutex::new(state));
+        let _ = run_liveness_heartbeat_once(&doc, &device_signing_key, t0).await;
+        let device_id = {
+            let g = doc.lock().await;
+            *g.enrollments.keys().next().unwrap()
+        };
+        // Clock regresses 100 days behind the cert.
+        let regressed = t0 - 100 * 24 * 60 * 60;
+        assert!(
+            !run_liveness_heartbeat_once(&doc, &device_signing_key, regressed).await,
+            "a future-stamped cert must not be re-signed under a regressed clock"
+        );
+        let g = doc.lock().await;
+        assert_eq!(
+            g.liveness.get(&device_id).unwrap().timestamp,
+            t0,
+            "the cert timestamp must not move backwards"
         );
     }
 }
