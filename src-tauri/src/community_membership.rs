@@ -5764,7 +5764,12 @@ pub(crate) fn plan_admin_proposal_auto_exec(
 /// - Signing or apply fails at the CRDT layer (e.g., actor not admin —
 ///   verify_event rejects with InsufficientPower).
 pub async fn apply_auto_exec_set_power(
-    node_state: &std::sync::Arc<std::sync::Mutex<crate::NodeState>>,
+    // Takes `&Mutex<NodeState>` (not `&Arc<..>`): the body only locks it to
+    // snapshot handles, never clones/stores the Arc. This lets production wire
+    // it from Tauri's managed `Mutex<NodeState>` via `app.state().inner()`
+    // (ZEB-300 Task 20.1). `&Arc<Mutex<NodeState>>` call sites still pass by
+    // Deref coercion.
+    node_state: &std::sync::Mutex<crate::NodeState>,
     community_id: crate::owner_state_types::SpaceId,
     target_pubkey: crate::owner_state_types::OwnerAddr,
     new_power: u32,
@@ -5946,7 +5951,9 @@ pub async fn apply_auto_exec_set_power(
 /// across ticks and tolerates absent admins; dangling proposals from
 /// simultaneous ticks expire per `ADMIN_PROPOSAL_EXPIRY_MS`.
 pub async fn apply_auto_exec_admin_proposal_set_power(
-    node_state: &std::sync::Arc<std::sync::Mutex<crate::NodeState>>,
+    // `&Mutex<NodeState>` (not `&Arc<..>`) for the same reason as
+    // `apply_auto_exec_set_power` — locked, never Arc-cloned.
+    node_state: &std::sync::Mutex<crate::NodeState>,
     community_id: crate::owner_state_types::SpaceId,
     target_pubkey: crate::owner_state_types::OwnerAddr,
     level: u8,
