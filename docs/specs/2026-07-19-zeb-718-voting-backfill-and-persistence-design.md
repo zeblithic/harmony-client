@@ -96,7 +96,7 @@ untouched. Local disk persistence (D3) provides restart-durability without that 
 
 ### D2. Full-dump reconciliation, no RBSR (§2.3).
 
-### D3. Persist `{events, policy}`; replay to rebuild — **YES** (approved)
+### D3. Persist `{events, policy, poll_restore}`; replay + overlay — **YES** (approved)
 
 `VotingLog` as a whole is not serde-serializable (`Tier3PollState.committee_oracle: Arc<dyn
 CommitteeOracle>` is a non-serde trait object; every materialized container lacks derives). Persist the
@@ -104,6 +104,17 @@ serde-clean subset: `events: Vec<SignedVotingEvent>` (already the CBOR wire type
 CommunityVotingPolicy` (already serde; local-only, must persist or post-restart replay may use wrong
 conviction thresholds). On boot, **replay** events through `apply_with_snapshot` to rebuild
 `polls`/`delegation_graph` — safer than trusting serialized fixed-point conviction state.
+
+**But replay alone is insufficient — it loses tick-driven lifecycle** (found in pre-push review). The
+lifecycle transitions that matter are *not* events: Tier-1 auto-close (`meta.lifecycle = Closed`),
+Tier-2 finalize (`meta.lifecycle = Finalized` + `finalized_at_ms`), and archive (`meta.lifecycle =
+Archived` + event prune) are all in-place `PollMeta` mutations by the tick; the Tier-2 contestability
+clock (`threshold_reached_at_ms`, `last_unsignal_after_threshold_ms`) lives in `tier_state`. Replaying
+events alone reconstructs a Finalized/Archived poll as active `Open` (re-contestable or a permanent
+zombie), and resets a mid-contestability window. So we also persist a **`poll_restore` overlay** —
+`HashMap<PollId, {meta: PollMeta, tier2_timing}>` — and reapply it after replay. Tier-3 stage
+transitions and Tier-2 auto-exec (ZEB-300) are *event*-driven (persisted + replayed), so the overlay
+needs only `meta` + the two Tier-2 timing fields to be complete.
 
 Disk shape mirrors the per-community CRDT (`community_state_persist.rs`): plaintext CBOR at rest
 (the codebase convention — channel-log segments are plaintext at rest too; encryption is wire-only;

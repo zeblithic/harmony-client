@@ -3416,9 +3416,15 @@ mod tests {
             path.exists(),
             "voting.cbor must exist after a persisted mutation"
         );
-        let (events, _policy) =
+        let (events, _policy, poll_restore) =
             crate::community_voting_persist::load_voting_log(&path, &community_id).unwrap();
         assert_eq!(events, vec![ev], "persisted log reloads the applied event");
+        // The applied PollCreate materialized one poll, so its restore persists.
+        assert_eq!(
+            poll_restore.len(),
+            1,
+            "the applied poll's tick-state overlay is persisted"
+        );
     }
 
     // ── VotingReplayTracker ────────────────────────────────────────────────

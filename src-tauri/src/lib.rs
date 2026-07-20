@@ -47856,9 +47856,10 @@ impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMember
 /// Replay is pure materialization (`apply_with_snapshot`): the events come
 /// from our own trusted disk, so signatures are NOT re-verified; only the
 /// membership snapshot at each event's own HLC is needed for correct
-/// tally/conviction weighting (ZEB-315 rolling eligibility). Replaying in
-/// stored order reproduces the pre-restart state (the stored log holds only
-/// successfully-applied events, in apply order).
+/// tally/conviction weighting (ZEB-315 rolling eligibility). Replay alone
+/// does NOT reconstruct tick-driven lifecycle (Closed/Finalized/Archived +
+/// `finalized_at_ms` are in-place `PollMeta` mutations, not events), so the
+/// persisted per-poll `PollMeta` overlay is restored after replay.
 ///
 /// Non-fatal throughout: a missing/corrupt file yields an empty log
 /// (recovered later via backfill), and a per-event replay error is logged
@@ -47886,7 +47887,7 @@ async fn reconcile_voting_from_state(
         }
     }
     let path = crate::community_voting_persist::voting_path_for(identity_dir, &community_id);
-    let (events, policy) = match crate::community_voting_persist::load_voting_log(
+    let (events, policy, poll_restore) = match crate::community_voting_persist::load_voting_log(
         &path,
         &community_id,
     ) {
@@ -47914,6 +47915,24 @@ async fn reconcile_voting_from_state(
             Ok(_) => replayed += 1,
             Err(e) => {
                 tracing::warn!(?community_id, err = ?e, "voting reconcile: skipped un-replayable event")
+            }
+        }
+    }
+    // Overlay the persisted per-poll tick-driven state. Replaying events
+    // rebuilds each poll's tally/conviction but NOT its tick-driven
+    // lifecycle (Closed/Finalized/Archived + finalized_at_ms in `meta`) nor
+    // the Tier-2 contestability clock (threshold_reached_at_ms /
+    // last_unsignal_after_threshold_ms in `tier_state`). Restoring both
+    // prevents a restart from resurrecting a Finalized/Archived poll as
+    // active `Open`, or resetting a mid-contestability proposal's 24h window.
+    for (pid, restore) in poll_restore {
+        if let Some(state) = log.polls.get_mut(&pid) {
+            state.meta = restore.meta;
+            if let Some((threshold_reached, last_unsignal)) = restore.tier2_timing {
+                if let crate::community_voting_log::TierState::Tier2(t2) = &mut state.tier_state {
+                    t2.threshold_reached_at_ms = threshold_reached;
+                    t2.last_unsignal_after_threshold_ms = last_unsignal;
+                }
             }
         }
     }
@@ -48050,6 +48069,60 @@ mod zeb718_voting_reconcile_tests {
             voting_logs.lock().await.is_empty(),
             "no file → no inserted log"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_tick_driven_finalized_lifecycle() {
+        use crate::community_voting_core::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x76; 16]);
+        let actor = OwnerAddr([0xbb; 16]);
+
+        // Materialize a poll, then simulate the tick flipping it to
+        // Finalized — an in-place PollMeta mutation, NOT an event. Replaying
+        // events alone would resurrect it as Open; the persisted overlay
+        // must restore Finalized.
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(
+                tier1_poll_create(actor, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply create");
+        {
+            let state = log.polls.get_mut(&pid).expect("poll materialized");
+            state.meta.lifecycle = Lifecycle::Finalized;
+            state.meta.finalized_at_ms = Some(1_234);
+        }
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        let state = g.polls.get(&pid).expect("poll reloaded");
+        assert_eq!(
+            state.meta.lifecycle,
+            Lifecycle::Finalized,
+            "tick-driven Finalized lifecycle must survive restart, not resurrect as Open"
+        );
+        assert_eq!(state.meta.finalized_at_ms, Some(1_234));
     }
 }
 

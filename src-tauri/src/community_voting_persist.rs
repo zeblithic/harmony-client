@@ -19,28 +19,47 @@
 //! alongside `crdt.cbor` / `replay.cbor` (same layout as
 //! `community_state_sync::paths_for`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::community_voting_conviction::CommunityVotingPolicy;
-use crate::community_voting_core::SignedVotingEvent;
-use crate::community_voting_log::VotingLog;
+use crate::community_voting_core::{PollId, PollMeta, SignedVotingEvent};
+use crate::community_voting_log::{TierState, VotingLog};
 use crate::owner_state_types::SpaceId;
 
 /// Current on-disk schema version. Bump on any breaking layout change;
 /// an unknown version decodes-as-corrupt → quarantine + default.
 const VOTING_LOG_SCHEMA_VERSION: u8 = 1;
 
+/// Per-poll state that replaying `events` does NOT reconstruct, because it is
+/// set by tick-driven in-place mutation rather than by any event:
+/// - `meta`: the whole `PollMeta` (Tier-1 auto-close → `Closed`, Tier-2
+///   finalize → `Finalized` + `finalized_at_ms`, archive → `Archived`).
+///   Without it a restart resurrects Finalized/Archived polls as active
+///   `Open` ones (re-contestable / zombie).
+/// - `tier2_timing`: the Tier-2 contestability clock in `tier_state`
+///   (`threshold_reached_at_ms`, `last_unsignal_after_threshold_ms`). Without
+///   it a mid-contestability proposal's 24h window resets on restart,
+///   re-opening a reversion window. `None` for non-Tier-2 polls.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PollRestore {
+    pub meta: PollMeta,
+    pub tier2_timing: Option<(Option<i128>, Option<i128>)>,
+}
+
 /// The persisted record. `version` + `community_id` ride inside the
 /// CBOR (not a raw prefix byte) — same idiom as `CommunityState`, which
-/// carries its own `community_id` for the routing check.
+/// carries its own `community_id` for the routing check. `poll_restore` is
+/// the tick-driven-state overlay applied after replay (see `PollRestore`).
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedVotingLog {
     version: u8,
     community_id: SpaceId,
     events: Vec<SignedVotingEvent>,
     policy: CommunityVotingPolicy,
+    poll_restore: HashMap<PollId, PollRestore>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -72,11 +91,32 @@ pub fn save_voting_log(
     log: &VotingLog,
     community_id: &SpaceId,
 ) -> Result<(), PersistError> {
+    let poll_restore: HashMap<PollId, PollRestore> = log
+        .polls
+        .iter()
+        .map(|(pid, state)| {
+            let tier2_timing = match &state.tier_state {
+                TierState::Tier2(t2) => Some((
+                    t2.threshold_reached_at_ms,
+                    t2.last_unsignal_after_threshold_ms,
+                )),
+                _ => None,
+            };
+            (
+                *pid,
+                PollRestore {
+                    meta: state.meta.clone(),
+                    tier2_timing,
+                },
+            )
+        })
+        .collect();
     let record = PersistedVotingLog {
         version: VOTING_LOG_SCHEMA_VERSION,
         community_id: *community_id,
         events: log.events.clone(),
         policy: log.policy().clone(),
+        poll_restore,
     };
     let mut bytes = Vec::new();
     ciborium::into_writer(&record, &mut bytes)
@@ -98,22 +138,31 @@ pub fn save_voting_log(
 ///   corruption of *this* slot — safe to quarantine, unlike
 ///   `community_state_persist` where a foreign file could legitimately
 ///   sit in the wrong directory during manual recovery).
+#[allow(clippy::type_complexity)]
 pub fn load_voting_log(
     path: &Path,
     expected_id: &SpaceId,
-) -> Result<(Vec<SignedVotingEvent>, CommunityVotingPolicy), PersistError> {
+) -> Result<
+    (
+        Vec<SignedVotingEvent>,
+        CommunityVotingPolicy,
+        HashMap<PollId, PollRestore>,
+    ),
+    PersistError,
+> {
+    let empty = || (Vec::new(), CommunityVotingPolicy::default(), HashMap::new());
     // Single-syscall NotFound handling (no TOCTOU between exists+read).
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), CommunityVotingPolicy::default()));
+            return Ok(empty());
         }
         Err(e) => return Err(PersistError::Io(e)),
     };
     match ciborium::from_reader::<PersistedVotingLog, _>(bytes.as_slice()) {
         Ok(record) if record.version != VOTING_LOG_SCHEMA_VERSION => {
             quarantine_corrupted(path, &format!("unknown schema version {}", record.version));
-            Ok((Vec::new(), CommunityVotingPolicy::default()))
+            Ok(empty())
         }
         Ok(record) if record.community_id != *expected_id => {
             quarantine_corrupted(
@@ -123,12 +172,12 @@ pub fn load_voting_log(
                     record.community_id, expected_id
                 ),
             );
-            Ok((Vec::new(), CommunityVotingPolicy::default()))
+            Ok(empty())
         }
-        Ok(record) => Ok((record.events, record.policy)),
+        Ok(record) => Ok((record.events, record.policy, record.poll_restore)),
         Err(decode_err) => {
             quarantine_corrupted(path, &decode_err.to_string());
-            Ok((Vec::new(), CommunityVotingPolicy::default()))
+            Ok(empty())
         }
     }
 }
@@ -216,7 +265,7 @@ mod tests {
         // policy stays default (fields are private) — round-trip still
         // exercises the serde path and Eq confirms fidelity.
         save_voting_log(&path, &log, &cid).unwrap();
-        let (events, policy) = load_voting_log(&path, &cid).unwrap();
+        let (events, policy, _poll_meta) = load_voting_log(&path, &cid).unwrap();
         assert_eq!(events, log.events);
         assert_eq!(&policy, log.policy());
     }
@@ -226,8 +275,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cid = SpaceId([5u8; 16]);
         let path = voting_path_for(dir.path(), &cid);
-        let (events, policy) = load_voting_log(&path, &cid).unwrap();
+        let (events, policy, poll_meta) = load_voting_log(&path, &cid).unwrap();
         assert!(events.is_empty());
+        assert!(poll_meta.is_empty());
         assert_eq!(policy, CommunityVotingPolicy::default());
     }
 
@@ -241,7 +291,7 @@ mod tests {
         let mut log = VotingLog::default();
         log.events.push(test_event(1, 0, "d"));
         save_voting_log(&path, &log, &cid_a).unwrap();
-        let (events, _policy) = load_voting_log(&path, &cid_b).unwrap();
+        let (events, _policy, _pm) = load_voting_log(&path, &cid_b).unwrap();
         assert!(
             events.is_empty(),
             "mismatch must not surface foreign events"
@@ -264,11 +314,12 @@ mod tests {
             community_id: cid,
             events: vec![test_event(1, 0, "d")],
             policy: CommunityVotingPolicy::default(),
+            poll_restore: HashMap::new(),
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&record, &mut bytes).unwrap();
         write_atomic(&path, &bytes).unwrap();
-        let (events, _) = load_voting_log(&path, &cid).unwrap();
+        let (events, _, _) = load_voting_log(&path, &cid).unwrap();
         assert!(events.is_empty());
     }
 
@@ -279,7 +330,7 @@ mod tests {
         let path = voting_path_for(dir.path(), &cid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, [0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
-        let (events, policy) = load_voting_log(&path, &cid).unwrap();
+        let (events, policy, _pm) = load_voting_log(&path, &cid).unwrap();
         assert!(events.is_empty());
         assert_eq!(policy, CommunityVotingPolicy::default());
     }
