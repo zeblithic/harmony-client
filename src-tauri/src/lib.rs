@@ -205,6 +205,7 @@ pub mod iroh_pex_acceptor;
 pub mod iroh_tunnel_acceptor;
 pub mod iroh_tunnel_dm_transport;
 pub mod library_directory;
+pub mod liveness_heartbeat;
 pub mod mail;
 pub mod mail_sync;
 pub mod mint;
@@ -1181,6 +1182,11 @@ pub struct NodeState {
     /// spawned by `start_node`. `Some` while the node is running; `take()`
     /// + `abort()` during `stop_inner` so a restart starts a fresh tick.
     pub voting_tick_handle: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// ZEB-410: JoinHandle for the periodic self-liveness heartbeat task
+    /// (spawned in start_node_inner when a resident trust engine exists;
+    /// aborted in stop_inner). Slot type mirrors `voting_tick_handle`.
+    pub liveness_heartbeat_handle:
+        std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// ZEB-163 Task 2: per-job cancellation flags for in-flight folder-
     /// tree ingests. `ingest_folder_tree` inserts a fresh `AtomicBool`
     /// keyed by its minted `job_id` and removes it on settle;
@@ -1912,6 +1918,7 @@ impl Default for NodeState {
                 std::collections::HashMap::new(),
             )),
             voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            liveness_heartbeat_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             folder_ingest_jobs: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -2464,6 +2471,18 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // tick that we'd then orphan. Engines clear in the same scope.
         {
             if let Ok(mut slot) = guard.voting_tick_handle.lock() {
+                if let Some(handle) = slot.take() {
+                    handle.abort();
+                }
+            }
+            // ZEB-410: abort the liveness heartbeat under the same lock. Recover a
+            // poisoned slot (into_inner) so shutdown can still take + abort the
+            // stored handle rather than leaking the task.
+            {
+                let mut slot = guard
+                    .liveness_heartbeat_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(handle) = slot.take() {
                     handle.abort();
                 }
@@ -4184,6 +4203,10 @@ pub async fn start_node_inner(
         let mut owner_trust_sync_engine_opt: Option<
             std::sync::Arc<crate::fleet_sync::FleetSyncEngine<harmony_owner::state::OwnerState>>,
         > = None;
+        // ZEB-410: device signing key for the liveness heartbeat, captured in the
+        // owner-loaded block below (where `loaded` is in scope) so it reaches the
+        // spawn block without ever living on NodeState.
+        let mut heartbeat_device_sk_opt: Option<std::sync::Arc<ed25519_dalek::SigningKey>> = None;
         let mut trust_sync_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
         // ZEB-677 S3: quorum-request engine + handles, lifted for the
         // NodeState assignment and event_loop::run (mirrors trust).
@@ -6119,6 +6142,11 @@ pub async fn start_node_inner(
                     );
                     owner_trust_doc_opt = Some(std::sync::Arc::clone(&owner_trust_doc));
                     owner_trust_sync_engine_opt = Some(std::sync::Arc::clone(&owner_trust_sync));
+                    // ZEB-410: capture the device signing key for the liveness
+                    // heartbeat here (loaded is in scope); moved into the task
+                    // closure at the spawn block, never onto NodeState.
+                    heartbeat_device_sk_opt =
+                        Some(std::sync::Arc::new(loaded.device_signing_key.clone()));
                     trust_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
                         addr_hex: owner_addr_hex.clone(),
                         outbound_rx: trust_out_rx,
@@ -11702,6 +11730,40 @@ pub async fn start_node_inner(
                         // IPC-side TrustStateAccess::Resident path.
                         guard.owner_trust_doc = owner_trust_doc_opt.clone();
                         guard.owner_trust_sync = owner_trust_sync_engine_opt.clone();
+                        // ZEB-410: spawn the periodic self-liveness heartbeat here,
+                        // where the three inputs (trust doc + engine, device signing
+                        // key) are in scope and `guard` is held. Re-signs the local
+                        // device's LivenessCert on a timer (node-start + hourly) so a
+                        // device — especially a headless serve node that never opens
+                        // the Devices panel — stays Full in siblings' evaluate_trust.
+                        // Reuses refresh_self_liveness (~15d gate) + the owner-trust-v1
+                        // sync path (notify_dirty). Spawn + slot-store live in the same
+                        // guard block that stores the doc/engine, so they are skipped
+                        // together on a lock-poison rollback (no leak) and aborted by
+                        // stop_inner on stop. The device signing key lives only in the
+                        // task closure — never on NodeState. Only spawns when a resident
+                        // trust engine + owner identity exist (all three _opt are Some).
+                        if let (Some(hb_doc), Some(hb_engine), Some(hb_device_sk)) = (
+                            owner_trust_doc_opt.clone(),
+                            owner_trust_sync_engine_opt.clone(),
+                            heartbeat_device_sk_opt.clone(),
+                        ) {
+                            let handle = crate::liveness_heartbeat::spawn_liveness_heartbeat(
+                                hb_doc,
+                                hb_engine,
+                                hb_device_sk,
+                                crate::liveness_heartbeat::LIVENESS_HEARTBEAT_INTERVAL,
+                            );
+                            // Recover a poisoned slot (into_inner) so a failed lock
+                            // can't leave the just-spawned task untracked (leaked).
+                            let mut slot = guard
+                                .liveness_heartbeat_handle
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if let Some(old) = slot.replace(handle) {
+                                old.abort();
+                            }
+                        }
                         guard.owner_quorum_doc = owner_quorum_doc_opt.clone();
                         guard.owner_quorum_sync = owner_quorum_sync_engine_opt.clone();
                         // ZEB-668 S5: carrier doc/engine + the shared key set
@@ -70329,6 +70391,7 @@ mod start_node_race_tests {
                 std::collections::HashMap::new(),
             )),
             voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            liveness_heartbeat_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             folder_ingest_jobs: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
