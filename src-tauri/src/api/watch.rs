@@ -32,11 +32,14 @@ const BACKFILL_PAGE: u32 = 200;
 // Projection: WireMessage (Deserialize) -> WatchLine (Serialize)
 // ---------------------------------------------------------------------------
 
-/// Wire twin of `ChannelMessageDto` that is `Deserialize`-able. The DTO is
+/// Wire twin of `ChannelMessageDto`, used only to extract the fields the watch
+/// needs (id/at for the cursor, plus the projection fields). The DTO is
 /// `Serialize`-only (its `kind: Option<&'static str>` can't deserialize), so
 /// both the backfill array rows and the live `payload.message` parse into this.
-/// Also `Serialize` so `--raw` backfill can re-emit the row verbatim.
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+/// `--raw` never goes through here — it emits the untouched original row/frame
+/// (see `backfill`/`handle_frame`), so fields not modeled here (e.g. reactions,
+/// attachments) still appear verbatim in raw output.
+#[derive(serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct WireMessage {
     pub message_id: String,
@@ -249,7 +252,9 @@ impl CursorSet {
         }
     }
 
-    /// Atomic write of `{channelHex: HlcDto}` (temp + rename).
+    /// Atomic write of `{channelHex: HlcDto}` (temp + rename). Creates the
+    /// parent dir first so a first-run `--cursor-file .../watch/fleet.json`
+    /// under a not-yet-existing directory persists instead of failing ENOENT.
     pub fn persist(&self, path: &Path) -> Result<(), String> {
         let map: BTreeMap<&String, HlcDto> = self
             .per_channel
@@ -257,6 +262,12 @@ impl CursorSet {
             .filter_map(|(ch, c)| c.since().map(|h| (ch, h)))
             .collect();
         let json = serde_json::to_string(&map).map_err(|e| format!("serialize cursors: {e}"))?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create cursor-file dir {}: {e}", parent.display()))?;
+            }
+        }
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("rename cursor-file: {e}"))?;
@@ -339,14 +350,15 @@ pub fn handle_frame(
 }
 
 /// Drain `list_channel_messages` history for every watched channel from its
-/// current cursor, emitting `source:"backfill"`. Returns early (Ok) if the
-/// consumer stops.
+/// current cursor, emitting `source:"backfill"`. Returns `Ok(true)` if the
+/// consumer stopped (stdout closed) mid-drain — so the caller can terminate
+/// instead of opening a live stream — or `Ok(false)` on normal completion.
 pub async fn backfill(
     d: &Discovery,
     cfg: &WatchConfig,
     cursors: &mut CursorSet,
     emit: &mut impl FnMut(&str) -> bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     for ch in &cfg.channels {
         loop {
             let since = cursors.since(ch);
@@ -362,23 +374,28 @@ pub async fn backfill(
             if status != 200 {
                 return Err(format!("list_channel_messages HTTP {status}: {body}"));
             }
-            let rows: Vec<WireMessage> =
+            // Parse as raw JSON values so `--raw` emits rows verbatim (including
+            // fields WireMessage doesn't model, e.g. reactions/attachments); each
+            // row is then deserialized into WireMessage for the cursor + projection.
+            let rows: Vec<serde_json::Value> =
                 serde_json::from_str(&body).map_err(|e| format!("parse backfill: {e}"))?;
             let page = rows.len();
-            for m in &rows {
+            for row in &rows {
+                let m: WireMessage = serde_json::from_value(row.clone())
+                    .map_err(|e| format!("parse backfill row: {e}"))?;
                 if !cursors.accept(ch, &m.message_id, &m.at) {
                     continue;
                 }
                 let out = if cfg.raw {
-                    serde_json::to_string(m).map_err(|e| format!("serialize row: {e}"))?
+                    serde_json::to_string(row).map_err(|e| format!("serialize row: {e}"))?
                 } else {
-                    serde_json::to_string(&WatchLine::from_wire(m, "backfill", None))
+                    serde_json::to_string(&WatchLine::from_wire(&m, "backfill", None))
                         .map_err(|e| format!("serialize line: {e}"))?
                 };
                 let keep_going = emit(&out);
                 cursors.maybe_persist();
                 if !keep_going {
-                    return Ok(()); // consumer stop
+                    return Ok(true); // consumer stop
                 }
             }
             if page < BACKFILL_PAGE as usize {
@@ -386,7 +403,7 @@ pub async fn backfill(
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// One live-stream pass: subscribe to `/v1/events`, dispatch each frame through
@@ -432,18 +449,29 @@ pub async fn run_watch(
                 emit(line)
             };
             async {
-                backfill(&d, &cfg, &mut cursors, &mut counting).await?;
+                if backfill(&d, &cfg, &mut cursors, &mut counting).await? {
+                    return Ok(StreamEnd::ConsumerStop); // stdout closed during catch-up
+                }
                 stream_once(&d, &cfg, &mut cursors, &mut counting).await
             }
             .await
         };
+        // Exit-code contract (module header): 0 clean stop, 1 server error,
+        // 2 local/usage (mapped by api_watch from the initial-Err path above),
+        // 3 --no-retry disconnect.
         match outcome {
             Ok(StreamEnd::ConsumerStop) => return Ok(0),
-            Ok(StreamEnd::Reconnect) => {}
-            Err(e) => eprintln!("watch: {e}"),
-        }
-        if cfg.no_retry {
-            return Ok(3);
+            Ok(StreamEnd::Reconnect) => {
+                if cfg.no_retry {
+                    return Ok(3); // clean disconnect / _lagged under --no-retry
+                }
+            }
+            Err(e) => {
+                eprintln!("watch: {e}");
+                if cfg.no_retry {
+                    return Ok(1); // server/transport error under --no-retry
+                }
+            }
         }
         // Port/token may have rotated on a node restart — re-read discovery.
         if let Ok(nd) = read_discovery(&data_dir) {
@@ -607,6 +635,32 @@ mod tests {
         let set2 = CursorSet::load(&cfg).unwrap();
         assert_eq!(set2.since("ch1").unwrap(), hlc(50, 0, "d"));
         assert!(set2.since("ch2").is_none());
+    }
+
+    #[test]
+    fn cursor_file_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent dirs do not exist yet (first-run --cursor-file .../watch/fleet.json).
+        let path = dir.path().join("watch").join("nested").join("fleet.json");
+        let cfg = WatchConfig {
+            community_id: "c1".into(),
+            channels: vec!["ch1".into()],
+            since: None,
+            cursor_file: Some(path.clone()),
+            raw: false,
+            no_retry: false,
+        };
+        let mut set = CursorSet::load(&cfg).unwrap();
+        assert!(set.accept("ch1", "m1", &hlc(7, 0, "d")));
+        set.persist(&path)
+            .expect("persist must create parent dirs, not ENOENT");
+        assert!(
+            path.exists(),
+            "cursor-file written under freshly-created dirs"
+        );
+
+        let set2 = CursorSet::load(&cfg).unwrap();
+        assert_eq!(set2.since("ch1").unwrap(), hlc(7, 0, "d"));
     }
 
     #[test]

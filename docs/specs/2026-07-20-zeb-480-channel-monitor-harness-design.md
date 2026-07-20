@@ -124,17 +124,27 @@ wake-relevant); a consumer that needs them uses `--raw` or a follow-up RPC. `--r
 untouched firehose frame for live and the raw `ChannelMessageDto` JSON for backfill.
 
 Stdout carries **only** NDJSON (frames); all diagnostics (reconnects, backoff, catch-up counts)
-go to stderr — same discipline as `api_cli`. Exit codes mirror `api_cli`: 0 clean stop, 1 server
-error, 2 local/usage error; `--no-retry` disconnect = a distinct code (e.g. 3).
+go to stderr — same discipline as `api_cli`. Exit codes: **0** clean stop (stdout closed), **1**
+server/transport error under `--no-retry`, **2** local/usage error (bad `--since`, missing
+discovery, no `--channel`), **3** clean disconnect / `_lagged` under `--no-retry`. Without
+`--no-retry` the watch retries indefinitely and only 0/2 are reachable.
 
 ### Resume correctness
 
-The cursor is an **HLC compared in total order** `(wallMs, logical, deviceId)`. A message is
-emitted iff its HLC is **strictly greater** than the channel's current cursor. Because
-`list_channel_messages{since}`'s inclusive/exclusive boundary is not guaranteed and the
-backfill→live handoff can overlap, the watch also keeps a **bounded recent-`messageId` set**
-(per channel, last K ids) and drops any message whose id it has already emitted. Strict-greater
-HLC + id-dedupe together guarantee the handoff never double-emits and never skips.
+The emit gate is **id-dedupe, NOT strict-greater HLC**. This system allows **backdated HLCs**
+(the at-event-HLC model), so a message can legitimately arrive live with an HLC earlier than one
+already seen; gating on HLC ordering would silently drop it. So the watch keeps a **bounded
+recent-`messageId` set** (per channel, last `DEDUPE_WINDOW` = 256 ids) and emits any message whose
+id it has not emitted recently — no HLC comparison gates emission. That handles the
+backfill→live overlap (a re-delivered id is dropped) regardless of `list_channel_messages{since}`'s
+inclusive/exclusive boundary.
+
+The **HLC** (compared in total order `(wallMs, logical, deviceId)`) serves one job only: the
+**high-water cursor** that bounds the next backfill's `since`. It advances monotonically as
+messages are emitted, so a reconnect re-backfills only the small frontier since the last emit —
+comfortably inside the dedupe window, so nothing double-emits. Known limitation: a message that
+materializes during watcher downtime with an HLC *earlier* than the high-water mark is not
+re-fetched by backfill (acceptable for coordination; full gap-freedom is a deferred follow-up).
 
 ### Auth / scoping
 
