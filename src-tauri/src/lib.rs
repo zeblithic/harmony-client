@@ -205,6 +205,7 @@ pub mod iroh_pex_acceptor;
 pub mod iroh_tunnel_acceptor;
 pub mod iroh_tunnel_dm_transport;
 pub mod library_directory;
+pub mod liveness_heartbeat;
 pub mod mail;
 pub mod mail_sync;
 pub mod mint;
