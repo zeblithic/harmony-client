@@ -19592,6 +19592,17 @@ async fn burn_content(
     sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
+    burn_content_impl(sidecar_id, &state).await
+}
+
+/// ZEB-722: testable seam for [`burn_content`] over a bare `&Mutex<NodeState>`
+/// (mirrors the `grant_read` → `grant_read_impl` split). In addition to the
+/// sidecar/runtime burn, GCs the owner-state `file_deks` / `file_grants`
+/// entries once a CID is FULLY burned (its last sidecar reference removed).
+pub(crate) async fn burn_content_impl(
+    sidecar_id: String,
+    state: &Mutex<NodeState>,
+) -> Result<bool, String> {
     let id = parse_sidecar_id(&sidecar_id)?;
 
     // ZEB-160: serialize against pin_content/unpin_content. The three-
@@ -19613,9 +19624,14 @@ async fn burn_content(
     // could pin/unpin offline but not burn. With sidecar-as-source-of-
     // truth, the entry-removal step succeeds even with the runtime down;
     // a future reconciliation pass cleans up surviving bytes.
-    let (index, maybe_verb_tx) = {
+    let (index, maybe_verb_tx, crdt_state, sync_engine) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        (guard.content_index.clone(), guard.content_verb_tx.clone())
+        (
+            guard.content_index.clone(),
+            guard.content_verb_tx.clone(),
+            guard.crdt_state.clone(),
+            guard.sync_engine.clone(),
+        )
     };
 
     // Three-branch decision under a single lock acquisition: read entry's
@@ -19655,6 +19671,17 @@ async fn burn_content(
 
     match action {
         RuntimeAction::Burn(cid) => {
+            // ZEB-722: the CID's last sidecar reference is gone — GC its
+            // owner-state DEK + grant list via a permanent burn tombstone that
+            // converges across the owner's devices. Best-effort-symmetric with
+            // the runtime Burn below: a headless/early-boot node without
+            // owner-state simply skips (like the `maybe_verb_tx` None path).
+            if let Some(crdt) = &crdt_state {
+                crdt.lock().await.burn_gc(cid);
+                if let Some(engine) = &sync_engine {
+                    engine.notify_dirty();
+                }
+            }
             // Sidecar mutation already committed — runtime Burn is best-
             // effort. If the event loop is gone, bytes may survive until
             // W-TinyLFU evicts them or a future reconciliation pass runs.
@@ -20739,6 +20766,74 @@ mod file_share_ipc_tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].grantee_address, grantee_hex());
         assert_eq!(list[0].display_name.as_deref(), Some("Alice"));
+    }
+
+    #[tokio::test]
+    async fn burn_content_gcs_owner_state_maps() {
+        // ZEB-722: burning a CID's LAST sidecar reference GCs its owner-state
+        // DEK + grant list and records the burn tombstone.
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store); // seeds crdt_state.file_deks[CID]
+
+        // Seed a grant for the same CID so we can assert it's GC'd too.
+        let (content_index, crdt) = {
+            let g = state.lock().unwrap();
+            (g.content_index.clone(), g.crdt_state.clone().unwrap())
+        };
+        crdt.lock().await.file_grants.insert(CID, Vec::new());
+
+        // A single sidecar entry pointing at CID → burning it makes CID's last
+        // reference disappear → RuntimeAction::Burn fires.
+        let res = send_ingest_with_name(&content_index, CID, "f.bin".into(), 3, None)
+            .await
+            .expect("sidecar insert");
+        // IngestResult.sidecar_id is already a String.
+        let burned = burn_content_impl(res.sidecar_id, &state)
+            .await
+            .expect("burn");
+        assert!(burned, "burn returns true when an entry was removed");
+
+        let owner = crdt.lock().await;
+        assert!(!owner.file_deks.contains_key(&CID), "DEK GC'd on burn");
+        assert!(!owner.file_grants.contains_key(&CID), "grants GC'd on burn");
+        assert!(
+            owner.burned_content.contains(&CID),
+            "burn tombstone recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_content_keeps_dek_while_a_sibling_reference_remains() {
+        // ZEB-722: TWO sidecar entries point at the same CID. Burning ONE leaves
+        // a live reference, so RuntimeAction::Burn does NOT fire and the DEK must
+        // survive — pins the "GC only when the CID is fully burned" invariant
+        // (the reason the GC lives in the Burn arm, not the entry-removal step).
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store); // crdt_state.file_deks[CID] seeded
+        let content_index = state.lock().unwrap().content_index.clone();
+
+        let first = send_ingest_with_name(&content_index, CID, "a.bin".into(), 3, None)
+            .await
+            .expect("first ref");
+        let _second = send_ingest_with_name(&content_index, CID, "b.bin".into(), 3, None)
+            .await
+            .expect("second ref");
+
+        let burned = burn_content_impl(first.sidecar_id, &state)
+            .await
+            .expect("burn");
+        assert!(burned, "the entry was removed");
+
+        let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+        let owner = crdt.lock().await;
+        assert!(
+            owner.file_deks.contains_key(&CID),
+            "DEK retained while a sibling ref remains"
+        );
+        assert!(
+            !owner.burned_content.contains(&CID),
+            "no tombstone until the last ref is burned"
+        );
     }
 
     #[tokio::test]

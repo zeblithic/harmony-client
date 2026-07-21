@@ -151,6 +151,23 @@ pub struct OwnerState {
     /// `default`) so pre-ZEB-674 snapshots load empty.
     #[serde(rename = "rg", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub received_file_grants: BTreeMap<[u8; 32], ReceivedFileGrant>,
+    /// ZEB-722: CIDs of encrypted personal files that have been BURNED (the last
+    /// sidecar reference removed). A permanent tombstone: it GCs the grow-only
+    /// `file_deks` / `file_grants` entries for the CID and keeps a stale sibling
+    /// device from resurrecting them on the add-wins union merge
+    /// (`owner_state_sync::merge_remote_into_local` sweeps the maps against this
+    /// set after unioning them).
+    ///
+    /// Permanent (never un-set) and HLC-free is SAFE: encrypted ingest mints a
+    /// fresh RANDOM DEK (`file_sharing::generate_file_dek` = `EpochKey::random`)
+    /// and ZEB-726 derives the frame nonce from the DEK, so re-ingesting
+    /// identical plaintext yields different ciphertext → a DIFFERENT CID. A
+    /// burned CID is therefore cryptographically unreproducible; it can never
+    /// re-appear as a live entry, so there is no "re-ingest after burn" race to
+    /// arbitrate. Absent on the wire when empty (`skip_serializing_if` +
+    /// `default`) so pre-ZEB-722 snapshots load empty.
+    #[serde(rename = "bt", skip_serializing_if = "BTreeSet::is_empty", default)]
+    pub burned_content: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +411,18 @@ impl OwnerState {
     pub fn tombstone_space(&mut self, space_id: SpaceId) {
         self.spaces.remove(&space_id);
         self.tombstones.insert(space_id);
+    }
+
+    /// ZEB-722: GC the owner-side file maps when a personal file is burned (its
+    /// last sidecar reference removed). Records a permanent `burned_content`
+    /// tombstone so the removal converges across the owner's devices — a stale
+    /// sibling cannot resurrect the entry on the add-wins union merge — then
+    /// drops the CID's sealed DEK and grant list. The caller MUST `notify_dirty`
+    /// afterward (ZEB-709) or the mutation is neither persisted nor replicated.
+    pub fn burn_gc(&mut self, cid: [u8; 32]) {
+        self.burned_content.insert(cid);
+        self.file_deks.remove(&cid);
+        self.file_grants.remove(&cid);
     }
 
     /// Apply an incoming OutboxEntry to the CRDT. Upsert by

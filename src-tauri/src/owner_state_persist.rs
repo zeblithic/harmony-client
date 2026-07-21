@@ -145,6 +145,12 @@ struct CrdtFileV2 {
     /// `skip_serializing_if` keeps existing file shapes compact.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     received_file_grants: BTreeMap<[u8; 32], crate::owner_state_types::ReceivedFileGrant>,
+    /// ZEB-722: persisted burn tombstones (root CID bytes). Absent in
+    /// pre-ZEB-722 V2 files; `serde(default)` loads those as empty (no
+    /// schema-version bump — absent == empty). `skip_serializing_if` keeps
+    /// existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty", default)]
+    burned_content: BTreeSet<[u8; 32]>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -163,6 +169,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             file_deks: s.file_deks.clone(),
             file_grants: s.file_grants.clone(),
             received_file_grants: s.received_file_grants.clone(),
+            burned_content: s.burned_content.clone(),
         }
     }
 }
@@ -183,6 +190,7 @@ impl From<CrdtFileV2> for OwnerState {
             file_deks: f.file_deks,
             file_grants: f.file_grants,
             received_file_grants: f.received_file_grants,
+            burned_content: f.burned_content,
         }
     }
 }
@@ -493,6 +501,25 @@ mod tests {
             loaded.received_file_grants.get(&cid).unwrap().file_size,
             4242
         );
+    }
+
+    #[test]
+    fn crdt_file_v2_round_trips_burned_content() {
+        // ZEB-722: the burn tombstone set must survive save->load, or a restart
+        // re-loads the GC'd DEK/grant entries as live and boot-replay never
+        // re-burns them — the map resurrects across restarts. Guards the
+        // CrdtFileV2 threading + both From impls. A default OwnerState (empty
+        // set, skipped on the wire) implicitly covers the pre-ZEB-722
+        // backward-compat "loads empty" case.
+        let mut s = OwnerState::default();
+        s.burn_gc([0x5cu8; 32]);
+        s.burn_gc([0x5du8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(loaded.burned_content, s.burned_content);
+        assert_eq!(loaded.burned_content.len(), 2);
     }
 
     #[test]
