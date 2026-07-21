@@ -27,6 +27,7 @@
 
 **Files:**
 - Modify: `src-tauri/src/file_stream_crypto.rs` (whole module: constants, `FrameSealer`, `decrypt_stream_to_writer`, `v3_ciphertext_len`, `decrypt_stream_to_path`, all `#[cfg(test)]` tests)
+- Modify: `src-tauri/src/lib.rs` — **only** the two compile-critical call sites that the fallible `FrameSealer::new` + `V3_HEADER_LEN` rename break (`produce_ciphertext` ~L20099 → `.map_err(|e| e.to_string())?`; ingest cap ~L20199 → `V3_HEADER_LEN`). These keep the crate compiling so T1 is an independently-testable deliverable. Everything else in lib.rs (buffer reuse, doc wording) stays in Task 2.
 
 **Interfaces:**
 - Consumes: `EpochKey` (`as_bytes`, `as_chacha_key`, `new`), `chacha20poly1305::aead::{stream::{EncryptorBE32, DecryptorBE32}, Payload, generic_array::GenericArray}`, `ChaCha20Poly1305`, `sha2::Sha256`, `tempfile::NamedTempFile`.
@@ -67,7 +68,7 @@
 
 - [ ] **Step 6 — Commit** (`feat(zeb-726): v3 fully-authenticated streaming file-encryption format`).
 
-**Scope note for reviewer:** this task owns the ENTIRE `file_stream_crypto.rs`. The dir-fsync (durability) and the `pub`-API guards (frame_size==0, length validation, overflow) live here by design — same file, reviewed together with the crypto.
+**Scope note for reviewer:** this task owns the ENTIRE `file_stream_crypto.rs`. The dir-fsync (durability) and the `pub`-API guards (frame_size==0, length validation, overflow) live here by design — same file, reviewed together with the crypto. Task 1 ALSO makes exactly two compile-critical edits in `lib.rs` (the fallible-`new` `.map_err(...)?` and the `V3_HEADER_LEN` cap constant) so the crate compiles — these are authorized, not scope creep; anything more in lib.rs would be.
 
 ---
 
@@ -81,9 +82,10 @@
 **Interfaces:**
 - Consumes from Task 1: `FrameSealer::new -> Result`, `V3_HEADER_LEN`, `v3_ciphertext_len`.
 
-**Changes:**
-- `produce_ciphertext`: `let mut sealer = crate::file_stream_crypto::FrameSealer::new(&dek, frame_size).map_err(|e| e.to_string())?;` (fn returns `Result<(), String>`). Reuse the look-ahead buffer: allocate `nxt` once before the loop and swap instead of reallocating — replace `let mut nxt = vec![0u8; fs];` inside the loop with a pre-loop `let mut nxt = vec![0u8; fs];` and, on the "advance" branch, `std::mem::swap(&mut cur, &mut nxt); cur_len = nxt_len;` (semantics identical: `cur` becomes the peeked frame; the old `cur` buffer is reused next iteration). Verify `read_up_to(&mut file, &mut nxt)` still fills from index 0 each iteration.
-- `ingest_content_encrypted_inner`: `let cap = (frame_size as usize + 16) * 2 + crate::file_stream_crypto::V3_HEADER_LEN;`.
+**Already done in Task 1 (do NOT redo):** `produce_ciphertext`'s `FrameSealer::new(...).map_err(|e| e.to_string())?` and `ingest_content_encrypted_inner`'s `V3_HEADER_LEN` cap constant — Task 1 folded these two compile-critical edits in. Confirm they're present; do not duplicate.
+
+**Changes (this task):**
+- `produce_ciphertext`: reuse the look-ahead buffer: allocate `nxt` once before the loop and swap instead of reallocating — replace `let mut nxt = vec![0u8; fs];` inside the loop with a pre-loop `let mut nxt = vec![0u8; fs];` and, on the "advance" branch, `std::mem::swap(&mut cur, &mut nxt); cur_len = nxt_len;` (semantics identical: `cur` becomes the peeked frame; the old `cur` buffer is reused next iteration). Verify `read_up_to(&mut file, &mut nxt)` still fills from index 0 each iteration.
 - Doc wording: "v2 chunked-AEAD" → "v3", "v2 STREAM frames" → "v3 STREAM frames" in the lib.rs comments listed above.
 - `file_sharing.rs` ×2 + `owner_state_types.rs` ×1: `file_stream_crypto::v2_ciphertext_len` → `v3_ciphertext_len`; "v2" → "v3" wording. (These describe `file_size` accounting; the "16-byte tag" AEAD-tag figure is correct and stays.)
 
