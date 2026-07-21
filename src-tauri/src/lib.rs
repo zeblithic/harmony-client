@@ -20051,6 +20051,407 @@ async fn ingest_content_encrypted(
     .await
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// ZEB-674 Task 6 (C2/C5): owner-side share IPC — grant_read / revoke_read /
+// list_grants + share orchestration (the delivery pipe's sender rung).
+//
+// The pure cores (honesty gates, per-device seal, DTO projection, lazy revoke)
+// live in `file_sharing`; these `*_impl` seams snapshot NodeState handles,
+// drive the crdt_state / content_store / sync_engine, emit `grants-updated`,
+// and (grant only) deposit the sealed grant to the grantee's butler set. Thin
+// `#[tauri::command]` wrappers below register them (JS args camelCase).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Wall-clock now in epoch-ms (the `granted_at` / deposit `now_ms` stamp).
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Parse a 16-byte master `owner_id` from its hex form (the grantee address the
+/// frontend passes — the friend's `owner_id_hex`).
+fn parse_owner_addr(hex_str: &str) -> Result<crate::owner_state_types::OwnerAddr, String> {
+    let bytes = hex::decode(hex_str).map_err(|_| "invalid owner address hex".to_string())?;
+    let arr = <[u8; 16]>::try_from(bytes.as_slice())
+        .map_err(|_| "owner address must be 16 bytes".to_string())?;
+    Ok(crate::owner_state_types::OwnerAddr(arr))
+}
+
+/// `list_grants(cid)` core: project `file_grants[cid]` into DTO rows (grantee
+/// address + friend-resolved display + granted_at). Empty vec for an unknown /
+/// ungranted cid. Read-only.
+pub(crate) async fn list_grants_impl(
+    state: &Mutex<NodeState>,
+    cid: String,
+) -> Result<Vec<crate::file_sharing::FileGrantDto>, String> {
+    let cid = parse_cid_hex(&cid)?;
+    let crdt_state = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?
+    };
+    let st = crdt_state.lock().await;
+    Ok(crate::file_sharing::list_grants_inner(&st, cid))
+}
+
+/// `grant_read(cid, granteeAddress)` core: share read access to an encrypted
+/// file with an active friend. Rejects a public CID / non-friend with the stable
+/// `ineligible:` prefix; otherwise unseals the DEK, seals the grant per grantee
+/// device, allowlists the CID's subtree for member serve, records the owner-local
+/// grant (notify_dirty + persist — ZEB-709), emits `grants-updated`, and (Phase
+/// 2) deposits the pure-grant to the grantee's butler set (best-effort).
+pub(crate) async fn grant_read_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    cid: String,
+    grantee_address: String,
+) -> Result<(), String> {
+    let cid_hex = cid;
+    let cid = parse_cid_hex(&cid_hex)?;
+    let grantee_owner = parse_owner_addr(&grantee_address)?;
+
+    // Snapshot NodeState handles under the std lock, then drop before awaiting.
+    let (crdt_state, keytree, content_store, sync_engine, meta) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let crdt_state = guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        let keytree = guard
+            .owner_keytree
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        let content_store = guard
+            .content_store
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let sync_engine = guard.sync_engine.clone();
+        // File display metadata from the sidecar (first entry for this CID).
+        // There is no MIME column on the sidecar today — default per design.
+        let meta = {
+            let idx = guard
+                .content_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let m = idx
+                .entries_for_cid(&cid)
+                .next()
+                .map(|e| (e.file_name.clone(), e.size_bytes));
+            m
+        };
+        (crdt_state, keytree, content_store, sync_engine, meta)
+    };
+    let (file_name, file_size) = meta.unwrap_or_default();
+    let mime = "application/octet-stream".to_string();
+
+    // 1. Validate + seal (pure, under the crdt lock; no await held).
+    let grant_push = {
+        let st = crdt_state.lock().await;
+        crate::file_sharing::build_grant_push(
+            &st,
+            &keytree,
+            cid,
+            grantee_owner,
+            file_name,
+            file_size,
+            mime,
+        )?
+    };
+    // 2. Allowlist the encrypted CID's subtree for member serve BEFORE recording
+    //    the grant, so a serve-registration failure aborts with no state change.
+    content_store
+        .allow_serve_subtree(harmony_content::cid::ContentId::from_bytes(cid))
+        .await
+        .map_err(|e| format!("allow_serve_subtree: {e}"))?;
+    // 3. Record the owner-local grant + notify_dirty (ZEB-709: a file_grants
+    //    mutation without notify_dirty is never persisted NOR replicated).
+    let now_ms = now_epoch_ms();
+    {
+        let mut st = crdt_state.lock().await;
+        crate::file_sharing::record_grant(&mut st, cid, grantee_owner, now_ms);
+    }
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
+    }
+    crate::node_event_sink::emit_ser(
+        sink,
+        "grants-updated",
+        &serde_json::json!({ "cid": cid_hex }),
+    );
+
+    // Phase 2 wires the pure-grant butler deposit send here (delivering
+    // `grant_push` to the grantee's own butler set, mirroring
+    // `push_revocation_to_friends`). Phase 1 seals + records + allowlists but
+    // does not yet transmit; the grant is already replicated to the owner's own
+    // fleet, so the ShareList is live even before the send lands.
+    tracing::debug!(
+        grant_bytes = grant_push.len(),
+        recipient = %hex::encode(grantee_owner.0),
+        "ZEB-674 T6 Phase 1: grant sealed + recorded; deposit send lands in Phase 2"
+    );
+    Ok(())
+}
+
+/// `revoke_read(cid, granteeAddress)` core: LAZY revoke — drop the grantee's
+/// `GrantEntry` from `file_grants[cid]` (notify_dirty + persist), emit
+/// `grants-updated`. Does NOT touch the DEK or the serve allowlist — an
+/// already-granted grantee keeps access to this CID version (design constraint
+/// 3); this only removes them from the ShareList and stops future re-delivery.
+pub(crate) async fn revoke_read_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    cid: String,
+    grantee_address: String,
+) -> Result<(), String> {
+    let cid_hex = cid;
+    let cid = parse_cid_hex(&cid_hex)?;
+    let grantee_owner = parse_owner_addr(&grantee_address)?;
+
+    let (crdt_state, sync_engine) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let crdt_state = guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        (crdt_state, guard.sync_engine.clone())
+    };
+    let removed = {
+        let mut st = crdt_state.lock().await;
+        crate::file_sharing::revoke_grant_inner(&mut st, cid, grantee_owner)
+    };
+    if removed {
+        if let Some(engine) = sync_engine {
+            engine.notify_dirty();
+        }
+        crate::node_event_sink::emit_ser(
+            sink,
+            "grants-updated",
+            &serde_json::json!({ "cid": cid_hex }),
+        );
+    }
+    Ok(())
+}
+
+/// ZEB-674 Task 6: project the owner's "Shared with" list for a file.
+#[tauri::command]
+async fn list_grants(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    cid: String,
+) -> Result<Vec<crate::file_sharing::FileGrantDto>, String> {
+    list_grants_impl(state.inner(), cid).await
+}
+
+/// ZEB-674 Task 6: share read access to an encrypted file with a friend.
+#[tauri::command]
+async fn grant_read(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    cid: String,
+    grantee_address: String,
+) -> Result<(), String> {
+    grant_read_impl(state.inner(), &app, cid, grantee_address).await
+}
+
+/// ZEB-674 Task 6: lazily revoke a grantee from a file's ShareList.
+#[tauri::command]
+async fn revoke_read(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    cid: String,
+    grantee_address: String,
+) -> Result<(), String> {
+    revoke_read_impl(state.inner(), &app, cid, grantee_address).await
+}
+
+#[cfg(test)]
+mod file_share_ipc_tests {
+    use super::*;
+    use crate::content_store::{ContentStore, ContentStoreError};
+    use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_crypto::KeyTree;
+    use crate::owner_state_types::{Hlc, OwnerAddr, OwnerDeviceEntry};
+    use harmony_content::cid::ContentId;
+
+    const CID: [u8; 32] = [0xC1u8; 32];
+
+    fn grantee() -> OwnerAddr {
+        OwnerAddr([0x77u8; 16])
+    }
+    fn cid_hex() -> String {
+        hex::encode(CID)
+    }
+    fn grantee_hex() -> String {
+        hex::encode(grantee().0)
+    }
+
+    /// A `ContentStore` that records every `allow_serve_subtree` root — lets the
+    /// tests assert the grant allowlists the CID and that revoke leaves it.
+    #[derive(Default)]
+    struct RecordingStore {
+        allowed: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    }
+    impl RecordingStore {
+        fn contains(&self, cid: &[u8; 32]) -> bool {
+            self.allowed.lock().unwrap().contains(cid)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ContentStore for RecordingStore {
+        async fn put(&self, _cid: ContentId, _blob: Vec<u8>) -> Result<(), ContentStoreError> {
+            Ok(())
+        }
+        async fn get(&self, _cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            Ok(None)
+        }
+        async fn allow_serve_subtree(&self, root: ContentId) -> Result<usize, ContentStoreError> {
+            self.allowed.lock().unwrap().insert(root.to_bytes());
+            Ok(1)
+        }
+    }
+
+    fn keytree() -> KeyTree {
+        KeyTree::derive(&[0x9Au8; 32]).expect("keytree")
+    }
+
+    /// A NodeState carrying an encrypted-file DEK for [`CID`] and an Active
+    /// friend [`grantee`] with one known device — the grantable happy path.
+    /// `sync_engine`/`butler_deposit_client` stay `None` (Phase-1 unit scope);
+    /// the keychain is never touched (KeyTree is derived, identity unminted).
+    fn grantable_state(store: std::sync::Arc<RecordingStore>) -> Mutex<NodeState> {
+        let tree = keytree();
+        let mut owner = OwnerState::default();
+        let dek = crate::file_sharing::generate_file_dek();
+        owner.file_deks.insert(
+            CID,
+            crate::file_sharing::seal_dek_at_rest(&tree, &dek).expect("seal dek"),
+        );
+        owner.friend_graph.friends.insert(
+            grantee(),
+            FriendEntry {
+                master_ed25519: [0x33; 32],
+                display: Some("Alice".into()),
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                sealed_secret: None,
+            },
+        );
+        let mut dev_pub = [0u8; 64];
+        dev_pub[..32].copy_from_slice(&[0xA1; 32]);
+        owner.owner_device_cache.devices.insert(
+            grantee(),
+            OwnerDeviceEntry {
+                devices: vec![],
+                device_identity_pubs: vec![Some(dev_pub)],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                device_tunnel_contacts: vec![],
+            },
+        );
+        let content_store: std::sync::Arc<dyn ContentStore> = store;
+        Mutex::new(NodeState {
+            crdt_state: Some(std::sync::Arc::new(tokio::sync::Mutex::new(owner))),
+            owner_keytree: Some(std::sync::Arc::new(tree)),
+            content_store: Some(content_store),
+            ..NodeState::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn grant_read_emits_grants_updated() {
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("grant to an active friend succeeds");
+
+        // Emitted exactly one `grants-updated` carrying the cid.
+        let frames = sink.frames();
+        assert_eq!(frames.len(), 1, "one event");
+        assert_eq!(frames[0].0, "grants-updated");
+        assert_eq!(frames[0].1["cid"], serde_json::json!(cid_hex()));
+
+        // The CID's subtree was allowlisted for member serve.
+        assert!(store.contains(&CID), "grant allowlists the CID");
+
+        // The ShareList now reflects the grantee with their display name.
+        let list = list_grants_impl(&state, cid_hex()).await.expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].grantee_address, grantee_hex());
+        assert_eq!(list[0].display_name.as_deref(), Some("Alice"));
+    }
+
+    #[tokio::test]
+    async fn grant_read_rejects_public_and_non_friend_with_stable_prefix() {
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        // Public CID → ineligible; nothing allowlisted, nothing emitted.
+        let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+        crdt.lock().await.file_deks.clear();
+        let err = grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect_err("public cid ineligible");
+        assert!(err.starts_with("ineligible:"), "{err}");
+        assert!(!store.contains(&CID), "no allowlist on a rejected grant");
+        assert!(sink.frames().is_empty(), "no emit on a rejected grant");
+    }
+
+    #[tokio::test]
+    async fn revoke_read_is_lazy_and_keeps_allowlist() {
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("grant");
+        assert!(store.contains(&CID));
+
+        revoke_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("revoke");
+
+        // ShareList omits the grantee...
+        assert!(
+            list_grants_impl(&state, cid_hex())
+                .await
+                .unwrap()
+                .is_empty(),
+            "revoke drops the record"
+        );
+        // ...the DEK survives (lazy — access not withdrawn)...
+        let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+        assert!(
+            crdt.lock().await.file_deks.contains_key(&CID),
+            "DEK untouched by revoke"
+        );
+        // ...and the CID stays allowlisted (removing it would break remaining
+        // authorized viewers — constraint 3).
+        assert!(store.contains(&CID), "revoke does not de-allowlist");
+
+        // Both grant + revoke emitted a `grants-updated`.
+        let events: Vec<_> = sink.frames().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(events, vec!["grants-updated", "grants-updated"]);
+    }
+}
+
 /// ZEB-343: ingest an in-memory byte buffer (a normalized avatar PNG from the
 /// frontend) into CAS, returning the root CID hex. Uses default ContentFlags
 /// (PublicDurable / unencrypted) so the resulting CID is publicly servable.
@@ -63398,6 +63799,9 @@ pub fn run() {
             export_content,
             ingest_content,
             ingest_content_encrypted,
+            list_grants,
+            grant_read,
+            revoke_read,
             ingest_avatar_bytes,
             ingest_vine_video,
             ingest_profile_doc,

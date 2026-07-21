@@ -22,7 +22,7 @@ use crate::owner_state_crypto::{
     canonical_cbor_decode, canonical_cbor_encode, decrypt_file_dek, encrypt_file_dek,
     CanonicalPayload, CryptoError, KeyTree,
 };
-use crate::owner_state_types::{EpochKey, OwnerAddr, ReceivedFileGrant};
+use crate::owner_state_types::{EpochKey, GrantEntry, OwnerAddr, ReceivedFileGrant};
 use harmony_content::cid::ContentId;
 use serde::{Deserialize, Serialize};
 
@@ -279,6 +279,184 @@ pub fn open_received_file(
     Ok(open_dek_at_rest(keytree, &grant.sealed_dek)?)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Task 6 (C2/C5): owner-side share orchestration cores.
+//
+// These are the PURE, NodeState-free halves of the `grant_read` / `revoke_read`
+// / `list_grants` IPC commands (the async orchestration + Tauri wrappers live in
+// `lib.rs`). Kept here beside the seal/ingest primitives so the honesty gates,
+// the per-device seal, and the DTO projection are unit-testable over a bare
+// `OwnerState` + `KeyTree` (no keychain, no Tauri) — mirroring the grantee-side
+// tests in `tests/file_sharing_grantee.rs`.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Stable `ineligible:`-prefixed rejection: a PUBLIC (unencrypted) file has no
+/// per-file DEK, so it cannot be per-viewer shared (a public CID cannot be
+/// retro-ACLed — design constraint 2). The frontend switches on the `ineligible:`
+/// prefix (`FileDetailPanel.svelte`).
+pub const INELIGIBLE_PUBLIC: &str = "ineligible: only encrypted files can be shared";
+
+/// Stable `ineligible:`-prefixed rejection: a grant rides the friend content
+/// transport, so the grantee must be an ACTIVE friend.
+pub const INELIGIBLE_NON_FRIEND: &str = "ineligible: can only share with friends";
+
+/// The built, ready-to-deposit outcome of [`build_grant_push`] paired with the
+/// resolved grantee — handed from the Phase-1 IPC core to the Phase-2 deposit
+/// send so the send rung (`lib.rs`) delivers exactly these bytes to exactly this
+/// owner's butler set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSendPlan {
+    /// The grantee's master `OwnerAddr` (deposit recipient).
+    pub grantee_owner: OwnerAddr,
+    /// The `DepositPayload.grant_push` wire value (canonical CBOR of the
+    /// per-device sealed blobs). Empty-list CBOR when the grantee has no known
+    /// device X25519s (the honest new-device edge — nothing to open yet).
+    pub grant_push: Vec<u8>,
+}
+
+/// One row of the owner's "Shared with" list, projected for the frontend. Serde
+/// camelCase: `granteeAddress` / `displayName` / `grantedAt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileGrantDto {
+    /// The grantee's 16-byte master `owner_id`, hex-encoded.
+    pub grantee_address: String,
+    /// The grantee's friend-graph display name; `None` when the grantee is not a
+    /// currently-known friend (e.g. an old grant to a since-unfriended peer).
+    pub display_name: Option<String>,
+    /// Wall-clock ms when the grant was recorded.
+    pub granted_at: u64,
+}
+
+/// Encode per-device sealed grant blobs into the `DepositPayload.grant_push`
+/// wire value: CBOR of `Vec<serde_bytes Vec<u8>>` (each element a byte-string) —
+/// the EXACT shape [`ingest_grant_push`] decodes. Infallible: a `Vec<ByteBuf>`
+/// always serializes into an in-memory `Vec`.
+pub fn encode_grant_push(sealed_blobs: &[Vec<u8>]) -> Vec<u8> {
+    let list: Vec<serde_bytes::ByteBuf> = sealed_blobs
+        .iter()
+        .cloned()
+        .map(serde_bytes::ByteBuf::from)
+        .collect();
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&list, &mut bytes)
+        .expect("CBOR encode of Vec<ByteBuf> into a Vec is infallible");
+    bytes
+}
+
+/// Validate a share request and build the per-device-sealed `grant_push` wire
+/// value WITHOUT mutating `state`, allowlisting, or touching the network (Phase
+/// 1 IPC core — pure over `&OwnerState`).
+///
+/// Enforces the two honesty gates in order — the file must have been encrypted
+/// at ingest ([`INELIGIBLE_PUBLIC`] when `file_deks` lacks `cid`) and the grantee
+/// must be an ACTIVE friend ([`INELIGIBLE_NON_FRIEND`]) — then unseals the
+/// owner's at-rest DEK, wraps `{cid, file_meta, dek}` sealed per grantee device
+/// ([`seal_grant_for_devices`]), and returns the CBOR `grant_push` bytes.
+///
+/// A grantee with no learned device X25519s yields an empty-list `grant_push`
+/// (no blob to open) rather than an error — the design's explicit
+/// "new-device re-seal deferred" edge; the owner's ShareList still records the
+/// intent and a later re-share reaches the device once its key is learned.
+pub fn build_grant_push(
+    state: &OwnerState,
+    keytree: &KeyTree,
+    cid: [u8; 32],
+    grantee_owner: OwnerAddr,
+    file_name: String,
+    file_size: u64,
+    mime: String,
+) -> Result<Vec<u8>, String> {
+    // Gate 1 — only an encrypted-at-ingest file has a DEK to share.
+    let Some(sealed_dek) = state.file_deks.get(&cid) else {
+        return Err(INELIGIBLE_PUBLIC.to_string());
+    };
+    // Gate 2 — grants deliver over the friend transport; grantee must be Active.
+    let is_active_friend = matches!(
+        state.friend_graph.friends.get(&grantee_owner),
+        Some(f) if f.status == crate::friend_graph::FriendStatus::Active
+    );
+    if !is_active_friend {
+        return Err(INELIGIBLE_NON_FRIEND.to_string());
+    }
+    // Unseal the owner's at-rest DEK and wrap it per grantee device.
+    let dek = open_dek_at_rest(keytree, sealed_dek).map_err(|e| format!("unseal DEK: {e:?}"))?;
+    let inner = FileGrantInner {
+        cid,
+        file_name,
+        file_size,
+        mime,
+        dek: *dek.as_bytes(),
+    };
+    let devices = grantee_device_x25519s(state, grantee_owner);
+    let sealed =
+        seal_grant_for_devices(&inner, &devices).map_err(|e| format!("seal grant: {e}"))?;
+    Ok(encode_grant_push(&sealed))
+}
+
+/// Record an owner-local grant (C2). UPSERT semantics: a re-share to the same
+/// grantee refreshes the single row's `granted_at` rather than appending a
+/// duplicate, so the ShareList shows exactly one row per grantee.
+///
+/// The CALLER MUST `notify_dirty()` + persist after a mutation — a `file_grants`
+/// change without it is NEVER persisted NOR replicated (ack-outruns-payload =
+/// permanent loss, ZEB-709).
+pub fn record_grant(
+    state: &mut OwnerState,
+    cid: [u8; 32],
+    grantee_owner: OwnerAddr,
+    granted_at: u64,
+) {
+    let entries = state.file_grants.entry(cid).or_default();
+    entries.retain(|g| g.grantee_owner != grantee_owner);
+    entries.push(GrantEntry {
+        grantee_owner,
+        granted_at,
+    });
+}
+
+/// Project `state.file_grants[cid]` into frontend DTO rows, resolving each
+/// grantee's `display_name` from the friend graph (`None` when the grantee is
+/// not a currently-known friend). Empty vec when `cid` has no grants. Pure.
+pub fn list_grants_inner(state: &OwnerState, cid: [u8; 32]) -> Vec<FileGrantDto> {
+    let Some(grants) = state.file_grants.get(&cid) else {
+        return Vec::new();
+    };
+    grants
+        .iter()
+        .map(|g| FileGrantDto {
+            grantee_address: hex::encode(g.grantee_owner.0),
+            display_name: state
+                .friend_graph
+                .friends
+                .get(&g.grantee_owner)
+                .and_then(|f| f.display.clone()),
+            granted_at: g.granted_at,
+        })
+        .collect()
+}
+
+/// LAZY revoke (design "Revocation semantics — lazy"): drop every `GrantEntry`
+/// for `grantee_owner` from `file_grants[cid]`, returning whether a record was
+/// removed. Does NOT touch the DEK or the serve allowlist — an already-granted
+/// grantee keeps the DEK and the CID stays served (constraint 3: access to this
+/// CID version cannot be withdrawn). This only removes the grantee from the
+/// owner's ShareList and stops future re-delivery. Empties the cid's entry when
+/// the last grant is dropped. The CALLER MUST `notify_dirty()` + persist on a
+/// `true` return (ZEB-709).
+pub fn revoke_grant_inner(state: &mut OwnerState, cid: [u8; 32], grantee_owner: OwnerAddr) -> bool {
+    let Some(grants) = state.file_grants.get_mut(&cid) else {
+        return false;
+    };
+    let before = grants.len();
+    grants.retain(|g| g.grantee_owner != grantee_owner);
+    let removed = grants.len() != before;
+    if grants.is_empty() {
+        state.file_grants.remove(&cid);
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +557,165 @@ mod tests {
 
         // Unknown grantee → empty (no cache entry).
         assert!(grantee_device_x25519s(&state, OwnerAddr([9u8; 16])).is_empty());
+    }
+
+    // ── Task 6 IPC cores ────────────────────────────────────────────────
+
+    use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+    use crate::owner_state_types::{Hlc, OwnerDeviceEntry};
+
+    const GRANTEE: OwnerAddr = OwnerAddr([0x77u8; 16]);
+    const CID: [u8; 32] = [0xC1u8; 32];
+
+    fn friend_entry(status: FriendStatus, display: Option<&str>) -> FriendEntry {
+        FriendEntry {
+            master_ed25519: [0x33; 32],
+            display: display.map(str::to_owned),
+            status,
+            established_via: FriendOrigin::Token,
+            referrable: false,
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            sealed_secret: None,
+        }
+    }
+
+    fn device_pub(seed: u8) -> [u8; 64] {
+        let mut p = [0u8; 64];
+        p[..32].copy_from_slice(&[seed; 32]);
+        p
+    }
+
+    /// Seed `state` with an encrypted-at-ingest file DEK for [`CID`], plus an
+    /// Active friend [`GRANTEE`] carrying one learned device X25519 — the happy
+    /// path for `build_grant_push`.
+    fn seed_grantable(tree: &KeyTree, display: Option<&str>) -> OwnerState {
+        let mut state = OwnerState::default();
+        let dek = generate_file_dek();
+        state
+            .file_deks
+            .insert(CID, seal_dek_at_rest(tree, &dek).expect("seal dek"));
+        state
+            .friend_graph
+            .friends
+            .insert(GRANTEE, friend_entry(FriendStatus::Active, display));
+        state.owner_device_cache.devices.insert(
+            GRANTEE,
+            OwnerDeviceEntry {
+                devices: vec![],
+                device_identity_pubs: vec![Some(device_pub(0xA1))],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                device_tunnel_contacts: vec![],
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn grant_read_rejects_public_cid() {
+        // No `file_deks[cid]` → the file was ingested public; ineligible.
+        let tree = test_tree();
+        let mut state = seed_grantable(&tree, None);
+        state.file_deks.clear(); // simulate a public (unencrypted) CID
+        let err = build_grant_push(&state, &tree, CID, GRANTEE, "f".into(), 1, "m".into())
+            .expect_err("public cid must be ineligible");
+        assert!(err.starts_with("ineligible:"), "stable prefix: {err}");
+        assert_eq!(err, INELIGIBLE_PUBLIC);
+    }
+
+    #[test]
+    fn grant_read_rejects_non_friend() {
+        // Encrypted file present, but the grantee is not a friend at all.
+        let tree = test_tree();
+        let mut state = seed_grantable(&tree, None);
+        state.friend_graph.friends.clear();
+        let err = build_grant_push(&state, &tree, CID, GRANTEE, "f".into(), 1, "m".into())
+            .expect_err("non-friend must be ineligible");
+        assert!(err.starts_with("ineligible:"), "stable prefix: {err}");
+        assert_eq!(err, INELIGIBLE_NON_FRIEND);
+
+        // A merely-Pending friend is also ineligible (not yet mutual).
+        state
+            .friend_graph
+            .friends
+            .insert(GRANTEE, friend_entry(FriendStatus::Pending, None));
+        let err2 = build_grant_push(&state, &tree, CID, GRANTEE, "f".into(), 1, "m".into())
+            .expect_err("pending friend must be ineligible");
+        assert_eq!(err2, INELIGIBLE_NON_FRIEND);
+    }
+
+    #[test]
+    fn grant_then_list_reflects_grantee() {
+        let tree = test_tree();
+        let mut state = seed_grantable(&tree, Some("Alice"));
+
+        // The seal must succeed and open on the grantee's device (a real,
+        // openable grant — not just a byte blob).
+        let grant_push = build_grant_push(
+            &state,
+            &tree,
+            CID,
+            GRANTEE,
+            "notes.md".into(),
+            9,
+            "text/plain".into(),
+        )
+        .expect("grant to an active friend with a known device succeeds");
+        let blobs: Vec<serde_bytes::ByteBuf> =
+            ciborium::from_reader(grant_push.as_slice()).expect("grant_push decodes");
+        assert_eq!(blobs.len(), 1, "one sealed blob per known device");
+
+        // Record it, then the ShareList reflects the grantee with the display.
+        record_grant(&mut state, CID, GRANTEE, 4_242);
+        let list = list_grants_inner(&state, CID);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].grantee_address, hex::encode(GRANTEE.0));
+        assert_eq!(list[0].display_name.as_deref(), Some("Alice"));
+        assert_eq!(list[0].granted_at, 4_242);
+
+        // Re-share upserts (no duplicate row), refreshing granted_at.
+        record_grant(&mut state, CID, GRANTEE, 5_000);
+        let list2 = list_grants_inner(&state, CID);
+        assert_eq!(list2.len(), 1, "re-share upserts, never duplicates");
+        assert_eq!(list2[0].granted_at, 5_000);
+    }
+
+    #[test]
+    fn revoke_read_drops_record_lazily() {
+        let tree = test_tree();
+        let mut state = seed_grantable(&tree, Some("Alice"));
+        let dek_before = state.file_deks.get(&CID).cloned().expect("dek present");
+
+        record_grant(&mut state, CID, GRANTEE, 4_242);
+        assert_eq!(list_grants_inner(&state, CID).len(), 1);
+
+        // Lazy revoke: the record drops from the ShareList...
+        assert!(
+            revoke_grant_inner(&mut state, CID, GRANTEE),
+            "a record was removed"
+        );
+        assert!(
+            list_grants_inner(&state, CID).is_empty(),
+            "list omits the revoked grantee"
+        );
+        // ...but the DEK is UNTOUCHED (already-granted access is not withdrawn).
+        assert_eq!(
+            state.file_deks.get(&CID),
+            Some(&dek_before),
+            "revoke must not touch the file DEK (lazy)"
+        );
+
+        // Revoking again is an idempotent no-op.
+        assert!(
+            !revoke_grant_inner(&mut state, CID, GRANTEE),
+            "nothing left to remove"
+        );
     }
 }
