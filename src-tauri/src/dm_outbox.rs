@@ -1915,6 +1915,7 @@ impl DmOutbox {
             // separate direct path (`grant_read`), never the outbox retry loop.
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
             now_ms,
         });
     }

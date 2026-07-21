@@ -499,6 +499,7 @@ fn build_fixture() -> RelayFixture {
         invite_packet: None,
         revocation_push: None,
         grant_push: None,
+        grant_revoke: None,
     };
     let cert_bytes = harmony_owner::cbor::to_canonical(&sender.cert).expect("encode cert");
     let frame = build_relay_deposit_frame(
@@ -1404,6 +1405,7 @@ fn build_deposit_frame_with_blob(
         invite_packet: None,
         revocation_push: None,
         grant_push: None,
+        grant_revoke: None,
     };
     let cert_bytes = harmony_owner::cbor::to_canonical(&sender.cert).expect("encode cert");
     let frame = build_relay_deposit_frame(

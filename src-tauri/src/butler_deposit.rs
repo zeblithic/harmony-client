@@ -78,6 +78,17 @@ pub const GRANT_DEPOSIT_MARKER: &[u8] = b"zeb674-file-grant";
 /// [`DEPOSIT_MAX_FRAME_BYTES`] whole-frame cap.
 pub const MAX_DEPOSIT_GRANT_BYTES: usize = 64 * 1024;
 
+/// ZEB-730: ack marker returned for a standalone file-grant *revoke* deposit
+/// (no message CID). Mirrors `GRANT_DEPOSIT_MARKER`; the sender binds the ack to
+/// this value for a `grant_revoke` request.
+pub const GRANT_REVOKE_DEPOSIT_MARKER: &[u8] = b"zeb730-grant-revoke";
+
+/// ZEB-730: per-deposit cap on the piggybacked `grant_revoke` bytes. A revoke
+/// carries a single 32-byte root ContentId as canonical CBOR (~35 B); 256 is
+/// generous headroom that still bars a malicious sender from inflating
+/// butler/relay storage via the field. Fail-closed on overflow.
+pub const MAX_DEPOSIT_GRANT_REVOKE_BYTES: usize = 256;
+
 /// Maximum number of [`crate::reachability_record::ButlerSetEntry`]s carried
 /// in the pkarr routing blob's butler set (spec §3: ordered priority list,
 /// max 2 in v1). Readers truncate anything longer (defence against oversized
@@ -264,6 +275,20 @@ pub struct DepositPayload {
         with = "serde_bytes"
     )]
     pub grant_push: Option<Vec<u8>>,
+    /// ZEB-730: owner→grantee file-grant revoke. Canonical CBOR of the revoked
+    /// root ContentId ([u8;32]). The whole `DepositPayload` is frame-sealed to
+    /// the recipient, so — unlike `grant_push` (which per-device-seals a DEK
+    /// secret) — this carries the CID in the clear inside the seal: there is no
+    /// secret here the grantee doesn't already hold, hence no inner seal. Sender
+    /// is the butler-verified `frame.sender_owner`, never a payload claim. `None`
+    /// for message / invite / revocation / grant / legacy deposits.
+    #[serde(
+        rename = "gr",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub grant_revoke: Option<Vec<u8>>,
 }
 
 // Manual CanonicalPayload registration (the `impl_canonical!` macro in
@@ -348,6 +373,28 @@ pub fn encode_deposit_payload(payload: &DepositPayload) -> Result<Vec<u8>, Depos
 /// Decode a [`DepositPayload`] from canonical CBOR (trailing bytes rejected).
 pub fn decode_deposit_payload(bytes: &[u8]) -> Result<DepositPayload, DepositWireError> {
     canonical_cbor_decode(bytes).map_err(|e| DepositWireError::Decode(format!("{e}")))
+}
+
+/// ZEB-730: encode a revoked root ContentId as the canonical CBOR of a 32-byte
+/// string — the wire value carried in [`DepositPayload::grant_revoke`]. A
+/// fixed-size 32-byte input can never fail to encode.
+pub fn encode_grant_revoke(cid: [u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(&serde_bytes::Bytes::new(&cid), &mut buf)
+        .expect("encode_grant_revoke: fixed-size input never fails");
+    buf
+}
+
+/// ZEB-730: decode a [`DepositPayload::grant_revoke`] wire value back to the
+/// revoked root ContentId. Rejects any non-32-byte payload (fail-closed).
+pub fn decode_grant_revoke(bytes: &[u8]) -> Result<[u8; 32], String> {
+    let buf: serde_bytes::ByteBuf =
+        ciborium::from_reader(bytes).map_err(|e| format!("grant_revoke decode: {e}"))?;
+    let arr: [u8; 32] = buf
+        .as_ref()
+        .try_into()
+        .map_err(|_| "grant_revoke: not 32 bytes".to_string())?;
+    Ok(arr)
 }
 
 /// Write `body` as a `[u32 LE length-prefix][body]` frame. Rejects bodies
@@ -440,6 +487,13 @@ pub struct ButlerDepositRequest {
     /// `message_cid`/`cidnotify_packet`/`invite_packet`/`revocation_push` are all
     /// `None`, `space_id` is zero, and the ack binds to `GRANT_DEPOSIT_MARKER`.
     pub grant_push: Option<Vec<u8>>,
+    /// ZEB-730: opaque `grant_revoke` wire bytes (canonical CBOR of the revoked
+    /// root ContentId — `butler_deposit::encode_grant_revoke`). When `Some`, this
+    /// is a pure file-grant revoke deposit —
+    /// `message_cid`/`cidnotify_packet`/`invite_packet`/`revocation_push`/`grant_push`
+    /// are all `None`, `space_id` is zero, and the ack binds to
+    /// `GRANT_REVOKE_DEPOSIT_MARKER`.
+    pub grant_revoke: Option<Vec<u8>>,
     /// Wall-clock now (ms) at candidacy time — drives the `bs_at` freshness
     /// check against the resolved routing blob.
     pub now_ms: u64,
@@ -659,6 +713,49 @@ impl IrohButlerDepositClient {
     }
 }
 
+/// Pure request→(ack marker, sealed payload) mapping for a single deposit,
+/// factored out of [`IrohButlerDepositClient::deposit`] so the
+/// marker-select + payload-shape invariant is unit-testable without any
+/// network / CAS I/O. `storage_blob` is the CAS blob for a message deposit
+/// (empty for every non-message deposit); the caller fetches it — the only
+/// async step — before calling. The ack marker is the message CID bytes for a
+/// message deposit, else the fixed per-variant marker for whichever single
+/// sub-payload the request carries. A valid request sets exactly one
+/// sub-payload `Some`, so the `None` arms are mutually exclusive; the ordering
+/// mirrors the historical precedence (message → revocation → grant → grant
+/// revoke → invite).
+fn build_deposit_payload_and_marker(
+    req: &ButlerDepositRequest,
+    storage_blob: Vec<u8>,
+) -> (Vec<u8>, DepositPayload) {
+    // ZEB-691: a revocation deposit has no message CID and its own ack marker;
+    // ZEB-674: a pure grant deposit likewise; ZEB-730: a pure grant-revoke
+    // deposit likewise; an invite-only deposit keeps the ZEB-505 marker.
+    let expect_cid: Vec<u8> = match req.message_cid {
+        Some(message_cid) => message_cid.to_bytes().to_vec(),
+        None if req.revocation_push.is_some() => REVOCATION_DEPOSIT_MARKER.to_vec(),
+        None if req.grant_push.is_some() => GRANT_DEPOSIT_MARKER.to_vec(),
+        None if req.grant_revoke.is_some() => GRANT_REVOKE_DEPOSIT_MARKER.to_vec(),
+        None => INVITE_ONLY_DEPOSIT_MARKER.to_vec(),
+    };
+    let payload = DepositPayload {
+        cidnotify_packet: req.cidnotify_packet.clone(),
+        storage_blob,
+        invite_packet: req.invite_packet.clone(),
+        revocation_push: req.revocation_push.clone(),
+        // ZEB-674 Task 6 (C3): carry the opaque per-device sealed grant through
+        // to the acceptor's grant-only arm (which acks with
+        // `GRANT_DEPOSIT_MARKER` and persists under `grant_key`). The butler
+        // cannot open the seals (`butler_cannot_open_grant_push`).
+        grant_push: req.grant_push.clone(),
+        // ZEB-730: carry the revoked-CID CBOR through to the acceptor's
+        // grant-revoke arm (acks with `GRANT_REVOKE_DEPOSIT_MARKER`). Sealed by
+        // the frame; unlike `grant_push` it carries no per-device secret.
+        grant_revoke: req.grant_revoke.clone(),
+    };
+    (expect_cid, payload)
+}
+
 #[async_trait]
 impl ButlerDepositClient for IrohButlerDepositClient {
     async fn deposit(&self, req: &ButlerDepositRequest) -> DepositRungOutcome {
@@ -682,39 +779,21 @@ impl ButlerDepositClient for IrohButlerDepositClient {
         // guarantees `invite_packet` is Some when `message_cid` is None.)
         // Fetched only after a fresh butler set is confirmed — no CAS work for a
         // skipped rung.
-        let (storage_blob, expect_cid): (Vec<u8>, Vec<u8>) = match req.message_cid {
-            Some(message_cid) => {
-                let blob = match self.cas.get(&message_cid).await {
-                    Ok(Some(blob)) => blob,
-                    Ok(None) => {
-                        return DepositRungOutcome::Failed(
-                            "storage blob missing from CAS".to_string(),
-                        )
-                    }
-                    Err(e) => return DepositRungOutcome::Failed(format!("CAS get: {e}")),
-                };
-                (blob, message_cid.to_bytes().to_vec())
-            }
-            // ZEB-691: a revocation deposit has no message CID and its own ack
-            // marker; ZEB-674: a pure grant deposit likewise; an invite-only
-            // deposit keeps the ZEB-505 marker.
-            None if req.revocation_push.is_some() => {
-                (Vec::new(), REVOCATION_DEPOSIT_MARKER.to_vec())
-            }
-            None if req.grant_push.is_some() => (Vec::new(), GRANT_DEPOSIT_MARKER.to_vec()),
-            None => (Vec::new(), INVITE_ONLY_DEPOSIT_MARKER.to_vec()),
+        // A message deposit fetches its CAS storage blob (the only async step);
+        // every non-message deposit carries an empty blob. The marker-select +
+        // payload build is then a pure mapping — see
+        // `build_deposit_payload_and_marker` (unit-tested without I/O).
+        let storage_blob: Vec<u8> = match req.message_cid {
+            Some(message_cid) => match self.cas.get(&message_cid).await {
+                Ok(Some(blob)) => blob,
+                Ok(None) => {
+                    return DepositRungOutcome::Failed("storage blob missing from CAS".to_string())
+                }
+                Err(e) => return DepositRungOutcome::Failed(format!("CAS get: {e}")),
+            },
+            None => Vec::new(),
         };
-        let payload = DepositPayload {
-            cidnotify_packet: req.cidnotify_packet.clone(),
-            storage_blob,
-            invite_packet: req.invite_packet.clone(),
-            revocation_push: req.revocation_push.clone(),
-            // ZEB-674 Task 6 (C3): carry the opaque per-device sealed grant
-            // through to the acceptor's grant-only arm (which acks with
-            // `GRANT_DEPOSIT_MARKER` and persists under `grant_key`). The butler
-            // cannot open the seals (`butler_cannot_open_grant_push`).
-            grant_push: req.grant_push.clone(),
-        };
+        let (expect_cid, payload) = build_deposit_payload_and_marker(req, storage_blob);
 
         // 3. Priority order, first ack wins. The frame is rebuilt per
         // entry: the sealed blob targets THAT entry's device key, and the
@@ -849,10 +928,171 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&payload).expect("encode");
         let back = decode_deposit_payload(&bytes).expect("decode");
         assert_eq!(back, payload);
+    }
+
+    /// ZEB-730: a `DepositPayload` carrying ONLY `grant_revoke` (all other
+    /// sub-payloads `None`, `storage_blob` empty) round-trips byte-identically,
+    /// and the carried CBOR decodes back to the revoked root ContentId.
+    #[test]
+    fn deposit_payload_round_trips_grant_revoke() {
+        let cid = [7u8; 32];
+        let payload = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: Some(encode_grant_revoke(cid)),
+        };
+        let bytes = encode_deposit_payload(&payload).expect("encode");
+        let decoded: DepositPayload = decode_deposit_payload(&bytes).expect("decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            decode_grant_revoke(decoded.grant_revoke.as_deref().unwrap()).unwrap(),
+            cid
+        );
+
+        // A legacy payload (no `gr` key) decodes grant_revoke to None, and the
+        // `gr` key is omitted entirely when grant_revoke is None.
+        let legacy = DepositPayload {
+            cidnotify_packet: Some(vec![9]),
+            storage_blob: vec![1],
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: None,
+        };
+        let lbytes = encode_deposit_payload(&legacy).expect("encode legacy");
+        assert_eq!(decode_deposit_payload(&lbytes).unwrap().grant_revoke, None);
+        assert!(
+            !lbytes.windows(2).any(|w| w == b"gr"),
+            "gr key omitted when grant_revoke is None"
+        );
+    }
+
+    /// ZEB-730: `encode_grant_revoke`/`decode_grant_revoke` round-trip a
+    /// [u8;32] ContentId through canonical CBOR.
+    #[test]
+    fn encode_grant_revoke_round_trips() {
+        let cid = [0xABu8; 32];
+        assert_eq!(decode_grant_revoke(&encode_grant_revoke(cid)).unwrap(), cid);
+    }
+
+    /// ZEB-730: `decode_grant_revoke` fails closed on non-32-byte / non-CBOR
+    /// garbage rather than silently truncating or padding.
+    #[test]
+    fn decode_grant_revoke_rejects_garbage() {
+        assert!(decode_grant_revoke(&[0x00, 0x01, 0x02]).is_err());
+        // A 31-byte CBOR byte string is well-formed CBOR but the wrong length.
+        let short = encode_grant_revoke_len(31);
+        assert!(decode_grant_revoke(&short).is_err());
+    }
+
+    /// Local helper: canonical CBOR of an `n`-byte all-zero byte string, to
+    /// exercise `decode_grant_revoke`'s length check with well-formed CBOR.
+    fn encode_grant_revoke_len(n: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&serde_bytes::Bytes::new(&vec![0u8; n]), &mut buf)
+            .expect("encode fixed byte string");
+        buf
+    }
+
+    /// A `ButlerDepositRequest` with every sub-payload `None` — the base for the
+    /// sender-side marker-select tests, which set exactly one field `Some`.
+    fn empty_deposit_request() -> ButlerDepositRequest {
+        ButlerDepositRequest {
+            entry_id: OutboxEntryId([0u8; 16]),
+            recipient_owner: OwnerAddr([0xAA; 16]),
+            space_id: SpaceId([0u8; 16]),
+            message_cid: None,
+            cidnotify_packet: None,
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: None,
+            now_ms: 0,
+        }
+    }
+
+    /// ZEB-730 (Task 3): a `grant_revoke`-only request maps, through the pure
+    /// sender-side seam, to a `DepositPayload` carrying ONLY `grant_revoke`
+    /// (empty `storage_blob`, every other sub-payload `None`), acked with
+    /// `GRANT_REVOKE_DEPOSIT_MARKER`. Exercised directly — no network / CAS I/O.
+    #[test]
+    fn build_deposit_payload_and_marker_selects_grant_revoke() {
+        let cid = [5u8; 32];
+        let req = ButlerDepositRequest {
+            grant_revoke: Some(encode_grant_revoke(cid)),
+            ..empty_deposit_request()
+        };
+        let (marker, payload) = build_deposit_payload_and_marker(&req, Vec::new());
+        assert_eq!(marker, GRANT_REVOKE_DEPOSIT_MARKER.to_vec());
+        assert_eq!(
+            decode_grant_revoke(payload.grant_revoke.as_deref().unwrap()).unwrap(),
+            cid
+        );
+        assert!(payload.storage_blob.is_empty());
+        assert!(payload.cidnotify_packet.is_none());
+        assert!(payload.invite_packet.is_none());
+        assert!(payload.revocation_push.is_none());
+        assert!(payload.grant_push.is_none());
+    }
+
+    /// ZEB-730 (Task 3): the extracted seam preserves every pre-existing
+    /// variant's marker-select + payload shape byte-for-byte — the guard that
+    /// the testability refactor is behavior-preserving for message / revocation
+    /// / grant / invite deposits.
+    #[test]
+    fn build_deposit_payload_and_marker_preserves_existing_variants() {
+        // Message deposit: ack marker == message CID bytes; the fetched blob is
+        // carried through verbatim; grant_revoke stays absent.
+        let mcid = ContentId::from_bytes([9u8; 32]);
+        let msg = ButlerDepositRequest {
+            message_cid: Some(mcid),
+            cidnotify_packet: Some(vec![1, 2, 3]),
+            ..empty_deposit_request()
+        };
+        let (marker, payload) = build_deposit_payload_and_marker(&msg, vec![0xAB, 0xCD]);
+        assert_eq!(marker, mcid.to_bytes().to_vec());
+        assert_eq!(payload.storage_blob, vec![0xAB, 0xCD]);
+        assert_eq!(payload.cidnotify_packet, Some(vec![1, 2, 3]));
+        assert!(payload.grant_revoke.is_none());
+
+        // Revocation deposit.
+        let rev = ButlerDepositRequest {
+            revocation_push: Some(vec![7]),
+            ..empty_deposit_request()
+        };
+        let (marker, payload) = build_deposit_payload_and_marker(&rev, Vec::new());
+        assert_eq!(marker, REVOCATION_DEPOSIT_MARKER.to_vec());
+        assert_eq!(payload.revocation_push, Some(vec![7]));
+        assert!(payload.storage_blob.is_empty());
+        assert!(payload.grant_revoke.is_none());
+
+        // Pure grant deposit.
+        let gp = ButlerDepositRequest {
+            grant_push: Some(vec![8]),
+            ..empty_deposit_request()
+        };
+        let (marker, payload) = build_deposit_payload_and_marker(&gp, Vec::new());
+        assert_eq!(marker, GRANT_DEPOSIT_MARKER.to_vec());
+        assert_eq!(payload.grant_push, Some(vec![8]));
+        assert!(payload.grant_revoke.is_none());
+
+        // Invite-only deposit (no message, no other sub-payload).
+        let inv = ButlerDepositRequest {
+            invite_packet: Some(vec![4]),
+            ..empty_deposit_request()
+        };
+        let (marker, payload) = build_deposit_payload_and_marker(&inv, Vec::new());
+        assert_eq!(marker, INVITE_ONLY_DEPOSIT_MARKER.to_vec());
+        assert_eq!(payload.invite_packet, Some(vec![4]));
+        assert!(payload.grant_revoke.is_none());
     }
 
     #[test]
@@ -863,6 +1103,7 @@ mod tests {
             invite_packet: None,
             revocation_push: Some(vec![0x05, 1, 2, 3]),
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&with_rev).unwrap();
         assert_eq!(decode_deposit_payload(&bytes).unwrap(), with_rev);
@@ -874,6 +1115,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let lbytes = encode_deposit_payload(&legacy).unwrap();
         assert_eq!(
@@ -891,6 +1133,7 @@ mod tests {
             invite_packet: Some(vec![7, 8, 9]),
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&with_invite).expect("encode");
         assert_eq!(decode_deposit_payload(&bytes).expect("decode"), with_invite);
@@ -902,6 +1145,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes_none = encode_deposit_payload(&without).expect("encode none");
         assert_eq!(
@@ -944,6 +1188,7 @@ mod tests {
             invite_packet: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&invite_only).expect("encode invite-only");
         assert_eq!(
@@ -967,6 +1212,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: Some(vec![0xAA, 0xBB, 0xCC, 0xDD]),
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&with_grant).expect("encode grant_push");
         assert_eq!(
@@ -982,6 +1228,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes_none = encode_deposit_payload(&without_grant).expect("encode none");
         assert_eq!(
@@ -1038,6 +1285,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: Some(grant_push_bytes.clone()),
+            grant_revoke: None,
         };
         let wire = encode_deposit_payload(&payload).expect("encode payload with grant_push");
         let decoded = decode_deposit_payload(&wire).expect("decode payload with grant_push");

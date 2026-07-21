@@ -20519,6 +20519,7 @@ pub(crate) async fn grant_read_impl(
             invite_packet: None,
             revocation_push: None,
             grant_push: Some(grant_push),
+            grant_revoke: None,
             now_ms,
         };
         // Surface the delivery outcome (do NOT silently discard it). Best-effort
@@ -20574,13 +20575,20 @@ pub(crate) async fn revoke_read_impl(
     let cid = parse_cid_hex(&cid_hex)?;
     let grantee_owner = parse_owner_addr(&grantee_address)?;
 
-    let (crdt_state, sync_engine) = {
+    // Snapshot the butler alongside the handle set (mirror `grant_read_impl`'s
+    // `guard.butler_deposit_client.clone()`) so the best-effort revoke deposit
+    // below never holds the std lock across an await.
+    let (crdt_state, sync_engine, butler) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let crdt_state = guard
             .crdt_state
             .clone()
             .ok_or_else(|| "no owner loaded".to_string())?;
-        (crdt_state, guard.sync_engine.clone())
+        (
+            crdt_state,
+            guard.sync_engine.clone(),
+            guard.butler_deposit_client.clone(),
+        )
     };
     let now_ms = crate::file_sharing::now_epoch_ms();
     let removed = {
@@ -20596,6 +20604,29 @@ pub(crate) async fn revoke_read_impl(
             "grants-updated",
             &serde_json::json!({ "cid": cid_hex }),
         );
+
+        // ZEB-730: fire a best-effort `grant_revoke` deposit at the grantee so
+        // their `received_file_grants` copy is pruned (routed into ZEB-727's
+        // dismiss tombstone). Mirrors `grant_read_impl`'s deposit block but a PURE
+        // grant_revoke request. Non-fatal by design: the owner-local revoke has
+        // already tombstoned + replicated across the owner's own fleet, so an
+        // unbound butler (iroh unbound) or a failed deposit simply drops the push
+        // (trigger #1 — the grantee's manual dismiss — remains the backstop).
+        if let Some(butler) = butler {
+            let req = crate::butler_deposit::ButlerDepositRequest {
+                entry_id: crate::owner_state_types::OutboxEntryId([0u8; 16]),
+                recipient_owner: grantee_owner,
+                space_id: crate::owner_state_types::SpaceId([0u8; 16]),
+                message_cid: None,
+                cidnotify_packet: None,
+                invite_packet: None,
+                revocation_push: None,
+                grant_push: None,
+                grant_revoke: Some(crate::butler_deposit::encode_grant_revoke(cid)),
+                now_ms,
+            };
+            let _ = butler.deposit(&req).await;
+        }
     }
     Ok(())
 }
@@ -21028,6 +21059,115 @@ mod file_share_ipc_tests {
         let blobs: Vec<serde_bytes::ByteBuf> =
             ciborium::from_reader(gp.as_slice()).expect("grant_push decodes");
         assert_eq!(blobs.len(), 1, "one sealed blob per known device");
+    }
+
+    /// A `ButlerDepositClient` that records EVERY request — lets the ZEB-730
+    /// revoke tests assert both the *count* (exactly one deposit) and the shape
+    /// of the fired `grant_revoke`.
+    #[derive(Default)]
+    struct RecordingButler {
+        reqs: std::sync::Mutex<Vec<crate::butler_deposit::ButlerDepositRequest>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::butler_deposit::ButlerDepositClient for RecordingButler {
+        async fn deposit(
+            &self,
+            req: &crate::butler_deposit::ButlerDepositRequest,
+        ) -> crate::butler_deposit::DepositRungOutcome {
+            self.reqs.lock().unwrap().push(req.clone());
+            crate::butler_deposit::DepositRungOutcome::Acked
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_read_deposits_grant_revoke_to_grantee() {
+        // ZEB-730: an owner revoke of an ACTIVE grant fires exactly one
+        // best-effort `grant_revoke` deposit at the grantee.
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        // Establish the active grant WITHOUT a butler so only the revoke's
+        // deposit lands in the recorder.
+        grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("grant");
+
+        let butler = std::sync::Arc::new(RecordingButler::default());
+        state.lock().unwrap().butler_deposit_client =
+            Some(butler.clone() as std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>);
+
+        revoke_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("revoke");
+
+        let reqs = butler.reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one grant_revoke deposit fired");
+        let req = &reqs[0];
+        // Routed to the grantee, zero space/entry, PURE grant_revoke shape.
+        assert_eq!(req.recipient_owner, grantee());
+        assert_eq!(req.space_id, crate::owner_state_types::SpaceId([0u8; 16]));
+        assert_eq!(
+            req.entry_id,
+            crate::owner_state_types::OutboxEntryId([0u8; 16])
+        );
+        assert!(req.message_cid.is_none());
+        assert!(req.cidnotify_packet.is_none());
+        assert!(req.invite_packet.is_none());
+        assert!(req.revocation_push.is_none());
+        assert!(req.grant_push.is_none());
+        assert_eq!(
+            req.grant_revoke.as_deref(),
+            Some(crate::butler_deposit::encode_grant_revoke(CID).as_slice()),
+            "grant_revoke carries the canonical CBOR of the revoked cid"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_read_without_butler_still_ok_and_emits() {
+        // ZEB-730: the deposit is best-effort — with no butler snapshot the local
+        // revoke still succeeds and still emits `grants-updated`.
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        // Record the active grant (grantable_state leaves butler None).
+        grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("grant");
+
+        revoke_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("revoke succeeds with no butler bound");
+
+        // grant + revoke each emitted a `grants-updated`.
+        let events: Vec<_> = sink.frames().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(events, vec!["grants-updated", "grants-updated"]);
+    }
+
+    #[tokio::test]
+    async fn revoke_read_no_active_grant_fires_no_deposit() {
+        // ZEB-730: revoking a grant that was never recorded (removed == false)
+        // changes nothing — no deposit, no emit.
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let sink = crate::node_event_sink::RecordingSink::new();
+        let butler = std::sync::Arc::new(RecordingButler::default());
+        state.lock().unwrap().butler_deposit_client =
+            Some(butler.clone() as std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>);
+
+        revoke_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("revoke of an absent grant is a no-op ok");
+
+        assert!(
+            butler.reqs.lock().unwrap().is_empty(),
+            "no deposit when nothing was revoked"
+        );
+        assert!(
+            sink.frames().is_empty(),
+            "no emit when the revoke changed nothing"
+        );
     }
 
     #[tokio::test]

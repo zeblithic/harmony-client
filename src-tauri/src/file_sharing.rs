@@ -449,6 +449,31 @@ pub fn dismiss_received_grant_inner(state: &mut OwnerState, cid: [u8; 32], now_m
     removed || advanced
 }
 
+/// ZEB-730: apply an owner→grantee file-grant revoke to owner-state.
+///
+/// Honors the revoke ONLY when `granter_owner` (the butler-verified deposit
+/// sender) matches the granter-of-record on the local received grant for `cid` —
+/// otherwise a no-op, so no Active friend can grief a grantee into losing a file
+/// they did not share. On authorization it reuses the ZEB-727 dismiss seam:
+/// removes the entry AND stamps the convergent LWW tombstone
+/// (`dismissed_received_grants[cid] = max(existing, now_ms)`), keyed by the
+/// shared file's stable root ContentId so a legitimate re-share (fresh
+/// `received_at > dismissed_at`) reactivates. Returns `true` iff owner-state
+/// changed (→ caller `notify_dirty` + emit).
+pub fn ingest_grant_revoke(
+    state: &mut OwnerState,
+    granter_owner: OwnerAddr,
+    cid: [u8; 32],
+    now_ms: u64,
+) -> bool {
+    match state.received_file_grants.get(&cid) {
+        Some(g) if g.granter_owner == granter_owner => {
+            dismiss_received_grant_inner(state, cid, now_ms)
+        }
+        _ => false,
+    }
+}
+
 /// Encode per-device sealed grant blobs into the `DepositPayload.grant_push`
 /// wire value: CBOR of `Vec<serde_bytes Vec<u8>>` (each element a byte-string) —
 /// the EXACT shape [`ingest_grant_push`] decodes. Infallible: a `Vec<ByteBuf>`
@@ -1032,6 +1057,83 @@ mod tests {
             "re-dismiss with an older stamp changes nothing"
         );
         assert_eq!(state.dismissed_received_grants.get(&cid), Some(&200));
+    }
+
+    // ZEB-730: seed a `ReceivedFileGrant` for the `ingest_grant_revoke` tests,
+    // mirroring the inline-literal fixture the ZEB-727 dismiss tests use.
+    fn sample_received_grant(
+        cid: [u8; 32],
+        granter: OwnerAddr,
+        received_at: u64,
+    ) -> ReceivedFileGrant {
+        ReceivedFileGrant {
+            granter_owner: granter,
+            cid,
+            file_name: "doc.pdf".into(),
+            file_size: 10,
+            mime: "application/pdf".into(),
+            sealed_dek: vec![1, 2, 3],
+            received_at,
+        }
+    }
+
+    #[test]
+    fn ingest_grant_revoke_authorized_gcs_and_tombstones() {
+        let mut st = OwnerState::default();
+        let granter = OwnerAddr([9u8; 16]);
+        let cid = [3u8; 32];
+        st.received_file_grants
+            .insert(cid, sample_received_grant(cid, granter, 100));
+
+        let changed = ingest_grant_revoke(&mut st, granter, cid, 200);
+
+        assert!(changed, "authorized revoke is a state change");
+        assert!(
+            !st.received_file_grants.contains_key(&cid),
+            "authorized revoke GCs the received-grant entry"
+        );
+        assert_eq!(
+            st.dismissed_received_grants.get(&cid),
+            Some(&200),
+            "authorized revoke stamps the LWW tombstone at now_ms"
+        );
+    }
+
+    #[test]
+    fn ingest_grant_revoke_wrong_granter_is_noop() {
+        // GRIEFING GUARD: an Active friend who did not share the file cannot
+        // revoke it. Security regression guard — entry intact, no tombstone.
+        let mut st = OwnerState::default();
+        let real = OwnerAddr([9u8; 16]);
+        let attacker = OwnerAddr([1u8; 16]);
+        let cid = [3u8; 32];
+        st.received_file_grants
+            .insert(cid, sample_received_grant(cid, real, 100));
+
+        let changed = ingest_grant_revoke(&mut st, attacker, cid, 200);
+
+        assert!(!changed, "wrong-granter revoke is a no-op");
+        assert!(
+            st.received_file_grants.contains_key(&cid),
+            "wrong-granter revoke leaves the received-grant entry intact"
+        );
+        assert!(
+            !st.dismissed_received_grants.contains_key(&cid),
+            "wrong-granter revoke mints NO tombstone"
+        );
+    }
+
+    #[test]
+    fn ingest_grant_revoke_absent_cid_is_noop() {
+        let mut st = OwnerState::default();
+
+        let changed = ingest_grant_revoke(&mut st, OwnerAddr([9u8; 16]), [3u8; 32], 200);
+
+        assert!(!changed, "revoke for an absent cid is a no-op");
+        assert!(
+            st.dismissed_received_grants.is_empty(),
+            "an unverifiable revoke mints no tombstone"
+        );
     }
 
     #[test]

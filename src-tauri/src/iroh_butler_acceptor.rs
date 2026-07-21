@@ -677,6 +677,14 @@ pub async fn handle_deposit_core(
             if payload.grant_push.is_some() {
                 return Err(DepositReject::BadPayload);
             }
+            // ZEB-730: symmetric with the grant_push guard — a message deposit
+            // carries no file-grant revoke. A stray grant_revoke would make the
+            // persisted entry match TWO dispatch guards, so the recipient's
+            // pure-revoke guard would fail to match and silently drop it. Reject
+            // fail-closed to keep the one-Option-only shape.
+            if payload.grant_revoke.is_some() {
+                return Err(DepositReject::BadPayload);
+            }
             let packet = decode_packet(cidnotify_bytes).map_err(|_| DepositReject::BadPayload)?;
             let (signed, signature, signed_bytes) = match packet {
                 DmPacket::CidNotify {
@@ -796,6 +804,14 @@ pub async fn handle_deposit_core(
                 if payload.grant_push.is_some() {
                     return Err(DepositReject::BadPayload);
                 }
+                // ZEB-730: symmetric with the grant_push guard above — a pure
+                // revocation carries no file-grant revoke either. A stray
+                // grant_revoke would make the persisted entry match BOTH dispatch
+                // guards, so the recipient's pure-revocation guard would fail to
+                // match and drop the revocation. Reject fail-closed.
+                if payload.grant_revoke.is_some() {
+                    return Err(DepositReject::BadPayload);
+                }
                 let packet = decode_packet(rp_bytes).map_err(|_| DepositReject::BadPayload)?;
                 let DmPacket::RevocationPush {
                     revocation,
@@ -861,6 +877,15 @@ pub async fn handle_deposit_core(
                 if payload.invite_packet.is_some() {
                     return Err(DepositReject::BadPayload);
                 }
+                // ZEB-730: the grant arm precedes the grant_revoke arm in this
+                // else-if chain, so grant_revoke is NOT already `None` here. A
+                // stray grant_revoke riding alongside a grant_push would make the
+                // persisted entry match two dispatch guards; reject fail-closed to
+                // keep the one-Option-only shape (the reverse of the grant_revoke
+                // arm's stray-grant_push guard).
+                if payload.grant_revoke.is_some() {
+                    return Err(DepositReject::BadPayload);
+                }
                 // Size-bound the opaque grant before persisting (defence against
                 // a malicious sender inflating butler storage).
                 if gp_bytes.len() > crate::butler_deposit::MAX_DEPOSIT_GRANT_BYTES {
@@ -876,6 +901,70 @@ pub async fn handle_deposit_core(
                     key,
                     crate::butler_deposit::GRANT_DEPOSIT_MARKER.to_vec(),
                 )
+            } else if let Some(gr_bytes) = payload.grant_revoke.as_deref() {
+                // ZEB-730: a standalone file-grant REVOKE deposit — no message,
+                // no invite, no revocation, no grant, just the canonical-CBOR
+                // revoked root ContentId. Unlike grant_push (which per-device-seals
+                // a DEK secret) this carries no secret the grantee doesn't already
+                // hold — the whole payload is frame-sealed to the recipient — so
+                // the butler needs no inner-seal handling; the recipient decodes it
+                // and routes it into ZEB-727's dismiss tombstone via
+                // `file_sharing::ingest_grant_revoke`, authorized by the
+                // butler-verified granter-of-record.
+                //
+                // FRIEND-scoped exactly like the grant it revokes: the send side
+                // (`revoke_read_impl`) only deposits to the grantee friend, and the
+                // recipient mutates the friend-scoped `received_file_grants` /
+                // `dismissed_received_grants` CRDTs on recover. A live group-DM
+                // co-member is admitted for message/invite deposits above but —
+                // exactly like the revocation and grant branches — is NOT
+                // authorized to prune another owner's friend-scoped received-grants
+                // set. Gate on Friend admission; reject any other scope fail-closed.
+                if !matches!(admission, Admission::Friend(_)) {
+                    return Err(DepositReject::NotAuthorizedForScope);
+                }
+                // The revoke is the SOLE payload: reject a non-empty storage_blob
+                // or any stray sibling sub-payload fail-closed, so the persisted
+                // entry matches EXACTLY the recipient's pure-revoke dispatch guard
+                // (one Option Some, all siblings None). cidnotify_packet /
+                // revocation_push / grant_push are already `None` on this branch,
+                // but assert it explicitly to keep the one-Option-only invariant
+                // local and audit-complete.
+                if !payload.storage_blob.is_empty() {
+                    return Err(DepositReject::BadPayload);
+                }
+                if payload.cidnotify_packet.is_some()
+                    || payload.invite_packet.is_some()
+                    || payload.revocation_push.is_some()
+                    || payload.grant_push.is_some()
+                {
+                    return Err(DepositReject::BadPayload);
+                }
+                // Size-bound the opaque revoke before persisting (a 32-byte CID as
+                // canonical CBOR is ~35B; MAX is generous headroom, fail-closed on
+                // overflow — defence against a sender inflating butler storage).
+                if gr_bytes.len() > crate::butler_deposit::MAX_DEPOSIT_GRANT_REVOKE_BYTES {
+                    return Err(DepositReject::BadPayload);
+                }
+                // ZEB-730 (CodeRabbit): unlike the sealed/opaque `grant_push`, the
+                // `grant_revoke` CID rides in the clear inside the frame seal, so the
+                // butler CAN validate it — fail-closed here rather than persisting an
+                // entry the recipient's ingest sweep can never decode (it would sit
+                // pending until TTL, and an admitted friend could mint many distinct
+                // un-ingestable entries, one per hashed key). A legitimate client's
+                // `encode_grant_revoke` is deterministic and always well-formed.
+                crate::butler_deposit::decode_grant_revoke(gr_bytes)
+                    .map_err(|_| DepositReject::BadPayload)?;
+                // Keyed by the revoking friend + a hash of the opaque revoke, so a
+                // redelivery of the SAME revoke is idempotent (one entry per
+                // distinct revoke payload). No space, no message CID — the ack
+                // binds to the grant-revoke marker.
+                let key = DmInboxDoc::grant_revoke_key(&frame.sender_owner, gr_bytes);
+                (
+                    [0u8; 16],
+                    key,
+                    crate::butler_deposit::GRANT_REVOKE_DEPOSIT_MARKER.to_vec(),
+                )
             } else {
                 // CodeRabbit (Stability, Major): the invite is the SOLE payload —
                 // an invite-only deposit carries no message, so any storage_blob
@@ -888,6 +977,14 @@ pub async fn handle_deposit_core(
                 // reject stray bytes fail-closed, mirroring the storage_blob
                 // waste guard above.
                 if payload.revocation_push.is_some() {
+                    return Err(DepositReject::BadPayload);
+                }
+                // ZEB-730: an invite deposit carries no file-grant revoke either.
+                // The grant_revoke arm precedes this `else`, so grant_revoke is
+                // already `None` here — but assert it fail-closed to keep the
+                // one-Option-only invariant complete across EVERY arm (matches the
+                // redundant revocation_push guard above).
+                if payload.grant_revoke.is_some() {
                     return Err(DepositReject::BadPayload);
                 }
                 let invite_bytes = payload
@@ -975,6 +1072,12 @@ pub async fn handle_deposit_core(
         // grant-only arm above), `None` otherwise (the pure-shape guards reject
         // a grant riding alongside another sub-payload).
         grant_push: payload.grant_push,
+        // ZEB-730: carry the opaque grant_revoke through to the recipient's
+        // ingest sweeper (`file_sharing::ingest_grant_revoke`). `Some` only on a
+        // pure grant-revoke deposit (the grant_revoke arm above), `None`
+        // otherwise (the pure-shape guards reject a revoke riding alongside any
+        // other sub-payload). Mirrors `grant_push` threading exactly.
+        grant_revoke: payload.grant_revoke,
         deposited_at: ctx.mint_hlc().await,
         deposited_by: ctx.device_id(),
         ingested_by: BTreeSet::new(),
@@ -1337,8 +1440,9 @@ impl IrohButlerDepositAcceptor {
 mod tests {
     use super::*;
     use crate::butler_deposit::{
-        encode_deposit_payload, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO, GRANT_DEPOSIT_MARKER,
-        MAX_DEPOSIT_GRANT_BYTES, MAX_DEPOSIT_INVITE_BYTES, REVOCATION_DEPOSIT_MARKER,
+        encode_deposit_payload, encode_grant_revoke, DepositPayload, BUTLER_DEPOSIT_SEAL_INFO,
+        GRANT_DEPOSIT_MARKER, GRANT_REVOKE_DEPOSIT_MARKER, MAX_DEPOSIT_GRANT_BYTES,
+        MAX_DEPOSIT_GRANT_REVOKE_BYTES, MAX_DEPOSIT_INVITE_BYTES, REVOCATION_DEPOSIT_MARKER,
     };
     use crate::community_membership::{mint_test_owner, TestOwner};
     use crate::dm_envelope::{build_signed_cidnotify, encode_packet, DmCidNotifySigned};
@@ -1454,6 +1558,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1502,6 +1607,7 @@ mod tests {
             invite_packet,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1693,6 +1799,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -1824,6 +1931,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -2008,6 +2116,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let butler_vk = butler_device_sk().verifying_key().to_bytes();
         let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
@@ -2377,6 +2486,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2401,6 +2511,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2427,6 +2538,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2687,6 +2799,7 @@ mod tests {
             invite_packet,
             revocation_push: Some(rp_wire),
             grant_push: None,
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -2903,6 +3016,7 @@ mod tests {
             invite_packet,
             revocation_push: None,
             grant_push: Some(grant_push),
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -3015,6 +3129,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: Some(b"stray-grant".to_vec()),
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -3069,6 +3184,266 @@ mod tests {
             .await
             .expect_err("a grant deposit from a non-friend co-member must be rejected");
         assert_eq!(err, DepositReject::NotAuthorizedForScope);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    // ── ZEB-730: file-grant REVOKE-deposit acceptor tests ────────────────────
+
+    /// A deposit frame carrying ONLY a `grant_revoke` (canonical CBOR of the
+    /// revoked root ContentId) — no CidNotify, no invite, no revocation, no
+    /// grant. The OUTER frame is a normal, fully valid `sender()` deposit (steps
+    /// 0–4 pass unchanged); `storage_blob` / `grant_push` let a test inject
+    /// illegal extra bytes to exercise the fail-closed pure-shape guards.
+    fn grant_revoke_fixture(
+        grant_revoke: Vec<u8>,
+        storage_blob: Vec<u8>,
+        grant_push: Option<Vec<u8>>,
+    ) -> Fixture {
+        let so = sender();
+        let space_id = SpaceId([0x77; 16]);
+        let message_cid = ContentId::for_book(
+            b"unused-by-grant-revoke",
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid");
+        let (_dm_sk, identity_pub, dm_device_hash) = dm_identity();
+        let payload = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: storage_blob.clone(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push,
+            grant_revoke: Some(grant_revoke),
+        };
+        let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
+        let sealed = seal_payload_bytes(&payload_bytes);
+        let sig = sign_frame(&BUTLER_OWNER, &sealed, &so.device_key);
+        let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
+        Fixture {
+            frame: DepositFrame {
+                signer_certs_cbor: Vec::new(),
+                recipient_owner: BUTLER_OWNER,
+                sender_owner: so.owner.0,
+                sender_enrollment_cert: cert_bytes,
+                sig,
+                sealed_blob: sealed,
+            },
+            sender_owner: so.owner.0,
+            sender_master: master_from_cert(&so.cert),
+            space_id,
+            message_cid,
+            cidnotify_packet: Vec::new(),
+            storage_blob,
+            dm_device_hash,
+            identity_pub,
+        }
+    }
+
+    /// A revoke-only deposit from an Active friend is ACCEPTED, persisted under
+    /// `grant-revoke:{sender_hex}:{hash_hex}`, projects `grant_revoke` onto the
+    /// entry verbatim, preserves the butler-verified `sender_owner` (the
+    /// authenticated granter-of-record), and acks with the grant-revoke marker.
+    #[tokio::test]
+    async fn handle_deposit_core_accepts_grant_revoke_and_projects_it() {
+        let cid = [0x5a; 32];
+        let gr = encode_grant_revoke(cid);
+        let f = grant_revoke_fixture(gr.clone(), Vec::new(), None);
+        let ctx = TestCtx::for_fixture(&f);
+
+        let ack = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect("valid grant-revoke deposit from active friend must be accepted");
+
+        // Ack: zero space + the grant-revoke marker (no message CID).
+        assert_eq!(ack.space_id, [0u8; 16]);
+        assert_eq!(ack.message_cid, GRANT_REVOKE_DEPOSIT_MARKER.to_vec());
+
+        // Persisted under EXACTLY grant-revoke:{sender_hex}:{hash_hex}, with
+        // grant_revoke projected and the authenticated sender preserved.
+        let key = DmInboxDoc::grant_revoke_key(&f.sender_owner, &gr);
+        let store = ctx.store.lock().unwrap();
+        let entry = store
+            .get(&key)
+            .expect("entry persisted under grant_revoke_key");
+        assert_eq!(
+            entry.sender_owner, f.sender_owner,
+            "the butler-verified granter is preserved as the entry sender"
+        );
+        assert_eq!(
+            entry.grant_revoke,
+            Some(gr),
+            "grant_revoke carried into the persisted entry verbatim"
+        );
+        assert!(entry.grant_push.is_none(), "no grant half");
+        assert!(entry.cidnotify_packet.is_none(), "no message half");
+        assert!(entry.invite_packet.is_none(), "no invite half");
+        assert!(entry.revocation_push.is_none(), "no revocation half");
+        assert!(entry.storage_blob.is_empty(), "no storage blob");
+    }
+
+    /// A revoke-only deposit from a live group-DM CO-MEMBER who is NOT a friend
+    /// is rejected `NotAuthorizedForScope`, nothing persisted. File-grant
+    /// revokes are friend-scoped exactly like the grant they revoke — a mere
+    /// co-member must not prune another owner's friend-scoped received-grants.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_grant_revoke_from_co_member() {
+        let f = grant_revoke_fixture(encode_grant_revoke([0x5a; 32]), Vec::new(), None);
+        let mut ctx = TestCtx::for_fixture(&f);
+        // NOT a friend, but a live group-DM co-member of the deposit's own space,
+        // so admission SUCCEEDS via the co-member fallback — the rejection is
+        // purely the revoke scope guard, not a failed admission.
+        ctx.friends.clear();
+        ctx.group_co_members.insert(f.sender_owner);
+        ctx.group_co_member_spaces
+            .insert((f.space_id.0, f.sender_owner));
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a grant-revoke deposit from a non-friend co-member must be rejected");
+        assert_eq!(err, DepositReject::NotAuthorizedForScope);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// A revoke deposit carries no message — a non-empty `storage_blob` is
+    /// unused bytes an admitted sender could attach; rejected fail-closed and
+    /// nothing persisted (mirrors the grant/revocation blob guards).
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_grant_revoke_with_blob() {
+        let f = grant_revoke_fixture(
+            encode_grant_revoke([0x5a; 32]),
+            b"unexpected-blob".to_vec(),
+            None,
+        );
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a grant-revoke deposit with a non-empty storage blob must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// A revoke whose `grant_revoke` exceeds `MAX_DEPOSIT_GRANT_REVOKE_BYTES` is
+    /// rejected `BadPayload`, nothing persisted (mirrors the oversized-grant
+    /// guard). `encode_grant_revoke` yields ~35B, so we pad past the cap.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_oversized_grant_revoke() {
+        let f = grant_revoke_fixture(
+            vec![0u8; MAX_DEPOSIT_GRANT_REVOKE_BYTES + 1],
+            Vec::new(),
+            None,
+        );
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("oversized grant_revoke must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// ZEB-730 (CodeRabbit): a malformed-but-under-cap `grant_revoke` (well-formed
+    /// frame, Friend-scoped, no stray siblings, ≤ cap, but NOT decodable to a
+    /// [u8;32] CID) is rejected `BadPayload` at accept time — nothing persisted —
+    /// rather than acking an entry the recipient could never ingest.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_undecodable_grant_revoke() {
+        // 3 bytes: under the cap, but not the canonical CBOR of a 32-byte string.
+        let f = grant_revoke_fixture(vec![0x00, 0x01, 0x02], Vec::new(), None);
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("an undecodable grant_revoke must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// Reverse guard — the existing GRANT arm rejects a stray `grant_revoke`
+    /// riding alongside a `grant_push` (grant_push diverts to the grant arm,
+    /// whose fail-closed guard rejects the stray revoke). Proves a two-payload
+    /// deposit can never be accepted from the grant side.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_grant_with_stray_grant_revoke() {
+        // grant_push present → GRANT arm; grant_revoke also present → its reverse
+        // guard must reject fail-closed.
+        let f = grant_revoke_fixture(
+            encode_grant_revoke([0x5a; 32]),
+            Vec::new(),
+            Some(b"stray-grant".to_vec()),
+        );
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a grant deposit carrying a stray grant_revoke must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// Reverse guard — the MESSAGE arm (CidNotify present) rejects a stray
+    /// `grant_revoke`. Load-bearing: a message deposit is the `Some(cidnotify)`
+    /// branch, so nothing else diverts a stray revoke away from it.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_message_with_stray_grant_revoke() {
+        let f = valid_fixture();
+        let so = sender();
+        let payload = DepositPayload {
+            cidnotify_packet: Some(f.cidnotify_packet.clone()),
+            storage_blob: f.storage_blob.clone(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: Some(encode_grant_revoke([0x5a; 32])),
+        };
+        let payload_bytes = encode_deposit_payload(&payload).expect("encode");
+        let sealed = seal_payload_bytes(&payload_bytes);
+        let sig = sign_frame(&BUTLER_OWNER, &sealed, &so.device_key);
+        let mut frame = f.frame.clone();
+        frame.sealed_blob = sealed;
+        frame.sig = sig;
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&frame, &ctx)
+            .await
+            .expect_err("a message deposit carrying a stray grant_revoke must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// Reverse guard — the REVOCATION arm rejects a stray `grant_revoke`. The
+    /// guard fires BEFORE the RevocationPush is decoded, so arbitrary (short)
+    /// revocation bytes suffice to reach and trip it. Load-bearing: a revoke can
+    /// ride alongside a revocation_push, and both `Some` must fail closed.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_revocation_with_stray_grant_revoke() {
+        let so = sender();
+        let payload = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: Some(b"arbitrary-short-revocation-bytes".to_vec()),
+            grant_push: None,
+            grant_revoke: Some(encode_grant_revoke([0x5a; 32])),
+        };
+        // Reuse a grant_revoke_fixture only for its valid frame scaffolding; then
+        // re-seal the two-payload body over it.
+        let base = grant_revoke_fixture(encode_grant_revoke([0x5a; 32]), Vec::new(), None);
+        let payload_bytes = encode_deposit_payload(&payload).expect("encode");
+        let sealed = seal_payload_bytes(&payload_bytes);
+        let sig = sign_frame(&BUTLER_OWNER, &sealed, &so.device_key);
+        let mut frame = base.frame.clone();
+        frame.sealed_blob = sealed;
+        frame.sig = sig;
+        let ctx = TestCtx::for_fixture(&base);
+
+        let err = handle_deposit_core(&frame, &ctx)
+            .await
+            .expect_err("a revocation deposit carrying a stray grant_revoke must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
         assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
     }
 

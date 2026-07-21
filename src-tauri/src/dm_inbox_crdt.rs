@@ -66,6 +66,20 @@ pub struct DmInboxEntry {
         with = "serde_bytes"
     )]
     pub grant_push: Option<Vec<u8>>,
+    /// ZEB-730: opaque `grant_revoke` wire value (canonical CBOR of the revoked
+    /// root ContentId — `butler_deposit::encode_grant_revoke`), carried through
+    /// from the sealed `DepositPayload` by the butler acceptor. Applied on recover
+    /// via `file_sharing::ingest_grant_revoke`. `None` for message / invite /
+    /// revocation / grant / legacy deposits. Symmetric to the other optional
+    /// sub-payloads (`cn`/`iv`/`rp`/`gp`); backward-compatible since absent →
+    /// `None`.
+    #[serde(
+        rename = "gr",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub grant_revoke: Option<Vec<u8>>,
     #[serde(rename = "da")]
     pub deposited_at: Hlc,
     /// SP1 device_id (64-hex).
@@ -129,6 +143,24 @@ impl DmInboxDoc {
             "grant:{}:{}",
             hex::encode(granter_owner),
             hex::encode(blake3::hash(grant_push).as_bytes())
+        )
+    }
+
+    /// ZEB-730: deposit key for a standalone file-grant REVOKE entry (no
+    /// message, no invite, no revocation, no grant). Keyed by the revoking
+    /// granter's owner + a blake3 hash of the opaque `grant_revoke` bytes, so
+    /// re-depositing the SAME revoke is idempotent (one entry per distinct
+    /// revoke payload). The literal `grant-revoke` first segment is a DISTINCT
+    /// domain from `grant_key`'s `grant` segment, so a revoke key can never
+    /// collide with a grant key for the same `(granter_owner, bytes)` — and
+    /// neither can it collide with a message key (`{space_hex}:{cid_hex}`), an
+    /// invite key (`{space_hex}:invite`), or a revoke-device key (`revoke:...`),
+    /// since none of those begins with `grant-revoke:`.
+    pub fn grant_revoke_key(granter_owner: &[u8; 16], grant_revoke: &[u8]) -> String {
+        format!(
+            "grant-revoke:{}:{}",
+            hex::encode(granter_owner),
+            hex::encode(blake3::hash(grant_revoke).as_bytes())
         )
     }
 
@@ -216,6 +248,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
             deposited_at: at,
             deposited_by: by.into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),
@@ -442,6 +475,7 @@ mod tests {
             invite_packet: None,
             revocation_push: Some(vec![0x05, 0xAA, 0xBB]),
             grant_push: None,
+            grant_revoke: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -510,5 +544,23 @@ mod tests {
         assert_ne!(grant, DmInboxDoc::revoke_key(&owner, &[0x22; 16]));
         // Distinct grant payloads from the same granter get distinct keys.
         assert_ne!(grant, DmInboxDoc::grant_key(&owner, &[0x01, 0x02]));
+    }
+
+    /// ZEB-730: a grant-REVOKE key can't alias a grant / message / invite /
+    /// revoke key, and — critically — never collides with a grant key for the
+    /// SAME `(granter_owner, bytes)` (distinct `grant-revoke:` domain segment).
+    #[test]
+    fn grant_revoke_key_de_collides_with_other_keys() {
+        let owner = [0x33; 16];
+        let bytes = [0xAB, 0xCD, 0xEF];
+        let revoke = DmInboxDoc::grant_revoke_key(&owner, &bytes);
+        assert!(revoke.starts_with("grant-revoke:"));
+        // Same owner + same bytes as a grant key → still distinct (domain split).
+        assert_ne!(revoke, DmInboxDoc::grant_key(&owner, &bytes));
+        assert_ne!(revoke, DmInboxDoc::key(&[0x33; 16], &[0xCD; 32]));
+        assert_ne!(revoke, DmInboxDoc::invite_key(&[0x33; 16]));
+        assert_ne!(revoke, DmInboxDoc::revoke_key(&owner, &[0x22; 16]));
+        // Distinct revoke payloads from the same granter get distinct keys.
+        assert_ne!(revoke, DmInboxDoc::grant_revoke_key(&owner, &[0x01, 0x02]));
     }
 }
