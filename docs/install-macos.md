@@ -41,7 +41,7 @@ This is expected. Here's how to get past it:
 
 After you do this once, macOS trusts the app permanently. Future launches work normally with a double-click.
 
-> **Why does this happen?** Apple charges developers a recurring fee for the notarization certificate macOS uses to verify an app's origin. Harmony is a small, self-funded project and **deliberately ships unsigned** rather than carry that ongoing cost — the app is fully functional without it. The one-time approval above is all you'll ever need.
+> **Why does this happen?** Signing and notarizing an app so macOS can verify its origin requires an **Apple Developer Program** membership — a recurring annual fee that bundles the Developer ID certificate and notarization. Harmony is a small, self-funded project and **deliberately ships unsigned** rather than carry that ongoing cost — the app is fully functional without it, and the one-time approval above is all you'll ever need.
 
 ---
 

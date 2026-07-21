@@ -34,7 +34,7 @@ This is expected. Here's how to get past it:
 
 After you install once, Windows trusts the app and won't warn you again for the same version.
 
-> **Why does this happen?** SmartScreen flags apps without a recognized code-signing certificate. Extended-validation certificates carry a recurring cost that Harmony — a small, self-funded project — **deliberately skips**; the app is fully functional unsigned, and the one-time approval above is all you'll ever need.
+> **Why does this happen?** SmartScreen warns about apps it doesn't recognize — an unsigned build has no publisher reputation, so each new release is flagged until it earns trust. A code-signing certificate (which accrues that reputation over time) carries a recurring cost that Harmony — a small, self-funded project — **deliberately skips**; the app is fully functional unsigned, and the one-time approval above clears it for that version.
 
 ---
 
