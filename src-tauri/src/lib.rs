@@ -20096,7 +20096,8 @@ async fn produce_ciphertext(
     writer: &mut tokio::io::DuplexStream,
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
-    let mut sealer = crate::file_stream_crypto::FrameSealer::new(&dek, frame_size);
+    let mut sealer =
+        crate::file_stream_crypto::FrameSealer::new(&dek, frame_size).map_err(|e| e.to_string())?;
     writer
         .write_all(&sealer.header())
         .await
@@ -20196,7 +20197,7 @@ pub async fn ingest_content_encrypted_inner(
         },
         serveable: true,
     };
-    let cap = (frame_size as usize + 16) * 2 + crate::file_stream_crypto::V2_HEADER_LEN;
+    let cap = (frame_size as usize + 16) * 2 + crate::file_stream_crypto::V3_HEADER_LEN;
     let (mut pipe_w, pipe_r) = tokio::io::duplex(cap);
     let dek_for_producer = dek.clone();
     let producer = tokio::spawn(async move {
