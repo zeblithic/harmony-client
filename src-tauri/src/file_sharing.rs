@@ -388,6 +388,14 @@ pub fn list_received_grants_inner(state: &OwnerState) -> Vec<ReceivedGrantDto> {
     let mut rows: Vec<ReceivedGrantDto> = state
         .received_file_grants
         .values()
+        // ZEB-727: hide dismissed grants — active iff `received_at > dismissed_at`
+        // (LWW; a legitimate re-share with a fresher `received_at` reappears).
+        // Belt-and-suspenders with the merge sweep: keeps the projection honest
+        // even for a grant a not-yet-swept local snapshot still holds.
+        .filter(|g| match state.dismissed_received_grants.get(&g.cid) {
+            Some(&dismissed_at) => g.received_at > dismissed_at,
+            None => true,
+        })
         .map(|g| ReceivedGrantDto {
             cid: hex::encode(g.cid),
             granter_address: hex::encode(g.granter_owner.0),
@@ -409,6 +417,36 @@ pub fn list_received_grants_inner(state: &OwnerState) -> Vec<ReceivedGrantDto> {
             .then_with(|| a.cid.cmp(&b.cid))
     });
     rows
+}
+
+/// ZEB-727: grantee-local "dismiss this shared-with-me entry". Removes the
+/// `received_file_grants` entry AND records an LWW tombstone
+/// (`dismissed_received_grants[cid] = max(existing, now_ms)`) so the removal
+/// CONVERGES across the grantee's own bound devices — a plain `remove` would be
+/// resurrected by the add-wins union merge (`merge_remote_into_local`). Returns
+/// `true` iff state changed (the entry was present, or the tombstone advanced);
+/// the caller uses this to gate `notify_dirty` + the `shared-with-me-updated`
+/// event.
+///
+/// Recording the tombstone even when the local entry is already gone is
+/// intentional: a sibling device may still hold the grant, and the tombstone is
+/// what suppresses it there on the next merge. Dismiss is REVERSIBLE — a later
+/// owner re-share ingests with a fresh `received_at > dismissed_at` (the shared
+/// file's root CID is stable) and reappears, so the tombstone is timestamped,
+/// not permanent. Pure; unit-testable without a live node.
+pub fn dismiss_received_grant_inner(state: &mut OwnerState, cid: [u8; 32], now_ms: u64) -> bool {
+    let removed = state.received_file_grants.remove(&cid).is_some();
+    // Advance the LWW tombstone. Check presence explicitly rather than treating
+    // `0` as an "absent" sentinel (a real `dismissed_at` could be 0), so the
+    // returned change-signal is correct even at timestamp zero.
+    let advanced = match state.dismissed_received_grants.get(&cid) {
+        Some(&prev) if now_ms <= prev => false,
+        _ => {
+            state.dismissed_received_grants.insert(cid, now_ms);
+            true
+        }
+    };
+    removed || advanced
 }
 
 /// Encode per-device sealed grant blobs into the `DepositPayload.grant_push`
@@ -955,5 +993,100 @@ mod tests {
 
         // Empty map → empty vec (proven-empty).
         assert!(list_received_grants_inner(&OwnerState::default()).is_empty());
+    }
+
+    #[test]
+    fn dismiss_received_grant_inner_gcs_and_tombstones() {
+        let cid = [0x33; 32];
+        let mut state = OwnerState::default();
+        state.received_file_grants.insert(
+            cid,
+            ReceivedFileGrant {
+                granter_owner: OwnerAddr([0x01; 16]),
+                cid,
+                file_name: "doc.pdf".into(),
+                file_size: 10,
+                mime: "application/pdf".into(),
+                sealed_dek: vec![1, 2, 3],
+                received_at: 100,
+            },
+        );
+
+        assert!(
+            dismiss_received_grant_inner(&mut state, cid, 200),
+            "dismissing a present grant is a state change"
+        );
+        assert!(
+            !state.received_file_grants.contains_key(&cid),
+            "dismiss removes the received-grant entry"
+        );
+        assert_eq!(
+            state.dismissed_received_grants.get(&cid),
+            Some(&200),
+            "dismiss records the LWW tombstone at now_ms"
+        );
+
+        // Re-dismiss with an OLDER stamp is a no-op (max-join keeps the newer).
+        assert!(
+            !dismiss_received_grant_inner(&mut state, cid, 150),
+            "re-dismiss with an older stamp changes nothing"
+        );
+        assert_eq!(state.dismissed_received_grants.get(&cid), Some(&200));
+    }
+
+    #[test]
+    fn list_received_grants_inner_hides_dismissed() {
+        let cid = [0x44; 32];
+        let mut state = OwnerState::default();
+        state.received_file_grants.insert(
+            cid,
+            ReceivedFileGrant {
+                granter_owner: OwnerAddr([0x01; 16]),
+                cid,
+                file_name: "hidden.bin".into(),
+                file_size: 5,
+                mime: "application/octet-stream".into(),
+                sealed_dek: vec![9],
+                received_at: 100,
+            },
+        );
+        // Tombstone AT received_at → not active (predicate is strict `>`) → hidden.
+        state.dismissed_received_grants.insert(cid, 100);
+        assert!(
+            list_received_grants_inner(&state).is_empty(),
+            "a grant with dismissed_at >= received_at is hidden from the projection"
+        );
+    }
+
+    /// ZEB-727 design crux at the projection layer: the dismiss tombstone is
+    /// LWW-timestamped, NOT permanent. A legitimate owner re-share (fresh
+    /// `received_at > dismissed_at`) reappears. A permanent-set tombstone (the
+    /// ZEB-722 burn idiom) would keep it hidden forever — this is the regression
+    /// guard for that.
+    #[test]
+    fn re_share_reactivates_in_projection() {
+        let cid = [0x55; 32];
+        let mut state = OwnerState::default();
+        state.dismissed_received_grants.insert(cid, 200);
+        // Owner re-shares: ingest stamps a FRESH received_at (300 > 200).
+        state.received_file_grants.insert(
+            cid,
+            ReceivedFileGrant {
+                granter_owner: OwnerAddr([0x02; 16]),
+                cid,
+                file_name: "re-shared.txt".into(),
+                file_size: 3,
+                mime: "text/plain".into(),
+                sealed_dek: vec![3],
+                received_at: 300,
+            },
+        );
+        let rows = list_received_grants_inner(&state);
+        assert_eq!(
+            rows.len(),
+            1,
+            "re-share (received_at 300 > dismissed 200) reappears in the projection"
+        );
+        assert_eq!(rows[0].received_at, 300);
     }
 }
