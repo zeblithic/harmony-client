@@ -2917,17 +2917,17 @@ fn save_with_fallback(
 
 /// Public entry point — resolves env-derived encrypted store, attempts the
 /// keychain, and runs the resolution chain. Returns the derived `NodeIdentity`.
-pub fn load_or_generate(plaintext_path: &Path) -> Result<NodeIdentity, String> {
-    let seed = read_seed_from_disk_with_keychain(plaintext_path, KeychainStore::new().ok())?;
+pub fn load_or_generate(identity_path: &Path) -> Result<NodeIdentity, String> {
+    let seed = read_seed_from_disk_with_keychain(identity_path, KeychainStore::new().ok())?;
     Ok(NodeIdentity::from_seed(&seed))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn load_or_generate_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     keychain: Option<KeychainStore>,
 ) -> Result<NodeIdentity, String> {
-    let seed = read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    let seed = read_seed_from_disk_with_keychain(identity_path, keychain)?;
     Ok(NodeIdentity::from_seed(&seed))
 }
 
@@ -2935,15 +2935,15 @@ pub(crate) fn load_or_generate_with_keychain(
 /// (keychain → encrypted file → fresh-generate). Returns the seed bytes
 /// directly so the recovery CLI can encode them without first deriving a
 /// `NodeIdentity`.
-pub fn read_seed_from_disk(plaintext_path: &Path) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
-    read_seed_from_disk_with_keychain(plaintext_path, KeychainStore::new().ok())
+pub fn read_seed_from_disk(identity_path: &Path) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
+    read_seed_from_disk_with_keychain(identity_path, KeychainStore::new().ok())
 }
 
 /// Inner entry point. Integration tests (across the crate boundary) inject a
 /// deterministic keychain. `pub` rather than `pub(crate)` so
 /// `tests/recovery_cli_integration.rs` can reach it.
 pub fn read_seed_from_disk_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     keychain: Option<KeychainStore>,
 ) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
     let mut keychain_probe_ok = false;
@@ -2960,7 +2960,7 @@ pub fn read_seed_from_disk_with_keychain(
         }
     }
 
-    let enc_path = plaintext_path.with_file_name("identity.enc");
+    let enc_path = identity_path.with_file_name("identity.enc");
     let encrypted = match EncryptedFileStore::from_env(enc_path) {
         Ok(opt) => opt,
         Err(e) if keychain_probe_ok => {
@@ -2989,11 +2989,11 @@ pub fn read_seed_from_disk_with_keychain(
 /// in place via the existing atomic `create_new` tmp-then-rename pattern in
 /// `save_with_fallback`.
 pub fn write_seed_to_disk(
-    plaintext_path: &Path,
+    identity_path: &Path,
     seed: &[u8; BLOB_LEN],
     force: bool,
 ) -> Result<(), String> {
-    write_seed_to_disk_with_keychain(plaintext_path, seed, force, KeychainStore::new().ok())
+    write_seed_to_disk_with_keychain(identity_path, seed, force, KeychainStore::new().ok())
 }
 
 /// Documented TOCTOU note (`!force` path): the existence probes (keychain
@@ -3022,12 +3022,12 @@ pub fn write_seed_to_disk(
 /// Tracked as a follow-up; not blocking ZEB-176. If you hit this in
 /// practice, that's a signal we should revisit — please file a bug.
 pub fn write_seed_to_disk_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     seed: &[u8; BLOB_LEN],
     force: bool,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
-    let enc_path = plaintext_path.with_file_name("identity.enc");
+    let enc_path = identity_path.with_file_name("identity.enc");
     let mut keychain_healthy = false;
 
     if !force {
@@ -3446,7 +3446,7 @@ mod tests {
     fn read_seed_round_trips_via_encrypted_file() {
         use secrecy::SecretString;
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let enc_path = dir.path().join("identity.enc");
 
         // Set up an encrypted store with a known passphrase, write a known seed.
@@ -3459,7 +3459,7 @@ mod tests {
         store.save(&written).expect("save");
 
         // Read it back through the public seed-shaped helper.
-        let loaded = read_seed_from_disk_with_keychain(&plaintext_path, None).expect("read");
+        let loaded = read_seed_from_disk_with_keychain(&identity_path, None).expect("read");
         assert_eq!(
             *loaded, written,
             "seed must round-trip through the encrypted store"
@@ -3473,7 +3473,7 @@ mod tests {
     fn write_seed_refuses_when_identity_exists_without_force() {
         use secrecy::SecretString;
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let enc_path = dir.path().join("identity.enc");
 
         std::env::set_var("HARMONY_PASSPHRASE", "refuse-test");
@@ -3490,7 +3490,7 @@ mod tests {
         // a developer machine reads/writes the real `harmony/identity` keychain
         // entry and prompts for keychain access.
         let err = write_seed_to_disk_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &new_seed,
             /*force=*/ false,
             None,
@@ -3507,7 +3507,7 @@ mod tests {
     fn write_seed_with_force_overwrites_existing() {
         use secrecy::SecretString;
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let enc_path = dir.path().join("identity.enc");
 
         std::env::set_var("HARMONY_PASSPHRASE", "force-test");
@@ -3521,10 +3521,10 @@ mod tests {
         let new_seed = [0x44u8; 32];
         // Pass `None` so the test stays file-only and never touches the real OS
         // keychain (see hermeticity comment on the sibling test above).
-        write_seed_to_disk_with_keychain(&plaintext_path, &new_seed, /*force=*/ true, None)
+        write_seed_to_disk_with_keychain(&identity_path, &new_seed, /*force=*/ true, None)
             .expect("force must succeed");
 
-        let reloaded = read_seed_from_disk_with_keychain(&plaintext_path, None).expect("reload");
+        let reloaded = read_seed_from_disk_with_keychain(&identity_path, None).expect("reload");
         assert_eq!(
             *reloaded, new_seed,
             "after force-overwrite, the new seed must be present"
@@ -3539,8 +3539,8 @@ mod tests {
         use secrecy::SecretString;
 
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
-        let enc_path = plaintext_path.with_file_name("identity.enc");
+        let identity_path = dir.path().join("identity.key");
+        let enc_path = identity_path.with_file_name("identity.enc");
 
         // Seed both backends with different seeds. We use a healthy mock keychain
         // for the keychain path; the encrypted file is real on disk.
@@ -3557,7 +3557,7 @@ mod tests {
 
         // Force-write a third seed. With keychain healthy, save_with_fallback
         // writes to keychain; the cleanup logic should unlink the stale .enc.
-        write_seed_to_disk_with_keychain(&plaintext_path, &[0x33u8; 32], true, Some(kc))
+        write_seed_to_disk_with_keychain(&identity_path, &[0x33u8; 32], true, Some(kc))
             .expect("force write must succeed");
         assert!(
             !enc_path.exists(),
@@ -4185,10 +4185,10 @@ mod tests {
             std::env::set_var("HARMONY_PASSPHRASE_FILE", "/nonexistent/passphrase/file");
 
             let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
+            let identity_path = dir.path().join("identity.key");
 
             let kc = KeychainStore::new_load_failing_mock();
-            let err = load_or_generate_with_keychain(&plaintext_path, Some(kc)).unwrap_err();
+            let err = load_or_generate_with_keychain(&identity_path, Some(kc)).unwrap_err();
 
             assert!(
                 err.contains("could not be read"),
@@ -4212,11 +4212,11 @@ mod tests {
             std::env::set_var("HARMONY_PASSPHRASE_FILE", "/nonexistent/passphrase/file");
 
             let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
+            let identity_path = dir.path().join("identity.key");
 
             // Healthy mock keychain: load returns Ok(None), save succeeds.
             let kc = KeychainStore::new_mock();
-            let result = load_or_generate_with_keychain(&plaintext_path, Some(kc));
+            let result = load_or_generate_with_keychain(&identity_path, Some(kc));
 
             assert!(
                 result.is_ok(),
@@ -4371,8 +4371,8 @@ mod tests {
     #[serial]
     fn force_does_not_delete_enc_when_keychain_save_fails_and_falls_back() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
-        let enc_path = plaintext_path.with_file_name("identity.enc");
+        let identity_path = dir.path().join("identity.key");
+        let enc_path = identity_path.with_file_name("identity.enc");
 
         std::env::set_var("HARMONY_PASSPHRASE", "fallback-test");
 
@@ -4381,7 +4381,7 @@ mod tests {
         let kc = KeychainStore::new_failing_mock();
 
         write_seed_to_disk_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &[0xBEu8; 32],
             /*force=*/ true,
             Some(kc),
@@ -4418,14 +4418,14 @@ mod tests {
     #[serial]
     fn force_write_succeeds_via_keychain_when_at_rest_passphrase_is_invalid() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
 
         // Empty HARMONY_PASSPHRASE → EncryptedFileStore::from_env returns Err.
         // With a healthy keychain the write should still succeed.
         std::env::set_var("HARMONY_PASSPHRASE", "");
         let kc = KeychainStore::new_mock();
         write_seed_to_disk_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &[0xCEu8; 32],
             /*force=*/ true,
             Some(kc),
@@ -4442,14 +4442,14 @@ mod tests {
     #[serial]
     fn write_seed_refuses_when_keychain_probe_fails_without_force() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
 
         std::env::set_var("HARMONY_PASSPHRASE", "probe-fail-test");
         // new_load_failing_mock returns Err on load(), simulating an unreachable keychain.
         let kc = KeychainStore::new_load_failing_mock();
 
         let err = write_seed_to_disk_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &[0x55u8; 32],
             /*force=*/ false,
             Some(kc),

@@ -1,12 +1,12 @@
 # Troubleshooting
 
-Common issues hand-picked alpha testers may hit on `harmony-client` v0.1.0-alpha. If your problem isn't covered here, submit feedback via the **(?) → Submit Feedback** menu in the app — the form pre-fills environment info and (optionally) a redacted network diagnostic snapshot for you.
+Common issues testers may hit on `harmony-client`. If your problem isn't covered here, submit feedback via the **(?) → Submit Feedback** menu in the app — the form pre-fills environment info and (optionally) a redacted network diagnostic snapshot for you.
 
 ## Install + first-launch
 
 ### Gatekeeper warns "Harmony cannot be opened" (macOS)
 
-The binary is unsigned for the alpha. macOS Gatekeeper blocks unsigned `.app` bundles on first launch:
+The binary is unsigned (a deliberate, permanent choice — see [`install-macos.md`](install-macos.md)). macOS Gatekeeper blocks unsigned `.app` bundles on first launch:
 
 1. Open **System Settings → Privacy & Security**.
 2. Scroll to the **Security** section.
@@ -93,17 +93,19 @@ See [`cross-wan-validation.md`](cross-wan-validation.md) for the two-host playbo
 
 ### "How do I back up my identity?"
 
-Identity backup is shipped separately ([ZEB-202](https://linear.app/zeblith/issue/ZEB-202)) and not yet available in v0.1.0-alpha. For now:
+Use the in-app backup flow: **Identity → Backup**, set a passphrase (12+ characters), and save the encrypted recovery file somewhere safe. Restore later via **Identity → Restore**. Make a backup early — otherwise the identity lives only in your OS credential store.
+
+If you need to reach the underlying secret directly:
 
 - **macOS:** your iroh secret key lives in Keychain Access → "harmony.client". You can export the keychain item via Keychain Access → File → Export. Treat the export as you would a password — it grants full control of your identity.
-- **Windows:** Credential Manager → Generic Credentials → "harmony.client". Currently no export UI from Credential Manager; expect ZEB-202 to add this.
+- **Windows:** Credential Manager → Generic Credentials → "harmony.client". Credential Manager has no export UI — use the in-app Backup flow instead.
 - **Linux:** secret-service entry under the "harmony.client" name. Use `secret-tool` or `seahorse` for inspection.
 
-Until ZEB-202 ships, treat the alpha as **non-recoverable** — if you lose the keychain entry, your identity is gone forever. Use only on devices you intend to keep.
+If you never make a backup and lose the credential-store entry, your identity is gone forever — so back up early, and keep the recovery file (and its passphrase) safe.
 
 ### "I see a 'Identity not backed up' warning"
 
-The `BackupStalenessWarning` reminds you to back up the identity. For v0.1.0-alpha there's no in-app backup flow yet (ZEB-202); the warning is informational. You can dismiss it for now.
+The `BackupStalenessWarning` reminds you to back up your identity via **Identity → Backup**. Until you do, treat it as a real prompt rather than dismissing it — an un-backed-up identity is unrecoverable if the credential store is lost.
 
 ## Window + app lifecycle
 

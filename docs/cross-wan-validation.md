@@ -8,7 +8,7 @@
 
 - Two machines on different networks (home Wi-Fi + coffee-shop Wi-Fi,
   two friends, two ISPs)
-- Both running Harmony v0.1.0-alpha-N
+- Both running the same Harmony version (v0.1.2 or later)
 - One out-of-band channel to share a `harmony://invite/...` URL
   (Signal, SMS, email)
 

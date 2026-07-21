@@ -87,9 +87,9 @@ pub(crate) fn resolve_recovery_passphrase() -> Result<SecretString, String> {
 /// Stdout/stderr separation is the load-bearing UX: `harmony-app export
 /// mnemonic > backup.txt` writes only the words; running interactively shows
 /// the warning + fingerprint on the terminal.
-pub fn export_mnemonic_cli(plaintext_path: &Path) -> Result<(), String> {
+pub fn export_mnemonic_cli(identity_path: &Path) -> Result<(), String> {
     export_mnemonic_to_writers(
-        plaintext_path,
+        identity_path,
         KeychainStore::new().ok(),
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
@@ -100,14 +100,14 @@ pub fn export_mnemonic_cli(plaintext_path: &Path) -> Result<(), String> {
 /// tests can both stay hermetic AND assert the exact stdout/stderr contract.
 /// Production callers go through [`export_mnemonic_cli`].
 pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
-    plaintext_path: &Path,
+    identity_path: &Path,
     keychain: Option<KeychainStore>,
     stdout: &mut W1,
     stderr: &mut W2,
 ) -> Result<(), String> {
     // Single source of truth for word derivation; identity_hash comes back
     // alongside the words so we avoid re-parsing the mnemonic.
-    let (words, id_hash) = export_mnemonic_words_with_keychain(plaintext_path, keychain)?;
+    let (words, id_hash) = export_mnemonic_words_with_keychain(identity_path, keychain)?;
     let phrase = words.join(" ");
 
     let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
@@ -152,10 +152,10 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
 /// Used by the GUI wizard so the words never touch a temp file. The CLI's
 /// `export_mnemonic_to_writers` delegates here.
 pub fn export_mnemonic_words_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     keychain: Option<KeychainStore>,
 ) -> Result<(Vec<String>, [u8; 16]), String> {
-    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    let seed = identity::read_seed_from_disk_with_keychain(identity_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
     let mnemonic = artifact.to_mnemonic();
@@ -180,8 +180,8 @@ pub fn export_mnemonic_words_with_keychain(
 /// stderr. The owner-id is the fingerprint the UI surfaces everywhere
 /// (`OwnerState.owner_id`), so an operator can eyeball-match the backup
 /// against their profile during incident response.
-pub fn export_owner_mnemonic_cli(plaintext_path: &Path) -> Result<(), String> {
-    let identity_dir = plaintext_path
+pub fn export_owner_mnemonic_cli(identity_path: &Path) -> Result<(), String> {
+    let identity_dir = identity_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -273,18 +273,18 @@ pub fn export_owner_mnemonic_words_with_keychain(
 ///
 /// Stdout: nothing. Stderr: `wrote <PATH> (<NN> bytes)\nidentity-hash: <hex32>`.
 pub fn export_recovery_file_cli(
-    plaintext_path: &Path,
+    identity_path: &Path,
     out: &Path,
     comment: Option<&str>,
     include_state: bool,
     force: bool,
 ) -> Result<(), String> {
-    let harmony_dir = plaintext_path
+    let harmony_dir = identity_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let result = export_recovery_file_pair_with_keychain(
-        plaintext_path,
+        identity_path,
         &harmony_dir,
         out,
         comment,
@@ -324,7 +324,7 @@ pub fn export_recovery_file_cli(
 /// kept for the headless CLI binary, which runs single-threaded and has
 /// no other way to receive the secret.
 pub fn export_recovery_file_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     out: &Path,
     comment: Option<&str>,
     passphrase: Option<&SecretString>,
@@ -340,7 +340,7 @@ pub fn export_recovery_file_with_keychain(
         Some(p) => p.clone(),
         None => resolve_recovery_passphrase()?,
     };
-    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    let seed = identity::read_seed_from_disk_with_keychain(identity_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let metadata = RecoveryMetadata {
         mint_at: None,
@@ -409,7 +409,7 @@ pub fn sidecar_path(out: &Path) -> PathBuf {
 /// (refusal already returned upstream), so the dance is skipped.
 #[allow(clippy::too_many_arguments)]
 pub fn export_recovery_file_pair_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     harmony_dir: &Path,
     out: &Path,
     comment: Option<&str>,
@@ -490,7 +490,7 @@ pub fn export_recovery_file_pair_with_keychain(
     }
 
     // 1. Read seed + write HRMR.
-    let seed = match identity::read_seed_from_disk_with_keychain(plaintext_path, keychain) {
+    let seed = match identity::read_seed_from_disk_with_keychain(identity_path, keychain) {
         Ok(s) => s,
         Err(e) => {
             // Pre-write failure — restore both backups (we haven't written
@@ -682,7 +682,7 @@ pub struct ExportResult {
 /// [`export_recovery_file_pair_with_keychain`] override channel.
 #[allow(clippy::too_many_arguments)]
 pub fn restore_recovery_file_pair_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     harmony_dir: &Path,
     in_path: &Path,
     passphrase: Option<&SecretString>,
@@ -743,7 +743,7 @@ pub fn restore_recovery_file_pair_with_keychain(
     let snap_at: Option<Hlc> = snapshot.as_ref().map(|s| s.at.clone());
 
     // Now safe to write identity.
-    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
+    identity::write_seed_to_disk_with_keychain(identity_path, &seed_bytes, force, keychain)?;
 
     // Then write owner-state if present.
     let spaces_restored = if let Some(snap) = snapshot {
@@ -841,12 +841,12 @@ pub fn now_hlc() -> Hlc {
 ///
 /// Stdout: nothing. Stderr: `restored identity-hash: <hex32>`.
 pub fn restore_mnemonic_cli(
-    plaintext_path: &Path,
+    identity_path: &Path,
     mnemonic_file: &Path,
     force: bool,
 ) -> Result<(), String> {
     restore_mnemonic_with_keychain(
-        plaintext_path,
+        identity_path,
         mnemonic_file,
         force,
         KeychainStore::new().ok(),
@@ -858,7 +858,7 @@ pub fn restore_mnemonic_cli(
 /// `restore_mnemonic_with_keychain` (which reads from a file path)
 /// delegates here after reading the file.
 pub fn restore_mnemonic_from_words_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     words: &[String],
     force: bool,
     keychain: Option<KeychainStore>,
@@ -869,14 +869,14 @@ pub fn restore_mnemonic_from_words_with_keychain(
     let phrase = words.join(" ");
     let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
-    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)
+    identity::write_seed_to_disk_with_keychain(identity_path, &seed_bytes, force, keychain)
         .map_err(|e| e.to_string())
 }
 
 /// Inner entry point — accepts an injected keychain so tests can stay
 /// hermetic. Production callers go through [`restore_mnemonic_cli`].
 pub fn restore_mnemonic_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     mnemonic_file: &Path,
     force: bool,
     keychain: Option<KeychainStore>,
@@ -887,7 +887,7 @@ pub fn restore_mnemonic_with_keychain(
     let raw = Zeroizing::new(raw);
 
     let words: Vec<String> = raw.split_whitespace().map(String::from).collect();
-    restore_mnemonic_from_words_with_keychain(plaintext_path, &words, force, keychain)?;
+    restore_mnemonic_from_words_with_keychain(identity_path, &words, force, keychain)?;
     // Derive the identity-hash for the confirmation message. We re-parse the
     // SAME normalized input the inner used (`words.join(" ")`), not the raw
     // file text — otherwise tabs or multiple spaces between words would let
@@ -919,11 +919,11 @@ pub fn restore_mnemonic_with_keychain(
 ///
 /// Stdout: nothing. Stderr: `restored owner-id: <hex32>`.
 pub fn restore_owner_mnemonic_cli(
-    plaintext_path: &Path,
+    identity_path: &Path,
     mnemonic_file: &Path,
     force: bool,
 ) -> Result<(), String> {
-    let identity_dir = plaintext_path
+    let identity_dir = identity_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -1110,17 +1110,17 @@ pub fn restore_owner_mnemonic_with_keychain(
 ///
 /// Stdout: nothing. Stderr: `restored identity-hash: <hex32>`.
 pub fn restore_recovery_file_cli(
-    plaintext_path: &Path,
+    identity_path: &Path,
     in_path: &Path,
     force: bool,
     ignore_state: bool,
 ) -> Result<(), String> {
-    let harmony_dir = plaintext_path
+    let harmony_dir = identity_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     restore_recovery_file_pair_with_keychain(
-        plaintext_path,
+        identity_path,
         &harmony_dir,
         in_path,
         None,
@@ -1134,7 +1134,7 @@ pub fn restore_recovery_file_cli(
 /// Inner entry point — accepts an injected keychain so tests can stay
 /// hermetic. Production callers go through [`restore_recovery_file_cli`].
 pub fn restore_recovery_file_with_keychain(
-    plaintext_path: &Path,
+    identity_path: &Path,
     in_path: &Path,
     force: bool,
     keychain: Option<KeychainStore>,
@@ -1148,7 +1148,7 @@ pub fn restore_recovery_file_with_keychain(
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
-    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
+    identity::write_seed_to_disk_with_keychain(identity_path, &seed_bytes, force, keychain)?;
     eprintln!("restored identity-hash: {}", hex::encode(id_hash));
     Ok(())
 }
@@ -1199,7 +1199,7 @@ mod tests {
         // identity on disk after a "failed" export. The fix resolves the
         // recovery passphrase first; this test pins the order.
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let enc_path = dir.path().join("identity.enc");
         let recovery_out = dir.path().join("recovery.bin");
 
@@ -1212,7 +1212,7 @@ mod tests {
         assert!(!enc_path.exists(), "test setup: enc file must be absent");
 
         let err = export_recovery_file_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &recovery_out,
             Some("rt"),
             /*passphrase=*/ None,
@@ -1242,7 +1242,7 @@ mod tests {
     #[serial]
     fn export_recovery_file_with_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let recovery_out = dir.path().join("recovery.bin");
 
         // Plant a known seed via the at-rest passphrase env var. The
@@ -1251,7 +1251,7 @@ mod tests {
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest-pass");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery-pass");
         identity::write_seed_to_disk_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &[0xCAu8; 32],
             /*force=*/ true,
             None,
@@ -1262,7 +1262,7 @@ mod tests {
         // hermetic and prevents any read/write to the developer's real OS
         // keychain entry.
         export_recovery_file_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &recovery_out,
             Some("test"),
             /*passphrase=*/ None,
@@ -1290,7 +1290,7 @@ mod tests {
     #[serial]
     fn restore_mnemonic_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
 
         std::env::set_var("HARMONY_PASSPHRASE", "restore-test");
@@ -1298,16 +1298,11 @@ mod tests {
         std::fs::write(&mnemonic_path, original.to_mnemonic().as_str()).unwrap();
         let original_id = original.master_pubkey_bundle().identity_hash();
 
-        restore_mnemonic_with_keychain(
-            &plaintext_path,
-            &mnemonic_path,
-            /*force=*/ false,
-            None,
-        )
-        .expect("restore");
+        restore_mnemonic_with_keychain(&identity_path, &mnemonic_path, /*force=*/ false, None)
+            .expect("restore");
 
         let reloaded_seed =
-            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+            identity::read_seed_from_disk_with_keychain(&identity_path, None).unwrap();
         let reloaded = RecoveryArtifact::from_seed(*reloaded_seed);
         assert_eq!(reloaded.master_pubkey_bundle().identity_hash(), original_id);
 
@@ -1318,7 +1313,7 @@ mod tests {
     #[serial]
     fn restore_refuses_when_identity_exists_without_force() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
 
         std::env::set_var("HARMONY_PASSPHRASE", "refuse-test");
@@ -1326,7 +1321,7 @@ mod tests {
         std::fs::write(&mnemonic_path, original.to_mnemonic().as_str()).unwrap();
         // Plant an existing identity.
         identity::write_seed_to_disk_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &[0x99u8; 32],
             /*force=*/ true,
             None,
@@ -1334,7 +1329,7 @@ mod tests {
         .unwrap();
 
         let err = restore_mnemonic_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &mnemonic_path,
             /*force=*/ false,
             None,
@@ -1349,7 +1344,7 @@ mod tests {
     #[serial]
     fn restore_with_force_overwrites_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
 
         std::env::set_var("HARMONY_PASSPHRASE", "force-test");
@@ -1358,17 +1353,17 @@ mod tests {
         let original_id = original.master_pubkey_bundle().identity_hash();
         // Plant a different existing identity.
         identity::write_seed_to_disk_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &[0x77u8; 32],
             /*force=*/ true,
             None,
         )
         .unwrap();
 
-        restore_mnemonic_with_keychain(&plaintext_path, &mnemonic_path, /*force=*/ true, None)
+        restore_mnemonic_with_keychain(&identity_path, &mnemonic_path, /*force=*/ true, None)
             .expect("force succeeds");
         let reloaded_seed =
-            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+            identity::read_seed_from_disk_with_keychain(&identity_path, None).unwrap();
         let reloaded = RecoveryArtifact::from_seed(*reloaded_seed);
         assert_eq!(reloaded.master_pubkey_bundle().identity_hash(), original_id);
 
@@ -1380,12 +1375,12 @@ mod tests {
     fn export_mnemonic_writes_warning_to_stderr_and_words_to_stdout() {
         use crate::identity;
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
 
         std::env::set_var("HARMONY_PASSPHRASE", "mnemonic-export-test");
         let planted = [0xA7u8; 32];
         identity::write_seed_to_disk_with_keychain(
-            &plaintext_path,
+            &identity_path,
             &planted,
             /*force=*/ true,
             None,
@@ -1398,7 +1393,7 @@ mod tests {
         // writes only the words), warning preamble + identity-hash on stderr.
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
-        export_mnemonic_to_writers(&plaintext_path, None, &mut stdout, &mut stderr)
+        export_mnemonic_to_writers(&identity_path, None, &mut stdout, &mut stderr)
             .expect("export must succeed");
 
         let stdout_str = String::from_utf8(stdout).expect("stdout is utf-8");
@@ -1985,17 +1980,17 @@ mod tests {
     #[serial]
     fn export_emits_pair_when_state_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xCA; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
 
         let result = super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             Some("rt"),
@@ -2019,17 +2014,17 @@ mod tests {
     #[serial]
     fn export_emits_solo_when_no_state() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xCA; 32], true, None)
             .unwrap();
         // No plant_owner_state — owner_state_crdt.cbor absent.
 
         let result = super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2051,17 +2046,17 @@ mod tests {
     #[serial]
     fn export_no_state_flag_skips_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xCA; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
 
         let result = super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2081,18 +2076,18 @@ mod tests {
     #[serial]
     fn export_refuses_when_sidecar_exists_without_force() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xCA; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
         std::fs::write(super::sidecar_path(&out), b"stale").unwrap();
 
         let err = super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2115,16 +2110,16 @@ mod tests {
     #[serial]
     fn restore_pair_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
         let seed = [0xCA; 32];
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &seed, true, None).unwrap();
+        identity::write_seed_to_disk_with_keychain(&identity_path, &seed, true, None).unwrap();
         plant_owner_state(dir.path());
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2136,10 +2131,10 @@ mod tests {
         .unwrap();
 
         // Wipe identity + owner-state, then restore.
-        let _ = std::fs::remove_file(&plaintext_path);
+        let _ = std::fs::remove_file(&identity_path);
         let _ = std::fs::remove_file(super::owner_state_path(dir.path()));
         let result = super::restore_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2150,7 +2145,7 @@ mod tests {
         .expect("restore");
         assert!(result.sidecar_present);
         // Identity round-trip.
-        let reloaded = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+        let reloaded = identity::read_seed_from_disk_with_keychain(&identity_path, None).unwrap();
         assert_eq!(&*reloaded, &seed);
         // Owner-state file restored.
         assert!(super::owner_state_path(dir.path()).exists());
@@ -2163,16 +2158,16 @@ mod tests {
     #[serial]
     fn restore_ignores_missing_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x42; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0x42; 32], true, None)
             .unwrap();
         // Skip plant_owner_state — HRSS will not be emitted.
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2184,9 +2179,9 @@ mod tests {
         .unwrap();
         assert!(!super::sidecar_path(&out).exists());
 
-        let _ = std::fs::remove_file(&plaintext_path);
+        let _ = std::fs::remove_file(&identity_path);
         let result = super::restore_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2206,16 +2201,16 @@ mod tests {
     #[serial]
     fn restore_ignore_state_flag_skips_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x42; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0x42; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2226,10 +2221,10 @@ mod tests {
         )
         .unwrap();
 
-        let _ = std::fs::remove_file(&plaintext_path);
+        let _ = std::fs::remove_file(&identity_path);
         let _ = std::fs::remove_file(super::owner_state_path(dir.path()));
         let result = super::restore_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2249,16 +2244,16 @@ mod tests {
     #[serial]
     fn restore_force_overwrites_existing_state_file() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x42; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0x42; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2308,7 +2303,7 @@ mod tests {
 
         // force=true overwrites.
         super::restore_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2326,19 +2321,19 @@ mod tests {
     #[serial]
     fn restore_addr_mismatch_hard_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path_a = dir.path().join("a.key");
-        let plaintext_path_b = dir.path().join("b.key");
+        let identity_path_a = dir.path().join("a.key");
+        let identity_path_b = dir.path().join("b.key");
         let out_a = dir.path().join("a.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
 
         // Build owner A's identity + state + sidecar.
-        identity::write_seed_to_disk_with_keychain(&plaintext_path_a, &[0xAA; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path_a, &[0xAA; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path_a,
+            &identity_path_a,
             dir.path(),
             &out_a,
             None,
@@ -2350,14 +2345,14 @@ mod tests {
         .unwrap();
 
         // Build owner B's identity (different seed).
-        identity::write_seed_to_disk_with_keychain(&plaintext_path_b, &[0xBB; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path_b, &[0xBB; 32], true, None)
             .unwrap();
         // Now overwrite a.bin's HRMR with B's identity but keep A's HRSS.
         // Easiest: emit B's identity-only backup at out_a, then keep A's
         // sidecar at out_a.state.
         let out_b = dir.path().join("b.bin");
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path_b,
+            &identity_path_b,
             dir.path(),
             &out_b,
             None,
@@ -2370,9 +2365,9 @@ mod tests {
         std::fs::copy(&out_b, &out_a).unwrap(); // a.bin = B's identity
                                                 // a.bin.state is still A's sidecar (untouched).
 
-        let _ = std::fs::remove_file(&plaintext_path_a);
+        let _ = std::fs::remove_file(&identity_path_a);
         let err = super::restore_recovery_file_pair_with_keychain(
-            &plaintext_path_a,
+            &identity_path_a,
             dir.path(),
             &out_a,
             None,
@@ -2394,16 +2389,16 @@ mod tests {
     #[serial]
     fn export_state_persists_last_backup_record() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xCA; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2428,18 +2423,18 @@ mod tests {
     #[serial]
     fn restore_refuses_state_overwrite_without_force_leaves_identity_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
 
         // Plant identity A + state.
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xAA; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xAA; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2452,15 +2447,15 @@ mod tests {
 
         // Pre-existing identity B installed (different seed), and a pre-existing
         // owner_state_crdt.cbor that would block the sidecar restore.
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xBB; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xBB; 32], true, None)
             .unwrap();
         let identity_before =
-            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+            identity::read_seed_from_disk_with_keychain(&identity_path, None).unwrap();
         // owner_state_crdt.cbor still exists from plant_owner_state above.
 
         // Restore without --force -- must refuse and leave identity B untouched.
         let err = super::restore_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2476,7 +2471,7 @@ mod tests {
 
         // Identity B's seed must still be on disk — NOT overwritten with A's seed.
         let identity_after =
-            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+            identity::read_seed_from_disk_with_keychain(&identity_path, None).unwrap();
         assert_eq!(
             &*identity_before, &*identity_after,
             "identity must be untouched after the metadata-refusal path"
@@ -2490,18 +2485,18 @@ mod tests {
     #[serial]
     fn restore_reports_snapshot_export_wall_ms_not_last_backup_json() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
 
         // Plant + export from this dir.
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCC; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xCC; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
         let export_result = super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2558,18 +2553,18 @@ mod tests {
     #[serial]
     fn export_no_state_removes_stale_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x77; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0x77; 32], true, None)
             .unwrap();
 
         // First export: paired (HRMR + HRSS sidecar).
         plant_owner_state(dir.path());
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2588,7 +2583,7 @@ mod tests {
         // Second export: identity-only (include_state=false). The stale
         // sidecar must be removed even though it's not what we're writing.
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2629,19 +2624,19 @@ mod tests {
     #[serial]
     fn export_pair_failure_restores_preexisting_recovery_file() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let out = dir.path().join("recovery.bin");
         let state_path = super::owner_state_path(dir.path());
 
         std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
-        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xC5; 32], true, None)
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xC5; 32], true, None)
             .unwrap();
         plant_owner_state(dir.path());
 
         // First export: paired so we have a known-good recovery.bin baseline.
         super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,
@@ -2663,7 +2658,7 @@ mod tests {
         // succeeds, then load_crdt fails on the corrupt state file. The
         // C5 dance must restore the pre-existing recovery.bin.
         let err = super::export_recovery_file_pair_with_keychain(
-            &plaintext_path,
+            &identity_path,
             dir.path(),
             &out,
             None,

@@ -1,6 +1,6 @@
 # Installing Harmony on macOS
 
-Harmony is in private alpha. These instructions cover the full install flow for tester machines.
+Harmony is in public alpha — anyone with the released client can create or join communities. These instructions cover the full install flow.
 
 ---
 
@@ -28,7 +28,7 @@ If you pick the wrong one, Harmony won't launch (you'll see an error about the a
 
 ## 3. First launch — Gatekeeper workaround
 
-Because Harmony is an alpha build and is not yet signed with an Apple Developer certificate, macOS Gatekeeper will block the first launch. You'll see:
+Because Harmony ships unsigned (no Apple Developer certificate — a deliberate choice, see below), macOS Gatekeeper will block the first launch. You'll see:
 
 > **"Harmony" can't be opened because Apple cannot check it for malicious software.**
 
@@ -41,7 +41,7 @@ This is expected. Here's how to get past it:
 
 After you do this once, macOS trusts the app permanently. Future launches work normally with a double-click.
 
-> **Why does this happen?** Apple requires developers to pay for a notarization certificate so macOS can verify the app came from a known source. Harmony will be notarized before public release; during private alpha we skip that cost.
+> **Why does this happen?** Signing and notarizing an app so macOS can verify its origin requires an **Apple Developer Program** membership — a recurring annual fee that bundles the Developer ID certificate and notarization. Harmony is a small, self-funded project and **deliberately ships unsigned** rather than carry that ongoing cost — the app is fully functional without it, and the one-time approval above is all you'll ever need.
 
 ---
 

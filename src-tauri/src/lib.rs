@@ -26163,8 +26163,8 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
     }
 
     // Resolve old passphrase via the standard env chain.
-    let plaintext_path = identity::resolve_path(None)?;
-    let enc_path = plaintext_path.with_file_name("identity.enc");
+    let identity_path = identity::resolve_path(None)?;
+    let enc_path = identity_path.with_file_name("identity.enc");
     let old_store = identity::EncryptedFileStore::from_env(enc_path)?
         .ok_or_else(|| {
             "HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — cannot rotate without the old passphrase".to_string()

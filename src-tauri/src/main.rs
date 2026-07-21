@@ -253,7 +253,7 @@ fn main() {
                 }
                 Some(Command::Export { format }) => {
                     init_tracing();
-                    let plaintext_path = match harmony_app::identity::resolve_path(None) {
+                    let identity_path = match harmony_app::identity::resolve_path(None) {
                         Ok(p) => p,
                         Err(e) => {
                             eprintln!("Error: {e}");
@@ -262,17 +262,17 @@ fn main() {
                     };
                     let result = match format {
                         ExportFormat::Mnemonic => {
-                            harmony_app::recovery_cli::export_mnemonic_cli(&plaintext_path)
+                            harmony_app::recovery_cli::export_mnemonic_cli(&identity_path)
                         }
                         ExportFormat::OwnerMnemonic => {
-                            harmony_app::recovery_cli::export_owner_mnemonic_cli(&plaintext_path)
+                            harmony_app::recovery_cli::export_owner_mnemonic_cli(&identity_path)
                         }
                         ExportFormat::RecoveryFile {
                             out,
                             comment,
                             no_state,
                         } => harmony_app::recovery_cli::export_recovery_file_cli(
-                            &plaintext_path,
+                            &identity_path,
                             &out,
                             comment.as_deref(),
                             /*include_state=*/ !no_state,
@@ -293,7 +293,7 @@ fn main() {
                     ignore_state,
                 }) => {
                     init_tracing();
-                    let plaintext_path = match harmony_app::identity::resolve_path(None) {
+                    let identity_path = match harmony_app::identity::resolve_path(None) {
                         Ok(p) => p,
                         Err(e) => {
                             eprintln!("Error: {e}");
@@ -303,21 +303,21 @@ fn main() {
                     let result = match format {
                         RestoreFormat::Mnemonic { mnemonic_file } => {
                             harmony_app::recovery_cli::restore_mnemonic_cli(
-                                &plaintext_path,
+                                &identity_path,
                                 &mnemonic_file,
                                 force,
                             )
                         }
                         RestoreFormat::OwnerMnemonic { mnemonic_file } => {
                             harmony_app::recovery_cli::restore_owner_mnemonic_cli(
-                                &plaintext_path,
+                                &identity_path,
                                 &mnemonic_file,
                                 force,
                             )
                         }
                         RestoreFormat::RecoveryFile { in_path } => {
                             harmony_app::recovery_cli::restore_recovery_file_cli(
-                                &plaintext_path,
+                                &identity_path,
                                 &in_path,
                                 force,
                                 ignore_state,
