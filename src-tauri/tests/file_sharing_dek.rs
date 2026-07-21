@@ -22,37 +22,17 @@
 //! obtained via `KeyTree::derive` (the same primitive a mint produces), so
 //! the ZEB-428 keychain-isolation rule is satisfied by avoidance.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use harmony_app::content_index::ContentIndex;
-use harmony_app::event_loop::IngestRequest;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_crypto::KeyTree;
 use harmony_app::owner_state_types::{OwnerAddr, ReceivedFileGrant};
-use harmony_content::book::{BookStore, MemoryBookStore};
 use harmony_content::cid::{ContentFlags, ContentId};
 
-/// Records each ingested `(cid_hex, bytes)` — a stand-in content store.
-type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
-
-fn spawn_recording_store() -> (tokio::sync::mpsc::Sender<IngestRequest>, Store) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<IngestRequest>(128);
-    let store: Store = Arc::new(Mutex::new(HashMap::new()));
-    let store_c = store.clone();
-    tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            // Insert BEFORE acking the reply so `send_ingest`'s reply-await
-            // guarantees the bytes are visible once the ingest call returns.
-            store_c
-                .lock()
-                .unwrap()
-                .insert(req.cid_hex.clone(), req.data);
-            let _ = req.reply.send(Ok(()));
-        }
-    });
-    (tx, store)
-}
+#[path = "common/file_sharing_helpers.rs"]
+mod file_sharing_helpers;
+use file_sharing_helpers::{reassemble_from_store, spawn_recording_store, write_temp};
 
 /// Fresh in-memory `ContentIndex` backed by a leaked tempdir — matches the
 /// `folder_ingest_walker_integration.rs` / `path_ingest_tests` patterns.
@@ -67,32 +47,6 @@ fn root_cid_from_hex(hex_str: &str) -> harmony_content::cid::ContentId {
     let bytes: [u8; 32] =
         <[u8; 32]>::try_from(hex::decode(hex_str).expect("cid hex")).expect("cid is 32 bytes");
     harmony_content::cid::ContentId::from_bytes(bytes)
-}
-
-/// ZEB-724: write `bytes` to a fresh tempfile and return the guard + path —
-/// `ingest_content_encrypted_inner` now takes an opened `tokio::fs::File`
-/// reader rather than an in-memory `Vec<u8>`.
-async fn write_temp(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("input.bin");
-    tokio::fs::write(&path, bytes).await.unwrap();
-    (dir, path)
-}
-
-/// ZEB-724: reassemble the DAG the recording store captured, via the real
-/// `harmony_content::dag::reassemble` (`&dyn BookStore`, not a bare closure).
-/// Replays every recorded `(cid_hex, data)` pair into a `MemoryBookStore`
-/// keyed by its real `ContentId` and hands that to `reassemble`. Mirrors
-/// `tests/file_sharing_streaming.rs::reassemble_from_store`.
-fn reassemble_from_store(store: &Store, root: &[u8; 32]) -> Vec<u8> {
-    let mut book_store = MemoryBookStore::new();
-    for (cid_hex, data) in store.lock().unwrap().iter() {
-        let bytes: [u8; 32] =
-            <[u8; 32]>::try_from(hex::decode(cid_hex).expect("cid hex")).expect("cid 32 bytes");
-        book_store.store(ContentId::from_bytes(bytes), data.clone());
-    }
-    let root_cid = ContentId::from_bytes(*root);
-    harmony_content::dag::reassemble(&root_cid, &book_store).expect("reassemble")
 }
 
 #[tokio::test]
@@ -144,7 +98,7 @@ async fn encrypted_ingest_dek_round_trip() {
     //     inputs (the v2 header + AEAD tag still round through the chunker).
     let ciphertext = reassemble_from_store(&store, &root_bytes);
     let recovered =
-        harmony_app::file_stream_crypto::decrypt_stream(&dek, &ciphertext).expect("v2 decrypt");
+        harmony_app::file_stream_crypto::decrypt_stream(&dek, &ciphertext).expect("v3 decrypt");
     assert_eq!(
         recovered, plaintext,
         "decrypted ciphertext must equal the original plaintext"

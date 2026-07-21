@@ -6,59 +6,19 @@
 //! Keychain-free (ZEB-428): the KeyTree comes from `KeyTree::derive`.
 
 use harmony_app::content_index::ContentIndex;
-use harmony_app::event_loop::IngestRequest;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_crypto::KeyTree;
-use harmony_content::book::{BookStore, MemoryBookStore};
-use harmony_content::cid::ContentId;
 use std::sync::{Arc, Mutex};
 
-type Store = Arc<Mutex<Vec<(String, Vec<u8>)>>>; // (cid_hex, data) in ingest order
-
-fn spawn_recording_store() -> (tokio::sync::mpsc::Sender<IngestRequest>, Store) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<IngestRequest>(256);
-    let store: Store = Arc::new(Mutex::new(Vec::new()));
-    let store_c = store.clone();
-    tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            store_c
-                .lock()
-                .unwrap()
-                .push((req.cid_hex.clone(), req.data));
-            let _ = req.reply.send(Ok(()));
-        }
-    });
-    (tx, store)
-}
+#[path = "common/file_sharing_helpers.rs"]
+mod file_sharing_helpers;
+use file_sharing_helpers::{reassemble_from_store, spawn_recording_store, write_temp};
 
 fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
     let dir = tempfile::tempdir().expect("tempdir");
     let idx = ContentIndex::load(dir.path());
     std::mem::forget(dir);
     Arc::new(Mutex::new(idx))
-}
-
-async fn write_temp(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("input.bin");
-    tokio::fs::write(&path, bytes).await.unwrap();
-    (dir, path)
-}
-
-/// Reassemble the DAG the recording store captured, via the real
-/// `harmony_content::dag::reassemble`. `dag::reassemble` takes `&dyn
-/// BookStore`, not a bare closure (confirmed against `dag.rs`), so we replay
-/// every recorded `(cid_hex, data)` pair into a `MemoryBookStore` keyed by its
-/// real `ContentId` and hand that to `reassemble`.
-fn reassemble_from_store(store: &Store, root: &[u8; 32]) -> Vec<u8> {
-    let mut book_store = MemoryBookStore::new();
-    for (cid_hex, data) in store.lock().unwrap().iter() {
-        let bytes: [u8; 32] =
-            <[u8; 32]>::try_from(hex::decode(cid_hex).expect("cid hex")).expect("cid 32 bytes");
-        book_store.store(ContentId::from_bytes(bytes), data.clone());
-    }
-    let root_cid = ContentId::from_bytes(*root);
-    harmony_content::dag::reassemble(&root_cid, &book_store).expect("reassemble")
 }
 
 /// Drive the real `ingest_content_encrypted_inner`, then reassemble the
@@ -100,7 +60,7 @@ async fn round_trip(plaintext: Vec<u8>) {
     // then decrypt with the v2 stream decryptor.
     let ciphertext = reassemble_from_store(&store, &root_bytes);
     let recovered =
-        harmony_app::file_stream_crypto::decrypt_stream(&dek, &ciphertext).expect("v2 decrypt");
+        harmony_app::file_stream_crypto::decrypt_stream(&dek, &ciphertext).expect("v3 decrypt");
     assert_eq!(
         recovered, plaintext,
         "streamed round-trip must recover plaintext"
