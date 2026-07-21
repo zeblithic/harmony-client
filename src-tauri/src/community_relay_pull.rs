@@ -231,6 +231,7 @@ mod tests {
             storage_blob: vec![tag + 1; 5],
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
         }
     }
 

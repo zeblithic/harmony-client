@@ -653,6 +653,7 @@ mod tests {
             storage_blob: vec![0x05, 0x06, 0x07, 0x08, 0x09],
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
         }
     }
 

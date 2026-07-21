@@ -237,6 +237,21 @@ pub struct DepositPayload {
         with = "serde_bytes"
     )]
     pub revocation_push: Option<Vec<u8>>,
+    /// ZEB-674 C3: canonical CBOR of `Vec<serde_bytes Vec<u8>>` — the
+    /// per-device sealed [`crate::file_sharing::FileGrantInner`] blobs
+    /// (`crate::file_sharing::seal_grant_for_devices`), piggybacked so a
+    /// file-share grant rides the offline-capable butler-deposit rung. Opaque
+    /// to the butler/relay (each inner blob is sealed end-to-end to a
+    /// specific grantee device's X25519 key); decoded and fanned out to
+    /// `OwnerState.file_grants` on the recipient's ingest path
+    /// (`ingest_grant_push`, Task 4). `None` for non-grant / legacy deposits.
+    #[serde(
+        rename = "gp",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub grant_push: Option<Vec<u8>>,
 }
 
 // Manual CanonicalPayload registration (the `impl_canonical!` macro in
@@ -674,6 +689,10 @@ impl ButlerDepositClient for IrohButlerDepositClient {
             storage_blob,
             invite_packet: req.invite_packet.clone(),
             revocation_push: req.revocation_push.clone(),
+            // ZEB-674 Task 4 wires `ButlerDepositRequest.grant_push` (or an
+            // equivalent request field) through to this sender rung; T3 adds
+            // only the wire field + demux-free round-trip.
+            grant_push: None,
         };
 
         // 3. Priority order, first ack wins. The frame is rebuilt per
@@ -808,6 +827,7 @@ mod tests {
             storage_blob: vec![0x04, 0x05, 0x06, 0x07],
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
         };
         let bytes = encode_deposit_payload(&payload).expect("encode");
         let back = decode_deposit_payload(&bytes).expect("decode");
@@ -821,6 +841,7 @@ mod tests {
             storage_blob: Vec::new(),
             invite_packet: None,
             revocation_push: Some(vec![0x05, 1, 2, 3]),
+            grant_push: None,
         };
         let bytes = encode_deposit_payload(&with_rev).unwrap();
         assert_eq!(decode_deposit_payload(&bytes).unwrap(), with_rev);
@@ -831,6 +852,7 @@ mod tests {
             storage_blob: vec![1],
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
         };
         let lbytes = encode_deposit_payload(&legacy).unwrap();
         assert_eq!(
@@ -847,6 +869,7 @@ mod tests {
             storage_blob: vec![4, 5, 6],
             invite_packet: Some(vec![7, 8, 9]),
             revocation_push: None,
+            grant_push: None,
         };
         let bytes = encode_deposit_payload(&with_invite).expect("encode");
         assert_eq!(decode_deposit_payload(&bytes).expect("decode"), with_invite);
@@ -857,6 +880,7 @@ mod tests {
             storage_blob: vec![2],
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
         };
         let bytes_none = encode_deposit_payload(&without).expect("encode none");
         assert_eq!(
@@ -898,12 +922,125 @@ mod tests {
             storage_blob: Vec::new(),
             invite_packet: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             revocation_push: None,
+            grant_push: None,
         };
         let bytes = encode_deposit_payload(&invite_only).expect("encode invite-only");
         assert_eq!(
             decode_deposit_payload(&bytes).expect("decode invite-only"),
             invite_only
         );
+    }
+
+    /// ZEB-674 Task 3 (C3): `grant_push` carries the opaque canonical-CBOR
+    /// `Vec<serde_bytes Vec<u8>>` of per-device sealed file-grant blobs
+    /// (Task 2's `seal_grant_for_devices`) so a grant can ride the
+    /// offline-capable butler-deposit rung. (a) `Some(bytes)` round-trips
+    /// intact; (b) `None` omits the `gp` key entirely — a legacy/old
+    /// decoder that has never heard of `grant_push` decodes the SAME bytes
+    /// unaffected (backward compatibility).
+    #[test]
+    fn deposit_payload_grant_push_roundtrip_and_back_compat() {
+        let with_grant = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: Some(vec![0xAA, 0xBB, 0xCC, 0xDD]),
+        };
+        let bytes = encode_deposit_payload(&with_grant).expect("encode grant_push");
+        assert_eq!(
+            decode_deposit_payload(&bytes).expect("decode grant_push"),
+            with_grant
+        );
+
+        // `None` omits the `gp` key (skip_serializing_if) — old decoders /
+        // old-shaped payloads are unaffected by this new field.
+        let without_grant = DepositPayload {
+            cidnotify_packet: Some(vec![1]),
+            storage_blob: vec![2],
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+        };
+        let bytes_none = encode_deposit_payload(&without_grant).expect("encode none");
+        assert_eq!(
+            decode_deposit_payload(&bytes_none).expect("decode none"),
+            without_grant
+        );
+        assert!(
+            !bytes_none.windows(2).any(|w| w == b"gp"),
+            "gp key omitted when grant_push is None"
+        );
+    }
+
+    /// ZEB-674 Task 3: the butler/relay carrying `grant_push` cannot open the
+    /// per-device sealed grant blobs inside it — each blob is sealed
+    /// end-to-end to a SPECIFIC grantee device's X25519 key
+    /// (`file_sharing::seal_grant_for_devices`), so an unrelated private key
+    /// (standing in for the butler, which never holds a grantee device's
+    /// key) fails to open it.
+    #[test]
+    fn butler_cannot_open_grant_push() {
+        use crate::file_sharing::{seal_grant_for_devices, FileGrantInner, FILE_GRANT_SEAL_INFO};
+
+        let (grantee_priv, grantee_pub) = make_x25519_keypair(0x03);
+        let (unrelated_priv, _unrelated_pub) = make_x25519_keypair(0x04);
+
+        let inner = FileGrantInner {
+            cid: [0x07; 32],
+            file_name: "report.pdf".into(),
+            file_size: 4096,
+            mime: "application/pdf".into(),
+            dek: [0x08; 32],
+        };
+        let sealed_blobs =
+            seal_grant_for_devices(&inner, &[grantee_pub]).expect("seal grant for devices");
+
+        // Build the realistic `grant_push` wire value: CBOR of
+        // `Vec<serde_bytes Vec<u8>>` (each element a byte-string, not a
+        // nested array of integers). `ByteBuf` is `serde_bytes`'s owned
+        // byte-string newtype — encoding via `ciborium` directly (this local
+        // `Vec<ByteBuf>` can't satisfy the module-private `CanonicalPayload`
+        // sealed trait that `canonical_cbor_encode` requires; mirrors the
+        // `LegacyDepositPayload` pattern above).
+        let grant_push_list: Vec<serde_bytes::ByteBuf> = sealed_blobs
+            .iter()
+            .cloned()
+            .map(serde_bytes::ByteBuf::from)
+            .collect();
+        let mut grant_push_bytes = Vec::new();
+        ciborium::into_writer(&grant_push_list, &mut grant_push_bytes).expect("encode gp list");
+
+        let payload = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: Some(grant_push_bytes.clone()),
+        };
+        let wire = encode_deposit_payload(&payload).expect("encode payload with grant_push");
+        let decoded = decode_deposit_payload(&wire).expect("decode payload with grant_push");
+        let gp = decoded.grant_push.expect("grant_push present");
+
+        // Decode the outer Vec<Vec<u8>> back out and attempt to open the
+        // single per-device seal with an UNRELATED X25519 private key — the
+        // butler/relay never holds a grantee device's private key.
+        let blobs: Vec<serde_bytes::ByteBuf> =
+            ciborium::from_reader(gp.as_slice()).expect("decode gp list");
+        assert_eq!(blobs.len(), 1);
+        let err = open_from_owner_with_info(&unrelated_priv, &blobs[0], FILE_GRANT_SEAL_INFO)
+            .expect_err("unrelated key must not open the sealed grant");
+        assert!(
+            matches!(err, crate::dm_signing::DmSignError::DecryptionFailed),
+            "expected DecryptionFailed, got {err:?}"
+        );
+
+        // Sanity: the intended grantee CAN open it (proves the fixture is
+        // realistic, not a vacuously-failing seal).
+        let opened = open_from_owner_with_info(&grantee_priv, &blobs[0], FILE_GRANT_SEAL_INFO)
+            .expect("grantee must open its own sealed grant");
+        let back: FileGrantInner = canonical_cbor_decode(&opened).expect("decode inner");
+        assert_eq!(back, inner);
     }
 
     /// The sealed envelope round-trips under the butler info string, and is
