@@ -66,7 +66,7 @@ flume = "0.11"
 # ZEB-445 serve mode adds: "rt-multi-thread" (serve_cli builds its own
 # multi-thread runtime), "macros" (tokio::select! in the shutdown path),
 # "signal" (ctrl-c / SIGTERM handling in wait_for_exit_signal).
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "signal", "io-util"] }
 # ZEB-473 (DM-over-iroh, Move 1a): the tunnel session loop reads length-prefixed
 # frames off the iroh bi-stream inside a `tokio::select!`; `FramedRead` +
 # `LengthDelimitedCodec` buffers partial reads internally so a cancelled read

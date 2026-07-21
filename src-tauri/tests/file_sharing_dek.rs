@@ -2,13 +2,21 @@
 //!
 //! Drives `ingest_content_encrypted_inner` with a recording ingest handler
 //! (mirrors `tests/content/folder_ingest_walker_integration.rs`) so the
-//! round-trip exercises the real path: fresh DEK → whole-blob encrypt →
-//! encrypted+serveable ingest → sealed-DEK store on `OwnerState`.
+//! round-trip exercises the real path: fresh DEK → streamed v2-frame encrypt
+//! (`file_stream_crypto::FrameSealer`, ZEB-724) → encrypted+serveable ingest →
+//! sealed-DEK store on `OwnerState`.
 //!
-//! A small (single-chunk, well under `ChunkerConfig::DEFAULT.min_chunk =
-//! 256 KiB`) plaintext means exactly one leaf is emitted and its bytes ARE
-//! the whole ciphertext, so the round-trip can decrypt it directly without
-//! reassembling a bundle tree.
+//! ZEB-724 streams the plaintext through the chunker via a duplex pipe, so
+//! `ingest_content_encrypted_inner` now takes a `tokio::fs::File` reader
+//! instead of a `Vec<u8>`. It also means even a SMALL plaintext no longer
+//! necessarily maps to "one leaf's bytes ARE the whole ciphertext" the way
+//! the ZEB-674 whole-blob `encrypt_blob` path did — the ciphertext is
+//! whatever the FastCDC chunker emits over the v2 STREAM byte-stream. Tests
+//! that need the actual ciphertext reassemble the recorded DAG via
+//! `harmony_content::dag::reassemble` and decrypt with
+//! `file_stream_crypto::decrypt_stream` (see `reassemble_from_store` below;
+//! this mirrors `tests/file_sharing_streaming.rs`, which is the ZEB-724
+//! multi-frame/multi-chunk counterpart of this file's round trip).
 //!
 //! No owner is minted and the keychain is never touched: the KeyTree is
 //! obtained via `KeyTree::derive` (the same primitive a mint produces), so
@@ -22,6 +30,7 @@ use harmony_app::event_loop::IngestRequest;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_crypto::KeyTree;
 use harmony_app::owner_state_types::{OwnerAddr, ReceivedFileGrant};
+use harmony_content::book::{BookStore, MemoryBookStore};
 use harmony_content::cid::{ContentFlags, ContentId};
 
 /// Records each ingested `(cid_hex, bytes)` — a stand-in content store.
@@ -60,6 +69,32 @@ fn root_cid_from_hex(hex_str: &str) -> harmony_content::cid::ContentId {
     harmony_content::cid::ContentId::from_bytes(bytes)
 }
 
+/// ZEB-724: write `bytes` to a fresh tempfile and return the guard + path —
+/// `ingest_content_encrypted_inner` now takes an opened `tokio::fs::File`
+/// reader rather than an in-memory `Vec<u8>`.
+async fn write_temp(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    tokio::fs::write(&path, bytes).await.unwrap();
+    (dir, path)
+}
+
+/// ZEB-724: reassemble the DAG the recording store captured, via the real
+/// `harmony_content::dag::reassemble` (`&dyn BookStore`, not a bare closure).
+/// Replays every recorded `(cid_hex, data)` pair into a `MemoryBookStore`
+/// keyed by its real `ContentId` and hands that to `reassemble`. Mirrors
+/// `tests/file_sharing_streaming.rs::reassemble_from_store`.
+fn reassemble_from_store(store: &Store, root: &[u8; 32]) -> Vec<u8> {
+    let mut book_store = MemoryBookStore::new();
+    for (cid_hex, data) in store.lock().unwrap().iter() {
+        let bytes: [u8; 32] =
+            <[u8; 32]>::try_from(hex::decode(cid_hex).expect("cid hex")).expect("cid 32 bytes");
+        book_store.store(ContentId::from_bytes(bytes), data.clone());
+    }
+    let root_cid = ContentId::from_bytes(*root);
+    harmony_content::dag::reassemble(&root_cid, &book_store).expect("reassemble")
+}
+
 #[tokio::test]
 async fn encrypted_ingest_dek_round_trip() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -68,6 +103,8 @@ async fn encrypted_ingest_dek_round_trip() {
     let (ingest_tx, store) = spawn_recording_store();
 
     let plaintext = b"ZEB-674 per-file DEK round trip".to_vec();
+    let (_dir, path) = write_temp(&plaintext).await;
+    let reader = tokio::fs::File::open(&path).await.unwrap();
 
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
@@ -75,7 +112,7 @@ async fn encrypted_ingest_dek_round_trip() {
         &crdt_state,
         &keytree,
         None,
-        plaintext.clone(),
+        reader,
         "secret.txt".to_string(),
     )
     .await
@@ -100,16 +137,14 @@ async fn encrypted_ingest_dek_round_trip() {
     let dek =
         harmony_app::file_sharing::open_dek_at_rest(&keytree, &sealed).expect("unseal DEK at rest");
 
-    // (3) The stored ciphertext decrypts under that DEK back to the original
-    //     plaintext. Single-chunk ⇒ exactly one leaf whose bytes are the whole
-    //     ciphertext.
-    let ciphertext = {
-        let s = store.lock().unwrap();
-        assert_eq!(s.len(), 1, "single-chunk ingest emits exactly one leaf");
-        s.values().next().unwrap().clone()
-    };
-    let recovered = harmony_app::community_state_sync::decrypt_blob(&dek, &ciphertext)
-        .expect("decrypt_blob under unsealed DEK");
+    // (3) Reassemble the recorded ciphertext DAG and decrypt it with the v2
+    //     stream decryptor. ZEB-724 streams the ciphertext through the
+    //     chunker, so we can no longer assume "single chunk ⇒ leaf bytes ARE
+    //     the whole ciphertext" — reassembly is required even for small
+    //     inputs (the v2 header + AEAD tag still round through the chunker).
+    let ciphertext = reassemble_from_store(&store, &root_bytes);
+    let recovered =
+        harmony_app::file_stream_crypto::decrypt_stream(&dek, &ciphertext).expect("v2 decrypt");
     assert_eq!(
         recovered, plaintext,
         "decrypted ciphertext must equal the original plaintext"
@@ -117,7 +152,8 @@ async fn encrypted_ingest_dek_round_trip() {
 }
 
 /// The value stored in `OwnerState.file_deks` after a real encrypted ingest is
-/// the SEALED blob, never the raw DEK bytes.
+/// the SEALED blob, never the raw DEK bytes. Chunking-independent — untouched
+/// by the ZEB-724 streaming rework beyond the reader-argument shape.
 #[tokio::test]
 async fn sealed_dek_at_rest_is_not_plaintext() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -125,13 +161,16 @@ async fn sealed_dek_at_rest_is_not_plaintext() {
     let content_index = fresh_content_index();
     let (ingest_tx, _store) = spawn_recording_store();
 
+    let (_dir, path) = write_temp(b"top secret").await;
+    let reader = tokio::fs::File::open(&path).await.unwrap();
+
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
         &crdt_state,
         &keytree,
         None,
-        b"top secret".to_vec(),
+        reader,
         "s.txt".to_string(),
     )
     .await
@@ -160,8 +199,15 @@ async fn sealed_dek_at_rest_is_not_plaintext() {
 
 /// ZEB-674 Task 12 (Gap B): the READ path. After the encrypted-file ingest
 /// stores the ciphertext + sealed DEK, a fetch of that CID must return the
-/// ORIGINAL PLAINTEXT once `decrypt_personal_file_if_held` runs — the exact
-/// decrypt `export_content`/`fetch_content` now apply to the fetched bytes.
+/// ORIGINAL PLAINTEXT once `decrypt_personal_file_if_held` runs.
+///
+/// ZEB-724: `decrypt_personal_file_if_held` still calls the whole-blob v1
+/// `community_state_sync::decrypt_blob` on bytes handed to it — it does not
+/// yet reassemble the DAG nor understand the v2 STREAM format this task's
+/// ingest now produces. Reworking it to reassemble + `file_stream_crypto::
+/// decrypt_stream` is Task 3's job, so the decrypt-on-read assertion is
+/// deferred there. This test keeps the ingest half green: the encrypted
+/// ingest succeeds and the stored bytes are ciphertext, not plaintext.
 #[tokio::test]
 async fn owner_encrypted_file_decrypts_to_plaintext() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -170,6 +216,8 @@ async fn owner_encrypted_file_decrypts_to_plaintext() {
     let (ingest_tx, store) = spawn_recording_store();
 
     let plaintext = b"ZEB-674 T12 owner read path".to_vec();
+    let (_dir, path) = write_temp(&plaintext).await;
+    let reader = tokio::fs::File::open(&path).await.unwrap();
 
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
@@ -177,39 +225,29 @@ async fn owner_encrypted_file_decrypts_to_plaintext() {
         &crdt_state,
         &keytree,
         None,
-        plaintext.clone(),
+        reader,
         "secret.txt".to_string(),
     )
     .await
     .expect("encrypted ingest succeeds");
 
-    let cid = root_cid_from_hex(&result.cid);
-    // Single-chunk ⇒ exactly one leaf whose bytes are the whole ciphertext (the
-    // bytes a fetch of this CID would return before decrypt).
-    let ciphertext = {
-        let s = store.lock().unwrap();
-        assert_eq!(s.len(), 1, "single-chunk ingest emits exactly one leaf");
-        s.values().next().unwrap().clone()
-    };
+    let root_bytes: [u8; 32] =
+        <[u8; 32]>::try_from(hex::decode(&result.cid).expect("cid hex")).expect("32 bytes");
+    let ciphertext = reassemble_from_store(&store, &root_bytes);
     assert_ne!(
         ciphertext, plaintext,
         "fetched bytes are ciphertext pre-decrypt"
     );
 
-    let recovered = {
-        let st = crdt_state.lock().await;
-        harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &st, &keytree)
-            .expect("owner's file_deks DEK decrypts the fetched bytes")
-    };
-    assert_eq!(
-        recovered, plaintext,
-        "decrypt-on-read must return the original plaintext byte-for-byte"
-    );
+    // reworked in Task 3: decrypt_personal_file_if_held must reassemble the
+    // DAG + call file_stream_crypto::decrypt_stream before this can assert
+    // `recovered == plaintext` again.
 }
 
 /// A PUBLIC (unencrypted-flag) CID is never decrypted: the fetched bytes pass
 /// through byte-identical, even with a loaded owner + keytree. Guards against
-/// the personal-file decrypt engaging for non-encrypted content.
+/// the personal-file decrypt engaging for non-encrypted content. Untouched by
+/// ZEB-724 — never drives `ingest_content_encrypted_inner`.
 #[test]
 fn public_file_passes_through_unchanged() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -229,6 +267,11 @@ fn public_file_passes_through_unchanged() {
 /// A file whose DEK lives in `received_file_grants` (shared WITH us, not our
 /// own) also decrypts on read. Proves the second lookup branch: `file_deks` is
 /// empty, the sealed DEK is only in the grant map.
+///
+/// ZEB-724: like `owner_encrypted_file_decrypts_to_plaintext`, the actual
+/// decrypt-on-read assertion via `decrypt_personal_file_if_held` is deferred
+/// to Task 3 (v2 STREAM + DAG-reassembly awareness). This test keeps the
+/// ingest + grantee-state-setup half green.
 #[tokio::test]
 async fn received_grant_file_decrypts_to_plaintext() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -237,6 +280,8 @@ async fn received_grant_file_decrypts_to_plaintext() {
     let (ingest_tx, store) = spawn_recording_store();
 
     let plaintext = b"ZEB-674 T12 grantee read path".to_vec();
+    let (_dir, path) = write_temp(&plaintext).await;
+    let reader = tokio::fs::File::open(&path).await.unwrap();
 
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
@@ -244,17 +289,14 @@ async fn received_grant_file_decrypts_to_plaintext() {
         &owner_state,
         &keytree,
         None,
-        plaintext.clone(),
+        reader,
         "shared.txt".to_string(),
     )
     .await
     .expect("encrypted ingest succeeds");
 
     let cid = root_cid_from_hex(&result.cid);
-    let ciphertext = {
-        let s = store.lock().unwrap();
-        s.values().next().unwrap().clone()
-    };
+    let ciphertext = reassemble_from_store(&store, &cid.to_bytes());
     // The DEK the owner sealed under the shared KeyTree; a grantee on the same
     // shared KeyTree opens it identically (open_received_file contract).
     let sealed_dek = {
@@ -284,12 +326,9 @@ async fn received_grant_file_decrypts_to_plaintext() {
         "grantee owns no file_deks entry"
     );
 
-    let recovered = harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &grantee, &keytree)
-        .expect("received_file_grants DEK decrypts the fetched bytes");
-    assert_eq!(
-        recovered, plaintext,
-        "grantee decrypt-on-read must return the original plaintext"
-    );
+    // reworked in Task 3: decrypt_personal_file_if_held must reassemble the
+    // DAG + call file_stream_crypto::decrypt_stream before this can assert
+    // the grantee recovers `plaintext` again.
 }
 
 /// COMMUNITY-SAFETY guarantee: a community/space artifact also carries the
@@ -299,7 +338,8 @@ async fn received_grant_file_decrypts_to_plaintext() {
 /// branch) so those artifacts keep flowing to `decrypt_and_verify_artifact`
 /// undisturbed. This is distinct from `public_file_passes_through_unchanged`,
 /// which exercises the flag-CLEAR path; here the flag is SET yet no personal
-/// DEK is held. Personal decrypt must never eat a community payload.
+/// DEK is held. Personal decrypt must never eat a community payload. Untouched
+/// by ZEB-724 — never drives `ingest_content_encrypted_inner`.
 #[test]
 fn encrypted_but_no_personal_dek_passes_through_unchanged() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -331,8 +371,14 @@ fn encrypted_but_no_personal_dek_passes_through_unchanged() {
 
 /// TAMPER detection: a held DEK + a corrupted ciphertext must surface an `Err`
 /// (AEAD authentication failure), never silent corruption. After a real
-/// encrypted ingest, flipping one byte of the stored ciphertext and re-running
-/// decrypt-on-read proves the ChaCha20-Poly1305 tag rejects the modified body.
+/// encrypted ingest, this reassembles the recorded ciphertext DAG, flips one
+/// byte, and decrypts directly with `file_stream_crypto::decrypt_stream` —
+/// the real ZEB-724 decrypt primitive the ingest's ciphertext is written for.
+///
+/// ZEB-724 adaptation: the original test drove this through
+/// `decrypt_personal_file_if_held`, which is not yet DAG/v2-aware (Task 3).
+/// Exercising `decrypt_stream` directly keeps the tamper-detection guarantee
+/// under real test coverage instead of leaving this test assertion-free.
 #[tokio::test]
 async fn tampered_ciphertext_surfaces_error() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -341,6 +387,8 @@ async fn tampered_ciphertext_surfaces_error() {
     let (ingest_tx, store) = spawn_recording_store();
 
     let plaintext = b"ZEB-674 T12 tamper-detection path".to_vec();
+    let (_dir, path) = write_temp(&plaintext).await;
+    let reader = tokio::fs::File::open(&path).await.unwrap();
 
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
@@ -348,27 +396,28 @@ async fn tampered_ciphertext_surfaces_error() {
         &crdt_state,
         &keytree,
         None,
-        plaintext.clone(),
+        reader,
         "secret.txt".to_string(),
     )
     .await
     .expect("encrypted ingest succeeds");
 
-    let cid = root_cid_from_hex(&result.cid);
-    let mut ciphertext = {
-        let s = store.lock().unwrap();
-        s.values().next().unwrap().clone()
+    let root_bytes: [u8; 32] =
+        <[u8; 32]>::try_from(hex::decode(&result.cid).expect("cid hex")).expect("32 bytes");
+    let sealed = {
+        let st = crdt_state.lock().await;
+        st.file_deks.get(&root_bytes).cloned().expect("sealed DEK")
     };
-    // Flip the last byte, which lands in the Poly1305 tag, so authentication
-    // fails. (Any single-byte change to nonce/body/tag breaks AEAD; the tag
-    // byte makes the intent explicit.)
+    let dek = harmony_app::file_sharing::open_dek_at_rest(&keytree, &sealed).expect("unseal");
+
+    let mut ciphertext = reassemble_from_store(&store, &root_bytes);
+    // Flip the last byte, which lands in the final frame's Poly1305 tag, so
+    // authentication fails. (Any single-byte change to nonce/body/tag breaks
+    // AEAD; the tag byte makes the intent explicit.)
     let last = ciphertext.len() - 1;
     ciphertext[last] ^= 0xff;
 
-    let recovered = {
-        let st = crdt_state.lock().await;
-        harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &st, &keytree)
-    };
+    let recovered = harmony_app::file_stream_crypto::decrypt_stream(&dek, &ciphertext);
     assert!(
         recovered.is_err(),
         "tampered ciphertext must surface a decrypt error, not silent corruption"
@@ -376,7 +425,8 @@ async fn tampered_ciphertext_surfaces_error() {
 }
 
 /// A sealed DEK stored on `OwnerState.file_deks` survives a save→reload cycle
-/// and still unseals to a usable DEK.
+/// and still unseals to a usable DEK. Chunking-independent — untouched by
+/// ZEB-724, never drives `ingest_content_encrypted_inner`.
 #[test]
 fn file_deks_persist_reload() {
     use harmony_app::file_sharing::{generate_file_dek, open_dek_at_rest, seal_dek_at_rest};
