@@ -474,7 +474,14 @@ export class FileManagerService {
   /** ZEB-674: revokes a previously granted peer's read access to a CID. */
   async revokeRead(cid: string, granteeAddress: string): Promise<void> {
     if (!this.adapter) throw new Error('adapter not connected');
-    await this.adapter.invoke('revoke_read', { cid, granteeAddress });
+    try {
+      await this.adapter.invoke('revoke_read', { cid, granteeAddress });
+    } catch (e) {
+      // Normalize both production (string) + test (Error) rejection shapes
+      // (CLAUDE.md "Tauri IPC error extraction").
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
   }
 
   /** Clears the pinned flag on a content item. */

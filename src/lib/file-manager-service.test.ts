@@ -722,4 +722,32 @@ describe('FileManagerService', () => {
 
     expect(adapter.invoke).toHaveBeenCalledWith('revoke_read', { cid: 'cidX', granteeAddress: 'addrY' });
   });
+
+  it('revokeRead surfaces an Error-shaped rejection unchanged', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'revoke_read') {
+        return Promise.reject(new Error('ineligible: grant not found'));
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(svc.revokeRead('cidX', 'addrY')).rejects.toThrow('ineligible: grant not found');
+  });
+
+  it('revokeRead surfaces a string (production-shape) rejection unchanged', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'revoke_read') {
+        return Promise.reject('ineligible: grant not found');
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(svc.revokeRead('cidX', 'addrY')).rejects.toThrow('ineligible: grant not found');
+  });
 });
