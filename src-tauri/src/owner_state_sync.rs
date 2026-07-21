@@ -262,6 +262,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         file_deks,
         file_grants,
         received_file_grants,
+        burned_content,
     } = remote;
 
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
@@ -479,6 +480,23 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
                 .then(a.granted_at.cmp(&b.granted_at))
         });
     }
+
+    // ZEB-722: burn tombstones — GROW-ONLY set union, then SWEEP the owner-side
+    // file maps. Placed AFTER the file_deks + file_grants union loops so a
+    // first-writer-wins `file_deks` re-add (or a grant union) from a stale
+    // sibling is immediately swept back out, and a tombstone arriving in THIS
+    // merge also cleans a pre-existing local entry. `received_file_grants` is
+    // intentionally NOT swept (different trigger — burn never reaches it; see
+    // ZEB-727). The disjoint-field `retain` mirrors the `revoked_dm_devices`
+    // GC-on-de-friend prune above (both capture one `local` field in the closure
+    // while retaining another).
+    local.burned_content.extend(burned_content);
+    local
+        .file_deks
+        .retain(|cid, _| !local.burned_content.contains(cid));
+    local
+        .file_grants
+        .retain(|cid, _| !local.burned_content.contains(cid));
 
     // ZEB-674 Task 4 / converge (CodeRabbit, Major): received-file grants —
     // GROW-ONLY union with a DETERMINISTIC tie-break per CID. A grantee's
@@ -2430,6 +2448,66 @@ mod integration_tests {
             b.outbox_tombstones, b_tombstones_before,
             "B's tombstones must be unchanged by idempotent merge (A has same tombstone)"
         );
+    }
+
+    /// ZEB-722: `burn_gc` records the tombstone and drops the owner-side maps
+    /// for the burned CID.
+    #[test]
+    fn burn_gc_records_tombstone_and_drops_maps() {
+        use crate::owner_state_types::{GrantEntry, OwnerAddr};
+        let cid = [0x7au8; 32];
+        let mut s = OwnerState::default();
+        s.file_deks.insert(cid, vec![1, 2, 3]);
+        // GrantEntry timestamps are u64 wall-clock millis (ZEB-725), not Hlc.
+        s.file_grants.insert(
+            cid,
+            vec![GrantEntry {
+                grantee_owner: OwnerAddr([0x0b; 16]),
+                granted_at: 1,
+                revoked_at: 0,
+            }],
+        );
+        s.burn_gc(cid);
+        assert!(!s.file_deks.contains_key(&cid), "DEK dropped");
+        assert!(!s.file_grants.contains_key(&cid), "grants dropped");
+        assert!(s.burned_content.contains(&cid), "tombstone recorded");
+    }
+
+    /// ZEB-722: a burned CID must not resurrect on the add-wins union merge, and
+    /// the sweep must converge regardless of merge direction.
+    #[test]
+    fn merge_sweeps_burned_cid_and_is_order_independent() {
+        let cid = [0x7bu8; 32];
+
+        // Device A burned the CID (tombstone present, maps empty).
+        let mut a = OwnerState::default();
+        a.burn_gc(cid);
+
+        // Device B still holds the DEK for that CID (stale sibling).
+        let mut b = OwnerState::default();
+        b.file_deks.insert(cid, vec![9, 9, 9]);
+
+        // A merges B: the union re-adds file_deks[cid], the sweep drops it again.
+        let mut a1 = a.clone();
+        super::merge_remote_into_local(&mut a1, b.clone());
+        assert!(
+            !a1.file_deks.contains_key(&cid),
+            "burned CID must not resurrect on merge"
+        );
+        assert!(a1.burned_content.contains(&cid), "tombstone retained");
+
+        // B merges A: B learns the tombstone and sweeps its own entry — converges.
+        let mut b1 = b.clone();
+        super::merge_remote_into_local(&mut b1, a.clone());
+        assert!(
+            !b1.file_deks.contains_key(&cid),
+            "sibling sweeps on learning the tombstone"
+        );
+        assert!(b1.burned_content.contains(&cid), "tombstone propagated");
+
+        // Both directions reached the same state.
+        assert_eq!(a1.file_deks, b1.file_deks);
+        assert_eq!(a1.burned_content, b1.burned_content);
     }
 
     /// ZEB-674 Task 2: the per-CID `file_grants` union in
