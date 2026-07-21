@@ -478,8 +478,19 @@ pub fn export_recovery_file_pair_with_keychain(
         match move_aside(&sidecar) {
             Ok(bak) => bak,
             Err(e) => {
+                // Roll back the HRMR move-aside. If the rollback ITSELF fails,
+                // the operator's original recovery file is stranded under its
+                // `.bak` — surface that path in the returned error rather than
+                // reducing it to a tracing log, since silent HRMR loss is
+                // exactly what ZEB-728 guards against.
                 if let Some(b) = hrmr_bak.as_deref() {
-                    restore_bak(out, b);
+                    if !restore_bak(out, b) {
+                        return Err(format!(
+                            "{e}; additionally FAILED to restore the original \
+                             recovery file, which remains at {}",
+                            b.display()
+                        ));
+                    }
                 }
                 return Err(e);
             }

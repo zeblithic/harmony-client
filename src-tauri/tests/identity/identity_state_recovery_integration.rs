@@ -65,6 +65,15 @@ fn setup_machine() -> TempDir {
 fn wipe_identity_store(identity_path: &std::path::Path) {
     let enc_path = identity_path.with_file_name("identity.enc");
     let _ = std::fs::remove_file(&enc_path);
+    // The wipe is the whole point — assert the store is actually gone so a
+    // discarded remove error can't silently leave `identity.enc` present and
+    // let the subsequent force=true restore skip the absent-store precondition.
+    // (A legitimately-absent store — NotFound above — still satisfies this.)
+    assert!(
+        !enc_path.exists(),
+        "identity.enc must be absent after wipe: {}",
+        enc_path.display()
+    );
 }
 
 #[test]
@@ -185,10 +194,17 @@ fn force_pair_export_rolls_back_hrmr_when_sidecar_backup_fails() {
         /*keychain=*/ None,
     );
 
-    // The export must fail at the sidecar backup step...
+    // The export must fail specifically at the SIDECAR backup step — not the
+    // HRMR backup. `move_aside` formats "failed to back up existing <path>
+    // before overwrite: ..."; only the sidecar path carries the ".state"
+    // suffix. Asserting this guards against a false-pass on a platform where a
+    // different filename/path limit made the HRMR move-aside fail first (which
+    // would never exercise the rollback window this test targets).
+    let err = result.expect_err("export should fail when the sidecar move-aside fails");
     assert!(
-        result.is_err(),
-        "export should fail when the sidecar move-aside fails"
+        err.contains("before overwrite") && err.contains(".state"),
+        "failure must originate from the sidecar move-aside (proving the HRMR \
+         backup was created and then rolled back), got: {err}"
     );
 
     // ...and the operator's original HRMR file must still be at its path with
