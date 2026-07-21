@@ -19,6 +19,7 @@ use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::aead::stream::{DecryptorBE32, EncryptorBE32};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 use sha2::{Digest, Sha256};
+use std::io::Write as _;
 
 const V2_MAGIC: [u8; 4] = *b"HSF2";
 const V2_VERSION: u8 = 0x02;
@@ -184,6 +185,48 @@ pub fn decrypt_stream_to_writer<W: std::io::Write>(
     Ok(())
 }
 
+/// Decrypt v2 ciphertext directly onto `final_path` without ever creating or
+/// truncating the caller's chosen file until decryption has fully succeeded.
+///
+/// Decrypts into a [`tempfile::NamedTempFile`] created in `final_path`'s
+/// parent directory (same filesystem, so the final rename is atomic),
+/// flushes + fsyncs it, then persists (renames) it onto `final_path` — only
+/// once decrypt has produced a complete, authenticated plaintext. On ANY
+/// error (bad header, truncated/tampered ciphertext, or I/O failure) the
+/// temp file is removed (via `NamedTempFile`'s drop-deletes-on-error
+/// behavior, including the file `tempfile::PersistError` hands back) and
+/// `final_path` is left completely untouched — an existing file there is
+/// neither truncated nor partially overwritten. See ZEB-724 whole-branch
+/// review (data-loss MUST-FIX): the previous `export_content` path did
+/// `File::create(&out_path)` (truncating to 0 bytes) BEFORE attempting
+/// decrypt, which clobbered the user's chosen file on every legacy-v1
+/// export (deterministic `UnsupportedLegacyFormat`) and on any tampered v2
+/// ciphertext.
+pub fn decrypt_stream_to_path(
+    dek: &EpochKey,
+    ciphertext: &[u8],
+    final_path: &std::path::Path,
+) -> Result<(), FileStreamError> {
+    let dir = match final_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let mut tmp =
+        tempfile::NamedTempFile::new_in(dir).map_err(|e| FileStreamError::Io(e.to_string()))?;
+    decrypt_stream_to_writer(dek, ciphertext, &mut tmp)?;
+    tmp.flush()
+        .map_err(|e| FileStreamError::Io(e.to_string()))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| FileStreamError::Io(e.to_string()))?;
+    // `persist` renames the temp file onto `final_path`. On failure it hands
+    // the still-live `NamedTempFile` back inside `PersistError`; we discard
+    // it here, which drops (and thus removes) the temp file.
+    tmp.persist(final_path)
+        .map_err(|e| FileStreamError::Io(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +375,84 @@ mod tests {
         let mut sink = Vec::new();
         decrypt_stream_to_writer(&d, &ct, &mut sink).unwrap();
         assert_eq!(sink, pt);
+    }
+
+    /// ZEB-724 whole-branch review (data-loss MUST-FIX): a successful
+    /// `decrypt_stream_to_path` writes the full plaintext to `final_path` and
+    /// leaves no temp file behind in the directory.
+    #[test]
+    fn decrypt_to_path_success_writes_plaintext() {
+        let d = dek();
+        let pt: Vec<u8> = (0..300u32).map(|i| i as u8).collect(); // multi-frame at FS=32
+        let ct = seal_all(&d, &pt, FS);
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.bin");
+
+        decrypt_stream_to_path(&d, &ct, &final_path).unwrap();
+
+        assert_eq!(std::fs::read(&final_path).unwrap(), pt);
+        // No stray temp file left in the directory.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("out.bin")]);
+    }
+
+    /// ZEB-724 whole-branch review (data-loss MUST-FIX): the previous
+    /// `export_content` path did `File::create(&out_path)` — truncating the
+    /// user's chosen file to 0 bytes — BEFORE attempting decrypt, so a
+    /// deterministic legacy-v1 export or a tampered v2 ciphertext clobbered
+    /// the user's existing file. `decrypt_stream_to_path` must never touch
+    /// `final_path` until decrypt has fully succeeded: on failure, the
+    /// existing file at `final_path` is left byte-for-byte untouched and no
+    /// leftover temp file remains in the directory.
+    #[test]
+    fn decrypt_to_path_failure_preserves_existing_file() {
+        let d = dek();
+        let pt = vec![4u8; (FS as usize) * 3];
+        let mut ct = seal_all(&d, &pt, FS);
+        // Tamper a body byte so decrypt fails with an AEAD auth error.
+        let i = V2_HEADER_LEN + 1;
+        ct[i] ^= 0x01;
+
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.bin");
+        std::fs::write(&final_path, b"KEEP ME").unwrap();
+
+        let err = decrypt_stream_to_path(&d, &ct, &final_path).unwrap_err();
+        assert!(matches!(err, FileStreamError::Aead));
+
+        // Final path is completely untouched.
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"KEEP ME");
+        // No leftover temp file in the directory.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("out.bin")]);
+    }
+
+    /// Same as above but for the OTHER deterministic failure mode called out
+    /// in ZEB-724: exporting a legacy v1 whole-blob file (which still has a
+    /// live DEK, so decrypt is attempted and immediately rejected).
+    #[test]
+    fn decrypt_to_path_legacy_v1_preserves_existing_file() {
+        let d = dek();
+        let v1 = crate::community_state_sync::encrypt_blob(&d, b"hello world").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.bin");
+        std::fs::write(&final_path, b"KEEP ME").unwrap();
+
+        let err = decrypt_stream_to_path(&d, &v1, &final_path).unwrap_err();
+        assert!(matches!(err, FileStreamError::UnsupportedLegacyFormat));
+
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"KEEP ME");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("out.bin")]);
     }
 }

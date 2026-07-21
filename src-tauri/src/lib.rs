@@ -19783,6 +19783,28 @@ async fn set_replication_tier(
     Ok(updated as u32)
 }
 
+/// Look up the KeyTree-sealed DEK bytes for an encrypted personal-file CID
+/// key, checking this owner's own files (`file_deks`) FIRST, then a file
+/// shared with us (`received_file_grants`). `None` = this node holds no
+/// personal DEK for the CID (either public content, or a community/space
+/// artifact that decrypts via its own epoch-key path elsewhere).
+///
+/// Shared by [`decrypt_personal_file_if_held`] and
+/// [`resolve_personal_file_dek`] so the lookup order/precedence can't drift
+/// between the two call sites (ZEB-724 whole-branch review: this sequence
+/// was previously duplicated inline in both functions).
+fn find_sealed_file_dek<'a>(
+    state: &'a crate::owner_state_crdt::OwnerState,
+    cid_key: &[u8; 32],
+) -> Option<&'a Vec<u8>> {
+    state.file_deks.get(cid_key).or_else(|| {
+        state
+            .received_file_grants
+            .get(cid_key)
+            .map(|g| &g.sealed_dek)
+    })
+}
+
 /// ZEB-674 Task 12 (Gap B): personal-file decrypt-on-read core.
 ///
 /// Given the raw bytes just fetched for `cid`, return the PLAINTEXT when this
@@ -19813,11 +19835,7 @@ pub fn decrypt_personal_file_if_held(
         return Ok(bytes);
     }
     let key = cid.to_bytes();
-    let sealed = state
-        .file_deks
-        .get(&key)
-        .or_else(|| state.received_file_grants.get(&key).map(|g| &g.sealed_dek));
-    let Some(sealed) = sealed else {
+    let Some(sealed) = find_sealed_file_dek(state, &key) else {
         // Encrypted, but not a personal file we hold a DEK for — leave the
         // fetched bytes untouched so the community/space epoch-key path is
         // undisturbed.
@@ -19879,11 +19897,7 @@ async fn resolve_personal_file_dek(
     };
     let key = cid.to_bytes();
     let st = crdt_state.lock().await;
-    let sealed = st
-        .file_deks
-        .get(&key)
-        .or_else(|| st.received_file_grants.get(&key).map(|g| &g.sealed_dek));
-    let Some(sealed) = sealed else {
+    let Some(sealed) = find_sealed_file_dek(&st, &key) else {
         return Ok(None);
     };
     let dek = crate::file_sharing::open_dek_at_rest(&keytree, sealed)
@@ -19967,15 +19981,15 @@ async fn export_content(
         if let Some(dek) = resolve_personal_file_dek(state.inner(), &cid_obj).await? {
             // Stream-decrypt: ciphertext is already resident; write plaintext
             // frame-by-frame so the whole plaintext is never also resident.
+            // Decrypts to a temp file in the same directory and renames onto
+            // `out_path` only on success (ZEB-724 whole-branch review,
+            // data-loss MUST-FIX) — the user's chosen file must never be
+            // truncated/clobbered by a failed decrypt (deterministic on
+            // legacy-v1 exports, possible on a tampered v2 ciphertext).
             let out_path = path.to_path_buf();
             tokio::task::spawn_blocking(move || -> Result<(), String> {
-                use std::io::Write as _;
-                let mut f =
-                    std::fs::File::create(&out_path).map_err(|e| format!("create failed: {e}"))?;
-                crate::file_stream_crypto::decrypt_stream_to_writer(&dek, &bytes, &mut f)
-                    .map_err(|e| format!("decrypt personal file: {e}"))?;
-                f.flush().map_err(|e| format!("flush failed: {e}"))?;
-                Ok(())
+                crate::file_stream_crypto::decrypt_stream_to_path(&dek, &bytes, &out_path)
+                    .map_err(|e| format!("decrypt personal file: {e}"))
             })
             .await
             .map_err(|e| format!("decrypt task: {e}"))??;
