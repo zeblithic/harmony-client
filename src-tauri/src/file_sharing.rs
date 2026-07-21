@@ -672,7 +672,7 @@ mod tests {
         // build_grant_push is pure (never mutates state on any path, success
         // or failure) — confirm nothing was recorded for the rejected grant.
         assert!(
-            state.file_grants.get(&CID).is_none(),
+            !state.file_grants.contains_key(&CID),
             "a rejected grant must record no GrantEntry"
         );
     }
