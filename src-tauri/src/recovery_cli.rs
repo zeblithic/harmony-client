@@ -470,7 +470,20 @@ pub fn export_recovery_file_pair_with_keychain(
 
     let hrmr_bak: Option<PathBuf> = if force { move_aside(out)? } else { None };
     let hrss_bak: Option<PathBuf> = if force && want_sidecar {
-        move_aside(&sidecar)?
+        // ZEB-728: if the sidecar move-aside fails *after* the HRMR move-aside
+        // already succeeded, roll back the HRMR backup before returning.
+        // Otherwise this early `?` bypasses every `restore_bak` error path
+        // below and orphans the operator's original recovery file under a
+        // randomized `.bak` name — turning a failed export into backup loss.
+        match move_aside(&sidecar) {
+            Ok(bak) => bak,
+            Err(e) => {
+                if let Some(b) = hrmr_bak.as_deref() {
+                    restore_bak(out, b);
+                }
+                return Err(e);
+            }
+        }
     } else {
         None
     };
