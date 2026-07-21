@@ -512,6 +512,13 @@ impl DmInboxIngestCtx for ProbeIngestCtx {
         Ok(())
     }
 
+    async fn apply_grant_revoke(&self, _entry: &DmInboxEntry) -> Result<(), String> {
+        // ZEB-730 standalone file-grant revoke deposits (only `grant_revoke` set)
+        // are not exercised by these message-entry probes; the recover path is
+        // unit-covered in `dm_inbox_ingest.rs`. Succeed without applying.
+        Ok(())
+    }
+
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
         let inserted = self
             .dm_store

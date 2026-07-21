@@ -125,6 +125,20 @@ pub trait DmInboxIngestCtx: Send + Sync {
     /// (the TTL GC is the safety valve), like the message/invite/revocation arms.
     async fn apply_grant_push(&self, entry: &DmInboxEntry) -> Result<(), String>;
 
+    /// ZEB-730: apply a deposited file-grant REVOKE entry (owner→grantee).
+    /// Decodes the revoked root ContentId from `grant_revoke`, then — under the
+    /// owner-state lock — honors the revoke ONLY when the butler-verified deposit
+    /// sender (`OwnerAddr(entry.sender_owner)`, NEVER a payload claim) matches the
+    /// granter-of-record on the local received grant (`ingest_grant_revoke`'s
+    /// griefing guard), reusing ZEB-727's dismiss tombstone. On a genuine change
+    /// it marks owner-state dirty (`received_file_grants`/`dismissed_received_grants`
+    /// have no deposit-rung re-delivery backstop — ZEB-709) AND emits
+    /// `"shared-with-me-updated"` so the grantee UI drops the entry. An
+    /// unauthorized / absent-entry revoke is a silent `Ok(())` no-op (a dropped
+    /// revoke is not an error) — mark nothing, emit nothing. An `Err` (malformed
+    /// wire bytes) leaves the entry PENDING for retry, like the other arms.
+    async fn apply_grant_revoke(&self, entry: &DmInboxEntry) -> Result<(), String>;
+
     /// `OwnerState::apply_inbox` under the owner-state lock (idempotent on
     /// `(space_id, message_cid)`). Returns `true` iff the entry was NEWLY
     /// inserted (`ApplyOutcome::Inserted`) — the `dm-received` emit gate,
@@ -196,6 +210,7 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
             && entry.cidnotify_packet.is_none()
             && entry.invite_packet.is_none()
             && entry.grant_push.is_none()
+            && entry.grant_revoke.is_none()
         {
             match ctx.apply_revocation(entry).await {
                 Ok(_) => {
@@ -225,6 +240,7 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
             && entry.cidnotify_packet.is_none()
             && entry.invite_packet.is_none()
             && entry.revocation_push.is_none()
+            && entry.grant_revoke.is_none()
         {
             match ctx.apply_grant_push(entry).await {
                 Ok(()) => {
@@ -241,10 +257,45 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
             }
             continue;
         }
+        // ZEB-730: a PURE file-grant REVOKE deposit (owner→grantee) — no
+        // cidnotify, no invite, no revocation, no grant. Apply it before the
+        // invite-only branch would otherwise swallow the `cidnotify_packet ==
+        // None` case. The guard is a pure-shape check mirroring the grant arm:
+        // `grant_revoke` rides on the persisted entry, so requiring every other
+        // sub-payload absent keeps a message/invite/revocation/grant entry that
+        // somehow carried a stray revoke from being mis-routed here (the butler's
+        // pure-shape guards already reject that shape, but a sibling doc merge is
+        // a trust boundary too, so re-check). `apply_grant_revoke` authorizes by
+        // granter-of-record and stamps ZEB-727's dismiss tombstone.
+        if entry.grant_revoke.is_some()
+            && entry.cidnotify_packet.is_none()
+            && entry.invite_packet.is_none()
+            && entry.revocation_push.is_none()
+            && entry.grant_push.is_none()
+        {
+            match ctx.apply_grant_revoke(entry).await {
+                Ok(()) => {
+                    entry.ingested_by.insert(self_id.clone());
+                    changed = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "ZEB-730: grant-revoke recover failed; leaving entry pending for retry"
+                    );
+                }
+            }
+            continue;
+        }
         // ZEB-505: invite-only entry (no CidNotify) — apply the bootstrap
         // invite ALONE (no blob, no message), then mark ingested. A failure
         // leaves it pending for retry, like the message path below.
-        if entry.cidnotify_packet.is_none() {
+        // ZEB-730: `grant_revoke.is_none()` excludes a stray revoke — a PURE
+        // grant-revoke (also CidNotify-less) is already claimed by the arm above
+        // and `continue`d; a malformed grant_revoke+sibling entry must not be
+        // mis-applied as an invite (fail-closed, like the acceptor's guards).
+        if entry.cidnotify_packet.is_none() && entry.grant_revoke.is_none() {
             match ctx.apply_invite_only(entry).await {
                 Ok(()) => {
                     // Deliberate asymmetry vs. the co-deposit path below: this
@@ -1312,6 +1363,49 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         Ok(())
     }
 
+    async fn apply_grant_revoke(&self, entry: &DmInboxEntry) -> Result<(), String> {
+        let gr = entry
+            .grant_revoke
+            .as_deref()
+            .ok_or("apply_grant_revoke: entry has no grant_revoke")?;
+        // Decode the revoked root ContentId. The whole payload was frame-sealed to
+        // us, so these bytes are authentic-to-transport; AUTHORIZATION (the
+        // granter-of-record match) happens inside `ingest_grant_revoke` under the
+        // lock — `sender_owner` is the butler-verified frame sender, never a
+        // payload claim.
+        let cid = crate::butler_deposit::decode_grant_revoke(gr)?;
+        let changed = {
+            let mut state = self.crdt_state.lock().await;
+            crate::file_sharing::ingest_grant_revoke(
+                &mut state,
+                OwnerAddr(entry.sender_owner),
+                cid,
+                crate::file_sharing::now_epoch_ms(),
+            )
+        };
+        // `received_file_grants`/`dismissed_received_grants` live in the owner-state
+        // CRDT and have NO deposit-rung re-delivery backstop (the entry is GC'd once
+        // covered), so persistence + sibling (Flow A) replication MUST come from
+        // notify_dirty here — ONLY when the revoke actually changed state
+        // (authorized AND a matching active grant existed). An unauthorized /
+        // absent revoke mutated nothing and must not churn a persist or a UI
+        // refresh (griefing guard).
+        if changed {
+            if let Some(mark) = &self.notify_owner_state_dirty {
+                mark();
+            }
+            // ZEB-723 parity: nudge the grantee UI to refresh "Shared with me"
+            // (the revoked grant disappears). Canonical lowercase-hex cid,
+            // mirroring `apply_grant_push` / `grants-updated`.
+            crate::node_event_sink::emit_ser(
+                self.sink.as_ref(),
+                "shared-with-me-updated",
+                &serde_json::json!({ "cid": hex::encode(cid) }),
+            );
+        }
+        Ok(())
+    }
+
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
         let inserted = {
             let mut state = self.crdt_state.lock().await;
@@ -1450,6 +1544,9 @@ mod tests {
         /// ZEB-674: when true, `apply_grant_push` returns `Err` (entry stays
         /// pending for retry) instead of succeeding.
         grant_fail: bool,
+        /// ZEB-730: when true, `apply_grant_revoke` returns `Err` (entry stays
+        /// pending for retry) instead of succeeding.
+        grant_revoke_fail: bool,
         /// What `apply_inbox` reports: `true` = newly inserted.
         apply_inserted: bool,
         calls: StdMutex<Vec<String>>,
@@ -1469,6 +1566,7 @@ mod tests {
                 cas_fail: false,
                 verify_fail: false,
                 grant_fail: false,
+                grant_revoke_fail: false,
                 apply_inserted: true,
                 calls: StdMutex::new(Vec::new()),
                 cas_blobs: StdMutex::new(Vec::new()),
@@ -1540,6 +1638,14 @@ mod tests {
             self.calls.lock().unwrap().push("apply_grant_push".into());
             if self.grant_fail {
                 return Err("simulated grant apply failure".into());
+            }
+            Ok(())
+        }
+
+        async fn apply_grant_revoke(&self, _entry: &DmInboxEntry) -> Result<(), String> {
+            self.calls.lock().unwrap().push("apply_grant_revoke".into());
+            if self.grant_revoke_fail {
+                return Err("simulated grant_revoke apply failure".into());
             }
             Ok(())
         }
@@ -1755,6 +1861,104 @@ mod tests {
         let changed = ingest_pending(&mut doc, &ctx).await;
         assert!(!changed, "a failed grant apply mutates nothing");
         assert_eq!(ctx.calls(), vec!["apply_grant_push"]);
+        assert!(
+            !doc.entries[&key].ingested_by.contains(SELF_ID),
+            "entry left pending for retry"
+        );
+    }
+
+    /// ZEB-730: a PURE grant-revoke entry (`grant_revoke: Some`, all other
+    /// sub-payloads `None`) is routed to `apply_grant_revoke` and SKIPS the
+    /// message/invite/revocation/grant pipelines entirely — no CAS-put, no
+    /// verify, no apply_inbox, no emit — then is marked ingested.
+    #[tokio::test]
+    async fn ingest_routes_grant_revoke_entry_to_apply_grant_revoke() {
+        let gr = crate::butler_deposit::encode_grant_revoke([0x77; 32]);
+        let key = DmInboxDoc::grant_revoke_key(&SENDER_OWNER, &gr);
+        let entry = DmInboxEntry {
+            sender_owner: SENDER_OWNER,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: Some(gr),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let ctx = ProbeCtx::new();
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed, "grant-revoke ingest mutated the doc (ig growth)");
+        assert_eq!(ctx.calls(), vec!["apply_grant_revoke"]);
+        assert!(
+            ctx.applied().is_empty(),
+            "no message apply_inbox on a grant-revoke"
+        );
+        assert!(
+            ctx.emitted().is_empty(),
+            "no dm-received emit on a grant-revoke"
+        );
+        assert!(doc.entries[&key].ingested_by.contains(SELF_ID));
+    }
+
+    /// ZEB-730 (guard completeness): a MESSAGE entry (cidnotify present) that
+    /// ALSO carries a stray `grant_revoke` must NOT be claimed by the grant-revoke
+    /// arm — that arm's pure-shape guard requires `cidnotify_packet.is_none()`.
+    /// The stray `grant_revoke` is inert: `apply_grant_revoke` is only reachable
+    /// from the pure arm, so the entry is processed as a normal message and the
+    /// revoke never fires (mirrors how a stray grant_push/revocation_push on a
+    /// message is inert).
+    #[tokio::test]
+    async fn ingest_message_with_stray_grant_revoke_not_routed_to_apply_grant_revoke() {
+        let (key, mut entry) = make_entry([1; 16], [2; 32], 500, &[]);
+        entry.grant_revoke = Some(crate::butler_deposit::encode_grant_revoke([0x77; 32]));
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let ctx = ProbeCtx::new();
+
+        let _ = ingest_pending(&mut doc, &ctx).await;
+
+        assert!(
+            !ctx.calls().contains(&"apply_grant_revoke".to_string()),
+            "a message carrying a stray grant_revoke must NOT route to apply_grant_revoke"
+        );
+        // Processed as a normal message end-to-end (the stray grant_revoke is inert).
+        assert_eq!(
+            ctx.calls(),
+            vec!["cas_put", "verify", "apply_inbox", "emit"]
+        );
+    }
+
+    /// ZEB-730: a failed `apply_grant_revoke` leaves the entry PENDING (not
+    /// ingested) for retry, exactly like the grant/message/invite/revocation arms.
+    #[tokio::test]
+    async fn ingest_grant_revoke_apply_failure_leaves_entry_pending() {
+        let gr = crate::butler_deposit::encode_grant_revoke([0x77; 32]);
+        let key = DmInboxDoc::grant_revoke_key(&SENDER_OWNER, &gr);
+        let entry = DmInboxEntry {
+            sender_owner: SENDER_OWNER,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: Some(gr),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let mut ctx = ProbeCtx::new();
+        ctx.grant_revoke_fail = true;
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(!changed, "a failed grant-revoke apply mutates nothing");
+        assert_eq!(ctx.calls(), vec!["apply_grant_revoke"]);
         assert!(
             !doc.entries[&key].ingested_by.contains(SELF_ID),
             "entry left pending for retry"
@@ -2371,6 +2575,144 @@ mod tests {
             matching, 1,
             "exactly one shared-with-me-updated frame for the recorded grant's cid \
              (cardinality + idempotency — a single record must not double-emit); got {frames:?}"
+        );
+    }
+
+    /// ZEB-730 seed helper: install a `ReceivedFileGrant` on a seeded owner-state
+    /// with `granter_owner == granter` so `apply_grant_revoke`'s granter-of-record
+    /// authorization can be exercised without a full grant_push ingest.
+    async fn seed_received_grant(
+        crdt_state: &Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+        cid: [u8; 32],
+        granter: OwnerAddr,
+    ) {
+        let mut state = crdt_state.lock().await;
+        state.received_file_grants.insert(
+            cid,
+            crate::owner_state_types::ReceivedFileGrant {
+                granter_owner: granter,
+                cid,
+                file_name: "doc.pdf".into(),
+                file_size: 10,
+                mime: "application/pdf".into(),
+                sealed_dek: vec![1, 2, 3],
+                received_at: 100,
+            },
+        );
+    }
+
+    /// ZEB-730 (prod path): an AUTHORIZED grant-revoke (deposit sender ==
+    /// granter-of-record) applied through the PRODUCTION `apply_grant_revoke`
+    /// GCs the received-grant entry, stamps ZEB-727's tombstone, fires
+    /// `notify_owner_state_dirty` exactly once, and emits exactly one
+    /// `shared-with-me-updated` frame carrying the canonical lowercase-hex cid.
+    #[tokio::test]
+    async fn apply_grant_revoke_authorized_gcs_notifies_and_emits() {
+        let (ctx, crdt_state, dirty, _revoked, sink_handle) = prod_ctx_with_dirty_and_sink();
+
+        let granter = OwnerAddr([0xB0; 16]);
+        let cid = [0xC1u8; 32];
+        seed_received_grant(&crdt_state, cid, granter).await;
+
+        let entry = DmInboxEntry {
+            sender_owner: granter.0, // butler-verified sender == granter-of-record
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: Some(crate::butler_deposit::encode_grant_revoke(cid)),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+
+        ctx.apply_grant_revoke(&entry)
+            .await
+            .expect("an authorized grant-revoke applies");
+
+        {
+            let state = crdt_state.lock().await;
+            assert!(
+                !state.received_file_grants.contains_key(&cid),
+                "authorized revoke GCs the received-grant entry"
+            );
+            assert!(
+                state.dismissed_received_grants.contains_key(&cid),
+                "authorized revoke stamps the ZEB-727 dismiss tombstone"
+            );
+        }
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "an authorized revoke fires notify_owner_state_dirty exactly once"
+        );
+        let frames = sink_handle.frames();
+        let matching = frames
+            .iter()
+            .filter(|(name, payload)| {
+                name == "shared-with-me-updated"
+                    && payload["cid"] == serde_json::json!(hex::encode(cid))
+            })
+            .count();
+        assert_eq!(
+            matching, 1,
+            "exactly one shared-with-me-updated frame carrying the canonical \
+             lowercase-hex cid; got {frames:?}"
+        );
+    }
+
+    /// ZEB-730 SECURITY (prod path, griefing guard): a grant-revoke whose
+    /// butler-verified deposit sender is NOT the granter-of-record is a silent
+    /// no-op — entry intact, no tombstone, no notify, no emit — so no Active
+    /// friend can grief a grantee into losing a file they did not share. Returns
+    /// `Ok(())` (a dropped revoke is not an error).
+    #[tokio::test]
+    async fn apply_grant_revoke_unauthorized_is_noop() {
+        let (ctx, crdt_state, dirty, _revoked, sink_handle) = prod_ctx_with_dirty_and_sink();
+
+        let granter = OwnerAddr([0xB0; 16]);
+        let attacker = OwnerAddr([0x1A; 16]);
+        let cid = [0xC1u8; 32];
+        seed_received_grant(&crdt_state, cid, granter).await;
+
+        // Deposit sender is the attacker, NOT the granter-of-record.
+        let entry = DmInboxEntry {
+            sender_owner: attacker.0,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: Some(crate::butler_deposit::encode_grant_revoke(cid)),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+
+        ctx.apply_grant_revoke(&entry)
+            .await
+            .expect("a dropped (unauthorized) revoke is not an error");
+
+        {
+            let state = crdt_state.lock().await;
+            assert!(
+                state.received_file_grants.contains_key(&cid),
+                "the received grant is intact (griefing guard)"
+            );
+            assert!(
+                state.dismissed_received_grants.is_empty(),
+                "no tombstone minted from an unauthorized revoke"
+            );
+        }
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            0,
+            "no notify on an unauthorized revoke"
+        );
+        assert!(
+            sink_handle.frames().is_empty(),
+            "no shared-with-me-updated emit on an unauthorized revoke"
         );
     }
 
