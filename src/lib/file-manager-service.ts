@@ -11,6 +11,8 @@ import type {
   ContentCategory,
   IngestOptions,
   FileGrant,
+  ReceivedFile,
+  ReceivedGrantWire,
 } from './types';
 import {
   mockPrivateContent,
@@ -22,6 +24,16 @@ import {
 export interface ContentAnnouncementEvent {
   cid: string;
   sizeBytes: number;
+}
+
+/** Count received files strictly newer than `lastSeenMs` (the unread badge).
+ *  `null` (unresolved) → 0, so an in-flight/failed load never shows a badge. */
+export function unreadReceivedCount(
+  files: ReceivedFile[] | null,
+  lastSeenMs: number,
+): number {
+  if (!files) return 0;
+  return files.filter((f) => f.receivedAt > lastSeenMs).length;
 }
 
 /** Wire format returned by the ingest_content Tauri command. */
@@ -487,6 +499,32 @@ export class FileManagerService {
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(msg);
     }
+  }
+
+  /** ZEB-723: lists files others have shared with this user. Backend-only —
+   *  returns [] without a connected adapter (demo/test). A real IPC rejection
+   *  PROPAGATES (never swallowed to []) so the caller keeps the honest
+   *  unresolved (null) state on failure. */
+  async listReceivedGrants(): Promise<ReceivedFile[]> {
+    if (!this.adapter) return [];
+    const rows = (await this.adapter.invoke('list_received_grants')) as ReceivedGrantWire[];
+    return rows.map((r) => ({
+      cid: r.cid,
+      granterAddress: r.granterAddress,
+      granterDisplay: r.displayName ?? r.granterAddress,
+      fileName: r.fileName,
+      fileSize: r.fileSize,
+      mime: r.mime,
+      receivedAt: r.receivedAt,
+    }));
+  }
+
+  /** ZEB-723: download a shared file to disk. `export_content` fetches the
+   *  ciphertext from the network and decrypts via `received_file_grants`
+   *  (ZEB-674 T12) — the grantee read path is already complete. */
+  async exportReceived(cid: string, fileName: string): Promise<void> {
+    if (!this.adapter) return;
+    await this.adapter.invoke('export_content', { cid, fileName });
   }
 
   /** Clears the pinned flag on a content item. */

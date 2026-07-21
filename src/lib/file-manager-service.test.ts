@@ -1,7 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
-import { FileManagerService, inferCategory, type ContentAnnouncementEvent } from './file-manager-service';
+import {
+  FileManagerService,
+  inferCategory,
+  unreadReceivedCount,
+  type ContentAnnouncementEvent,
+} from './file-manager-service';
 import { createMockAdapter } from './test-utils';
-import type { FileGrant } from './types';
+import type { FileGrant, ReceivedFile } from './types';
 
 describe('FileManagerService', () => {
   it('constructs with default settings', () => {
@@ -749,5 +754,113 @@ describe('FileManagerService', () => {
     await svc.connectAdapter(adapter);
 
     await expect(svc.revokeRead('cidX', 'addrY')).rejects.toThrow('ineligible: grant not found');
+  });
+
+  // ── received grants (ZEB-723) ───────────────────────────────────────
+
+  const mkReceived = (cid: string, receivedAt: number): ReceivedFile => ({
+    cid,
+    granterAddress: 'aa',
+    granterDisplay: 'aa',
+    fileName: 'f',
+    fileSize: 1,
+    mime: 'text/plain',
+    receivedAt,
+  });
+
+  it('unreadReceivedCount counts files newer than lastSeen', () => {
+    const files = [mkReceived('a', 100), mkReceived('b', 200), mkReceived('c', 300)];
+    expect(unreadReceivedCount(files, 150)).toBe(2); // b, c
+    expect(unreadReceivedCount(files, 0)).toBe(3);
+    expect(unreadReceivedCount(files, 300)).toBe(0); // strictly-newer
+    expect(unreadReceivedCount([], 0)).toBe(0);
+    expect(unreadReceivedCount(null, 0)).toBe(0); // unresolved → no badge
+  });
+
+  it('listReceivedGrants maps the wire DTO', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      list_received_grants: [
+        {
+          cid: 'ab',
+          granterAddress: 'cd',
+          displayName: 'Alice',
+          fileName: 'q.pdf',
+          fileSize: 9,
+          mime: 'application/pdf',
+          receivedAt: 5,
+        },
+      ],
+    });
+    await svc.connectAdapter(adapter);
+
+    const rows = await svc.listReceivedGrants();
+
+    expect(rows).toEqual([
+      {
+        cid: 'ab',
+        granterAddress: 'cd',
+        granterDisplay: 'Alice',
+        fileName: 'q.pdf',
+        fileSize: 9,
+        mime: 'application/pdf',
+        receivedAt: 5,
+      },
+    ]);
+  });
+
+  it('listReceivedGrants falls back to the address when displayName is null', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      list_received_grants: [
+        {
+          cid: 'ab',
+          granterAddress: 'cd',
+          displayName: null,
+          fileName: 'q.pdf',
+          fileSize: 9,
+          mime: 'application/pdf',
+          receivedAt: 5,
+        },
+      ],
+    });
+    await svc.connectAdapter(adapter);
+
+    const rows = await svc.listReceivedGrants();
+
+    expect(rows[0].granterDisplay).toBe('cd');
+  });
+
+  it('listReceivedGrants propagates an IPC error (never swallows to [])', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      list_received_grants: () => Promise.reject(new Error('boom')),
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(svc.listReceivedGrants()).rejects.toThrow('boom');
+  });
+
+  it('listReceivedGrants returns [] without a connected adapter (demo/test)', async () => {
+    const svc = new FileManagerService();
+    await expect(svc.listReceivedGrants()).resolves.toEqual([]);
+  });
+
+  it('exportReceived invokes export_content with cid and fileName', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+
+    await svc.exportReceived('cid-x', 'file.pdf');
+
+    expect(adapter.invoke).toHaveBeenCalledWith('export_content', { cid: 'cid-x', fileName: 'file.pdf' });
+  });
+
+  it('exportReceived is a no-op without adapter', async () => {
+    const svc = new FileManagerService();
+    await expect(svc.exportReceived('cid-x', 'file.pdf')).resolves.toBeUndefined();
   });
 });
