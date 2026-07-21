@@ -3,7 +3,7 @@
 //! Each command is a thin wrapper around [`crate::recovery_cli`] helpers.
 //! The actual logic lives in `recovery_cli` so it can be tested without a
 //! live Tauri runtime. Commands delegate to `*_helper` functions that take
-//! a `plaintext_path` argument; tests call the helpers directly.
+//! a `identity_path` argument; tests call the helpers directly.
 //!
 //! Tauri commands wrap each helper in [`tokio::task::spawn_blocking`] —
 //! the helpers do file I/O, Argon2id KDF, and XChaCha20-Poly1305 work that
@@ -219,10 +219,10 @@ fn read_recovery_file(path: &Path) -> Result<Vec<u8>, String> {
 /// `read_seed_from_disk_with_keychain` with the same chain). Tests inject
 /// `None` to stay hermetic.
 pub fn current_identity_hash_helper(
-    plaintext_path: &Path,
+    identity_path: &Path,
     keychain: Option<KeychainStore>,
 ) -> Result<String, String> {
-    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    let seed = identity::read_seed_from_disk_with_keychain(identity_path, keychain)?;
     use harmony_owner::lifecycle::RecoveryArtifact;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
@@ -238,11 +238,11 @@ pub fn current_identity_hash_helper(
 /// Threads `keychain` through to match the running node's identity-resolution
 /// chain. Tests inject `None`.
 pub fn export_mnemonic_words_helper(
-    plaintext_path: &Path,
+    identity_path: &Path,
     keychain: Option<KeychainStore>,
 ) -> Result<Vec<String>, String> {
     let (words, _id_hash) =
-        recovery_cli::export_mnemonic_words_with_keychain(plaintext_path, keychain)?;
+        recovery_cli::export_mnemonic_words_with_keychain(identity_path, keychain)?;
     Ok(words)
 }
 
@@ -328,7 +328,7 @@ pub fn preview_recovery_file_helper(
 /// `secrecy::SecretString` also zeroizes the heap allocation on drop,
 /// which a `String` env var does not.
 pub fn export_recovery_file_to_path_helper(
-    plaintext_path: &Path,
+    identity_path: &Path,
     out_path: &Path,
     passphrase: &str,
     comment: Option<String>,
@@ -350,17 +350,17 @@ pub fn export_recovery_file_to_path_helper(
     }
 
     // The harmony dir hosts the owner-state CRDT and the last_backup.json
-    // metadata file. Production wires plaintext_path = <harmony>/identity.key,
-    // so plaintext_path.parent() is the harmony dir. Mirrors the CLI helper
+    // metadata file. Production wires identity_path = <harmony>/identity.key,
+    // so identity_path.parent() is the harmony dir. Mirrors the CLI helper
     // `export_recovery_file_cli`.
-    let harmony_dir = plaintext_path
+    let harmony_dir = identity_path
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     let pass = SecretString::from(passphrase.to_string());
     recovery_cli::export_recovery_file_pair_with_keychain(
-        plaintext_path,
+        identity_path,
         &harmony_dir,
         out_path,
         comment.as_deref(),
@@ -378,13 +378,13 @@ pub fn export_recovery_file_to_path_helper(
 /// `TypeToConfirmDialog` and received explicit acknowledgement that the current
 /// identity will be overwritten.
 pub fn restore_mnemonic_from_words_helper(
-    plaintext_path: &Path,
+    identity_path: &Path,
     words: &[String],
     keychain: Option<KeychainStore>,
 ) -> Result<String, String> {
     // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
     recovery_cli::restore_mnemonic_from_words_with_keychain(
-        plaintext_path,
+        identity_path,
         words,
         /*force=*/ true,
         keychain,
@@ -449,7 +449,7 @@ pub fn restore_mnemonic_from_words_helper(
 ///   partial-success per `metadata-before-irreversible-write`. Round-1
 ///   bot finding C3.
 pub fn restore_recovery_from_preview_token_helper(
-    plaintext_path: &Path,
+    identity_path: &Path,
     preview_token: &str,
     ignore_state: bool,
     keychain: Option<KeychainStore>,
@@ -470,7 +470,7 @@ pub fn restore_recovery_from_preview_token_helper(
     //
     // Decoded snapshot stash for the post-identity-write step. `None`
     // when ignore_state is true or no sidecar exists.
-    let harmony_dir = plaintext_path
+    let harmony_dir = identity_path
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -502,7 +502,7 @@ pub fn restore_recovery_from_preview_token_helper(
     // All sidecar metadata is verified — now safe to write identity.
     // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
     identity::write_seed_to_disk_with_keychain(
-        plaintext_path,
+        identity_path,
         &seed,
         /*force=*/ true,
         keychain,
@@ -550,16 +550,16 @@ where
 /// Return the 32-char hex identity hash of the current on-disk identity.
 #[tauri::command]
 pub async fn current_identity_hash() -> Result<String, String> {
-    let plaintext_path = identity::resolve_path(None)?;
-    run_blocking(move || current_identity_hash_helper(&plaintext_path, KeychainStore::new().ok()))
+    let identity_path = identity::resolve_path(None)?;
+    run_blocking(move || current_identity_hash_helper(&identity_path, KeychainStore::new().ok()))
         .await
 }
 
 /// Return the 24 BIP39 mnemonic words for the backup wizard.
 #[tauri::command]
 pub async fn export_mnemonic_words() -> Result<Vec<String>, String> {
-    let plaintext_path = identity::resolve_path(None)?;
-    run_blocking(move || export_mnemonic_words_helper(&plaintext_path, KeychainStore::new().ok()))
+    let identity_path = identity::resolve_path(None)?;
+    run_blocking(move || export_mnemonic_words_helper(&identity_path, KeychainStore::new().ok()))
         .await
 }
 
@@ -631,7 +631,7 @@ pub async fn export_recovery_file_to_path(
             "Recovery passphrase must be at least {MIN_RECOVERY_PASSPHRASE_LEN} characters."
         ));
     }
-    let plaintext_path = identity::resolve_path(None)?;
+    let identity_path = identity::resolve_path(None)?;
     // Validate comment length BEFORE consuming the single-use path token.
     // Otherwise a too-long comment burns the token and forces the user
     // to re-pick a save path for a purely local validation error.
@@ -653,7 +653,7 @@ pub async fn export_recovery_file_to_path(
             "Save path token expired or invalid. Please re-trigger backup.".to_string()
         })?;
         let result = export_recovery_file_to_path_helper(
-            &plaintext_path,
+            &identity_path,
             &out_path,
             &passphrase,
             comment,
@@ -702,9 +702,9 @@ pub async fn restore_mnemonic_from_words(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<String, String> {
     require_node_stopped(&state)?;
-    let plaintext_path = identity::resolve_path(None)?;
+    let identity_path = identity::resolve_path(None)?;
     run_blocking(move || {
-        restore_mnemonic_from_words_helper(&plaintext_path, &words, KeychainStore::new().ok())
+        restore_mnemonic_from_words_helper(&identity_path, &words, KeychainStore::new().ok())
     })
     .await
 }
@@ -731,10 +731,10 @@ pub async fn restore_recovery_from_preview_token(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<RestoreInfo, String> {
     require_node_stopped(&state)?;
-    let plaintext_path = identity::resolve_path(None)?;
+    let identity_path = identity::resolve_path(None)?;
     run_blocking(move || {
         restore_recovery_from_preview_token_helper(
-            &plaintext_path,
+            &identity_path,
             &preview_token,
             ignore_state,
             KeychainStore::new().ok(),
@@ -752,14 +752,9 @@ mod tests {
     use harmony_owner::recovery::RecoveryMetadata;
     use serial_test::serial;
 
-    fn plant_seed(plaintext_path: &Path, seed: &[u8; 32]) {
-        identity::write_seed_to_disk_with_keychain(
-            plaintext_path,
-            seed,
-            /*force=*/ true,
-            None,
-        )
-        .expect("plant");
+    fn plant_seed(identity_path: &Path, seed: &[u8; 32]) {
+        identity::write_seed_to_disk_with_keychain(identity_path, seed, /*force=*/ true, None)
+            .expect("plant");
     }
 
     // ── current_identity_hash_helper ─────────────────────────────────────
@@ -768,12 +763,12 @@ mod tests {
     #[serial]
     fn current_identity_hash_returns_32_hex_chars() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
 
         std::env::set_var("HARMONY_PASSPHRASE", "cih-test");
-        plant_seed(&plaintext_path, &[0x11u8; 32]);
+        plant_seed(&identity_path, &[0x11u8; 32]);
 
-        let hash = current_identity_hash_helper(&plaintext_path, None).expect("hash");
+        let hash = current_identity_hash_helper(&identity_path, None).expect("hash");
         // identity_hash() is [u8; 16] → 32 hex characters.
         assert_eq!(hash.len(), 32, "identity hash is 16 bytes → 32 hex chars");
         assert!(
@@ -788,18 +783,18 @@ mod tests {
     #[serial]
     fn current_identity_hash_matches_artifact() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
 
         std::env::set_var("HARMONY_PASSPHRASE", "cih-match");
         let seed = [0x22u8; 32];
-        plant_seed(&plaintext_path, &seed);
+        plant_seed(&identity_path, &seed);
 
         let expected = hex::encode(
             RecoveryArtifact::from_seed(seed)
                 .master_pubkey_bundle()
                 .identity_hash(),
         );
-        let got = current_identity_hash_helper(&plaintext_path, None).expect("hash");
+        let got = current_identity_hash_helper(&identity_path, None).expect("hash");
         assert_eq!(got, expected);
 
         std::env::remove_var("HARMONY_PASSPHRASE");
@@ -811,12 +806,12 @@ mod tests {
     #[serial]
     fn export_mnemonic_words_helper_returns_24_words() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
 
         std::env::set_var("HARMONY_PASSPHRASE", "emw-test");
-        plant_seed(&plaintext_path, &[0x33u8; 32]);
+        plant_seed(&identity_path, &[0x33u8; 32]);
 
-        let words = export_mnemonic_words_helper(&plaintext_path, None).expect("words");
+        let words = export_mnemonic_words_helper(&identity_path, None).expect("words");
         assert_eq!(words.len(), 24, "BIP39-24 produces exactly 24 words");
         for w in &words {
             assert!(
@@ -929,12 +924,12 @@ mod tests {
     #[serial]
     fn preview_failure_issues_no_token_and_leaves_identity_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
 
         std::env::set_var("HARMONY_PASSPHRASE", "preview-fail-test");
-        plant_seed(&plaintext_path, &[0xC1u8; 32]);
+        plant_seed(&identity_path, &[0xC1u8; 32]);
 
-        let enc_path = plaintext_path.with_file_name("identity.enc");
+        let enc_path = identity_path.with_file_name("identity.enc");
         let original_enc = std::fs::read(&enc_path).expect("read original enc");
 
         // Sub-case 1: missing recovery file — preview returns Err.
@@ -961,7 +956,7 @@ mod tests {
         assert!(!err.is_empty(), "error must be non-empty; got: {err}");
 
         // Identity bytes are byte-for-byte identical to before the call —
-        // preview never touches plaintext_path.
+        // preview never touches identity_path.
         let after_enc = std::fs::read(&enc_path).expect("read after enc");
         assert_eq!(
             original_enc, after_enc,
@@ -1017,15 +1012,15 @@ mod tests {
     #[serial]
     fn export_recovery_file_rejects_oversized_comment() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let recovery_path = dir.path().join("rec.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "comment-cap-test");
-        plant_seed(&plaintext_path, &[0xC0u8; 32]);
+        plant_seed(&identity_path, &[0xC0u8; 32]);
 
         let too_long = "x".repeat(MAX_RECOVERY_COMMENT_BYTES + 1);
         let err = export_recovery_file_to_path_helper(
-            &plaintext_path,
+            &identity_path,
             &recovery_path,
             "any-pass",
             Some(too_long),
@@ -1045,7 +1040,7 @@ mod tests {
         // Boundary: exactly the cap is accepted.
         let max_ok = "x".repeat(MAX_RECOVERY_COMMENT_BYTES);
         export_recovery_file_to_path_helper(
-            &plaintext_path,
+            &identity_path,
             &recovery_path,
             "any-pass",
             Some(max_ok),
@@ -1181,11 +1176,11 @@ mod tests {
         use secrecy::SecretString;
 
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let recovery_path = dir.path().join("rec.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "swap-test");
-        plant_seed(&plaintext_path, &[0xA1u8; 32]);
+        plant_seed(&identity_path, &[0xA1u8; 32]);
         clear_preview_cache();
 
         // Backup A — the one the user picks, previews, and confirms.
@@ -1217,7 +1212,7 @@ mod tests {
         // ignore_state=true skips the sidecar (none exists here anyway —
         // this test pins identity TOCTOU, not sidecar TOCTOU).
         let info = restore_recovery_from_preview_token_helper(
-            &plaintext_path,
+            &identity_path,
             &preview.preview_token,
             /*ignore_state=*/ true,
             None,
@@ -1230,7 +1225,7 @@ mod tests {
 
         // Step 4: verify the on-disk seed is A's, not B's.
         let on_disk =
-            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).expect("read seed");
+            identity::read_seed_from_disk_with_keychain(&identity_path, None).expect("read seed");
         assert_eq!(
             *on_disk, seed_a,
             "on-disk seed must be A (previewed), not B (current file contents)"
@@ -1252,11 +1247,11 @@ mod tests {
         use secrecy::SecretString;
 
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let recovery_path = dir.path().join("rec.bin");
 
         std::env::set_var("HARMONY_PASSPHRASE", "single-use-test");
-        plant_seed(&plaintext_path, &[0xC2u8; 32]);
+        plant_seed(&identity_path, &[0xC2u8; 32]);
         clear_preview_cache();
 
         let artifact = RecoveryArtifact::from_seed([0xCCu8; 32]);
@@ -1269,7 +1264,7 @@ mod tests {
         let preview = preview_recovery_file_helper(&recovery_path, "pass").expect("preview");
         // First commit: succeeds.
         restore_recovery_from_preview_token_helper(
-            &plaintext_path,
+            &identity_path,
             &preview.preview_token,
             /*ignore_state=*/ true,
             None,
@@ -1277,7 +1272,7 @@ mod tests {
         .expect("first commit");
         // Second commit with the SAME token: fails — the entry was consumed.
         let err = restore_recovery_from_preview_token_helper(
-            &plaintext_path,
+            &identity_path,
             &preview.preview_token,
             /*ignore_state=*/ true,
             None,
@@ -1296,19 +1291,19 @@ mod tests {
     #[serial]
     fn token_commit_rejects_unknown_token() {
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
 
         std::env::set_var("HARMONY_PASSPHRASE", "unknown-token-test");
-        plant_seed(&plaintext_path, &[0xD3u8; 32]);
+        plant_seed(&identity_path, &[0xD3u8; 32]);
         clear_preview_cache();
 
-        let enc_path = plaintext_path.with_file_name("identity.enc");
+        let enc_path = identity_path.with_file_name("identity.enc");
         let original_enc = std::fs::read(&enc_path).expect("read original enc");
 
         // Random UUID that was never issued.
         let bogus = Uuid::new_v4().to_string();
         let err = restore_recovery_from_preview_token_helper(
-            &plaintext_path,
+            &identity_path,
             &bogus,
             /*ignore_state=*/ true,
             None,
@@ -1325,7 +1320,7 @@ mod tests {
 
         // Non-UUID garbage is also rejected.
         let err = restore_recovery_from_preview_token_helper(
-            &plaintext_path,
+            &identity_path,
             "not-a-uuid",
             /*ignore_state=*/ true,
             None,
@@ -1364,18 +1359,18 @@ mod tests {
         use secrecy::SecretString;
 
         let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
+        let identity_path = dir.path().join("identity.key");
         let recovery_path = dir.path().join("rec.bin");
         let sidecar_path = recovery_cli::sidecar_path(&recovery_path);
-        let harmony_dir = plaintext_path.parent().unwrap();
+        let harmony_dir = identity_path.parent().unwrap();
         let state_path = recovery_cli::owner_state_path(harmony_dir);
 
         std::env::set_var("HARMONY_PASSPHRASE", "addr-mismatch-test");
 
         // Plant identity B (this is what's on disk before the restore attempt).
         let seed_b = [0xBBu8; 32];
-        plant_seed(&plaintext_path, &seed_b);
-        let enc_path = plaintext_path.with_file_name("identity.enc");
+        plant_seed(&identity_path, &seed_b);
+        let enc_path = identity_path.with_file_name("identity.enc");
         let identity_b_bytes = std::fs::read(&enc_path).expect("read identity B");
 
         // Sanity: no owner-state file at start.
@@ -1417,7 +1412,7 @@ mod tests {
         // Commit by token. The sidecar's `oa` is B's, the cached seed is
         // A's → addr-binding mismatch. Must fail BEFORE writing identity.
         let err = restore_recovery_from_preview_token_helper(
-            &plaintext_path,
+            &identity_path,
             &preview.preview_token,
             /*ignore_state=*/ false,
             None,
