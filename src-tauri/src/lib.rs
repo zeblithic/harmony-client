@@ -19778,11 +19778,88 @@ async fn set_replication_tier(
     Ok(updated as u32)
 }
 
+/// ZEB-674 Task 12 (Gap B): personal-file decrypt-on-read core.
+///
+/// Given the raw bytes just fetched for `cid`, return the PLAINTEXT when this
+/// node holds a per-file DEK for the CID — the owner's own file (`file_deks`)
+/// is consulted FIRST, else a file shared with us (`received_file_grants`).
+/// Both maps store the DEK sealed under this node's shared `KeyTree`, so
+/// [`file_sharing::open_dek_at_rest`] unseals it and
+/// [`community_state_sync::decrypt_blob`] reverses the whole-blob encrypt done
+/// at ingest ([`ingest_content_encrypted_inner`]).
+///
+/// Pass-through (returns `bytes` unchanged) for:
+/// - a PUBLIC CID (encrypted flag clear) — no decrypt is attempted; and
+/// - an encrypted CID for which NO personal DEK is held. Community/space
+///   artifacts also carry the encrypted flag but decrypt via their own
+///   epoch-key path elsewhere (`decrypt_and_verify_artifact` +
+///   `current_epoch_key_for`); the "no DEK ⇒ return bytes" branch guarantees
+///   they keep flowing through this path unchanged.
+pub fn decrypt_personal_file_if_held(
+    bytes: Vec<u8>,
+    cid: harmony_content::cid::ContentId,
+    state: &crate::owner_state_crdt::OwnerState,
+    keytree: &crate::owner_state_crypto::KeyTree,
+) -> Result<Vec<u8>, String> {
+    if !cid.flags().encrypted {
+        return Ok(bytes);
+    }
+    let key = cid.to_bytes();
+    let sealed = state
+        .file_deks
+        .get(&key)
+        .or_else(|| state.received_file_grants.get(&key).map(|g| &g.sealed_dek));
+    let Some(sealed) = sealed else {
+        // Encrypted, but not a personal file we hold a DEK for — leave the
+        // fetched bytes untouched so the community/space epoch-key path is
+        // undisturbed.
+        return Ok(bytes);
+    };
+    let dek = crate::file_sharing::open_dek_at_rest(keytree, sealed)
+        .map_err(|e| format!("unseal personal file DEK: {e:?}"))?;
+    crate::community_state_sync::decrypt_blob(&dek, &bytes)
+        .map_err(|e| format!("decrypt personal file: {e:?}"))
+}
+
+/// ZEB-674 Task 12: snapshot the owner handles off `NodeState` and apply the
+/// personal-file decrypt (see [`decrypt_personal_file_if_held`]) to bytes just
+/// fetched for `cid_hex`. Returns the fetched `bytes` unchanged when the CID is
+/// public, malformed, when no owner is loaded (pre-mint), or when no personal
+/// DEK is held — so it never turns a successful fetch into a read error.
+async fn maybe_decrypt_personal_file(
+    state: &Mutex<NodeState>,
+    cid_hex: &str,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    // A non-32-byte / malformed CID can't be an encrypted personal file; the
+    // fetch already succeeded, so never surface a parse quirk as a read error.
+    let Ok(cid_bytes) = parse_cid_hex(cid_hex) else {
+        return Ok(bytes);
+    };
+    let cid = harmony_content::cid::ContentId::from_bytes(cid_bytes);
+    if !cid.flags().encrypted {
+        return Ok(bytes);
+    }
+    // Snapshot the owner handles under the std lock, then drop it before the
+    // async crdt lock. Pre-mint (`None`) ⇒ nothing to decrypt with, pass through.
+    let (crdt_state, keytree) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        match (guard.crdt_state.clone(), guard.owner_keytree.clone()) {
+            (Some(c), Some(k)) => (c, k),
+            _ => return Ok(bytes),
+        }
+    };
+    let st = crdt_state.lock().await;
+    decrypt_personal_file_if_held(bytes, cid, &st, &keytree)
+}
+
 /// Export content to the local filesystem via a save dialog.
 ///
 /// Fetches the raw bytes for `cid` through the Zenoh content transport,
 /// opens a native save-file dialog with `file_name` as the suggested name,
-/// and writes the bytes to the chosen path.
+/// and writes the bytes to the chosen path. Encrypted personal files (created
+/// via `ingest_content_encrypted`) are decrypted to plaintext before the write
+/// when this node holds the file's DEK (ZEB-674 T12).
 #[tauri::command]
 async fn export_content(
     app: tauri::AppHandle,
@@ -19809,7 +19886,7 @@ async fn export_content(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     fetch_tx
         .send(event_loop::FetchRequest {
-            cid_hex: cid,
+            cid_hex: cid.clone(),
             reply: reply_tx,
             max_bytes: None,
             serveable: false,
@@ -19820,6 +19897,10 @@ async fn export_content(
     let bytes = reply_rx
         .await
         .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    // 1b. ZEB-674 T12: if this is an encrypted personal file we hold a DEK for,
+    // decrypt to plaintext before writing; otherwise the bytes are unchanged.
+    let bytes = maybe_decrypt_personal_file(state.inner(), &cid, bytes).await?;
 
     // 2. Open a native save-file dialog.
     let (path_tx, path_rx) = tokio::sync::oneshot::channel();
@@ -23841,7 +23922,7 @@ async fn fetch_content(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     fetch_tx
         .send(event_loop::FetchRequest {
-            cid_hex: cid,
+            cid_hex: cid.clone(),
             reply: reply_tx,
             max_bytes: None,
             serveable: false,
@@ -23849,9 +23930,13 @@ async fn fetch_content(
         .await
         .map_err(|_| "event loop not running".to_string())?;
 
-    reply_rx
+    let bytes = reply_rx
         .await
-        .map_err(|_| "event loop dropped fetch request".to_string())?
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    // ZEB-674 T12: decrypt an encrypted personal file to plaintext when this
+    // node holds its DEK; public / non-personal CIDs pass through unchanged.
+    maybe_decrypt_personal_file(state.inner(), &cid, bytes).await
 }
 
 /// ZEB-344: avatar-semantic CAS fetch. Identical to `fetch_content` but caps the

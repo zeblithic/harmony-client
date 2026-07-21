@@ -21,6 +21,8 @@ use harmony_app::content_index::ContentIndex;
 use harmony_app::event_loop::IngestRequest;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_crypto::KeyTree;
+use harmony_app::owner_state_types::{OwnerAddr, ReceivedFileGrant};
+use harmony_content::cid::{ContentFlags, ContentId};
 
 /// Records each ingested `(cid_hex, bytes)` — a stand-in content store.
 type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
@@ -153,6 +155,140 @@ async fn sealed_dek_at_rest_is_not_plaintext() {
         sealed.len(),
         60,
         "sealed DEK blob is nonce(12)+ct(32)+tag(16)"
+    );
+}
+
+/// ZEB-674 Task 12 (Gap B): the READ path. After the encrypted-file ingest
+/// stores the ciphertext + sealed DEK, a fetch of that CID must return the
+/// ORIGINAL PLAINTEXT once `decrypt_personal_file_if_held` runs — the exact
+/// decrypt `export_content`/`fetch_content` now apply to the fetched bytes.
+#[tokio::test]
+async fn owner_encrypted_file_decrypts_to_plaintext() {
+    let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+    let content_index = fresh_content_index();
+    let (ingest_tx, store) = spawn_recording_store();
+
+    let plaintext = b"ZEB-674 T12 owner read path".to_vec();
+
+    let result = harmony_app::ingest_content_encrypted_inner(
+        &ingest_tx,
+        &content_index,
+        &crdt_state,
+        &keytree,
+        None,
+        plaintext.clone(),
+        "secret.txt".to_string(),
+    )
+    .await
+    .expect("encrypted ingest succeeds");
+
+    let cid = root_cid_from_hex(&result.cid);
+    // Single-chunk ⇒ exactly one leaf whose bytes are the whole ciphertext (the
+    // bytes a fetch of this CID would return before decrypt).
+    let ciphertext = {
+        let s = store.lock().unwrap();
+        assert_eq!(s.len(), 1, "single-chunk ingest emits exactly one leaf");
+        s.values().next().unwrap().clone()
+    };
+    assert_ne!(
+        ciphertext, plaintext,
+        "fetched bytes are ciphertext pre-decrypt"
+    );
+
+    let recovered = {
+        let st = crdt_state.lock().await;
+        harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &st, &keytree)
+            .expect("owner's file_deks DEK decrypts the fetched bytes")
+    };
+    assert_eq!(
+        recovered, plaintext,
+        "decrypt-on-read must return the original plaintext byte-for-byte"
+    );
+}
+
+/// A PUBLIC (unencrypted-flag) CID is never decrypted: the fetched bytes pass
+/// through byte-identical, even with a loaded owner + keytree. Guards against
+/// the personal-file decrypt engaging for non-encrypted content.
+#[test]
+fn public_file_passes_through_unchanged() {
+    let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
+    let state = OwnerState::default();
+
+    let bytes = b"arbitrary public bytes, not ciphertext".to_vec();
+    // A public CID: default flags ⇒ encrypted bit clear.
+    let public_cid = ContentId::for_book(&bytes, ContentFlags::default()).expect("public cid");
+    assert!(!public_cid.flags().encrypted, "sanity: CID is public");
+
+    let out =
+        harmony_app::decrypt_personal_file_if_held(bytes.clone(), public_cid, &state, &keytree)
+            .expect("public pass-through never errors");
+    assert_eq!(out, bytes, "public file bytes must be returned unchanged");
+}
+
+/// A file whose DEK lives in `received_file_grants` (shared WITH us, not our
+/// own) also decrypts on read. Proves the second lookup branch: `file_deks` is
+/// empty, the sealed DEK is only in the grant map.
+#[tokio::test]
+async fn received_grant_file_decrypts_to_plaintext() {
+    let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
+    let owner_state = Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+    let content_index = fresh_content_index();
+    let (ingest_tx, store) = spawn_recording_store();
+
+    let plaintext = b"ZEB-674 T12 grantee read path".to_vec();
+
+    let result = harmony_app::ingest_content_encrypted_inner(
+        &ingest_tx,
+        &content_index,
+        &owner_state,
+        &keytree,
+        None,
+        plaintext.clone(),
+        "shared.txt".to_string(),
+    )
+    .await
+    .expect("encrypted ingest succeeds");
+
+    let cid = root_cid_from_hex(&result.cid);
+    let ciphertext = {
+        let s = store.lock().unwrap();
+        s.values().next().unwrap().clone()
+    };
+    // The DEK the owner sealed under the shared KeyTree; a grantee on the same
+    // shared KeyTree opens it identically (open_received_file contract).
+    let sealed_dek = {
+        let st = owner_state.lock().await;
+        st.file_deks
+            .get(&cid.to_bytes())
+            .cloned()
+            .expect("sealed DEK")
+    };
+
+    // Grantee state: file_deks EMPTY, DEK only in received_file_grants.
+    let mut grantee = OwnerState::default();
+    grantee.received_file_grants.insert(
+        cid.to_bytes(),
+        ReceivedFileGrant {
+            granter_owner: OwnerAddr([0u8; 16]),
+            cid: cid.to_bytes(),
+            file_name: "shared.txt".to_string(),
+            file_size: ciphertext.len() as u64,
+            mime: "application/octet-stream".to_string(),
+            sealed_dek,
+            received_at: 0,
+        },
+    );
+    assert!(
+        grantee.file_deks.is_empty(),
+        "grantee owns no file_deks entry"
+    );
+
+    let recovered = harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &grantee, &keytree)
+        .expect("received_file_grants DEK decrypts the fetched bytes");
+    assert_eq!(
+        recovered, plaintext,
+        "grantee decrypt-on-read must return the original plaintext"
     );
 }
 
