@@ -52,6 +52,20 @@ pub struct DmInboxEntry {
         with = "serde_bytes"
     )]
     pub revocation_push: Option<Vec<u8>>,
+    /// ZEB-674 (C4): opaque `grant_push` wire value (canonical CBOR of
+    /// `Vec<serde_bytes Vec<u8>>` — the per-device sealed
+    /// [`crate::file_sharing::FileGrantInner`] blobs), carried through from the
+    /// sealed `DepositPayload` by the butler acceptor. Applied on recover via
+    /// `file_sharing::ingest_grant_push`. `None` for message / invite /
+    /// revocation / legacy deposits. Symmetric to the other optional
+    /// sub-payloads (`cn`/`iv`/`rp`); backward-compatible since absent → `None`.
+    #[serde(
+        rename = "gp",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub grant_push: Option<Vec<u8>>,
     #[serde(rename = "da")]
     pub deposited_at: Hlc,
     /// SP1 device_id (64-hex).
@@ -98,6 +112,23 @@ impl DmInboxDoc {
             "revoke:{}:{}",
             hex::encode(revoked_owner),
             hex::encode(revoked_target)
+        )
+    }
+
+    /// ZEB-674 (C4): deposit key for a standalone file-share grant entry (no
+    /// message, no invite, no revocation). Keyed by the depositing granter's
+    /// owner + a blake3 hash of the opaque `grant_push` bytes, so re-depositing
+    /// the SAME grant is idempotent (one entry per distinct grant payload) while
+    /// two grants from the same granter (different files, or a re-seal to a
+    /// changed device set) get distinct keys. The literal `grant` first segment
+    /// can never be 32 hex chars, so it cannot collide with a message key
+    /// (`{space_hex}:{cid_hex}`), an invite key (`{space_hex}:invite`), or a
+    /// revoke key (`revoke:...`).
+    pub fn grant_key(granter_owner: &[u8; 16], grant_push: &[u8]) -> String {
+        format!(
+            "grant:{}:{}",
+            hex::encode(granter_owner),
+            hex::encode(blake3::hash(grant_push).as_bytes())
         )
     }
 
@@ -184,6 +215,7 @@ mod tests {
             storage_blob: vec![4, 5, 6],
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
             deposited_at: at,
             deposited_by: by.into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),
@@ -409,6 +441,7 @@ mod tests {
             storage_blob: Vec::new(),
             invite_packet: None,
             revocation_push: Some(vec![0x05, 0xAA, 0xBB]),
+            grant_push: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -420,5 +453,62 @@ mod tests {
         let bytes = canonical_cbor_encode(&e).unwrap();
         let back: DmInboxEntry = canonical_cbor_decode(&bytes).unwrap();
         assert_eq!(back.revocation_push, Some(vec![0x05, 0xAA, 0xBB]));
+    }
+
+    /// ZEB-674 (C4): a standalone file-share grant entry carries `grant_push`
+    /// ALONE (no message / invite / revocation). The field must survive the
+    /// canonical-CBOR round-trip (skip_serializing_if omits `gp` when `None`;
+    /// absent → `None` via default) and merge into a sibling doc insert-once,
+    /// exactly like its optional-sub-payload siblings.
+    #[test]
+    fn dm_inbox_entry_grant_push_merge_persist() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+        let mut e = entry(hlc(1, "A"), "dev-a", &["dev-1"]);
+        e.cidnotify_packet = None;
+        e.storage_blob = Vec::new();
+        e.grant_push = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // Persist round-trip: `grant_push` survives canonical CBOR.
+        let mut d = DmInboxDoc::default();
+        let k = DmInboxDoc::grant_key(&[7u8; 16], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        d.entries.insert(k.clone(), e.clone());
+        let bytes = canonical_cbor_encode(&d).expect("encode");
+        let back: DmInboxDoc = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(back, d, "grant entry round-trips through canonical CBOR");
+        assert_eq!(
+            back.entries[&k].grant_push,
+            Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            "grant_push preserved verbatim"
+        );
+
+        // Merge into an empty sibling: insert-once carries `grant_push` through
+        // (first-writer-wins, like `revocation_push`), and re-merge is a no-op.
+        let mut sibling = DmInboxDoc::default();
+        let out = sibling.merge_from(d.clone());
+        assert!(out.changed, "new grant entry flags changed");
+        assert_eq!(
+            sibling.entries[&k].grant_push,
+            Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            "merged sibling holds the grant payload"
+        );
+        let out = sibling.merge_from(d.clone());
+        assert!(
+            !out.changed,
+            "re-merge of the identical grant entry is a no-op"
+        );
+    }
+
+    /// A grant key can't alias a message / invite / revoke key.
+    #[test]
+    fn grant_key_de_collides_with_other_keys() {
+        let owner = [0x33; 16];
+        let gp = [0xAB, 0xCD, 0xEF];
+        let grant = DmInboxDoc::grant_key(&owner, &gp);
+        assert!(grant.starts_with("grant:"));
+        assert_ne!(grant, DmInboxDoc::key(&[0x33; 16], &[0xCD; 32]));
+        assert_ne!(grant, DmInboxDoc::invite_key(&[0x33; 16]));
+        assert_ne!(grant, DmInboxDoc::revoke_key(&owner, &[0x22; 16]));
+        // Distinct grant payloads from the same granter get distinct keys.
+        assert_ne!(grant, DmInboxDoc::grant_key(&owner, &[0x01, 0x02]));
     }
 }

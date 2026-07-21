@@ -66,6 +66,18 @@ pub const INVITE_ONLY_DEPOSIT_MARKER: &[u8] = b"zeb505-invite-only";
 /// binds the ack to this value for a `revocation_push` request.
 pub const REVOCATION_DEPOSIT_MARKER: &[u8] = b"zeb691-revocation";
 
+/// ZEB-674 (C4): ack marker returned for a standalone file-share grant deposit
+/// (no message CID). Mirrors `INVITE_ONLY_DEPOSIT_MARKER` / `REVOCATION_DEPOSIT_MARKER`;
+/// the sender binds the ack to this value for a `grant_push` request.
+pub const GRANT_DEPOSIT_MARKER: &[u8] = b"zeb674-file-grant";
+
+/// ZEB-674 (C4): per-deposit cap on the piggybacked `grant_push` bytes. A grant
+/// carries one sealed `FileGrantInner` (~200 B) per grantee device; 64 KiB is a
+/// generous ceiling (hundreds of devices) that still bars a malicious sender
+/// from inflating butler/relay storage via the grant field, well under the
+/// [`DEPOSIT_MAX_FRAME_BYTES`] whole-frame cap.
+pub const MAX_DEPOSIT_GRANT_BYTES: usize = 64 * 1024;
+
 /// Maximum number of [`crate::reachability_record::ButlerSetEntry`]s carried
 /// in the pkarr routing blob's butler set (spec §3: ordered priority list,
 /// max 2 in v1). Readers truncate anything longer (defence against oversized
