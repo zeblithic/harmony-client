@@ -88,7 +88,7 @@
   import { ChannelNavSyncService } from './lib/channel-nav-sync';
   import { AvatarResolver } from './lib/avatar-resolver';
   import { ProfilePageResolver } from './lib/profile-page-resolver';
-  import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
+  import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation, FileGrant } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder, resolveChannelSelection } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
@@ -2708,6 +2708,19 @@
         console.warn('[harmony-client] recovery alerter init failed:', e);
       }
 
+      // ── ZEB-674 C5: refresh the ShareList when a grant/revoke lands —
+      // fleet-synced `file_grants` means another of the owner's own devices
+      // (or this device's own grant_read/revoke_read round-trip) can emit
+      // this. Only refetches when the emitted cid matches the currently
+      // selected file; otherwise a background grant on an unrelated file
+      // would needlessly re-query.
+      const unlistenGrantsUpdated = await listen('grants-updated', (event) => {
+        const payload = (event as { payload: { cid?: string } }).payload;
+        if (!payload?.cid || !selectedFileCid || payload.cid !== selectedFileCid) return;
+        void refreshFileGrants(selectedFileCid);
+      });
+      fileManagerService.addUnlisten(unlistenGrantsUpdated);
+
       // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
       // The backend emits these once per call-state transition; route each into
       // the CallSession state machine (built lazily in buildVoiceSession, so
@@ -2982,6 +2995,64 @@
     if (!selectedFileDetail) return 0;
     return vineService.countByVideoCid(selectedFileDetail.cid);
   });
+
+  // ── ZEB-674 C5: encrypted-file ShareList state ──────────────────────
+  // `null` until `listGrants` resolves for the current file — ShareList
+  // self-hides rather than rendering a fabricated "Not shared with anyone"
+  // before the query proves the (possibly empty) set.
+  let fileGrants = $state<FileGrant[] | null>(null);
+  // Monotonic guard: a fast file switch (or an overlapping grant/revoke
+  // refresh) must not let a stale listGrants reply clobber a newer file's
+  // state — same idiom as dmContactsRefreshSeq above.
+  let fileGrantsReq = 0;
+
+  async function refreshFileGrants(cid: string): Promise<void> {
+    const req = ++fileGrantsReq;
+    try {
+      const grants = await fileManagerService.listGrants(cid);
+      if (req !== fileGrantsReq) return; // stale — a newer file/request owns the state
+      fileGrants = grants;
+    } catch (err) {
+      if (req !== fileGrantsReq) return;
+      console.error('listGrants failed:', err);
+      // A failed query is still "resolved" — [] renders the honest
+      // fallback empty state rather than leaving the panel stuck hidden.
+      fileGrants = [];
+    }
+  }
+
+  $effect(() => {
+    const cid = selectedFileCid;
+    const encrypted = selectedFileDetail?.encrypted ?? false;
+    if (!cid || !encrypted) {
+      fileGrantsReq++; // invalidate any in-flight request for the old file
+      fileGrants = null;
+      return;
+    }
+    fileGrants = null; // unresolved for the new file until the query lands
+    void refreshFileGrants(cid);
+  });
+
+  // ZEB-674 C5: the "Share with…" picker's friend source — reuses the same
+  // DM-contact map already threaded to StorageBuddySheet (friendContacts).
+  let availableFileGrantFriends = $derived(
+    [...pickerContacts.entries()].map(([address, profile]) => ({
+      address,
+      displayName: profile.displayName || null,
+    })),
+  );
+
+  async function handleFileGrant(address: string): Promise<void> {
+    if (!selectedFileCid) return;
+    await fileManagerService.grantRead(selectedFileCid, address);
+    await refreshFileGrants(selectedFileCid);
+  }
+
+  async function handleFileRevoke(address: string): Promise<void> {
+    if (!selectedFileCid) return;
+    await fileManagerService.revokeRead(selectedFileCid, address);
+    await refreshFileGrants(selectedFileCid);
+  }
 
   // ── File manager callbacks ──────────────────────────────────────────
   function handleFileItemClick(item: ContentItem) {
@@ -4006,6 +4077,10 @@
         onUnpin={handleFileUnpin}
         onExport={handleFileExport}
         onSetBackup={(sidecarId, backup) => fileManagerService.setBackupFlag(sidecarId, backup)}
+        fileGrants={fileGrants}
+        availableGrantFriends={availableFileGrantFriends}
+        onGrantRead={handleFileGrant}
+        onRevokeRead={handleFileRevoke}
       />
     {:else}
       <div class="file-detail-empty">

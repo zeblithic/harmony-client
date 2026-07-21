@@ -19059,6 +19059,14 @@ pub struct ContentItemWire {
     /// ZEB-669 S4: provenance recorded at entry creation; `None` for legacy
     /// and manifest-derived rows (the UI renders no "From" row).
     pub origin: Option<content_index::OriginInfo>,
+    /// ZEB-674 T8: whether this CID's content class is encrypted (per-file
+    /// DEK, ZEB-674 C1). Derived from the CID header flag bit — the same
+    /// signal `ContentAttachmentDto`/`ReactionDto` project elsewhere
+    /// (`ContentId::from_bytes(cid).flags().encrypted`) — not from the
+    /// cosmetic `sensitivity` label, which is decoupled and does not imply
+    /// encryption. Drives the FileDetailPanel ShareList gate: the honest
+    /// "Shared with" surface renders only on encrypted files.
+    pub encrypted: bool,
 }
 
 /// ZEB-612 S3: overwrite `replica_count` with 1 (self) + observed peers.
@@ -19233,6 +19241,9 @@ pub(crate) fn list_root(
                 replica_count: 1,
                 backup: e.backup,
                 origin: e.origin.clone(),
+                encrypted: harmony_content::cid::ContentId::from_bytes(e.cid)
+                    .flags()
+                    .encrypted,
             })
             .collect()
     };
@@ -19322,6 +19333,9 @@ pub async fn list_folder(
             replica_count: 1,
             backup: false,
             origin: None,
+            encrypted: harmony_content::cid::ContentId::from_bytes(e.cid)
+                .flags()
+                .encrypted,
         })
         .collect())
 }
@@ -65761,6 +65775,7 @@ mod pin_persistence_tests {
                 kind: content_index::OriginKind::SelfIngest,
                 introducer: None,
             }),
+            encrypted: false,
         };
         let json = serde_json::to_string(&wire).expect("serialize");
         assert!(
@@ -65795,6 +65810,7 @@ mod pin_persistence_tests {
             replica_count: 1,
             backup: false,
             origin: None,
+            encrypted: false,
         }
     }
 
@@ -65823,6 +65839,93 @@ mod pin_persistence_tests {
         assert!(parse_sidecar_id(&id).is_ok());
         assert!(parse_sidecar_id("").is_err(), "empty rejected");
         assert!(parse_sidecar_id("not-a-uuid").is_err(), "garbage rejected");
+    }
+
+    /// ZEB-674 T8: `encrypted` on the `list_content`/`list_root` wire DTO must
+    /// come from the CID header's flag bit (`ContentId::from_bytes(cid)
+    /// .flags().encrypted`), NOT from the cosmetic `sensitivity` label — both
+    /// fixture entries below share `sensitivity` values that don't line up
+    /// with their encrypted-ness, so a projection that reads `sensitivity`
+    /// instead of the CID flag would flip this assertion.
+    #[test]
+    fn list_root_derives_encrypted_flag_from_cid_header() {
+        let enc_cid = harmony_content::cid::ContentId::for_book(
+            b"secret bytes",
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid")
+        .to_bytes();
+        let pub_cid = harmony_content::cid::ContentId::for_book(
+            b"public bytes",
+            harmony_content::cid::ContentFlags::default(),
+        )
+        .expect("cid")
+        .to_bytes();
+
+        let mut idx = content_index::ContentIndex::load(std::path::Path::new(""));
+        idx.insert(content_index::ContentIndexEntry {
+            sidecar_id: content_index::SidecarId::new(),
+            cid: enc_cid,
+            file_name: "secret.txt".into(),
+            size_bytes: 12,
+            stored_at_ms: 1,
+            // Deliberately mismatched vs. the CID's encrypted flag (Public
+            // sensitivity, encrypted CID) to prove the projection isn't
+            // reading this field.
+            sensitivity: content_index::Sensitivity::Public,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: content_index::ContentKind::Leaf,
+            backup: false,
+            origin: None,
+        });
+        idx.insert(content_index::ContentIndexEntry {
+            sidecar_id: content_index::SidecarId::new(),
+            cid: pub_cid,
+            file_name: "public.txt".into(),
+            size_bytes: 12,
+            stored_at_ms: 2,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: content_index::ContentKind::Leaf,
+            backup: false,
+            origin: None,
+        });
+
+        let app = tauri::test::mock_builder()
+            .manage(Mutex::new(NodeState {
+                content_index: std::sync::Arc::new(std::sync::Mutex::new(idx)),
+                ..NodeState::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        use tauri::Manager as _;
+
+        let items = list_root(app.state::<Mutex<NodeState>>()).expect("list_root");
+        let enc_item = items
+            .iter()
+            .find(|i| i.cid == hex::encode(enc_cid))
+            .expect("encrypted entry present");
+        let pub_item = items
+            .iter()
+            .find(|i| i.cid == hex::encode(pub_cid))
+            .expect("public entry present");
+        assert!(
+            enc_item.encrypted,
+            "encrypted-ingested CID must project encrypted: true"
+        );
+        assert!(
+            !pub_item.encrypted,
+            "public CID must project encrypted: false"
+        );
     }
 }
 

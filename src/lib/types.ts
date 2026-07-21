@@ -286,6 +286,13 @@ export interface ContentItem {
    *  legacy, manifest-derived, and demo rows (the detail panel renders no
    *  "From" row — never fabricated). */
   origin?: ContentOriginInfo | null;
+  /** ZEB-674 T8: whether this CID's content class is encrypted (per-file
+   *  DEK, ZEB-674 C1) — derived backend-side from the CID header flag bit,
+   *  NOT from the cosmetic `sensitivity` label. Drives the FileDetailPanel
+   *  ShareList gate: the honest "Shared with" surface renders only on
+   *  encrypted files. Optional so mock fixtures can omit it; absent ===
+   *  not encrypted. */
+  encrypted?: boolean;
 }
 
 /** ZEB-669 S4: mirrors Rust `OriginInfo` (camelCase serde). The reserved

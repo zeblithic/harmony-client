@@ -123,6 +123,10 @@ interface ContentItemWire {
   /** ZEB-669 S4: provenance recorded at creation; null for legacy and
    *  manifest-derived rows. Optional: pre-ZEB-669 backends omit it. */
   origin?: ContentOriginInfo | null;
+  /** ZEB-674 T8: whether this CID's content class is encrypted — derived
+   *  backend-side from the CID header flag bit. Always present from a
+   *  ZEB-674+ backend; treated as `false` when omitted (pre-ZEB-674). */
+  encrypted?: boolean;
 }
 
 /** Wire shape of the `get_storage_budget` query (ZEB-612 S3). */
@@ -170,6 +174,7 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
     isFolder: wire.kind === 'folder',
     backup: wire.backup ?? false,
     origin: wire.origin ?? null,
+    encrypted: wire.encrypted ?? false,
   };
 }
 
@@ -557,6 +562,10 @@ export class FileManagerService {
       archived: false,
       parentCid: parentCid ?? null,
       isFolder: false,
+      // ZEB-674 T8: the optimistic local item must reflect which ingest
+      // command actually ran — a refetch confirms this from the CID's real
+      // header flag, but the pre-refetch row shouldn't lie in the meantime.
+      encrypted: options?.encrypted === true,
     };
     this.privateContent.push(item);
     return item;
