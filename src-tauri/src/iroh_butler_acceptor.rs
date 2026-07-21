@@ -946,6 +946,15 @@ pub async fn handle_deposit_core(
                 if gr_bytes.len() > crate::butler_deposit::MAX_DEPOSIT_GRANT_REVOKE_BYTES {
                     return Err(DepositReject::BadPayload);
                 }
+                // ZEB-730 (CodeRabbit): unlike the sealed/opaque `grant_push`, the
+                // `grant_revoke` CID rides in the clear inside the frame seal, so the
+                // butler CAN validate it — fail-closed here rather than persisting an
+                // entry the recipient's ingest sweep can never decode (it would sit
+                // pending until TTL, and an admitted friend could mint many distinct
+                // un-ingestable entries, one per hashed key). A legitimate client's
+                // `encode_grant_revoke` is deterministic and always well-formed.
+                crate::butler_deposit::decode_grant_revoke(gr_bytes)
+                    .map_err(|_| DepositReject::BadPayload)?;
                 // Keyed by the revoking friend + a hash of the opaque revoke, so a
                 // redelivery of the SAME revoke is idempotent (one entry per
                 // distinct revoke payload). No space, no message CID — the ack
@@ -3332,6 +3341,23 @@ mod tests {
         let err = handle_deposit_core(&f.frame, &ctx)
             .await
             .expect_err("oversized grant_revoke must be rejected");
+        assert_eq!(err, DepositReject::BadPayload);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// ZEB-730 (CodeRabbit): a malformed-but-under-cap `grant_revoke` (well-formed
+    /// frame, Friend-scoped, no stray siblings, ≤ cap, but NOT decodable to a
+    /// [u8;32] CID) is rejected `BadPayload` at accept time — nothing persisted —
+    /// rather than acking an entry the recipient could never ingest.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_undecodable_grant_revoke() {
+        // 3 bytes: under the cap, but not the canonical CBOR of a 32-byte string.
+        let f = grant_revoke_fixture(vec![0x00, 0x01, 0x02], Vec::new(), None);
+        let ctx = TestCtx::for_fixture(&f);
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("an undecodable grant_revoke must be rejected");
         assert_eq!(err, DepositReject::BadPayload);
         assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
     }
