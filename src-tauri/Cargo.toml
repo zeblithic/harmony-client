@@ -66,7 +66,7 @@ flume = "0.11"
 # ZEB-445 serve mode adds: "rt-multi-thread" (serve_cli builds its own
 # multi-thread runtime), "macros" (tokio::select! in the shutdown path),
 # "signal" (ctrl-c / SIGTERM handling in wait_for_exit_signal).
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "signal", "io-util"] }
 # ZEB-473 (DM-over-iroh, Move 1a): the tunnel session loop reads length-prefixed
 # frames off the iroh bi-stream inside a `tokio::select!`; `FramedRead` +
 # `LengthDelimitedCodec` buffers partial reads internally so a cancelled read
@@ -133,7 +133,7 @@ harmony-tunnel = { git = "https://github.com/zeblithic/harmony.git", rev = "5665
 url = "2"
 blake3 = "1"
 argon2 = "0.5"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
 clap = { version = "4", features = ["derive"] }
 secrecy = "0.10"
 subtle = "2"

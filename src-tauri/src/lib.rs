@@ -178,6 +178,7 @@ pub mod enrollment_verify;
 pub mod event_loop;
 pub mod feed_authority;
 pub mod file_sharing;
+pub mod file_stream_crypto;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
 pub mod fleet_net_persist;
@@ -19104,7 +19105,11 @@ fn kind_wire(k: content_index::ContentKind) -> &'static str {
     }
 }
 
-fn parse_cid_hex(cid_hex: &str) -> Result<[u8; 32], String> {
+/// `pub` (rather than `pub(crate)`) so the `tests/file_sharing_streaming.rs`
+/// integration test can parse the root CID hex the same way production code
+/// does (ZEB-724 ambiguity resolution: minimal visibility bump for a test
+/// seam, not a broadened public surface).
+pub fn parse_cid_hex(cid_hex: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(cid_hex).map_err(|_| "invalid cid hex".to_string())?;
     <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "cid must be 32 bytes".to_string())
 }
@@ -19778,6 +19783,28 @@ async fn set_replication_tier(
     Ok(updated as u32)
 }
 
+/// Look up the KeyTree-sealed DEK bytes for an encrypted personal-file CID
+/// key, checking this owner's own files (`file_deks`) FIRST, then a file
+/// shared with us (`received_file_grants`). `None` = this node holds no
+/// personal DEK for the CID (either public content, or a community/space
+/// artifact that decrypts via its own epoch-key path elsewhere).
+///
+/// Shared by [`decrypt_personal_file_if_held`] and
+/// [`resolve_personal_file_dek`] so the lookup order/precedence can't drift
+/// between the two call sites (ZEB-724 whole-branch review: this sequence
+/// was previously duplicated inline in both functions).
+fn find_sealed_file_dek<'a>(
+    state: &'a crate::owner_state_crdt::OwnerState,
+    cid_key: &[u8; 32],
+) -> Option<&'a Vec<u8>> {
+    state.file_deks.get(cid_key).or_else(|| {
+        state
+            .received_file_grants
+            .get(cid_key)
+            .map(|g| &g.sealed_dek)
+    })
+}
+
 /// ZEB-674 Task 12 (Gap B): personal-file decrypt-on-read core.
 ///
 /// Given the raw bytes just fetched for `cid`, return the PLAINTEXT when this
@@ -19785,8 +19812,11 @@ async fn set_replication_tier(
 /// is consulted FIRST, else a file shared with us (`received_file_grants`).
 /// Both maps store the DEK sealed under this node's shared `KeyTree`, so
 /// [`file_sharing::open_dek_at_rest`] unseals it and
-/// [`community_state_sync::decrypt_blob`] reverses the whole-blob encrypt done
-/// at ingest ([`ingest_content_encrypted_inner`]).
+/// [`file_stream_crypto::decrypt_stream`] reverses the v2 chunked-AEAD stream
+/// encrypt done at ingest ([`ingest_content_encrypted_inner`], ZEB-724). A v1
+/// whole-blob ciphertext (pre-ZEB-724) fails loud via
+/// `FileStreamError::UnsupportedLegacyFormat` rather than silently
+/// misparsing — callers should surface the "re-ingest this file" message.
 ///
 /// Pass-through (returns `bytes` unchanged) for:
 /// - a PUBLIC CID (encrypted flag clear) — no decrypt is attempted; and
@@ -19805,11 +19835,7 @@ pub fn decrypt_personal_file_if_held(
         return Ok(bytes);
     }
     let key = cid.to_bytes();
-    let sealed = state
-        .file_deks
-        .get(&key)
-        .or_else(|| state.received_file_grants.get(&key).map(|g| &g.sealed_dek));
-    let Some(sealed) = sealed else {
+    let Some(sealed) = find_sealed_file_dek(state, &key) else {
         // Encrypted, but not a personal file we hold a DEK for — leave the
         // fetched bytes untouched so the community/space epoch-key path is
         // undisturbed.
@@ -19817,8 +19843,8 @@ pub fn decrypt_personal_file_if_held(
     };
     let dek = crate::file_sharing::open_dek_at_rest(keytree, sealed)
         .map_err(|e| format!("unseal personal file DEK: {e:?}"))?;
-    crate::community_state_sync::decrypt_blob(&dek, &bytes)
-        .map_err(|e| format!("decrypt personal file: {e:?}"))
+    crate::file_stream_crypto::decrypt_stream(&dek, &bytes)
+        .map_err(|e| format!("decrypt personal file: {e}"))
 }
 
 /// ZEB-674 Task 12: snapshot the owner handles off `NodeState` and apply the
@@ -19853,13 +19879,40 @@ async fn maybe_decrypt_personal_file(
     decrypt_personal_file_if_held(bytes, cid, &st, &keytree)
 }
 
+/// Resolve the unsealed per-file DEK for an encrypted personal CID, if this
+/// node holds it (own `file_deks` or a received grant). `None` = not held.
+async fn resolve_personal_file_dek(
+    state: &Mutex<NodeState>,
+    cid: &harmony_content::cid::ContentId,
+) -> Result<Option<crate::owner_state_types::EpochKey>, String> {
+    if !cid.flags().encrypted {
+        return Ok(None);
+    }
+    let (crdt_state, keytree) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        match (guard.crdt_state.clone(), guard.owner_keytree.clone()) {
+            (Some(c), Some(k)) => (c, k),
+            _ => return Ok(None),
+        }
+    };
+    let key = cid.to_bytes();
+    let st = crdt_state.lock().await;
+    let Some(sealed) = find_sealed_file_dek(&st, &key) else {
+        return Ok(None);
+    };
+    let dek = crate::file_sharing::open_dek_at_rest(&keytree, sealed)
+        .map_err(|e| format!("unseal personal file DEK: {e:?}"))?;
+    Ok(Some(dek))
+}
+
 /// Export content to the local filesystem via a save dialog.
 ///
 /// Fetches the raw bytes for `cid` through the Zenoh content transport,
 /// opens a native save-file dialog with `file_name` as the suggested name,
 /// and writes the bytes to the chosen path. Encrypted personal files (created
-/// via `ingest_content_encrypted`) are decrypted to plaintext before the write
-/// when this node holds the file's DEK (ZEB-674 T12).
+/// via `ingest_content_encrypted`) are stream-decrypted to plaintext directly
+/// to disk when this node holds the file's DEK (ZEB-674 T12; streamed to disk
+/// as of ZEB-724, so the whole plaintext is never also resident in memory).
 #[tauri::command]
 async fn export_content(
     app: tauri::AppHandle,
@@ -19898,10 +19951,6 @@ async fn export_content(
         .await
         .map_err(|_| "event loop dropped fetch request".to_string())??;
 
-    // 1b. ZEB-674 T12: if this is an encrypted personal file we hold a DEK for,
-    // decrypt to plaintext before writing; otherwise the bytes are unchanged.
-    let bytes = maybe_decrypt_personal_file(state.inner(), &cid, bytes).await?;
-
     // 2. Open a native save-file dialog.
     let (path_tx, path_rx) = tokio::sync::oneshot::channel();
     app.dialog()
@@ -19916,10 +19965,39 @@ async fn export_content(
         .map_err(|_| "dialog error".to_string())?
         .ok_or_else(|| "export cancelled".to_string())?;
 
-    // 3. Write bytes to disk.
+    // 3. Write to disk. ZEB-674 T12 / ZEB-724: an encrypted personal file we
+    // hold the DEK for is stream-decrypted directly to disk (the whole
+    // plaintext is never also resident in memory); everything else (public
+    // content, or encrypted content we hold no DEK for) writes the fetched
+    // bytes unchanged.
     let path = file_path
         .as_path()
         .ok_or_else(|| "unsupported file path".to_string())?;
+
+    let cid_parsed = parse_cid_hex(&cid)
+        .ok()
+        .map(harmony_content::cid::ContentId::from_bytes);
+    if let Some(cid_obj) = cid_parsed {
+        if let Some(dek) = resolve_personal_file_dek(state.inner(), &cid_obj).await? {
+            // Stream-decrypt: ciphertext is already resident; write plaintext
+            // frame-by-frame so the whole plaintext is never also resident.
+            // Decrypts to a temp file in the same directory and renames onto
+            // `out_path` only on success (ZEB-724 whole-branch review,
+            // data-loss MUST-FIX) — the user's chosen file must never be
+            // truncated/clobbered by a failed decrypt (deterministic on
+            // legacy-v1 exports, possible on a tampered v2 ciphertext).
+            let out_path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                crate::file_stream_crypto::decrypt_stream_to_path(&dek, &bytes, &out_path)
+                    .map_err(|e| format!("decrypt personal file: {e}"))
+            })
+            .await
+            .map_err(|e| format!("decrypt task: {e}"))??;
+            return Ok(true);
+        }
+    }
+
+    // Public (or encrypted-but-not-held) content: write bytes unchanged.
     tokio::fs::write(path, &bytes)
         .await
         .map_err(|e| format!("write failed: {e}"))?;
@@ -19993,16 +20071,98 @@ async fn ingest_content(
         .map_err(|e| e.to_string())
 }
 
-/// ZEB-674 Task 1 (C1): pure inner for the encrypted-file ingest path.
+/// Read up to `buf.len()` bytes, tolerating short reads; returns bytes filled
+/// (< len only at EOF).
+async fn read_up_to(file: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt;
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
+/// Seal `file`'s plaintext into v2 STREAM frames and write them to `writer`
+/// (the write half of a duplex pipe). One-frame lookahead marks the true final
+/// frame (so a frame-aligned file emits exactly ceil(len/frame_size) frames).
+async fn produce_ciphertext(
+    mut file: tokio::fs::File,
+    dek: crate::owner_state_types::EpochKey,
+    frame_size: u32,
+    writer: &mut tokio::io::DuplexStream,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let mut sealer = crate::file_stream_crypto::FrameSealer::new(&dek, frame_size);
+    writer
+        .write_all(&sealer.header())
+        .await
+        .map_err(|e| format!("pipe write header: {e}"))?;
+
+    let fs = frame_size as usize;
+    let mut cur = vec![0u8; fs];
+    let mut cur_len = read_up_to(&mut file, &mut cur)
+        .await
+        .map_err(|e| format!("read plaintext: {e}"))?;
+    loop {
+        if cur_len < fs {
+            // File ended within this frame ⇒ it is the final frame (maybe empty).
+            let ct = sealer
+                .seal_last(&cur[..cur_len])
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&ct)
+                .await
+                .map_err(|e| format!("pipe write: {e}"))?;
+            break;
+        }
+        // `cur` is a full frame; peek to learn whether more data follows.
+        let mut nxt = vec![0u8; fs];
+        let nxt_len = read_up_to(&mut file, &mut nxt)
+            .await
+            .map_err(|e| format!("read plaintext: {e}"))?;
+        if nxt_len == 0 {
+            let ct = sealer
+                .seal_last(&cur[..cur_len])
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&ct)
+                .await
+                .map_err(|e| format!("pipe write: {e}"))?;
+            break;
+        }
+        let ct = sealer
+            .seal_next(&cur[..cur_len])
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&ct)
+            .await
+            .map_err(|e| format!("pipe write: {e}"))?;
+        cur = nxt;
+        cur_len = nxt_len;
+    }
+    writer
+        .shutdown()
+        .await
+        .map_err(|e| format!("pipe shutdown: {e}"))?;
+    Ok(())
+}
+
+/// ZEB-674 Task 1 (C1) / ZEB-724: pure inner for the encrypted-file ingest
+/// path.
 ///
-/// Generates a FRESH per-file DEK, encrypts the WHOLE plaintext blob under it
-/// (`community_state_sync::encrypt_blob` — deterministic nonce, so a given
-/// (DEK, plaintext) reproduces the same ciphertext/CID), ingests the resulting
-/// ciphertext as an encrypted + serveable artifact, then seals the DEK at rest
-/// under the owner's `KeyTree` and stores it on `OwnerState.file_deks` keyed by
-/// the ingest root CID.
+/// Generates a FRESH per-file DEK, then STREAMS the plaintext through a
+/// producer task that seals it into v2 STREAM frames
+/// (`file_stream_crypto::FrameSealer`) and writes them into a bounded
+/// `tokio::io::duplex` pipe. The pipe's read half feeds
+/// [`streaming_ingest_with_options`] directly, so the FastCDC chunker
+/// consumes the ciphertext byte-stream as it's produced — neither the whole
+/// plaintext nor the whole ciphertext is ever resident (ZEB-724: bounded
+/// memory, no size cap).
 ///
-/// The pipeline does NOT encrypt — it is handed PRE-ENCRYPTED ciphertext.
 /// `ContentFlags{ encrypted: true }` + `serveable: true` stamp every emitted
 /// leaf + bundle CID so decrypt-on-fetch and member-to-member serve behave
 /// (see [`streaming_ingest_with_options`]).
@@ -20011,31 +20171,24 @@ async fn ingest_content(
 /// after the local `file_deks` mutation, or the sealed DEK is dropped on the
 /// floor — never persisted, never replicated (ZEB-709). Pass `None` only in
 /// focused tests that inspect `crdt_state` directly.
-///
-/// NOTE: whole-blob DEK encryption materializes the full plaintext AND
-/// ciphertext in memory (this path is not streaming, unlike [`ingest_content`]).
-/// Callers gate large files upstream.
 pub async fn ingest_content_encrypted_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     keytree: &crate::owner_state_crypto::KeyTree,
     sync_engine: Option<&std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
-    plaintext: Vec<u8>,
+    plaintext_reader: tokio::fs::File,
     file_name: String,
 ) -> Result<IngestResult, String> {
     use harmony_content::chunker::ChunkerConfig;
 
     // 1. Fresh per-file DEK.
     let dek = crate::file_sharing::generate_file_dek();
+    let frame_size = crate::file_stream_crypto::DEFAULT_FRAME_SIZE;
 
-    // 2. Encrypt the whole blob under the DEK. The CID is computed over this
-    //    ciphertext, so a fresh DEK yields a fresh root CID.
-    let ciphertext = crate::community_state_sync::encrypt_blob(&dek, &plaintext)
-        .map_err(|e| format!("encrypt_blob: {e:?}"))?;
-
-    // 3. Ingest the PRE-ENCRYPTED ciphertext as an encrypted + serveable
-    //    artifact (flags stamped onto every leaf + bundle CID).
+    // 2. Stream: producer seals plaintext → v2 frames → duplex pipe; the FastCDC
+    //    chunker consumes the ciphertext byte-stream. Neither the whole plaintext
+    //    nor the whole ciphertext is ever resident (bounded to a few frames).
     let opts = IngestOptions {
         flags: harmony_content::cid::ContentFlags {
             encrypted: true,
@@ -20043,19 +20196,31 @@ pub async fn ingest_content_encrypted_inner(
         },
         serveable: true,
     };
-    let (root, size_bytes) = streaming_ingest_with_options(
-        std::io::Cursor::new(ciphertext),
-        ingest_tx,
-        ChunkerConfig::DEFAULT,
-        None,
-        opts,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let cap = (frame_size as usize + 16) * 2 + crate::file_stream_crypto::V2_HEADER_LEN;
+    let (mut pipe_w, pipe_r) = tokio::io::duplex(cap);
+    let dek_for_producer = dek.clone();
+    let producer = tokio::spawn(async move {
+        produce_ciphertext(plaintext_reader, dek_for_producer, frame_size, &mut pipe_w).await
+    });
+    let ingest_res =
+        streaming_ingest_with_options(pipe_r, ingest_tx, ChunkerConfig::DEFAULT, None, opts).await;
+    let produce_res = producer
+        .await
+        .map_err(|e| format!("encrypt task join: {e}"))?;
+    // Surface the ROOT error and never commit state on any failure. If the
+    // ingest side failed, that is the root cause — it drops the pipe reader,
+    // so the producer's error (if any) is a derivative broken-pipe write that
+    // must not mask the real ingest error. If ingest succeeded but the producer
+    // failed, ingest saw a clean short stream (a truncated file) and the
+    // producer error is the root cause. Either failure returns before any
+    // `file_deks`/sidecar commit.
+    let (root, size_bytes) = match (ingest_res, produce_res) {
+        (Err(e), _) => return Err(e.to_string()),
+        (Ok(_), Err(e)) => return Err(e),
+        (Ok(rooted), Ok(())) => rooted,
+    };
 
-    // 4. Seal the DEK at rest and store it keyed by the root CID. A crdt_state
-    //    mutation without a following notify_dirty would never persist NOR
-    //    replicate (ZEB-709).
+    // 3. Seal the DEK at rest and store it keyed by the root CID (ZEB-709).
     let sealed = crate::file_sharing::seal_dek_at_rest(keytree, &dek)
         .map_err(|e| format!("seal DEK at rest: {e:?}"))?;
     {
@@ -20066,85 +20231,17 @@ pub async fn ingest_content_encrypted_inner(
         engine.notify_dirty();
     }
 
-    // 5. Insert the sidecar row pointing at the streamed root CID.
+    // 4. Insert the sidecar row pointing at the streamed root CID.
     send_ingest_with_name(content_index, root.to_bytes(), file_name, size_bytes, None)
         .await
         .map_err(|e| e.to_string())
 }
 
-/// ZEB-674 converge (Qodo, reliability): cap on the encrypted-upload size.
-/// Whole-blob DEK encryption is NOT streaming — `ingest_content_encrypted` must
-/// hold the whole plaintext (and then its ciphertext) in memory at once, unlike
-/// the non-encrypted `ingest_file_at_path`, which streams through the chunker
-/// with bounded memory (ZEB-161). Without a cap a huge encrypted upload could
-/// OOM the app, and this path is UI-reachable via the "Encrypt (private)"
-/// toggle. This is an MVP guard; lifting it via streaming (chunked-AEAD)
-/// encryption is a tracked follow-up (see the ZEB-674 design's deferrals).
-const MAX_ENCRYPTED_INGEST_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
-
-/// Read a file fully into memory, BOUNDED: read at most `cap` bytes and return
-/// `Err` if the file is larger. `Take` caps the allocation regardless of the
-/// on-disk size (so a huge file can't OOM), and reading rather than trusting
-/// `metadata().len()` closes the stat→read TOCTOU. Used by the non-streaming
-/// encrypted-ingest path ([`MAX_ENCRYPTED_INGEST_BYTES`]).
-async fn read_file_capped(path: &std::path::Path, cap: u64) -> Result<Vec<u8>, String> {
-    use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| format!("open failed: {e}"))?;
-    let mut buf = Vec::new();
-    // Read at most cap+1 bytes: if the reader yields more than cap, it's over.
-    let read = file
-        .take(cap + 1)
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|e| format!("read failed: {e}"))?;
-    if read as u64 > cap {
-        return Err(format!(
-            "encrypted upload is limited to {} MiB in this version; \
-             large-file streaming encryption is a tracked follow-up",
-            cap / (1024 * 1024),
-        ));
-    }
-    Ok(buf)
-}
-
-#[cfg(test)]
-mod read_file_capped_tests {
-    use super::read_file_capped;
-
-    #[tokio::test]
-    async fn accepts_within_cap_and_rejects_oversize() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let p = dir.path().join("f.bin");
-
-        // Under cap → returned verbatim.
-        tokio::fs::write(&p, b"hello").await.expect("write");
-        assert_eq!(
-            read_file_capped(&p, 1024).await.expect("within cap"),
-            b"hello"
-        );
-
-        // Exactly cap → allowed (read == cap, not > cap).
-        tokio::fs::write(&p, vec![0xABu8; 8]).await.expect("write");
-        assert_eq!(
-            read_file_capped(&p, 8).await.expect("exactly cap"),
-            vec![0xABu8; 8]
-        );
-
-        // Over cap → rejected with the stable limit message; nothing returned.
-        tokio::fs::write(&p, vec![0u8; 20]).await.expect("write");
-        let err = read_file_capped(&p, 8)
-            .await
-            .expect_err("over cap must be rejected");
-        assert!(err.contains("limited to"), "stable limit message: {err}");
-    }
-}
-
 /// ZEB-674 Task 1 (C1): encrypted-file ingest via the native file picker.
 ///
 /// Mirrors [`ingest_content`] but routes through the per-file-DEK encrypt path
-/// (fresh DEK → whole-blob encrypt → EncryptedDurable + serveable ingest →
+/// (fresh DEK → streamed v2 chunked-AEAD frame-by-frame encrypt via
+/// `file_stream_crypto::FrameSealer`, ZEB-724 → encrypted + serveable ingest →
 /// sealed DEK on `OwnerState`). Backend-only; Task 6 wires the frontend.
 #[tauri::command]
 async fn ingest_content_encrypted(
@@ -20197,10 +20294,10 @@ async fn ingest_content_encrypted(
         )
     };
 
-    // 3. Read the whole file into memory — whole-blob DEK encryption is not
-    //    streaming (see the inner's NOTE) — but BOUND the read so a huge file
-    //    cannot OOM the app (see `read_file_capped`).
-    let plaintext = read_file_capped(path, MAX_ENCRYPTED_INGEST_BYTES).await?;
+    // 3. Open a streaming reader; the inner encrypts frame-by-frame (no cap).
+    let plaintext_reader = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open failed: {e}"))?;
 
     ingest_content_encrypted_inner(
         &ingest_tx,
@@ -20208,7 +20305,7 @@ async fn ingest_content_encrypted(
         &crdt_state,
         &keytree,
         sync_engine.as_ref(),
-        plaintext,
+        plaintext_reader,
         file_name,
     )
     .await
