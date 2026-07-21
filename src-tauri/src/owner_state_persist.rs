@@ -139,6 +139,12 @@ struct CrdtFileV2 {
     /// keeps existing file shapes compact.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     file_grants: BTreeMap<[u8; 32], Vec<crate::owner_state_types::GrantEntry>>,
+    /// ZEB-674 Task 4 (C4): persisted received-file grants (root CID bytes →
+    /// received grant record). Absent in pre-Task-4 V2 files; `serde(default)`
+    /// loads those as empty (no schema-version bump — absent == empty).
+    /// `skip_serializing_if` keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    received_file_grants: BTreeMap<[u8; 32], crate::owner_state_types::ReceivedFileGrant>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -156,6 +162,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             revoked_dm_devices: s.revoked_dm_devices.clone(),
             file_deks: s.file_deks.clone(),
             file_grants: s.file_grants.clone(),
+            received_file_grants: s.received_file_grants.clone(),
         }
     }
 }
@@ -175,6 +182,7 @@ impl From<CrdtFileV2> for OwnerState {
             revoked_dm_devices: f.revoked_dm_devices,
             file_deks: f.file_deks,
             file_grants: f.file_grants,
+            received_file_grants: f.received_file_grants,
         }
     }
 }

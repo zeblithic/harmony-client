@@ -2530,6 +2530,49 @@ pub struct GrantEntry {
     pub granted_at: u64,
 }
 
+/// ZEB-674 Task 4 (C4): one grant the local owner RECEIVED — an encrypted file
+/// another owner shared with one of this owner's devices. Stored in
+/// `OwnerState.received_file_grants` keyed by the shared file's root ContentId
+/// bytes, and replicated across the owner's own devices via Flow A (so any of
+/// the owner's devices can render "shared with me" / open the file — even
+/// though only the device the grant was sealed to can UNSEAL the DEK, which is
+/// the `sealed_dek` blob's own property, not this record's).
+///
+/// `sealed_dek` is the WHOLE matched per-device seal blob
+/// (`seal_to_owner_with_info(dev, canonical_cbor(FileGrantInner), INFO)`), kept
+/// verbatim so `open_received_file` can re-open it lazily on demand rather than
+/// caching the raw DEK at rest. Confidentiality therefore still rests entirely
+/// on the sealing device's X25519 private key — the DEK never lands unsealed in
+/// `OwnerState`.
+///
+/// 2-char field keys (codebase convention; satisfies `canonical_cbor_encode`'s
+/// same-length-keys precondition — mirrors `GrantEntry` / `FileGrantInner`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceivedFileGrant {
+    /// The granting owner's master `OwnerAddr` (who shared the file).
+    #[serde(rename = "gr")]
+    pub granter_owner: OwnerAddr,
+    /// The shared file's encrypted root ContentId, canonical 32-byte form.
+    #[serde(rename = "ci")]
+    pub cid: [u8; 32],
+    /// Display file name (for the grantee's received-files UI).
+    #[serde(rename = "nm")]
+    pub file_name: String,
+    /// Plaintext byte length (pre-encryption).
+    #[serde(rename = "sz")]
+    pub file_size: u64,
+    /// MIME type string.
+    #[serde(rename = "mt")]
+    pub mime: String,
+    /// The matched per-device seal blob (opaque; opens only with this device's
+    /// X25519 private key). NEVER the raw DEK — always the sealed envelope.
+    #[serde(rename = "sk")]
+    pub sealed_dek: Vec<u8>,
+    /// Wall-clock milliseconds when this grant was ingested.
+    #[serde(rename = "ra")]
+    pub received_at: u64,
+}
+
 #[cfg(test)]
 mod inbox_tests {
     use super::*;

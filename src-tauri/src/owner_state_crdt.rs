@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::owner_state_types::{
     DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, GrantEntry, Hlc, InboxEntry,
     InboxKey, LibraryEntry, OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache,
-    OwnerDeviceEntry, ReadMarker, Space, SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER,
-    MAX_PRIOR_CONTENT_KEYS,
+    OwnerDeviceEntry, ReadMarker, ReceivedFileGrant, Space, SpaceId, SpaceKind,
+    MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +128,24 @@ pub struct OwnerState {
     /// load empty.
     #[serde(rename = "fr", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub file_grants: BTreeMap<[u8; 32], Vec<GrantEntry>>,
+    /// ZEB-674 Task 4 (C4): grants this owner RECEIVED — encrypted files other
+    /// owners shared with this owner. Keyed by the shared file's ROOT ContentId's
+    /// canonical 32-byte form (same `[u8; 32]` = `ContentId::to_bytes()` keying
+    /// as `file_deks` / `file_grants`, because `ContentId` is not `Ord`). The
+    /// value is the [`ReceivedFileGrant`] carrying the matched per-device sealed
+    /// DEK blob + display metadata.
+    ///
+    /// Replicates across the owner's own bound devices via Flow A. Merge is a
+    /// GROW-ONLY union, first-writer-wins per CID (see
+    /// `owner_state_sync::merge_remote_into_local`), like `file_deks` and NOT the
+    /// `file_grants` set-union: a received grant per CID is stable in the MVP (one
+    /// grant record per shared CID; a re-share overwrites nothing observable —
+    /// the sealed blob for a given CID unseals to the one DEK that decrypts that
+    /// CID's ciphertext, so which device's copy survives is immaterial). Absent on
+    /// the wire when empty (`skip_serializing_if` + `default`) so pre-ZEB-674
+    /// snapshots load empty.
+    #[serde(rename = "rg", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub received_file_grants: BTreeMap<[u8; 32], ReceivedFileGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

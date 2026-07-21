@@ -15,14 +15,15 @@
 //!   the DEK under the owner's `KeyTree` — shared across the owner's bound
 //!   devices, so `file_deks` replicates and unseals on any of them (Flow A).
 
-use crate::dm_signing::{seal_to_owner_with_info, DmSignError};
+use crate::dm_signing::{open_from_owner_with_info, seal_to_owner_with_info, DmSignError};
 use crate::owner_state_crdt::OwnerState;
 use crate::owner_state_crypto::sealed::CanonicalPayloadSealed;
 use crate::owner_state_crypto::{
-    canonical_cbor_encode, decrypt_file_dek, encrypt_file_dek, CanonicalPayload, CryptoError,
-    KeyTree,
+    canonical_cbor_decode, canonical_cbor_encode, decrypt_file_dek, encrypt_file_dek,
+    CanonicalPayload, CryptoError, KeyTree,
 };
-use crate::owner_state_types::{EpochKey, OwnerAddr};
+use crate::owner_state_types::{EpochKey, OwnerAddr, ReceivedFileGrant};
+use harmony_content::cid::ContentId;
 use serde::{Deserialize, Serialize};
 
 /// Generate a fresh per-file DEK (32 random bytes from OS entropy). Mirrors
@@ -152,6 +153,119 @@ pub fn grantee_device_x25519s(state: &OwnerState, grantee_owner: OwnerAddr) -> V
             })
         })
         .collect()
+}
+
+/// Wall-clock now in epoch-ms — the `received_at` stamp on an ingested grant.
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Failure opening or decoding a received file grant (grantee read path, C4).
+#[derive(Debug, thiserror::Error)]
+pub enum FileGrantIngestError {
+    /// The outer `grant_push` wire value (`Vec<serde_bytes Vec<u8>>`) did not
+    /// decode — malformed / truncated CBOR.
+    #[error("grant_push wire decode failed: {0}")]
+    WireDecode(String),
+    /// A blob opened with our device key but its plaintext was not a canonical
+    /// [`FileGrantInner`] — real corruption, NOT a wrong-recipient miss.
+    #[error("canonical CBOR decode of FileGrantInner failed: {0}")]
+    Decode(#[from] CryptoError),
+    /// No received grant recorded for the requested cid.
+    #[error("no received grant for the requested cid")]
+    NotFound,
+    /// Opening the stored sealed DEK with this device's X25519 key failed
+    /// (wrong device / tampered blob).
+    #[error("opening the sealed grant failed: {0}")]
+    Open(#[from] DmSignError),
+}
+
+/// Grantee ingest (C4): apply an inbound `grant_push` payload to `state`.
+///
+/// `grant_push_bytes` is the wire value of `DepositPayload.grant_push` — CBOR
+/// of `Vec<serde_bytes Vec<u8>>`, the per-device sealed blobs produced by
+/// [`seal_grant_for_devices`]. Each blob is tried against THIS device's X25519
+/// private key via `open_from_owner_with_info` under [`FILE_GRANT_SEAL_INFO`];
+/// on the FIRST blob that opens, the inner [`FileGrantInner`] is parsed and
+/// recorded on `state.received_file_grants[cid]` — storing the MATCHED sealed
+/// blob verbatim as `sealed_dek`, so the DEK stays sealed at rest and re-opens
+/// lazily via [`open_received_file`]. Returns `Ok(Some(cid))`.
+///
+/// If NO blob opens with this device's key (the grant was sealed only to other
+/// devices — the honest new-device edge), returns `Ok(None)` and leaves `state`
+/// untouched. A blob that opens but does not parse is `Err(Decode)`.
+///
+/// `granter_owner` is the AUTHENTICATED deposit sender (the butler-verified
+/// frame `sender_owner`), passed in by the recover-path demux — it is NOT read
+/// from the sealed payload, which the seal does not authenticate (anyone can
+/// seal to a recipient's pubkey), so trusting a payload-claimed granter would
+/// let a depositor forge attribution.
+pub fn ingest_grant_push(
+    state: &mut OwnerState,
+    my_device_x25519_priv: &[u8; 32],
+    granter_owner: OwnerAddr,
+    grant_push_bytes: &[u8],
+) -> Result<Option<ContentId>, FileGrantIngestError> {
+    // The outer list rides as CBOR byte-strings (`Vec<serde_bytes Vec<u8>>`,
+    // per `DepositPayload.grant_push`); decode with the matching `ByteBuf`
+    // element type rather than a plain `Vec<Vec<u8>>` (which would expect
+    // array-of-int elements).
+    let blobs: Vec<serde_bytes::ByteBuf> = ciborium::from_reader(grant_push_bytes)
+        .map_err(|e| FileGrantIngestError::WireDecode(e.to_string()))?;
+    for blob in blobs {
+        let Ok(plaintext) =
+            open_from_owner_with_info(my_device_x25519_priv, blob.as_ref(), FILE_GRANT_SEAL_INFO)
+        else {
+            // Not sealed to us — try the next device blob.
+            continue;
+        };
+        // Opened with our key — this blob is ours. A parse failure now is
+        // corruption of an authenticated-to-us payload, so it propagates.
+        let inner: FileGrantInner = canonical_cbor_decode(&plaintext)?;
+        let cid = ContentId::from_bytes(inner.cid);
+        state.received_file_grants.insert(
+            inner.cid,
+            ReceivedFileGrant {
+                granter_owner,
+                cid: inner.cid,
+                file_name: inner.file_name,
+                file_size: inner.file_size,
+                mime: inner.mime,
+                sealed_dek: blob.into_vec(),
+                received_at: now_epoch_ms(),
+            },
+        );
+        return Ok(Some(cid));
+    }
+    Ok(None)
+}
+
+/// Grantee read (C4): recover the per-file DEK for a previously-ingested grant.
+///
+/// Looks up `state.received_file_grants[cid]`, re-opens its `sealed_dek` with
+/// this device's X25519 private key under [`FILE_GRANT_SEAL_INFO`], parses the
+/// inner [`FileGrantInner`], and returns its DEK as an [`EpochKey`] ready for
+/// `community_state_sync::decrypt_blob`. `Err(NotFound)` if no grant is
+/// recorded for `cid`; `Err(Open)` if this device did not hold the sealing key.
+pub fn open_received_file(
+    state: &OwnerState,
+    my_device_x25519_priv: &[u8; 32],
+    cid: ContentId,
+) -> Result<EpochKey, FileGrantIngestError> {
+    let grant = state
+        .received_file_grants
+        .get(&cid.to_bytes())
+        .ok_or(FileGrantIngestError::NotFound)?;
+    let plaintext = open_from_owner_with_info(
+        my_device_x25519_priv,
+        &grant.sealed_dek,
+        FILE_GRANT_SEAL_INFO,
+    )?;
+    let inner: FileGrantInner = canonical_cbor_decode(&plaintext)?;
+    Ok(EpochKey::new(inner.dek))
 }
 
 #[cfg(test)]

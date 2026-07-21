@@ -261,6 +261,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         revoked_dm_devices,
         file_deks,
         file_grants,
+        received_file_grants,
     } = remote;
 
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
@@ -462,6 +463,17 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
                 .cmp(&b.grantee_owner)
                 .then(a.granted_at.cmp(&b.granted_at))
         });
+    }
+
+    // ZEB-674 Task 4: received-file grants — GROW-ONLY union, first-writer-wins
+    // per CID (like `file_deks`, NOT the `file_grants` set-union). A received
+    // grant per CID is stable in the MVP: the sealed blob a sibling holds for a
+    // given CID unseals (on the device it was sealed to) to the one DEK that
+    // decrypts that CID's ciphertext, so which sibling's copy survives is
+    // immaterial to the observable key. `or_insert` therefore converges
+    // regardless of merge order.
+    for (cid, grant) in received_file_grants {
+        local.received_file_grants.entry(cid).or_insert(grant);
     }
 }
 
