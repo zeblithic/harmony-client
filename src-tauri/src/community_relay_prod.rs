@@ -1075,6 +1075,7 @@ impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayD
             // only — this community-relay path never carries them.
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
 
         // 4. Fan out: the FIRST relay that acks ≥1 sealed copy wins. For each
@@ -2074,6 +2075,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
             now_ms: TEST_NOW,
         }
     }
@@ -3340,6 +3342,7 @@ mod tests {
             invite_packet: Some(invite_wire),
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
 
         // Bob's state: NO Space (offline-at-create). Alice's signing device is

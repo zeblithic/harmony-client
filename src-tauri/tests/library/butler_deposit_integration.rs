@@ -627,6 +627,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         },
     )
     .expect("sender-side frame build");
@@ -929,6 +930,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         },
     )
     .expect("sender-side frame build");
@@ -1089,6 +1091,7 @@ async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         },
     )
     .expect("sender-side frame build");
@@ -1185,6 +1188,7 @@ async fn co_member_deposit_for_unrelated_space_is_rejected_and_not_persisted() {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         },
     )
     .expect("sender-side frame build");

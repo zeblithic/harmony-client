@@ -20519,6 +20519,7 @@ pub(crate) async fn grant_read_impl(
             invite_packet: None,
             revocation_push: None,
             grant_push: Some(grant_push),
+            grant_revoke: None,
             now_ms,
         };
         // Surface the delivery outcome (do NOT silently discard it). Best-effort

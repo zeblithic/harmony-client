@@ -975,6 +975,7 @@ pub async fn handle_deposit_core(
         // grant-only arm above), `None` otherwise (the pure-shape guards reject
         // a grant riding alongside another sub-payload).
         grant_push: payload.grant_push,
+        grant_revoke: None,
         deposited_at: ctx.mint_hlc().await,
         deposited_by: ctx.device_id(),
         ingested_by: BTreeSet::new(),
@@ -1454,6 +1455,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1502,6 +1504,7 @@ mod tests {
             invite_packet,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -1693,6 +1696,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -1824,6 +1828,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -2008,6 +2013,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let butler_vk = butler_device_sk().verifying_key().to_bytes();
         let cert_bytes = harmony_owner::cbor::to_canonical(&so.cert).expect("encode cert");
@@ -2377,6 +2383,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2401,6 +2408,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2427,6 +2435,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         });
         let ctx = TestCtx::for_fixture(&f);
         let err = handle_deposit_core(&frame, &ctx).await.unwrap_err();
@@ -2687,6 +2696,7 @@ mod tests {
             invite_packet,
             revocation_push: Some(rp_wire),
             grant_push: None,
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -2903,6 +2913,7 @@ mod tests {
             invite_packet,
             revocation_push: None,
             grant_push: Some(grant_push),
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode payload");
         let sealed = seal_payload_bytes(&payload_bytes);
@@ -3015,6 +3026,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: Some(b"stray-grant".to_vec()),
+            grant_revoke: None,
         };
         let payload_bytes = encode_deposit_payload(&payload).expect("encode");
         let sealed = seal_payload_bytes(&payload_bytes);

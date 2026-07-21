@@ -1084,6 +1084,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
 
         let cert_bytes = harmony_owner::cbor::to_canonical(&s.cert).expect("encode cert");
@@ -1334,6 +1335,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let cert_bytes =
             harmony_owner::cbor::to_canonical(&world.c_quorum_cert).expect("encode cert");

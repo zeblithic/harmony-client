@@ -78,6 +78,17 @@ pub const GRANT_DEPOSIT_MARKER: &[u8] = b"zeb674-file-grant";
 /// [`DEPOSIT_MAX_FRAME_BYTES`] whole-frame cap.
 pub const MAX_DEPOSIT_GRANT_BYTES: usize = 64 * 1024;
 
+/// ZEB-730: ack marker returned for a standalone file-grant *revoke* deposit
+/// (no message CID). Mirrors `GRANT_DEPOSIT_MARKER`; the sender binds the ack to
+/// this value for a `grant_revoke` request.
+pub const GRANT_REVOKE_DEPOSIT_MARKER: &[u8] = b"zeb730-grant-revoke";
+
+/// ZEB-730: per-deposit cap on the piggybacked `grant_revoke` bytes. A revoke
+/// carries a single 32-byte root ContentId as canonical CBOR (~35 B); 256 is
+/// generous headroom that still bars a malicious sender from inflating
+/// butler/relay storage via the field. Fail-closed on overflow.
+pub const MAX_DEPOSIT_GRANT_REVOKE_BYTES: usize = 256;
+
 /// Maximum number of [`crate::reachability_record::ButlerSetEntry`]s carried
 /// in the pkarr routing blob's butler set (spec §3: ordered priority list,
 /// max 2 in v1). Readers truncate anything longer (defence against oversized
@@ -264,6 +275,20 @@ pub struct DepositPayload {
         with = "serde_bytes"
     )]
     pub grant_push: Option<Vec<u8>>,
+    /// ZEB-730: owner→grantee file-grant revoke. Canonical CBOR of the revoked
+    /// root ContentId ([u8;32]). The whole `DepositPayload` is frame-sealed to
+    /// the recipient, so — unlike `grant_push` (which per-device-seals a DEK
+    /// secret) — this carries the CID in the clear inside the seal: there is no
+    /// secret here the grantee doesn't already hold, hence no inner seal. Sender
+    /// is the butler-verified `frame.sender_owner`, never a payload claim. `None`
+    /// for message / invite / revocation / grant / legacy deposits.
+    #[serde(
+        rename = "gr",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub grant_revoke: Option<Vec<u8>>,
 }
 
 // Manual CanonicalPayload registration (the `impl_canonical!` macro in
@@ -348,6 +373,28 @@ pub fn encode_deposit_payload(payload: &DepositPayload) -> Result<Vec<u8>, Depos
 /// Decode a [`DepositPayload`] from canonical CBOR (trailing bytes rejected).
 pub fn decode_deposit_payload(bytes: &[u8]) -> Result<DepositPayload, DepositWireError> {
     canonical_cbor_decode(bytes).map_err(|e| DepositWireError::Decode(format!("{e}")))
+}
+
+/// ZEB-730: encode a revoked root ContentId as the canonical CBOR of a 32-byte
+/// string — the wire value carried in [`DepositPayload::grant_revoke`]. A
+/// fixed-size 32-byte input can never fail to encode.
+pub fn encode_grant_revoke(cid: [u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(&serde_bytes::Bytes::new(&cid), &mut buf)
+        .expect("encode_grant_revoke: fixed-size input never fails");
+    buf
+}
+
+/// ZEB-730: decode a [`DepositPayload::grant_revoke`] wire value back to the
+/// revoked root ContentId. Rejects any non-32-byte payload (fail-closed).
+pub fn decode_grant_revoke(bytes: &[u8]) -> Result<[u8; 32], String> {
+    let buf: serde_bytes::ByteBuf =
+        ciborium::from_reader(bytes).map_err(|e| format!("grant_revoke decode: {e}"))?;
+    let arr: [u8; 32] = buf
+        .as_ref()
+        .try_into()
+        .map_err(|_| "grant_revoke: not 32 bytes".to_string())?;
+    Ok(arr)
 }
 
 /// Write `body` as a `[u32 LE length-prefix][body]` frame. Rejects bodies
@@ -440,6 +487,13 @@ pub struct ButlerDepositRequest {
     /// `message_cid`/`cidnotify_packet`/`invite_packet`/`revocation_push` are all
     /// `None`, `space_id` is zero, and the ack binds to `GRANT_DEPOSIT_MARKER`.
     pub grant_push: Option<Vec<u8>>,
+    /// ZEB-730: opaque `grant_revoke` wire bytes (canonical CBOR of the revoked
+    /// root ContentId — `butler_deposit::encode_grant_revoke`). When `Some`, this
+    /// is a pure file-grant revoke deposit —
+    /// `message_cid`/`cidnotify_packet`/`invite_packet`/`revocation_push`/`grant_push`
+    /// are all `None`, `space_id` is zero, and the ack binds to
+    /// `GRANT_REVOKE_DEPOSIT_MARKER`.
+    pub grant_revoke: Option<Vec<u8>>,
     /// Wall-clock now (ms) at candidacy time — drives the `bs_at` freshness
     /// check against the resolved routing blob.
     pub now_ms: u64,
@@ -714,6 +768,7 @@ impl ButlerDepositClient for IrohButlerDepositClient {
             // `GRANT_DEPOSIT_MARKER` and persists under `grant_key`). The butler
             // cannot open the seals (`butler_cannot_open_grant_push`).
             grant_push: req.grant_push.clone(),
+            grant_revoke: None,
         };
 
         // 3. Priority order, first ack wins. The frame is rebuilt per
@@ -849,10 +904,78 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&payload).expect("encode");
         let back = decode_deposit_payload(&bytes).expect("decode");
         assert_eq!(back, payload);
+    }
+
+    /// ZEB-730: a `DepositPayload` carrying ONLY `grant_revoke` (all other
+    /// sub-payloads `None`, `storage_blob` empty) round-trips byte-identically,
+    /// and the carried CBOR decodes back to the revoked root ContentId.
+    #[test]
+    fn deposit_payload_round_trips_grant_revoke() {
+        let cid = [7u8; 32];
+        let payload = DepositPayload {
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: Some(encode_grant_revoke(cid)),
+        };
+        let bytes = encode_deposit_payload(&payload).expect("encode");
+        let decoded: DepositPayload = decode_deposit_payload(&bytes).expect("decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            decode_grant_revoke(decoded.grant_revoke.as_deref().unwrap()).unwrap(),
+            cid
+        );
+
+        // A legacy payload (no `gr` key) decodes grant_revoke to None, and the
+        // `gr` key is omitted entirely when grant_revoke is None.
+        let legacy = DepositPayload {
+            cidnotify_packet: Some(vec![9]),
+            storage_blob: vec![1],
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: None,
+        };
+        let lbytes = encode_deposit_payload(&legacy).expect("encode legacy");
+        assert_eq!(decode_deposit_payload(&lbytes).unwrap().grant_revoke, None);
+        assert!(
+            !lbytes.windows(2).any(|w| w == b"gr"),
+            "gr key omitted when grant_revoke is None"
+        );
+    }
+
+    /// ZEB-730: `encode_grant_revoke`/`decode_grant_revoke` round-trip a
+    /// [u8;32] ContentId through canonical CBOR.
+    #[test]
+    fn encode_grant_revoke_round_trips() {
+        let cid = [0xABu8; 32];
+        assert_eq!(decode_grant_revoke(&encode_grant_revoke(cid)).unwrap(), cid);
+    }
+
+    /// ZEB-730: `decode_grant_revoke` fails closed on non-32-byte / non-CBOR
+    /// garbage rather than silently truncating or padding.
+    #[test]
+    fn decode_grant_revoke_rejects_garbage() {
+        assert!(decode_grant_revoke(&[0x00, 0x01, 0x02]).is_err());
+        // A 31-byte CBOR byte string is well-formed CBOR but the wrong length.
+        let short = encode_grant_revoke_len(31);
+        assert!(decode_grant_revoke(&short).is_err());
+    }
+
+    /// Local helper: canonical CBOR of an `n`-byte all-zero byte string, to
+    /// exercise `decode_grant_revoke`'s length check with well-formed CBOR.
+    fn encode_grant_revoke_len(n: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&serde_bytes::Bytes::new(&vec![0u8; n]), &mut buf)
+            .expect("encode fixed byte string");
+        buf
     }
 
     #[test]
@@ -863,6 +986,7 @@ mod tests {
             invite_packet: None,
             revocation_push: Some(vec![0x05, 1, 2, 3]),
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&with_rev).unwrap();
         assert_eq!(decode_deposit_payload(&bytes).unwrap(), with_rev);
@@ -874,6 +998,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let lbytes = encode_deposit_payload(&legacy).unwrap();
         assert_eq!(
@@ -891,6 +1016,7 @@ mod tests {
             invite_packet: Some(vec![7, 8, 9]),
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&with_invite).expect("encode");
         assert_eq!(decode_deposit_payload(&bytes).expect("decode"), with_invite);
@@ -902,6 +1028,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes_none = encode_deposit_payload(&without).expect("encode none");
         assert_eq!(
@@ -944,6 +1071,7 @@ mod tests {
             invite_packet: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&invite_only).expect("encode invite-only");
         assert_eq!(
@@ -967,6 +1095,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: Some(vec![0xAA, 0xBB, 0xCC, 0xDD]),
+            grant_revoke: None,
         };
         let bytes = encode_deposit_payload(&with_grant).expect("encode grant_push");
         assert_eq!(
@@ -982,6 +1111,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
         };
         let bytes_none = encode_deposit_payload(&without_grant).expect("encode none");
         assert_eq!(
@@ -1038,6 +1168,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: Some(grant_push_bytes.clone()),
+            grant_revoke: None,
         };
         let wire = encode_deposit_payload(&payload).expect("encode payload with grant_push");
         let decoded = decode_deposit_payload(&wire).expect("decode payload with grant_push");

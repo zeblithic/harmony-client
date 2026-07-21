@@ -66,6 +66,20 @@ pub struct DmInboxEntry {
         with = "serde_bytes"
     )]
     pub grant_push: Option<Vec<u8>>,
+    /// ZEB-730: opaque `grant_revoke` wire value (canonical CBOR of the revoked
+    /// root ContentId — `butler_deposit::encode_grant_revoke`), carried through
+    /// from the sealed `DepositPayload` by the butler acceptor. Applied on recover
+    /// via `file_sharing::ingest_grant_revoke`. `None` for message / invite /
+    /// revocation / grant / legacy deposits. Symmetric to the other optional
+    /// sub-payloads (`cn`/`iv`/`rp`/`gp`); backward-compatible since absent →
+    /// `None`.
+    #[serde(
+        rename = "gr",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes"
+    )]
+    pub grant_revoke: Option<Vec<u8>>,
     #[serde(rename = "da")]
     pub deposited_at: Hlc,
     /// SP1 device_id (64-hex).
@@ -216,6 +230,7 @@ mod tests {
             invite_packet: None,
             revocation_push: None,
             grant_push: None,
+            grant_revoke: None,
             deposited_at: at,
             deposited_by: by.into(),
             ingested_by: ig.iter().map(|s| s.to_string()).collect(),
@@ -442,6 +457,7 @@ mod tests {
             invite_packet: None,
             revocation_push: Some(vec![0x05, 0xAA, 0xBB]),
             grant_push: None,
+            grant_revoke: None,
             deposited_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
