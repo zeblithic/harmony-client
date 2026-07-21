@@ -619,13 +619,19 @@ mod tests {
         let tree = test_tree();
         let dek = generate_file_dek();
         let sealed = seal_dek_at_rest(&tree, &dek).expect("seal");
-        assert_ne!(
-            sealed.as_slice(),
-            dek.as_bytes().as_slice(),
-            "the sealed-at-rest blob must not be the plaintext DEK"
-        );
-        // nonce(12) + ciphertext(32) + tag(16) = 60 bytes.
+        // Structure: nonce(12) + ciphertext(32) + tag(16) = 60 bytes.
         assert_eq!(sealed.len(), 60);
+        // The raw DEK must not appear VERBATIM anywhere in the sealed blob — a
+        // length inequality alone would pass even if the DEK were embedded
+        // beside padding. Scan every 32-byte window.
+        let raw: &[u8] = dek.as_bytes();
+        assert!(
+            !sealed.windows(raw.len()).any(|w| w == raw),
+            "the raw DEK must not appear verbatim in the sealed-at-rest blob"
+        );
+        // Positive proof: the seal is reversible under the same tree.
+        let opened = open_dek_at_rest(&tree, &sealed).expect("open");
+        assert_eq!(opened.as_bytes(), dek.as_bytes());
     }
 
     #[test]
