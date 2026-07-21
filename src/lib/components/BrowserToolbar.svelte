@@ -18,7 +18,7 @@
     onViewModeChange: (mode: FileViewMode) => void;
     searchQuery: string;
     onSearchChange: (query: string) => void;
-    onUploadClick: () => void;
+    onUploadClick: (encrypted?: boolean) => void;
     onCleanupClick: () => void;
     onNewFolderClick?: () => void;
     onAddFolderClick?: () => void;
@@ -26,6 +26,15 @@
     section: ContentSection;
     onSectionChange: (section: ContentSection) => void;
   } = $props();
+
+  // ZEB-674 Gap A: local toggle controlling whether the *next* "Add files"
+  // upload routes through the encrypted (private, per-file-DEK) ingest path
+  // instead of the default unencrypted one. Defaults OFF so existing
+  // behavior is unchanged unless a user opts in. Encrypted files stay
+  // private and can be shared with specific people via the file detail
+  // panel's "Shared with" list; unencrypted files become public once
+  // published.
+  let encryptOnUpload = $state(false);
 </script>
 
 <div class="browser-toolbar">
@@ -72,7 +81,18 @@
           aria-pressed={viewMode === 'grid'}
           onclick={() => onViewModeChange('grid')}
         >⊞</button>
-        <button class="action-btn" onclick={onUploadClick} aria-label="Add files">⤓ Add files</button>
+        <button class="action-btn" onclick={() => onUploadClick(encryptOnUpload)} aria-label="Add files">⤓ Add files</button>
+        <label
+          class="encrypt-toggle"
+          title="Encrypted files are private and can be shared with specific people via &quot;Shared with&quot;. Unencrypted files are public once published."
+        >
+          <input
+            type="checkbox"
+            checked={encryptOnUpload}
+            onchange={(e) => { encryptOnUpload = e.currentTarget.checked; }}
+          />
+          Encrypt (private)
+        </label>
         {#if onNewFolderClick}
           <button class="action-btn" onclick={onNewFolderClick} aria-label="New Folder">📁 New Folder</button>
         {/if}
@@ -201,6 +221,27 @@
   .action-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
+  }
+
+  .encrypt-toggle {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .encrypt-toggle input {
+    cursor: pointer;
+  }
+
+  .encrypt-toggle:has(input:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: 4px;
   }
 
   .view-btn:focus-visible {

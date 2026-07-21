@@ -3151,9 +3151,13 @@
     }
   }
 
-  async function handleFileUploadClick() {
+  async function handleFileUploadClick(encrypted?: boolean) {
     try {
-      const item = await fileManagerService.ingest(currentFolderCid);
+      // ZEB-674 Gap A: BrowserToolbar's "Encrypt (private)" checkbox threads
+      // its state through here. Explicit `{ encrypted: ... }` (rather than
+      // relying on the ingest() default) keeps the toggle's intent visible
+      // at the call site.
+      const item = await fileManagerService.ingest(currentFolderCid, { encrypted: encrypted === true });
       if (item) fileManagerVersion++;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
