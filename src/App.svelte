@@ -74,7 +74,7 @@
   import * as stq8ProfileStorage from './lib/stq8-profile-storage';
   import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
-  import { FileManagerService, unreadReceivedCount } from './lib/file-manager-service';
+  import { FileManagerService, unreadReceivedCount, nextSharedLastSeen } from './lib/file-manager-service';
   import { StorageBuddyService } from './lib/storage-buddy-service';
   import type { ContributionSummaryDto, StorageBuddyDto } from './lib/storage-buddy-service';
   import StorageBuddySheet from './lib/components/StorageBuddySheet.svelte';
@@ -3091,9 +3091,13 @@
   function markSharedSeen() {
     // Clear the badge: last-seen = the newest received_at we know about (or now,
     // so a later-clock grant that arrives before this write still can't re-light
-    // a badge the user has already looked at).
-    const newest = (receivedFiles ?? []).reduce((m, f) => Math.max(m, f.receivedAt), 0);
-    localStorage.setItem(SWM_LAST_SEEN_KEY, String(Math.max(newest, Date.now())));
+    // a badge the user has already looked at). A FAILED/unresolved load
+    // (receivedFiles === null) must NOT advance the watermark — otherwise a
+    // grant that arrived while this load was failing gets silently marked
+    // seen and never re-badges, even though the user only ever saw "Loading…".
+    const next = nextSharedLastSeen(receivedFiles, Date.now());
+    if (next === null) return;
+    localStorage.setItem(SWM_LAST_SEEN_KEY, String(next));
     recomputeSharedUnread();
   }
 

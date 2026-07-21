@@ -36,6 +36,16 @@ export function unreadReceivedCount(
   return files.filter((f) => f.receivedAt > lastSeenMs).length;
 }
 
+/** Next value for the "last seen" badge watermark, or null = do not advance it.
+ *  A failed/unresolved load (files === null) must NOT advance the watermark —
+ *  else pre-existing grants get silently marked seen and never re-badge. The
+ *  proven-empty ([]) case DOES advance (there is genuinely nothing unseen). */
+export function nextSharedLastSeen(files: ReceivedFile[] | null, nowMs: number): number | null {
+  if (files === null) return null;
+  const newest = files.reduce((m, f) => Math.max(m, f.receivedAt), 0);
+  return Math.max(newest, nowMs);
+}
+
 /** Wire format returned by the ingest_content Tauri command. */
 interface IngestResult {
   sidecarId: string;

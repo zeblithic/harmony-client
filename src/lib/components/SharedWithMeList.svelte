@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ReceivedFile } from '../types';
+  import { formatBytes, relativeTime } from '../file-utils';
 
   let {
     files,
@@ -13,12 +14,6 @@
     files: ReceivedFile[] | null;
     onDownload: (file: ReceivedFile) => void;
   } = $props();
-
-  function fmtSize(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  }
 </script>
 
 <section class="shared-with-me" aria-label="Shared with me">
@@ -32,7 +27,7 @@
         <li class="swm-row">
           <div class="swm-meta">
             <span class="swm-name">{file.fileName}</span>
-            <span class="swm-sub">Shared by {file.granterDisplay} · {fmtSize(file.fileSize)}</span>
+            <span class="swm-sub">Shared by {file.granterDisplay} · {formatBytes(file.fileSize)} · {relativeTime(file.receivedAt)}</span>
           </div>
           <button type="button" class="swm-download" onclick={() => onDownload(file)}>
             Download

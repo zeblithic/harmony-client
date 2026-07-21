@@ -3,6 +3,7 @@ import {
   FileManagerService,
   inferCategory,
   unreadReceivedCount,
+  nextSharedLastSeen,
   type ContentAnnouncementEvent,
 } from './file-manager-service';
 import { createMockAdapter } from './test-utils';
@@ -775,6 +776,30 @@ describe('FileManagerService', () => {
     expect(unreadReceivedCount(files, 300)).toBe(0); // strictly-newer
     expect(unreadReceivedCount([], 0)).toBe(0);
     expect(unreadReceivedCount(null, 0)).toBe(0); // unresolved → no badge
+  });
+
+  // ── nextSharedLastSeen (ZEB-723 fix-wave) ───────────────────────────
+  // A FAILED/unresolved load (files === null) must NOT advance the "last
+  // seen" watermark — else a grant that arrived while offline gets silently
+  // marked seen and never re-badges, even though the user only saw
+  // "Loading…". The proven-empty ([]) case DOES advance.
+
+  it('nextSharedLastSeen does not advance the watermark on a failed/unresolved load (null)', () => {
+    expect(nextSharedLastSeen(null, 1_000)).toBeNull();
+  });
+
+  it('nextSharedLastSeen advances to nowMs for a proven-empty load ([])', () => {
+    expect(nextSharedLastSeen([], 1_000)).toBe(1_000);
+  });
+
+  it('nextSharedLastSeen advances to the newest receivedAt when it is newer than nowMs', () => {
+    const files = [mkReceived('a', 500), mkReceived('b', 5_000), mkReceived('c', 2_000)];
+    expect(nextSharedLastSeen(files, 1_000)).toBe(5_000);
+  });
+
+  it('nextSharedLastSeen advances to nowMs when it is newer than every receivedAt', () => {
+    const files = [mkReceived('a', 100), mkReceived('b', 200)];
+    expect(nextSharedLastSeen(files, 1_000)).toBe(1_000);
   });
 
   it('listReceivedGrants maps the wire DTO', async () => {
