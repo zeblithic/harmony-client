@@ -18,7 +18,7 @@
 - **Keychain isolation (ZEB-428):** all new Rust tests build `OwnerState` / `NodeState` directly (no mint, no `KeychainStore::new()`) — safe by avoidance, exactly like `tests/file_sharing_grants.rs` and the existing `file_share_ipc_tests`.
 - **`ReceivedGrantDto` is NOT a canonical-CBOR wire type** — it is a frontend projection (serde JSON camelCase), never `canonical_cbor_encode`d — so the same-length-key rule that governs `ReceivedFileGrant`/`GrantEntry` does NOT apply to it.
 - **Scope:** download-only (no in-app preview), badge-only (no toast). No grantee-side dismiss/hide.
-- **Gates (all must pass before PR):** from `src-tauri/`: `cargo fmt --all -- --check` · `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` · `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. From repo root: `npx tsc --noEmit` · `npx vitest run`. During iterative dev use `scripts/test-select --context task`; the final pre-PR sweep is the full commands above.
+- **Gates (all must pass before PR):** from `src-tauri/`: `cargo fmt --all -- --check` · `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` · `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. From repo root: `npx tsc --noEmit` · `npx vitest run`. During iterative dev use `scripts/test-select --context task`, and paste its printed `round=… bucket=…` summary line into the task report so the selection is auditable; the final pre-PR sweep is the full commands above.
 
 ---
 

@@ -3089,7 +3089,10 @@
       return true;
     } catch (err) {
       if (req !== receivedFilesReq) return false;
-      console.error('listReceivedGrants failed:', err);
+      // Normalize both production (string) and test (Error) rejection shapes
+      // before logging (CLAUDE.md "Tauri IPC error extraction").
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('listReceivedGrants failed:', msg);
       receivedFiles = null; // unresolved, NOT [] (null-until-resolved honesty)
       recomputeSharedUnread();
       return false;
