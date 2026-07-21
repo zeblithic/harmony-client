@@ -26451,6 +26451,11 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
 /// ~1 MiB MSVC default and overflows on `serve` boot. Driving CLI entries on a
 /// thread we size ourselves removes the dependency on the link-time `/STACK`
 /// value on every platform. Mirrors the `harmony-runtime` GUI path above.
+///
+/// The panic → exit-1 contract assumes `panic = "unwind"` (the default) so
+/// `join()` observes the panic. Under `panic = "abort"` a panicking entry would
+/// `SIGABRT` the process instead — acceptable (still non-zero), but the code
+/// path here would not run.
 pub fn run_on_large_stack<F>(name: &str, f: F) -> i32
 where
     F: FnOnce() -> i32 + Send + 'static,
@@ -26495,8 +26500,13 @@ mod run_on_large_stack_tests {
 
     #[test]
     fn runs_a_closure_needing_a_multi_mib_stack_frame() {
-        // A 4 MiB stack frame overflows the ~1 MiB Windows main-thread default
-        // that a ZEB-519 repo-root build links; on the sized thread it is fine.
+        // Runs a closure with a 4 MiB stack frame through the helper. This is a
+        // weak sizing check, not a proof: the test env pins RUST_MIN_STACK=8 MiB
+        // (root .cargo/config.toml), so a plain spawn would survive the frame
+        // too — it would only overflow on the ~1 MiB Windows main-thread default
+        // a ZEB-519 repo-root build links, which we can't reproduce in-process.
+        // It mainly guards that the helper runs the closure and returns its
+        // value; the real overflow backstop is the serve-spawn e2e path.
         let mib = run_on_large_stack("test-stack", || {
             let big = [0u8; 4 * 1024 * 1024];
             std::hint::black_box(&big);
