@@ -20099,11 +20099,16 @@ pub(crate) async fn list_grants_impl(
 }
 
 /// `grant_read(cid, granteeAddress)` core: share read access to an encrypted
-/// file with an active friend. Rejects a public CID / non-friend with the stable
-/// `ineligible:` prefix; otherwise unseals the DEK, seals the grant per grantee
-/// device, allowlists the CID's subtree for member serve, records the owner-local
-/// grant (notify_dirty + persist — ZEB-709), emits `grants-updated`, and (Phase
-/// 2) deposits the pure-grant to the grantee's butler set (best-effort).
+/// file with an active friend. Rejects a public CID / non-friend / a grantee
+/// with no resolvable device keys with the stable `ineligible:` prefix (see
+/// `file_sharing::build_grant_push`'s three gates); otherwise unseals the DEK,
+/// seals the grant per grantee device, allowlists the CID's subtree for member
+/// serve, records the owner-local grant (notify_dirty + persist — ZEB-709),
+/// emits `grants-updated`, and (Phase 2) deposits the pure-grant to the
+/// grantee's butler set (best-effort). `build_grant_push`'s `Err` short-circuits
+/// via `?` BEFORE the allowlist/record/emit/deposit steps below, so a rejected
+/// grant leaves no trace — nothing is recorded for a grant the backend cannot
+/// deliver (ZEB-674 T6 review fix).
 pub(crate) async fn grant_read_impl(
     state: &Mutex<NodeState>,
     sink: &dyn crate::node_event_sink::NodeEventSink,

@@ -300,6 +300,16 @@ pub const INELIGIBLE_PUBLIC: &str = "ineligible: only encrypted files can be sha
 /// transport, so the grantee must be an ACTIVE friend.
 pub const INELIGIBLE_NON_FRIEND: &str = "ineligible: can only share with friends";
 
+/// Stable `ineligible:`-prefixed rejection: the grantee has ZERO resolvable
+/// device X25519 keys (`grantee_device_x25519s` returned empty — their
+/// device-identity-pubs haven't propagated to this owner's fleet yet). There
+/// is no device to seal the grant to, so recording the grant now would let
+/// the owner's ShareList claim "shared" (with a `grantedAt`) for a delivery
+/// the backend cannot make — the render-only-what-you-can-deliver rule this
+/// feature is built on. A later re-share reaches the device once its key is
+/// learned.
+pub const INELIGIBLE_NO_DEVICES: &str = "ineligible: recipient's devices not yet reachable";
+
 /// The built, ready-to-deposit outcome of [`build_grant_push`] paired with the
 /// resolved grantee — handed from the Phase-1 IPC core to the Phase-2 deposit
 /// send so the send rung (`lib.rs`) delivers exactly these bytes to exactly this
@@ -309,8 +319,9 @@ pub struct GrantSendPlan {
     /// The grantee's master `OwnerAddr` (deposit recipient).
     pub grantee_owner: OwnerAddr,
     /// The `DepositPayload.grant_push` wire value (canonical CBOR of the
-    /// per-device sealed blobs). Empty-list CBOR when the grantee has no known
-    /// device X25519s (the honest new-device edge — nothing to open yet).
+    /// per-device sealed blobs). [`build_grant_push`] never returns an
+    /// empty-list `grant_push` — a grantee with no known device X25519s is
+    /// rejected with [`INELIGIBLE_NO_DEVICES`] before this is built.
     pub grant_push: Vec<u8>,
 }
 
@@ -348,16 +359,22 @@ pub fn encode_grant_push(sealed_blobs: &[Vec<u8>]) -> Vec<u8> {
 /// value WITHOUT mutating `state`, allowlisting, or touching the network (Phase
 /// 1 IPC core — pure over `&OwnerState`).
 ///
-/// Enforces the two honesty gates in order — the file must have been encrypted
-/// at ingest ([`INELIGIBLE_PUBLIC`] when `file_deks` lacks `cid`) and the grantee
-/// must be an ACTIVE friend ([`INELIGIBLE_NON_FRIEND`]) — then unseals the
-/// owner's at-rest DEK, wraps `{cid, file_meta, dek}` sealed per grantee device
-/// ([`seal_grant_for_devices`]), and returns the CBOR `grant_push` bytes.
+/// Enforces THREE honesty gates in order — the file must have been encrypted
+/// at ingest ([`INELIGIBLE_PUBLIC`] when `file_deks` lacks `cid`), the grantee
+/// must be an ACTIVE friend ([`INELIGIBLE_NON_FRIEND`]), and the grantee must
+/// have at least one resolvable device X25519 key
+/// ([`INELIGIBLE_NO_DEVICES`] when [`grantee_device_x25519s`] returns empty —
+/// their device-identity-pubs haven't propagated to this owner's fleet yet)
+/// — then unseals the owner's at-rest DEK, wraps `{cid, file_meta, dek}`
+/// sealed per grantee device ([`seal_grant_for_devices`]), and returns the
+/// CBOR `grant_push` bytes.
 ///
-/// A grantee with no learned device X25519s yields an empty-list `grant_push`
-/// (no blob to open) rather than an error — the design's explicit
-/// "new-device re-seal deferred" edge; the owner's ShareList still records the
-/// intent and a later re-share reaches the device once its key is learned.
+/// The no-devices gate matters because the caller (`grant_read_impl`) records
+/// the `GrantEntry` / allowlists the CID / emits `grants-updated` only AFTER
+/// this returns `Ok` — an empty-list `grant_push` would let those all fire
+/// for a grant with nothing to open, leaving the owner's ShareList claiming
+/// "shared" for a delivery the backend cannot make. A later re-share reaches
+/// the device once its key is learned.
 pub fn build_grant_push(
     state: &OwnerState,
     keytree: &KeyTree,
@@ -389,6 +406,13 @@ pub fn build_grant_push(
         dek: *dek.as_bytes(),
     };
     let devices = grantee_device_x25519s(state, grantee_owner);
+    // Gate 3 — nothing to open yet. Reject rather than emit an empty
+    // grant_push: recording/allowlisting/emitting for a grant the grantee
+    // cannot decrypt would be a completed-grant claim the backend cannot
+    // deliver (ZEB-674 T6 review fix).
+    if devices.is_empty() {
+        return Err(INELIGIBLE_NO_DEVICES.to_string());
+    }
     let sealed =
         seal_grant_for_devices(&inner, &devices).map_err(|e| format!("seal grant: {e}"))?;
     Ok(encode_grant_push(&sealed))
@@ -628,6 +652,29 @@ mod tests {
             .expect_err("public cid must be ineligible");
         assert!(err.starts_with("ineligible:"), "stable prefix: {err}");
         assert_eq!(err, INELIGIBLE_PUBLIC);
+    }
+
+    #[test]
+    fn grant_read_rejects_when_no_device_keys() {
+        // Encrypted file present, grantee IS an Active friend, but their
+        // device-identity-pubs have not propagated yet — no
+        // `owner_device_cache` entry at all, so `grantee_device_x25519s`
+        // resolves empty. There is no device to seal the grant to; recording
+        // it anyway would let the owner's ShareList claim "shared" for a
+        // delivery the backend cannot make (the honesty fix under test).
+        let tree = test_tree();
+        let mut state = seed_grantable(&tree, None);
+        state.owner_device_cache.devices.remove(&GRANTEE);
+        let err = build_grant_push(&state, &tree, CID, GRANTEE, "f".into(), 1, "m".into())
+            .expect_err("grantee with no resolvable device keys must be ineligible");
+        assert!(err.starts_with("ineligible:"), "stable prefix: {err}");
+        assert_eq!(err, INELIGIBLE_NO_DEVICES);
+        // build_grant_push is pure (never mutates state on any path, success
+        // or failure) — confirm nothing was recorded for the rejected grant.
+        assert!(
+            state.file_grants.get(&CID).is_none(),
+            "a rejected grant must record no GrantEntry"
+        );
     }
 
     #[test]
