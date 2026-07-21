@@ -292,6 +292,89 @@ async fn received_grant_file_decrypts_to_plaintext() {
     );
 }
 
+/// COMMUNITY-SAFETY guarantee: a community/space artifact also carries the
+/// ENCRYPTED flag, but its key lives in the epoch-key path — NOT this node's
+/// personal `file_deks` / `received_file_grants`. `decrypt_personal_file_if_held`
+/// must return such bytes UNCHANGED (the "encrypted but no personal DEK held"
+/// branch) so those artifacts keep flowing to `decrypt_and_verify_artifact`
+/// undisturbed. This is distinct from `public_file_passes_through_unchanged`,
+/// which exercises the flag-CLEAR path; here the flag is SET yet no personal
+/// DEK is held. Personal decrypt must never eat a community payload.
+#[test]
+fn encrypted_but_no_personal_dek_passes_through_unchanged() {
+    let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
+    let state = OwnerState::default();
+
+    let bytes = b"community epoch-encrypted artifact bytes".to_vec();
+    // An encrypted-flag CID with NO matching entry in file_deks/received_file_grants.
+    let enc_flags = ContentFlags {
+        encrypted: true,
+        ..ContentFlags::default()
+    };
+    let cid = ContentId::for_book(&bytes, enc_flags).expect("encrypted cid");
+    assert!(
+        cid.flags().encrypted,
+        "sanity: CID carries the encrypted flag"
+    );
+    assert!(
+        state.file_deks.is_empty() && state.received_file_grants.is_empty(),
+        "sanity: node holds no personal DEK for this CID"
+    );
+
+    let out = harmony_app::decrypt_personal_file_if_held(bytes.clone(), cid, &state, &keytree)
+        .expect("no-personal-DEK path never errors");
+    assert_eq!(
+        out, bytes,
+        "encrypted community artifact with no personal DEK must pass through byte-for-byte"
+    );
+}
+
+/// TAMPER detection: a held DEK + a corrupted ciphertext must surface an `Err`
+/// (AEAD authentication failure), never silent corruption. After a real
+/// encrypted ingest, flipping one byte of the stored ciphertext and re-running
+/// decrypt-on-read proves the ChaCha20-Poly1305 tag rejects the modified body.
+#[tokio::test]
+async fn tampered_ciphertext_surfaces_error() {
+    let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+    let content_index = fresh_content_index();
+    let (ingest_tx, store) = spawn_recording_store();
+
+    let plaintext = b"ZEB-674 T12 tamper-detection path".to_vec();
+
+    let result = harmony_app::ingest_content_encrypted_inner(
+        &ingest_tx,
+        &content_index,
+        &crdt_state,
+        &keytree,
+        None,
+        plaintext.clone(),
+        "secret.txt".to_string(),
+    )
+    .await
+    .expect("encrypted ingest succeeds");
+
+    let cid = root_cid_from_hex(&result.cid);
+    let mut ciphertext = {
+        let s = store.lock().unwrap();
+        s.values().next().unwrap().clone()
+    };
+    // Flip the last byte, which lands in the Poly1305 tag, so authentication
+    // fails. (Any single-byte change to nonce/body/tag breaks AEAD; the tag
+    // byte makes the intent explicit.)
+    let last = ciphertext.len() - 1;
+    ciphertext[last] ^= 0xff;
+
+    let recovered = {
+        let st = crdt_state.lock().await;
+        harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &st, &keytree)
+    };
+    assert!(
+        recovered.is_err(),
+        "tampered ciphertext must surface a decrypt error, not silent corruption"
+    );
+}
+
 /// A sealed DEK stored on `OwnerState.file_deks` survives a save→reload cycle
 /// and still unseals to a usable DEK.
 #[test]
