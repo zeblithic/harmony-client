@@ -2581,9 +2581,10 @@ pub struct ReceivedFileGrant {
     /// Display file name (for the grantee's received-files UI).
     #[serde(rename = "nm")]
     pub file_name: String,
-    /// Stored (CAS) byte length of the file's content — for encrypted content
-    /// this includes the AEAD nonce+tag overhead (`encrypt_blob` prepends a
-    /// 12-byte nonce and appends a 16-byte tag, so it is plaintext length + 28).
+    /// Stored (CAS) byte length of the file's content. For v2 streaming-encrypted
+    /// content this is the chunked-AEAD ciphertext length: a 16-byte header plus,
+    /// per 64 KiB frame, a 16-byte tag (see `file_stream_crypto::v2_ciphertext_len`),
+    /// so it exceeds the plaintext length by the header + per-frame tag overhead.
     #[serde(rename = "sz")]
     pub file_size: u64,
     /// MIME type string.
