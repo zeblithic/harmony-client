@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Common issues hand-picked alpha testers may hit on `harmony-client` v0.1.0-alpha. If your problem isn't covered here, submit feedback via the **(?) → Submit Feedback** menu in the app — the form pre-fills environment info and (optionally) a redacted network diagnostic snapshot for you.
+Common issues testers may hit on `harmony-client`. If your problem isn't covered here, submit feedback via the **(?) → Submit Feedback** menu in the app — the form pre-fills environment info and (optionally) a redacted network diagnostic snapshot for you.
 
 ## Install + first-launch
 

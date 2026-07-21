@@ -1,6 +1,6 @@
 # Installing Harmony on Windows
 
-Harmony is in private alpha. These instructions cover the full install flow for tester machines running Windows 10 or 11 (x64).
+Harmony is in public alpha — anyone with the released client can create or join communities. These instructions cover the full install flow on Windows 10 or 11 (x64).
 
 ---
 
@@ -20,7 +20,7 @@ Harmony currently ships for 64-bit Windows only. ARM Windows is not yet supporte
 
 ## 2. Run the installer — SmartScreen workaround
 
-Double-click the `.exe` file. Because Harmony is an alpha build and does not yet have an extended-validation code-signing certificate, Windows SmartScreen will block it:
+Double-click the `.exe` file. Because Harmony ships without an extended-validation code-signing certificate (a deliberate choice, see below), Windows SmartScreen will block it:
 
 > **Windows protected your PC**
 > Microsoft Defender SmartScreen prevented an unrecognized app from starting.
@@ -34,7 +34,7 @@ This is expected. Here's how to get past it:
 
 After you install once, Windows trusts the app and won't warn you again for the same version.
 
-> **Why does this happen?** SmartScreen flags apps that don't have a recognized code-signing certificate. Harmony will be signed before public release; during private alpha we skip that cost.
+> **Why does this happen?** SmartScreen flags apps without a recognized code-signing certificate. Extended-validation certificates carry a recurring cost that Harmony — a small, self-funded project — **deliberately skips**; the app is fully functional unsigned, and the one-time approval above is all you'll ever need.
 
 ---
 

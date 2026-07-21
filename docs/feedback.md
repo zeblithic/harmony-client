@@ -19,7 +19,7 @@ Every feedback submission includes:
 
 - **`## Description`** — exactly what you typed, verbatim.
 - **`## Environment`** — four lines:
-  - App version (e.g., `0.1.0-alpha.1`)
+  - App version (e.g., `0.1.2`)
   - Platform (`macos` for macOS, `windows` for Windows, `linux` for Linux)
   - OS version (e.g., `15.0`)
   - Timestamp (ISO-8601 UTC of when you submitted)
