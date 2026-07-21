@@ -20614,8 +20614,7 @@ pub(crate) async fn dismiss_received_grant_impl(
     sink: &dyn crate::node_event_sink::NodeEventSink,
     cid: String,
 ) -> Result<(), String> {
-    let cid_hex = cid;
-    let cid = parse_cid_hex(&cid_hex)?;
+    let cid = parse_cid_hex(&cid)?;
 
     let (crdt_state, sync_engine) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -20634,10 +20633,14 @@ pub(crate) async fn dismiss_received_grant_impl(
         if let Some(engine) = sync_engine {
             engine.notify_dirty();
         }
+        // Emit the CANONICAL cid (hex of the parsed bytes), matching the ingest
+        // path's `shared-with-me-updated` payload — never the raw input string,
+        // which may be non-canonical (e.g. uppercase) and would not match the
+        // hex the grantee surface keys its rows by.
         crate::node_event_sink::emit_ser(
             sink,
             "shared-with-me-updated",
-            &serde_json::json!({ "cid": cid_hex }),
+            &serde_json::json!({ "cid": hex::encode(cid) }),
         );
     }
     Ok(())
@@ -21090,7 +21093,9 @@ mod file_share_ipc_tests {
         }
 
         let sink = crate::node_event_sink::RecordingSink::new();
-        dismiss_received_grant_impl(&state, &sink, hex::encode(cid))
+        // Pass a NON-canonical (uppercase) cid to prove the impl parses + emits
+        // the canonical lowercase hex, not the raw input string (Qodo bug #2).
+        dismiss_received_grant_impl(&state, &sink, hex::encode(cid).to_uppercase())
             .await
             .expect("dismiss ok");
 
@@ -21107,7 +21112,8 @@ mod file_share_ipc_tests {
                 "dismiss records the tombstone"
             );
         }
-        // The grantee "shared with me" surface is nudged to refresh.
+        // The grantee "shared with me" surface is nudged to refresh, with the
+        // CANONICAL (lowercase) cid — matching the ingest path's payload.
         let frames = sink.frames();
         assert_eq!(frames.len(), 1, "exactly one refresh event emitted");
         assert_eq!(frames[0].0, "shared-with-me-updated");

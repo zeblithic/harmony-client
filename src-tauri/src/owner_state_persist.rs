@@ -555,6 +555,19 @@ mod tests {
     }
 
     #[test]
+    fn pre_dismissed_received_grants_snapshot_loads_empty() {
+        // A V2 file serialized WITHOUT the dismiss-tombstone map (skipped on the
+        // wire when empty) must load to an empty map — backward-compat with
+        // snapshots written before ZEB-727.
+        let s = OwnerState::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert!(loaded.dismissed_received_grants.is_empty());
+    }
+
+    #[test]
     fn pre_received_file_grants_snapshot_loads_empty() {
         // A V2 file serialized WITHOUT the received-file-grants store (skipped on
         // the wire when empty) must load to an empty map — backward-compat with

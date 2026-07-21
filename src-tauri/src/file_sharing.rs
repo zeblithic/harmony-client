@@ -436,10 +436,17 @@ pub fn list_received_grants_inner(state: &OwnerState) -> Vec<ReceivedGrantDto> {
 /// not permanent. Pure; unit-testable without a live node.
 pub fn dismiss_received_grant_inner(state: &mut OwnerState, cid: [u8; 32], now_ms: u64) -> bool {
     let removed = state.received_file_grants.remove(&cid).is_some();
-    let slot = state.dismissed_received_grants.entry(cid).or_insert(0);
-    let prev = *slot;
-    *slot = (*slot).max(now_ms);
-    removed || *slot != prev
+    // Advance the LWW tombstone. Check presence explicitly rather than treating
+    // `0` as an "absent" sentinel (a real `dismissed_at` could be 0), so the
+    // returned change-signal is correct even at timestamp zero.
+    let advanced = match state.dismissed_received_grants.get(&cid) {
+        Some(&prev) if now_ms <= prev => false,
+        _ => {
+            state.dismissed_received_grants.insert(cid, now_ms);
+            true
+        }
+    };
+    removed || advanced
 }
 
 /// Encode per-device sealed grant blobs into the `DepositPayload.grant_push`

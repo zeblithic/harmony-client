@@ -500,25 +500,52 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         .file_grants
         .retain(|cid, _| !local.burned_content.contains(cid));
 
+    // ZEB-727: join the dismiss tombstones (LWW max per CID) BEFORE resolving
+    // duplicate received-grant records, so the union tie-break below can prefer
+    // an ACTIVE candidate over a dismissed one. Without this ordering a stale
+    // sibling's pre-dismissal grant could win the `sealed_dek` tie-break and
+    // clobber a fresh re-share, which the sweep would then delete — a re-share
+    // lost on merge (CodeRabbit/Qodo, converge round 1).
+    for (cid, dismissed_at) in dismissed_received_grants {
+        let slot = local.dismissed_received_grants.entry(cid).or_insert(0);
+        *slot = (*slot).max(dismissed_at);
+    }
+
     // ZEB-674 Task 4 / converge (CodeRabbit, Major): received-file grants —
     // GROW-ONLY union with a DETERMINISTIC tie-break per CID. A grantee's
     // sibling devices each ingest the SAME grant_push independently, and
     // `ingest_grant_push` reseals the DEK under the shared KeyTree with a FRESH
     // random nonce (and stamps a wall-clock `received_at`), so the two devices'
     // `ReceivedFileGrant` BYTES for a given CID differ even though both unseal
-    // to the same DEK. A first-writer-wins `or_insert` is NON-commutative
-    // (`merge(A,B)` keeps A's copy, `merge(B,A)` keeps B's), so the devices'
-    // canonically-encoded state roots would never become byte-identical and
-    // owner-state sync would churn forever. Resolve duplicates deterministically
-    // instead — keep the record with the lexicographically smaller `sealed_dek`,
-    // tie-broken by smaller `received_at` — so both devices pick the SAME whole
-    // record (including its `received_at`) and converge byte-for-byte. Both
-    // records unseal to the same DEK, so the observable key is unchanged.
+    // to the same DEK. A first-writer-wins `or_insert` is NON-commutative, so
+    // the devices' canonically-encoded state roots would never become
+    // byte-identical and owner-state sync would churn forever. Resolve
+    // duplicates deterministically:
+    //   1. ZEB-727: an ACTIVE grant (`received_at > dismissed_at`) beats a
+    //      dismissed one — a fresh re-share is never clobbered by a stale
+    //      sibling's pre-dismissal record (which the sweep would then delete).
+    //   2. Among records of the SAME active status, keep the lexicographically
+    //      smaller `sealed_dek`, tie-broken by smaller `received_at` — the
+    //      original ZEB-674 rule, unchanged when no dismissal is in play, so
+    //      both devices pick the SAME whole record and converge byte-for-byte.
+    // Both records unseal to the same DEK, so the observable key is unchanged.
     for (cid, grant) in received_file_grants {
         match local.received_file_grants.get(&cid) {
             Some(existing) => {
-                let incoming_wins = (grant.sealed_dek.as_slice(), grant.received_at)
-                    < (existing.sealed_dek.as_slice(), existing.received_at);
+                let dismissed_at = local.dismissed_received_grants.get(&cid).copied();
+                let active = |received_at: u64| match dismissed_at {
+                    Some(d) => received_at > d,
+                    None => true,
+                };
+                let incoming_wins = match (active(grant.received_at), active(existing.received_at))
+                {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => {
+                        (grant.sealed_dek.as_slice(), grant.received_at)
+                            < (existing.sealed_dek.as_slice(), existing.received_at)
+                    }
+                };
                 if incoming_wins {
                     local.received_file_grants.insert(cid, grant);
                 }
@@ -529,20 +556,14 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         }
     }
 
-    // ZEB-727: received-grant dismiss tombstones — LWW max-join per CID, then
-    // SWEEP `received_file_grants` against it. Placed AFTER the union loop above
-    // so a grant re-supplied by a stale sibling is immediately swept back out,
-    // and a tombstone arriving in THIS merge also cleans a pre-existing local
-    // entry. Unlike the permanent `burned_content` sweep, the predicate is
-    // LWW-timestamped — a grant survives iff `received_at > dismissed_at` — so a
-    // legitimate re-share (fresh ingest `received_at`) reactivates over an older
-    // dismissal (the shared file's root CID is stable → dismiss is reversible,
-    // contrast burn which is terminal). Same disjoint-field `retain` idiom as the
-    // burn sweep (retain `received_file_grants` while reading `dismissed_received_grants`).
-    for (cid, dismissed_at) in dismissed_received_grants {
-        let slot = local.dismissed_received_grants.entry(cid).or_insert(0);
-        *slot = (*slot).max(dismissed_at);
-    }
+    // ZEB-727: SWEEP `received_file_grants` against the (already-joined) dismiss
+    // tombstones. Runs AFTER the union so a grant re-supplied by a stale sibling
+    // is dropped, and a tombstone arriving in THIS merge also cleans a
+    // pre-existing local entry. LWW-timestamped (contrast the permanent
+    // `burned_content` sweep) — a grant survives iff `received_at > dismissed_at`,
+    // so a legitimate re-share (fresh ingest `received_at`) reactivates over an
+    // older dismissal (the shared file's root CID is stable → dismiss is
+    // reversible, unlike terminal burn). Same disjoint-field `retain` idiom.
     local
         .received_file_grants
         .retain(|cid, g| match local.dismissed_received_grants.get(cid) {
@@ -2873,6 +2894,71 @@ mod integration_tests {
         assert_eq!(
             a1.received_file_grants, b1.received_file_grants,
             "converges with the re-share present"
+        );
+    }
+
+    /// ZEB-727 converge round 1 (CodeRabbit/Qodo Major): a stale sibling holding
+    /// the PRE-DISMISSAL grant with a SMALLER `sealed_dek` must not win the union
+    /// tie-break and clobber a fresh re-share (which the sweep would then delete).
+    /// The active re-share (`received_at > dismissed_at`) wins over the dismissed
+    /// stale grant regardless of `sealed_dek` ordering. Without the active-status
+    /// precedence this drops a re-share the grantee legitimately received.
+    #[test]
+    fn re_share_survives_stale_grant_with_smaller_sealed_dek() {
+        use crate::owner_state_types::{OwnerAddr, ReceivedFileGrant};
+        let cid = [0x66u8; 32];
+        // Stale pre-dismissal grant: OLD received_at (100), SMALLER sealed_dek.
+        let stale = ReceivedFileGrant {
+            granter_owner: OwnerAddr([0x0a; 16]),
+            cid,
+            file_name: "f".into(),
+            file_size: 1,
+            mime: "application/octet-stream".into(),
+            sealed_dek: vec![0x01; 8], // sorts BEFORE the re-share's dek
+            received_at: 100,
+        };
+        // Fresh re-share: NEW received_at (300 > dismissed 200), LARGER sealed_dek.
+        let re_shared = ReceivedFileGrant {
+            sealed_dek: vec![0xFF; 8], // sorts AFTER the stale dek
+            received_at: 300,
+            ..stale.clone()
+        };
+
+        // Device A: dismissed at 200, then received the fresh re-share.
+        let mut a = OwnerState::default();
+        a.dismissed_received_grants.insert(cid, 200);
+        a.received_file_grants.insert(cid, re_shared.clone());
+
+        // Device B: a stale sibling — still holds the pre-dismissal grant and
+        // never saw the dismiss.
+        let mut b = OwnerState::default();
+        b.received_file_grants.insert(cid, stale.clone());
+
+        // A merges B: the stale grant's smaller sealed_dek must NOT win — the
+        // active re-share is preserved and survives the sweep.
+        let mut a1 = a.clone();
+        super::merge_remote_into_local(&mut a1, b.clone());
+        let got = a1
+            .received_file_grants
+            .get(&cid)
+            .expect("re-share must survive a merge with a stale smaller-dek sibling");
+        assert_eq!(
+            got.received_at, 300,
+            "the ACTIVE re-share wins the tie-break, not the stale dismissed grant"
+        );
+
+        // B merges A: learns the dismissal + the re-share; converges to the
+        // re-share present (300 > 200), byte-identically in both orders.
+        let mut b1 = b.clone();
+        super::merge_remote_into_local(&mut b1, a.clone());
+        assert_eq!(
+            b1.received_file_grants.get(&cid).map(|g| g.received_at),
+            Some(300),
+            "sibling converges on the active re-share"
+        );
+        assert_eq!(
+            a1.received_file_grants, b1.received_file_grants,
+            "byte-convergent in both merge orders"
         );
     }
 

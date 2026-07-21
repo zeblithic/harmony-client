@@ -148,44 +148,81 @@ v0.2.0 UI pass): the command is the backend contract; wiring a button to
 
 ### Projection (active filter)
 
-`list_received_grants_inner` (file_sharing.rs) filters to active grants —
+`list_received_grants_inner` (file_sharing.rs) iterates `.values()` and filters
+to active grants (keyed by the record's own `g.cid`, which equals the map key) —
 belt-and-suspenders with the merge sweep, and the same active-filter discipline
 ZEB-725 applied in `list_grants_inner`:
 
 ```rust
-.filter(|(cid, g)| {
-    state.dismissed_received_grants.get(*cid).map_or(true, |&d| g.received_at > d)
+.filter(|g| match state.dismissed_received_grants.get(&g.cid) {
+    Some(&dismissed_at) => g.received_at > dismissed_at,
+    None => true,
 })
 ```
 
 ### Merge convergence
 
-In `merge_remote_into_local`, LWW-max-join the tombstone map, then **sweep**
-`received_file_grants` against it **after** the existing union loop
-(owner_state_sync.rs), structurally identical to the `burned_content` block but
-with the `received_at > dismissed_at` predicate rather than set membership:
+`merge_remote_into_local` (owner_state_sync.rs) does three steps, **in order**:
+
+1. **Join the dismiss tombstones** (LWW `max` per CID) — *before* the grant
+   union, so step 2's tie-break can read the fully-merged `dismissed_at`.
+2. **Union the grants** with an active-status-first tie-break. The original
+   ZEB-674 rule kept the smaller `sealed_dek` (then smaller `received_at`), but
+   that alone loses a re-share: a stale sibling's pre-dismissal grant (older
+   `received_at`, but smaller `sealed_dek`) would win and then be swept in step 3,
+   dropping a re-share the grantee legitimately received (converge round 1,
+   CodeRabbit/Qodo Major). So an **active** candidate (`received_at >
+   dismissed_at`) beats a **dismissed** one; among records of the *same* active
+   status, the ZEB-674 `sealed_dek`/`received_at` rule stands (unchanged when no
+   dismissal is in play — the non-dismissal path is byte-identical to before).
+3. **Sweep** `received_file_grants` against the joined tombstones (`retain` keeps
+   a grant iff `received_at > dismissed_at`), removing any dismissed grant the
+   union re-added from a stale sibling.
 
 ```rust
-for (cid, dismissed_at) in dismissed_received_grants {          // LWW max-join
+// 1. join (before the union)
+for (cid, dismissed_at) in dismissed_received_grants {
     let slot = local.dismissed_received_grants.entry(cid).or_insert(0);
     *slot = (*slot).max(dismissed_at);
 }
-local.received_file_grants.retain(|cid, g| {                   // disjoint-field
-    local.dismissed_received_grants.get(cid).map_or(true, |&d| g.received_at > d)
+// 2. union with active-status-first tie-break
+for (cid, grant) in received_file_grants {
+    match local.received_file_grants.get(&cid) {
+        Some(existing) => {
+            let dismissed_at = local.dismissed_received_grants.get(&cid).copied();
+            let active = |received_at: u64| match dismissed_at {
+                Some(d) => received_at > d,
+                None => true,
+            };
+            let incoming_wins = match (active(grant.received_at), active(existing.received_at)) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => (grant.sealed_dek.as_slice(), grant.received_at)
+                    < (existing.sealed_dek.as_slice(), existing.received_at),
+            };
+            if incoming_wins {
+                local.received_file_grants.insert(cid, grant);
+            }
+        }
+        None => { local.received_file_grants.insert(cid, grant); }
+    }
+}
+// 3. sweep (disjoint-field retain, like the burned_content sweep)
+local.received_file_grants.retain(|cid, g| match local.dismissed_received_grants.get(cid) {
+    Some(&dismissed_at) => g.received_at > dismissed_at,
+    None => true,
 });
 ```
 
-(The disjoint-field borrow — `&mut received_file_grants` in `retain`,
-`&dismissed_received_grants` in the closure — compiles for the same reason the
-shipped `burned_content` sweep does.)
-
 **Convergence sketch.** `dismissed_received_grants` is a join-semilattice under
-per-key `max` (commutative, associative, idempotent). The sweep is a pure
-function of the merged tombstone map and the merged grants map, so the post-merge
-state is merge-order-independent. Device A dismissing while B still holds the
-grant converge to `{dismissed_at present, entry absent}` on both. A re-share
-(fresh `received_at > dismissed_at`) survives the sweep on both devices —
-reactivation converges too.
+per-key `max` (commutative, associative, idempotent). Step 2's winner is a pure
+function of the merged `dismissed_at` (so active-status agrees in both merge
+orders) with a total-order tie-break, and step 3 is a pure function of the merged
+tombstone and grant maps — so the post-merge state is merge-order-independent.
+Device A dismissing while B still holds the grant converge to `{dismissed_at
+present, entry absent}` on both. A re-share (fresh `received_at > dismissed_at`)
+wins the union over any stale dismissed record and survives the sweep on both
+devices — reactivation converges too.
 
 ## Scope
 
@@ -195,7 +232,8 @@ reactivation converges too.
 - `dismiss_received_grant_inner` + the `dismiss_received_grant` IPC command
   (file_sharing.rs, lib.rs); `notify_dirty` + `"shared-with-me-updated"` emit.
 - Active filter in `list_received_grants_inner` (file_sharing.rs).
-- Merge LWW-join + sweep (owner_state_sync.rs).
+- Merge: LWW tombstone join + active-status-first union tie-break + sweep
+  (owner_state_sync.rs).
 
 **Deferred (new follow-up ticket):**
 - **Trigger #2 — owner-revoke → grantee prune.** Needs a new revoke-push wire: a
@@ -231,10 +269,16 @@ Keychain-free, wall-clock-free; mirror the ZEB-722 merge/persist tests.
 6. **persistence round-trip** — `dismissed_received_grants` survives
    `save_crdt`/`load_crdt`; a pre-ZEB-727 snapshot (field absent) loads empty.
 7. **IPC** — `dismiss_received_grant_impl` mutates owner-state and (on change)
-   notify_dirty + emits `"shared-with-me-updated"` (mirror the ZEB-723 emit test).
+   notify_dirty + emits `"shared-with-me-updated"` with the **canonical** cid
+   (parses a non-canonical/uppercase input, emits lowercase hex).
+8. **re-share beats a stale smaller-`sealed_dek` sibling** (converge round 1) — a
+   stale pre-dismissal grant with a smaller `sealed_dek` must NOT win the union
+   and get swept; the active re-share survives in both merge orders.
 
-Full `nextest --workspace --all-targets --features test-fixtures` + CI-exact
-clippy + fmt green locally before PR.
+Local gates (CI-exact): `cargo fmt --all -- --check`; `cargo clippy --locked
+--all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest
+run --locked --workspace --all-targets --features test-fixtures` (CI's 3-shard
+sweep is the backstop; iterative runs scope with `-p harmony-app --lib`).
 
 ## Non-goals
 
