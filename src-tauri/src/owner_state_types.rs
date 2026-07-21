@@ -3691,16 +3691,19 @@ mod space_tests {
         let mut bytes = Vec::new();
         into_writer(&s, &mut bytes).unwrap();
         // Folder serialization MUST NOT contain the "ck" or "pk" map keys —
-        // the skip_serializing_if attributes elide them. Crude check: the
-        // text strings "ck" and "pk" should not appear in the encoded bytes.
-        let needle_ck = b"ck";
-        let needle_pk = b"pk";
+        // the skip_serializing_if attributes elide them. Check the full 3-byte
+        // CBOR text(2) header sequence (0x62 = major type 3, length 2) rather
+        // than a bare 2-char window, to avoid false positives from data values
+        // that incidentally contain the same byte pair (mirrors the
+        // windows(3) discipline in non_community_space_skips_membership_fields_in_wire).
+        let needle_ck: [u8; 3] = [0x62, b'c', b'k']; // CBOR text(2) "ck"
+        let needle_pk: [u8; 3] = [0x62, b'p', b'k']; // CBOR text(2) "pk"
         assert!(
-            !bytes.windows(2).any(|w| w == needle_ck),
+            !bytes.windows(3).any(|w| w == needle_ck),
             "Folder serialization unexpectedly contains 'ck' key"
         );
         assert!(
-            !bytes.windows(2).any(|w| w == needle_pk),
+            !bytes.windows(3).any(|w| w == needle_pk),
             "Folder serialization unexpectedly contains 'pk' key"
         );
     }
