@@ -15,6 +15,8 @@ This file documents conventions, recommended tooling, and gotchas for working in
 
 Cargo commands run from `src-tauri/`. Frontend commands run from the repo root.
 
+> **Why `src-tauri/` specifically (Windows/MSVC):** Cargo discovers `.cargo/config.toml` from the **cwd**, not the manifest path. `src-tauri/.cargo/config.toml` carries MSVC-only linker args a repo-root-cwd build silently misses. After ZEB-519, `serve`/`api`/`watch` boot no longer depends on that config's `/STACK` arg — those entry points now drive their `block_on` on an explicit 8 MiB-stack thread (`run_on_large_stack`) regardless of how the binary was linked. But the inner config's `/MANIFESTDEPENDENCY` arg (comctl32 v6 for GUI-linking **test** binaries) is still cwd-discovered, so a repo-root `cargo test` can still fail to link test binaries on some Windows hosts. Running cargo from `src-tauri/` keeps every MSVC linker arg in effect.
+
 ## Required tooling
 
 ### Rust side
