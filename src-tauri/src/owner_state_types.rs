@@ -2558,7 +2558,9 @@ pub struct ReceivedFileGrant {
     /// Display file name (for the grantee's received-files UI).
     #[serde(rename = "nm")]
     pub file_name: String,
-    /// Plaintext byte length (pre-encryption).
+    /// Stored (CAS) byte length of the file's content — for encrypted content
+    /// this includes the AEAD nonce+tag overhead (`encrypt_blob` prepends a
+    /// 12-byte nonce and appends a 16-byte tag, so it is plaintext length + 28).
     #[serde(rename = "sz")]
     pub file_size: u64,
     /// MIME type string.

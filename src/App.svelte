@@ -3044,14 +3044,16 @@
 
   async function handleFileGrant(address: string): Promise<void> {
     if (!selectedFileCid) return;
-    await fileManagerService.grantRead(selectedFileCid, address);
-    await refreshFileGrants(selectedFileCid);
+    const cid = selectedFileCid;
+    await fileManagerService.grantRead(cid, address);
+    await refreshFileGrants(cid);
   }
 
   async function handleFileRevoke(address: string): Promise<void> {
     if (!selectedFileCid) return;
-    await fileManagerService.revokeRead(selectedFileCid, address);
-    await refreshFileGrants(selectedFileCid);
+    const cid = selectedFileCid;
+    await fileManagerService.revokeRead(cid, address);
+    await refreshFileGrants(cid);
   }
 
   // ── File manager callbacks ──────────────────────────────────────────

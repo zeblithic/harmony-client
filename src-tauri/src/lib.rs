@@ -20076,14 +20076,6 @@ async fn ingest_content_encrypted(
 // `#[tauri::command]` wrappers below register them (JS args camelCase).
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Wall-clock now in epoch-ms (the `granted_at` / deposit `now_ms` stamp).
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 /// Parse a 16-byte master `owner_id` from its hex form (the grantee address the
 /// frontend passes — the friend's `owner_id_hex`).
 fn parse_owner_addr(hex_str: &str) -> Result<crate::owner_state_types::OwnerAddr, String> {
@@ -20196,7 +20188,7 @@ pub(crate) async fn grant_read_impl(
         .map_err(|e| format!("allow_serve_subtree: {e}"))?;
     // 3. Record the owner-local grant + notify_dirty (ZEB-709: a file_grants
     //    mutation without notify_dirty is never persisted NOR replicated).
-    let now_ms = now_epoch_ms();
+    let now_ms = crate::file_sharing::now_epoch_ms();
     {
         let mut st = crdt_state.lock().await;
         crate::file_sharing::record_grant(&mut st, cid, grantee_owner, now_ms);

@@ -195,6 +195,7 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
         if entry.revocation_push.is_some()
             && entry.cidnotify_packet.is_none()
             && entry.invite_packet.is_none()
+            && entry.grant_push.is_none()
         {
             match ctx.apply_revocation(entry).await {
                 Ok(_) => {
@@ -1670,6 +1671,49 @@ mod tests {
         );
         assert!(ctx.emitted().is_empty(), "no dm-received emit on a grant");
         assert!(doc.entries[&key].ingested_by.contains(SELF_ID));
+    }
+
+    /// Whole-branch review (guard symmetry): an ADVERSARIAL sibling-doc entry
+    /// carrying BOTH `revocation_push` AND `grant_push` (cidnotify + invite
+    /// `None`) must NOT be claimed by the revocation arm. The revocation arm's
+    /// `grant_push.is_none()` guard is symmetric with the grant arm's
+    /// `revocation_push.is_none()` guard — each specialized arm fires ONLY for
+    /// its exact pure shape. Without the guard, `revocation_push.is_some()`
+    /// alone would route this entry into `apply_revocation`, which acks +
+    /// consumes the entry and silently DROPS the grant (and would apply an
+    /// attacker-chosen revocation riding a mixed payload). A sibling doc merge
+    /// is a trust boundary, so this malformed shape — the honest butler never
+    /// emits it — must be declined defensively rather than processed.
+    #[tokio::test]
+    async fn ingest_revocation_plus_grant_entry_not_claimed_by_revocation_arm() {
+        let key = DmInboxDoc::grant_key(&SENDER_OWNER, &[0xDE, 0xAD]);
+        let entry = DmInboxEntry {
+            sender_owner: SENDER_OWNER,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: Some(vec![0xBA, 0xAD]), // stray/adversarial
+            grant_push: Some(vec![0xDE, 0xAD]),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let ctx = ProbeCtx::new();
+
+        let _ = ingest_pending(&mut doc, &ctx).await;
+
+        assert!(
+            !ctx.calls().contains(&"apply_revocation".to_string()),
+            "a {{revocation+grant}} entry must not be claimed by the revocation \
+             arm (that arm acks the entry and drops the grant); the \
+             grant_push.is_none() guard forbids it"
+        );
+        // Mutually-exclusive pure-shape guards: the grant arm also declines (it
+        // requires revocation_push.is_none()), so the entry falls through to the
+        // existing cidnotify-None invite-only catch-all — never the revocation path.
+        assert_eq!(ctx.calls(), vec!["apply_invite_only"]);
     }
 
     /// A failed `apply_grant_push` leaves the entry PENDING (not ingested) for

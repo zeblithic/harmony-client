@@ -25,6 +25,7 @@ use crate::owner_state_crypto::{
 use crate::owner_state_types::{EpochKey, GrantEntry, OwnerAddr, ReceivedFileGrant};
 use harmony_content::cid::ContentId;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Generate a fresh per-file DEK (32 random bytes from OS entropy). Mirrors
 /// how a fresh `EpochKey` is minted for a new community (`EpochKey::random`).
@@ -70,7 +71,9 @@ pub struct FileGrantInner {
     /// Display file name (for the grantee's received-files UI).
     #[serde(rename = "fn")]
     pub file_name: String,
-    /// Plaintext byte length (pre-encryption).
+    /// Stored (CAS) byte length of the file's content — for encrypted content
+    /// this includes the AEAD nonce+tag overhead (`encrypt_blob` prepends a
+    /// 12-byte nonce and appends a 16-byte tag, so it is plaintext length + 28).
     #[serde(rename = "fs")]
     pub file_size: u64,
     /// MIME type string.
@@ -155,8 +158,10 @@ pub fn grantee_device_x25519s(state: &OwnerState, grantee_owner: OwnerAddr) -> V
         .collect()
 }
 
-/// Wall-clock now in epoch-ms — the `received_at` stamp on an ingested grant.
-fn now_epoch_ms() -> u64 {
+/// Wall-clock now in epoch-ms — the `received_at` stamp on an ingested grant
+/// (also the `granted_at` / deposit `now_ms` stamp on the owner-side share path
+/// in `lib.rs`).
+pub(crate) fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -233,13 +238,18 @@ pub fn ingest_grant_push(
         };
         // Opened with our key — this blob is ours. A parse failure now is
         // corruption of an authenticated-to-us payload, so it propagates.
-        let inner: FileGrantInner = canonical_cbor_decode(&plaintext)?;
+        let mut inner: FileGrantInner = canonical_cbor_decode(&plaintext)?;
         let cid = ContentId::from_bytes(inner.cid);
         // Re-seal the recovered DEK under the grantee's OWN shared KeyTree so
         // any of the grantee's bound devices can open the stored grant (Flow A),
         // not only the device this per-device envelope was sealed to. Mirrors
-        // `file_deks`.
-        let sealed_dek = seal_dek_at_rest(keytree, &EpochKey::new(inner.dek))?;
+        // `file_deks`. The `EpochKey` copy is `ZeroizeOnDrop`; the raw
+        // `inner.dek` copy is not, so scrub it as soon as the seal has consumed
+        // it (defense-in-depth — don't let the plaintext key linger, on the
+        // seal-error path too).
+        let sealed_dek = seal_dek_at_rest(keytree, &EpochKey::new(inner.dek));
+        inner.dek.zeroize();
+        let sealed_dek = sealed_dek?;
         state.received_file_grants.insert(
             inner.cid,
             ReceivedFileGrant {
@@ -398,7 +408,7 @@ pub fn build_grant_push(
     }
     // Unseal the owner's at-rest DEK and wrap it per grantee device.
     let dek = open_dek_at_rest(keytree, sealed_dek).map_err(|e| format!("unseal DEK: {e:?}"))?;
-    let inner = FileGrantInner {
+    let mut inner = FileGrantInner {
         cid,
         file_name,
         file_size,
@@ -409,13 +419,17 @@ pub fn build_grant_push(
     // Gate 3 — nothing to open yet. Reject rather than emit an empty
     // grant_push: recording/allowlisting/emitting for a grant the grantee
     // cannot decrypt would be a completed-grant claim the backend cannot
-    // deliver (ZEB-674 T6 review fix).
+    // deliver (ZEB-674 T6 review fix). Scrub the raw DEK copy before bailing.
     if devices.is_empty() {
+        inner.dek.zeroize();
         return Err(INELIGIBLE_NO_DEVICES.to_string());
     }
-    let sealed =
-        seal_grant_for_devices(&inner, &devices).map_err(|e| format!("seal grant: {e}"))?;
-    Ok(encode_grant_push(&sealed))
+    // The per-device seals have consumed the DEK; scrub the raw `inner.dek`
+    // copy (the `dek` `EpochKey` is `ZeroizeOnDrop`, this plain `[u8; 32]` is
+    // not) before returning — on the seal-error path too.
+    let sealed = seal_grant_for_devices(&inner, &devices).map_err(|e| format!("seal grant: {e}"));
+    inner.dek.zeroize();
+    Ok(encode_grant_push(&sealed?))
 }
 
 /// Record an owner-local grant (C2). UPSERT semantics: a re-share to the same
