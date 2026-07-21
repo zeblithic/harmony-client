@@ -20204,13 +20204,21 @@ pub async fn ingest_content_encrypted_inner(
     });
     let ingest_res =
         streaming_ingest_with_options(pipe_r, ingest_tx, ChunkerConfig::DEFAULT, None, opts).await;
-    // Join the producer and surface its error BEFORE any state commit — a
-    // producer failure would otherwise look like a clean short stream.
     let produce_res = producer
         .await
         .map_err(|e| format!("encrypt task join: {e}"))?;
-    produce_res?;
-    let (root, size_bytes) = ingest_res.map_err(|e| e.to_string())?;
+    // Surface the ROOT error and never commit state on any failure. If the
+    // ingest side failed, that is the root cause — it drops the pipe reader,
+    // so the producer's error (if any) is a derivative broken-pipe write that
+    // must not mask the real ingest error. If ingest succeeded but the producer
+    // failed, ingest saw a clean short stream (a truncated file) and the
+    // producer error is the root cause. Either failure returns before any
+    // `file_deks`/sidecar commit.
+    let (root, size_bytes) = match (ingest_res, produce_res) {
+        (Err(e), _) => return Err(e.to_string()),
+        (Ok(_), Err(e)) => return Err(e),
+        (Ok(rooted), Ok(())) => rooted,
+    };
 
     // 3. Seal the DEK at rest and store it keyed by the root CID (ZEB-709).
     let sealed = crate::file_sharing::seal_dek_at_rest(keytree, &dek)

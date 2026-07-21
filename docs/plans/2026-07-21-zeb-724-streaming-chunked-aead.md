@@ -934,8 +934,10 @@ git commit -m "docs(zeb-724): grant file_size overhead reflects v2 chunked layou
 ```bash
 cd src-tauri
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets 2>&1 | tail -20      # 0 warnings
-cargo nextest run --workspace --all-targets 2>&1 | tail -30 # all green (ignored large test excluded)
+# CI-exact (see CLAUDE.md): --locked + --features test-fixtures are load-bearing
+# (integration targets only compile with the feature; --locked pins the dep graph).
+cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+cargo nextest run --locked --workspace --all-targets --features test-fixtures 2>&1 | tail -30 # all green (ignored large test excluded)
 ```
 Frontend is untouched (no `src/` changes), so `tsc`/`vitest` are not required for this branch — but run `npx tsc --noEmit` once to be safe if any `.ts` was touched (it should not be).
 

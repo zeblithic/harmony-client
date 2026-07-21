@@ -203,3 +203,12 @@ Keychain-isolated (no `KeychainStore::new()`); wall-clock-free.
 - Incremental **streaming read** (bounded read memory) — separate ticket.
 - **Folder-ingest** encryption — separate ZEB-674 deferral.
 - v1→v2 migration/re-ingest tooling (clean break means none for MVP).
+
+## Implementation notes (as-built — reconciles this design with the shipped code, PR #514)
+
+This document is the point-in-time *design*; a few details evolved during implementation. The code is authoritative — noted here so a future reader isn't misled:
+
+- **Streaming primitive.** The design sketched a `StreamingEncryptReader<R: Read>` adapter. The FastCDC ingest streamer's reader bound turned out to be `tokio::io::AsyncRead + Unpin` (async), so the as-built instead uses a pure, unit-tested **`FrameSealer`** driving a **`tokio::io::duplex` pipe + spawned producer task** (`produce_ciphertext`) feeding the unchanged chunker. Same streaming property (bounded memory, plaintext never fully resident); cleaner error propagation and no hand-written `poll_read` state machine.
+- **`file_size` semantics.** Persisted `file_size` (on `FileGrantInner`/`ReceivedFileGrant`) is the **stored (CAS) ciphertext length** — i.e. the actual byte count the streamer returned (`v2_ciphertext_len(plaintext_len, frame_size)`), sourced from the sidecar `size_bytes`, **not** the plaintext length. (The design table's "store plaintext size" note was not taken; storing the true stored size needs no populate-site arithmetic and stays correct for v2.)
+- **Export atomicity.** `export_content` decrypts via `file_stream_crypto::decrypt_stream_to_path`, which writes to a same-directory `NamedTempFile` and **atomic-renames** on success (never `File::create` on the user's target directly), so a failed decrypt cannot clobber an existing file. Exported files land `0600` (owner-only) as a side effect — intended for decrypted private content.
+- **Gate commands.** The CI-exact gates are `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` and `cargo nextest run --locked --workspace --all-targets --features test-fixtures` (see `CLAUDE.md`); `--features test-fixtures` is required for integration targets to compile.
