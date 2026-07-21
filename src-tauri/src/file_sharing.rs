@@ -349,6 +349,64 @@ pub struct FileGrantDto {
     pub granted_at: u64,
 }
 
+/// One row of the grantee's "Shared with me" list, projected for the frontend
+/// from [`crate::owner_state_types::ReceivedFileGrant`]. Serde camelCase:
+/// `cid` / `granterAddress` / `displayName` / `fileName` / `fileSize` / `mime` /
+/// `receivedAt`. NOT a canonical-CBOR wire type — never `canonical_cbor_encode`d,
+/// so the same-length-key rule does not apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceivedGrantDto {
+    /// The shared file's encrypted root CID, hex-encoded.
+    pub cid: String,
+    /// The granting owner's 16-byte master `owner_id`, hex-encoded.
+    pub granter_address: String,
+    /// The granter's friend-graph display name; `None` when the granter is not a
+    /// currently-known friend (frontend falls back to `granter_address`).
+    pub display_name: Option<String>,
+    /// Display file name.
+    pub file_name: String,
+    /// Stored (CAS) byte length — for encrypted content this includes the AEAD
+    /// nonce+tag overhead (plaintext length + 28); the UI shows it as-is.
+    pub file_size: u64,
+    /// MIME type string.
+    pub mime: String,
+    /// Wall-clock ms when this grant was ingested.
+    pub received_at: u64,
+}
+
+/// Project `state.received_file_grants` into DTO rows for the grantee's
+/// "Shared with me" surface, newest first. The granter's `display_name` is
+/// resolved from the friend graph exactly as [`list_grants_inner`] resolves the
+/// grantee's (`None` when the granter is not a currently-known friend). Pure;
+/// unit-testable without a live node.
+pub fn list_received_grants_inner(state: &OwnerState) -> Vec<ReceivedGrantDto> {
+    let mut rows: Vec<ReceivedGrantDto> = state
+        .received_file_grants
+        .values()
+        .map(|g| ReceivedGrantDto {
+            cid: hex::encode(g.cid),
+            granter_address: hex::encode(g.granter_owner.0),
+            display_name: state
+                .friend_graph
+                .friends
+                .get(&g.granter_owner)
+                .and_then(|f| f.display.clone()),
+            file_name: g.file_name.clone(),
+            file_size: g.file_size,
+            mime: g.mime.clone(),
+            received_at: g.received_at,
+        })
+        .collect();
+    // Newest first; tie-break on cid for a deterministic order.
+    rows.sort_by(|a, b| {
+        b.received_at
+            .cmp(&a.received_at)
+            .then_with(|| a.cid.cmp(&b.cid))
+    });
+    rows
+}
+
 /// Encode per-device sealed grant blobs into the `DepositPayload.grant_push`
 /// wire value: CBOR of `Vec<serde_bytes Vec<u8>>` (each element a byte-string) —
 /// the EXACT shape [`ingest_grant_push`] decodes. Infallible: a `Vec<ByteBuf>`
@@ -828,5 +886,64 @@ mod tests {
             1,
             "re-share after revoke reactivates the grant"
         );
+    }
+
+    #[test]
+    fn list_received_grants_inner_projects_sorts_and_resolves_names() {
+        let granter_friend = OwnerAddr([0x11; 16]);
+        let granter_stranger = OwnerAddr([0x22; 16]);
+        let cid_a = [0xAA; 32];
+        let cid_b = [0xBB; 32];
+
+        let mut state = OwnerState::default();
+        // A friend granter → display name resolves.
+        state.friend_graph.friends.insert(
+            granter_friend,
+            friend_entry(FriendStatus::Active, Some("Alice")),
+        );
+        // Older grant from a friend.
+        state.received_file_grants.insert(
+            cid_a,
+            ReceivedFileGrant {
+                granter_owner: granter_friend,
+                cid: cid_a,
+                file_name: "a.pdf".into(),
+                file_size: 100,
+                mime: "application/pdf".into(),
+                sealed_dek: vec![1, 2, 3],
+                received_at: 1_000,
+            },
+        );
+        // Newer grant from a non-friend stranger.
+        state.received_file_grants.insert(
+            cid_b,
+            ReceivedFileGrant {
+                granter_owner: granter_stranger,
+                cid: cid_b,
+                file_name: "b.png".into(),
+                file_size: 200,
+                mime: "image/png".into(),
+                sealed_dek: vec![4, 5],
+                received_at: 2_000,
+            },
+        );
+
+        let rows = list_received_grants_inner(&state);
+
+        // Sorted by received_at DESC → newest (cid_b) first.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].cid, hex::encode(cid_b));
+        assert_eq!(rows[0].granter_address, hex::encode(granter_stranger.0));
+        assert_eq!(rows[0].display_name, None, "stranger has no friend display");
+        assert_eq!(rows[0].file_name, "b.png");
+        assert_eq!(rows[0].file_size, 200);
+        assert_eq!(rows[0].mime, "image/png");
+        assert_eq!(rows[0].received_at, 2_000);
+
+        assert_eq!(rows[1].cid, hex::encode(cid_a));
+        assert_eq!(rows[1].display_name.as_deref(), Some("Alice"));
+
+        // Empty map → empty vec (proven-empty).
+        assert!(list_received_grants_inner(&OwnerState::default()).is_empty());
     }
 }
