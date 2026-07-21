@@ -80,44 +80,48 @@ fn seal_fanout_one_per_known_device() {
     assert_eq!(parsed1, inner);
 }
 
-/// Owner-local grant records append and revoke (lazy remove) on
-/// `OwnerState.file_grants` — the data behind the "Shared with" list.
+/// Owner-local grant records append and revoke on `OwnerState.file_grants` —
+/// the data behind the "Shared with" list. Revoke TOMBSTONES (ZEB-725): the
+/// entry is retained (for cross-device convergence) but hidden from the list.
 #[test]
-fn grant_record_append_remove() {
+fn grant_record_append_revoke_tombstones() {
+    use harmony_app::file_sharing::{list_grants_inner, record_grant, revoke_grant_inner};
     use harmony_app::owner_state_crdt::OwnerState;
-    use harmony_app::owner_state_types::{GrantEntry, OwnerAddr};
+    use harmony_app::owner_state_types::OwnerAddr;
 
     let cid = [0x33u8; 32];
     let alice = OwnerAddr([1u8; 16]);
     let bob = OwnerAddr([2u8; 16]);
 
     let mut state = OwnerState::default();
-    let grants = state.file_grants.entry(cid).or_default();
-    grants.push(GrantEntry {
-        grantee_owner: alice,
-        granted_at: 100,
-    });
-    grants.push(GrantEntry {
-        grantee_owner: bob,
-        granted_at: 200,
-    });
-    assert_eq!(state.file_grants[&cid].len(), 2, "two grants appended");
+    record_grant(&mut state, cid, alice, 100);
+    record_grant(&mut state, cid, bob, 200);
+    assert_eq!(list_grants_inner(&state, cid).len(), 2, "two active grants");
 
-    // Lazy revoke: drop Alice's record.
-    state
-        .file_grants
-        .get_mut(&cid)
-        .unwrap()
-        .retain(|g| g.grantee_owner != alice);
-
-    let remaining: Vec<OwnerAddr> = state.file_grants[&cid]
+    // Revoke Alice: hidden from the list, but the entry is KEPT (tombstone).
+    assert!(
+        revoke_grant_inner(&mut state, cid, alice, 300),
+        "Alice's active grant was revoked"
+    );
+    let listed: Vec<String> = list_grants_inner(&state, cid)
         .iter()
-        .map(|g| g.grantee_owner)
+        .map(|g| g.grantee_address.clone())
         .collect();
     assert_eq!(
-        remaining,
-        vec![bob],
-        "only Bob's grant remains after revoking Alice"
+        listed,
+        vec![hex::encode(bob.0)],
+        "only Bob's active grant is listed after revoking Alice"
+    );
+    assert_eq!(
+        state.file_grants[&cid].len(),
+        2,
+        "the revoked entry is retained (tombstone), not removed — needed for convergence"
+    );
+    assert!(
+        state.file_grants[&cid]
+            .iter()
+            .any(|g| g.grantee_owner == alice && g.granted_at <= g.revoked_at),
+        "Alice's entry is present and inactive (granted_at <= revoked_at)"
     );
 }
 
@@ -137,10 +141,14 @@ fn grant_records_persist_reload() {
             GrantEntry {
                 grantee_owner: OwnerAddr([5u8; 16]),
                 granted_at: 42,
+                revoked_at: 0,
             },
+            // A tombstoned (revoked) entry — `revoked_at` must survive the
+            // round-trip so the revoke stays converged after a reload.
             GrantEntry {
                 grantee_owner: OwnerAddr([6u8; 16]),
                 granted_at: 43,
+                revoked_at: 99,
             },
         ],
     );

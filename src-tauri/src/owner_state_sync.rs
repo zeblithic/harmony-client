@@ -447,10 +447,13 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // ZEB-674 converge). max() preserves the refresh and is equally a
     // commutative/associative/idempotent semilattice join.
     //
-    // Lazy-revoke note (ZEB-674 plan §Task 5): a local revoke just drops the
-    // record (no tombstone), so a still-holding sibling re-adds it on the next
-    // merge. Intentional — revoke is best-effort UI honesty and never withdraws
-    // already-granted crypto access.
+    // Revoke convergence (ZEB-725): this is an LWW-ELEMENT-SET. Each grantee's
+    // entry carries `granted_at` AND `revoked_at`, both merged by max; the grant
+    // is ACTIVE iff `granted_at > revoked_at`. A revoke tombstones (bumps
+    // `revoked_at`) rather than dropping the record, so it can no longer be
+    // resurrected by a stale sibling on union — the revoke converges across the
+    // owner's devices. (An already-delivered DEK still can't be withdrawn
+    // without rotation; that limitation is unchanged.)
     for (cid, remote_grants) in file_grants {
         let entry = local.file_grants.entry(cid).or_default();
         for g in remote_grants {
@@ -459,8 +462,12 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
                 .position(|e| e.grantee_owner == g.grantee_owner)
             {
                 Some(i) => {
+                    // Both timestamps are grow-only max joins → convergent.
                     if g.granted_at > entry[i].granted_at {
                         entry[i].granted_at = g.granted_at;
+                    }
+                    if g.revoked_at > entry[i].revoked_at {
+                        entry[i].revoked_at = g.revoked_at;
                     }
                 }
                 None => entry.push(g),
@@ -2455,20 +2462,24 @@ mod integration_tests {
             GrantEntry {
                 grantee_owner: x,
                 granted_at: 5,
+                revoked_at: 0,
             },
             GrantEntry {
                 grantee_owner: y,
                 granted_at: 3,
+                revoked_at: 0,
             },
         ]);
         let b0 = mk(vec![
             GrantEntry {
                 grantee_owner: y,
                 granted_at: 7,
+                revoked_at: 0,
             },
             GrantEntry {
                 grantee_owner: x,
                 granted_at: 2,
+                revoked_at: 0,
             },
         ]);
 
@@ -2477,10 +2488,12 @@ mod integration_tests {
             GrantEntry {
                 grantee_owner: x,
                 granted_at: 5,
+                revoked_at: 0,
             },
             GrantEntry {
                 grantee_owner: y,
                 granted_at: 7,
+                revoked_at: 0,
             },
         ];
 
@@ -2508,6 +2521,75 @@ mod integration_tests {
             2,
             "overlapping grantees must dedup, not stack"
         );
+    }
+
+    /// ZEB-725: `file_grants` is an LWW-element-set, so a REVOKE converges across
+    /// the owner's devices instead of being resurrected by a stale sibling. A
+    /// revokes grantee X (bumps `revoked_at` past `granted_at` → inactive); B
+    /// still holds the pre-revoke active entry. After merging in BOTH directions,
+    /// A and B agree byte-for-byte AND the grant is inactive on both. A later
+    /// re-share (`granted_at` past `revoked_at`) reactivates and likewise
+    /// converges.
+    #[test]
+    fn file_grants_revoke_converges_and_reactivates() {
+        use crate::owner_state_types::{GrantEntry, OwnerAddr};
+
+        let cid = [0x99u8; 32];
+        let x = OwnerAddr([1u8; 16]);
+        let mk = |g: GrantEntry| {
+            let mut s = OwnerState::default();
+            s.file_grants.insert(cid, vec![g]);
+            s
+        };
+        let active = |s: &OwnerState| -> bool {
+            s.file_grants
+                .get(&cid)
+                .and_then(|v| v.iter().find(|e| e.grantee_owner == x))
+                .map(|e| e.granted_at > e.revoked_at)
+                .unwrap_or(false)
+        };
+
+        // A revoked X (granted@100, revoked@200 → inactive); stale B still active.
+        let a0 = mk(GrantEntry {
+            grantee_owner: x,
+            granted_at: 100,
+            revoked_at: 200,
+        });
+        let b0 = mk(GrantEntry {
+            grantee_owner: x,
+            granted_at: 100,
+            revoked_at: 0,
+        });
+
+        let mut a = a0.clone();
+        super::merge_remote_into_local(&mut a, b0.clone());
+        let mut b = b0.clone();
+        super::merge_remote_into_local(&mut b, a0.clone());
+
+        assert_eq!(
+            a.file_grants.get(&cid),
+            b.file_grants.get(&cid),
+            "revoke must converge byte-identically across devices"
+        );
+        assert!(!active(&a), "revoke wins on A after merge");
+        assert!(
+            !active(&b),
+            "the stale sibling's active copy does NOT resurrect the revoked grant"
+        );
+
+        // Re-share on the converged state (granted@300 > revoked@200) reactivates,
+        // and merging it back likewise converges to active.
+        let mut regrant = a.clone();
+        crate::file_sharing::record_grant(&mut regrant, cid, x, 300);
+        assert!(active(&regrant), "re-share past revoked_at reactivates");
+        let mut merged_back = b.clone();
+        super::merge_remote_into_local(&mut merged_back, regrant.clone());
+        assert_eq!(
+            merged_back.file_grants.get(&cid),
+            regrant.file_grants.get(&cid),
+            "reactivation converges"
+        );
+        assert!(active(&merged_back), "reactivation propagates via merge");
     }
 
     /// ZEB-674 (C4) converge (CodeRabbit, Major): `received_file_grants` merges

@@ -446,11 +446,22 @@ pub fn record_grant(
     granted_at: u64,
 ) {
     let entries = state.file_grants.entry(cid).or_default();
-    entries.retain(|g| g.grantee_owner != grantee_owner);
-    entries.push(GrantEntry {
-        grantee_owner,
-        granted_at,
-    });
+    // Upsert: bump `granted_at` forward on an existing entry — PRESERVING any
+    // `revoked_at`, so a re-share after a revoke REACTIVATES the grant via
+    // `granted_at > revoked_at` (ZEB-725 LWW-element-set). Otherwise append a
+    // fresh, never-revoked entry.
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|g| g.grantee_owner == grantee_owner)
+    {
+        existing.granted_at = granted_at;
+    } else {
+        entries.push(GrantEntry {
+            grantee_owner,
+            granted_at,
+            revoked_at: 0,
+        });
+    }
 }
 
 /// Project `state.file_grants[cid]` into frontend DTO rows, resolving each
@@ -462,6 +473,9 @@ pub fn list_grants_inner(state: &OwnerState, cid: [u8; 32]) -> Vec<FileGrantDto>
     };
     grants
         .iter()
+        // ACTIVE only: a tombstoned (revoked) entry stays in `file_grants` for
+        // convergence but must not appear in the "Shared with" list (ZEB-725).
+        .filter(|g| g.granted_at > g.revoked_at)
         .map(|g| FileGrantDto {
             grantee_address: hex::encode(g.grantee_owner.0),
             display_name: state
@@ -474,25 +488,41 @@ pub fn list_grants_inner(state: &OwnerState, cid: [u8; 32]) -> Vec<FileGrantDto>
         .collect()
 }
 
-/// LAZY revoke (design "Revocation semantics — lazy"): drop every `GrantEntry`
-/// for `grantee_owner` from `file_grants[cid]`, returning whether a record was
-/// removed. Does NOT touch the DEK or the serve allowlist — an already-granted
-/// grantee keeps the DEK and the CID stays served (constraint 3: access to this
-/// CID version cannot be withdrawn). This only removes the grantee from the
-/// owner's ShareList and stops future re-delivery. Empties the cid's entry when
-/// the last grant is dropped. The CALLER MUST `notify_dirty()` + persist on a
-/// `true` return (ZEB-709).
-pub fn revoke_grant_inner(state: &mut OwnerState, cid: [u8; 32], grantee_owner: OwnerAddr) -> bool {
+/// LAZY revoke (design "Revocation semantics — lazy"), ZEB-725 convergent form:
+/// TOMBSTONE the grantee's `GrantEntry` for `cid` by stamping `revoked_at`
+/// forward past `granted_at` (so `granted_at > revoked_at` is now false and the
+/// grant is inactive). The entry is KEPT, not removed — a removed record would
+/// be re-added by a plain grow-only union with a stale sibling, resurrecting the
+/// revoked grantee; a tombstone that merges by `max` instead CONVERGES the
+/// revoke across the owner's devices. Returns whether an ACTIVE grant was
+/// revoked (idempotent no-op — `false` — when already inactive or absent).
+///
+/// Does NOT touch the DEK or the serve allowlist — an already-granted grantee
+/// keeps the DEK and the CID stays served (constraint 3: access to this CID
+/// version cannot be withdrawn without rotation). This only drops the grantee
+/// from the owner's ShareList and stops future re-delivery. The CALLER MUST
+/// `notify_dirty()` + persist on a `true` return (ZEB-709).
+pub fn revoke_grant_inner(
+    state: &mut OwnerState,
+    cid: [u8; 32],
+    grantee_owner: OwnerAddr,
+    now_ms: u64,
+) -> bool {
     let Some(grants) = state.file_grants.get_mut(&cid) else {
         return false;
     };
-    let before = grants.len();
-    grants.retain(|g| g.grantee_owner != grantee_owner);
-    let removed = grants.len() != before;
-    if grants.is_empty() {
-        state.file_grants.remove(&cid);
+    let Some(entry) = grants.iter_mut().find(|g| g.grantee_owner == grantee_owner) else {
+        return false;
+    };
+    // Already inactive ⇒ idempotent no-op (no state change, no re-emit).
+    if entry.granted_at <= entry.revoked_at {
+        return false;
     }
-    removed
+    // Stamp revoked_at forward PAST granted_at so the grant is inactive even
+    // under clock skew (revoked_at >= granted_at ⇒ `granted_at > revoked_at`
+    // is false), while remaining a `max`-mergeable LWW timestamp.
+    entry.revoked_at = now_ms.max(entry.granted_at);
+    true
 }
 
 #[cfg(test)]
@@ -749,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn revoke_read_drops_record_lazily() {
+    fn revoke_tombstones_record_hides_and_reactivates() {
         let tree = test_tree();
         let mut state = seed_grantable(&tree, Some("Alice"));
         let dek_before = state.file_deks.get(&CID).cloned().expect("dek present");
@@ -757,26 +787,46 @@ mod tests {
         record_grant(&mut state, CID, GRANTEE, 4_242);
         assert_eq!(list_grants_inner(&state, CID).len(), 1);
 
-        // Lazy revoke: the record drops from the ShareList...
+        // Revoke TOMBSTONES the grantee: the ShareList omits it...
         assert!(
-            revoke_grant_inner(&mut state, CID, GRANTEE),
-            "a record was removed"
+            revoke_grant_inner(&mut state, CID, GRANTEE, 5_000),
+            "an active grant was revoked"
         );
         assert!(
             list_grants_inner(&state, CID).is_empty(),
             "list omits the revoked grantee"
         );
-        // ...but the DEK is UNTOUCHED (already-granted access is not withdrawn).
+        // ...but the entry is KEPT (tombstoned, not dropped) so the revoke
+        // converges across devices, and it is inactive (granted_at <= revoked_at).
+        let entry = state.file_grants[&CID]
+            .iter()
+            .find(|g| g.grantee_owner == GRANTEE)
+            .expect("tombstoned entry retained for convergence");
+        assert!(
+            entry.granted_at <= entry.revoked_at,
+            "tombstoned entry is inactive: granted_at {} <= revoked_at {}",
+            entry.granted_at,
+            entry.revoked_at
+        );
+        // ...and the DEK is UNTOUCHED (already-granted access is not withdrawn).
         assert_eq!(
             state.file_deks.get(&CID),
             Some(&dek_before),
             "revoke must not touch the file DEK (lazy)"
         );
 
-        // Revoking again is an idempotent no-op.
+        // Revoking again is an idempotent no-op (already inactive).
         assert!(
-            !revoke_grant_inner(&mut state, CID, GRANTEE),
-            "nothing left to remove"
+            !revoke_grant_inner(&mut state, CID, GRANTEE, 6_000),
+            "nothing active left to revoke"
+        );
+
+        // Re-sharing REACTIVATES: granted_at bumps past revoked_at.
+        record_grant(&mut state, CID, GRANTEE, 7_000);
+        assert_eq!(
+            list_grants_inner(&state, CID).len(),
+            1,
+            "re-share after revoke reactivates the grant"
         );
     }
 }

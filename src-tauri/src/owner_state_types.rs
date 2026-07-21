@@ -2515,8 +2515,16 @@ impl LibraryEntry {
 ///
 /// The sealed key is intentionally NOT stored here: sealing to the grantee's
 /// devices happens at share time from the DEK (see `file_sharing`), so this
-/// record only names WHO was granted and WHEN. Revoke is lazy — the record is
-/// simply dropped (no tombstone; see the field doc on `file_grants`).
+/// record only names WHO was granted, WHEN, and (if applicable) when it was
+/// revoked.
+///
+/// This is one element of an LWW-element-set (ZEB-725): the grant is ACTIVE iff
+/// `granted_at > revoked_at`. A re-share bumps `granted_at` forward (reactivate);
+/// a revoke bumps `revoked_at` forward (deactivate). Both timestamps merge by
+/// `max`, so a revoke CONVERGES across the owner's devices — a stale sibling can
+/// no longer resurrect a revoked grant (the pre-ZEB-725 "drop the record"
+/// approach let a union re-add it). Crypto access is a separate matter: an
+/// already-delivered DEK cannot be withdrawn without rotation.
 ///
 /// 2-char field keys (codebase convention; satisfies `canonical_cbor_encode`'s
 /// same-length-keys precondition — mirrors `ReadMarker` / `LibraryEntry`).
@@ -2525,9 +2533,24 @@ pub struct GrantEntry {
     /// The grantee's master `OwnerAddr` (their `owner_id`).
     #[serde(rename = "go")]
     pub grantee_owner: OwnerAddr,
-    /// Wall-clock milliseconds when this grant was recorded.
+    /// Wall-clock milliseconds when this grant was last (re-)recorded.
     #[serde(rename = "ga")]
     pub granted_at: u64,
+    /// Wall-clock milliseconds of the latest revoke of this grantee for this
+    /// file, or `0` if never revoked. The grant is ACTIVE iff
+    /// `granted_at > revoked_at`. Absent on the wire when `0` (so a
+    /// never-revoked grant encodes exactly as it did pre-ZEB-725, and
+    /// pre-tombstone snapshots load with `revoked_at = 0`).
+    #[serde(rename = "gv", default, skip_serializing_if = "is_zero_u64")]
+    pub revoked_at: u64,
+}
+
+/// serde `skip_serializing_if` predicate: drop a `u64` field from the wire when
+/// it is zero (keeps never-revoked `GrantEntry`s byte-identical to pre-tombstone
+/// encoding and satisfies the equal-length-key canonical-encode precondition
+/// whether or not `gv` is present).
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// ZEB-674 Task 4 (C4): one grant the local owner RECEIVED — an encrypted file

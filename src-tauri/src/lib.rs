@@ -20407,11 +20407,13 @@ pub(crate) async fn grant_read_impl(
     Ok(())
 }
 
-/// `revoke_read(cid, granteeAddress)` core: LAZY revoke — drop the grantee's
-/// `GrantEntry` from `file_grants[cid]` (notify_dirty + persist), emit
-/// `grants-updated`. Does NOT touch the DEK or the serve allowlist — an
-/// already-granted grantee keeps access to this CID version (design constraint
-/// 3); this only removes them from the ShareList and stops future re-delivery.
+/// `revoke_read(cid, granteeAddress)` core: LAZY revoke — TOMBSTONE the
+/// grantee's `GrantEntry` in `file_grants[cid]` (ZEB-725: stamp `revoked_at` so
+/// the grant is inactive AND the revoke converges across the owner's devices),
+/// then notify_dirty + persist and emit `grants-updated`. Does NOT touch the DEK
+/// or the serve allowlist — an already-granted grantee keeps access to this CID
+/// version (design constraint 3); this only removes them from the ShareList and
+/// stops future re-delivery.
 pub(crate) async fn revoke_read_impl(
     state: &Mutex<NodeState>,
     sink: &dyn crate::node_event_sink::NodeEventSink,
@@ -20430,9 +20432,10 @@ pub(crate) async fn revoke_read_impl(
             .ok_or_else(|| "no owner loaded".to_string())?;
         (crdt_state, guard.sync_engine.clone())
     };
+    let now_ms = crate::file_sharing::now_epoch_ms();
     let removed = {
         let mut st = crdt_state.lock().await;
-        crate::file_sharing::revoke_grant_inner(&mut st, cid, grantee_owner)
+        crate::file_sharing::revoke_grant_inner(&mut st, cid, grantee_owner, now_ms)
     };
     if removed {
         if let Some(engine) = sync_engine {
@@ -20669,13 +20672,13 @@ mod file_share_ipc_tests {
             .await
             .expect("revoke");
 
-        // ShareList omits the grantee...
+        // ShareList omits the grantee (tombstoned, hidden from the list)...
         assert!(
             list_grants_impl(&state, cid_hex())
                 .await
                 .unwrap()
                 .is_empty(),
-            "revoke drops the record"
+            "revoke hides the record from the ShareList"
         );
         // ...the DEK survives (lazy — access not withdrawn)...
         let crdt = state.lock().unwrap().crdt_state.clone().unwrap();

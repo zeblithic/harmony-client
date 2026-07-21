@@ -120,12 +120,14 @@ pub struct OwnerState {
     /// list is a growable SET, so a grant appended on one device must survive a
     /// merge with a sibling holding a different grant for the same CID (plain
     /// `or_insert` would silently drop it, diverging the list permanently).
-    /// Revoke is LAZY — a local revoke just drops the record with no tombstone,
-    /// so a still-holding sibling re-adds it on the next merge; this is
-    /// intentional (revoke is best-effort UI honesty and never withdraws
-    /// already-granted crypto access — ZEB-674 plan §Task 5). Absent on the wire
-    /// when empty (`skip_serializing_if` + `default`) so pre-ZEB-674 snapshots
-    /// load empty.
+    /// Revoke is LAZY but CONVERGENT (ZEB-725): this is an LWW-element-set. Each
+    /// `GrantEntry` carries `granted_at` and `revoked_at` (both merged by `max`);
+    /// the grant is ACTIVE iff `granted_at > revoked_at`. A revoke TOMBSTONES the
+    /// entry (bumps `revoked_at`) rather than dropping it, so a still-holding
+    /// sibling can no longer resurrect it on merge — the revoke converges across
+    /// the owner's devices. (Crypto access is unchanged: an already-delivered DEK
+    /// can't be withdrawn without rotation.) Absent on the wire when empty
+    /// (`skip_serializing_if` + `default`) so pre-ZEB-674 snapshots load empty.
     #[serde(rename = "fr", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub file_grants: BTreeMap<[u8; 32], Vec<GrantEntry>>,
     /// ZEB-674 Task 4 (C4): grants this owner RECEIVED — encrypted files other
