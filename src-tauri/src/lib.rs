@@ -26440,6 +26440,72 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
     Ok(())
 }
 
+/// ZEB-519: run a CLI entry point's body on a dedicated 8 MiB-stack thread and
+/// return its process exit code.
+///
+/// Tokio's `Runtime::block_on` drives its *root* future on the CALLING thread
+/// (only `tokio::spawn`ed tasks go to workers). On Windows/MSVC the OS main
+/// thread's stack is fixed at link time by the `/STACK` linker arg and is NOT
+/// sized by `RUST_MIN_STACK` (which only reaches std-spawned threads); a
+/// repo-root cargo build that misses `src-tauri/.cargo/config.toml` links the
+/// ~1 MiB MSVC default and overflows on `serve` boot. Driving CLI entries on a
+/// thread we size ourselves removes the dependency on the link-time `/STACK`
+/// value on every platform. Mirrors the `harmony-runtime` GUI path above.
+pub fn run_on_large_stack<F>(name: &str, f: F) -> i32
+where
+    F: FnOnce() -> i32 + Send + 'static,
+{
+    match thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(f)
+    {
+        Ok(h) => h.join().unwrap_or_else(|_| {
+            // The default panic hook already printed the payload + backtrace to
+            // stderr before unwinding. Exit non-zero so a supervisor never
+            // mistakes a serve crash for a clean (exit 0) shutdown.
+            eprintln!("harmony-app: {name} thread panicked");
+            1
+        }),
+        Err(e) => {
+            eprintln!("harmony-app: cannot spawn {name} thread: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_on_large_stack_tests {
+    use super::run_on_large_stack;
+
+    #[test]
+    fn propagates_the_closure_exit_code() {
+        assert_eq!(run_on_large_stack("test-exit", || 7), 7);
+        assert_eq!(run_on_large_stack("test-exit", || 0), 0);
+    }
+
+    #[test]
+    fn converts_a_panicking_closure_to_exit_one() {
+        // A serve/api/watch entry that panics must never look like a clean
+        // (exit 0) shutdown to a supervisor; the join boundary must catch the
+        // unwind and report non-zero. (nextest's process-per-test isolation
+        // contains the panic output.)
+        assert_eq!(run_on_large_stack("test-panic", || panic!("boom")), 1);
+    }
+
+    #[test]
+    fn runs_a_closure_needing_a_multi_mib_stack_frame() {
+        // A 4 MiB stack frame overflows the ~1 MiB Windows main-thread default
+        // that a ZEB-519 repo-root build links; on the sized thread it is fine.
+        let mib = run_on_large_stack("test-stack", || {
+            let big = [0u8; 4 * 1024 * 1024];
+            std::hint::black_box(&big);
+            (big.len() / (1024 * 1024)) as i32
+        });
+        assert_eq!(mib, 4);
+    }
+}
+
 /// ZEB-445: headless serve mode. Returns the process exit code.
 ///
 /// Lifecycle (spec §Lifecycle, lock, and shutdown): tracing (stderr console,
@@ -26467,6 +26533,11 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
     }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
+        // ZEB-519: size Zenoh/tokio worker threads independently of
+        // RUST_MIN_STACK (which only reaches Cargo-spawned launches), matching
+        // the `harmony-runtime` GUI runtime. The block_on *driver* thread is
+        // sized separately by `run_on_large_stack`.
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
     {

@@ -335,7 +335,12 @@ fn main() {
                 Some(Command::Serve { api_port }) => {
                     // No init_tracing() here: serve_cli installs its own
                     // subscriber (stderr console + rolling file, ZEB-445).
-                    std::process::exit(harmony_app::serve_cli(api_port));
+                    // ZEB-519: drive the heavy node-bringup block_on on an
+                    // explicit 8 MiB-stack thread so a repo-root build that
+                    // missed the `/STACK` linker arg can't overflow on boot.
+                    std::process::exit(harmony_app::run_on_large_stack("serve-main", move || {
+                        harmony_app::serve_cli(api_port)
+                    }));
                 }
                 Some(Command::Api {
                     command,
@@ -343,7 +348,12 @@ fn main() {
                     events,
                 }) => {
                     init_tracing();
-                    std::process::exit(harmony_app::api_cli(command, args, events));
+                    // ZEB-519: uniform invariant — no CLI entry drives block_on
+                    // on the unsized OS main thread (defensive; api is a thin
+                    // HTTP client with no observed overflow).
+                    std::process::exit(harmony_app::run_on_large_stack("api-main", move || {
+                        harmony_app::api_cli(command, args, events)
+                    }));
                 }
                 Some(Command::Watch {
                     community,
@@ -370,7 +380,10 @@ fn main() {
                         raw,
                         no_retry,
                     };
-                    std::process::exit(harmony_app::api_watch(cfg));
+                    // ZEB-519: same uniform large-stack invariant as serve/api.
+                    std::process::exit(harmony_app::run_on_large_stack("watch-main", move || {
+                        harmony_app::api_watch(cfg)
+                    }));
                 }
                 None => {
                     // Default path — launch the Tauri runtime.
