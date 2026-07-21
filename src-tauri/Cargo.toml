@@ -133,7 +133,7 @@ harmony-tunnel = { git = "https://github.com/zeblithic/harmony.git", rev = "5665
 url = "2"
 blake3 = "1"
 argon2 = "0.5"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
 clap = { version = "4", features = ["derive"] }
 secrecy = "0.10"
 subtle = "2"
