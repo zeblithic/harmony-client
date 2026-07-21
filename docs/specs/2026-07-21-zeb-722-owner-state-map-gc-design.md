@@ -148,3 +148,20 @@ Keychain-free, wall-clock-free. Full `nextest --workspace --all-targets
   `SpaceId` tombstone set; negligible, YAGNI now).
 - Reconciling runtime bytes that survive a best-effort runtime-Burn failure
   (pre-existing `burn_content` behavior, unchanged).
+
+## Forward-looking constraint (for a future personal-library-sync implementer)
+
+The burn trigger is **local** (fires on "last **local** sidecar reference gone"
+— `content_index` is per-device, not in the owner-state merge), but the DEK it
+GCs lives in the **replicated** `file_deks`. This is safe **today** because no
+flow gives a sibling device an independent live sidecar for another device's
+ingested CID: CIDs are unique per ingest and there is no cross-device
+personal-file library sync, so a sibling's `file_deks[cid]` is only ever the
+replicated DEK (exactly the "stale sibling" this design sweeps).
+
+If a future ticket adds **cross-device personal-library sync** — device B holds
+its own live sidecar + fetched ciphertext for A's file, relying on the
+replicated DEK — then a burn on A would strip B's DEK while B still references
+it, leaving B with ciphertext it can no longer decrypt. That implementer must
+make the burn trigger **global** (converge the sidecar removal, or gate the
+DEK-GC on a cross-device reference count) rather than local.

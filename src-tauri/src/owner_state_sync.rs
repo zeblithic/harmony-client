@@ -2474,39 +2474,62 @@ mod integration_tests {
     }
 
     /// ZEB-722: a burned CID must not resurrect on the add-wins union merge, and
-    /// the sweep must converge regardless of merge direction.
+    /// the sweep must converge regardless of merge direction. Covers BOTH swept
+    /// maps: a stale sibling holding `file_deks[cid]` AND a concurrent share
+    /// (`file_grants[cid]`) — the spec's load-bearing "you cannot share a file
+    /// you burned" scenario — must both be swept by the tombstone.
     #[test]
     fn merge_sweeps_burned_cid_and_is_order_independent() {
+        use crate::owner_state_types::{GrantEntry, OwnerAddr};
         let cid = [0x7bu8; 32];
 
         // Device A burned the CID (tombstone present, maps empty).
         let mut a = OwnerState::default();
         a.burn_gc(cid);
 
-        // Device B still holds the DEK for that CID (stale sibling).
+        // Device B is a stale sibling: still holds the DEK AND concurrently
+        // recorded a share (grant) for that CID.
         let mut b = OwnerState::default();
         b.file_deks.insert(cid, vec![9, 9, 9]);
+        b.file_grants.insert(
+            cid,
+            vec![GrantEntry {
+                grantee_owner: OwnerAddr([0x0c; 16]),
+                granted_at: 5,
+                revoked_at: 0,
+            }],
+        );
 
-        // A merges B: the union re-adds file_deks[cid], the sweep drops it again.
+        // A merges B: the union re-adds file_deks/file_grants[cid], the sweep
+        // drops them again (burn wins over the concurrent share).
         let mut a1 = a.clone();
         super::merge_remote_into_local(&mut a1, b.clone());
         assert!(
             !a1.file_deks.contains_key(&cid),
-            "burned CID must not resurrect on merge"
+            "burned CID's DEK must not resurrect on merge"
+        );
+        assert!(
+            !a1.file_grants.contains_key(&cid),
+            "a concurrent share of a burned CID must be swept"
         );
         assert!(a1.burned_content.contains(&cid), "tombstone retained");
 
-        // B merges A: B learns the tombstone and sweeps its own entry — converges.
+        // B merges A: B learns the tombstone and sweeps its own entries — converges.
         let mut b1 = b.clone();
         super::merge_remote_into_local(&mut b1, a.clone());
         assert!(
             !b1.file_deks.contains_key(&cid),
-            "sibling sweeps on learning the tombstone"
+            "sibling sweeps its DEK on learning the tombstone"
+        );
+        assert!(
+            !b1.file_grants.contains_key(&cid),
+            "sibling sweeps its grant on learning the tombstone"
         );
         assert!(b1.burned_content.contains(&cid), "tombstone propagated");
 
         // Both directions reached the same state.
         assert_eq!(a1.file_deks, b1.file_deks);
+        assert_eq!(a1.file_grants, b1.file_grants);
         assert_eq!(a1.burned_content, b1.burned_content);
     }
 
