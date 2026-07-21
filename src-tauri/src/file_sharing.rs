@@ -72,7 +72,7 @@ pub struct FileGrantInner {
     #[serde(rename = "fn")]
     pub file_name: String,
     /// Stored (CAS) byte length of the file's content. For v3 streaming-encrypted
-    /// content this is the chunked-AEAD ciphertext length: a 16-byte header plus,
+    /// content this is the chunked-AEAD ciphertext length: a 9-byte header plus,
     /// per 64 KiB frame, a 16-byte tag (see `file_stream_crypto::v3_ciphertext_len`),
     /// so it exceeds the plaintext length by the header + per-frame tag overhead.
     #[serde(rename = "fs")]
@@ -368,7 +368,7 @@ pub struct ReceivedGrantDto {
     /// Display file name.
     pub file_name: String,
     /// Stored (CAS) byte length of the file's content. For v3 streaming-encrypted
-    /// content this is the chunked-AEAD ciphertext length: a 16-byte header plus,
+    /// content this is the chunked-AEAD ciphertext length: a 9-byte header plus,
     /// per 64 KiB frame, a 16-byte tag (see `file_stream_crypto::v3_ciphertext_len`),
     /// so it exceeds the plaintext length by the header + per-frame tag overhead;
     /// the UI shows it as-is.
