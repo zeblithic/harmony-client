@@ -12,11 +12,19 @@
 
 use harmony_app::community_state_sync::{decrypt_blob, encrypt_blob};
 use harmony_app::file_sharing::{
-    ingest_grant_push, open_received_file, seal_grant_for_devices, FileGrantInner,
+    ingest_grant_push, open_dek_at_rest, open_received_file, seal_grant_for_devices, FileGrantInner,
 };
 use harmony_app::owner_state_crdt::OwnerState;
+use harmony_app::owner_state_crypto::KeyTree;
 use harmony_app::owner_state_types::{EpochKey, OwnerAddr};
 use harmony_content::cid::ContentId;
+
+/// Deterministic grantee shared KeyTree (mirrors `file_sharing_dek.rs`). A fresh
+/// derivation from the same material models a DIFFERENT device of the same owner
+/// — the re-seal must open under any of them.
+fn test_keytree() -> KeyTree {
+    KeyTree::derive(&[0x9Au8; 32]).expect("keytree")
+}
 
 /// Deterministic test X25519 keypair (mirrors `file_sharing_grants.rs`).
 /// Returns (priv_scalar, pub).
@@ -77,10 +85,12 @@ fn grantee_ingest_then_decrypt() {
     let grant_push = wrap_grant_push(&sealed);
 
     let granter = OwnerAddr([0x11u8; 16]);
+    let keytree = test_keytree();
     let mut state = OwnerState::default();
 
-    // Ingest → Some(cid), and the record lands with the matched sealed blob.
-    let ingested = ingest_grant_push(&mut state, &grantee_priv, granter, &grant_push)
+    // Ingest → Some(cid). The recovered DEK is RE-SEALED under the grantee's
+    // shared KeyTree (device-agnostic), not the opened per-device envelope.
+    let ingested = ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &grant_push)
         .expect("ingest ok")
         .expect("a blob opened with our device key");
     assert_eq!(ingested, ContentId::from_bytes(cid_bytes), "returned cid");
@@ -97,18 +107,29 @@ fn grantee_ingest_then_decrypt() {
     assert_eq!(rec.file_name, "shared-notes.md");
     assert_eq!(rec.file_size, plaintext.len() as u64);
     assert_eq!(rec.mime, "text/markdown");
-    assert_eq!(
-        rec.sealed_dek, sealed[0],
-        "stores the MATCHED sealed blob verbatim"
-    );
     assert_ne!(
         rec.sealed_dek.as_slice(),
         dek_bytes.as_slice(),
         "the stored blob must be the sealed envelope, never the raw DEK"
     );
+    assert_ne!(
+        rec.sealed_dek, sealed[0],
+        "the stored blob is the KeyTree re-seal, NOT the per-device envelope"
+    );
 
-    // Open → the DEK, and it actually decrypts the file back to plaintext.
-    let recovered = open_received_file(&state, &grantee_priv, ContentId::from_bytes(cid_bytes))
+    // Device-agnostic: a FRESH KeyTree of the same shared material (a different
+    // device of the same owner) opens the stored blob directly.
+    let via_other_device = open_dek_at_rest(&test_keytree(), &rec.sealed_dek)
+        .expect("a different device with the same shared KeyTree opens the re-sealed DEK");
+    assert_eq!(
+        via_other_device.as_bytes(),
+        &dek_bytes,
+        "device-agnostic DEK"
+    );
+
+    // Open (grantee read path) → the DEK via the shared KeyTree; it decrypts the
+    // file back to plaintext.
+    let recovered = open_received_file(&state, &keytree, ContentId::from_bytes(cid_bytes))
         .expect("open received file");
     assert_eq!(recovered.as_bytes(), &dek_bytes, "recovered DEK matches");
 
@@ -135,8 +156,15 @@ fn grantee_ingest_no_matching_device_is_none() {
     let grant_push = wrap_grant_push(&sealed);
 
     let mut state = OwnerState::default();
-    let out = ingest_grant_push(&mut state, &us_priv, OwnerAddr([0x22u8; 16]), &grant_push)
-        .expect("ingest ok");
+    let keytree = test_keytree();
+    let out = ingest_grant_push(
+        &mut state,
+        &us_priv,
+        &keytree,
+        OwnerAddr([0x22u8; 16]),
+        &grant_push,
+    )
+    .expect("ingest ok");
     assert_eq!(out, None, "no blob opens with our key → Ok(None)");
     assert!(
         state.received_file_grants.is_empty(),

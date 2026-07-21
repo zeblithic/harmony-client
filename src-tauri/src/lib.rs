@@ -5462,6 +5462,20 @@ pub async fn start_node_inner(
                             Some(std::sync::Arc::new(move || e.notify_dirty())
                                 as std::sync::Arc<dyn Fn() + Send + Sync>)
                         },
+                        // ZEB-674 (C4): this device's X25519 private — derived
+                        // from the cert-bound ed25519 signing key exactly as the
+                        // butler acceptor derives its seal target
+                        // (`ed25519_priv_to_x25519(&community_signing_key_arc)`),
+                        // so `apply_grant_push` opens the per-device grant blob a
+                        // sender sealed to `birational(vk)` of this device.
+                        device_x25519_priv: crate::dm_signing::ed25519_priv_to_x25519(
+                            &community_signing_key_arc,
+                        ),
+                        // ZEB-674 (C4): the grantee's shared (pinned epoch-0)
+                        // fleet KeyTree — the SAME tree `file_deks` seals under —
+                        // so a received grant re-sealed at ingest opens on any of
+                        // the owner's bound devices (Flow A).
+                        owner_keytree: std::sync::Arc::clone(&kt),
                     });
                     // The ingest sweeper: one startup sweep (entries
                     // deposited while this device was offline), then one

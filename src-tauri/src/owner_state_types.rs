@@ -2533,17 +2533,17 @@ pub struct GrantEntry {
 /// ZEB-674 Task 4 (C4): one grant the local owner RECEIVED — an encrypted file
 /// another owner shared with one of this owner's devices. Stored in
 /// `OwnerState.received_file_grants` keyed by the shared file's root ContentId
-/// bytes, and replicated across the owner's own devices via Flow A (so any of
-/// the owner's devices can render "shared with me" / open the file — even
-/// though only the device the grant was sealed to can UNSEAL the DEK, which is
-/// the `sealed_dek` blob's own property, not this record's).
+/// bytes, and replicated across the owner's own devices via Flow A. Because the
+/// DEK is RE-SEALED under the grantee's own shared `KeyTree` at ingest (see
+/// `file_sharing::ingest_grant_push`), ANY of the owner's bound devices can
+/// render "shared with me" AND open the file — exactly like `file_deks` — not
+/// only the device the deposit was originally sealed to.
 ///
-/// `sealed_dek` is the WHOLE matched per-device seal blob
-/// (`seal_to_owner_with_info(dev, canonical_cbor(FileGrantInner), INFO)`), kept
-/// verbatim so `open_received_file` can re-open it lazily on demand rather than
-/// caching the raw DEK at rest. Confidentiality therefore still rests entirely
-/// on the sealing device's X25519 private key — the DEK never lands unsealed in
-/// `OwnerState`.
+/// `sealed_dek` is the KeyTree-sealed DEK
+/// (`file_sharing::seal_dek_at_rest(keytree, dek)`), stored so
+/// `open_received_file` can unseal it lazily on demand rather than caching the
+/// raw DEK at rest. Confidentiality rests on the grantee's shared KeyTree — the
+/// DEK never lands unsealed in `OwnerState`.
 ///
 /// 2-char field keys (codebase convention; satisfies `canonical_cbor_encode`'s
 /// same-length-keys precondition — mirrors `GrantEntry` / `FileGrantInner`).
@@ -2564,8 +2564,8 @@ pub struct ReceivedFileGrant {
     /// MIME type string.
     #[serde(rename = "mt")]
     pub mime: String,
-    /// The matched per-device seal blob (opaque; opens only with this device's
-    /// X25519 private key). NEVER the raw DEK — always the sealed envelope.
+    /// The KeyTree-sealed DEK (opaque; opens with the grantee's shared KeyTree
+    /// on any bound device). NEVER the raw DEK — always the sealed envelope.
     #[serde(rename = "sk")]
     pub sealed_dek: Vec<u8>,
     /// Wall-clock milliseconds when this grant was ingested.

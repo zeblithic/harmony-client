@@ -170,17 +170,17 @@ pub enum FileGrantIngestError {
     /// decode — malformed / truncated CBOR.
     #[error("grant_push wire decode failed: {0}")]
     WireDecode(String),
-    /// A blob opened with our device key but its plaintext was not a canonical
-    /// [`FileGrantInner`] — real corruption, NOT a wrong-recipient miss.
-    #[error("canonical CBOR decode of FileGrantInner failed: {0}")]
+    /// A crypto step on an authenticated-to-us grant failed: either a blob
+    /// opened with our device key but its plaintext was not a canonical
+    /// [`FileGrantInner`] (real corruption, NOT a wrong-recipient miss), the
+    /// re-seal of the recovered DEK under the shared KeyTree failed, or an
+    /// at-rest unseal in [`open_received_file`] failed (wrong KeyTree / tampered
+    /// blob).
+    #[error("crypto on a received grant failed: {0}")]
     Decode(#[from] CryptoError),
     /// No received grant recorded for the requested cid.
     #[error("no received grant for the requested cid")]
     NotFound,
-    /// Opening the stored sealed DEK with this device's X25519 key failed
-    /// (wrong device / tampered blob).
-    #[error("opening the sealed grant failed: {0}")]
-    Open(#[from] DmSignError),
 }
 
 /// Grantee ingest (C4): apply an inbound `grant_push` payload to `state`.
@@ -189,10 +189,18 @@ pub enum FileGrantIngestError {
 /// of `Vec<serde_bytes Vec<u8>>`, the per-device sealed blobs produced by
 /// [`seal_grant_for_devices`]. Each blob is tried against THIS device's X25519
 /// private key via `open_from_owner_with_info` under [`FILE_GRANT_SEAL_INFO`];
-/// on the FIRST blob that opens, the inner [`FileGrantInner`] is parsed and
-/// recorded on `state.received_file_grants[cid]` — storing the MATCHED sealed
-/// blob verbatim as `sealed_dek`, so the DEK stays sealed at rest and re-opens
-/// lazily via [`open_received_file`]. Returns `Ok(Some(cid))`.
+/// on the FIRST blob that opens, the inner [`FileGrantInner`] is parsed, the DEK
+/// is RE-SEALED under the grantee's own shared `keytree` via
+/// [`seal_dek_at_rest`], and THAT at-rest blob is stored as
+/// `state.received_file_grants[cid].sealed_dek`. Returns `Ok(Some(cid))`.
+///
+/// Re-sealing under the shared KeyTree (rather than storing the opened
+/// per-device envelope verbatim) makes the stored grant openable by ANY of the
+/// grantee's bound devices — exactly like `file_deks` — because
+/// `received_file_grants` replicates fleet-wide via Flow A but the per-device
+/// seal only opens on the one device it was sealed to. The DEK still never lands
+/// unsealed in `OwnerState`; confidentiality now rests on the grantee's shared
+/// KeyTree instead of a single device key. [`open_received_file`] recovers it.
 ///
 /// If NO blob opens with this device's key (the grant was sealed only to other
 /// devices — the honest new-device edge), returns `Ok(None)` and leaves `state`
@@ -206,6 +214,7 @@ pub enum FileGrantIngestError {
 pub fn ingest_grant_push(
     state: &mut OwnerState,
     my_device_x25519_priv: &[u8; 32],
+    keytree: &KeyTree,
     granter_owner: OwnerAddr,
     grant_push_bytes: &[u8],
 ) -> Result<Option<ContentId>, FileGrantIngestError> {
@@ -226,6 +235,11 @@ pub fn ingest_grant_push(
         // corruption of an authenticated-to-us payload, so it propagates.
         let inner: FileGrantInner = canonical_cbor_decode(&plaintext)?;
         let cid = ContentId::from_bytes(inner.cid);
+        // Re-seal the recovered DEK under the grantee's OWN shared KeyTree so
+        // any of the grantee's bound devices can open the stored grant (Flow A),
+        // not only the device this per-device envelope was sealed to. Mirrors
+        // `file_deks`.
+        let sealed_dek = seal_dek_at_rest(keytree, &EpochKey::new(inner.dek))?;
         state.received_file_grants.insert(
             inner.cid,
             ReceivedFileGrant {
@@ -234,7 +248,7 @@ pub fn ingest_grant_push(
                 file_name: inner.file_name,
                 file_size: inner.file_size,
                 mime: inner.mime,
-                sealed_dek: blob.into_vec(),
+                sealed_dek,
                 received_at: now_epoch_ms(),
             },
         );
@@ -245,27 +259,24 @@ pub fn ingest_grant_push(
 
 /// Grantee read (C4): recover the per-file DEK for a previously-ingested grant.
 ///
-/// Looks up `state.received_file_grants[cid]`, re-opens its `sealed_dek` with
-/// this device's X25519 private key under [`FILE_GRANT_SEAL_INFO`], parses the
-/// inner [`FileGrantInner`], and returns its DEK as an [`EpochKey`] ready for
-/// `community_state_sync::decrypt_blob`. `Err(NotFound)` if no grant is
-/// recorded for `cid`; `Err(Open)` if this device did not hold the sealing key.
+/// Looks up `state.received_file_grants[cid]` and unseals its `sealed_dek` with
+/// the grantee's shared `keytree` via [`open_dek_at_rest`], returning the DEK as
+/// an [`EpochKey`] ready for `community_state_sync::decrypt_blob`. Because the
+/// grant was re-sealed under the SHARED KeyTree at ingest (see
+/// [`ingest_grant_push`]), ANY of the grantee's bound devices opens it — not
+/// only the device the deposit was sealed to. `Err(NotFound)` if no grant is
+/// recorded for `cid`; `Err(Decode)` if the at-rest unseal fails (wrong KeyTree
+/// / tampered blob).
 pub fn open_received_file(
     state: &OwnerState,
-    my_device_x25519_priv: &[u8; 32],
+    keytree: &KeyTree,
     cid: ContentId,
 ) -> Result<EpochKey, FileGrantIngestError> {
     let grant = state
         .received_file_grants
         .get(&cid.to_bytes())
         .ok_or(FileGrantIngestError::NotFound)?;
-    let plaintext = open_from_owner_with_info(
-        my_device_x25519_priv,
-        &grant.sealed_dek,
-        FILE_GRANT_SEAL_INFO,
-    )?;
-    let inner: FileGrantInner = canonical_cbor_decode(&plaintext)?;
-    Ok(EpochKey::new(inner.dek))
+    Ok(open_dek_at_rest(keytree, &grant.sealed_dek)?)
 }
 
 #[cfg(test)]

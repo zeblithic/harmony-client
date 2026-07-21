@@ -113,6 +113,18 @@ pub trait DmInboxIngestCtx: Send + Sync {
     /// leaves the entry PENDING for retry, like the message/invite arms.
     async fn apply_revocation(&self, entry: &DmInboxEntry) -> Result<bool, String>;
 
+    /// ZEB-674 (C4): apply a deposited file-share grant entry. Decodes the
+    /// opaque `grant_push`, opens the per-device blob sealed to THIS device (if
+    /// any), re-seals the recovered DEK under the grantee's shared KeyTree, and
+    /// records it on `OwnerState.received_file_grants` — marking owner-state
+    /// dirty when a new record lands (`received_file_grants` has no deposit-rung
+    /// re-delivery backstop, the entry is GC'd once covered). `Ok(())` on a
+    /// recorded grant OR when no blob was sealed to this device (a sibling will
+    /// record it and replicate via Flow A — either way THIS device is done, so
+    /// the caller marks it ingested). An `Err` leaves the entry PENDING for retry
+    /// (the TTL GC is the safety valve), like the message/invite/revocation arms.
+    async fn apply_grant_push(&self, entry: &DmInboxEntry) -> Result<(), String>;
+
     /// `OwnerState::apply_inbox` under the owner-state lock (idempotent on
     /// `(space_id, message_cid)`). Returns `true` iff the entry was NEWLY
     /// inserted (`ApplyOutcome::Inserted`) — the `dm-received` emit gate,
@@ -194,6 +206,35 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
                         error = %e,
                         key = %key,
                         "ZEB-691: revocation recover failed; leaving entry pending for retry"
+                    );
+                }
+            }
+            continue;
+        }
+        // ZEB-674 (C4): a PURE file-share grant deposit (no cidnotify, no
+        // invite, no revocation). Apply it before the invite-only branch would
+        // otherwise swallow the `cidnotify_packet == None` case. The guard is a
+        // pure-shape check (mirroring the revocation arm): `grant_push` rides
+        // on the persisted entry, so requiring the other sub-payloads absent
+        // keeps a message/invite/revocation entry that somehow carried a stray
+        // grant from being mis-routed here (the butler's pure-shape guards
+        // already reject that shape, but a sibling doc merge is a trust
+        // boundary too, so re-check).
+        if entry.grant_push.is_some()
+            && entry.cidnotify_packet.is_none()
+            && entry.invite_packet.is_none()
+            && entry.revocation_push.is_none()
+        {
+            match ctx.apply_grant_push(entry).await {
+                Ok(()) => {
+                    entry.ingested_by.insert(self_id.clone());
+                    changed = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "ZEB-674: grant recover failed; leaving entry pending for retry"
                     );
                 }
             }
@@ -897,6 +938,17 @@ pub struct ProdDmInboxIngestCtx {
     /// re-delivery), the recover MUST persist the owner-state mutation itself.
     /// `None` only in unit tests that assert without persistence.
     pub notify_owner_state_dirty: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// ZEB-674 (C4): this device's X25519 private key, derived at start_node via
+    /// `dm_signing::ed25519_priv_to_x25519` from the device ed25519 signing key
+    /// (the SAME derivation the butler acceptor uses as its seal target — see
+    /// `ProdRelayIngestCtx::device_x25519_privs` / `ProdButlerDepositCtx`). Used
+    /// by `apply_grant_push` to open the per-device grant blob sealed to us.
+    pub device_x25519_priv: zeroize::Zeroizing<[u8; 32]>,
+    /// ZEB-674 (C4): the grantee's own shared `KeyTree` (the pinned epoch-0
+    /// fleet tree — the SAME one `file_deks` seals under). `apply_grant_push`
+    /// re-seals the recovered DEK under it so any of the owner's bound devices
+    /// can open the stored grant (Flow A).
+    pub owner_keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
 }
 
 #[async_trait]
@@ -1216,6 +1268,39 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         Ok(inserted)
     }
 
+    async fn apply_grant_push(&self, entry: &DmInboxEntry) -> Result<(), String> {
+        let gp = entry
+            .grant_push
+            .as_deref()
+            .ok_or("apply_grant_push: entry has no grant_push")?;
+        // Open + re-seal + record under the owner-state lock. `granter_owner` is
+        // the butler-verified deposit sender (never the payload's claim — the
+        // per-device seal does not authenticate the granter).
+        let recorded = {
+            let mut state = self.crdt_state.lock().await;
+            crate::file_sharing::ingest_grant_push(
+                &mut state,
+                &self.device_x25519_priv,
+                &self.owner_keytree,
+                OwnerAddr(entry.sender_owner),
+                gp,
+            )
+            .map_err(|e| format!("ingest_grant_push: {e}"))?
+        };
+        // `received_file_grants` lives in the owner-state CRDT and has NO
+        // deposit-rung re-delivery backstop (the entry is GC'd once covered), so
+        // persistence + sibling (Flow A) replication MUST come from notify_dirty
+        // here — ONLY when a grant was actually recorded (`Some`). A `None` (no
+        // blob sealed to this device) mutated nothing; a sibling records it and
+        // replicates it back to us, so we do not churn a persist.
+        if recorded.is_some() {
+            if let Some(mark) = &self.notify_owner_state_dirty {
+                mark();
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
         let inserted = {
             let mut state = self.crdt_state.lock().await;
@@ -1286,6 +1371,27 @@ mod tests {
     const SELF_ID: &str = "self-device-64hex";
     const SIBLING_ID: &str = "sibling-device-64hex";
     const SENDER_OWNER: [u8; 16] = [0xAA; 16];
+    /// ZEB-674: deterministic seeds for the grant-path Prod-ctx test. The device
+    /// ed25519 seed drives BOTH the ctx's X25519 private (via
+    /// `ed25519_priv_to_x25519`) AND the pubkey a grant is sealed to (via
+    /// `ed25519_pub_to_x25519`) — mirroring production's device-key derivation —
+    /// and the keytree seed drives the grantee's shared re-seal tree.
+    const TEST_DEVICE_ED25519_SEED: [u8; 32] = [0x33; 32];
+    const TEST_KEYTREE_SEED: [u8; 32] = [0x44; 32];
+
+    /// The X25519 public key a grant must be sealed to so `prod_ctx_with_dirty`'s
+    /// device key opens it (production's `birational(vk)` seal target).
+    fn test_device_x25519_pub() -> [u8; 32] {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&TEST_DEVICE_ED25519_SEED);
+        crate::dm_signing::ed25519_pub_to_x25519(&sk.verifying_key().to_bytes())
+            .expect("valid x25519 pub")
+    }
+
+    /// The grantee's shared KeyTree matching `prod_ctx_with_dirty`'s
+    /// `owner_keytree` — used to open the re-sealed DEK from another "device".
+    fn test_owner_keytree() -> crate::owner_state_crypto::KeyTree {
+        crate::owner_state_crypto::KeyTree::derive(&TEST_KEYTREE_SEED).expect("keytree")
+    }
 
     fn hlc(wall_ms: u64) -> Hlc {
         Hlc {
@@ -1329,6 +1435,9 @@ mod tests {
         now_ms: u64,
         cas_fail: bool,
         verify_fail: bool,
+        /// ZEB-674: when true, `apply_grant_push` returns `Err` (entry stays
+        /// pending for retry) instead of succeeding.
+        grant_fail: bool,
         /// What `apply_inbox` reports: `true` = newly inserted.
         apply_inserted: bool,
         calls: StdMutex<Vec<String>>,
@@ -1347,6 +1456,7 @@ mod tests {
                 now_ms: 1_000_000,
                 cas_fail: false,
                 verify_fail: false,
+                grant_fail: false,
                 apply_inserted: true,
                 calls: StdMutex::new(Vec::new()),
                 cas_blobs: StdMutex::new(Vec::new()),
@@ -1412,6 +1522,14 @@ mod tests {
         async fn apply_revocation(&self, _entry: &DmInboxEntry) -> Result<bool, String> {
             self.calls.lock().unwrap().push("apply_revocation".into());
             Ok(true)
+        }
+
+        async fn apply_grant_push(&self, _entry: &DmInboxEntry) -> Result<(), String> {
+            self.calls.lock().unwrap().push("apply_grant_push".into());
+            if self.grant_fail {
+                return Err("simulated grant apply failure".into());
+            }
+            Ok(())
         }
 
         async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
@@ -1518,6 +1636,70 @@ mod tests {
 
         // Self added to the grow-only ig set: the entry is marked ingested.
         assert!(doc.entries[&key].ingested_by.contains(SELF_ID));
+    }
+
+    /// ZEB-674 (C4): a PURE grant entry (`grant_push: Some`, all other
+    /// sub-payloads `None`) is routed to `apply_grant_push` and SKIPS the
+    /// message/invite/revocation pipelines entirely — no CAS-put, no verify, no
+    /// apply_inbox, no emit — then is marked ingested.
+    #[tokio::test]
+    async fn ingest_routes_grant_entry_to_apply_grant_push() {
+        let key = DmInboxDoc::grant_key(&SENDER_OWNER, &[0xDE, 0xAD]);
+        let entry = DmInboxEntry {
+            sender_owner: SENDER_OWNER,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: Some(vec![0xDE, 0xAD]),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let ctx = ProbeCtx::new();
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed, "grant ingest mutated the doc (ig growth)");
+
+        assert_eq!(ctx.calls(), vec!["apply_grant_push"]);
+        assert!(
+            ctx.applied().is_empty(),
+            "no message apply_inbox on a grant"
+        );
+        assert!(ctx.emitted().is_empty(), "no dm-received emit on a grant");
+        assert!(doc.entries[&key].ingested_by.contains(SELF_ID));
+    }
+
+    /// A failed `apply_grant_push` leaves the entry PENDING (not ingested) for
+    /// retry, exactly like the message/invite/revocation arms.
+    #[tokio::test]
+    async fn ingest_grant_apply_failure_leaves_entry_pending() {
+        let key = DmInboxDoc::grant_key(&SENDER_OWNER, &[0x01]);
+        let entry = DmInboxEntry {
+            sender_owner: SENDER_OWNER,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: Some(vec![0x01]),
+            deposited_at: hlc(500),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+        let mut ctx = ProbeCtx::new();
+        ctx.grant_fail = true;
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(!changed, "a failed grant apply mutates nothing");
+        assert_eq!(ctx.calls(), vec!["apply_grant_push"]);
+        assert!(
+            !doc.entries[&key].ingested_by.contains(SELF_ID),
+            "entry left pending for retry"
+        );
     }
 
     #[tokio::test]
@@ -1921,6 +2103,10 @@ mod tests {
             enrolled: BTreeSet::new(),
             revoked: revoked.clone(),
             notify_owner_state_dirty: Some(notify),
+            device_x25519_priv: crate::dm_signing::ed25519_priv_to_x25519(
+                &ed25519_dalek::SigningKey::from_bytes(&TEST_DEVICE_ED25519_SEED),
+            ),
+            owner_keytree: Arc::new(test_owner_keytree()),
         };
         (ctx, crdt_state, dirty, revoked)
     }
@@ -1945,6 +2131,106 @@ mod tests {
             deposited_by: "butler-device".into(),
             ingested_by: Default::default(),
         }
+    }
+
+    /// ZEB-674 (C4) sweeper integration: a grant-only entry carrying a REAL
+    /// `grant_push` (sealed to this ctx's device key) is swept end-to-end through
+    /// the PRODUCTION `apply_grant_push` — it lands on `received_file_grants`,
+    /// fires `notify_owner_state_dirty` exactly once, and the stored DEK is
+    /// openable BOTH via `open_received_file` (the grantee read path) AND
+    /// directly via `open_dek_at_rest` with a freshly-derived KeyTree of the same
+    /// material (a DIFFERENT device with the same shared KeyTree — device-
+    /// agnostic, mirroring `file_deks`). The granter recorded is the entry's
+    /// butler-verified `sender_owner`.
+    #[tokio::test]
+    async fn sweep_ingests_real_grant_push_via_prod_ctx_device_agnostic() {
+        use crate::file_sharing::{
+            open_dek_at_rest, open_received_file, seal_grant_for_devices, FileGrantInner,
+        };
+        let (ctx, crdt_state, dirty, _revoked) = prod_ctx_with_dirty();
+
+        // A real sealed grant, targeted at the ctx device's X25519 pubkey.
+        let dek_bytes = [0x5Au8; 32];
+        let cid_bytes = [0xC1u8; 32];
+        let inner = FileGrantInner {
+            cid: cid_bytes,
+            file_name: "shared.md".into(),
+            file_size: 42,
+            mime: "text/markdown".into(),
+            dek: dek_bytes,
+        };
+        let sealed = seal_grant_for_devices(&inner, &[test_device_x25519_pub()]).expect("seal");
+        let list: Vec<serde_bytes::ByteBuf> =
+            sealed.into_iter().map(serde_bytes::ByteBuf::from).collect();
+        let mut grant_push = Vec::new();
+        ciborium::into_writer(&list, &mut grant_push).expect("encode grant_push");
+
+        let granter = OwnerAddr([0xB0; 16]);
+        let key = DmInboxDoc::grant_key(&granter.0, &grant_push);
+        // Deposit "now" (the Prod ctx's `now_ms` is the real wall clock, and an
+        // empty enrolled set disables coverage-GC) so the entry survives the
+        // sweep's TTL check and we can assert it was marked ingested.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let entry = DmInboxEntry {
+            sender_owner: granter.0,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: Some(grant_push),
+            deposited_at: hlc(now),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed, "grant sweep mutated the doc (ig growth)");
+        assert!(
+            doc.entries[&key].ingested_by.contains(SELF_ID),
+            "entry marked ingested"
+        );
+        assert_eq!(
+            dirty.load(Ordering::SeqCst),
+            1,
+            "a recorded grant fires notify_owner_state_dirty exactly once"
+        );
+
+        let cid = ContentId::from_bytes(cid_bytes);
+        let state = crdt_state.lock().await;
+        let rec = state
+            .received_file_grants
+            .get(&cid_bytes)
+            .expect("received_file_grants populated");
+        assert_eq!(
+            rec.granter_owner, granter,
+            "granter is the butler-verified deposit sender"
+        );
+        assert_ne!(
+            rec.sealed_dek.as_slice(),
+            dek_bytes.as_slice(),
+            "stored blob is the KeyTree-sealed envelope, never the raw DEK"
+        );
+
+        // (a) grantee read path recovers the DEK.
+        let recovered =
+            open_received_file(&state, &test_owner_keytree(), cid).expect("open received file");
+        assert_eq!(recovered.as_bytes(), &dek_bytes, "recovered DEK matches");
+
+        // (b) device-agnostic: a FRESH KeyTree of the same shared material (a
+        // different device of the same owner) opens the stored blob directly.
+        let other_device_tree = test_owner_keytree();
+        let via_tree =
+            open_dek_at_rest(&other_device_tree, &rec.sealed_dek).expect("open via shared KeyTree");
+        assert_eq!(
+            via_tree.as_bytes(),
+            &dek_bytes,
+            "any device with the shared KeyTree opens the re-sealed grant"
+        );
     }
 
     #[tokio::test]
@@ -4729,6 +5015,10 @@ mod tests {
             enrolled: BTreeSet::new(),
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
             notify_owner_state_dirty: None,
+            device_x25519_priv: zeroize::Zeroizing::new([0x33; 32]),
+            owner_keytree: Arc::new(
+                crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
+            ),
         };
 
         RecoverInviteFixture {
@@ -5069,6 +5359,10 @@ mod tests {
             enrolled: BTreeSet::new(),
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
             notify_owner_state_dirty: None,
+            device_x25519_priv: zeroize::Zeroizing::new([0x33; 32]),
+            owner_keytree: Arc::new(
+                crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
+            ),
         };
 
         let err = prod_ctx
@@ -5278,6 +5572,10 @@ mod tests {
             enrolled: BTreeSet::new(),
             revoked: crate::revoked_device_projection::RevokedDeviceProjection::new(),
             notify_owner_state_dirty: None,
+            device_x25519_priv: zeroize::Zeroizing::new([0x33; 32]),
+            owner_keytree: Arc::new(
+                crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
+            ),
         };
         (prod_ctx, pending, sink_handle)
     }

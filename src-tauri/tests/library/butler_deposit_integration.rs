@@ -505,6 +505,13 @@ impl DmInboxIngestCtx for ProbeIngestCtx {
         Ok(true)
     }
 
+    async fn apply_grant_push(&self, _entry: &DmInboxEntry) -> Result<(), String> {
+        // ZEB-674 standalone file-share grant deposits (only `grant_push` set)
+        // are not exercised by these message-entry probes; the recover path is
+        // unit-covered in `dm_inbox_ingest.rs`. Succeed without applying.
+        Ok(())
+    }
+
     async fn apply_inbox(&self, entry: InboxEntry) -> Result<bool, String> {
         let inserted = self
             .dm_store

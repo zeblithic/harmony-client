@@ -2482,6 +2482,63 @@ mod integration_tests {
         );
     }
 
+    /// ZEB-674 (C4): `received_file_grants` merges GROW-ONLY first-writer-wins
+    /// per CID (`or_insert`, like `file_deks` — NOT the `file_grants` set-union).
+    /// A CID present locally is never overwritten; a CID absent locally is
+    /// pulled in from the remote. Both merge orders converge.
+    #[test]
+    fn received_file_grants_merge_or_insert_first_writer_wins() {
+        use crate::owner_state_types::{OwnerAddr, ReceivedFileGrant};
+
+        let cid1 = [0x11u8; 32];
+        let cid2 = [0x22u8; 32];
+        let mk = |cid: [u8; 32], tag: u8| ReceivedFileGrant {
+            granter_owner: OwnerAddr([tag; 16]),
+            cid,
+            file_name: format!("f-{tag}"),
+            file_size: tag as u64,
+            mime: "application/octet-stream".into(),
+            sealed_dek: vec![tag; 8],
+            received_at: tag as u64,
+        };
+
+        // A holds cid1 (tag 0xA1); B holds cid1 (tag 0xB2 — a DIFFERENT record
+        // for the same CID) AND cid2.
+        let mut a0 = OwnerState::default();
+        a0.received_file_grants.insert(cid1, mk(cid1, 0xA1));
+        let mut b0 = OwnerState::default();
+        b0.received_file_grants.insert(cid1, mk(cid1, 0xB2));
+        b0.received_file_grants.insert(cid2, mk(cid2, 0xB2));
+
+        // Merge B → A: A keeps its own cid1 (first-writer-wins), gains cid2.
+        let mut a = a0.clone();
+        super::merge_remote_into_local(&mut a, b0.clone());
+        assert_eq!(
+            a.received_file_grants.get(&cid1).unwrap().granter_owner,
+            OwnerAddr([0xA1; 16]),
+            "local cid1 record is NOT overwritten by the remote (or_insert)"
+        );
+        assert!(
+            a.received_file_grants.contains_key(&cid2),
+            "a CID absent locally is pulled in from the remote"
+        );
+        assert_eq!(a.received_file_grants.len(), 2);
+
+        // Merge A → B: B keeps its own cid1 (0xB2). Distinct-CID convergence.
+        let mut b = b0;
+        super::merge_remote_into_local(&mut b, a0);
+        assert_eq!(
+            b.received_file_grants.get(&cid1).unwrap().granter_owner,
+            OwnerAddr([0xB2; 16]),
+            "each side keeps its own cid1 under first-writer-wins"
+        );
+        assert_eq!(b.received_file_grants.len(), 2);
+        // The union of CIDs converges from both directions.
+        let a_cids: std::collections::BTreeSet<_> = a.received_file_grants.keys().collect();
+        let b_cids: std::collections::BTreeSet<_> = b.received_file_grants.keys().collect();
+        assert_eq!(a_cids, b_cids, "both merge orders converge on the CID set");
+    }
+
     /// 10 randomized sequences of (mutate-on-A, mutate-on-B,
     /// publish-A, publish-B) operations. After draining, A and B
     /// must hold equal `OwnerState.spaces` maps (the only field this

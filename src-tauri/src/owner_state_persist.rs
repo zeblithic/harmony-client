@@ -465,6 +465,50 @@ mod tests {
     }
 
     #[test]
+    fn crdt_file_v2_round_trips_received_file_grants() {
+        // ZEB-674 (C4): the grantee-side received-file-grants store must survive
+        // save->load or a restart drops "shared with me" grants (they have no
+        // deposit-rung backstop). Guards the CrdtFileV2 threading + both From
+        // impls. The `sk` (sealed_dek) value is the KeyTree-sealed DEK.
+        let mut s = OwnerState::default();
+        let cid = [0x66u8; 32];
+        s.received_file_grants.insert(
+            cid,
+            crate::owner_state_types::ReceivedFileGrant {
+                granter_owner: crate::owner_state_types::OwnerAddr([0x88; 16]),
+                cid,
+                file_name: "shared.md".into(),
+                file_size: 4242,
+                mime: "text/markdown".into(),
+                sealed_dek: vec![0xDE, 0xAD, 0xBE, 0xEF],
+                received_at: 1_700_000_000_000,
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(loaded.received_file_grants, s.received_file_grants);
+        assert_eq!(
+            loaded.received_file_grants.get(&cid).unwrap().file_size,
+            4242
+        );
+    }
+
+    #[test]
+    fn pre_received_file_grants_snapshot_loads_empty() {
+        // A V2 file serialized WITHOUT the received-file-grants store (skipped on
+        // the wire when empty) must load to an empty map — backward-compat with
+        // snapshots written before ZEB-674 Task 4.
+        let s = OwnerState::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert!(loaded.received_file_grants.is_empty());
+    }
+
+    #[test]
     fn pre_revoked_dm_devices_snapshot_loads_empty() {
         // A V2 file serialized WITHOUT the revoked-DM store (skipped on the wire
         // when empty) must load to an empty map — backward-compat with snapshots
