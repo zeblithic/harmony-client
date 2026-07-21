@@ -56,6 +56,26 @@ fn setup_machine() -> TempDir {
     tempfile::tempdir().unwrap()
 }
 
+/// ZEB-729: wipe the encrypted identity store (mirrors
+/// `recovery_cli_integration::wipe_identity_store`). With `keychain: None`, the
+/// at-rest identity lives at the `.enc` sibling of `identity_path`, NOT at
+/// `identity.key` — removing `identity.key` was a no-op that let the subsequent
+/// `force=true` restore overwrite an existing store instead of exercising the
+/// intended "restore into an absent store" precondition.
+fn wipe_identity_store(identity_path: &std::path::Path) {
+    let enc_path = identity_path.with_file_name("identity.enc");
+    let _ = std::fs::remove_file(&enc_path);
+    // The wipe is the whole point — assert the store is actually gone so a
+    // discarded remove error can't silently leave `identity.enc` present and
+    // let the subsequent force=true restore skip the absent-store precondition.
+    // (A legitimately-absent store — NotFound above — still satisfies this.)
+    assert!(
+        !enc_path.exists(),
+        "identity.enc must be absent after wipe: {}",
+        enc_path.display()
+    );
+}
+
 #[test]
 #[serial]
 fn mnemonic_round_trip_still_works_unchanged() {
@@ -101,7 +121,7 @@ fn recovery_file_round_trip_with_state() {
     .unwrap();
 
     // Wipe + restore.
-    let _ = std::fs::remove_file(&identity_path);
+    wipe_identity_store(&identity_path);
     let _ = std::fs::remove_file(recovery_cli::owner_state_path(dir.path()));
     recovery_cli::restore_recovery_file_pair_with_keychain(
         &identity_path,
@@ -117,6 +137,98 @@ fn recovery_file_round_trip_with_state() {
     assert_eq!(
         restored_bytes, original_bytes,
         "owner-state must round-trip byte-equal"
+    );
+}
+
+/// ZEB-728: a `force` pair-export must roll back the HRMR move-aside when the
+/// **sidecar** move-aside fails, so a failed export never orphans the operator's
+/// original recovery file under a randomized `.bak` name.
+///
+/// Reproduction is filesystem-deterministic without root or platform hooks.
+/// `sidecar_path(out)` is `out` + ".state", so both artifacts share a parent
+/// directory — a directory-permission trick would fail the HRMR move-aside
+/// *first* (line 471), which is already safe and not the bug. Instead we size
+/// `out`'s basename so `move_aside(out)` (which appends a 21-char
+/// ".{16hex}.bak" suffix) stays within the 255-byte filename limit, while the
+/// 6-char-longer sidecar's `.bak` target exceeds it and fails with
+/// ENAMETOOLONG. That makes the HRMR move-aside succeed and *only* the sidecar
+/// move-aside fail — exactly the window where the original bug orphaned the
+/// HRMR backup.
+#[test]
+#[serial]
+fn force_pair_export_rolls_back_hrmr_when_sidecar_backup_fails() {
+    let dir = setup_machine();
+    let identity_path = dir.path().join("identity.key");
+
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "zeb728-at-rest");
+    let _recov = set_env("HARMONY_RECOVERY_PASSPHRASE", "zeb728-recovery");
+
+    // A real identity + owner-state so this is a genuine force re-export.
+    identity::write_seed_to_disk_with_keychain(&identity_path, &[0x28; 32], true, None).unwrap();
+    plant_state(dir.path()); // owner_state_crdt.cbor present => want_sidecar = true
+
+    // `out` basename = 232 bytes: move-aside target = 232 + 21 = 253 <= 255 (OK).
+    // sidecar basename = 232 + len(".state") = 238: target = 238 + 21 = 259 > 255
+    // => ENAMETOOLONG, so ONLY the sidecar move-aside fails.
+    let out = dir.path().join("h".repeat(232));
+    let sidecar = recovery_cli::sidecar_path(&out);
+    assert_eq!(
+        sidecar.file_name().unwrap().len(),
+        238,
+        "sidecar basename must be 6 bytes longer than out (\".state\")"
+    );
+
+    // Pre-existing recovery pair on disk — what `force` will overwrite.
+    const HRMR_MARK: &[u8] = b"ORIGINAL-HRMR-DO-NOT-LOSE";
+    std::fs::write(&out, HRMR_MARK).unwrap();
+    std::fs::write(&sidecar, b"ORIGINAL-HRSS").unwrap();
+
+    let result = recovery_cli::export_recovery_file_pair_with_keychain(
+        &identity_path,
+        dir.path(),
+        &out,
+        /*comment=*/ None,
+        /*passphrase=*/ None,
+        /*include_state=*/ true,
+        /*force=*/ true,
+        /*keychain=*/ None,
+    );
+
+    // The export must fail specifically at the SIDECAR backup step — not the
+    // HRMR backup. `move_aside` formats "failed to back up existing <path>
+    // before overwrite: ..."; only the sidecar path carries the ".state"
+    // suffix. Asserting this guards against a false-pass on a platform where a
+    // different filename/path limit made the HRMR move-aside fail first (which
+    // would never exercise the rollback window this test targets).
+    let err = result.expect_err("export should fail when the sidecar move-aside fails");
+    assert!(
+        err.contains("before overwrite") && err.contains(".state"),
+        "failure must originate from the sidecar move-aside (proving the HRMR \
+         backup was created and then rolled back), got: {err}"
+    );
+
+    // ...and the operator's original HRMR file must still be at its path with
+    // its original content — NOT orphaned under a randomized `.bak`.
+    assert!(
+        out.exists(),
+        "original HRMR recovery file must be restored, not orphaned under a .bak"
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        HRMR_MARK,
+        "restored HRMR must be byte-identical to the original"
+    );
+
+    // No stray `<out>.<hex>.bak` orphan should remain in the directory.
+    let out_name = out.file_name().unwrap().to_string_lossy().into_owned();
+    let orphan = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with(&out_name) && n.ends_with(".bak"));
+    assert!(
+        orphan.is_none(),
+        "no HRMR `.bak` orphan should remain, found: {orphan:?}"
     );
 }
 
@@ -149,7 +261,7 @@ fn legacy_hrmr_only_restores_with_empty_state() {
     assert!(!sidecar.exists(), "no sidecar in legacy mode");
 
     // Wipe + restore — should succeed with empty owner-state.
-    let _ = std::fs::remove_file(&identity_path);
+    wipe_identity_store(&identity_path);
     let result = recovery_cli::restore_recovery_file_pair_with_keychain(
         &identity_path,
         dir.path(),
