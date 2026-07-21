@@ -20371,7 +20371,33 @@ pub(crate) async fn grant_read_impl(
             grant_push: Some(grant_push),
             now_ms,
         };
-        let _ = butler.deposit(&req).await;
+        // Surface the delivery outcome (do NOT silently discard it). Best-effort
+        // by design: the grant is already recorded + replicated to the owner's
+        // fleet and the CID is allowlisted, so a non-Acked deposit does NOT fail
+        // the grant — the grantee simply hasn't received the DEK yet, and a
+        // re-share re-attempts. Automatic delivery retry + a UI delivery-status
+        // indicator are a tracked follow-up (see ZEB-674 converge round 2).
+        match butler.deposit(&req).await {
+            crate::butler_deposit::DepositRungOutcome::Acked => {
+                tracing::debug!(
+                    recipient = %hex::encode(grantee_owner.0),
+                    "ZEB-674 T6: grant deposited to grantee butler (acked)"
+                );
+            }
+            crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {
+                tracing::debug!(
+                    recipient = %hex::encode(grantee_owner.0),
+                    "ZEB-674 T6: grant recorded; grantee advertises no fresh butler set — delivery deferred to re-share once reachable"
+                );
+            }
+            crate::butler_deposit::DepositRungOutcome::Failed(detail) => {
+                tracing::warn!(
+                    recipient = %hex::encode(grantee_owner.0),
+                    detail = %detail,
+                    "ZEB-674 T6: grant recorded but butler deposit FAILED; delivery deferred to re-share"
+                );
+            }
+        }
     } else {
         tracing::debug!(
             recipient = %hex::encode(grantee_owner.0),

@@ -3021,9 +3021,12 @@
     } catch (err) {
       if (req !== fileGrantsReq || selectedFileCid !== cid) return;
       console.error('listGrants failed:', err);
-      // A failed query is still "resolved" — [] renders the honest
-      // fallback empty state rather than leaving the panel stuck hidden.
-      fileGrants = [];
+      // A load FAILURE is not proof of "no grants": leave the list UNRESOLVED
+      // (null) so the ShareList self-hides, rather than fabricating the
+      // "Not shared with anyone" proven-empty state (null-until-resolved model;
+      // see ShareList's `grants` doc). A `[]` here would assert an empty share
+      // list the backend never confirmed. The next selection/refresh retries.
+      fileGrants = null;
     }
   }
 
