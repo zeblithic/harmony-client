@@ -19812,7 +19812,7 @@ fn find_sealed_file_dek<'a>(
 /// is consulted FIRST, else a file shared with us (`received_file_grants`).
 /// Both maps store the DEK sealed under this node's shared `KeyTree`, so
 /// [`file_sharing::open_dek_at_rest`] unseals it and
-/// [`file_stream_crypto::decrypt_stream`] reverses the v2 chunked-AEAD stream
+/// [`file_stream_crypto::decrypt_stream`] reverses the v3 stream
 /// encrypt done at ingest ([`ingest_content_encrypted_inner`], ZEB-724). A v1
 /// whole-blob ciphertext (pre-ZEB-724) fails loud via
 /// `FileStreamError::UnsupportedLegacyFormat` rather than silently
@@ -20086,7 +20086,7 @@ async fn read_up_to(file: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Resu
     Ok(filled)
 }
 
-/// Seal `file`'s plaintext into v2 STREAM frames and write them to `writer`
+/// Seal `file`'s plaintext into v3 STREAM frames and write them to `writer`
 /// (the write half of a duplex pipe). One-frame lookahead marks the true final
 /// frame (so a frame-aligned file emits exactly ceil(len/frame_size) frames).
 async fn produce_ciphertext(
@@ -20105,6 +20105,7 @@ async fn produce_ciphertext(
 
     let fs = frame_size as usize;
     let mut cur = vec![0u8; fs];
+    let mut nxt = vec![0u8; fs];
     let mut cur_len = read_up_to(&mut file, &mut cur)
         .await
         .map_err(|e| format!("read plaintext: {e}"))?;
@@ -20121,7 +20122,9 @@ async fn produce_ciphertext(
             break;
         }
         // `cur` is a full frame; peek to learn whether more data follows.
-        let mut nxt = vec![0u8; fs];
+        // Reuses the `nxt` buffer allocated before the loop (filled from index
+        // 0 each call via `read_up_to`) instead of allocating a fresh Vec per
+        // iteration.
         let nxt_len = read_up_to(&mut file, &mut nxt)
             .await
             .map_err(|e| format!("read plaintext: {e}"))?;
@@ -20142,7 +20145,10 @@ async fn produce_ciphertext(
             .write_all(&ct)
             .await
             .map_err(|e| format!("pipe write: {e}"))?;
-        cur = nxt;
+        // Swap instead of reallocating: `cur` becomes the just-peeked frame,
+        // and the old `cur` allocation is reused as next iteration's `nxt`
+        // buffer (overwritten from index 0 by the next `read_up_to` call).
+        std::mem::swap(&mut cur, &mut nxt);
         cur_len = nxt_len;
     }
     writer
@@ -20156,7 +20162,7 @@ async fn produce_ciphertext(
 /// path.
 ///
 /// Generates a FRESH per-file DEK, then STREAMS the plaintext through a
-/// producer task that seals it into v2 STREAM frames
+/// producer task that seals it into v3 STREAM frames
 /// (`file_stream_crypto::FrameSealer`) and writes them into a bounded
 /// `tokio::io::duplex` pipe. The pipe's read half feeds
 /// [`streaming_ingest_with_options`] directly, so the FastCDC chunker
@@ -20187,7 +20193,7 @@ pub async fn ingest_content_encrypted_inner(
     let dek = crate::file_sharing::generate_file_dek();
     let frame_size = crate::file_stream_crypto::DEFAULT_FRAME_SIZE;
 
-    // 2. Stream: producer seals plaintext → v2 frames → duplex pipe; the FastCDC
+    // 2. Stream: producer seals plaintext → v3 frames → duplex pipe; the FastCDC
     //    chunker consumes the ciphertext byte-stream. Neither the whole plaintext
     //    nor the whole ciphertext is ever resident (bounded to a few frames).
     let opts = IngestOptions {
@@ -20241,7 +20247,7 @@ pub async fn ingest_content_encrypted_inner(
 /// ZEB-674 Task 1 (C1): encrypted-file ingest via the native file picker.
 ///
 /// Mirrors [`ingest_content`] but routes through the per-file-DEK encrypt path
-/// (fresh DEK → streamed v2 chunked-AEAD frame-by-frame encrypt via
+/// (fresh DEK → streamed v3 frame-by-frame encrypt via
 /// `file_stream_crypto::FrameSealer`, ZEB-724 → encrypted + serveable ingest →
 /// sealed DEK on `OwnerState`). Backend-only; Task 6 wires the frontend.
 #[tauri::command]
